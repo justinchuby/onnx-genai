@@ -473,6 +473,73 @@ mod tests {
         assert_eq!(matched, 4);
         assert_eq!(snapshot.as_str(), "fork");
     }
+
+    #[test]
+    fn interleaved_prefix_borrow_release_and_eviction_stress() {
+        const PREFIX_COUNT: usize = 1024;
+        const LOOKUP_ROUNDS: usize = 128;
+
+        fn prefix(index: usize) -> [TokenId; 3] {
+            [
+                7,
+                (index / 256) as TokenId + 10,
+                (index % 256) as TokenId + 100,
+            ]
+        }
+
+        let mut table = PageTable::new(1, PREFIX_COUNT);
+        let pages = (0..PREFIX_COUNT)
+            .map(|_| {
+                table
+                    .allocate(Device::Gpu(0))
+                    .expect("stress pool has room")
+            })
+            .collect::<Vec<_>>();
+        let mut cache = PrefixCache::new();
+        for (index, &page) in pages.iter().enumerate() {
+            cache.insert_pages(&prefix(index), &[page], &mut table);
+            assert_eq!(table.pages[&page].ref_count, 2);
+        }
+
+        // EngineDriver serializes logical requests through this same mutation
+        // path. Exercise more than 100k interleaved borrower lifetimes.
+        for round in 0..LOOKUP_ROUNDS {
+            for (index, &page) in pages.iter().enumerate() {
+                let mut query = prefix(index).to_vec();
+                query.push(10_000 + round as TokenId);
+                let matched = cache.lookup_shared(&query, &mut table);
+                assert_eq!(matched.matched_tokens, 3);
+                assert_eq!(matched.page_ids, vec![page]);
+                assert_eq!(table.pages[&page].ref_count, 3);
+                assert_eq!(
+                    cache.release_shared(&query, matched.matched_tokens, &mut table),
+                    vec![page]
+                );
+                assert_eq!(table.pages[&page].ref_count, 2);
+            }
+        }
+
+        // Keep one quarter of the prefixes borrowed while LRU reclaims every
+        // inactive entry, then release and reclaim the remainder.
+        let mut active = Vec::new();
+        for index in (0..PREFIX_COUNT).step_by(4) {
+            let query = prefix(index).to_vec();
+            let matched = cache.lookup_shared(&query, &mut table);
+            active.push((query, matched.matched_tokens, pages[index]));
+        }
+        let evicted = cache.evict_lru(PREFIX_COUNT, &mut table);
+        assert_eq!(evicted.len(), PREFIX_COUNT - active.len());
+        for &(ref query, matched_tokens, page) in &active {
+            assert_eq!(table.pages[&page].ref_count, 3);
+            cache.release_shared(query, matched_tokens, &mut table);
+            assert_eq!(table.pages[&page].ref_count, 2);
+        }
+        assert_eq!(
+            cache.evict_lru(PREFIX_COUNT, &mut table).len(),
+            active.len()
+        );
+        assert!(pages.iter().all(|page| table.pages[page].ref_count == 1));
+    }
 }
 
 #[cfg(test)]

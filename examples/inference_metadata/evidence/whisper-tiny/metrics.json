@@ -1,0 +1,110 @@
+{
+  "long": {
+    "seconds": 9.115,
+    "hf_feature_shape": [
+      1,
+      80,
+      3000
+    ],
+    "mel_max_abs_diff": 1.1920928955078125e-05,
+    "mel_mean_abs_diff": 4.992882551846378e-08,
+    "encoder_shape": [
+      1,
+      1500,
+      384
+    ],
+    "encoder_max_abs_diff": 0.0017557144165039062,
+    "encoder_rel_l2": 6.416324140445795e-06,
+    "hf_tokens": [
+      7807,
+      295,
+      34993,
+      34406,
+      13,
+      3664,
+      3554,
+      21058,
+      43125,
+      11,
+      1821,
+      666,
+      14770,
+      11,
+      5127,
+      5139,
+      11,
+      8532,
+      293,
+      18030,
+      281,
+      3196,
+      13
+    ],
+    "hf_transcript": " Call of Flower mayonnaise. Take cold boiled cauliflower, break into branches, adding salt, pepper and vinegar to season.",
+    "onnx_tokens": [
+      7807,
+      295,
+      34993,
+      34406,
+      13,
+      3664,
+      3554,
+      21058,
+      43125,
+      11,
+      1821,
+      666,
+      14770,
+      11,
+      5127,
+      5139,
+      11,
+      8532,
+      293,
+      18030,
+      281,
+      3196,
+      13,
+      50257
+    ],
+    "onnx_transcript": " Call of Flower mayonnaise. Take cold boiled cauliflower, break into branches, adding salt, pepper and vinegar to season.",
+    "onnx_matches_hf": true
+  },
+  "short": {
+    "seconds": 1.6,
+    "hf_feature_shape": [
+      1,
+      80,
+      3000
+    ],
+    "mel_max_abs_diff": 2.4437904357910156e-05,
+    "mel_mean_abs_diff": 1.1972089986045376e-08,
+    "encoder_shape": [
+      1,
+      1500,
+      384
+    ],
+    "encoder_max_abs_diff": 0.0015668869018554688,
+    "encoder_rel_l2": 6.575014595000539e-06,
+    "hf_tokens": [
+      7807,
+      295,
+      34993,
+      11,
+      2458,
+      13
+    ],
+    "hf_transcript": " Call of Flower, Man.",
+    "onnx_tokens": [
+      7807,
+      295,
+      34993,
+      11,
+      2458,
+      13,
+      50257
+    ],
+    "onnx_transcript": " Call of Flower, Man.",
+    "onnx_matches_hf": true
+  }
+}

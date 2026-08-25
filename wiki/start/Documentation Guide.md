@@ -56,7 +56,6 @@ updated: 2026-08-19
 |---|---|
 | 产品架构是什么? | [`docs/architecture/DESIGN.md`](../../docs/architecture/DESIGN.md) |
 | 原生运行时架构是什么? | [`docs/architecture/ORT2.md`](../../docs/architecture/ORT2.md) |
-| 现在实现了哪些? | [`docs/status/PROGRESS.md`](../../docs/status/PROGRESS.md) 及代码 |
 | 内存现在做了什么? | [`docs/memory/MEMORY_ARCHITECTURE.md`](../../docs/memory/MEMORY_ARCHITECTURE.md) |
 | 提议中的内存模型是什么? | [`docs/memory/MEMORY_MANAGEMENT_MODEL_DESIGN.md`](../../docs/memory/MEMORY_MANAGEMENT_MODEL_DESIGN.md) |
 | weight-offload 的北极星目标是什么? | [`docs/memory/WEIGHT_OFFLOAD.md`](../../docs/memory/WEIGHT_OFFLOAD.md) |

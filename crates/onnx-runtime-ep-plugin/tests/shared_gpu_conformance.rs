@@ -211,6 +211,10 @@ impl MockCudaLikeEp {
 }
 
 impl ExecutionProvider for MockCudaLikeEp {
+    fn consume_route_residency_at_boundary(&self) -> EpResult<()> {
+        Ok(())
+    }
+
     fn name(&self) -> &str {
         "mock_cuda_like_ep"
     }

@@ -1,0 +1,254 @@
+ir_version: 11
+graph {
+  node {
+    input: "X"
+    input: "router"
+    input: "fc1_packed"
+    input: "fc1_scales"
+    input: ""
+    input: "fc2_packed"
+    input: "fc2_scales"
+    output: "Y"
+    name: "node_QMoE_0"
+    op_type: "QMoE"
+    attribute {
+      name: "expert_weight_bits"
+      i: 4
+      type: INT
+    }
+    attribute {
+      name: "block_size"
+      i: 16
+      type: INT
+    }
+    attribute {
+      name: "k"
+      i: 1
+      type: INT
+    }
+    attribute {
+      name: "activation_type"
+      s: "identity"
+      type: STRING
+    }
+    attribute {
+      name: "normalize_routing_weights"
+      i: 0
+      type: INT
+    }
+    domain: "com.microsoft"
+  }
+  name: "qmoe_weight_offload"
+  initializer {
+    dims: 4
+    dims: 16
+    dims: 8
+    data_type: 2
+    name: "fc1_packed"
+    external_data {
+      key: "location"
+      value: "weights.bin"
+    }
+    external_data {
+      key: "offset"
+      value: "4"
+    }
+    external_data {
+      key: "length"
+      value: "512"
+    }
+    data_location: EXTERNAL
+  }
+  initializer {
+    dims: 4
+    dims: 16
+    dims: 1
+    data_type: 1
+    name: "fc1_scales"
+    external_data {
+      key: "location"
+      value: "weights.bin"
+    }
+    external_data {
+      key: "offset"
+      value: "516"
+    }
+    external_data {
+      key: "length"
+      value: "256"
+    }
+    data_location: EXTERNAL
+  }
+  initializer {
+    dims: 4
+    dims: 16
+    dims: 8
+    data_type: 2
+    name: "fc2_packed"
+    external_data {
+      key: "location"
+      value: "weights.bin"
+    }
+    external_data {
+      key: "offset"
+      value: "772"
+    }
+    external_data {
+      key: "length"
+      value: "512"
+    }
+    data_location: EXTERNAL
+  }
+  initializer {
+    dims: 4
+    dims: 16
+    dims: 1
+    data_type: 1
+    name: "fc2_scales"
+    external_data {
+      key: "location"
+      value: "weights.bin"
+    }
+    external_data {
+      key: "offset"
+      value: "1284"
+    }
+    external_data {
+      key: "length"
+      value: "256"
+    }
+    data_location: EXTERNAL
+  }
+  input {
+    name: "X"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 4
+          }
+          dim {
+            dim_value: 16
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "router"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 4
+          }
+          dim {
+            dim_value: 4
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "Y"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 4
+          }
+          dim {
+            dim_value: 16
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "fc1_packed"
+    type {
+      tensor_type {
+        elem_type: 2
+        shape {
+          dim {
+            dim_value: 4
+          }
+          dim {
+            dim_value: 16
+          }
+          dim {
+            dim_value: 8
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "fc1_scales"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 4
+          }
+          dim {
+            dim_value: 16
+          }
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "fc2_packed"
+    type {
+      tensor_type {
+        elem_type: 2
+        shape {
+          dim {
+            dim_value: 4
+          }
+          dim {
+            dim_value: 16
+          }
+          dim {
+            dim_value: 8
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "fc2_scales"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 4
+          }
+          dim {
+            dim_value: 16
+          }
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+}
+opset_import {
+  domain: ""
+  version: 24
+}
+opset_import {
+  domain: "com.microsoft"
+  version: 1
+}

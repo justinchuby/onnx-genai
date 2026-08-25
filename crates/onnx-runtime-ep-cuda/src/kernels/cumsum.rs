@@ -237,7 +237,7 @@ impl Kernel for CumSumKernel {
             let func = self
                 .runtime
                 .nvrtc_function("cumsum", SOURCE, "cumsum_block_i64")?;
-            let shared_mem_bytes = u32::from(BLOCK) * std::mem::size_of::<i64>() as u32;
+            let shared_mem_bytes = BLOCK * std::mem::size_of::<i64>() as u32;
             let mut builder = self.runtime.stream().launch_builder(&func);
             builder
                 .arg(&input_ptr)

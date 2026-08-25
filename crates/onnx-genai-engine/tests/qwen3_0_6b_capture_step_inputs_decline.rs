@@ -28,7 +28,7 @@
 //! cargo test -p onnx-genai-engine --features cuda,native-backend \
 //!   --test qwen3_0_6b_capture_step_inputs_decline -- --ignored --nocapture
 //! ```
-#![cfg(all(feature = "cuda", feature = "native-backend"))]
+#![cfg(feature = "native-cuda")]
 
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -66,7 +66,7 @@ fn qwen3_0_6b_single_component_declines_capture_step_inputs() -> anyhow::Result<
     };
 
     // (1) It is NOT a multi-component pipeline: `from_pipeline_dir` must refuse.
-    let pipeline_load = Engine::from_pipeline_dir(&dir, EngineConfig::default());
+    let pipeline_load = Engine::from_dir(&dir, EngineConfig::default());
     assert!(
         pipeline_load.is_err(),
         "qwen3-0.6b unexpectedly loaded as a multi-component pipeline; it is single-component"

@@ -26,7 +26,7 @@
 //! cargo test -p onnx-genai-engine --features cuda,native-backend \
 //!   --test gemma3n_native_cuda_capture_realmodel -- --ignored --nocapture
 //! ```
-#![cfg(all(feature = "cuda", feature = "native-backend"))]
+#![cfg(feature = "native-cuda")]
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -34,7 +34,7 @@ use std::sync::atomic::Ordering;
 use onnx_genai_engine::pipeline::PipelineGenerateRequest;
 use onnx_genai_engine::{
     Engine, EngineConfig, GenerateOptions, GeneratePrompt, GenerateRequest,
-    NATIVE_DECODER_CAPTURED_STEP_INPUT_DECODES, PipelineEngine,
+    NATIVE_DECODER_CAPTURED_STEP_INPUT_DECODES,
 };
 use onnx_genai_ort::{DataType, Value};
 
@@ -90,8 +90,8 @@ fn dummy_vision() -> anyhow::Result<(Value, Value)> {
     Ok((pixel_values, pixel_position_ids))
 }
 
-fn build_engine(dir: &Path) -> anyhow::Result<PipelineEngine> {
-    Engine::from_pipeline_dir(
+fn build_engine(dir: &Path) -> anyhow::Result<Engine> {
+    Engine::from_dir(
         dir,
         EngineConfig {
             pipeline_cache_bytes: 0,
@@ -100,7 +100,7 @@ fn build_engine(dir: &Path) -> anyhow::Result<PipelineEngine> {
     )
 }
 
-fn decode(engine: &mut PipelineEngine) -> anyhow::Result<Vec<u32>> {
+fn decode(engine: &mut Engine) -> anyhow::Result<Vec<u32>> {
     let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(PROMPT.to_vec()));
     request.options = GenerateOptions {
         max_new_tokens: MAX_NEW_TOKENS,

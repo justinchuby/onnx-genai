@@ -61,7 +61,10 @@ pub(crate) async fn status(State(state): State<AppState>) -> Result<Json<NodeSta
         active_sessions: u32::try_from(snapshot.active_sessions).unwrap_or(u32::MAX),
         paused_sessions: 0, // not yet tracked (no preemption/pause state exposed)
         tokens_per_second: 0.0, // not yet tracked (only cumulative token totals recorded)
-        batch_utilization: 0.0, // not yet tracked (max batch size not surfaced to the server)
+        // Real when a batched forward has run: mean co-decoded rows over the
+        // physical batch. Stays 0.0 on a backend that never batches, which is
+        // the honest answer rather than a placeholder.
+        batch_utilization: snapshot.batch_utilization().unwrap_or(0.0) as f32,
         // Per-session detail: session ids are real (redacted, since full ids are
         // bearer tokens — see session.rs). priority/kv_pages/state are not yet
         // tracked, so they carry documented placeholders rather than invented values.
@@ -90,9 +93,12 @@ pub(crate) async fn debug_config(
         .resolve("")
         .map_err(map_registry_error)?
         .ok_or_else(|| ApiError::internal("no model loaded"))?;
+    let facts = handle.engine.workflow_facts();
     Ok(Json(DebugConfigResponse {
         model_id: handle.id.clone(),
-        pipeline: handle.pipeline,
+        workflow_components: facts.components,
+        workflow_graph_components: facts.graph_components,
+        workflow_declares_generation_loop: facts.declares_generation_loop,
         max_output_tokens: state.config.max_output_tokens,
         max_sessions: state.config.max_sessions,
         max_queue_depth: state.config.max_queue_depth,
@@ -405,16 +411,24 @@ pub(crate) async fn admin_unload_model(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<StatusCode, ApiError> {
-    state.registry.unload(&id).map_err(|err| {
-        if err
-            .downcast_ref::<crate::registry::RegistryError>()
-            .is_some()
-        {
-            map_registry_error(crate::registry::RegistryError)
-        } else {
-            ApiError::not_found(format!("model '{id}' is not loaded"))
-        }
-    })?;
+    // Unloading waits for the model's engine worker to stop, which can take as
+    // long as the generation it is running, so it runs on a blocking thread
+    // instead of stalling the executor that has to keep serving everyone else.
+    let registry = state.registry.clone();
+    let unload_id = id.clone();
+    tokio::task::spawn_blocking(move || registry.unload(&unload_id))
+        .await
+        .map_err(|err| ApiError::internal(format!("model unload task panicked: {err}")))?
+        .map_err(|err| {
+            if err
+                .downcast_ref::<crate::registry::RegistryError>()
+                .is_some()
+            {
+                map_registry_error(crate::registry::RegistryError)
+            } else {
+                ApiError::not_found(format!("model '{id}' is not loaded"))
+            }
+        })?;
     Ok(StatusCode::NO_CONTENT)
 }
 

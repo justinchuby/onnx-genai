@@ -1,0 +1,84 @@
+ir_version: 11
+graph {
+  node {
+    input: "active"
+    output: "active_i32"
+    op_type: "Cast"
+    attribute {
+      name: "to"
+      i: 6
+      type: INT
+    }
+  }
+  node {
+    input: "active_i32"
+    input: "zero_1d"
+    output: "any_i32"
+    op_type: "ReduceMax"
+    attribute {
+      name: "keepdims"
+      i: 1
+      type: INT
+    }
+  }
+  node {
+    input: "any_i32"
+    output: "continue"
+    op_type: "Cast"
+    attribute {
+      name: "to"
+      i: 9
+      type: INT
+    }
+  }
+  name: "static_cache_loop_continue"
+  initializer {
+    dims: 1
+    data_type: 7
+    name: "zero_1d"
+    raw_data: "\000\000\000\000\000\000\000\000"
+  }
+  input {
+    name: "active"
+    type {
+      tensor_type {
+        elem_type: 9
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "continue"
+    type {
+      tensor_type {
+        elem_type: 9
+        shape {
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "zero_1d"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+}
+opset_import {
+  domain: ""
+  version: 24
+}

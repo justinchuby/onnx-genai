@@ -37,22 +37,29 @@ const CUDA_MEMCPY_DEVICE_TO_HOST: i32 = 2;
 const CUDA_MEMCPY_DEVICE_TO_DEVICE: i32 = 3;
 
 type CudaMemcpyFn = unsafe extern "C" fn(*mut c_void, *const c_void, usize, i32) -> i32;
+type CudaMemcpyAsyncFn =
+    unsafe extern "C" fn(*mut c_void, *const c_void, usize, i32, *mut c_void) -> i32;
 type CudaMemsetFn = unsafe extern "C" fn(*mut c_void, i32, usize) -> i32;
 type CudaDeviceSynchronizeFn = unsafe extern "C" fn() -> i32;
 type CudaSetDeviceFn = unsafe extern "C" fn(i32) -> i32;
 type CudaGetDeviceFn = unsafe extern "C" fn(*mut i32) -> i32;
 type CudaMemGetInfoFn = unsafe extern "C" fn(*mut usize, *mut usize) -> i32;
+type CudaMallocFn = unsafe extern "C" fn(*mut *mut c_void, usize) -> i32;
+type CudaFreeFn = unsafe extern "C" fn(*mut c_void) -> i32;
 
 struct CudaRt {
     // Kept alive so the resolved function pointers remain valid; never called
     // directly after construction.
     _lib: Library,
     memcpy: CudaMemcpyFn,
+    memcpy_async: CudaMemcpyAsyncFn,
     memset: CudaMemsetFn,
     device_synchronize: CudaDeviceSynchronizeFn,
     set_device: CudaSetDeviceFn,
     get_device: CudaGetDeviceFn,
     mem_get_info: CudaMemGetInfoFn,
+    malloc: CudaMallocFn,
+    free: CudaFreeFn,
 }
 
 // SAFETY: the resolved `cudart` entry points are plain C functions that are
@@ -83,49 +90,64 @@ fn load() -> std::result::Result<CudaRt, String> {
         };
         // SAFETY: the symbol signatures match the documented `cudart` ABI.
         let memcpy = unsafe { lib.get::<CudaMemcpyFn>(b"cudaMemcpy\0") };
+        let memcpy_async = unsafe { lib.get::<CudaMemcpyAsyncFn>(b"cudaMemcpyAsync\0") };
         let memset = unsafe { lib.get::<CudaMemsetFn>(b"cudaMemset\0") };
         let device_synchronize =
             unsafe { lib.get::<CudaDeviceSynchronizeFn>(b"cudaDeviceSynchronize\0") };
         let set_device = unsafe { lib.get::<CudaSetDeviceFn>(b"cudaSetDevice\0") };
         let get_device = unsafe { lib.get::<CudaGetDeviceFn>(b"cudaGetDevice\0") };
         let mem_get_info = unsafe { lib.get::<CudaMemGetInfoFn>(b"cudaMemGetInfo\0") };
+        let malloc = unsafe { lib.get::<CudaMallocFn>(b"cudaMalloc\0") };
+        let free = unsafe { lib.get::<CudaFreeFn>(b"cudaFree\0") };
         match (
             memcpy,
+            memcpy_async,
             memset,
             device_synchronize,
             set_device,
             get_device,
             mem_get_info,
+            malloc,
+            free,
         ) {
             (
                 Ok(memcpy),
+                Ok(memcpy_async),
                 Ok(memset),
                 Ok(device_synchronize),
                 Ok(set_device),
                 Ok(get_device),
                 Ok(mem_get_info),
+                Ok(malloc),
+                Ok(free),
             ) => {
                 // Copy the function pointers out before `lib` is moved into the
                 // struct; the borrows on `lib` end here.
                 let memcpy = *memcpy;
+                let memcpy_async = *memcpy_async;
                 let memset = *memset;
                 let device_synchronize = *device_synchronize;
                 let set_device = *set_device;
                 let get_device = *get_device;
                 let mem_get_info = *mem_get_info;
+                let malloc = *malloc;
+                let free = *free;
                 return Ok(CudaRt {
                     _lib: lib,
                     memcpy,
+                    memcpy_async,
                     memset,
                     device_synchronize,
                     set_device,
                     get_device,
                     mem_get_info,
+                    malloc,
+                    free,
                 });
             }
             _ => {
                 last_err = format!(
-                    "{name}: missing cudaMemcpy/cudaMemset/cudaDeviceSynchronize/cudaSetDevice/cudaGetDevice/cudaMemGetInfo symbol"
+                    "{name}: missing cudaMemcpy/cudaMemcpyAsync/cudaMemset/cudaDeviceSynchronize/cudaSetDevice/cudaGetDevice/cudaMemGetInfo/cudaMalloc/cudaFree symbol"
                 );
             }
         }
@@ -252,6 +274,114 @@ impl Drop for DeviceGuard {
     }
 }
 
+/// A device allocation this process owns, freed when the guard drops.
+///
+/// Every field is a plain integer, so `Send + Sync` come from the compiler
+/// rather than from an assertion — which is what
+/// [`crate::Value::from_external_memory_with_owner`]'s `Box<dyn Any + Send +
+/// Sync>` requires, and what a hand-written `unsafe impl` would only serve to
+/// keep true by fiat if a field ever became a raw pointer.
+///
+/// The address is a plain `usize` so it can be handed to
+/// [`crate::Value::from_external_memory_with_owner`] as a raw pointer while the
+/// guard travels with the value that borrows it: the allocation outlives every
+/// view derived from it, which is the property a device-resident slice depends
+/// on. Dropping the guard is the *only* way the memory is released, so there is
+/// no path where a live tensor points at freed device memory.
+#[derive(Debug)]
+pub struct CudaAllocation {
+    device_ptr: usize,
+    bytes: usize,
+    device_id: i32,
+}
+
+/// Device allocations this process holds through [`CudaAllocation`].
+///
+/// An owning wrapper's whole job is that the memory goes back, and "it went
+/// back" is not something a throughput number or a device-wide free-memory
+/// reading can attribute: another process on the same GPU moves that number
+/// under you. A process-local live count can be asserted exactly.
+static LIVE_ALLOCATIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// How many [`CudaAllocation`]s this process currently holds.
+pub fn live_allocations() -> usize {
+    LIVE_ALLOCATIONS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+impl CudaAllocation {
+    /// Allocate `bytes` of device memory on `device_id`.
+    ///
+    /// A zero-byte request is rejected rather than served with a null pointer:
+    /// every caller here is building a tensor, and a tensor with no allocation
+    /// has no address to publish.
+    pub fn new(device_id: i32, bytes: usize) -> Result<Self> {
+        if bytes == 0 {
+            return Err(OrtError::InvalidArgument(
+                "cannot allocate a zero-byte CUDA buffer; a tensor with no elements has no device \
+                 address to publish"
+                    .to_string(),
+            ));
+        }
+        let _guard = DeviceGuard::set(device_id)?;
+        let rt = runtime()?;
+        let mut device_ptr: *mut c_void = std::ptr::null_mut();
+        // SAFETY: `device_ptr` is a valid out-parameter and `cudaMalloc` matches
+        // the `cudart` ABI; it allocates on the device `DeviceGuard` made
+        // current.
+        let code = unsafe { (rt.malloc)(&mut device_ptr, bytes) };
+        if code != 0 {
+            return Err(OrtError::InvalidArgument(format!(
+                "cudaMalloc({bytes} bytes) on CUDA device {device_id} failed with CUDA error code \
+                 {code}; the device may be out of memory"
+            )));
+        }
+        if device_ptr.is_null() {
+            return Err(OrtError::InvalidArgument(format!(
+                "cudaMalloc({bytes} bytes) on CUDA device {device_id} reported success but \
+                 returned a null device pointer"
+            )));
+        }
+        LIVE_ALLOCATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(Self {
+            device_ptr: device_ptr as usize,
+            bytes,
+            device_id,
+        })
+    }
+
+    /// The device address of the allocation.
+    pub fn device_ptr(&self) -> usize {
+        self.device_ptr
+    }
+
+    /// How many bytes the allocation holds.
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// The CUDA device the allocation lives on.
+    pub fn device_id(&self) -> i32 {
+        self.device_id
+    }
+}
+
+impl Drop for CudaAllocation {
+    fn drop(&mut self) {
+        LIVE_ALLOCATIONS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        // Freeing on the wrong current device is a CUDA error, so pin first; a
+        // failure here is best-effort (the process is already unwinding or
+        // shutting down) and would have nowhere to be reported.
+        let Ok(_guard) = DeviceGuard::set(self.device_id) else {
+            return;
+        };
+        if let Ok(rt) = runtime() {
+            // SAFETY: `device_ptr` came from `cudaMalloc` on this device and has
+            // not been freed; `cudaFree` matches the `cudart` ABI.
+            let _ = unsafe { (rt.free)(self.device_ptr as *mut c_void) };
+        }
+    }
+}
+
 /// Zero `bytes` of device memory at device address `dst`.
 ///
 /// Used to define the tail of a freshly allocated (uninitialized) KV bucket so
@@ -369,6 +499,34 @@ pub fn memcpy_device_to_device(dst: usize, src: usize, bytes: usize) -> Result<(
     if code != 0 {
         return Err(OrtError::InvalidArgument(format!(
             "cudaMemcpy (device-to-device) failed with CUDA error code {code}"
+        )));
+    }
+    Ok(())
+}
+
+/// Enqueue a device-to-device copy on CUDA's default stream.
+///
+/// Callers must synchronize once after enqueueing their complete copy batch
+/// and before another session consumes the destination buffers.
+pub fn memcpy_device_to_device_async(dst: usize, src: usize, bytes: usize) -> Result<()> {
+    if bytes == 0 {
+        return Ok(());
+    }
+    let rt = runtime()?;
+    // SAFETY: `src` and `dst` cover `bytes`; a null stream selects CUDA's
+    // default stream; the function pointer matches the documented cudart ABI.
+    let code = unsafe {
+        (rt.memcpy_async)(
+            dst as *mut c_void,
+            src as *const c_void,
+            bytes,
+            CUDA_MEMCPY_DEVICE_TO_DEVICE,
+            std::ptr::null_mut(),
+        )
+    };
+    if code != 0 {
+        return Err(OrtError::InvalidArgument(format!(
+            "cudaMemcpyAsync (device-to-device) failed with CUDA error code {code}"
         )));
     }
     Ok(())

@@ -3,24 +3,28 @@
 //! [`CudaExecutionProvider`] and shared (via `Arc`) into every kernel the
 //! provider hands out, so the whole EP drives a single device + stream.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::{CStr, CString, c_void};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 
 use cudarc::driver::sys::{CUdevice_attribute, CUdeviceptr, CUfunction_attribute_enum};
 use cudarc::driver::{CudaContext, CudaEvent, CudaFunction, CudaModule, CudaStream, LaunchConfig};
 
+use onnx_runtime_ep_api::DeviceGraphSlot;
 use onnx_runtime_ep_api::EpError;
 use onnx_runtime_ep_api::Kernel;
-use onnx_runtime_ep_api::Result;
+use onnx_runtime_ep_api::{RawDeviceAllocationSiteStats, Result};
 
 use crate::blas::CublasLt;
 use crate::cudnn::CudnnBackend;
 use crate::dynamic_library::{CudaLibrary, require, wheel_cuda_include_paths};
 use crate::error::{driver_err, nvrtc_err};
 use crate::graph::CudaGraphLifecycle;
+use crate::kernel_cache;
+use onnx_runtime_cuda_memory::capture_gate;
 
 /// Counts explicit device allocation/free calls made through a runtime.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -39,6 +43,57 @@ pub struct CudaTransferCounts {
     pub async_host_to_device: u64,
 }
 
+/// Whether a failed measured H2D operation can still be using its source and
+/// destination.
+#[derive(Debug)]
+pub enum FailedHtodCompletion {
+    /// No copy was successfully submitted.
+    NotSubmitted,
+    /// A fallback copy-stream synchronization proved the submitted copy ended.
+    Completed(CopyCompleted),
+    /// A copy was submitted and the fallback synchronization also failed.
+    MayBeInFlight,
+}
+
+/// Failure from [`CudaRuntime::htod_async_elapsed_ms`] with ordering evidence.
+#[derive(Debug)]
+pub struct HtodAsyncElapsedError {
+    detail: String,
+    completion: FailedHtodCompletion,
+}
+
+impl HtodAsyncElapsedError {
+    pub fn into_parts(self) -> (String, FailedHtodCompletion) {
+        (self.detail, self.completion)
+    }
+}
+
+impl std::fmt::Display for HtodAsyncElapsedError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.detail)
+    }
+}
+
+impl std::error::Error for HtodAsyncElapsedError {}
+
+fn classify_submitted_htod_failure(
+    error: String,
+    synchronization: std::result::Result<(), String>,
+) -> HtodAsyncElapsedError {
+    match synchronization {
+        Ok(()) => HtodAsyncElapsedError {
+            detail: format!("{error}; copy-stream completion was established before rollback"),
+            completion: FailedHtodCompletion::Completed(CopyCompleted::new()),
+        },
+        Err(sync_error) => HtodAsyncElapsedError {
+            detail: format!(
+                "{error}; cuStreamSynchronize(copy) could not establish completion: {sync_error}"
+            ),
+            completion: FailedHtodCompletion::MayBeInFlight,
+        },
+    }
+}
+
 fn nvrtc_include_paths() -> Vec<String> {
     let mut candidates = Vec::<PathBuf>::new();
     for variable in ["CUDA_HOME", "CUDA_PATH"] {
@@ -51,10 +106,17 @@ fn nvrtc_include_paths() -> Vec<String> {
 
     if let Some(paths) = std::env::var_os("LD_LIBRARY_PATH") {
         for path in std::env::split_paths(&paths) {
-            if path.ends_with(Path::new("nvidia/cuda_nvrtc/lib"))
-                && let Some(nvidia) = path.parent().and_then(Path::parent)
-            {
-                candidates.push(nvidia.join("cuda_runtime/include"));
+            // Recover the wheel root through the shared helper rather than
+            // matching one layout's spelling: this previously only recognised
+            // `nvidia/cuda_nvrtc/lib`, so a consolidated wheel's loader path
+            // never yielded its sibling headers.
+            if let Some(root) = onnx_genai_cuda_version_guard::wheel_root_of(&path) {
+                candidates.extend(
+                    onnx_genai_cuda_version_guard::WHEEL_CUDA_MAJORS
+                        .iter()
+                        .map(|major| root.join("nvidia").join(major).join("include")),
+                );
+                candidates.push(root.join("nvidia/cuda_runtime/include"));
             }
         }
     }
@@ -195,6 +257,36 @@ impl CudaDeviceCapabilities {
     }
 }
 
+/// The process-wide CUDA context for `ordinal`, created at most once.
+///
+/// `CudaContext::new` retains the device's **primary** context, so every
+/// `CudaRuntime` on a device already shares one `CUcontext` — caching the
+/// `Arc` changes no semantics. What it removes is the retain/release churn:
+/// when the last `Arc` for a device dropped, cudarc released the primary
+/// context, and a primary-context teardown synchronizes the device. That
+/// invalidates any CUDA graph capture in progress on another thread, which is
+/// how a test doing nothing but constructing and dropping a runtime could break
+/// an unrelated test's capture. Holding one reference for the life of the
+/// process keeps the refcount off zero and takes the teardown off the table.
+///
+/// The entries are intentionally never evicted. A released primary context is
+/// exactly the hazard being avoided, and a handful of per-device contexts is
+/// bounded by the machine's device count.
+fn shared_context(ordinal: u32) -> Result<Arc<CudaContext>> {
+    static CONTEXTS: OnceLock<Mutex<HashMap<u32, Arc<CudaContext>>>> = OnceLock::new();
+    let contexts = CONTEXTS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut contexts = contexts.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(context) = contexts.get(&ordinal) {
+        return Ok(Arc::clone(context));
+    }
+    // Creating a context synchronizes the device; see `CudaRuntime::alloc_raw`.
+    let _section = capture_gate::synchronizing_section();
+    let context =
+        CudaContext::new(ordinal as usize).map_err(|e| driver_err("CudaContext::new", e))?;
+    contexts.insert(ordinal, Arc::clone(&context));
+    Ok(context)
+}
+
 fn positive_attribute(context: &CudaContext, attribute: CUdevice_attribute) -> Option<u32> {
     context
         .attribute(attribute)
@@ -248,6 +340,125 @@ fn dynamic_shared_memory_optin(
 }
 
 /// Device context, stream, and vendor-library backends shared across the EP.
+/// Environment override for the `alloc_raw` pool bound, in bytes.
+///
+/// `0` disables pooling, restoring one `cuMemAlloc`/`cuMemFree` pair per
+/// request — which is what to set when bisecting a suspected reuse bug.
+pub const CUDA_RAW_POOL_BYTES_ENV: &str = "ONNX_GENAI_CUDA_RAW_POOL_BYTES";
+
+/// Enable source-attributed profiling for [`CudaRuntime::alloc_raw`].
+///
+/// The disabled path performs no map lookup or locking. This is intentionally
+/// opt-in because pool hits may occur on kernel dispatch paths.
+pub const CUDA_RAW_ALLOCATION_PROFILE_ENV: &str = "ONNX_GENAI_PROFILE_CUDA_RAW_ALLOCATIONS";
+
+/// Default bound on device bytes held in the `alloc_raw` pool.
+///
+/// Sized for the transient scratch one prefill chunk holds rather than for the
+/// model, so pooling never competes with weights for a meaningful share of the
+/// device.
+const DEFAULT_RAW_POOL_BYTES: u64 = 2 << 30;
+
+fn raw_pool_limit_bytes() -> u64 {
+    std::env::var(CUDA_RAW_POOL_BYTES_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_RAW_POOL_BYTES)
+}
+
+fn raw_allocation_profile_enabled() -> bool {
+    std::env::var_os(CUDA_RAW_ALLOCATION_PROFILE_ENV).is_some_and(|value| {
+        matches!(
+            value.to_string_lossy().trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct RawAllocationSite {
+    file: &'static str,
+    line: u32,
+}
+
+#[derive(Debug, Default)]
+struct RawAllocationProfile {
+    enabled: bool,
+    sites: Mutex<BTreeMap<RawAllocationSite, RawDeviceAllocationSiteStats>>,
+}
+
+impl RawAllocationProfile {
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            sites: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    fn record(
+        &self,
+        location: &'static std::panic::Location<'static>,
+        requested: usize,
+        class: usize,
+        pool_hit: bool,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        let key = RawAllocationSite {
+            file: location.file(),
+            line: location.line(),
+        };
+        let mut sites = self
+            .sites
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let site = sites
+            .entry(key)
+            .or_insert_with(|| RawDeviceAllocationSiteStats {
+                file: key.file,
+                line: key.line,
+                ..RawDeviceAllocationSiteStats::default()
+            });
+        site.requests = site.requests.saturating_add(1);
+        site.requested_bytes = site.requested_bytes.saturating_add(requested as u64);
+        if pool_hit {
+            site.pool_hits = site.pool_hits.saturating_add(1);
+            site.pool_hit_bytes = site.pool_hit_bytes.saturating_add(class as u64);
+        } else {
+            site.driver_allocations = site.driver_allocations.saturating_add(1);
+            site.driver_bytes = site.driver_bytes.saturating_add(class as u64);
+        }
+    }
+
+    fn snapshot(&self) -> Vec<RawDeviceAllocationSiteStats> {
+        self.sites
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .cloned()
+            .collect()
+    }
+}
+
+/// Round a raw allocation to the size class the pool keys on.
+///
+/// Rounding up is what lets a recycled block satisfy a slightly different
+/// request without ever being too small, and keeps the number of distinct
+/// classes bounded when shapes vary a little between chunks.
+fn raw_pool_size_class(bytes: usize) -> usize {
+    const SMALL: usize = 1 << 20;
+    if bytes <= SMALL {
+        bytes.next_power_of_two().max(512)
+    } else {
+        bytes.div_ceil(SMALL) * SMALL
+    }
+}
+
+/// Source of [`CudaRuntime::runtime_id`]. Monotonic and never reset, so an id
+/// is never handed to a second runtime.
+static NEXT_RUNTIME_ID: AtomicU64 = AtomicU64::new(1);
+
 pub struct CudaRuntime {
     context: Arc<CudaContext>,
     stream: Arc<CudaStream>,
@@ -259,6 +470,7 @@ pub struct CudaRuntime {
     /// default-stream barrier.
     copy_stream: Arc<CudaStream>,
     graph: CudaGraphLifecycle,
+    verify_graph: CudaGraphLifecycle,
     blas: CublasLt,
     cudnn: CudnnBackend,
     ordinal: u32,
@@ -275,6 +487,51 @@ pub struct CudaRuntime {
     nvrtc_cubin_fallback: AtomicBool,
     allocations: AtomicU64,
     frees: AtomicU64,
+    /// Blocks freed through `free_raw` and held for reuse, keyed by size class.
+    ///
+    /// `free_raw` is told only a pointer, so the class each live block was
+    /// carved from is recorded in `raw_pool_classes` at allocation time. Device
+    /// addresses rather than pointers, so this stays `Send`/`Sync`; nothing
+    /// here is dereferenced on the host.
+    raw_pool: Mutex<HashMap<usize, Vec<CUdeviceptr>>>,
+    raw_pool_classes: Mutex<HashMap<CUdeviceptr, usize>>,
+    raw_pool_retained: AtomicU64,
+    raw_pool_hits: AtomicU64,
+    /// Identity for this runtime, unique in this process and never reused.
+    ///
+    /// Not the ordinal: several runtimes may share a device, and the point of
+    /// the id is to tell them apart. Not an address either -- a dropped
+    /// runtime's address can be handed to the next one, which is the very reuse
+    /// this guards against. See [`crate::interleave_cache`].
+    runtime_id: u64,
+    /// Interleaved copies of int4 packed weights, keyed by the source weight's
+    /// device address.
+    ///
+    /// A field rather than a process global because the key *is* an address
+    /// this runtime's allocator minted: once the runtime goes away the address
+    /// means nothing, and serving a later session's weight from an entry keyed
+    /// on it is the #1726 defect. See [`crate::interleave_cache`].
+    interleave: crate::interleave_cache::InterleaveCache,
+    /// Whether device weight offload is on, meaning weight buffers may be paged.
+    ///
+    /// Set once by the provider when it configures residency. A paged weight's
+    /// pages are retired by `weight_paging` without passing through
+    /// `deallocate`, so `interleave` is never told the address died and cannot
+    /// safely key on one. It refuses to cache at all when this is set; see
+    /// [`crate::interleave_cache::InterleaveDevice::interleave_frees_are_observed`].
+    weights_may_be_paged: std::sync::atomic::AtomicBool,
+    /// The one cuBLASLt workspace shared by every GEMM on this runtime's
+    /// compute stream. Allocated on first use and never freed until the
+    /// runtime drops.
+    ///
+    /// cuBLASLt scratch does not carry state between calls, and work on a
+    /// single stream is serial, so one buffer per stream is exactly as correct
+    /// as one per call — while a per-call allocation costs
+    /// [`WORKSPACE_BYTES`] for every attention op in flight. Measured on a
+    /// 32-layer 1.8B model, the per-call path put hundreds of MiB of raw
+    /// device memory behind a prefill that needed 32 MiB.
+    shared_blas_workspace: Mutex<Option<CUdeviceptr>>,
+    raw_allocation_profile: RawAllocationProfile,
     host_to_device_copies: AtomicU64,
     device_to_host_copies: AtomicU64,
     async_host_to_device_copies: AtomicU64,
@@ -285,13 +542,13 @@ pub struct CudaRuntime {
     /// dependency. See [`CudaRuntime::record_copy_fence`].
     fences: Mutex<HashMap<u64, CudaEvent>>,
     next_fence_id: AtomicU64,
-    /// Persistent four-byte device word into which capture-safe kernels latch an
-    /// out-of-range bounds violation detected during CUDA-graph replay. It is set
-    /// (via `atomicOr`) by device kernels and never auto-cleared on the device;
-    /// only an explicit host [`CudaRuntime::reset_capture_error`] (invoked on
-    /// graph reset / re-capture) returns it to zero. The host reads it at the
-    /// existing per-step logits sync so a poisoned replay becomes a hard error
-    /// before the produced token is consumed.
+    /// Persistent four-byte device word into which kernels latch an out-of-range
+    /// bounds violation during deferred eager execution or CUDA-graph replay. It
+    /// is set (via `atomicOr`) and never auto-cleared on the device;
+    /// only an explicit host [`CudaRuntime::reset_capture_error`] returns it to
+    /// zero. Session request boundaries and graph reset/re-capture use that reset.
+    /// The host reads it after a request synchronization so eager or captured
+    /// validation failures become hard errors before outputs are consumed.
     capture_error: CUdeviceptr,
     /// When set, the public [`CudaRuntime::synchronize`] becomes a no-op so the
     /// redundant trailing per-op eager device syncs (issued by kernels on the
@@ -301,6 +558,15 @@ pub struct CudaRuntime {
     /// default (eager decode is made consistent with the captured path, which
     /// already elides these); disable via `ONNX_GENAI_DEFER_EAGER_SYNC=0`.
     defer_eager_sync: AtomicBool,
+    /// Capture-gate section covering this runtime's teardown, acquired in
+    /// [`Drop::drop`] rather than at construction.
+    ///
+    /// **This field must stay last.** Fields drop in declaration order *after*
+    /// the `drop` body returns, so a guard bound as a local inside that body is
+    /// released too early -- before the modules and streams whose destruction is
+    /// the hazard. Declared last, it is released last, and every earlier field's
+    /// teardown happens while it is still held.
+    teardown_section: Option<capture_gate::SynchronizingSection>,
 }
 
 impl std::fmt::Debug for CudaRuntime {
@@ -358,8 +624,7 @@ impl CudaRuntime {
         // `nvidia/cuda_runtime/include`. That is a *header* dependency, checked
         // where those kernels are built, not a reason to demand the DLL here.
         let _ = require(CudaLibrary::Runtime);
-        let context =
-            CudaContext::new(ordinal as usize).map_err(|e| driver_err("CudaContext::new", e))?;
+        let context = shared_context(ordinal)?;
         let major = context
             .attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
             .map_err(|e| driver_err("querying CUDA compute capability major", e))?;
@@ -426,11 +691,17 @@ impl CudaRuntime {
         let blas = CublasLt::new()?;
         let cudnn = CudnnBackend::new(stream.clone());
         let graph = CudaGraphLifecycle::new(stream.clone());
+        // Second captured-graph slot for the MTP fixed-width verify forward,
+        // held independently of `graph` (the M=1 decode step) on the same
+        // compute stream so both shapes can be replayed by shape key without
+        // per-step recapture (see `DeviceGraphSlot`).
+        let verify_graph = CudaGraphLifecycle::new(stream.clone());
         Self {
             context,
             stream,
             copy_stream,
             graph,
+            verify_graph,
             blas,
             cudnn,
             ordinal,
@@ -441,6 +712,15 @@ impl CudaRuntime {
             nvrtc_cubin_fallback: AtomicBool::new(false),
             allocations: AtomicU64::new(0),
             frees: AtomicU64::new(0),
+            raw_pool: Mutex::new(HashMap::new()),
+            raw_pool_classes: Mutex::new(HashMap::new()),
+            raw_pool_retained: AtomicU64::new(0),
+            raw_pool_hits: AtomicU64::new(0),
+            runtime_id: NEXT_RUNTIME_ID.fetch_add(1, Ordering::Relaxed),
+            interleave: crate::interleave_cache::InterleaveCache::default(),
+            weights_may_be_paged: std::sync::atomic::AtomicBool::new(false),
+            shared_blas_workspace: Mutex::new(None),
+            raw_allocation_profile: RawAllocationProfile::new(raw_allocation_profile_enabled()),
             host_to_device_copies: AtomicU64::new(0),
             device_to_host_copies: AtomicU64::new(0),
             async_host_to_device_copies: AtomicU64::new(0),
@@ -455,10 +735,9 @@ impl CudaRuntime {
                     .as_deref()
                     .map(str::trim)
                     .map(str::to_ascii_lowercase)
-                    .map_or(true, |v| {
-                        !matches!(v.as_str(), "0" | "false" | "off" | "no")
-                    }),
+                    .is_none_or(|v| !matches!(v.as_str(), "0" | "false" | "off" | "no")),
             ),
+            teardown_section: None,
         }
         .with_capture_error_word()
     }
@@ -581,10 +860,9 @@ impl CudaRuntime {
     /// Read the latching capture-error word device → host, returning the raw
     /// violation bitmask (zero when no capture-safe kernel has tripped).
     ///
-    /// This does not clear the latch: once set, every subsequent captured replay
-    /// stays poisoned until [`CudaRuntime::reset_capture_error`]. Callers invoke
-    /// this at the per-step logits D2H sync, so the trailing stream synchronize
-    /// is already satisfied and no additional serialization is introduced.
+    /// This does not clear the latch: once set, subsequent work stays poisoned
+    /// until [`CudaRuntime::reset_capture_error`]. Callers invoke this only after
+    /// a request-level host synchronization boundary.
     pub fn check_capture_error(&self) -> Result<u32> {
         let mut bytes = [0_u8; std::mem::size_of::<u32>()];
         // SAFETY: `capture_error` is a live four-byte device allocation owned by
@@ -594,7 +872,7 @@ impl CudaRuntime {
     }
 
     /// Clear the latching capture-error word back to the un-poisoned state.
-    /// Invoked on graph reset / re-capture so a fresh generation starts clean.
+    /// Invoked at session request boundaries and on graph reset / re-capture.
     pub fn reset_capture_error(&self) -> Result<()> {
         // SAFETY: `capture_error` is a live four-byte device allocation owned by
         // this runtime for its whole lifetime.
@@ -606,12 +884,73 @@ impl CudaRuntime {
         self.graph.capture_status()
     }
 
+    /// The [`CudaGraphLifecycle`] backing a given [`DeviceGraphSlot`]. Both slots
+    /// share this runtime's single compute stream; only one may be *capturing* at
+    /// a time (enforced per-lifecycle), but each may independently hold an
+    /// instantiated executable ready to replay.
+    fn graph_slot(&self, slot: DeviceGraphSlot) -> &CudaGraphLifecycle {
+        match slot {
+            DeviceGraphSlot::Primary => &self.graph,
+            DeviceGraphSlot::Verify => &self.verify_graph,
+        }
+    }
+
+    /// Slot-aware [`begin_graph_capture`](Self::begin_graph_capture).
+    pub fn begin_graph_capture_in(
+        &self,
+        slot: DeviceGraphSlot,
+        kernels: &[&dyn Kernel],
+    ) -> Result<()> {
+        crate::capture::require_subgraph_graph_capturable(kernels)?;
+        self.graph_slot(slot).begin()
+    }
+
+    /// Slot-aware [`end_graph_capture`](Self::end_graph_capture).
+    pub fn end_graph_capture_in(&self, slot: DeviceGraphSlot) -> Result<()> {
+        self.graph_slot(slot).end()
+    }
+
+    /// Slot-aware [`abort_graph_capture`](Self::abort_graph_capture).
+    pub fn abort_graph_capture_in(&self, slot: DeviceGraphSlot) -> Result<()> {
+        self.graph_slot(slot).abort()
+    }
+
+    /// Slot-aware [`replay_graph`](Self::replay_graph).
+    pub fn replay_graph_in(&self, slot: DeviceGraphSlot) -> Result<()> {
+        self.graph_slot(slot).replay()
+    }
+
+    /// Slot-aware [`replay_graph_segment`](Self::replay_graph_segment).
+    pub fn replay_graph_segment_in(&self, slot: DeviceGraphSlot, index: usize) -> Result<()> {
+        self.graph_slot(slot).replay_segment(index)
+    }
+
+    /// Slot-aware [`graph_segment_count`](Self::graph_segment_count).
+    pub fn graph_segment_count_in(&self, slot: DeviceGraphSlot) -> Result<usize> {
+        self.graph_slot(slot).segment_count()
+    }
+
+    /// Slot-aware [`reset_graph`](Self::reset_graph).
+    pub fn reset_graph_in(&self, slot: DeviceGraphSlot) -> Result<bool> {
+        self.graph_slot(slot).reset()
+    }
+
+    /// Slot-aware [`has_graph_executable`](Self::has_graph_executable).
+    pub fn has_graph_executable_in(&self, slot: DeviceGraphSlot) -> Result<bool> {
+        self.graph_slot(slot).has_executable()
+    }
+
     /// Snapshot explicit device allocation/free calls made through this runtime.
     pub fn allocation_counts(&self) -> CudaAllocationCounts {
         CudaAllocationCounts {
             allocations: self.allocations.load(Ordering::Relaxed),
             frees: self.frees.load(Ordering::Relaxed),
         }
+    }
+
+    /// Snapshot source-attributed [`Self::alloc_raw`] activity.
+    pub fn raw_allocation_site_stats(&self) -> Vec<RawDeviceAllocationSiteStats> {
+        self.raw_allocation_profile.snapshot()
     }
 
     /// Snapshot explicit host/device transfer calls made through this runtime.
@@ -771,6 +1110,12 @@ impl CudaRuntime {
     /// compilation is retried for the matching real SM architecture and the
     /// resulting CUBIN is loaded instead. An NVRTC failure surfaces the compiler
     /// log via [`nvrtc_err`] (RULES.md #1).
+    ///
+    /// Compiler output is also persisted by [`crate::kernel_cache`], so only the
+    /// first process to see a given kernel pays NVRTC for it. That matters most
+    /// for decode-only kernels: they are first launched inside the first decode
+    /// step, where the compile lands as a single multi-hundred-millisecond
+    /// inter-token stall.
     pub fn nvrtc_function(
         &self,
         module_key: &'static str,
@@ -789,17 +1134,17 @@ impl CudaRuntime {
                 m.clone()
             } else {
                 let include_paths = nvrtc_include_paths();
+                // Loading a module into the context synchronizes the device,
+                // invalidating a CUDA graph capture in progress on another
+                // thread. Held across the whole compile-and-load block: the
+                // NVRTC half is host work, but splitting the section would only
+                // add a second gate acquisition for no benefit. See
+                // `alloc_raw`.
+                let _section = capture_gate::synchronizing_section();
                 let m = if self.nvrtc_cubin_fallback.load(Ordering::Relaxed) {
                     self.load_nvrtc_cubin(module_key, src, &include_paths)?
                 } else {
-                    let opts = cudarc::nvrtc::CompileOptions {
-                        include_paths: include_paths.clone(),
-                        options: vec![format!("--gpu-architecture={}", self.ptx_arch)],
-                        ..Default::default()
-                    };
-                    let ptx = cudarc::nvrtc::compile_ptx_with_opts(src, opts).map_err(|e| {
-                        nvrtc_err(&format!("compiling NVRTC module '{module_key}'"), e)
-                    })?;
+                    let ptx = self.nvrtc_ptx(module_key, src, &include_paths)?;
                     match self.context.load_module(ptx) {
                         Ok(module) => module,
                         Err(error)
@@ -826,12 +1171,82 @@ impl CudaRuntime {
             .map_err(|e| driver_err(&format!("loading NVRTC function '{entry}'"), e))
     }
 
+    /// PTX for `module_key`, from the on-disk cache when possible.
+    ///
+    /// A cached hit is returned as PTX source rather than a compiled image;
+    /// both load through the same driver entry point, and the driver keeps its
+    /// own PTX→SASS cache, so the only work skipped here is the NVRTC frontend.
+    /// That frontend is the expensive half for this crate's templated kernels.
+    fn nvrtc_ptx(
+        &self,
+        module_key: &'static str,
+        src: &str,
+        include_paths: &[String],
+    ) -> Result<cudarc::nvrtc::Ptx> {
+        let key = kernel_cache::CacheKey {
+            module_key,
+            source: src,
+            arch: &self.ptx_arch,
+            include_paths,
+            kind: kernel_cache::ArtifactKind::Ptx,
+        };
+        if let Some(bytes) = kernel_cache::load(&key)
+            && let Ok(text) = String::from_utf8(bytes)
+        {
+            return Ok(cudarc::nvrtc::Ptx::from_src(text));
+        }
+        let opts = cudarc::nvrtc::CompileOptions {
+            include_paths: include_paths.to_vec(),
+            options: vec![format!("--gpu-architecture={}", self.ptx_arch)],
+            ..Default::default()
+        };
+        let started = Instant::now();
+        let ptx = cudarc::nvrtc::compile_ptx_with_opts(src, opts)
+            .map_err(|e| nvrtc_err(&format!("compiling NVRTC module '{module_key}'"), e))?;
+        kernel_cache::record_compile(started.elapsed());
+        kernel_cache::store(&key, ptx.to_src().as_bytes());
+        Ok(ptx)
+    }
+
     fn load_nvrtc_cubin(
         &self,
         module_key: &'static str,
         src: &str,
         include_paths: &[String],
     ) -> Result<Arc<CudaModule>> {
+        let key = kernel_cache::CacheKey {
+            module_key,
+            source: src,
+            arch: &self.cubin_arch,
+            include_paths,
+            kind: kernel_cache::ArtifactKind::Cubin,
+        };
+        let image = match kernel_cache::load(&key) {
+            Some(image) => image,
+            None => {
+                let started = Instant::now();
+                let image = self.compile_nvrtc_cubin(module_key, src, include_paths)?;
+                kernel_cache::record_compile(started.elapsed());
+                kernel_cache::store(&key, &image);
+                image
+            }
+        };
+        self.context
+            .load_module(cudarc::nvrtc::Ptx::from_binary(image))
+            .map_err(|error| {
+                driver_err(
+                    &format!("loading NVRTC CUBIN fallback module '{module_key}'"),
+                    error,
+                )
+            })
+    }
+
+    fn compile_nvrtc_cubin(
+        &self,
+        module_key: &'static str,
+        src: &str,
+        include_paths: &[String],
+    ) -> Result<Vec<u8>> {
         let source = CString::new(src).map_err(|_| {
             EpError::KernelFailed(format!(
                 "cuda_ep: compiling NVRTC module '{module_key}': source contains a NUL byte"
@@ -900,14 +1315,7 @@ impl CudaRuntime {
                 "cuda_ep: destroying NVRTC CUBIN program '{module_key}': {error:?}"
             ))
         })?;
-        self.context
-            .load_module(cudarc::nvrtc::Ptx::from_binary(image))
-            .map_err(|error| {
-                driver_err(
-                    &format!("loading NVRTC CUBIN fallback module '{module_key}'"),
-                    error,
-                )
-            })
+        Ok(image)
     }
 
     pub fn require_nvrtc_half_headers(&self, op: &str) -> Result<()> {
@@ -1032,16 +1440,214 @@ impl CudaRuntime {
             != cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE)
     }
 
+    /// This runtime's process-unique identity. See [`Self::runtime_id`].
+    pub(crate) fn runtime_id(&self) -> u64 {
+        self.runtime_id
+    }
+
+    /// The interleaved copy of the `bytes`-byte int4 packed weight at `packed`,
+    /// built once per weight and released when this runtime drops. Returns
+    /// `(pointer, warm)`; see [`crate::interleave_cache::InterleaveCache::ensure`].
+    pub(crate) fn ensure_interleaved_int4(
+        &self,
+        packed: CUdeviceptr,
+        bytes: usize,
+    ) -> Result<(CUdeviceptr, bool)> {
+        self.interleave.ensure(self, packed, bytes)
+    }
+
+    /// Release every interleaved weight copy this runtime holds.
+    ///
+    /// The backstop, for anything still cached when the runtime itself goes
+    /// away. The load-bearing eviction is [`Self::invalidate_interleaved_for`],
+    /// which runs per buffer as the provider frees it.
+    #[cfg(test)]
+    pub(crate) fn release_interleaved_weights(&self) {
+        self.interleave.release_all(self);
+    }
+
+    /// Drop any interleaved copy derived from the buffer at `base`.
+    ///
+    /// The provider calls this as it frees a device buffer, passing the whole
+    /// allocation — an entry is keyed on a weight's data pointer, which may sit
+    /// at an offset inside the buffer being freed. That address names that
+    /// weight only until this moment; past it the allocator may hand it to the
+    /// next weight of the same size, whose interleave would otherwise be served
+    /// out of this entry (#1726). A provider outlives its executors — sibling
+    /// plans share one, and the control-flow child-executor cache evicts plans
+    /// and frees their initializers back into the same arena — so runtime
+    /// scoping alone leaves that window open and this is what closes it.
+    pub(crate) fn invalidate_interleaved_for(&self, base: CUdeviceptr, len: usize) {
+        self.interleave.invalidate(self, base, len);
+    }
+
+    /// Record that device weight offload is on, so weight buffers may be paged.
+    ///
+    /// One-way: a runtime that has ever paged weights can have had an address
+    /// recycled behind the interleave cache's back, so there is no sound way
+    /// back to caching for the rest of its life.
+    pub(crate) fn set_weights_may_be_paged(&self) {
+        self.weights_may_be_paged
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether weight buffers on this runtime may be paged by the offload path.
+    pub(crate) fn weights_may_be_paged(&self) -> bool {
+        self.weights_may_be_paged
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Interleaved weight copies this runtime currently holds.
+    #[cfg(test)]
+    pub(crate) fn interleaved_weight_count(&self) -> usize {
+        self.interleave.len()
+    }
+
     /// Allocate `bytes` (>= 1) of device memory, returning the raw device
     /// pointer. Binds the context first.
+    #[track_caller]
     pub fn alloc_raw(&self, bytes: usize) -> Result<CUdeviceptr> {
+        let location = std::panic::Location::caller();
         self.bind()?;
+        let requested = bytes.max(1);
+        let class = raw_pool_size_class(requested);
+        if let Some(ptr) = self.take_pooled(class) {
+            self.raw_pool_hits.fetch_add(1, Ordering::Relaxed);
+            self.raw_allocation_profile
+                .record(location, requested, class, true);
+            return Ok(ptr);
+        }
+        // Past the pool: this path makes a real `cuMemAlloc`, which
+        // synchronizes the device and would invalidate a CUDA graph capture
+        // running on another thread. Pool hits returned above take no lock, so
+        // decode's steady state stays entirely off the gate.
+        let _section = capture_gate::synchronizing_section();
         // SAFETY: `malloc_sync` returns a fresh device allocation on the current
         // (bound) context; we own it and free it exactly once via `free_raw`.
-        let ptr = unsafe { cudarc::driver::result::malloc_sync(bytes.max(1)) }
-            .map_err(|e| driver_err("cuMemAlloc", e))?;
+        let mut allocated = unsafe { cudarc::driver::result::malloc_sync(class) };
+        if allocated.is_err() {
+            // Pooled blocks are device memory this runtime is holding back from
+            // everyone else. Releasing them before reporting out-of-memory is
+            // what keeps a pool from behaving like a leak under pressure.
+            self.drain_raw_pool();
+            // SAFETY: as above.
+            allocated = unsafe { cudarc::driver::result::malloc_sync(class) };
+        }
+        let ptr = allocated.map_err(|e| driver_err("cuMemAlloc", e))?;
+        self.raw_pool_classes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(ptr, class);
         self.allocations.fetch_add(1, Ordering::Relaxed);
+        self.raw_allocation_profile
+            .record(location, requested, class, false);
         Ok(ptr)
+    }
+
+    /// Blocks `alloc_raw` served from the pool instead of the driver.
+    pub fn raw_pool_hits(&self) -> u64 {
+        self.raw_pool_hits.load(Ordering::Relaxed)
+    }
+
+    /// Device bytes currently held in the `alloc_raw` pool.
+    pub fn raw_pool_retained_bytes(&self) -> u64 {
+        self.raw_pool_retained.load(Ordering::Relaxed)
+    }
+
+    /// The cuBLASLt workspace shared by every GEMM on this runtime's stream.
+    ///
+    /// Allocated on first use and retained for the runtime's lifetime, so a
+    /// warm call makes no allocation and stays CUDA-graph capture-safe. Callers
+    /// must not free the returned pointer.
+    ///
+    /// Sharing is sound because cuBLASLt scratch carries nothing between calls
+    /// and work on one stream is serial: two GEMMs on this runtime cannot be
+    /// mid-flight at once, so they cannot observe each other's scratch.
+    pub fn shared_blas_workspace(&self, bytes: usize) -> Result<CUdeviceptr> {
+        let mut slot = self
+            .shared_blas_workspace
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(ptr) = *slot {
+            return Ok(ptr);
+        }
+        let ptr = self.alloc_raw(bytes)?;
+        *slot = Some(ptr);
+        Ok(ptr)
+    }
+
+    fn take_pooled(&self, class: usize) -> Option<CUdeviceptr> {
+        let mut pool = self.raw_pool.lock().unwrap_or_else(|e| e.into_inner());
+        let ptr = pool.get_mut(&class)?.pop()?;
+        self.raw_pool_retained
+            .fetch_sub(class as u64, Ordering::Relaxed);
+        Some(ptr)
+    }
+
+    /// Hold a freed block for reuse, or report that the cap leaves no room.
+    fn retain_pooled(&self, ptr: CUdeviceptr) -> bool {
+        let limit = raw_pool_limit_bytes();
+        if limit == 0 {
+            return false;
+        }
+        let Some(class) = self
+            .raw_pool_classes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&ptr)
+            .copied()
+        else {
+            // Not ours to pool: an allocation made before this runtime tracked
+            // classes, or a double free the caller is responsible for.
+            return false;
+        };
+        let class_bytes = class as u64;
+        // Reserve before inserting, so two threads cannot both claim the last
+        // of the budget.
+        if self
+            .raw_pool_retained
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
+                (held + class_bytes <= limit).then_some(held + class_bytes)
+            })
+            .is_err()
+        {
+            return false;
+        }
+        self.raw_pool
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(class)
+            .or_default()
+            .push(ptr);
+        true
+    }
+
+    /// Return every pooled block to the driver.
+    fn drain_raw_pool(&self) {
+        let drained: Vec<CUdeviceptr> = {
+            let mut pool = self.raw_pool.lock().unwrap_or_else(|e| e.into_inner());
+            let mut drained = Vec::new();
+            for (class, blocks) in pool.drain() {
+                self.raw_pool_retained
+                    .fetch_sub((class as u64) * blocks.len() as u64, Ordering::Relaxed);
+                drained.extend(blocks);
+            }
+            drained
+        };
+        // Draining the pool issues one real `cuMemFree` per block; see
+        // `alloc_raw`.
+        let _section = capture_gate::synchronizing_section();
+        let mut classes = self
+            .raw_pool_classes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for ptr in drained {
+            classes.remove(&ptr);
+            // SAFETY: every pooled block came from `malloc_sync` on this
+            // runtime's context and is freed exactly once — it was removed from
+            // the pool here, so `free_raw` cannot also free it.
+            let _ = unsafe { cudarc::driver::result::free_sync(ptr) };
+        }
     }
 
     /// Free a device pointer previously returned by [`CudaRuntime::alloc_raw`].
@@ -1050,6 +1656,19 @@ impl CudaRuntime {
     /// `ptr` must have come from this runtime's `alloc_raw` and not been freed.
     pub unsafe fn free_raw(&self, ptr: CUdeviceptr) -> Result<()> {
         self.bind()?;
+        // A pooled free deliberately does not count here. `frees` exists to
+        // report driver calls — a `cuMemFree` during graph capture invalidates
+        // the capture — and retaining a block makes no driver call at all, so
+        // counting it would report a capture hazard that did not happen.
+        if self.retain_pooled(ptr) {
+            return Ok(());
+        }
+        // A real `cuMemFree` follows; see `alloc_raw`.
+        let _section = capture_gate::synchronizing_section();
+        self.raw_pool_classes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&ptr);
         // SAFETY: caller upholds the single-free contract.
         unsafe { cudarc::driver::result::free_sync(ptr) }
             .map_err(|e| driver_err("cuMemFree", e))?;
@@ -1063,6 +1682,8 @@ impl CudaRuntime {
     /// `dst` is a live device allocation of at least `src.len()` bytes.
     pub unsafe fn htod(&self, src: &[u8], dst: CUdeviceptr) -> Result<()> {
         self.bind()?;
+        // A synchronous copy on the null stream; see `alloc_raw`.
+        let _section = capture_gate::synchronizing_section();
         // SAFETY: bound context; `dst` covers `src.len()` bytes per the contract.
         unsafe { cudarc::driver::result::memcpy_htod_sync(dst, src) }
             .map_err(|e| driver_err("cuMemcpyHtoD", e))?;
@@ -1076,6 +1697,9 @@ impl CudaRuntime {
     /// `src` is a live device allocation of at least `dst.len()` bytes.
     pub unsafe fn dtoh(&self, dst: &mut [u8], src: CUdeviceptr) -> Result<()> {
         self.bind()?;
+        // A stream drain plus a synchronous copy on the null stream; see
+        // `alloc_raw`.
+        let _section = capture_gate::synchronizing_section();
         // Kernels enqueue work on the EP's dedicated non-default stream. Wait
         // before issuing the synchronous driver copy so the host never observes
         // bytes that were still being produced on that stream.
@@ -1100,6 +1724,7 @@ impl CudaRuntime {
         // consumer that already queued a read of `dst`). Drain the EP stream
         // first so the synchronous copy always sees fully-produced bytes. This
         // mirrors `dtoh`, which synchronizes for the same reason.
+        let _section = capture_gate::synchronizing_section();
         self.force_synchronize()?;
         // SAFETY: bound context; both endpoints cover `bytes` per the contract.
         unsafe { cudarc::driver::result::memcpy_dtod_sync(dst, src, bytes) }
@@ -1180,40 +1805,80 @@ impl CudaRuntime {
         &self,
         src: &[u8],
         dst: CUdeviceptr,
-    ) -> Result<(f32, CopyCompleted)> {
-        self.bind()?;
+    ) -> std::result::Result<(f32, CopyCompleted), HtodAsyncElapsedError> {
+        self.bind().map_err(|error| HtodAsyncElapsedError {
+            detail: error.to_string(),
+            completion: FailedHtodCompletion::NotSubmitted,
+        })?;
         if src.is_empty() {
             return Ok((0.0, CopyCompleted::new()));
         }
         let start = self
             .context
             .new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))
-            .map_err(|e| driver_err("cuEventCreate(start)", e))?;
+            .map_err(|error| HtodAsyncElapsedError {
+                detail: driver_err("cuEventCreate(start)", error).to_string(),
+                completion: FailedHtodCompletion::NotSubmitted,
+            })?;
         let end = self
             .context
             .new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))
-            .map_err(|e| driver_err("cuEventCreate(end)", e))?;
+            .map_err(|error| HtodAsyncElapsedError {
+                detail: driver_err("cuEventCreate(end)", error).to_string(),
+                completion: FailedHtodCompletion::NotSubmitted,
+            })?;
         start
             .record(&self.copy_stream)
-            .map_err(|e| driver_err("cuEventRecord(start)", e))?;
+            .map_err(|error| HtodAsyncElapsedError {
+                detail: driver_err("cuEventRecord(start)", error).to_string(),
+                completion: FailedHtodCompletion::NotSubmitted,
+            })?;
         // SAFETY: caller guarantees `dst` covers `src.len()` bytes. The source
         // must remain live until `end.elapsed_ms` returns, which this method
         // enforces by synchronizing the end event before returning.
         unsafe {
             cudarc::driver::result::memcpy_htod_async(dst, src, self.copy_stream.cu_stream())
         }
-        .map_err(|e| driver_err("cuMemcpyHtoDAsync", e))?;
-        end.record(&self.copy_stream)
-            .map_err(|e| driver_err("cuEventRecord(end)", e))?;
+        .map_err(|error| HtodAsyncElapsedError {
+            detail: driver_err("cuMemcpyHtoDAsync", error).to_string(),
+            completion: FailedHtodCompletion::NotSubmitted,
+        })?;
+        if let Err(error) = end.record(&self.copy_stream) {
+            return Err(self.settle_submitted_htod_failure(driver_err("cuEventRecord(end)", error)));
+        }
         // `elapsed_ms` host-synchronizes the end event (cudarc `Event::elapsed_ms`
         // calls `end.synchronize()`), so on return the copy is complete on the
         // host timeline — which is exactly what `CopyCompleted` attests.
-        let elapsed_ms = start
-            .elapsed_ms(&end)
-            .map_err(|e| driver_err("cuEventElapsedTime", e))?;
+        let elapsed_ms = match start.elapsed_ms(&end) {
+            Ok(elapsed_ms) => elapsed_ms,
+            Err(error) => {
+                return Err(
+                    self.settle_submitted_htod_failure(driver_err("cuEventElapsedTime", error))
+                );
+            }
+        };
         self.async_host_to_device_copies
             .fetch_add(1, Ordering::Relaxed);
         Ok((elapsed_ms, CopyCompleted::new()))
+    }
+
+    fn settle_submitted_htod_failure(&self, error: EpError) -> HtodAsyncElapsedError {
+        let Some(_section) = capture_gate::synchronizing_section() else {
+            return classify_submitted_htod_failure(
+                error.to_string(),
+                Err(
+                    "the copy failed on the active capture thread; synchronization was deferred \
+                     to preserve capture"
+                        .into(),
+                ),
+            );
+        };
+        classify_submitted_htod_failure(
+            error.to_string(),
+            self.copy_stream
+                .synchronize()
+                .map_err(|sync_error| sync_error.to_string()),
+        )
     }
 
     /// Enqueue an asynchronous device → device copy on the transfer stream, so
@@ -1234,6 +1899,7 @@ impl CudaRuntime {
         if bytes == 0 {
             return Ok(());
         }
+
         // SAFETY: bound context; both endpoints cover `bytes` and the copy is
         // ordered on the runtime-owned transfer stream.
         unsafe {
@@ -1291,6 +1957,75 @@ impl CudaRuntime {
         self.wait_fence_on(&self.copy_stream, fence_id)
     }
 
+    /// Resolve a transfer-stream fence for a genuinely ahead-of-need prefetch
+    /// (issue #82 BlockQuantizedMoE prefill prefetch): order the compute stream
+    /// after it exactly like [`CudaRuntime::compute_wait_fence`] (cheap,
+    /// non-host-blocking), and additionally host-synchronize the same event
+    /// before returning.
+    ///
+    /// The host wait is what proves — to the caller and to the type system —
+    /// that the transfer stream's DMA read of the prefetch's pinned source
+    /// buffer has *completed*, not merely been enqueued: the returned
+    /// [`CopyCompleted`] witness is exactly the token
+    /// [`crate::pinned_pool::PinnedStagingPool::release`] /
+    /// [`crate::pinned_pool::PooledStaging::retire`] require before a pooled
+    /// staging buffer may be reused, so a prefetch's staging buffer returns to
+    /// the same shared pool an on-demand page-in uses instead of paying a
+    /// fresh `cuMemHostAlloc`/`cuMemFreeHost` pair every time (the exact
+    /// steady-state cost issue #837 already fixed for the page-in path).
+    /// Because the prefetch was issued strictly before the consumer that
+    /// resolves it — while unrelated compute was free to run in between —
+    /// this wait blocks only for whatever transfer time genuinely remains,
+    /// zero once that intervening compute has already hidden it. Fence id `0`
+    /// (already-signalled) and an unknown id (already resolved by an earlier
+    /// call) are no-ops that still mint a witness: by definition nothing is
+    /// left in flight in either case, so the completion guarantee already
+    /// holds.
+    ///
+    /// A DMA was already submitted by the caller before this fence id was
+    /// handed out (it is the whole reason a fence exists to resolve), so
+    /// every failure path below reuses [`CudaRuntime::settle_submitted_htod_failure`]
+    /// — the same fallback-synchronize-then-classify machinery
+    /// [`CudaRuntime::htod_async_elapsed_ms`] uses — instead of returning a
+    /// bare driver error: it either proves completion through a coarser
+    /// `copy_stream` sync ([`FailedHtodCompletion::Completed`]) or reports
+    /// that the source/destination may still be touched by an in-flight read
+    /// ([`FailedHtodCompletion::MayBeInFlight`]), so a caller can quarantine
+    /// the staging buffer and destination page instead of freeing or reusing
+    /// either while a DMA might still be reading/writing them.
+    pub fn resolve_prefetch_fence(
+        &self,
+        fence_id: u64,
+    ) -> std::result::Result<CopyCompleted, HtodAsyncElapsedError> {
+        if fence_id == 0 {
+            return Ok(CopyCompleted::new());
+        }
+        let event = self
+            .fences
+            .lock()
+            .expect("cuda fence registry poisoned")
+            .remove(&fence_id);
+        let Some(event) = event else {
+            return Ok(CopyCompleted::new());
+        };
+        if let Err(error) = self.bind() {
+            return Err(self.settle_submitted_htod_failure(error));
+        }
+        // Cross-stream order first (cheap, enqueue-only): any kernel the
+        // compute stream launches after this point observes the transfer, even
+        // before the host wait below completes.
+        if let Err(error) = self.stream.wait(&event) {
+            return Err(self.settle_submitted_htod_failure(driver_err("cuStreamWaitEvent", error)));
+        }
+        // Host-blocking: proves the transfer stream's read of the prefetch's
+        // source buffer has finished, so it is safe to free or, preferably,
+        // return to the pinned staging pool for reuse.
+        if let Err(error) = event.synchronize() {
+            return Err(self.settle_submitted_htod_failure(driver_err("cuEventSynchronize", error)));
+        }
+        Ok(CopyCompleted::new())
+    }
+
     fn wait_fence_on(&self, waiter: &CudaStream, fence_id: u64) -> Result<()> {
         if fence_id == 0 {
             return Ok(());
@@ -1326,6 +2061,8 @@ impl CudaRuntime {
     /// makes the transfer genuinely asynchronous and overlappable.
     pub fn alloc_pinned(&self, bytes: usize) -> Result<PinnedStaging> {
         self.bind()?;
+        // Page-locking host memory synchronizes the device; see `alloc_raw`.
+        let _section = capture_gate::synchronizing_section();
         // SAFETY: `malloc_host` returns a fresh page-locked host allocation on
         // the bound context; `PinnedStaging` owns it and frees it once on drop.
         let ptr = unsafe { cudarc::driver::result::malloc_host(bytes.max(1), 0) }
@@ -1354,6 +2091,7 @@ impl CudaRuntime {
 /// `htod_async` + deferred fence, no `CopyCompleted` is available at the reuse
 /// site, so the code **fails to compile** until the author threads the witness
 /// through after awaiting the fence — the hazard cannot be reached by accident.
+#[derive(Debug)]
 #[must_use = "a CopyCompleted witness exists to gate pinned-buffer reuse; dropping it is pointless"]
 pub struct CopyCompleted(());
 
@@ -1425,6 +2163,8 @@ impl std::fmt::Debug for PinnedStaging {
 impl Drop for PinnedStaging {
     fn drop(&mut self) {
         let _ = self.context.bind_to_thread();
+        // Unpinning synchronizes the device; see `CudaRuntime::alloc_raw`.
+        let _section = capture_gate::synchronizing_section();
         // SAFETY: `ptr` came from `malloc_host` on this context and is freed
         // exactly once here.
         let _ = unsafe { cudarc::driver::result::free_host(self.ptr.cast::<c_void>()) };
@@ -1433,6 +2173,22 @@ impl Drop for PinnedStaging {
 
 impl Drop for CudaRuntime {
     fn drop(&mut self) {
+        // Tearing a runtime down unloads its modules and destroys its streams.
+        // `cuModuleUnload` and `cuStreamDestroy` synchronize the device, so a
+        // runtime going out of scope on one thread can invalidate a CUDA graph
+        // capture on another. Those calls are made by `cudarc` as the fields
+        // drop, not by this crate, so the section has to cover the whole
+        // teardown rather than any individual call.
+        //
+        // Stored in the last-declared field instead of a local: locals are
+        // released when this body returns, which is *before* the fields drop.
+        // See `teardown_section`.
+        self.teardown_section = capture_gate::synchronizing_section();
+        // Before the context goes: an interleaved weight copy is keyed by the
+        // source weight's device address, and that address stops meaning
+        // anything once this runtime's allocator is gone. Freeing here is what
+        // bounds an entry's life by the life of the address that names it.
+        self.interleave.release_all(&*self);
         if self.capture_error != 0 {
             // SAFETY: `capture_error` was allocated by this runtime's `alloc_raw`
             // in `with_capture_error_word` and is freed exactly once here.
@@ -1462,6 +2218,169 @@ pub fn raw_ptr(dptr: CUdeviceptr) -> *mut c_void {
 mod tests {
     use super::*;
     use cudarc::driver::PushKernelArg;
+
+    #[test]
+    fn submitted_htod_failure_reports_completion_after_fallback_sync() {
+        let error =
+            classify_submitted_htod_failure("injected end-event record failure".into(), Ok(()));
+        let (detail, completion) = error.into_parts();
+        assert!(detail.contains("completion was established"));
+        assert!(matches!(completion, FailedHtodCompletion::Completed(_)));
+    }
+
+    #[test]
+    fn submitted_htod_failure_reports_possible_in_flight_copy_when_sync_fails() {
+        let error = classify_submitted_htod_failure(
+            "injected end-event record failure".into(),
+            Err("injected copy-stream synchronization failure".into()),
+        );
+        let (detail, completion) = error.into_parts();
+        assert!(detail.contains("could not establish completion"));
+        assert!(matches!(completion, FailedHtodCompletion::MayBeInFlight));
+    }
+
+    #[test]
+    fn raw_allocation_profile_attributes_driver_and_pool_paths() {
+        let profile = RawAllocationProfile::new(true);
+        let location = std::panic::Location::caller();
+        profile.record(location, 513, 1024, false);
+        profile.record(location, 700, 1024, true);
+
+        let sites = profile.snapshot();
+        assert_eq!(sites.len(), 1);
+        assert_eq!(
+            sites[0],
+            RawDeviceAllocationSiteStats {
+                file: location.file(),
+                line: location.line(),
+                requests: 2,
+                requested_bytes: 1213,
+                driver_allocations: 1,
+                driver_bytes: 1024,
+                pool_hits: 1,
+                pool_hit_bytes: 1024,
+            }
+        );
+    }
+
+    #[test]
+    fn disabled_raw_allocation_profile_has_no_hot_path_state() {
+        let profile = RawAllocationProfile::new(false);
+        profile.record(std::panic::Location::caller(), 4096, 4096, false);
+        assert!(profile.snapshot().is_empty());
+    }
+
+    /// The pool hands a recycled block to a *different* request than the one it
+    /// was carved for, so the only thing standing between reuse and a buffer
+    /// overrun is that the class is never smaller than the request. Check that
+    /// directly, including the boundary where the rounding rule changes.
+    #[test]
+    fn raw_pool_size_class_never_undersizes_a_request() {
+        let sizes = [
+            1usize,
+            2,
+            511,
+            512,
+            513,
+            4096,
+            (1 << 20) - 1,
+            1 << 20,
+            (1 << 20) + 1,
+            3_000_000,
+            1 << 24,
+        ];
+        for bytes in sizes {
+            let class = raw_pool_size_class(bytes);
+            assert!(
+                class >= bytes,
+                "class {class} is smaller than the {bytes}-byte request it must satisfy"
+            );
+            assert!(
+                class >= 512,
+                "class {class} is below the minimum block size"
+            );
+        }
+        // Monotonic, so a larger request can never land in a smaller class and
+        // pick up a block that does not fit it.
+        let mut previous = 0;
+        for bytes in sizes {
+            let class = raw_pool_size_class(bytes);
+            assert!(class >= previous, "class fell from {previous} to {class}");
+            previous = class;
+        }
+    }
+
+    /// Pooling only pays if the second request for a shape skips the driver
+    /// entirely, and it is only safe if the pointer it hands back is the one it
+    /// retained. Both are asserted here rather than inferred from a wall-clock
+    /// improvement.
+    #[test]
+    #[ignore = "requires a CUDA device"]
+    fn raw_pool_recycles_freed_blocks_without_reentering_the_driver() {
+        let Ok(runtime) = CudaRuntime::new(0) else {
+            eprintln!("skipping raw pool reuse: CUDA runtime unavailable");
+            return;
+        };
+        let bytes = 4 << 20;
+        let first = runtime.alloc_raw(bytes).unwrap();
+        let allocations_after_first = runtime.allocation_counts().allocations;
+        // SAFETY: `first` came from this runtime's `alloc_raw` and is freed once.
+        unsafe { runtime.free_raw(first).unwrap() };
+
+        let second = runtime.alloc_raw(bytes).unwrap();
+        assert_eq!(
+            second, first,
+            "the pool must hand back the block it just retained"
+        );
+        assert_eq!(
+            runtime.raw_pool_hits(),
+            1,
+            "the second request must be served from the pool"
+        );
+        assert_eq!(
+            runtime.allocation_counts().allocations,
+            allocations_after_first,
+            "a pooled request must not reach cuMemAlloc"
+        );
+        // SAFETY: `second` is the same live block, freed once.
+        unsafe { runtime.free_raw(second).unwrap() };
+    }
+
+    /// With pooling disabled the runtime must behave exactly as it did before:
+    /// every request reaches the driver. This is the bisect switch, so it has
+    /// to actually switch something.
+    #[test]
+    #[ignore = "requires a CUDA device"]
+    fn raw_pool_disabled_returns_every_block_to_the_driver() {
+        let Ok(runtime) = CudaRuntime::new(0) else {
+            eprintln!("skipping raw pool disable: CUDA runtime unavailable");
+            return;
+        };
+        // SAFETY: this ignored GPU test runs serially; no other thread reads the
+        // variable concurrently.
+        unsafe { std::env::set_var(CUDA_RAW_POOL_BYTES_ENV, "0") };
+        let bytes = 4 << 20;
+        let first = runtime.alloc_raw(bytes).unwrap();
+        // SAFETY: `first` came from `alloc_raw` and is freed once.
+        unsafe { runtime.free_raw(first).unwrap() };
+        let before = runtime.allocation_counts().allocations;
+        let second = runtime.alloc_raw(bytes).unwrap();
+        assert_eq!(
+            runtime.raw_pool_hits(),
+            0,
+            "pooling is disabled, so nothing may be served from the pool"
+        );
+        assert_eq!(
+            runtime.allocation_counts().allocations,
+            before + 1,
+            "with pooling disabled every request must reach cuMemAlloc"
+        );
+        assert_eq!(runtime.raw_pool_retained_bytes(), 0);
+        // SAFETY: `second` is live and freed once.
+        unsafe { runtime.free_raw(second).unwrap() };
+        // SAFETY: restore the process-global default for other tests.
+        unsafe { std::env::remove_var(CUDA_RAW_POOL_BYTES_ENV) };
+    }
 
     #[test]
     fn derives_ptx_arch_from_compute_capability() {
@@ -1592,6 +2511,101 @@ mod tests {
         std::panic::catch_unwind(|| CudaRuntime::new(0).ok().map(Arc::new))
             .ok()
             .flatten()
+    }
+
+    /// The on-disk kernel cache stores PTX *text* and restores it through a
+    /// different driver entry point than a freshly compiled image uses.
+    ///
+    /// This is the property the whole cache rests on: if a restored module ever
+    /// computed something different from a compiled one, every second run of
+    /// every model would be silently wrong. A pure round-trip test of the bytes
+    /// would not catch that — the module has to actually run.
+    #[test]
+    fn a_module_restored_from_cached_ptx_computes_what_a_compiled_one_does() {
+        const MODULE: &str = "kernel_cache_roundtrip_v1";
+        const SOURCE: &str = r#"
+extern "C" __global__ void add_seven(float* out, unsigned long long n) {
+    unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = (float)i + 7.0f;
+}
+"#;
+        let Some(runtime) = maybe_runtime() else {
+            eprintln!("skipping cached-PTX equivalence: CUDA runtime unavailable");
+            return;
+        };
+        runtime.bind().unwrap();
+        let include_paths = nvrtc_include_paths();
+        let before = crate::kernel_cache::kernel_compile_stats();
+        let ptx = runtime.nvrtc_ptx(MODULE, SOURCE, &include_paths).unwrap();
+        let after = crate::kernel_cache::kernel_compile_stats();
+
+        // The accounting must be wired to the real path. A counter that never
+        // moves is worse than no counter: it reports "nothing was compiled",
+        // which is exactly the answer a warm cache is supposed to give.
+        //
+        // The bound is `>= 1`, not `== 1`. These counters are process-global
+        // and the harness runs several hundred tests as parallel threads, so
+        // other threads resolve their own modules between the two reads. An
+        // exact count would be asserting that no other test was running, which
+        // is not a property of the code under test. What still holds -- and is
+        // what this guards -- is that a counter moved at all.
+        assert!(
+            (after.compiled - before.compiled) + (after.cache_hits - before.cache_hits) >= 1,
+            "resolving a module must advance the compiled or cache-hit counter: \
+             {before:?} -> {after:?}"
+        );
+        if after.compiled > before.compiled {
+            assert!(
+                after.compile_time > before.compile_time,
+                "a recorded compile must carry time: {before:?} -> {after:?}"
+            );
+        }
+
+        // Whatever the first resolution did, a second one for the same key is a
+        // hit: the negative control that separates "the cache is wired up" from
+        // "some counter happens to be moving".
+        let warm_before = crate::kernel_cache::kernel_compile_stats();
+        runtime.nvrtc_ptx(MODULE, SOURCE, &include_paths).unwrap();
+        let warm_after = crate::kernel_cache::kernel_compile_stats();
+        assert!(
+            warm_after.cache_hits > warm_before.cache_hits,
+            "re-resolving an already cached module must count a cache hit: \
+             {warm_before:?} -> {warm_after:?}"
+        );
+
+        // Exactly the bytes `kernel_cache::store` writes, read back exactly the
+        // way `nvrtc_ptx` reads them on a hit.
+        let stored = ptx.to_src().into_bytes();
+        let restored = cudarc::nvrtc::Ptx::from_src(String::from_utf8(stored).unwrap());
+
+        let n = 1024usize;
+        let bytes = n * std::mem::size_of::<f32>();
+        let run = |ptx: cudarc::nvrtc::Ptx| -> Vec<f32> {
+            let module = runtime.context.load_module(ptx).unwrap();
+            let function = module.load_function("add_seven").unwrap();
+            let out = runtime.alloc_raw(bytes).unwrap();
+            let mut builder = runtime.stream().launch_builder(&function);
+            let n_u64 = n as u64;
+            builder.arg(&out).arg(&n_u64);
+            unsafe {
+                builder
+                    .launch(LaunchConfig::for_num_elems(n as u32))
+                    .unwrap();
+            }
+            runtime.synchronize().unwrap();
+            let mut host = vec![0.0f32; n];
+            let host_bytes =
+                unsafe { std::slice::from_raw_parts_mut(host.as_mut_ptr().cast::<u8>(), bytes) };
+            unsafe { runtime.dtoh(host_bytes, out) }.unwrap();
+            let _ = unsafe { runtime.free_raw(out) };
+            host
+        };
+
+        let fresh = run(ptx);
+        let cached = run(restored);
+
+        assert_eq!(fresh[0], 7.0, "the kernel must have actually run");
+        assert_eq!(fresh, cached, "cached PTX must not change the result");
     }
 
     // Regression guard for the DeepSeek-V2-Lite garbage-decode race: kernels run

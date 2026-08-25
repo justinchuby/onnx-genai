@@ -42,7 +42,7 @@ impl DecodeState {
     /// Construct decode state from metadata or unambiguous tensor shapes.
     pub(crate) fn new_with_io(
         session: &dyn GraphIo,
-        io: Option<&onnx_genai_metadata::ModelIoSpec>,
+        io: Option<&onnx_genai_metadata::DecoderAbi>,
     ) -> anyhow::Result<Self> {
         Self::new_with_io_and_positions(session, io, None)
     }
@@ -51,7 +51,7 @@ impl DecodeState {
     /// declared position program.
     pub(crate) fn new_with_io_and_positions(
         session: &dyn GraphIo,
-        io: Option<&onnx_genai_metadata::ModelIoSpec>,
+        io: Option<&onnx_genai_metadata::DecoderAbi>,
         positions: Option<&PositionProgram>,
     ) -> anyhow::Result<Self> {
         Self::new_with_io_positions_and_state_budget(session, io, positions, u64::MAX)
@@ -59,7 +59,7 @@ impl DecodeState {
 
     pub(crate) fn new_with_io_positions_and_state_budget(
         session: &dyn GraphIo,
-        io: Option<&onnx_genai_metadata::ModelIoSpec>,
+        io: Option<&onnx_genai_metadata::DecoderAbi>,
         positions: Option<&PositionProgram>,
         fixed_state_budget_bytes: u64,
     ) -> anyhow::Result<Self> {
@@ -107,7 +107,7 @@ impl DecodeState {
     pub(crate) fn new_for_path_with_io(
         session: &Session,
         path: &ModelDecodePath,
-        io: Option<&onnx_genai_metadata::ModelIoSpec>,
+        io: Option<&onnx_genai_metadata::DecoderAbi>,
     ) -> anyhow::Result<Self> {
         Self::new_for_path_with_io_positions_and_state_budget(session, path, io, None, u64::MAX)
     }
@@ -115,12 +115,12 @@ impl DecodeState {
     pub(crate) fn new_for_path_with_io_positions_and_state_budget(
         session: &Session,
         path: &ModelDecodePath,
-        io: Option<&onnx_genai_metadata::ModelIoSpec>,
+        io: Option<&onnx_genai_metadata::DecoderAbi>,
         positions: Option<&PositionProgram>,
         fixed_state_budget_bytes: u64,
     ) -> anyhow::Result<Self> {
         match path {
-            ModelDecodePath::Legacy => Self::new_with_io_positions_and_state_budget(
+            ModelDecodePath::Generic => Self::new_with_io_positions_and_state_budget(
                 session,
                 io,
                 positions,
@@ -130,7 +130,7 @@ impl DecodeState {
                 let resolved = ResolvedIo::resolve_with_positions(session, io, positions)?;
                 if !resolved.state_pairs.is_empty() || positions.is_some() {
                     anyhow::bail!(
-                        "static-cache decode does not support declared generic positions or fixed loop-carried state; select the past/present or legacy decode path"
+                        "static-cache decode does not support declared generic positions or fixed loop-carried state; select the past/present or generic decode path"
                     );
                 }
                 Ok(Self {
@@ -313,6 +313,12 @@ impl DecodeState {
     /// runner (which owns its own cursor); every other state tracks the length
     /// next to the `past` tensors it describes, so the pipeline no longer has
     /// to thread it in from the retained context.
+    ///
+    /// No production caller today: the generic workflow still threads `past_len`
+    /// into each decode step, and the composite prefix-reuse component that read
+    /// this was retired. Kept (and exercised by the tests below) because it is
+    /// the read side of the `past`/`kv_len` invariant `set_past` maintains.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn current_kv_len(&self) -> usize {
         match self.runner {
             Some(_) => self.runner_len(),
@@ -321,10 +327,14 @@ impl DecodeState {
     }
 
     /// Drop the KV for everything past `target`, reusing the shared prefix a
-    /// diverging prompt still has in common. Same name and signature as
-    /// [`PipelineDecoderComponent::rewind_kv`](crate::pipeline::PipelineDecoderComponent::rewind_kv),
-    /// so both backends' `KvPrefixStore` adapters are the same shape: the state
-    /// owns its length, so it is not told `current_len` from outside.
+    /// diverging prompt still has in common. The state owns its length, so it is
+    /// not told `current_len` from outside.
+    ///
+    /// No production caller today: the composite pipeline's prefix-reuse
+    /// component was retired, and the generic workflow has not yet declared a
+    /// rollback capability. Kept as the tested primitive that a future rollback
+    /// step will drive.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn rewind_kv(&mut self, target: usize) -> anyhow::Result<bool> {
         self.truncate_past(self.current_kv_len(), target)
     }
@@ -417,11 +427,25 @@ impl DecodeState {
         }
     }
 
+    /// Borrow the active native runner iff it carries recurrent (GDN SSM /
+    /// conv1d) state, so the speculative loop can snapshot/commit that state
+    /// around a verify window. `None` for every non-native or pure-dense target,
+    /// keeping the commit path inert elsewhere.
+    #[cfg(feature = "native-backend")]
+    pub(crate) fn native_recurrent_runner_mut(
+        &mut self,
+    ) -> Option<&mut crate::native_decode::NativeDecodeSession> {
+        self.runner
+            .as_mut()
+            .and_then(DecodeRunner::native_recurrent_mut)
+    }
+
     /// Length-aware primitive behind [`rewind_kv`](Self::rewind_kv). Private:
     /// production callers go through `rewind_kv`, which passes
     /// `self.current_kv_len()` so `current_len` can never disagree with the
     /// tracked length. On every successful outcome `self.kv_len` is updated in
     /// lockstep with `self.past`, so the two cannot drift apart.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn truncate_past(
         &mut self,
         current_len: usize,
@@ -628,106 +652,6 @@ impl DecodeState {
 
 #[cfg(test)]
 mod tests {
-    use super::super::logits::extract_next_token_logits_from_outputs;
-    use super::super::step::run_decode_step_with_extra;
-    use super::*;
-    use onnx_genai_ort::{PipelineModels, Value};
-    use std::collections::HashSet;
-    use std::path::Path;
-
-    #[test]
-    fn declared_multiaxis_positions_and_replace_state_continue_across_steps() -> anyhow::Result<()>
-    {
-        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/fixtures/tiny-multiaxis-state-decoder");
-        let models = PipelineModels::load(&fixture)?;
-        let session = models
-            .session("decoder")
-            .expect("fixture decoder session is loaded");
-        let component = &models.directory.spec.models["decoder"];
-        let positions = models
-            .directory
-            .spec
-            .positions
-            .as_ref()
-            .expect("fixture position program");
-        let mut state = DecodeState::new_with_io_and_positions(
-            session,
-            component.io.as_ref(),
-            Some(positions),
-        )?;
-        let routed = Value::from_vec_f32(vec![0.0; 3], &[1, 3, 1])?;
-        let extras = vec![("routed_sequence".to_string(), routed)];
-
-        let outputs = run_decode_step_with_extra(session, &mut state, &[1, 2, 3], 0, &extras)?;
-        let logits = extract_next_token_logits_from_outputs(
-            session,
-            &outputs,
-            state.io.logits_output.as_deref(),
-        )?;
-        assert_eq!(
-            logits
-                .iter()
-                .enumerate()
-                .max_by(|(_, left), (_, right)| left.total_cmp(right))
-                .map(|(index, _)| index),
-            Some(6)
-        );
-        assert_eq!(state.next_positions, Some(vec![3, 3, 3]));
-        assert_eq!(state.loop_state["state_a.in"].to_vec_f32()?, vec![1.0, 1.0]);
-        assert_eq!(state.loop_state["state_b.in"].to_vec_f32()?, vec![2.0, 2.0]);
-        assert_eq!(
-            state.past().keys().cloned().collect::<HashSet<_>>(),
-            [
-                "past.3.key".to_string(),
-                "past.3.value".to_string(),
-                "past.11.key".to_string(),
-                "past.11.value".to_string(),
-            ]
-            .into_iter()
-            .collect()
-        );
-
-        let outputs = run_decode_step_with_extra(session, &mut state, &[6], 3, &extras)?;
-        let logits = extract_next_token_logits_from_outputs(
-            session,
-            &outputs,
-            state.io.logits_output.as_deref(),
-        )?;
-        assert_eq!(
-            logits
-                .iter()
-                .enumerate()
-                .max_by(|(_, left), (_, right)| left.total_cmp(right))
-                .map(|(index, _)| index),
-            Some(15)
-        );
-        assert_eq!(state.next_positions, Some(vec![4, 4, 4]));
-
-        let outputs = run_decode_step_with_extra(session, &mut state, &[15], 4, &extras)?;
-        let logits = extract_next_token_logits_from_outputs(
-            session,
-            &outputs,
-            state.io.logits_output.as_deref(),
-        )?;
-        assert_eq!(
-            logits
-                .iter()
-                .enumerate()
-                .max_by(|(_, left), (_, right)| left.total_cmp(right))
-                .map(|(index, _)| index),
-            Some(24)
-        );
-        assert_eq!(state.loop_state["state_a.in"].to_vec_f32()?, vec![3.0, 3.0]);
-        assert_eq!(state.loop_state["state_b.in"].to_vec_f32()?, vec![6.0, 6.0]);
-        assert!(
-            state
-                .past()
-                .values()
-                .all(|value| value.shape() == [1, 1, 5, 1])
-        );
-        Ok(())
-    }
     /// Truncation is what lets a forked or edited conversation keep the head it
     /// still shares, and a wrong slice silently corrupts attention rather than
     /// failing, so the mechanics are pinned directly here.

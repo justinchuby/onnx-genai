@@ -65,7 +65,7 @@ fn retry_pre_run_captured_failure<T>(
 /// A stateful IoBinding decode runner that keeps KV OrtValues inside ORT.
 pub struct DecodeSession<'a> {
     session: &'a Session,
-    binding: IoBinding,
+    binding: IoBinding<'a>,
     kv_pairs: Vec<KvPair>,
     token_input: String,
     attention_mask_input: Option<String>,
@@ -80,7 +80,7 @@ pub struct DecodeSession<'a> {
     /// field is declared after `current_kv` so Rust drops the KV `Value`s first
     /// and releases this allocator afterwards; releasing it earlier caused a
     /// use-after-free SIGSEGV at session close.
-    kv_allocator: Option<crate::Allocator>,
+    kv_allocator: Option<crate::Allocator<'a>>,
     /// Static-shape captured-decode state, populated lazily on the first
     /// single-token step when the session has CUDA graph capture enabled.
     /// Holds the persistent, fixed-address I/O buffers a captured graph replays
@@ -305,7 +305,7 @@ impl<'a> DecodeSession<'a> {
     pub fn new_with_io(
         session: &'a Session,
         options: DecodeSessionOptions,
-        io: Option<&onnx_genai_metadata::ModelIoSpec>,
+        io: Option<&onnx_genai_metadata::DecoderAbi>,
     ) -> Result<Self> {
         let kv_pairs = infer_kv_pairs(session, io)?;
         let excluded = kv_pairs
@@ -332,28 +332,30 @@ impl<'a> DecodeSession<'a> {
         let never = |_: &TensorInfo| false;
         let token_input = resolve_input(
             io.and_then(|io| io.token_input.as_deref()),
-            "model.io.token_input",
+            "token_input",
             crate::io_roles::is_rank_one_or_two_sequence,
         )?
         .ok_or_else(|| {
             OrtError::InvalidArgument(
-                "cannot resolve token input from tensor shape; declare model.io.token_input".into(),
+                "cannot resolve token_input from tensor shape; give the port the token_ids role \
+                 in pipeline.workflow.components.<component>.ports.roles"
+                    .into(),
             )
         })?;
         let attention_mask_input = resolve_input(
             io.and_then(|io| io.attention_mask_input.as_deref()),
-            "model.io.attention_mask_input",
+            "attention_mask_input",
             never,
         )?;
         let position_ids_input = resolve_input(
             io.and_then(|io| io.position_ids_input.as_deref()),
-            "model.io.position_ids_input",
+            "position_ids_input",
             never,
         )?;
         let logits_output = crate::io_roles::resolve_port(
             session.outputs(),
             io.and_then(|io| io.logits_output.as_deref()),
-            "model.io.logits_output",
+            "logits_output",
             |tensor| {
                 !excluded.contains(tensor.name.as_str())
                     && crate::io_roles::is_rank_one_to_three_output(tensor)
@@ -363,7 +365,8 @@ impl<'a> DecodeSession<'a> {
         .map(|port| port.name)
         .ok_or_else(|| {
             OrtError::InvalidArgument(
-                "cannot resolve logits output from tensor shape; declare model.io.logits_output"
+                "cannot resolve logits_output from tensor shape; give the port the logits role \
+                 in pipeline.workflow.components.<component>.ports.roles"
                     .into(),
             )
         })?;
@@ -372,10 +375,24 @@ impl<'a> DecodeSession<'a> {
             attention_mask_input.as_deref(),
             position_ids_input.as_deref(),
             io.and_then(|io| io.inputs_embeds_input.as_deref()),
+            io.and_then(|io| io.encoder_hidden_states_input.as_deref()),
+            io.and_then(|io| io.audio_features_input.as_deref()),
         ]
         .into_iter()
         .flatten()
         .chain(kv_pairs.iter().map(|pair| pair.past.as_str()))
+        .chain(
+            io.and_then(|io| io.cross_kv_inputs.as_deref())
+                .into_iter()
+                .flatten()
+                .map(String::as_str),
+        )
+        .chain(
+            io.and_then(|io| io.state_pairs.as_deref())
+                .into_iter()
+                .flatten()
+                .map(|pair| pair.input.as_str()),
+        )
         .collect::<HashSet<_>>();
         let assigned_outputs = [
             Some(logits_output.as_str()),
@@ -384,6 +401,18 @@ impl<'a> DecodeSession<'a> {
         .into_iter()
         .flatten()
         .chain(kv_pairs.iter().map(|pair| pair.present.as_str()))
+        .chain(
+            io.and_then(|io| io.cross_kv_outputs.as_deref())
+                .into_iter()
+                .flatten()
+                .map(String::as_str),
+        )
+        .chain(
+            io.and_then(|io| io.state_pairs.as_deref())
+                .into_iter()
+                .flatten()
+                .map(|pair| pair.output.as_str()),
+        )
         .collect::<HashSet<_>>();
         let unassigned_state_inputs = session
             .inputs()
@@ -401,14 +430,23 @@ impl<'a> DecodeSession<'a> {
             })
             .map(|tensor| tensor.name.as_str())
             .collect::<Vec<_>>();
+        // A rank-3+ output is legitimate only when the ABI accounts for it:
+        // logits, the declared hidden/auxiliary output a chained proposer or
+        // embedding head consumes (`hidden_output`, a `hidden_states` port role),
+        // a paired present-KV (self- or cross-attention), or a declared recurrent
+        // `state_pairs` output — all resolved into `assigned_outputs` above. Any
+        // OTHER unassigned rank-3+ output is an unpaired state-like tensor: a
+        // `present`-shaped cache with no `past` input, or an undeclared recurrent
+        // output. Silently ignoring it (the old behavior) would let a rejected
+        // proposal or a rewind desynchronize a cache the runtime never bound, so
+        // reject it symmetrically with an unassigned input rather than guessing it
+        // is a harmless activation.
         if !unassigned_state_inputs.is_empty() || !unassigned_state_outputs.is_empty() {
             return Err(OrtError::InvalidArgument(format!(
-                "cannot resolve decoder state from tensor shapes (inputs: {unassigned_state_inputs:?}, outputs: {unassigned_state_outputs:?}); declare model.io.kv_inputs and model.io.kv_outputs"
+                "cannot resolve decoder state from tensor shapes (inputs: {unassigned_state_inputs:?}, outputs: {unassigned_state_outputs:?}); give a hidden/auxiliary output the hidden_states port role, or bind the per-layer buffers in a pipeline.workflow.serving.state_service group"
             )));
         }
-        let share_buffer = options
-            .past_present_share_buffer
-            .unwrap_or(session.past_present_share_buffer_supported());
+        let share_buffer = options.past_present_share_buffer.unwrap_or(false);
         let mode = if share_buffer {
             DecodeKvMode::SharedBuffer
         } else {
@@ -656,6 +694,22 @@ impl<'a> DecodeSession<'a> {
         let input_ids = Value::from_slice_i64(new_input_ids, &[1, seq_len])?;
         let attention_mask = Value::from_slice_i64(attention_mask, &[1, total_len])?;
         let position_ids = Value::from_slice_i64(position_ids, &[1, seq_len])?;
+
+        if debug_shapes_enabled() {
+            let past_desc = self
+                .kv_pairs
+                .first()
+                .map(|pair| match self.current_kv.get(&pair.past) {
+                    Some(value) => format!("{:?}", value.shape()),
+                    None => "empty".to_string(),
+                })
+                .unwrap_or_else(|| "<no kv pairs>".to_string());
+            eprintln!(
+                "ort_debug_shapes: seq_len={seq_len} mask_total_len={total_len} \
+                 past[0]={past_desc} mode={:?}",
+                self.mode
+            );
+        }
 
         let bind_span = crate::prof_span!("ort.bind_inputs");
         self.binding.clear()?;
@@ -1627,6 +1681,21 @@ impl DecodeSession<'_> {
                 .into(),
         ))
     }
+}
+
+/// Whether per-step input-shape diagnostics are enabled
+/// (`ONNX_GENAI_ORT_DEBUG_SHAPES`).
+///
+/// Cached on first use: this is consulted once per decode step, and a raw
+/// `env::var_os` there would put an environment lookup in the hot path.
+///
+/// The shapes it prints — the attention-mask length against the past KV extent
+/// actually bound — are what identified the share-buffer/standard-`Attention`
+/// mismatch this module now guards against, so the hook is kept rather than
+/// deleted with the investigation.
+fn debug_shapes_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("ONNX_GENAI_ORT_DEBUG_SHAPES").is_some())
 }
 
 #[cfg(test)]

@@ -155,6 +155,13 @@ __device__ float op_round(float x) { return rintf(x); }
 __device__ float op_sin(float x) { return sinf(x); }
 __device__ float op_cos(float x) { return cosf(x); }
 __device__ float op_softplus(float x) { return fmaxf(x, 0.0f) + log1pf(expf(-fabsf(x))); }
+// Mish(x) = x * tanh(softplus(x)). Softplus is spelled in the same
+// overflow-stable form as `op_softplus` above rather than `log1pf(expf(x))`,
+// which saturates for large x and would make Mish return NaN where the CPU
+// kernel returns x.
+__device__ float op_mish(float x) {
+    return x * tanhf(fmaxf(x, 0.0f) + log1pf(expf(-fabsf(x))));
+}
 __device__ float op_tan(float x) { return tanf(x); }
 __device__ float op_sinh(float x) { return sinhf(x); }
 __device__ float op_cosh(float x) { return coshf(x); }
@@ -184,6 +191,7 @@ DEFINE_UNARY(round, TYPE, SUFFIX) \
 DEFINE_UNARY(sin, TYPE, SUFFIX) \
 DEFINE_UNARY(cos, TYPE, SUFFIX) \
 DEFINE_UNARY(softplus, TYPE, SUFFIX) \
+DEFINE_UNARY(mish, TYPE, SUFFIX) \
 DEFINE_UNARY(tan, TYPE, SUFFIX) \
 DEFINE_UNARY(sinh, TYPE, SUFFIX) \
 DEFINE_UNARY(cosh, TYPE, SUFFIX) \
@@ -236,6 +244,8 @@ pub enum UnaryMathOp {
     Sin,
     Cos,
     Softplus,
+    /// `Mish(x) = x * tanh(softplus(x))` (opset 22).
+    Mish,
     Tan,
     Sinh,
     Cosh,
@@ -266,6 +276,7 @@ impl UnaryMathOp {
             UnaryMathOp::Sin => "sin",
             UnaryMathOp::Cos => "cos",
             UnaryMathOp::Softplus => "softplus",
+            UnaryMathOp::Mish => "mish",
             UnaryMathOp::Tan => "tan",
             UnaryMathOp::Sinh => "sinh",
             UnaryMathOp::Cosh => "cosh",
@@ -297,6 +308,7 @@ impl UnaryMathOp {
             UnaryMathOp::Sin => "Sin",
             UnaryMathOp::Cos => "Cos",
             UnaryMathOp::Softplus => "Softplus",
+            UnaryMathOp::Mish => "Mish",
             UnaryMathOp::Tan => "Tan",
             UnaryMathOp::Sinh => "Sinh",
             UnaryMathOp::Cosh => "Cosh",

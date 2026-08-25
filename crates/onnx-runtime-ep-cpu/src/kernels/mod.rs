@@ -166,6 +166,15 @@ static I32_ONLY: &[DataType] = &[DataType::Int32];
 /// Integer index/length inputs, matching `to_dense_i64`'s acceptance set.
 static INDEX_DTYPES: &[DataType] = &[DataType::Int64, DataType::Int32];
 
+/// STFT edges mix f32-compute signal/output tensors with integer scalar inputs.
+static STFT_DTYPES: &[DataType] = &[
+    DataType::Float32,
+    DataType::Float16,
+    DataType::BFloat16,
+    DataType::Int32,
+    DataType::Int64,
+];
+
 /// Per-input-slot dtype constraints for a mixed-dtype op.
 ///
 /// `supported_dtypes_for_op` returns the *union* of the dtypes on an op's
@@ -252,6 +261,13 @@ pub fn input_dtype_constraints_for_op(
         (12, U8_ONLY),
         (13, U8_ONLY),
     ];
+    // signal, frame_step, window?, frame_length?
+    static STFT_SLOTS: &[(usize, &[DataType])] = &[
+        (0, FLOAT_COMPUTE_DTYPES),
+        (1, INDEX_DTYPES),
+        (2, FLOAT_COMPUTE_DTYPES),
+        (3, INDEX_DTYPES),
+    ];
     match (op_type, domain) {
         ("MatMulNBits", "com.microsoft") => MATMUL_NBITS_SLOTS,
         ("QLinearMatMul", "") => QLINEAR_MATMUL_SLOTS,
@@ -262,6 +278,7 @@ pub fn input_dtype_constraints_for_op(
         ("Attention", "com.microsoft") => MSFT_ATTENTION_SLOTS,
         ("PackedMultiHeadAttention", "com.microsoft") => PACKED_MHA_SLOTS,
         ("QMoE", "com.microsoft") => QMOE_SLOTS,
+        ("STFT", "") => STFT_SLOTS,
         _ => &[],
     }
 }
@@ -309,6 +326,14 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
         | ("Max", "")
         | ("Sum", "")
         | ("Mean", "") => ARITH_DTYPES,
+
+        // TensorScatter moves bytes rather than computing, but it is dispatched
+        // through `dispatch_arith!`, so it claims exactly that set instead of
+        // `ALL_DTYPES`. The claim has to be honest in both directions: the
+        // plugin dtype filter requires *every* input and output dtype to be in
+        // this set, and `write_indices` is Int64 — which ARITH_DTYPES covers, so
+        // a real KV-cache node with an f16 cache and Int64 indices passes.
+        ("TensorScatter", "") => ARITH_DTYPES,
 
         // MatMul supports f32 natively + f16/bf16 via half_gemm.
         ("MatMul", "") | ("Gemm", "") => FLOAT_DTYPES,
@@ -423,6 +448,7 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
         ("HannWindow", "") | ("HammingWindow", "") | ("BlackmanWindow", "") | ("DFT", "") => {
             FLOAT_DTYPES
         }
+        ("STFT", "") => STFT_DTYPES,
 
         // com.microsoft contrib ops.
         ("LayerNormalization", "com.microsoft")
@@ -445,7 +471,9 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
         | ("LinearAttention", "com.microsoft")
         | ("GatherBlockQuantized", "com.microsoft") => FLOAT_DTYPES,
 
-        ("SimplifiedLayerNormalization", "") | ("LinearAttention", "") => FLOAT_DTYPES,
+        ("SimplifiedLayerNormalization", "")
+        | ("LinearAttention", "")
+        | ("CausalConvWithState", "") => FLOAT_DTYPES,
 
         ("MatMulNBits", "com.microsoft") => MATMUL_NBITS_DTYPES,
         // `moe.rs` widens f16/bf16 to f32, computes, and narrows on the way
@@ -534,6 +562,7 @@ pub mod hardmax;
 pub mod identity;
 pub mod index_share;
 pub mod indexing;
+pub(crate) mod int4_nibble;
 pub mod is_inf;
 pub mod is_nan;
 pub mod layernorm;
@@ -551,6 +580,8 @@ pub mod onehot;
 pub mod packed_multi_head_attention;
 pub mod packed_varlen_attention;
 pub mod pad;
+pub mod planar_block_quant;
+pub(crate) mod qgemm_native;
 pub mod qlinear_matmul;
 pub mod qmoe;
 pub mod quantization;
@@ -573,6 +604,8 @@ pub mod slice;
 pub mod softmax;
 pub mod sparse_kv_gather;
 pub mod split;
+pub mod stft;
+pub mod tensor_scatter;
 pub mod transpose;
 pub mod unary_math;
 pub mod unique;
@@ -1062,6 +1095,14 @@ fn build_cpu_registry_recorded_inner(
         OpKey::new("CausalConvWithState", "com.microsoft", 1),
         Box::new(causal_conv::CausalConvWithStateFactory),
     );
+    // Standard ONNX-domain spelling, opset 27. Same contract as the contrib op
+    // (rank-3 `[B, C, L]`, depthwise `[C, 1, k]` weight, `k-1` carry state,
+    // `none`/`silu`/`swish` activation), so it reuses the same kernel rather
+    // than growing a second implementation to keep in step.
+    rec.register(
+        OpKey::new("CausalConvWithState", "", 27),
+        Box::new(causal_conv::CausalConvWithStateFactory),
+    );
     rec.register(
         OpKey::new("LinearAttention", "com.microsoft", 1),
         Box::new(linear_attention::LinearAttentionFactory),
@@ -1478,6 +1519,11 @@ fn build_cpu_registry_recorded_inner(
     rec.register(
         OpKey::new("OneHot", "", 9),
         Box::new(indexing::OneHotFactory),
+    ); // TensorScatter (opset 24) standardizes the KV-cache update that GenAI
+    // decoders previously expressed as ScatterND or a contrib op.
+    rec.register(
+        OpKey::new("TensorScatter", "", 24),
+        Box::new(tensor_scatter::TensorScatterFactory),
     );
     rec.register(
         OpKey::new("OneHot", "", 11),
@@ -1517,6 +1563,7 @@ fn build_cpu_registry_recorded_inner(
         Box::new(window::BlackmanWindowFactory),
     );
     rec.register(OpKey::new("DFT", "", 17), Box::new(dft::DftFactory));
+    rec.register(OpKey::new("STFT", "", 17), Box::new(stft::StftFactory));
     rec.register(
         OpKey::new("BitwiseAnd", "", 18),
         Box::new(bitwise::BitwiseAndFactory),
@@ -1924,6 +1971,7 @@ pub(crate) mod testutil {
     use onnx_runtime_ir::{DataType, DeviceId, compute_contiguous_strides};
 
     /// A dense f32 buffer plus the shape/stride metadata a view needs.
+    #[derive(Debug)]
     pub struct Owned {
         pub bytes: Vec<u8>,
         pub shape: Vec<usize>,
@@ -2120,28 +2168,36 @@ pub(crate) mod testutil {
 
         pub fn to_f32(&self) -> Vec<f32> {
             self.bytes
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect()
         }
 
         pub fn to_f64(&self) -> Vec<f64> {
             self.bytes
-                .chunks_exact(8)
-                .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|c| f64::from_le_bytes(*c))
                 .collect()
         }
 
         pub fn to_i64(&self) -> Vec<i64> {
             self.bytes
-                .chunks_exact(8)
-                .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|c| i64::from_le_bytes(*c))
                 .collect()
         }
 
         pub fn to_i32(&self) -> Vec<i32> {
             self.bytes
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect()
         }
@@ -2153,7 +2209,9 @@ pub(crate) mod testutil {
         /// Widen an f16 buffer to f32 for comparison.
         pub fn to_f16_as_f32(&self) -> Vec<f32> {
             self.bytes
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
                 .collect()
         }
@@ -2162,7 +2220,9 @@ pub(crate) mod testutil {
         /// f32-reinterpret corruption of NaN/inf/denormal inputs).
         pub fn to_u16_bits(&self) -> Vec<u16> {
             self.bytes
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
                 .collect()
         }
@@ -2170,7 +2230,9 @@ pub(crate) mod testutil {
         /// Widen a bf16 buffer to f32 for comparison.
         pub fn to_bf16_as_f32(&self) -> Vec<f32> {
             self.bytes
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32())
                 .collect()
         }
@@ -2219,6 +2281,20 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn stft_advertises_only_its_f32_compute_and_scalar_edge_dtypes() {
+        let dtypes = supported_dtypes_for_op("STFT", "");
+        assert_eq!(dtypes, STFT_DTYPES);
+        assert!(!dtypes.contains(&DataType::Float64));
+
+        let slots = input_dtype_constraints_for_op("STFT", "");
+        assert_eq!(slots[0], (0, FLOAT_COMPUTE_DTYPES));
+        assert_eq!(slots[1], (1, INDEX_DTYPES));
+        assert_eq!(slots[2], (2, FLOAT_COMPUTE_DTYPES));
+        assert_eq!(slots[3], (3, INDEX_DTYPES));
+    }
+
     use super::*;
     use crate::strided::view_in_bounds;
     use testutil::Owned;
@@ -2495,8 +2571,12 @@ mod tests {
         // Conv is always registered, using the pure-Rust reference kernel without
         // `mlas` and the optimized implementation with it.
         // `IsNaN` (opset-9 float NaN predicate) adds one default-domain entry.
+        // `TensorScatter` (opset-24 KV-cache update) adds one more, and the
+        // standard-domain `CausalConvWithState` (opset 27) adds one alongside
+        // its `com.microsoft` spelling.
+        // `STFT` adds its opset-17 standard-domain registration.
         let mlas_registrations = if cfg!(feature = "mlas") { 6 } else { 0 };
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 102 + mlas_registrations);
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 105 + mlas_registrations);
         for op in PHASE1_OPS {
             assert!(reg.lookup(op, "", 21).is_some(), "missing factory for {op}");
         }
@@ -2513,6 +2593,7 @@ mod tests {
         assert!(reg.lookup("HammingWindow", "", 17).is_some());
         assert!(reg.lookup("BlackmanWindow", "", 17).is_some());
         assert!(reg.lookup("DFT", "", 17).is_some());
+        assert!(reg.lookup("STFT", "", 17).is_some());
         assert!(reg.lookup("Conv", "", 22).is_some());
         assert!(reg.lookup("LpPool", "", 18).is_some());
         assert!(reg.lookup("GlobalLpPool", "", 2).is_some());

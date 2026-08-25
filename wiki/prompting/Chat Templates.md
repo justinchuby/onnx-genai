@@ -111,10 +111,11 @@ Muse Glimmer 用 `<|eot|>` / `<|eom|>` 表达完全相同的一对语义。所�
 `eos_token_id` 时,需要把"轮结束"和"消息结束"都算作停止条件,并区别对待:
 遇到 `eot` 是本轮结束交还给用户,遇到 `eom` 通常意味着**该执行工具了**。
 
-## 三、"模型是不是从模板后面开始预测第一个字?"
+## 三、生成从模板的末尾开始
 
-**是的,而且可以说得更精确一点。**你的理解在方向上完全正确,下面是具体机制,以及
-一个关于中文的重要修正。
+模板渲染完成后,序列停在一个"轮到助手开口、但一个字都还没说"的位置,模型正是从这里
+接着往下写。这一节把这个过程拆成四步。最后一小节澄清一个常见的说法偏差:模型推进的
+单位是 token 而不是字 —— 这对中文尤其要紧。
 
 ### 第一步:`add_generation_prompt`
 
@@ -130,8 +131,8 @@ Muse Glimmer 用 `<|eot|>` / `<|eom|>` 表达完全相同的一对语义。所�
 (上面这段就是 Muse Glimmer 模板的最后三行,一字未改。)
 
 这一步的意义是:把序列停在一个"轮到助手说话、但一个字都还没说"的位置。
-推理时用 `True`;而当你是在把一段**完整的历史对话**渲染出来做日志或训练回放时用
-`False`,因为那时最后一条助手消息已经有内容了,不需要再挂一个空的开头。
+推理时用 `True`;而把一段**完整的历史对话**渲染出来做日志或训练回放时用 `False`,
+因为那时最后一条助手消息已经有内容了,不需要再挂一个空的开头。
 
 ### 第二步:Prefill,一次前向
 
@@ -167,7 +168,8 @@ flowchart LR
 
 ### 一个必须澄清的地方:是"token",不是"字"
 
-你说的"预测第一个字",严格讲是**预测第一个 token**。对中文来说这两者差别很大:
+上面这一步常被说成"预测第一个字",严格讲是**预测第一个 token**。对中文来说这两者
+差别很大:
 
 现代 tokenizer(BPE / SentencePiece / tiktoken 系)主要在 UTF-8 **字节序列**上训练,
 一个汉字**经常被切成 2–3 个子字符级 token**,而不是直觉上的"1 个汉字 = 1 个 token"。
@@ -231,16 +233,8 @@ flowchart LR
 
 ## 五、案例精读:Muse Glimmer 的 channel(收件人)设计
 
-你提到"看到一个模型的模板里有 ToSelf、ToUser 这类 channel"。先澄清两件事,再讲设计。
-
-> [!warning] 名字的澄清
-> 这个模型是 **Muse Glimmer**(Meta Superintelligence Labs,2026 年 8 月,30B,
-> Apache 2.0,开放权重),不是 "Llama 3-V"。顺带一提,`Llama3-V` 是 2024 年一个
-> 斯坦福学生项目、后被证实大量抄袭 MiniCPM-Llama3-V 2.5,与 Meta 无关,不要混淆。
->
-> 另外,模板里的实际写法**不是** `ToSelf`/`ToUser` 这样的驼峰名,而是 `to=` 收件人
-> 语法:`to=self`、`to=user`、`to=<工具名>`。下面所有代码均逐字引自
-> `meta-models/Muse-Glimmer-30B` 的 `chat_template.jinja`。
+Muse Glimmer 的模板用的是 `to=` **收件人**语法:`to=self`、`to=user`、`to=<工具名>`。
+下面所有代码均逐字引自 `meta-models/Muse-Glimmer-30B` 的 `chat_template.jinja`。
 
 ### 核心思想:助手的每条消息都有一个"收件人"
 
@@ -362,7 +356,7 @@ schema + 一个示例调用;Llama 3.1 则靠 system 里的 `Environment: ipython
 
 | 模型 | 语法 |
 |---|---|
-| Llama 3.1/3.2 | `<\|python_tag\|>{"type":"function","name":...,"parameters":{...}}<\|eom_id\|>` |
+| Llama 3.1/3.2 | 裸 JSON `{"name": ..., "parameters": {...}}` + `<\|eot_id\|>`(见下方更正) |
 | Qwen / Hermes 系 | `<tool_call>\n{"name": ..., "arguments": {...}}\n</tool_call>` |
 | Muse Glimmer | `<atem:function_calls><atem:invoke name="..."><atem:parameter name="...">…` |
 
@@ -374,6 +368,13 @@ Muse Glimmer 这套 XML 式的 ATEM 语法有个有意思的工程细节:模板�
     {{- raise_exception('Muse Glimmer ATEM chat template requires tool_call.function.arguments
         to be a dict (mapping); a JSON string cannot be parsed in the HF jinja sandbox.') -}}
 ```
+
+> [!warning] 对 Llama 的一处常见误解
+> `<|python_tag|>` **不是**普通工具调用的语法。读模板可以看到,它只在
+> `builtin_tools is defined` 且被调函数属于内置工具(`brave_search`、`wolfram_alpha`
+> 这类)时才出现;`<|eom_id|>` 同样只在 `builtin_tools is defined` 时才用。只传普通的
+> `tools=[...]`,实际渲染出来是裸 JSON 加 `<|eot_id|>`,而且键名是 `parameters`
+> 不是 `arguments`。实测见 [[prompting/Chat Template Survey]]。
 
 原因说得很清楚:HF 的 Jinja 沙箱里没有 JSON 解析器,所以**必须**由调用方传 dict。
 这也正是 HF 约定与 OpenAI wire format 的一个经典差异 —— OpenAI 的
@@ -432,7 +433,11 @@ HF 文档明确警告:多数模型一次只发一个调用;支持并行的模型
   Llama 3.2 模板在 `tool_calls` 多于一个时直接 `raise_exception`。
 - Muse Glimmer 用 `for` 循环 + `<|eom|>` 串联,原生支持多个。
 
-所以写转接层时,"能不能并行"必须按模型查,不能想当然。
+所以写转接层时,"能不能并行"必须按模型查,不能想当然。Llama 3.1 模板里那一行的原文是
+`raise_exception("This model only supports single tool-calls at once!")`。
+
+更完整的横向对比 —— 包括各家工具调用的真实语法、工具结果角色的九种写法,以及三份
+**会静默丢掉 `tool_calls` 而不报错**的模板 —— 见 [[prompting/Chat Template Survey]]。
 
 ## 七、给实现者的一份检查清单
 
@@ -460,6 +465,7 @@ HF 文档明确警告:多数模型一次只发一个调用;支持并行的模型
 
 ## 相关笔记
 
+- [[prompting/Chat Template Survey]] —— 横向调研:54 份真实模板的实测对比,工具调用格式全览
 - [[memory/Virtual Memory for KV Cache]] —— 渲染出来的这串 token 在显存里是怎么被安置的
 - [[memory/Memory Management for Beginners]] —— 内存管理的第一性原理介绍
 - [[architecture/Inference Request Lifecycle]] —— 一个请求从进入到产出的完整路径

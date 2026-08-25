@@ -823,12 +823,18 @@ pub(super) fn run_attention_phase2a(
     // The governed path hands us pre-reserved scratch carved from the executor's
     // workspace; the compatibility/opt-out path owns disposable scratch and must
     // free it here. `owned` records which contract applies.
+    //
+    // The cuBLASLt workspace is *not* part of that ownership: it carries no
+    // state between calls and this runtime's stream is serial, so one buffer
+    // per stream is exactly as correct as one per call. Allocating it per call
+    // cost WORKSPACE_BYTES for every attention op — hundreds of MiB of raw
+    // device memory across a 32-layer prefill that needs 32 MiB at a time.
     let owned = scratch.is_none();
     let (scores_buf, workspace, workspace_bytes) = match scratch {
         Some(scratch) => (scratch.scores, scratch.workspace, scratch.workspace_bytes),
         None => {
             let scores_buf = runtime.alloc_raw(scores_elems * elem_size as usize)?;
-            let workspace = match runtime.alloc_raw(WORKSPACE_BYTES) {
+            let workspace = match runtime.shared_blas_workspace(WORKSPACE_BYTES) {
                 Ok(workspace) => workspace,
                 Err(error) => {
                     // SAFETY: `scores_buf` was allocated immediately above and
@@ -952,12 +958,15 @@ pub(super) fn run_attention_phase2a(
         runtime.synchronize()
     })();
     if owned {
-        // SAFETY: both pointers came from this runtime and are freed exactly
+        // SAFETY: `scores_buf` came from this runtime and is freed exactly
         // once; the governed path never enters this branch and leaves scratch
         // lifetime to the executor-owned workspace.
+        //
+        // The cuBLASLt workspace is deliberately NOT freed here: it is the
+        // runtime's shared buffer, kept alive for the next call. Freeing it
+        // would hand the following GEMM a dangling pointer.
         let free_scores = unsafe { runtime.free_raw(scores_buf) };
-        let free_ws = unsafe { runtime.free_raw(workspace) };
-        result.and(free_scores).and(free_ws)
+        result.and(free_scores)
     } else {
         result
     }
@@ -1039,17 +1048,7 @@ mod tests {
     use super::*;
 
     fn rt() -> Option<Arc<CudaRuntime>> {
-        // `CudaRuntime::new` may *panic* (not just `Err`) when a CUDA library is
-        // absent: cudarc's dynamic loader `expect()`s the shared object on first
-        // use. Catch that so these GPU-gated tests skip cleanly on a host without
-        // libcuda/libcublasLt, instead of failing the CPU-only suite.
-        let prev = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-        let runtime = std::panic::catch_unwind(|| CudaRuntime::new(0).ok().map(Arc::new))
-            .ok()
-            .flatten();
-        std::panic::set_hook(prev);
-        runtime
+        crate::test_support::maybe_runtime()
     }
 
     #[test]

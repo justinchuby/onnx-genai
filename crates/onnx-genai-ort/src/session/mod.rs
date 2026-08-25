@@ -3,11 +3,13 @@
 use std::ffi::{CStr, CString};
 use std::path::Path;
 use std::ptr::NonNull;
+use std::sync::Arc;
 
 pub use onnx_genai_runtime_config::CudaAttentionMode;
 #[cfg(test)]
 use onnx_genai_runtime_config::{EpSelection, ExecutionProviderEntry};
 
+use crate::thread_affinity::{OwnerThread, ThreadAccess, ThreadAffinity};
 use crate::{Allocator, DataType, Environment, IoBinding, MemoryInfo, OrtError, Result, Value};
 
 #[cfg(feature = "cuda")]
@@ -345,6 +347,134 @@ impl From<OrtError> for SessionAttemptError {
     }
 }
 
+/// Create one ORT session, trying the requested execution-provider chain and its
+/// declared fallbacks in order.
+///
+/// Shared by the from-path and from-bytes constructors so an execution island
+/// linked in memory selects its provider exactly like a package component loaded
+/// from disk. Returns the session pointer, the options that actually succeeded,
+/// whether the whole session fell back to CPU, and every provider that was tried
+/// and rejected along the way.
+fn create_session_with_provider_fallback(
+    options: &SessionOptions,
+    create_session: impl Fn(
+        &SessionOptions,
+    ) -> std::result::Result<
+        *mut onnx_genai_ort_sys::OrtSession,
+        SessionAttemptError,
+    >,
+) -> Result<(
+    *mut onnx_genai_ort_sys::OrtSession,
+    SessionOptions,
+    bool,
+    Vec<SkippedExecutionProvider>,
+)> {
+    let mut candidates = execution_provider_candidates(options);
+    let mut skipped_providers: Vec<SkippedExecutionProvider> = Vec::new();
+    let mut last_error = None;
+    let mut loaded = None;
+    let mut index = 0;
+
+    while index < candidates.len() {
+        if candidates[index].providers.is_empty() {
+            index += 1;
+            continue;
+        }
+        let candidate_plan = candidates[index].clone();
+        let candidate = options.for_execution_providers(
+            candidate_plan.providers.clone(),
+            candidate_plan.allow_cpu_nodes,
+        );
+        match create_session(&candidate) {
+            Ok(ptr) => {
+                loaded = Some((ptr, candidate, candidate_plan.whole_session_cpu_fallback));
+                break;
+            }
+            Err(err)
+                if candidate_plan
+                    .providers
+                    .iter()
+                    .any(ResolvedEp::is_unsupported_name) =>
+            {
+                return Err(err.into_ort_error());
+            }
+            Err(SessionAttemptError::ProviderAppend(append_error)) => {
+                let failed_provider = append_error.provider_name.clone();
+                let failed_position = append_error.provider_index + 1;
+                let reason = append_error.source.to_string();
+                tracing::warn!(
+                    "ORT session creation failed while appending execution provider {failed_provider} (position {failed_position}) in requested chain {}; removing only that provider and retrying the remaining explicitly requested alternatives: {}",
+                    provider_names(&candidate_plan.providers),
+                    reason
+                );
+                if !skipped_providers
+                    .iter()
+                    .any(|provider| provider.name == failed_provider)
+                {
+                    skipped_providers.push(SkippedExecutionProvider {
+                        name: failed_provider.clone(),
+                        reason: reason.clone(),
+                    });
+                }
+                prune_failed_provider_from_candidates(&mut candidates[index..], &failed_provider);
+                if candidates[index].providers.is_empty() {
+                    index += 1;
+                }
+                last_error = Some(append_error.source);
+            }
+            Err(err)
+                if candidates[index + 1..]
+                    .iter()
+                    .any(|plan| !plan.providers.is_empty()) =>
+            {
+                let err = err.into_ort_error();
+                let current_first = candidate_plan
+                    .providers
+                    .first()
+                    .map(|provider| provider.selection.name.as_str());
+                let next_first = candidates[index + 1..]
+                    .iter()
+                    .find(|plan| !plan.providers.is_empty())
+                    .and_then(|plan| {
+                        plan.providers
+                            .first()
+                            .map(|provider| provider.selection.name.as_str())
+                    });
+                tracing::warn!(
+                    "ORT session creation failed for requested execution provider chain {}; trying the next explicitly requested provider alternative: {err}",
+                    provider_names(&candidate_plan.providers)
+                );
+                if current_first != next_first
+                    && let Some(skipped) = current_first
+                    && !skipped_providers
+                        .iter()
+                        .any(|provider| provider.name == skipped)
+                {
+                    skipped_providers.push(SkippedExecutionProvider {
+                        name: skipped.to_string(),
+                        reason: err.to_string(),
+                    });
+                }
+                last_error = Some(err);
+                index += 1;
+            }
+            Err(err) => {
+                last_error = Some(err.into_ort_error());
+                break;
+            }
+        }
+    }
+
+    let (ptr, effective_options, cpu_fallback_used) = if let Some(loaded) = loaded {
+        loaded
+    } else {
+        return Err(last_error.unwrap_or_else(|| {
+            OrtError::InvalidArgument("no execution provider was available to try".into())
+        }));
+    };
+    Ok((ptr, effective_options, cpu_fallback_used, skipped_providers))
+}
+
 /// An ORT inference session (a loaded model).
 pub struct Session {
     ptr: NonNull<onnx_genai_ort_sys::OrtSession>,
@@ -369,9 +499,132 @@ pub struct Session {
     node_cpu_fallback_allowed: bool,
     /// Whether ORT actually placed nodes on CPU through internal fallback.
     node_cpu_fallback_used: Option<bool>,
+    /// Guards `Run` against overlapping calls when this session's providers or
+    /// graph-capture state make concurrent runs unsafe. Sessions that
+    /// [`Session::supports_concurrent_run`] are guarded as
+    /// [`ThreadAffinity::Shared`], i.e. the guard costs one branch and never
+    /// refuses.
+    run_affinity: OwnerThread,
 }
 
 impl Session {
+    /// Load an ONNX model from serialized protobuf bytes.
+    ///
+    /// This is used by workflow execution-island lowering, which links several
+    /// package components into one optimizer-visible ORT session without
+    /// materializing a generated model file.
+    pub fn from_model_bytes(
+        env: &Environment,
+        model_name: impl Into<String>,
+        bytes: &[u8],
+        options: SessionOptions,
+    ) -> Result<Self> {
+        Self::from_model_bytes_with_external_files(env, model_name, bytes, &[], options)
+    }
+
+    /// Load an in-memory model and supply its external-data files from memory.
+    ///
+    /// File names must exactly match `TensorProto.external_data.location`.
+    /// ORT copies the referenced initializer ranges during session creation, so
+    /// the provided buffers need not outlive this call.
+    pub fn from_model_bytes_with_external_files(
+        env: &Environment,
+        model_name: impl Into<String>,
+        bytes: &[u8],
+        external_files: &[(String, Vec<u8>)],
+        options: SessionOptions,
+    ) -> Result<Self> {
+        let api = crate::error::api()?;
+        let create_session = |opts: &SessionOptions| -> std::result::Result<
+            *mut onnx_genai_ort_sys::OrtSession,
+            SessionAttemptError,
+        > {
+            let session_options = RawSessionOptions::new(env, opts)?;
+            if !external_files.is_empty() {
+                let add = api.AddExternalInitializersFromFilesInMemory.ok_or(
+                    OrtError::ApiUnavailable("AddExternalInitializersFromFilesInMemory"),
+                )?;
+                #[cfg(not(windows))]
+                let names = external_files
+                    .iter()
+                    .map(|(name, _)| {
+                        CString::new(name.as_str()).map_err(|_| {
+                            OrtError::InvalidArgument(format!(
+                                "external initializer file name contains NUL: {name}"
+                            ))
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                #[cfg(windows)]
+                let names = external_files
+                    .iter()
+                    .map(|(name, _)| {
+                        if name.contains('\0') {
+                            return Err(OrtError::InvalidArgument(format!(
+                                "external initializer file name contains NUL: {name}"
+                            )));
+                        }
+                        Ok(name
+                            .encode_utf16()
+                            .chain(std::iter::once(0))
+                            .collect::<Vec<_>>())
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let name_ptrs = names.iter().map(|name| name.as_ptr()).collect::<Vec<_>>();
+                let buffers = external_files
+                    .iter()
+                    .map(|(_, bytes)| bytes.as_ptr().cast_mut().cast())
+                    .collect::<Vec<_>>();
+                let lengths = external_files
+                    .iter()
+                    .map(|(_, bytes)| bytes.len())
+                    .collect::<Vec<_>>();
+                // SAFETY: all arrays contain `external_files.len()` entries
+                // and their strings/buffers remain live through the call.
+                crate::error::check_status(unsafe {
+                    add(
+                        session_options.as_ptr().cast_mut(),
+                        name_ptrs.as_ptr(),
+                        buffers.as_ptr(),
+                        lengths.as_ptr(),
+                        external_files.len(),
+                    )
+                })?;
+            }
+            let create = api
+                .CreateSessionFromArray
+                .ok_or(OrtError::ApiUnavailable("CreateSessionFromArray"))?;
+            let mut ptr = std::ptr::null_mut();
+            // SAFETY: `env` and `session_options` are live handles, `bytes`
+            // remains valid for the call, and `ptr` is an out-parameter.
+            crate::error::check_status(unsafe {
+                create(
+                    env.as_ptr(),
+                    bytes.as_ptr().cast(),
+                    bytes.len(),
+                    session_options.as_ptr(),
+                    &mut ptr,
+                )
+            })?;
+            Ok(ptr)
+        };
+        // An in-memory model picks its execution provider exactly like a model
+        // loaded from disk: an execution island is linked package components, so
+        // it must not silently land on a different provider than the components
+        // it replaces.
+        let (ptr, effective_options, cpu_fallback_used, skipped_providers) =
+            create_session_with_provider_fallback(&options, create_session)?;
+        let model_name = model_name.into();
+        tracing::info!("Loading in-memory model: {model_name}");
+        Self::from_created_session(
+            ptr,
+            model_name,
+            &effective_options,
+            cpu_fallback_used,
+            skipped_providers,
+        )
+    }
+
     /// Load a model from an ONNX file.
     pub fn new(env: &Environment, path: &Path, options: SessionOptions) -> Result<Self> {
         if !path.exists() {
@@ -459,115 +712,30 @@ impl Session {
             Ok(ptr)
         };
 
-        let mut candidates = execution_provider_candidates(&options);
-        let mut skipped_providers: Vec<SkippedExecutionProvider> = Vec::new();
-        let mut last_error = None;
-        let mut loaded = None;
-        let mut index = 0;
+        let (ptr, effective_options, cpu_fallback_used, skipped_providers) =
+            create_session_with_provider_fallback(&options, create_session)?;
+        tracing::info!("Loading model: {}", path.display());
 
-        while index < candidates.len() {
-            if candidates[index].providers.is_empty() {
-                index += 1;
-                continue;
-            }
-            let candidate_plan = candidates[index].clone();
-            let candidate = options.for_execution_providers(
-                candidate_plan.providers.clone(),
-                candidate_plan.allow_cpu_nodes,
-            );
-            match create_session(&candidate) {
-                Ok(ptr) => {
-                    loaded = Some((ptr, candidate, candidate_plan.whole_session_cpu_fallback));
-                    break;
-                }
-                Err(err)
-                    if candidate_plan
-                        .providers
-                        .iter()
-                        .any(ResolvedEp::is_unsupported_name) =>
-                {
-                    return Err(err.into_ort_error());
-                }
-                Err(SessionAttemptError::ProviderAppend(append_error)) => {
-                    let failed_provider = append_error.provider_name.clone();
-                    let failed_position = append_error.provider_index + 1;
-                    let reason = append_error.source.to_string();
-                    tracing::warn!(
-                        "ORT session creation failed while appending execution provider {failed_provider} (position {failed_position}) in requested chain {}; removing only that provider and retrying the remaining explicitly requested alternatives: {}",
-                        provider_names(&candidate_plan.providers),
-                        reason
-                    );
-                    if !skipped_providers
-                        .iter()
-                        .any(|provider| provider.name == failed_provider)
-                    {
-                        skipped_providers.push(SkippedExecutionProvider {
-                            name: failed_provider.clone(),
-                            reason: reason.clone(),
-                        });
-                    }
-                    prune_failed_provider_from_candidates(
-                        &mut candidates[index..],
-                        &failed_provider,
-                    );
-                    if candidates[index].providers.is_empty() {
-                        index += 1;
-                    }
-                    last_error = Some(append_error.source);
-                }
-                Err(err)
-                    if candidates[index + 1..]
-                        .iter()
-                        .any(|plan| !plan.providers.is_empty()) =>
-                {
-                    let err = err.into_ort_error();
-                    let current_first = candidate_plan
-                        .providers
-                        .first()
-                        .map(|provider| provider.selection.name.as_str());
-                    let next_first = candidates[index + 1..]
-                        .iter()
-                        .find(|plan| !plan.providers.is_empty())
-                        .and_then(|plan| {
-                            plan.providers
-                                .first()
-                                .map(|provider| provider.selection.name.as_str())
-                        });
-                    tracing::warn!(
-                        "ORT session creation failed for requested execution provider chain {}; trying the next explicitly requested provider alternative: {err}",
-                        provider_names(&candidate_plan.providers)
-                    );
-                    if current_first != next_first
-                        && let Some(skipped) = current_first
-                        && !skipped_providers
-                            .iter()
-                            .any(|provider| provider.name == skipped)
-                    {
-                        skipped_providers.push(SkippedExecutionProvider {
-                            name: skipped.to_string(),
-                            reason: err.to_string(),
-                        });
-                    }
-                    last_error = Some(err);
-                    index += 1;
-                }
-                Err(err) => {
-                    last_error = Some(err.into_ort_error());
-                    break;
-                }
-            }
-        }
+        Self::from_created_session(
+            ptr,
+            path.display().to_string(),
+            &effective_options,
+            cpu_fallback_used,
+            skipped_providers,
+        )
+    }
 
-        let (ptr, effective_options, cpu_fallback_used) = if let Some(loaded) = loaded {
-            loaded
-        } else {
-            return Err(last_error.unwrap_or_else(|| {
-                OrtError::InvalidArgument("no execution provider was available to try".into())
-            }));
-        };
+    /// Record a freshly created ORT session together with the provider outcome
+    /// that produced it, querying the graph I/O and CPU-fallback placement once.
+    fn from_created_session(
+        ptr: *mut onnx_genai_ort_sys::OrtSession,
+        model_path: String,
+        effective_options: &SessionOptions,
+        cpu_fallback_used: bool,
+        skipped_providers: Vec<SkippedExecutionProvider>,
+    ) -> Result<Self> {
         let node_cpu_fallback_allowed =
-            requested_non_cpu_provider(&effective_options) && effective_options.allow_cpu_fallback;
-        let effective_providers = effective_options.execution_providers.clone();
+            requested_non_cpu_provider(effective_options) && effective_options.allow_cpu_fallback;
         let ptr = NonNull::new(ptr).ok_or(OrtError::NullPointer)?;
         let node_cpu_fallback_used = query_node_cpu_fallback_used(ptr, node_cpu_fallback_allowed);
         let inputs = query_io(ptr.as_ptr(), IoKind::Input)?;
@@ -575,26 +743,36 @@ impl Session {
         let input_names = inputs.iter().map(|info| info.name.clone()).collect();
         let output_names = outputs.iter().map(|info| info.name.clone()).collect();
 
-        tracing::info!("Loading model: {}", path.display());
+        let execution_providers = effective_options.execution_providers.clone();
+        let graph_capture = effective_options.graph_capture;
+        let run_affinity = OwnerThread::new(
+            "Session",
+            match concurrent_run_support(&execution_providers, graph_capture) {
+                ConcurrentRunSupport::Supported => ThreadAffinity::Shared,
+                ConcurrentRunSupport::Unsupported { .. } => ThreadAffinity::Exclusive,
+            },
+        );
 
         Ok(Self {
             ptr,
-            _model_path: path.display().to_string(),
+            _model_path: model_path,
             input_names,
             output_names,
             inputs,
             outputs,
-            execution_providers: effective_providers,
-            graph_capture: effective_options.graph_capture,
+            execution_providers,
+            graph_capture,
             cpu_fallback_used,
             skipped_providers,
             node_cpu_fallback_allowed,
             node_cpu_fallback_used,
+            run_affinity,
         })
     }
 
     /// Run inference with named inputs, returns named outputs.
     pub fn run(&self, inputs: &[(&str, &Value)]) -> Result<Vec<Value>> {
+        let _access = self.enter_run("run")?;
         let input_names: Vec<CString> = inputs
             .iter()
             .map(|(name, _)| {
@@ -650,7 +828,9 @@ impl Session {
     }
 
     /// Run inference using pre-bound I/O (zero-copy for device tensors).
-    pub fn run_with_binding(&self, binding: &IoBinding) -> Result<()> {
+    pub fn run_with_binding(&self, binding: &IoBinding<'_>) -> Result<()> {
+        let _session_access = self.enter_run("run_with_binding")?;
+        let _binding_access = binding.enter_run("run_with_binding")?;
         let api = crate::error::api()?;
         let run = api
             .RunWithBinding
@@ -665,6 +845,47 @@ impl Session {
     /// Whether this session was created with EP graph capture enabled.
     pub fn graph_capture(&self) -> bool {
         self.graph_capture
+    }
+
+    /// Whether ORT permits several threads to run this session at once.
+    ///
+    /// A session worker pool may only share one [`Session`] across threads when
+    /// this is `true`; otherwise each worker needs its own session. It answers
+    /// from the providers this session actually resolved to plus its
+    /// graph-capture state, never from a model or vendor name, and fails closed
+    /// when a provider does not declare [`capability::CONCURRENT_RUN`].
+    ///
+    /// Use [`Session::concurrent_run_support`] when the caller has to explain
+    /// the refusal.
+    #[must_use]
+    pub fn supports_concurrent_run(&self) -> bool {
+        matches!(
+            self.concurrent_run_support(),
+            ConcurrentRunSupport::Supported
+        )
+    }
+
+    /// [`Session::supports_concurrent_run`], with the reason for a refusal.
+    #[must_use]
+    pub fn concurrent_run_support(&self) -> ConcurrentRunSupport {
+        concurrent_run_support(&self.execution_providers, self.graph_capture)
+    }
+
+    /// Take this session for one run.
+    ///
+    /// Sessions whose providers support concurrent `Run` are shared, so this
+    /// costs a branch and never refuses. For the rest — a graph-capturing
+    /// session above all, whose capture/replay state machine lives in the
+    /// session and not in the call — it turns a second concurrent run into a
+    /// named error instead of a corrupted capture.
+    fn enter_run(&self, operation: &'static str) -> Result<ThreadAccess<'_>> {
+        self.run_affinity.enter(operation).map_err(Into::into)
+    }
+
+    /// The guard that decides whether two threads may run this session at once.
+    #[must_use]
+    pub fn run_thread_affinity(&self) -> &OwnerThread {
+        &self.run_affinity
     }
 
     /// Execution providers this session actually runs on, in priority order.
@@ -733,7 +954,7 @@ impl Session {
     /// leaving the variable-shape prefill uncaptured.
     pub fn run_with_binding_graph(
         &self,
-        binding: &IoBinding,
+        binding: &IoBinding<'_>,
         graph_annotation_id: i32,
     ) -> Result<()> {
         self.run_with_binding_graph_phased(binding, graph_annotation_id)
@@ -743,9 +964,15 @@ impl Session {
     /// Run with graph annotation while distinguishing setup from invocation failures.
     pub fn run_with_binding_graph_phased(
         &self,
-        binding: &IoBinding,
+        binding: &IoBinding<'_>,
         graph_annotation_id: i32,
     ) -> std::result::Result<(), RunPhaseError> {
+        let _session_access = self
+            .enter_run("run_with_binding_graph")
+            .map_err(RunPhaseError::Setup)?;
+        let _binding_access = binding
+            .enter_run("run_with_binding_graph")
+            .map_err(RunPhaseError::Setup)?;
         let api = crate::error::api().map_err(RunPhaseError::Setup)?;
         let run = api
             .RunWithBinding
@@ -880,19 +1107,6 @@ impl Session {
         result
     }
 
-    /// Detect whether model metadata declares ORT past/present share-buffer KV.
-    pub fn past_present_share_buffer_supported(&self) -> bool {
-        ["past_present_share_buffer", "past.present.share_buffer"]
-            .iter()
-            .filter_map(|key| self.custom_metadata_value(key).ok().flatten())
-            .any(|value| {
-                matches!(
-                    value.to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                )
-            })
-    }
-
     pub(crate) fn as_mut_ptr(&self) -> *mut onnx_genai_ort_sys::OrtSession {
         self.ptr.as_ptr()
     }
@@ -947,7 +1161,30 @@ impl Session {
     /// allocator. If a device EP is selected but ORT cannot produce a matching
     /// allocator (e.g. the EP silently fell back to CPU), the error is logged
     /// and `Ok(None)` is returned so decode still works via CPU buffers.
-    pub(crate) fn device_kv_allocator(&self) -> Result<Option<Allocator>> {
+    pub fn device_kv_allocator(&self) -> Result<Option<Allocator<'_>>> {
+        self.device_kv_allocator_with(|memory_info| {
+            Allocator::for_session_device(self, memory_info)
+        })
+    }
+
+    /// Same as [`Session::device_kv_allocator`], but the allocator co-owns the
+    /// session instead of borrowing it.
+    ///
+    /// An owner that stores the session beside the allocator (an execution
+    /// island, a workflow component cache) cannot name the borrow the borrowed
+    /// form needs, so it takes a strong reference instead: ORT then releases
+    /// the allocator before the session no matter which field the owner
+    /// declared first.
+    pub fn shared_device_allocator(session: &Arc<Session>) -> Result<Option<Allocator<'static>>> {
+        session.device_kv_allocator_with(|memory_info| {
+            Allocator::for_shared_session_device(Arc::clone(session), memory_info)
+        })
+    }
+
+    fn device_kv_allocator_with<'a>(
+        &self,
+        create: impl Fn(MemoryInfo) -> Result<Allocator<'a>>,
+    ) -> Result<Option<Allocator<'a>>> {
         if !self
             .execution_providers
             .iter()
@@ -974,7 +1211,7 @@ impl Session {
             }
         }) {
             let memory_info = MemoryInfo::cuda(device_id)?;
-            return match Allocator::for_session_device(self.ptr.as_ptr(), memory_info) {
+            return match create(memory_info) {
                 Ok(allocator) => {
                     tracing::info!(device_id, "allocating shared GQA KV on CUDA device memory");
                     Ok(Some(allocator))
@@ -1004,7 +1241,7 @@ impl Session {
                 return Ok(None);
             }
         };
-        match Allocator::for_session_device(self.ptr.as_ptr(), memory_info) {
+        match create(memory_info) {
             Ok(allocator) => {
                 tracing::warn!(
                     "ONNX_GENAI_DEVICE_KV=1: allocating shared GQA KV on the WebGPU device allocator (EXPERIMENTAL; ORT 1.27 WebGPU may segfault during multi-step decode)"
@@ -1017,6 +1254,50 @@ impl Session {
                 );
                 Ok(None)
             }
+        }
+    }
+
+    /// Create an allocator for this session's execution device when supported.
+    ///
+    /// This is the generic counterpart to the decode KV allocation path. It is
+    /// used by execution-island I/O binding so CUDA graph capture sees stable,
+    /// device-resident input and output addresses.
+    pub fn device_allocator(&self) -> Result<Option<Allocator<'_>>> {
+        self.device_kv_allocator()
+    }
+
+    /// Bind an output for allocation on this session's execution device.
+    ///
+    /// Returns `false` when the session has no supported device allocator.
+    pub fn bind_output_to_execution_device(
+        &self,
+        binding: &mut IoBinding<'_>,
+        name: &str,
+    ) -> Result<bool> {
+        #[cfg(feature = "cuda")]
+        if let Some(device_id) = self.cuda_device_id() {
+            binding.bind_output_to_device(name, &MemoryInfo::cuda(device_id)?)?;
+            return Ok(true);
+        }
+        #[cfg(not(feature = "cuda"))]
+        let _ = (binding, name);
+        Ok(false)
+    }
+
+    /// Synchronize this session's CUDA device before or after external buffer copies.
+    pub fn synchronize_device(&self) -> Result<()> {
+        if !self.is_cuda() {
+            return Ok(());
+        }
+        #[cfg(feature = "cuda")]
+        {
+            crate::cuda_rt::device_synchronize()
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            Err(OrtError::InvalidArgument(
+                "CUDA session synchronization requested from a build without CUDA support".into(),
+            ))
         }
     }
 }
@@ -1032,17 +1313,96 @@ impl Drop for Session {
     }
 }
 
-// SAFETY: `Session` owns one `OrtSession` handle plus immutable Rust metadata.
-// ONNX Runtime documents `OrtSession::Run`/`RunWithBinding` as safe for
-// concurrent calls on the same session; per-run inputs, outputs, and `IoBinding`
-// values are supplied by the caller and are not stored in `Session`. `Drop` still
-// requires unique ownership and releases the handle exactly once. This would stop
-// being sound for an execution provider that violates ORT's concurrent-run
-// contract, or if future code cached mutable per-run state inside `Session`.
+/// Whether ORT permits concurrent `Run` calls on one session, and why not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConcurrentRunSupport {
+    /// Every resolved provider declares [`capability::CONCURRENT_RUN`] and the
+    /// session holds no per-session run state of its own.
+    Supported,
+    /// Concurrent runs are refused. `reason` names what makes them unsafe and
+    /// what a caller can do instead.
+    Unsupported { reason: String },
+}
+
+impl ConcurrentRunSupport {
+    /// The refusal reason, or `None` when concurrent runs are supported.
+    #[must_use]
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Supported => None,
+            Self::Unsupported { reason } => Some(reason),
+        }
+    }
+}
+
+/// Resolve concurrent-run support from what a session actually runs on.
+///
+/// Two properties decide it, and both are properties of this session rather
+/// than of a model or a vendor:
+///
+/// * **Graph capture.** A capturing session owns a capture/replay state machine
+///   keyed by `gpu_graph_id`, and it replays against the exact device addresses
+///   seen at capture time. Two threads inside that state machine capture each
+///   other's buffers; the corruption is silent, so this fails closed.
+/// * **Provider capability.** ORT's session-level contract allows concurrent
+///   `Run` only as far as every provider under it does, so an EP that does not
+///   declare [`capability::CONCURRENT_RUN`] withdraws it for the whole session.
+///   A session with no resolved providers has nothing to declare it, which is
+///   also a refusal.
+fn concurrent_run_support(
+    execution_providers: &[ResolvedEp],
+    graph_capture: bool,
+) -> ConcurrentRunSupport {
+    if graph_capture {
+        return ConcurrentRunSupport::Unsupported {
+            reason: "this session captures and replays EP graphs, and capture/replay is \
+                     per-session state keyed by gpu_graph_id: a second concurrent run would \
+                     capture the first run's buffers. Give each worker thread its own \
+                     session, or create the session without graph capture."
+                .to_owned(),
+        };
+    }
+    if execution_providers.is_empty() {
+        return ConcurrentRunSupport::Unsupported {
+            reason: "this session resolved no execution provider, so nothing declares that \
+                     concurrent Run is safe. Give each worker thread its own session."
+                .to_owned(),
+        };
+    }
+    if let Some(provider) = execution_providers
+        .iter()
+        .find(|ep| !ep.caps.has(capability::CONCURRENT_RUN))
+    {
+        return ConcurrentRunSupport::Unsupported {
+            reason: format!(
+                "execution provider '{}' does not declare the '{}' capability, so ORT may not \
+                 run this session from two threads at once. Give each worker thread its own \
+                 session, or select a provider that declares it.",
+                provider.caps.name,
+                capability::CONCURRENT_RUN
+            ),
+        };
+    }
+    ConcurrentRunSupport::Supported
+}
+
+// SAFETY: `Session` owns one `OrtSession` handle plus immutable Rust metadata,
+// and the only interior mutability is `run_affinity`, whose atomics are
+// synchronized. Moving a session to another thread is therefore sound
+// unconditionally: ORT sessions have no thread affinity, and `Drop` still
+// requires unique ownership and releases the handle exactly once. This would
+// stop being sound if future code cached unsynchronized mutable per-run state
+// inside `Session`.
 unsafe impl Send for Session {}
-// SAFETY: Shared `&Session` access only permits ORT runs against the thread-safe
-// session handle and reads immutable metadata. Callers must not share a mutable
-// ORT binding/value through unsafe code across concurrent runs.
+// SAFETY: Shared `&Session` access permits reading immutable metadata and
+// calling ORT `Run`/`RunWithBinding`. ORT documents concurrent `Run` on one
+// session as safe *when the providers underneath it are*, which is precisely
+// what `Session::supports_concurrent_run` reports; a session that is not
+// concurrently runnable refuses the second overlapping run through
+// `run_affinity` with a named error rather than corrupting a capture. Sharing a
+// `&Session` never hands out an `IoBinding`, `Allocator`, or `Value` — those are
+// `!Send + !Sync` and stay with the thread that created them — so `Sync` here
+// does not make the non-thread-safe handles shareable.
 unsafe impl Sync for Session {}
 
 struct RawSessionOptions {
@@ -1054,6 +1414,25 @@ impl RawSessionOptions {
         env: &Environment,
         options: &SessionOptions,
     ) -> std::result::Result<Self, SessionAttemptError> {
+        #[cfg(feature = "cuda")]
+        if let Some(config) = options.managed_cuda_allocator() {
+            if !options.selects_cuda() {
+                return Err(OrtError::InvalidArgument(
+                    "managed CUDA allocator registration requires a CUDA execution provider".into(),
+                )
+                .into());
+            }
+            if options.cuda_device_id() != Some(config.device_id()) {
+                return Err(OrtError::InvalidArgument(format!(
+                    "managed CUDA allocator is registered for device {}, but these session \
+                     options target CUDA device {:?}",
+                    config.device_id(),
+                    options.cuda_device_id()
+                ))
+                .into());
+            }
+            env.ensure_managed_cuda_allocator(config)?;
+        }
         let api = crate::error::api()?;
         let create = api
             .CreateSessionOptions

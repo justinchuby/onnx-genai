@@ -7,17 +7,159 @@ use crate::memory_authority::{
 };
 
 impl Engine {
-    /// Load a model from a directory.
+    /// Whether the decode core can execute every graph step this package
+    /// declares.
+    ///
+    /// This is a question about *executors*, not about package kinds. The
+    /// decode core is the registered executor for
+    /// `onnx-genai.autoregressive-decode`: one fused session that owns paged
+    /// KV, the device sampling fast paths and a captured graph. It can stand in
+    /// for a declared decode step only when that step is the package's *whole*
+    /// graph, because it loads one model directory and holds one session.
+    ///
+    /// It does not re-derive that shape. `contracted_single_decoder` is layer 2
+    /// of the one classification in `onnx-genai-metadata`: layer 1 (this
+    /// workflow executes exactly one ONNX graph and that graph's declared roles
+    /// make it a decoder) *plus* the contract naming the step. Asking the same
+    /// helper the metadata, CLI and server layers ask is what makes "the loader
+    /// routed a package the metadata layer does not call a single decoder"
+    /// unrepresentable rather than merely unobserved.
+    ///
+    /// A package it cannot cover loses nothing: the same interpreter executes
+    /// the same declared workflow, invoking each component from the artifact
+    /// the package names. There is no second generation path either way — only
+    /// a faster executor for one declared step, when that step is one this
+    /// runtime registered an executor for.
+    fn decode_core_covers(workflow: &onnx_genai_metadata::WorkflowSpec) -> bool {
+        onnx_genai_metadata::classify_workflow(workflow)
+            .contracted_single_decoder()
+            .is_some()
+    }
+
+    /// The workflow a package declares, read from the package.
+    ///
+    /// Nothing is synthesized: a package from before the workflow existed is
+    /// refused rather than repaired, because inventing one at load would mean
+    /// the package on disk says one thing and the runtime executes another.
+    pub(crate) fn declared_workflow(
+        model_dir: &Path,
+    ) -> anyhow::Result<onnx_genai_metadata::WorkflowSpec> {
+        // An authored package answers from its own metadata. Only a package
+        // that ships none needs the `genai_config.json` importer, which converts
+        // that foreign format into this project's one representation — and which
+        // needs a resolvable model directory, something a composite workflow
+        // package (components in subdirectories) deliberately does not present.
+        let metadata = match onnx_genai_metadata::parser::load_metadata_from_dir(model_dir)
+            .map_err(|error| anyhow::anyhow!("{error}"))?
+        {
+            Some(metadata) => Some(metadata),
+            None => onnx_genai_ort::ModelDirectory::load(model_dir)
+                .ok()
+                .and_then(|directory| load_inference_metadata(&directory).ok()),
+        };
+        metadata
+            .as_ref()
+            .and_then(|metadata| metadata.pipeline.as_ref())
+            .map(|pipeline| pipeline.workflow.clone())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{}: this package declares no pipeline.workflow.\n\n\
+                     A single decoder is declared exactly like every other pipeline: a workflow \
+                     with one ONNX component whose ports carry roles, a state_service group \
+                     owning its KV cache, and a generation loop. Packages carrying the retired \
+                     `model.io` block are no longer loadable.\n\n\
+                     Convert the package once, offline:\n    \
+                     migrate_model_io {}\n",
+                    model_dir.display(),
+                    model_dir.display()
+                )
+            })
+    }
+
+    /// Adopt the package's declared workflow as the one this runtime executes.
+    ///
+    /// Nothing is synthesized and nothing is written back: this is the document
+    /// the package ships, and it is what the interpreter walks. The runtime
+    /// built here holds no ORT session for the decoder — the decode core beside
+    /// it already owns that graph, its paged KV and its device fast paths, and
+    /// supplies it as the executor registered for the decode contract.
+    pub(crate) fn hosted_workflow_runtime(
+        model_directory: &ModelDirectory,
+        metadata: &InferenceMetadata,
+        decode_backend: EngineDecodeBackend,
+        memory_strategy_plan: &MemoryStrategyPlan,
+    ) -> anyhow::Result<Box<crate::pipeline::WorkflowRuntime>> {
+        let workflow = metadata
+            .pipeline
+            .as_ref()
+            .map(|pipeline| pipeline.workflow.clone())
+            .context(
+                "this package declares no pipeline.workflow, so there is no workflow to execute",
+            )?;
+        crate::pipeline::validate_generation_workflow(&workflow)?;
+        let spec = onnx_genai_metadata::PipelineSpec {
+            workflow: workflow.clone(),
+        };
+        let directory = onnx_genai_ort::PipelineModelDirectory {
+            root: model_directory.root.clone(),
+            metadata_path: model_directory.metadata_path.clone(),
+            spec,
+            adapters: None,
+            metadata: Some(metadata.clone()),
+            preprocessing: None,
+            model_paths: std::collections::BTreeMap::from([(
+                onnx_genai_metadata::decoder_workflow::DECODER_COMPONENT.to_string(),
+                model_directory.model_path.clone(),
+            )]),
+            tokenizer_paths: onnx_genai_ort::PipelineTokenizerPaths {
+                shared: Some(model_directory.tokenizer_path.clone()),
+                per_component: std::collections::BTreeMap::new(),
+            },
+        };
+        // The decode core owns the package's tokenizer; handing this runtime a
+        // second copy would decode the same ids through a different object.
+        let models =
+            onnx_genai_ort::PipelineModels::hosted(directory, SessionOptions::default(), None);
+        Ok(Box::new(crate::pipeline::WorkflowRuntime::hosted(
+            model_directory.root.clone(),
+            workflow,
+            decode_backend,
+            memory_strategy_plan.clone(),
+            models,
+            metadata.speculative.clone(),
+        )?))
+    }
+
+    /// Load a package from a directory.
+    ///
+    /// One entry point, one representation. Every package declares
+    /// `pipeline.workflow` and every package executes it through the
+    /// interpreter; what this decides is only whether the decode core is the
+    /// executor for the package's declared decode step, which is a question
+    /// about the contract that step names.
     pub fn from_dir(model_dir: &Path, config: EngineConfig) -> anyhow::Result<Self> {
+        let workflow = Self::declared_workflow(model_dir)?;
+        if !Self::decode_core_covers(&workflow) {
+            return Self::from_interpreted_dir(model_dir, config, SessionOptions::default(), None);
+        }
         Self::from_dir_impl(model_dir, config, SessionOptions::default(), false, None)
     }
 
-    /// Load a model using a caller-owned device authority provider.
+    /// Load a package using a caller-owned device authority provider.
     pub fn from_dir_with_memory_authority_provider(
         model_dir: &Path,
         config: EngineConfig,
         provider: Arc<dyn MemoryAuthorityProvider>,
     ) -> anyhow::Result<Self> {
+        let workflow = Self::declared_workflow(model_dir)?;
+        if !Self::decode_core_covers(&workflow) {
+            return Self::from_interpreted_dir(
+                model_dir,
+                config,
+                SessionOptions::default(),
+                Some(provider),
+            );
+        }
         Self::from_dir_impl(
             model_dir,
             config,
@@ -27,13 +169,43 @@ impl Engine {
         )
     }
 
-    /// Load a model from a directory with explicit ORT session options.
+    /// Load a package from a directory with explicit ORT session options.
     pub fn from_dir_with_session_options(
         model_dir: &Path,
         config: EngineConfig,
         session_options: SessionOptions,
     ) -> anyhow::Result<Self> {
+        let workflow = Self::declared_workflow(model_dir)?;
+        if !Self::decode_core_covers(&workflow) {
+            return Self::from_interpreted_dir(model_dir, config, session_options, None);
+        }
         Self::from_dir_impl(model_dir, config, session_options, true, None)
+    }
+
+    /// Load a package whose every declared component the interpreter invokes
+    /// from its own artifact.
+    fn from_interpreted_dir(
+        model_dir: &Path,
+        config: EngineConfig,
+        session_options: SessionOptions,
+        provider: Option<Arc<dyn MemoryAuthorityProvider>>,
+    ) -> anyhow::Result<Self> {
+        let (runtime, governor) = match provider {
+            Some(provider) => {
+                crate::pipeline::WorkflowRuntime::from_dir_with_session_options_and_memory_authority_provider(
+                    model_dir,
+                    config,
+                    session_options,
+                    provider,
+                )?
+            }
+            None => crate::pipeline::WorkflowRuntime::from_dir_with_session_options(
+                model_dir,
+                config,
+                session_options,
+            )?,
+        };
+        Self::from_workflow(runtime, governor)
     }
 
     fn from_dir_impl(
@@ -118,12 +290,12 @@ impl Engine {
             config.limits.vram_limit,
         )?;
         let metadata = load_inference_metadata(&model_directory)?;
-        let model_io = metadata.model.as_ref().and_then(|model| model.io.as_ref());
-        let kv_inputs = model_io
-            .and_then(|io| io.kv_inputs.clone())
+        let decoder_abi = metadata.decoder_io();
+        let kv_inputs = decoder_abi
+            .and_then(|abi| abi.kv_inputs.clone())
             .unwrap_or_default();
-        let kv_outputs = model_io
-            .and_then(|io| io.kv_outputs.clone())
+        let kv_outputs = decoder_abi
+            .and_then(|abi| abi.kv_outputs.clone())
             .unwrap_or_default();
         let graph_io = onnx_genai_ort::graph_io_from_model_path_for_kv_pairs(
             &model_directory.model_path,
@@ -131,11 +303,15 @@ impl Engine {
             &kv_outputs,
         )
         .map_err(|e| anyhow::anyhow!("Failed to read decoder graph I/O for KV geometry: {e}"))?;
-        let kv_model =
-            infer_kv_model_info(&graph_io, model_io, config.page_size, config.kv_cache_dtype)?;
+        let kv_model = infer_kv_model_info(
+            &graph_io,
+            decoder_abi,
+            config.page_size,
+            config.kv_cache_dtype,
+        )?;
         let plan_kv_config = match kv_model.as_ref() {
             Some(kv_model) => governor_kv_config(Some(kv_model), &config)?,
-            None if model_io_declares_only_fixed_state(model_io) => {
+            None if decoder_abi_declares_only_fixed_state(decoder_abi) => {
                 governor_no_paged_kv_config(&config)?
             }
             None => governor_kv_config(None, &config)?,
@@ -192,9 +368,12 @@ impl Engine {
                 .any(|provider| !provider.caps.is_host()),
         )?;
 
-        // ORT CUDA graph capture is opt-in: it fails with unconstructed OrtValue
-        // outputs on some Foundry exports. SessionOptions still honors an explicit
-        // ONNX_GENAI_CUDA_GRAPH=1 request; native whole-step capture is separate.
+        // ORT CUDA graph capture is opt-in via ONNX_GENAI_CUDA_GRAPH (default
+        // off, resolved per-EP as `ResolvedEp::graph_capture_env`): it fails with
+        // unconstructed OrtValue outputs on some Foundry exports. Note that
+        // requesting it is not sufficient — the decode session only captures on
+        // `DecodeKvMode::SharedBuffer`, so a model on the zero-copy-rebind path
+        // runs uncaptured regardless. Native whole-step capture is separate.
         configure_ort_cuda_graph(&mut session_options, &model_directory.model_path);
 
         let environment = {
@@ -216,11 +395,11 @@ impl Engine {
         };
 
         // Stage: metadata and decode-path resolution.
+        let shared_kv = shared_kv_offer(&session, &metadata, &model_directory.model_path);
         let MetadataResolution {
             metadata,
-            metadata_max_context,
             decode_path,
-        } = resolve_metadata_and_decode_path(&session, &model_directory.model_path, metadata)?;
+        } = resolve_metadata_and_decode_path(metadata, shared_kv, session.graph_capture())?;
 
         let tokenizer = {
             let _span = onnx_genai_ort::prof_span!("engine.tokenizer_load");
@@ -239,25 +418,14 @@ impl Engine {
         )?;
         // Stage: draft-model loading. Kept before KV-cache allocation to preserve
         // the original constructor's fallible-step ordering.
-        let draft = load_draft_model(
-            &config,
-            &environment,
-            &session_options,
-            metadata_max_context,
-            &governor,
-        )?;
+        let draft = load_draft_model(&config, &environment, &session_options, &governor)?;
 
         // Stage: runtime KV-cache allocation, granted by the governor built above.
         let kv_cache = allocate_kv_cache(&config, kv_model.as_ref(), &governor)?;
 
         // Stage: speculative-assistant loading (mode resolution then per-mode heads).
-        let (speculative_mode, resolved_mtp_config) = resolve_speculative_mode(
-            config.speculative_mode.clone(),
-            &metadata,
-            &model_directory,
-            &session,
-            draft.is_some(),
-        )?;
+        let (speculative_mode, resolved_mtp_config) =
+            resolve_speculative_mode(config.speculative_mode.clone(), draft.is_some())?;
         let mtp = load_mtp_model(
             resolved_mtp_config,
             &session,
@@ -267,15 +435,24 @@ impl Engine {
         )?;
         let eagle3 =
             load_eagle3_model(&speculative_mode, &session, &environment, &session_options)?;
-        let shared_kv_proposer =
-            load_shared_kv_proposer(&speculative_mode, &session, &environment, &session_options)?;
 
         let connector = {
             let _span = onnx_genai_ort::prof_span!("engine.connector_bridge");
             build_connector_bridge(&config.kv_connector, &model_directory, kv_model.as_ref())?
         };
 
+        // The interpreter that executes this package's declared workflow, with
+        // the decode core above it as the executor for the declared decode
+        // step. Built after the core so a package this runtime cannot execute
+        // as declared is refused before it is handed back as loaded.
+        let workflow = Self::hosted_workflow_runtime(
+            &model_directory,
+            &metadata,
+            decode_backend,
+            &memory_strategy_plan,
+        )?;
         Ok(Self {
+            workflow,
             decode_backend,
             metadata,
             metadata_hints,
@@ -287,6 +464,8 @@ impl Engine {
             scheduler,
             governor,
             sessions: HashMap::new(),
+            workflow_sessions: HashMap::new(),
+            workflow_session_ids: SharedSessionIds::new(),
             _environment: Some(environment),
             session: Some(Box::new(session)),
             #[cfg(feature = "native-backend")]
@@ -299,7 +478,7 @@ impl Engine {
             #[cfg(feature = "native-backend")]
             native_active_session: None,
             #[cfg(feature = "native-backend")]
-            native_session_counter: 0,
+            native_session_ids: SharedSessionIds::new(),
             #[cfg(feature = "native-backend")]
             native_access_counter: 0,
             #[cfg(feature = "native-backend")]
@@ -307,14 +486,12 @@ impl Engine {
             #[cfg(feature = "native-backend")]
             native_max_sessions: config.native_max_sessions,
             #[cfg(feature = "native-backend")]
-            native_shared_kv_proposer: None,
             #[cfg(feature = "native-backend")]
             native_recurrent_prefix_stats: RecurrentPrefixCacheStats::default(),
             draft,
             mtp,
             eagle3,
-            shared_kv_proposer,
-            tokenizer,
+            tokenizer: Some(tokenizer),
             fim_config,
             num_speculative_tokens: config.num_speculative_tokens.max(1),
             speculative_mode,
@@ -327,7 +504,7 @@ impl Engine {
     fn from_native_model_directory(
         model_directory: ModelDirectory,
         config: EngineConfig,
-        _session_options: &SessionOptions,
+        session_options: &SessionOptions,
         metadata_hints: MetadataHints,
         native_device: crate::native_decode::NativeDecodeDevice,
         authority_provider: Option<&SharedMemoryAuthorityProvider>,
@@ -335,8 +512,12 @@ impl Engine {
     ) -> anyhow::Result<Self> {
         if config.draft_model.is_some() || !matches!(config.speculative_mode, SpeculativeMode::None)
         {
+            // User-configured speculation (draft model / explicit mode) is still
+            // unsupported on the native backend. Metadata-advertised proposers
+            // (shared-KV, MTP) are resolved below and do NOT set
+            // `config.speculative_mode`, so they never trip this guard.
             anyhow::bail!(
-                "native decoder backend does not yet support speculative, MTP, EAGLE-3, or shared-KV generation"
+                "native decoder backend does not yet support user-configured speculative, MTP, EAGLE-3, or shared-KV generation; declare the proposer in inference metadata instead"
             );
         }
         if !matches!(&config.kv_connector.backend, KvConnectorBackend::Null) {
@@ -371,9 +552,17 @@ impl Engine {
         // decoders (no recurrent state pairs) yield no derived spec and keep their
         // existing load path unchanged. See #384 and the qwen3.5-27B enablement.
         maybe_fill_hybrid_io_from_graph(&mut metadata, &model_directory.model_path);
-        let runtime_caps = onnx_genai_metadata::RuntimeCapabilities::default();
-        if let Err(unsupported) = onnx_genai_metadata::validate(&metadata, &runtime_caps) {
-            anyhow::bail!("Unsupported capabilities: {unsupported:?}");
+        admit_inference_metadata(&metadata)?;
+        // Native MTP self-speculation seeds its draft head from a target hidden
+        // output. The native decode session only records that hidden state when
+        // the decode ABI names it, but the seed is declared by the MTP sidecar
+        // rather than by the target's own graph contract, so it has to be
+        // carried across. Install it as a *derived* ABI: the package keeps one
+        // serialized representation and gains no second writable statement of
+        // its own ports. An ABI that already names a hidden output wins, and a
+        // directory that declares no MTP sidecar is left exactly as it was.
+        if let Some(seeded) = mtp_seeded_decoder_io(&metadata, &model_directory.root) {
+            metadata.set_derived_decoder_io(seeded);
         }
         let tokenizer = {
             let _span = onnx_genai_ort::prof_span!("engine.tokenizer_load");
@@ -383,11 +572,11 @@ impl Engine {
         let fim_config = load_fim_config_from_model_dir(&model_directory.root)?;
         let kv_model = {
             let _span = onnx_genai_ort::prof_span!("engine.native_kv_model_info");
-            let model_io = metadata.model.as_ref().and_then(|model| model.io.as_ref());
-            let kv_inputs = model_io
+            let decoder_abi = metadata.decoder_io();
+            let kv_inputs = decoder_abi
                 .and_then(|io| io.kv_inputs.clone())
                 .unwrap_or_default();
-            let kv_outputs = model_io
+            let kv_outputs = decoder_abi
                 .and_then(|io| io.kv_outputs.clone())
                 .unwrap_or_default();
             let graph_io = onnx_genai_ort::graph_io_from_model_path_for_kv_pairs(
@@ -398,13 +587,18 @@ impl Engine {
             .map_err(|e| {
                 anyhow::anyhow!("Failed to read native decoder graph I/O for KV geometry: {e}")
             })?;
-            infer_kv_model_info(&graph_io, model_io, config.page_size, config.kv_cache_dtype)
-                .context("failed to infer native decoder KV geometry from model graph I/O")?
+            infer_kv_model_info(
+                &graph_io,
+                decoder_abi,
+                config.page_size,
+                config.kv_cache_dtype,
+            )
+            .context("failed to infer native decoder KV geometry from model graph I/O")?
         };
-        let model_io = metadata.model.as_ref().and_then(|model| model.io.as_ref());
+        let decoder_abi = metadata.decoder_io();
         let governor_kv_config = match kv_model.as_ref() {
             Some(kv_model) => governor_native_kv_config(Some(kv_model), &config)?,
-            None if model_io_declares_only_fixed_state(model_io) => {
+            None if decoder_abi_declares_only_fixed_state(decoder_abi) => {
                 governor_no_paged_kv_config(&config)?
             }
             None => governor_kv_config(None, &config)?,
@@ -432,7 +626,7 @@ impl Engine {
             resolve_vram_limit_bytes(&config.limits, native_device.cuda_index())?;
         let residency_ceiling_bytes =
             resolve_memory_strategy_hot_tier_bytes(&config.limits, native_device.cuda_index())?;
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "native-cuda")]
         let required_device_non_weight_bytes = if matches!(
             native_device,
             crate::native_decode::NativeDecodeDevice::Cuda { .. }
@@ -453,18 +647,18 @@ impl Engine {
             let graph = onnx_runtime_loader::load_model(&model_directory.model_path)
                 .context("loading native graph for recurrent-state memory planning")?;
             let recurrent_bytes =
-                crate::native_decode::recurrent_state_bytes_from_graph(&graph, model_io)?;
+                crate::native_decode::recurrent_state_bytes_from_graph(&graph, decoder_abi)?;
             kv_bytes.saturating_add(recurrent_bytes)
         } else {
             0
         };
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "native-cuda"))]
         let required_device_non_weight_bytes = 0;
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "native-cuda")]
         let cuda_env_policy = onnx_runtime_ep_cuda::DeviceOffloadPolicy::from_env();
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "native-cuda")]
         let memory_strategy_overrides = memory_strategy_overrides_from_cuda_env(cuda_env_policy);
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "native-cuda"))]
         let memory_strategy_overrides = MemoryStrategyOverrides::default();
         let native_cuda_load = matches!(
             native_device,
@@ -509,13 +703,13 @@ impl Engine {
         // (unless the legacy allocator opt-out is set). On other backends the
         // managed path is unavailable, so it stays keyed on an explicit byte
         // limit as before.
-        #[cfg(all(feature = "cuda", feature = "native-backend"))]
+        #[cfg(feature = "native-cuda")]
         let managed_vmm = if native_cuda_load {
             managed_vmm_default_enabled()
         } else {
             explicit_vram_bytes
         };
-        #[cfg(not(all(feature = "cuda", feature = "native-backend")))]
+        #[cfg(not(feature = "native-cuda"))]
         let managed_vmm = explicit_vram_bytes;
         let memory_strategy_plan = build_memory_strategy_plan(MemoryStrategyPlanInput {
             config: &config,
@@ -527,11 +721,11 @@ impl Engine {
             graph: graph_memory,
             required_device_non_weight_bytes,
             minimum_useful_weight_budget_bytes,
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "native-cuda")]
             default_dynamic_device_budget_bytes: Some(
                 onnx_runtime_ep_cuda::DEFAULT_DEVICE_OFFLOAD_BUDGET_BYTES,
             ),
-            #[cfg(not(feature = "cuda"))]
+            #[cfg(not(feature = "native-cuda"))]
             default_dynamic_device_budget_bytes: None,
             inferred_policy_enabled: managed_vmm || explicit_vram_bytes,
             managed_vmm,
@@ -569,8 +763,13 @@ impl Engine {
         // per transposed constant weight) is the third buffer folded into
         // `resident_f32_cache_bytes`, so the same verdict governs it. When
         // declined, the `MatMul`/`Gemm` kernels transpose per call and retain
-        // nothing (byte-identical output, only slower decode) instead of holding
-        // the session-lifetime copies resident over budget.
+        // nothing instead of holding the session-lifetime copies resident over
+        // budget. That is byte-identical everywhere except the x86 f16/bf16
+        // decode GEMV, where admission picks the kernel too: a declined
+        // session reads the [K, N] weight in place with a different (slower,
+        // and further from an f64 reference) accumulation order, so its decode
+        // output differs in the low bits. See
+        // `set_weight_transpose_cache_enabled`.
         onnx_runtime_ep_cpu::set_weight_transpose_cache_enabled(
             memory_strategy_plan.f32_weight_cache_admitted,
         );
@@ -596,25 +795,25 @@ impl Engine {
         onnx_runtime_ep_cpu::set_qlinear_packed_b_enabled(
             memory_strategy_plan.f32_weight_cache_admitted,
         );
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "native-cuda")]
         let cuda_offload_resolution =
             cuda_offload_resolution_from_plan(&native_device, &memory_strategy_plan);
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "native-cuda")]
         let cuda_offload_policy = cuda_offload_resolution.map(|resolution| resolution.policy);
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "native-cuda")]
         let governed_physical_pool = uses_governed_physical_pool(
             cuda_offload_resolution,
             dynamic_lending_enabled(),
             onnx_runtime_ep_cuda::vmm_allocator::production_physical_pool_enabled(),
         );
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "native-cuda")]
         let weight_reservation_bytes = cuda_weight_startup_reservation(
             model_weight_bytes,
             cuda_offload_resolution,
             governed_physical_pool,
             governor_kv_config.page_size_bytes,
         );
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "native-cuda")]
         tracing::info!(
             // The device actually resolved, not the compiled-in feature. This
             // line used to say "CUDA" on every run of a CUDA-enabled build,
@@ -629,7 +828,7 @@ impl Engine {
             weight_reservation_bytes,
             "resolved device-memory strategy before governor creation"
         );
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "native-cuda"))]
         let weight_reservation_bytes = device_weight_reservation_for(
             model_weight_bytes,
             None,
@@ -671,11 +870,13 @@ impl Engine {
                 native_device.clone(),
                 crate::native_decode::NativeDecodeLoadOptions {
                     host_cache: governor.weight_offload_host_cache(),
-                    #[cfg(feature = "cuda")]
+                    #[cfg(feature = "native-cuda")]
                     cuda_offload_policy,
-                    #[cfg(feature = "cuda")]
+                    #[cfg(feature = "native-cuda")]
                     cuda_memory_governor: std::sync::Arc::new(governor.device_authority()),
-                    io: metadata.model.as_ref().and_then(|model| model.io.as_ref()),
+                    #[cfg(feature = "native-cuda")]
+                    process_memory_manager: governor.process_memory_manager(),
+                    io: metadata.decoder_io(),
                     metadata_max_len: metadata
                         .model
                         .as_ref()
@@ -703,7 +904,7 @@ impl Engine {
                 .and_then(|runtime| runtime.chunked_prefill.as_ref())
                 .and_then(|chunked| chunked.chunk_size),
         );
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "native-cuda")]
         let cuda_offload_policy = reconcile_cuda_offload_budget_after_native_load(
             &native_session,
             metadata
@@ -774,7 +975,7 @@ impl Engine {
         // providers do not hold this residency cache, and VMM has already
         // released the weight portion above because its allocator records real
         // commits instead of a standing weight budget.
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "native-cuda")]
         if matches!(
             native_device,
             crate::native_decode::NativeDecodeDevice::Cuda { .. }
@@ -922,12 +1123,34 @@ impl Engine {
         if let Some(trace) = trace {
             native_session.set_trace_context(trace);
         }
-        let (native_shared_kv_proposer, speculative_mode) =
-            load_native_shared_kv_proposer(&metadata, &model_directory.root, native_device)?;
+        // MTP is the one native proposer kind; the effective mode is decided
+        // below once the MTP loader has reported.
+        let shared_kv_mode = SpeculativeMode::None;
         let environment = {
             let _span = onnx_genai_ort::prof_span!("engine.ort_environment");
             Environment::new("onnx-genai-engine")
                 .map_err(|e| anyhow::anyhow!("Failed to create ORT environment: {e}"))?
+        };
+        // Sidecar-declared MTP self-speculation: the pure-attention MTP head
+        // loads on the ORT `environment` (ORT CUDA EP), seeded from the native
+        // hybrid target's declared hidden output. Yields `None` for every
+        // non-MTP model, preserving the plain native load path exactly.
+        let (mtp, mtp_mode) = load_native_mtp_proposer(
+            &metadata,
+            &model_directory,
+            &environment,
+            session_options,
+            native_device,
+        )?;
+        // A model runs at most one proposer kind; shared-KV drafting and MTP are
+        // mutually exclusive, so at most one of these may be anything but
+        // `None`.
+        let speculative_mode = match (&shared_kv_mode, &mtp_mode) {
+            (SpeculativeMode::None, mode) => mode.clone(),
+            (mode, SpeculativeMode::None) => mode.clone(),
+            _ => anyhow::bail!(
+                "native metadata resolved both a shared-KV and an MTP proposer; only one speculative proposer is supported per model"
+            ),
         };
         // Native CUDA can replace its conservative startup weight reservation
         // with the provider's smaller governed residency pool during load.
@@ -936,7 +1159,14 @@ impl Engine {
         let scheduler =
             Scheduler::with_byte_budget(scheduler_config, governor.byte_budget_after_native_load());
 
+        let workflow = Self::hosted_workflow_runtime(
+            &model_directory,
+            &metadata,
+            EngineDecodeBackend::Native,
+            &memory_strategy_plan,
+        )?;
         Ok(Self {
+            workflow,
             decode_backend: EngineDecodeBackend::Native,
             metadata,
             metadata_hints,
@@ -944,27 +1174,27 @@ impl Engine {
             prefix_cache: PrefixCache::new(),
             token_prefix_cache: Vec::new(),
             kv_model,
-            decode_path: ModelDecodePath::Legacy,
+            decode_path: ModelDecodePath::Generic,
             scheduler,
             governor,
             sessions: HashMap::new(),
+            workflow_sessions: HashMap::new(),
+            workflow_session_ids: SharedSessionIds::new(),
             session: None,
             native_session: Some(native_session),
             weight_placement,
             memory_strategy_plan,
             native_sessions: HashMap::new(),
             native_active_session: None,
-            native_session_counter: 0,
+            native_session_ids: SharedSessionIds::new(),
             native_access_counter: 0,
             native_default_session: None,
             native_max_sessions: config.native_max_sessions,
-            native_shared_kv_proposer,
             native_recurrent_prefix_stats: RecurrentPrefixCacheStats::default(),
             draft: None,
-            mtp: None,
+            mtp,
             eagle3: None,
-            shared_kv_proposer: None,
-            tokenizer,
+            tokenizer: Some(tokenizer),
             fim_config,
             num_speculative_tokens: config.num_speculative_tokens.max(1),
             speculative_mode,
@@ -987,7 +1217,7 @@ impl Engine {
     }
 }
 
-/// Fill `metadata.model.io` from the ONNX graph's declared ports when the
+/// Fill the resolved decode ABI from the ONNX graph's declared ports when the
 /// package's sidecar declares no `io` block AND the graph is a hybrid
 /// linear-attention decoder (exposes recurrent `conv_state`/`recurrent_state`
 /// state pairs).
@@ -1005,30 +1235,64 @@ impl Engine {
 /// This is deliberately attribute/shape-driven, never model-name-gated, and
 /// engages only for the recurrent-hybrid case (the safety gate is a non-empty
 /// derived `state_pairs`, mirroring the native decode driver's
-/// `derive_fallback_io`). A declared `io` block always wins; pure-dense decoders
-/// (no state pairs) are left untouched and keep their existing load path.
+/// `derive_fallback_io`). An already-resolved ABI always wins; pure-dense
+/// decoders (no state pairs) are left untouched and keep their existing load
+/// path. The result is installed as a *derived* ABI rather than written into
+/// the deprecated serialized block, so it stays one representation.
 #[cfg(feature = "native-backend")]
 fn maybe_fill_hybrid_io_from_graph(metadata: &mut InferenceMetadata, model_path: &Path) {
-    // A declared `io` block is always authoritative.
-    if metadata
-        .model
-        .as_ref()
-        .is_some_and(|model| model.io.is_some())
-    {
+    // A workflow-recognized or legacy-declared ABI is always authoritative.
+    if metadata.decoder_io().is_some() {
         return;
     }
     let Some(graph_info) = crate::engine::decoder_graph_info_from_model_path(model_path) else {
         return;
     };
-    let Some(io) =
-        onnx_genai_genai_config::GenAiConfig::derive_model_io_spec_from_graph(&graph_info)
+    let Some(io) = onnx_genai_genai_config::GenAiConfig::derive_decoder_abi_from_graph(&graph_info)
     else {
         return;
     };
-    let model = metadata
-        .model
-        .get_or_insert_with(onnx_genai_metadata::ModelCapabilities::default);
-    model.io = Some(io);
+    metadata.set_derived_decoder_io(io);
+}
+
+/// The resolved decode ABI with an MTP sidecar's target hidden output filled in.
+///
+/// `None` unless the package resolves an ABI that names no hidden output *and*
+/// the model directory declares an MTP sidecar that names one, so every other
+/// model keeps exactly the ABI it resolved.
+#[cfg(feature = "native-backend")]
+fn mtp_seeded_decoder_io(
+    metadata: &InferenceMetadata,
+    model_root: &Path,
+) -> Option<onnx_genai_metadata::DecoderAbi> {
+    let io = metadata.decoder_io()?;
+    let descriptor = onnx_genai_metadata::detect_speculator(model_root)?;
+    let onnx_genai_metadata::SpeculatorProposerStatus::Mtp(spec) = descriptor.proposer else {
+        return None;
+    };
+    decoder_io_seeded_with(io, &spec.target_hidden_output)
+}
+
+/// Name `target_hidden_output` as the ABI's hidden output, or decline.
+///
+/// Declines when the ABI already names one -- a declared port is authoritative
+/// and a sidecar must not redirect the target's own contract -- and when the
+/// sidecar names nothing, which would otherwise install an empty port name that
+/// reads as "declared" everywhere downstream.
+#[cfg(feature = "native-backend")]
+fn decoder_io_seeded_with(
+    io: &onnx_genai_metadata::DecoderAbi,
+    target_hidden_output: &str,
+) -> Option<onnx_genai_metadata::DecoderAbi> {
+    if !io.hidden_output.as_deref().unwrap_or_default().is_empty() {
+        return None;
+    }
+    if target_hidden_output.is_empty() {
+        return None;
+    }
+    let mut seeded = io.clone();
+    seeded.hidden_output = Some(target_hidden_output.to_string());
+    Some(seeded)
 }
 
 fn package_selection_from_session_options(
@@ -1055,7 +1319,6 @@ fn package_selection_from_session_options(
 /// Produced by [`resolve_metadata_and_decode_path`] as the first construction stage.
 struct MetadataResolution {
     metadata: InferenceMetadata,
-    metadata_max_context: Option<usize>,
     decode_path: ModelDecodePath,
 }
 
@@ -1078,66 +1341,180 @@ fn load_inference_metadata(model_directory: &ModelDirectory) -> anyhow::Result<I
     Ok(default_inference_metadata())
 }
 
-fn resolve_metadata_and_decode_path(
-    session: &Session,
-    model_path: &Path,
-    metadata: InferenceMetadata,
-) -> anyhow::Result<MetadataResolution> {
-    // Validate capabilities
+/// Admit metadata for the bare-decoder decode path.
+///
+/// Structural defects mean the document does not describe a runnable model, so
+/// they stay fatal.
+///
+/// Declared capabilities split on one question: **does the capability describe
+/// the document, or does it prescribe computation this path must perform?**
+///
+/// *Descriptive* capabilities are derived from the workflow manifest —
+/// `workflow_ssa`, `serving_service_contract`, `bounded_state_recurrence`,
+/// `typed_emit`, `emit_valid_length`, `linear_effects`,
+/// `loop_induction_values`, `nested_control_flow`. The canonical package
+/// describes a workflow; this path derives its IO from the graph and never
+/// interprets that manifest, so refusing to load over one rejects packages that
+/// decode correctly. Measured: a package declaring all eight loads, decodes,
+/// and produces a coherent token stream whose first token matches the same
+/// model exported without a workflow manifest. Report and continue.
+///
+/// *Prescriptive* capabilities are derived from `metadata.adapters` — a
+/// concrete weight overlay, not a description. This path never reads
+/// `metadata.adapters`, so decoding anyway would silently emit **base-model
+/// output** rather than the adapted output the package asks for. That is wrong
+/// output, not degraded output, and the caller has no way to notice. These stay
+/// fatal.
+fn admit_inference_metadata(metadata: &InferenceMetadata) -> anyhow::Result<()> {
+    use onnx_genai_metadata::capabilities as capability;
+
     let runtime_caps = onnx_genai_metadata::RuntimeCapabilities::default();
-    if let Err(unsupported) = onnx_genai_metadata::validate(&metadata, &runtime_caps) {
-        anyhow::bail!("Unsupported capabilities: {unsupported:?}");
+    let report = onnx_genai_metadata::validate_structure_and_capabilities(metadata, &runtime_caps);
+    if !report.structural.is_empty() {
+        anyhow::bail!("Invalid inference metadata: {:?}", report.structural);
     }
 
-    // Optional explicit cap on runtime-owned KV growth. Foundry /
-    // onnxruntime-genai `genai_config.json` models advertise the model's full
-    // `context_length` (e.g. 32k-131k) as their max sequence length. The
-    // shared-buffer decode path pre-allocates at an initial power-of-two bucket
-    // (256 tokens by default, overridden by `ONNX_GENAI_KV_MIN_BUCKET`) and grows
-    // on demand up to the model's declared `max_length`; it does not pre-allocate
-    // the full context. `ONNX_GENAI_KV_MAX_LEN` caps growth below the model
-    // maximum, mirroring the native path's `ONNX_GENAI_CUDA_KV_MAX_LEN`.
-    // Unset = model metadata is the factual ceiling.
-    let kv_shared_buffer_cap = shared_buffer_cap_from_env();
-    let metadata_max_context = metadata
-        .model
-        .as_ref()
-        .and_then(|model| model.max_sequence_length)
-        .map(|max_len| cap_kv_len(max_len, kv_shared_buffer_cap));
-    // Our own inference metadata (inference_metadata.yaml), not
-    // onnxruntime-genai's genai_config.json, drives the runtime-owned
-    // share-buffer KV path for GQA models.
-    let shared_kv_max_len = crate::decode::shared_kv_buffer_len_from_metadata(&metadata)
-        .map(|max_len| cap_kv_len(max_len, kv_shared_buffer_cap));
+    // Capabilities that prescribe computation this path cannot perform. Keyed
+    // on the derived capability name rather than on `metadata.adapters`,
+    // because these are also derived from the workflow spec: a component whose
+    // adapter ABI or contract id is `onnx-genai.parameter-overlay`, or an input
+    // carrying an adapter-segment/count/scale role, yields them with
+    // `metadata.adapters` unset. Checking the service would miss exactly those
+    // workflow-declared overlays, which carry the identical wrong-output risk.
+    const PRESCRIPTIVE: &[&str] = &[
+        capability::PARAMETER_ADAPTERS,
+        capability::HETEROGENEOUS_ADAPTER_BATCHING,
+    ];
+
+    let (prescriptive, descriptive): (Vec<_>, Vec<_>) = report
+        .unsupported_capabilities
+        .iter()
+        .partition(|capability| PRESCRIPTIVE.contains(&capability.as_str()));
+
+    if !prescriptive.is_empty() {
+        anyhow::bail!(
+            "inference metadata requires capabilities this decode path cannot perform: {}; \
+             decoding anyway would silently emit base-model output instead of the output the \
+             package describes",
+            prescriptive
+                .iter()
+                .map(|capability| capability.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    if !descriptive.is_empty() {
+        tracing::warn!(
+            "inference metadata declares capabilities this runtime does not implement: {}; \
+             continuing because the decode path does not interpret the workflow manifest",
+            descriptive
+                .iter()
+                .map(|capability| capability.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    Ok(())
+}
+
+fn resolve_metadata_and_decode_path(
+    metadata: InferenceMetadata,
+    shared_kv: crate::decode::SharedKvOffer,
+    capture_requested: bool,
+) -> anyhow::Result<MetadataResolution> {
+    // Canonical metadata is the sole execution contract. Structural defects are
+    // fatal; declared workflow capabilities are reported and do not block the
+    // bare-decoder path (see `admit_inference_metadata`).
+    admit_inference_metadata(&metadata)?;
+
     let sliding_window = crate::decode::sliding_window_from_metadata(&metadata)?;
     let sink_tokens = crate::decode::sink_tokens_from_metadata(&metadata);
-    // Graph-truth check for the declared sliding window: only a window the
-    // exported decoder graph actually enforces (GQA `local_window_size`) is
-    // treated as active, because the runtime cannot re-apply a mask the export
-    // dropped. Such a model is reclassified as global attention so decode reaches
-    // the capture-stable shared-buffer KV path, and the mismatch is warned about
-    // (it is an export defect, not a harmless quirk). Best-effort: if the graph
-    // cannot be read, the declared window is kept (no regression for real SWA
-    // models).
-    let decoder_graph =
-        sliding_window.and_then(|_| onnx_runtime_loader::load_model(model_path).ok());
     let decode_path = {
         let _span = onnx_genai_ort::prof_span!("engine.detect_decode_path");
         detect_model_decode_path(
-            session,
-            metadata.model.as_ref().and_then(|model| model.io.as_ref()),
-            metadata_max_context,
-            shared_kv_max_len,
+            metadata.decoder_io(),
             sliding_window,
-            decoder_graph.as_ref(),
             sink_tokens,
+            shared_kv,
         )?
     };
+    // Report the resolved decode path together with whether the session even
+    // asked for CUDA-graph capture. Both matter and neither was visible before:
+    // ORT capture requires `DecodeKvMode::SharedBuffer` (see
+    // `will_sample_on_device`), so a model that lands on zero-copy-rebind runs
+    // uncaptured no matter what `enable_cuda_graph` says. A benchmark can
+    // therefore compare two backends on two different KV strategies and read
+    // like a backend comparison. Emitting this once at load makes it visible in
+    // every CLI, server and benchmark run.
+    tracing::info!(
+        decode_path = %decode_path.summary(),
+        graph_capture_requested = capture_requested,
+        "resolved decode path"
+    );
+    eprintln!(
+        "decode_path: {} graph_capture_requested={capture_requested}",
+        decode_path.summary()
+    );
     Ok(MetadataResolution {
         metadata,
-        metadata_max_context,
         decode_path,
     })
+}
+
+/// Resolve what this deployment can offer for an aliased KV buffer.
+///
+/// A shared buffer is a fixed reservation, so it needs a capacity, and the only
+/// capacity known at load time is the one the package declares as its context
+/// window. Without that bound the runtime declines to reserve rather than
+/// guessing a size.
+fn shared_kv_offer(
+    session: &Session,
+    metadata: &InferenceMetadata,
+    model_path: &Path,
+) -> crate::decode::SharedKvOffer {
+    let max_len = metadata
+        .model
+        .as_ref()
+        .and_then(|model| model.max_sequence_length);
+    // The EP capability is necessary but not sufficient. Whether a
+    // capacity-padded past is legal is a property of the attention *operator*:
+    // the standard opset `Attention` derives `total_sequence_length` from the
+    // past tensor's own extent and cross-checks it against the mask, so a
+    // capacity-sized past makes the two disagree and ORT refuses to run. Ask the
+    // graph before offering a shared buffer, so such a model falls back to the
+    // exact-length rebind path instead of failing at the first decode step.
+    //
+    // Best-effort and short-circuited: the graph is only read when a shared
+    // buffer is otherwise on the table, and a graph that cannot be read leaves
+    // the offer as the session alone described it.
+    let ep_supports = session.supports_fixed_capacity_present_binding();
+    let present_binding_supported = ep_supports
+        && (max_len.is_none()
+            || match onnx_runtime_loader::load_model(model_path) {
+                Ok(graph) => {
+                    let accepts = crate::decode::graph_accepts_padded_past(&graph);
+                    let explicit_kv_length =
+                        crate::decode::graph_uses_explicit_kv_length_attention(&graph);
+                    if !accepts {
+                        tracing::debug!(
+                            "decoder graph uses the standard opset Attention op, which \
+                             cross-checks the attention mask against the past KV extent; \
+                             declining the shared KV buffer for this deployment"
+                        );
+                    } else if explicit_kv_length {
+                        tracing::debug!(
+                            "decoder graph uses attention with an explicit valid KV length; \
+                             fixed-capacity present binding is graph-compatible"
+                        );
+                    }
+                    accepts
+                }
+                Err(_) => true,
+            });
+    crate::decode::SharedKvOffer {
+        present_binding_supported,
+        max_len,
+    }
 }
 
 fn build_governor_and_scheduler(
@@ -1149,7 +1526,7 @@ fn build_governor_and_scheduler(
     authority_domain: &DeviceCompatibilityDomain,
 ) -> anyhow::Result<(EngineResourceGovernor, Scheduler)> {
     let governor_kv_config = match (kv_model, decode_path) {
-        (None, ModelDecodePath::StaticCache { .. } | ModelDecodePath::Legacy) => {
+        (None, ModelDecodePath::StaticCache { .. } | ModelDecodePath::Generic) => {
             governor_no_paged_kv_config(config)?
         }
         _ => governor_kv_config(kv_model, config)?,
@@ -1244,8 +1621,8 @@ fn required_bytes_per_token_from_kv_config(
     kv_config.bytes_per_token().map(Some).with_context(|| {
         format!(
             "cannot derive scheduler bytes_per_token because KV page byte geometry is unknown \
-             for {} token(s) per page; fix by declaring model.io.kv_inputs and \
-             model.io.kv_outputs so admission uses real KV memory costs",
+             for {} token(s) per page; fix by declaring kv_inputs and \
+             kv_outputs so admission uses real KV memory costs",
             kv_config.tokens_per_page
         )
     })
@@ -1272,7 +1649,6 @@ fn load_draft_model(
     config: &EngineConfig,
     environment: &Environment,
     session_options: &SessionOptions,
-    metadata_max_context: Option<usize>,
     governor: &EngineResourceGovernor,
 ) -> anyhow::Result<Option<DraftModel>> {
     let draft = if let Some(draft_model_path) = &config.draft_model {
@@ -1283,7 +1659,7 @@ fn load_draft_model(
             .as_deref()
             .map(onnx_genai_metadata::load_metadata)
             .transpose()?
-            .and_then(|metadata| metadata.model.and_then(|model| model.io));
+            .and_then(|metadata| metadata.decoder_io().cloned());
         let draft_session = Session::new(
             environment,
             &draft_directory.model_path,
@@ -1302,15 +1678,7 @@ fn load_draft_model(
             // path were introduced without explicitly loading draft metadata.
             // If a draft model needs its own SWA + sinks, load its
             // inference_metadata.yaml and pass the values from there.
-            detect_model_decode_path(
-                &draft_session,
-                None,
-                metadata_max_context,
-                None,
-                None,
-                None,
-                0,
-            )?;
+            detect_model_decode_path(None, None, 0, crate::decode::SharedKvOffer::default())?;
         let draft_kv_model = infer_kv_model_info(
             &draft_session,
             draft_io.as_ref(),
@@ -1468,7 +1836,7 @@ fn device_weight_reservation_for(
     }
 }
 
-#[cfg(all(feature = "cuda", feature = "native-backend"))]
+#[cfg(feature = "native-cuda")]
 #[derive(Clone, Copy, Debug)]
 struct CudaOffloadResolution {
     policy: onnx_runtime_ep_cuda::DeviceOffloadPolicy,
@@ -1476,7 +1844,7 @@ struct CudaOffloadResolution {
     auto_enabled_from_vram_limit: bool,
 }
 
-#[cfg(all(feature = "cuda", feature = "native-backend"))]
+#[cfg(feature = "native-cuda")]
 fn dynamic_lending_enabled() -> bool {
     !std::env::var("ONNX_GENAI_DYNAMIC_KV_WEIGHT_LENDING").is_ok_and(|value| {
         matches!(
@@ -1503,7 +1871,7 @@ pub(crate) fn force_managed_weight_streaming_enabled() -> bool {
     )
 }
 
-#[cfg(all(feature = "cuda", feature = "native-backend"))]
+#[cfg(feature = "native-cuda")]
 pub(crate) fn managed_vmm_default_enabled() -> bool {
     let legacy_allocator_opt_out =
         std::env::var("ONNX_GENAI_LEGACY_ALLOCATOR").is_ok_and(|value| {
@@ -1515,7 +1883,7 @@ pub(crate) fn managed_vmm_default_enabled() -> bool {
     !legacy_allocator_opt_out && dynamic_lending_enabled()
 }
 
-#[cfg(all(feature = "cuda", feature = "native-backend"))]
+#[cfg(feature = "native-cuda")]
 fn uses_governed_physical_pool(
     resolution: Option<CudaOffloadResolution>,
     lending_enabled: bool,
@@ -1527,7 +1895,7 @@ fn uses_governed_physical_pool(
     })
 }
 
-#[cfg(all(feature = "cuda", feature = "native-backend"))]
+#[cfg(feature = "native-cuda")]
 fn cuda_weight_startup_reservation(
     model_weight_bytes: u64,
     resolution: Option<CudaOffloadResolution>,
@@ -1554,7 +1922,7 @@ fn cuda_weight_startup_reservation(
     )
 }
 
-#[cfg(all(feature = "cuda", feature = "native-backend"))]
+#[cfg(feature = "native-cuda")]
 fn cuda_offload_resolution_from_plan(
     native_device: &crate::native_decode::NativeDecodeDevice,
     plan: &MemoryStrategyPlan,
@@ -1587,7 +1955,7 @@ fn cuda_offload_resolution_from_plan(
 /// (prefill and the first decode step), so it is the safe floor to reserve
 /// while everything above it is lent to weights and reclaimed on demand as the
 /// sequence grows (issue #857).
-#[cfg(all(feature = "cuda", feature = "native-backend"))]
+#[cfg(feature = "native-cuda")]
 fn elastic_kv_floor_context(max_context: usize) -> usize {
     // The engine commits KV in power-of-two buckets whose smallest value is the
     // configured minimum bucket; `kv_capacity_bucket(1, ..)` is that first
@@ -1599,7 +1967,7 @@ fn elastic_kv_floor_context(max_context: usize) -> usize {
 /// VRAM minus the KV floor and recurrent state) less a headroom margin, but
 /// never below what the static full-context reservation would have granted, so
 /// elastic lending is never a regression versus baseline (issue #857).
-#[cfg(all(feature = "cuda", feature = "native-backend"))]
+#[cfg(feature = "native-cuda")]
 fn elastic_weight_budget_bytes(
     elastic_available_bytes: u64,
     static_baseline_budget_bytes: u64,
@@ -1611,7 +1979,7 @@ fn elastic_weight_budget_bytes(
 }
 
 /// Environment override for the elastic-lending device headroom (issue #857).
-#[cfg(all(feature = "cuda", feature = "native-backend"))]
+#[cfg(feature = "native-cuda")]
 const ELASTIC_LENDING_HEADROOM_BYTES_ENV: &str = "ONNX_GENAI_ELASTIC_LENDING_HEADROOM_BYTES";
 
 /// Default device bytes kept *unlent* below the managed no-spill limit under
@@ -1632,12 +2000,12 @@ const ELASTIC_LENDING_HEADROOM_BYTES_ENV: &str = "ONNX_GENAI_ELASTIC_LENDING_HEA
 /// our favour it is a cheap follow-up to lower it (or set it to 0) and lend more
 /// aggressively; the reverse mistake — a hidden host-spill regression that only
 /// shows up as wall-clock variance — is not cheap.
-#[cfg(all(feature = "cuda", feature = "native-backend"))]
+#[cfg(feature = "native-cuda")]
 const DEFAULT_ELASTIC_LENDING_HEADROOM_BYTES: u64 = 512 * 1024 * 1024;
 
 /// The device headroom to keep unlent below the managed no-spill limit under
 /// elastic weight lending (issue #857), honouring the environment override.
-#[cfg(all(feature = "cuda", feature = "native-backend"))]
+#[cfg(feature = "native-cuda")]
 fn elastic_lending_headroom_bytes() -> u64 {
     std::env::var(ELASTIC_LENDING_HEADROOM_BYTES_ENV)
         .ok()
@@ -1654,7 +2022,7 @@ fn elastic_lending_headroom_bytes() -> u64 {
 /// Without that path the static full-context reservation is the only thing that
 /// guarantees a sequence can reach its declared max context, so lending is
 /// refused.
-#[cfg(all(feature = "cuda", feature = "native-backend"))]
+#[cfg(feature = "native-cuda")]
 fn elastic_weight_lending_active(
     managed_no_spill: bool,
     commits_on_demand: bool,
@@ -1667,7 +2035,7 @@ fn elastic_weight_lending_active(
 ///
 /// Host-tier KV (a host-accessible EP) contributes nothing to the device weight
 /// budget and returns zero.
-#[cfg(all(feature = "cuda", feature = "native-backend"))]
+#[cfg(feature = "native-cuda")]
 fn elastic_kv_floor_device_bytes(
     native_session: &crate::native_decode::NativeDecodeSession,
     max_context: Option<usize>,
@@ -1686,7 +2054,7 @@ fn elastic_kv_floor_device_bytes(
     })
 }
 
-#[cfg(all(feature = "cuda", feature = "native-backend"))]
+#[cfg(feature = "native-cuda")]
 fn reconcile_cuda_offload_budget_after_native_load(
     native_session: &crate::native_decode::NativeDecodeSession,
     max_context: Option<usize>,
@@ -1919,32 +2287,11 @@ fn allocate_kv_cache(
 
 fn resolve_speculative_mode(
     requested_mode: SpeculativeMode,
-    metadata: &InferenceMetadata,
-    model_directory: &ModelDirectory,
-    session: &Session,
     draft_present: bool,
 ) -> anyhow::Result<(SpeculativeMode, Option<ResolvedMtpConfig>)> {
     let (speculative_mode, resolved_mtp_config) = match requested_mode {
         SpeculativeMode::None if draft_present => (SpeculativeMode::DraftModel, None),
-        // No explicit mode: adopt a shared-KV draft proposer advertised by
-        // the model's own inference metadata, if the target exposes an f32
-        // hidden output the assistant can be seeded from.
-        SpeculativeMode::None => {
-            if let Some(config) =
-                mtp_config_from_metadata(metadata, &model_directory.root, session)?
-            {
-                (
-                    SpeculativeMode::Mtp(config.public_config.clone()),
-                    Some(config),
-                )
-            } else {
-                (
-                    shared_kv_mode_from_metadata(&model_directory.root, session)
-                        .unwrap_or(SpeculativeMode::None),
-                    None,
-                )
-            }
-        }
+        SpeculativeMode::None => (SpeculativeMode::None, None),
         SpeculativeMode::Mtp(config) => (
             SpeculativeMode::Mtp(config.clone()),
             Some(ResolvedMtpConfig::from_manual(config)),
@@ -2011,87 +2358,265 @@ fn load_mtp_model(
                 mtp_config.public_config.hidden_size
             ),
         }
-        let head_session = Session::new(
+        Some(build_mtp_model_from_resolved(
+            mtp_config,
             environment,
-            &mtp_config.public_config.head_model,
-            session_options.clone(),
-        )
-        .map_err(|error| anyhow::anyhow!("Failed to load MTP head: {error}"))?;
-        let decode_options = onnx_genai_ort::MtpDecodeOptions {
-            kv_mode: mtp_config.public_config.kv_mode,
-            batch_size: 1,
-            hc_mult: mtp_config.hc_mult,
-            hidden_state_rank4: mtp_config.target_hidden_layout == MtpHiddenLayout::Bshc,
-            hidden_output: mtp_config.mtp_hidden_output.clone(),
-            state_output: mtp_config.mtp_state_output.clone(),
-        };
-        let head_signature = MtpDecodeSession::new(&head_session, decode_options)
-            .map_err(|error| anyhow::anyhow!("Failed to inspect MTP head: {error}"))?
-            .signature()
-            .clone();
-        if head_signature.hidden_size != mtp_config.public_config.hidden_size {
-            anyhow::bail!(
-                "MTP head hidden size {} does not match configured target hidden size {}",
-                head_signature.hidden_size,
-                mtp_config.public_config.hidden_size
-            );
-        }
-        let (embedder, lm_head) = match (&mtp_config.embedding_weights, &mtp_config.lm_head_weights)
-        {
-            (MtpWeightSource::File(embedding), MtpWeightSource::File(lm_head)) => (
-                MtpEmbedder::Linear(
-                    LinearEmbedder::new(
-                        read_f32_weights(embedding)?,
-                        mtp_config.public_config.vocab_size,
-                        mtp_config.public_config.hidden_size,
-                    )
-                    .map_err(|error| anyhow::anyhow!("Invalid MTP embedding weights: {error}"))?,
-                ),
-                MtpLmHead::Linear(
-                    LinearLmHead::new(
-                        read_f32_weights(lm_head)?,
-                        mtp_config.public_config.hidden_size,
-                        mtp_config.public_config.vocab_size,
-                    )
-                    .map_err(|error| anyhow::anyhow!("Invalid MTP LM-head weights: {error}"))?,
-                ),
-            ),
-            (
-                MtpWeightSource::TargetInitializer(embedding),
-                MtpWeightSource::TargetInitializer(lm_head),
-            ) => {
-                let (embedder, lm_head, vocab_size) = load_target_initializer_adapters(
-                    &model_directory.model_path,
-                    embedding,
-                    lm_head,
-                    mtp_config.public_config.hidden_size,
-                )?;
-                if vocab_size != mtp_config.public_config.vocab_size {
-                    anyhow::bail!(
-                        "MTP target initializer vocabulary {vocab_size} does not match configured vocabulary {}",
-                        mtp_config.public_config.vocab_size
-                    );
-                }
-                (embedder, lm_head)
-            }
-            _ => anyhow::bail!(
-                "MTP embedding_weights and lm_head_weights must both use files or both use target initializers"
-            ),
-        };
-        Some(MtpModel {
-            config: mtp_config.public_config.clone(),
-            runtime_config: mtp_config.clone(),
-            session: Arc::new(head_session),
-            embedder,
-            lm_head,
-            hidden_output: mtp_config.public_config.target_hidden_output.clone(),
-            kv_mode: mtp_config.public_config.kv_mode,
-            num_speculative_tokens: mtp_config.public_config.num_speculative_tokens,
-        })
+            session_options,
+            model_directory,
+            // The ORT target path has no native projection device; a quantised
+            // shared LM-head therefore still fails fast in the adapter loader,
+            // preserving the existing ORT-backend behaviour exactly.
+            None,
+        )?)
     } else {
         None
     };
     Ok(mtp)
+}
+
+/// Build an [`MtpModel`] (ORT MTP-head session + shared target embedding / LM
+/// head) from an already-resolved and validated [`ResolvedMtpConfig`].
+///
+/// The target hidden-state output existence/shape/dtype validation is the
+/// caller's responsibility because it depends on the target backend: the ORT
+/// path validates against the target [`Session`] outputs, the native path
+/// validates against the target ONNX graph. Everything downstream of that
+/// validation — loading the pure-attention MTP head on the ORT environment and
+/// resolving the target-initializer or file-based embedding/LM-head adapters —
+/// is backend-agnostic and shared here.
+fn build_mtp_model_from_resolved(
+    mtp_config: ResolvedMtpConfig,
+    environment: &Environment,
+    session_options: &SessionOptions,
+    model_directory: &ModelDirectory,
+    draft_projection: Option<crate::speculative::DraftProjectionDevice>,
+) -> anyhow::Result<MtpModel> {
+    if mtp_config.cache_scope == MtpCacheScope::AcceptedPrefix {
+        anyhow::bail!(
+            "MTP kv_mode accepted_prefix is declared but not executable: the frozen Mobius contract does not define correction-token/cache alignment"
+        );
+    }
+    let head_session = Session::new(
+        environment,
+        &mtp_config.public_config.head_model,
+        session_options.clone(),
+    )
+    .map_err(|error| anyhow::anyhow!("Failed to load MTP head: {error}"))?;
+    let decode_options = onnx_genai_ort::MtpDecodeOptions {
+        kv_mode: mtp_config.public_config.kv_mode,
+        batch_size: 1,
+        hc_mult: mtp_config.hc_mult,
+        hidden_state_rank4: mtp_config.target_hidden_layout == MtpHiddenLayout::Bshc,
+        hidden_output: mtp_config.mtp_hidden_output.clone(),
+        state_output: mtp_config.mtp_state_output.clone(),
+    };
+    let head_signature = MtpDecodeSession::new(&head_session, decode_options)
+        .map_err(|error| anyhow::anyhow!("Failed to inspect MTP head: {error}"))?
+        .signature()
+        .clone();
+    if head_signature.hidden_size != mtp_config.public_config.hidden_size {
+        anyhow::bail!(
+            "MTP head hidden size {} does not match configured target hidden size {}",
+            head_signature.hidden_size,
+            mtp_config.public_config.hidden_size
+        );
+    }
+    let (embedder, lm_head) = match (&mtp_config.embedding_weights, &mtp_config.lm_head_weights) {
+        (MtpWeightSource::File(embedding), MtpWeightSource::File(lm_head)) => (
+            MtpEmbedder::Linear(
+                LinearEmbedder::new(
+                    read_f32_weights(embedding)?,
+                    mtp_config.public_config.vocab_size,
+                    mtp_config.public_config.hidden_size,
+                )
+                .map_err(|error| anyhow::anyhow!("Invalid MTP embedding weights: {error}"))?,
+            ),
+            MtpLmHead::Linear(
+                LinearLmHead::new(
+                    read_f32_weights(lm_head)?,
+                    mtp_config.public_config.hidden_size,
+                    mtp_config.public_config.vocab_size,
+                )
+                .map_err(|error| anyhow::anyhow!("Invalid MTP LM-head weights: {error}"))?,
+            ),
+        ),
+        (
+            MtpWeightSource::TargetInitializer(embedding),
+            MtpWeightSource::TargetInitializer(lm_head),
+        ) => {
+            let (embedder, lm_head, vocab_size) = load_target_initializer_adapters(
+                &model_directory.model_path,
+                embedding,
+                lm_head,
+                mtp_config.public_config.hidden_size,
+                draft_projection,
+            )?;
+            if vocab_size != mtp_config.public_config.vocab_size {
+                anyhow::bail!(
+                    "MTP target initializer vocabulary {vocab_size} does not match configured vocabulary {}",
+                    mtp_config.public_config.vocab_size
+                );
+            }
+            (embedder, lm_head)
+        }
+        _ => anyhow::bail!(
+            "MTP embedding_weights and lm_head_weights must both use files or both use target initializers"
+        ),
+    };
+    Ok(MtpModel {
+        config: mtp_config.public_config.clone(),
+        runtime_config: mtp_config.clone(),
+        session: Arc::new(head_session),
+        embedder,
+        lm_head,
+        hidden_output: mtp_config.public_config.target_hidden_output.clone(),
+        kv_mode: mtp_config.public_config.kv_mode,
+        num_speculative_tokens: mtp_config.public_config.num_speculative_tokens,
+    })
+}
+
+/// Resolve and build a native-backend MTP proposer from a model directory's
+/// inference metadata, mirroring [`load_native_shared_kv_proposer`].
+///
+/// Returns the loaded [`MtpModel`] (the pure-attention MTP head runs on the ORT
+/// `environment`; only the hybrid GDN target needs the native EP) together with
+/// the [`SpeculativeMode::Mtp`] the engine should adopt. Yields `None` /
+/// [`SpeculativeMode::None`] when the metadata advertises no MTP speculator, so
+/// non-speculative models keep their exact existing load path.
+#[cfg(feature = "native-backend")]
+fn load_native_mtp_proposer(
+    metadata: &InferenceMetadata,
+    model_directory: &ModelDirectory,
+    environment: &Environment,
+    session_options: &SessionOptions,
+    native_device: crate::native_decode::NativeDecodeDevice,
+) -> anyhow::Result<(Option<MtpModel>, SpeculativeMode)> {
+    // The package's workflow describes the *target* graph; the draft head is a
+    // separate artifact the model directory declares for itself in `config.json`.
+    // Discovery is therefore the signal here, and a directory that declares no
+    // speculator simply loads unspeculated.
+    let Some(descriptor) = onnx_genai_metadata::detect_speculator(&model_directory.root) else {
+        return Ok((None, SpeculativeMode::None));
+    };
+    let spec = match descriptor.proposer {
+        onnx_genai_metadata::SpeculatorProposerStatus::Mtp(spec) => spec,
+        // A declaration that cannot be read is an authoring error worth
+        // surfacing. Any other proposer kind is simply not this loader's
+        // business and leaves the native path unspeculated.
+        onnx_genai_metadata::SpeculatorProposerStatus::Unknown(reason) => {
+            anyhow::bail!("Invalid native MTP sidecar metadata: {reason}")
+        }
+        _ => return Ok((None, SpeculativeMode::None)),
+    };
+    // The native target exposes no ORT `Session` to interrogate for the target
+    // vocabulary (that is the point of the native EP). The head borrows the
+    // target's own LM-head initializer, so the vocabulary that sizes it is the
+    // target's: read the package's declared capability rather than restating the
+    // same number in a second place that nothing forces to agree.
+    let vocab_size = metadata
+        .model
+        .as_ref()
+        .and_then(|model| model.vocab_size)
+        .filter(|&value| value > 0)
+        .context(
+            "native MTP speculation requires the target vocabulary size; declare \
+             `model.vocab_size` in the package metadata",
+        )?;
+    let resolved = ResolvedMtpConfig::from_sidecar_descriptor(&spec, vocab_size);
+    validate_resolved_mtp_config(&resolved)?;
+    validate_native_mtp_hidden_output(&model_directory.model_path, &resolved)?;
+    // The pure-attention MTP head runs as an ORT session; when the native target
+    // is on CUDA the head must load on the CUDA EP too (its mixed-precision graph
+    // relies on CUDA kernels — the CPU EP rejects the bf16/f32 mix). Build head
+    // session options that match the native decode device rather than inheriting
+    // the native path's default (CPU) options. Allow CPU fallback so the handful
+    // of mixed-precision norm nodes ORT cannot assign to CUDA still get a home
+    // (the bulk of the head — attention and matmuls — stays on CUDA).
+    let head_session_options = match native_device.cuda_index() {
+        Some(index) => {
+            let mut selection = onnx_genai_ort::ep_selection("cuda");
+            selection
+                .options
+                .insert("device_id".to_string(), index.to_string());
+            SessionOptions::with_execution_provider(selection).with_cpu_fallback(true)
+        }
+        None => session_options.clone(),
+    };
+    // The int4 shared LM-head is projected on the same device as the native
+    // target: CUDA when the target is on CUDA, otherwise the CPU int4 kernel.
+    // This projection runs during proposal, outside the captured decode step.
+    let draft_projection = Some(match native_device.cuda_index() {
+        Some(index) => crate::speculative::DraftProjectionDevice::Cuda { index },
+        None => crate::speculative::DraftProjectionDevice::Cpu,
+    });
+    let mtp = build_mtp_model_from_resolved(
+        resolved,
+        environment,
+        &head_session_options,
+        model_directory,
+        draft_projection,
+    )?;
+    let mode = SpeculativeMode::Mtp(mtp.config.clone());
+    Ok((Some(mtp), mode))
+}
+
+/// Validate the target decoder's hidden-state seed output against the target
+/// ONNX graph for the native MTP path — the analogue of [`load_mtp_model`]'s
+/// ORT-`Session` validation, but reading only the declared hidden port from the
+/// graph so the 17GB target is never loaded into ORT just to be inspected.
+#[cfg(feature = "native-backend")]
+fn validate_native_mtp_hidden_output(
+    model_path: &Path,
+    mtp_config: &ResolvedMtpConfig,
+) -> anyhow::Result<()> {
+    let hidden_name = mtp_config.public_config.target_hidden_output.clone();
+    use onnx_genai_ort::GraphIo as _;
+    let graph_io = onnx_genai_ort::graph_io_from_model_path_for_names(
+        model_path,
+        &[],
+        std::slice::from_ref(&hidden_name),
+    )
+    .map_err(|error| {
+        anyhow::anyhow!("read native MTP target hidden output '{hidden_name}': {error}")
+    })?;
+    let hidden_output = graph_io
+        .outputs()
+        .iter()
+        .find(|output| output.name == hidden_name)
+        .with_context(|| {
+            format!("native MTP target model must expose hidden-state output '{hidden_name}'")
+        })?;
+    if !matches!(
+        hidden_output.dtype,
+        DataType::Float32 | DataType::Float16 | DataType::BFloat16
+    ) {
+        anyhow::bail!(
+            "native MTP target hidden-state output '{hidden_name}' must be Float32, Float16, or BFloat16, got {:?}",
+            hidden_output.dtype
+        );
+    }
+    let hidden_size = mtp_config.public_config.hidden_size as i64;
+    let matches_layout = match mtp_config.target_hidden_layout {
+        MtpHiddenLayout::Bsh => {
+            hidden_output.shape.len() == 3
+                && hidden_output.shape.last().copied().filter(|dim| *dim > 0) == Some(hidden_size)
+        }
+        MtpHiddenLayout::Bshc => {
+            hidden_output.shape.len() == 4
+                && hidden_output.shape[2] == mtp_config.hc_mult as i64
+                && hidden_output.shape[3] == hidden_size
+        }
+    };
+    if !matches_layout {
+        anyhow::bail!(
+            "native MTP target hidden-state output '{hidden_name}' shape {:?} does not match configured {:?} with hc_mult {} and hidden size {}",
+            hidden_output.shape,
+            mtp_config.target_hidden_layout,
+            mtp_config.hc_mult,
+            mtp_config.public_config.hidden_size
+        );
+    }
+    Ok(())
 }
 
 fn load_eagle3_model(
@@ -2102,6 +2627,7 @@ fn load_eagle3_model(
 ) -> anyhow::Result<Option<Eagle3Model>> {
     let eagle3 = if let SpeculativeMode::Eagle3(eagle_config) = speculative_mode {
         crate::config::validate_eagle3_config(eagle_config)?;
+        let mut target_activation_dtype = None;
         for output_name in &eagle_config.target_hidden_outputs {
             let hidden_output = session
                 .outputs()
@@ -2110,12 +2636,27 @@ fn load_eagle3_model(
                 .with_context(|| {
                     format!("EAGLE-3 target model must expose hidden-state output '{output_name}'")
                 })?;
-            if hidden_output.dtype != DataType::Float32 {
+            if !matches!(
+                hidden_output.dtype,
+                DataType::Float32 | DataType::Float16 | DataType::BFloat16
+            ) {
                 anyhow::bail!(
-                    "EAGLE-3 target hidden-state output '{}' must be Float32, got {:?}",
+                    "chained proposer target context '{}' must be Float32, Float16, or BFloat16, got {:?}",
                     hidden_output.name,
                     hidden_output.dtype
                 );
+            }
+            if let Some(dtype) = target_activation_dtype {
+                if hidden_output.dtype != dtype {
+                    anyhow::bail!(
+                        "chained proposer target context outputs must share one dtype; '{}' is {:?}, expected {:?}",
+                        hidden_output.name,
+                        hidden_output.dtype,
+                        dtype
+                    );
+                }
+            } else {
+                target_activation_dtype = Some(hidden_output.dtype);
             }
             if hidden_output.shape.last().copied().filter(|dim| *dim > 0)
                 != Some(eagle_config.hidden_size as i64)
@@ -2144,6 +2685,13 @@ fn load_eagle3_model(
                 eagle_config.hidden_size
             );
         }
+        if Some(head_signature.activation_dtype) != target_activation_dtype {
+            anyhow::bail!(
+                "chained proposer activation dtype {:?} does not match target context dtype {:?}",
+                head_signature.activation_dtype,
+                target_activation_dtype
+            );
+        }
         let expected_fused = eagle_config.hidden_size * eagle_config.target_hidden_outputs.len();
         if head_signature.fused_hidden_size != expected_fused {
             anyhow::bail!(
@@ -2160,6 +2708,39 @@ fn load_eagle3_model(
             );
         }
         let embedding = read_f32_weights(&eagle_config.embedding_weights)?;
+        let token_map = eagle_config
+            .token_map
+            .as_ref()
+            .map(|path| {
+                let bytes = std::fs::read(path).with_context(|| {
+                    format!("Failed to read proposer vocabulary map '{}'", path.display())
+                })?;
+                if bytes.len() % std::mem::size_of::<i64>() != 0 {
+                    anyhow::bail!(
+                        "proposer vocabulary map '{}' has byte length {}, which is not divisible by 8",
+                        path.display(),
+                        bytes.len()
+                    );
+                }
+                bytes
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|bytes| {
+                        let token = i64::from_le_bytes(*bytes);
+                        TokenId::try_from(token).with_context(|| {
+                            format!("mapped proposer token id {token} is outside the target range")
+                        })
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()
+            })
+            .transpose()?;
+        if token_map
+            .as_ref()
+            .is_some_and(|map| map.len() < head_signature.draft_vocab_size)
+        {
+            anyhow::bail!("proposer vocabulary map has fewer entries than the draft vocabulary");
+        }
         Some(Eagle3Model {
             config: eagle_config.clone(),
             session: Box::new(head_session),
@@ -2169,6 +2750,7 @@ fn load_eagle3_model(
                 eagle_config.hidden_size,
             )
             .map_err(|error| anyhow::anyhow!("Invalid EAGLE-3 embedding weights: {error}"))?,
+            token_map,
             hidden_outputs: eagle_config.target_hidden_outputs.clone(),
             kv_mode: eagle_config.kv_mode,
             num_speculative_tokens: eagle_config.num_speculative_tokens,
@@ -2179,104 +2761,408 @@ fn load_eagle3_model(
     Ok(eagle3)
 }
 
-fn load_shared_kv_proposer(
-    speculative_mode: &SpeculativeMode,
-    session: &Session,
-    environment: &Environment,
-    session_options: &SessionOptions,
-) -> anyhow::Result<Option<SharedKvProposerModel>> {
-    let shared_kv_proposer = if let SpeculativeMode::SharedKv(assistant_config) = speculative_mode {
-        crate::config::validate_shared_kv_proposer_config(assistant_config)?;
-        let hidden_output = session
-            .outputs()
-            .iter()
-            .find(|output| output.name == assistant_config.target_hidden_output)
-            .with_context(|| {
-                format!(
-                    "shared-KV proposer target model must expose hidden-state output '{}'",
-                    assistant_config.target_hidden_output
-                )
-            })?;
-        if hidden_output.dtype != DataType::Float32 {
-            anyhow::bail!(
-                "shared-KV proposer target hidden-state output '{}' must be Float32, got {:?}",
-                hidden_output.name,
-                hidden_output.dtype
-            );
-        }
-        if hidden_output.shape.last().copied().filter(|dim| *dim > 0)
-            != Some(assistant_config.backbone_hidden_size as i64)
-        {
-            anyhow::bail!(
-                "shared-KV proposer target hidden-state output '{}' shape {:?} does not end in configured backbone hidden size {}",
-                hidden_output.name,
-                hidden_output.shape,
-                assistant_config.backbone_hidden_size
-            );
-        }
-        let assistant_session = Session::new(
-            environment,
-            &assistant_config.assistant_model,
-            session_options.clone(),
+#[cfg(test)]
+mod metadata_admission_tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_declared_capability_is_reported_but_does_not_block_decode() {
+        let metadata: InferenceMetadata =
+            serde_yaml::from_str("schema_version: v1\nrequired_capabilities: [vendor.future]\n")
+                .expect("metadata parses");
+
+        admit_inference_metadata(&metadata).expect(
+            "an unimplemented declared capability must not block a package that decodes correctly",
+        );
+    }
+
+    #[test]
+    fn workflow_manifest_capabilities_do_not_block_the_bare_decoder() {
+        let metadata: InferenceMetadata = serde_yaml::from_str(
+            r#"
+schema_version: v1
+pipeline:
+  workflow:
+    manifest:
+      capabilities: [workflow_ssa]
+    components:
+      decoder:
+        implementation: { kind: binding }
+        ports: {}
+    steps:
+      - kind: invoke
+        component: decoder
+"#,
         )
-        .map_err(|error| anyhow::anyhow!("Failed to load shared-KV proposer model: {error}"))?;
-        let signature = SharedKvProposerSession::detect(&assistant_session)
-            .map_err(|error| {
-                anyhow::anyhow!("Failed to inspect shared-KV proposer model: {error}")
-            })?
-            .context("configured shared-KV proposer model does not expose proposer I/O")?;
-        if signature.backbone_hidden_size != assistant_config.backbone_hidden_size {
-            anyhow::bail!(
-                "shared-KV proposer hidden size {} does not match configured backbone hidden size {}",
-                signature.backbone_hidden_size,
-                assistant_config.backbone_hidden_size
-            );
+        .expect("metadata parses");
+
+        // The canonical package describes a workflow; the decode path derives
+        // its IO from the graph and never interprets the manifest, so a
+        // capability the runtime has not implemented is not a reason to refuse.
+        admit_inference_metadata(&metadata)
+            .expect("a workflow manifest must not block the bare decode path");
+    }
+
+    #[test]
+    fn structural_defect_still_fails_closed() {
+        let metadata: InferenceMetadata = serde_yaml::from_str(
+            r#"
+schema_version: v1
+pipeline:
+  workflow:
+    manifest:
+      capabilities: [workflow_ssa]
+    components:
+      decoder:
+        implementation: { kind: binding }
+        ports: {}
+    steps:
+      - kind: invoke
+        component: absent_component
+"#,
+        )
+        .expect("metadata parses");
+
+        let error = admit_inference_metadata(&metadata)
+            .expect_err("a document that does not describe a runnable model must fail closed")
+            .to_string();
+        assert!(error.contains("Invalid inference metadata"), "{error}");
+        assert!(
+            error.contains("absent_component"),
+            "the specific unknown-component defect must be named: {error}"
+        );
+    }
+
+    #[test]
+    fn declared_adapters_fail_closed_because_this_path_cannot_apply_them() {
+        // An adapter overlay is prescriptive, not descriptive: this path never
+        // reads `metadata.adapters`, so loading anyway would silently emit
+        // base-model output instead of the adapted output the package asks for.
+        let metadata: InferenceMetadata = serde_yaml::from_str(
+            r#"
+schema_version: v1
+adapters:
+  target_manifest:
+    targets:
+      - id: projection
+        component: model
+        initializer: projection.weight
+        layer_index: 0
+        node_name: projection
+        output_name: projection.output
+        activation_dtype: float32
+        input_features: 2
+        output_features: 2
+        rank: 2
+        alpha: 4.0
+  discovery_fallback: tooling_only
+  selection:
+    segments: request.lora_segments
+    adapter_counts: request.lora_counts
+    scales: request.lora_scales
+    max_adapters: 2
+  application_capability: onnx-genai.adapters@1
+  artifacts:
+    demo:
+      index: 0
+      identity: demo.peft
+      version: "1"
+      rank: 2
+      alpha: 4.0
+      dtype: float32
+      weights:
+        - location: adapters/demo/adapter_model.safetensors
+          loader_capability: onnx-genai.adapters.hf-peft@1
+          config_location: adapters/demo/adapter_config.json
+          scale_encoding: alpha_over_rank
+          format: hf_peft
+      bindings: [{ target: projection, weight_key: projection }]
+"#,
+        )
+        .expect("metadata parses");
+
+        assert!(
+            metadata.adapters.is_some(),
+            "fixture must actually declare an adapter service"
+        );
+
+        let error = admit_inference_metadata(&metadata)
+            .expect_err("an adapter package must not silently decode as the base model")
+            .to_string();
+        assert!(
+            !error.contains("Invalid inference metadata"),
+            "the fixture must be structurally valid so the adapter guard is what rejects it: \
+             {error}"
+        );
+        assert!(
+            error.contains("cannot perform") && error.contains("base-model output"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn workflow_declared_parameter_overlay_also_fails_closed_without_an_adapter_service() {
+        // The prescriptive capabilities are ALSO derived from the workflow spec
+        // (`workflow_required_capabilities`: a component whose adapter ABI or
+        // contract id is `onnx-genai.parameter-overlay` yields
+        // `parameter_adapters`), with `metadata.adapters` unset. This is the
+        // case that makes the explicit capability list correct and a
+        // `metadata.adapters.is_some()` check wrong -- keying off the service
+        // would let a workflow-declared overlay through with only a warning.
+        let metadata: InferenceMetadata = serde_yaml::from_str(
+            r#"
+schema_version: v1
+pipeline:
+  workflow:
+    manifest:
+      capabilities: [workflow_ssa, parameter_adapters]
+      adapter_abis:
+        onnx-genai.parameter-overlay: "1"
+    components:
+      overlay:
+        implementation:
+          kind: adapter
+          abi: onnx-genai.parameter-overlay
+          version: "1"
+        ports: {}
+    steps:
+      - kind: invoke
+        component: overlay
+"#,
+        )
+        .expect("metadata parses");
+
+        assert!(
+            metadata.adapters.is_none(),
+            "this fixture must exercise the workflow-derived path, not the adapter service"
+        );
+
+        let error = admit_inference_metadata(&metadata)
+            .expect_err("a workflow-declared parameter overlay must not decode as the base model")
+            .to_string();
+        assert!(
+            !error.contains("Invalid inference metadata"),
+            "the fixture must be structurally valid so the overlay guard is what rejects it: \
+             {error}"
+        );
+        assert!(
+            error.contains("parameter_adapters") && error.contains("base-model output"),
+            "{error}"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "native-backend"))]
+mod mtp_seed_tests {
+    use super::*;
+
+    fn io_with_hidden_output(hidden_output: Option<&str>) -> onnx_genai_metadata::DecoderAbi {
+        let mut value = serde_json::json!({});
+        if let Some(name) = hidden_output {
+            value["hidden_output"] = serde_json::json!(name);
         }
-        if signature.vocab_size != assistant_config.vocab_size {
-            anyhow::bail!(
-                "shared-KV proposer vocabulary {} does not match configured vocab size {}",
-                signature.vocab_size,
-                assistant_config.vocab_size
-            );
-        }
-        for group in &assistant_config.shared_kv {
-            if !signature
-                .shared_kv
-                .iter()
-                .any(|spec| spec.name == group.name)
+        serde_json::from_value(value).expect("model io spec parses")
+    }
+
+    /// The seed the sidecar names has to reach the ABI, or the native session
+    /// never records the hidden state the draft head is supposed to consume.
+    #[test]
+    fn a_sidecar_seed_names_the_hidden_output_an_abi_left_unset() {
+        let io = io_with_hidden_output(None);
+
+        let seeded = decoder_io_seeded_with(&io, "hidden_states").expect("seed applies");
+
+        assert_eq!(seeded.hidden_output.as_deref(), Some("hidden_states"));
+    }
+
+    /// A declared port is authoritative: a sidecar must not redirect the
+    /// target's own contract at load time.
+    #[test]
+    fn a_declared_hidden_output_outranks_the_sidecar_seed() {
+        let io = io_with_hidden_output(Some("last_hidden_state"));
+
+        assert!(decoder_io_seeded_with(&io, "hidden_states").is_none());
+    }
+
+    /// An empty seed must decline rather than install `""`, which would read as
+    /// a declared port everywhere downstream.
+    #[test]
+    fn an_unnamed_seed_declines_instead_of_declaring_an_empty_port() {
+        let io = io_with_hidden_output(None);
+
+        assert!(decoder_io_seeded_with(&io, "").is_none());
+    }
+}
+
+#[cfg(test)]
+mod decode_core_coverage_tests {
+    use super::*;
+
+    /// Every workflow this repository maintains, read from disk.
+    ///
+    /// The same corpus `decoder_recognizer_agreement.rs` walks, including the
+    /// crate-local fixture directories, so the loader is checked against every
+    /// package the metadata layer classifies rather than a subset of them.
+    fn maintained_workflows() -> Vec<(String, onnx_genai_metadata::WorkflowSpec)> {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut workflows = Vec::new();
+        collect(&root, &root, &mut workflows);
+        assert!(
+            workflows.len() > 50,
+            "the corpus walk found only {} workflows, so it is not walking the fixtures",
+            workflows.len()
+        );
+        workflows
+    }
+
+    fn collect(
+        directory: &Path,
+        root: &Path,
+        out: &mut Vec<(String, onnx_genai_metadata::WorkflowSpec)>,
+    ) {
+        const SKIPPED: &[&str] = &["target", ".git", ".github", "node_modules", "wiki"];
+
+        let Ok(entries) = std::fs::read_dir(directory) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if path.is_dir() {
+                if !SKIPPED.contains(&name.as_str()) {
+                    collect(&path, root, out);
+                }
+                continue;
+            }
+            let recognized_extension = path.extension().is_some_and(|extension| {
+                matches!(
+                    extension.to_string_lossy().as_ref(),
+                    "yaml" | "yml" | "json"
+                )
+            });
+            let location = path.to_string_lossy().replace('\\', "/");
+            let maintained_fixture = name.starts_with("inference_metadata")
+                || location.contains("/tests/fixtures/")
+                || location.contains("/examples/inference_metadata/");
+            if !recognized_extension || !maintained_fixture {
+                continue;
+            }
+            if let Some(pipeline) = onnx_genai_metadata::load_metadata(&path)
+                .ok()
+                .and_then(|metadata| metadata.pipeline)
             {
-                anyhow::bail!(
-                    "shared-KV proposer model does not expose shared_kv group '{}'",
-                    group.name
+                let relative = path.strip_prefix(root).unwrap_or(&path);
+                out.push((relative.display().to_string(), pipeline.workflow));
+            }
+        }
+    }
+
+    /// The smallest complete single decoder: one ONNX graph, one runtime policy.
+    fn single_decoder_workflow() -> onnx_genai_metadata::WorkflowSpec {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-llm/inference_metadata.yaml");
+        onnx_genai_metadata::load_metadata(&path)
+            .expect("the tiny-llm fixture must load")
+            .pipeline
+            .expect("the tiny-llm fixture declares a workflow")
+            .workflow
+    }
+
+    /// The loader never routes a package the metadata layer calls composite.
+    ///
+    /// The corpus sweep is the regression net over real packages; the two
+    /// adversarial shapes beneath it are what make this test load-bearing,
+    /// because no fixture has either shape.
+    ///
+    /// * *a decode contract with no roles* is the shape on which the loader's
+    ///   own previous scan disagreed with the metadata layer, so restoring that
+    ///   scan fails this assertion — verified by doing exactly that.
+    /// * *a binding wearing the decoder's roles* is the shape on which
+    ///   `origin/main`'s **pair** disagreed: the contract-only cover check said
+    ///   "the decode core has this" while role recognition, which counted
+    ///   bindings as candidates, called the package composite. It is carried
+    ///   here so the loader is exercised on it too;
+    ///   `decoder_recognizer_agreement.rs` pins the recognition half.
+    #[test]
+    fn nothing_the_decode_core_covers_is_composite_elsewhere() {
+        let mut corpus = maintained_workflows();
+
+        // A `binding` wearing the decoder's roles. The old recognizer counted
+        // every component as a decoder candidate, so two candidates made
+        // `sole_decoder_component` yield `None` and `is_single_decoder_workflow`
+        // therefore say "not a single decoder" — not because the graph count
+        // rose, but because the decoder had become ambiguous. The contract-only
+        // cover check meanwhile still said "the decode core has this".
+        let mut binding_decoy = single_decoder_workflow();
+        let decoder_roles = binding_decoy.components["decoder"].ports.roles.clone();
+        binding_decoy
+            .components
+            .get_mut("token_policy")
+            .expect("the fixture declares a token policy")
+            .ports
+            .roles = decoder_roles;
+        corpus.push((
+            "a token policy wearing the decoder's roles".into(),
+            binding_decoy,
+        ));
+
+        // A decode contract with no roles to drive it. The old cover check read
+        // only the contract id, so it handed this to an executor that resolves
+        // its ABI from the roles and would have found none.
+        let mut contract_without_roles = single_decoder_workflow();
+        contract_without_roles
+            .components
+            .get_mut("decoder")
+            .expect("the fixture declares a decoder")
+            .ports
+            .roles = std::collections::BTreeMap::new();
+        corpus.push((
+            "a decoder declaring the contract but no roles".into(),
+            contract_without_roles,
+        ));
+
+        for (name, workflow) in corpus {
+            if Engine::decode_core_covers(&workflow) {
+                assert!(
+                    onnx_genai_metadata::is_single_decoder_workflow(&workflow),
+                    "{name}: the loader chose the fused executor for a package the metadata, CLI \
+                     and server layers do not call a single decoder",
                 );
             }
         }
-        let embedding = read_f32_weights(&assistant_config.input_embedding_weights)?;
-        let embedder = LinearEmbedder::new(
-            embedding,
-            assistant_config.vocab_size,
-            assistant_config.backbone_hidden_size,
-        )
-        .map_err(|error| {
-            anyhow::anyhow!("Invalid shared-KV proposer input embedding weights: {error}")
-        })?;
-        Some(SharedKvProposerModel {
-            config: assistant_config.clone(),
-            session: Box::new(assistant_session),
-            embedder,
-            num_speculative_tokens: assistant_config.num_speculative_tokens,
-        })
-    } else {
-        None
-    };
-    Ok(shared_kv_proposer)
+    }
+
+    /// The loader declines a decode contract that has no roles behind it.
+    ///
+    /// Stated separately from the containment above because it is the stronger
+    /// claim: not merely that the two layers agree, but that this shape is
+    /// refused rather than routed to an executor with no ABI to drive it.
+    #[test]
+    fn the_loader_declines_a_decode_contract_with_no_roles() {
+        let mut workflow = single_decoder_workflow();
+        assert!(
+            Engine::decode_core_covers(&workflow),
+            "the unmodified fixture is exactly what the decode core covers",
+        );
+        workflow
+            .components
+            .get_mut("decoder")
+            .expect("the fixture declares a decoder")
+            .ports
+            .roles = std::collections::BTreeMap::new();
+        assert!(
+            !Engine::decode_core_covers(&workflow),
+            "a component naming the decode step without the roles that resolve its ABI must not \
+             be handed to the fused executor",
+        );
+    }
 }
 
 #[cfg(test)]
 mod pool_sizing_tests {
     use super::*;
 
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "native-cuda")]
     fn cuda_plan(
         strategy: MemoryStrategy,
         total_weight_bytes: u64,
@@ -2308,15 +3194,15 @@ mod pool_sizing_tests {
             .canonicalize()?)
     }
 
-    fn tiny_llm_io() -> anyhow::Result<onnx_genai_metadata::ModelIoSpec> {
+    fn tiny_llm_io() -> anyhow::Result<onnx_genai_metadata::DecoderAbi> {
         let metadata_path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/tiny-llm/inference_metadata.yaml")
             .canonicalize()?;
         let metadata = onnx_genai_metadata::load_metadata(&metadata_path)?;
         metadata
-            .model
-            .and_then(|model| model.io)
-            .context("tiny-llm fixture must declare model.io")
+            .decoder_io()
+            .cloned()
+            .context("tiny-llm fixture must declare a decode ABI")
     }
 
     fn profile_json(name: &str) -> anyhow::Result<serde_json::Value> {
@@ -2675,7 +3561,7 @@ mod pool_sizing_tests {
         assert_eq!(source, "model.max_sequence_length");
     }
 
-    #[cfg(all(feature = "cuda", feature = "native-backend"))]
+    #[cfg(feature = "native-cuda")]
     #[test]
     fn elastic_lending_requires_reclaim_path_to_be_guaranteed() {
         // Elastic lending is only safe when the reclaim path exists, which is
@@ -2688,7 +3574,7 @@ mod pool_sizing_tests {
         assert!(!elastic_weight_lending_active(true, true, false));
     }
 
-    #[cfg(all(feature = "cuda", feature = "native-backend"))]
+    #[cfg(feature = "native-cuda")]
     #[test]
     fn elastic_kv_floor_is_the_first_bucket_and_never_exceeds_max_context() {
         // The floor is exactly the engine's first KV bucket, capped at the
@@ -2707,7 +3593,7 @@ mod pool_sizing_tests {
         }
     }
 
-    #[cfg(all(feature = "cuda", feature = "native-backend"))]
+    #[cfg(feature = "native-cuda")]
     #[test]
     fn elastic_weight_budget_leaves_headroom_and_never_regresses_below_baseline() {
         // resolved_vram=100, full-context KV reservation=40, floor=4.
@@ -2738,7 +3624,7 @@ mod pool_sizing_tests {
         );
     }
 
-    #[cfg(all(feature = "cuda", feature = "native-backend"))]
+    #[cfg(feature = "native-cuda")]
     #[test]
     fn elastic_lending_headroom_defaults_to_a_conservative_nonzero_margin() {
         // The default must be non-zero so we never lend to the last byte while
@@ -2779,7 +3665,7 @@ mod pool_sizing_tests {
             .expect("a VRAM limit should not reject a host-only execution provider");
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "native-cuda")]
     #[test]
     fn explicit_vram_limit_auto_enables_cuda_weight_offload() {
         let plan = cuda_plan(
@@ -2824,7 +3710,7 @@ mod pool_sizing_tests {
         );
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "native-cuda")]
     #[test]
     fn explicit_weight_offload_device_bytes_overrides_vram_limit_derivation() {
         let plan = cuda_plan(
@@ -2852,7 +3738,7 @@ mod pool_sizing_tests {
         assert!(policy.device_budget_is_override);
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "native-cuda")]
     #[test]
     fn explicit_vram_limit_selects_managed_mode_even_when_weights_fit() {
         let plan = cuda_plan(
@@ -2891,7 +3777,7 @@ mod pool_sizing_tests {
         );
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "native-cuda")]
     #[test]
     fn resident_non_vmm_weights_keep_package_reservation() {
         let resolution = CudaOffloadResolution {

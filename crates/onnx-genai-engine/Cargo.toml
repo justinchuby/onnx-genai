@@ -10,75 +10,57 @@ categories = ["science", "text-processing"]
 
 [[test]]
 name = "qwen35_0_8b_hybrid_native_cuda_e2e"
-required-features = ["cuda", "native-backend"]
+required-features = ["native-cuda"]
 
 [[test]]
 name = "glm_tiny_qmoe_native_cuda_e2e"
-required-features = ["cuda", "native-backend"]
+required-features = ["native-cuda"]
 
 [[test]]
 name = "qwen3_0_6b_native_cuda_e2e"
-required-features = ["cuda", "native-backend"]
+required-features = ["native-cuda"]
 
 [[test]]
 name = "tiny_llm_native_cuda_decode_workspace"
-required-features = ["cuda", "native-backend"]
+required-features = ["native-cuda"]
 
 [[test]]
 name = "marlin_m_gt_1_e2e"
-required-features = ["cuda", "native-backend"]
+required-features = ["native-cuda"]
 
 [[test]]
 name = "weight_offload_native_cuda_e2e"
-required-features = ["cuda", "native-backend"]
-
-[[test]]
-name = "native_step_component_parity"
-required-features = ["native-backend"]
-
-[[test]]
-name = "native_pipeline_decoder_parity"
-required-features = ["native-backend"]
-
-# Uses PipelineEngine::materialize_published_prefix_kv, which is itself
-# #[cfg(feature = "native-backend")]. Without this the test is built on a
-# default `cargo test --all-targets` and fails to compile; CI only checks this
-# crate with the feature on, so the break is invisible there.
-[[test]]
-name = "native_pipeline_backend_selection_parity"
-required-features = ["native-backend"]
-
-[[test]]
-name = "native_full_pipeline_parity"
-required-features = ["native-backend"]
+required-features = ["native-cuda"]
 
 [[test]]
 name = "deepseek_v2_tiny_qmoe_native_e2e"
 required-features = ["native-backend"]
 
 [[test]]
-name = "native_cuda_pipeline_decoder_parity"
-required-features = ["cuda", "native-backend"]
+name = "native_workflow_smoke"
+required-features = ["native-backend"]
 
 [[test]]
-name = "native_cuda_routed_pipeline_decoder_parity"
-required-features = ["cuda", "native-backend"]
+name = "native_workflow_parity"
+required-features = ["native-backend"]
+
+# Asserts a process-global CUDA live-allocation count, so it needs a process
+# with no sibling test building or dropping CUDA engines underneath it.
+[[test]]
+name = "chained_proposal_device_memory"
+required-features = ["native-cuda"]
 
 [[test]]
 name = "native_cuda_captured_step_inputs_parity"
-required-features = ["cuda", "native-backend"]
-
-[[test]]
-name = "gemma4_e2b_native_cuda_pipeline_bench"
-required-features = ["cuda", "native-backend"]
+required-features = ["native-cuda"]
 
 [[test]]
 name = "gemma3n_native_cuda_capture_realmodel"
-required-features = ["cuda", "native-backend"]
+required-features = ["native-cuda"]
 
 [[test]]
 name = "qwen3_0_6b_capture_step_inputs_decline"
-required-features = ["cuda", "native-backend"]
+required-features = ["native-cuda"]
 
 [features]
 default = ["cuda-13000"]
@@ -93,13 +75,23 @@ mlas = [
     "onnx-runtime-ep-cpu/mlas",
     "onnx-runtime-session/mlas",
 ]
+# Our hand-written CUDA EP (`onnx-runtime-ep-cuda`), on top of everything
+# `ort-cuda` gives you. This is a strict superset: `native-cuda` = `ort-cuda` +
+# our kernels + the native backend that can actually reach them.
+#
+# `native-backend` is enabled deliberately rather than left to the caller.
+# Without it `onnx-runtime-session` is absent, our EP is compiled but
+# unreachable, and the build silently behaves exactly like `ort-cuda` while
+# looking like it should not -- a trap that has cost real measurement time.
+#
 # Runtime EP selection still goes through `ONNX_GENAI_EP`; without
 # `onnx-genai-ort/cuda`, a `cuda` request is rejected at session creation rather
 # than silently falling back to CPU. The CUDA API version is selected by exactly
 # one `cuda-*` feature; this crate defaults to CUDA 13.0.
-cuda = [
-    "onnx-genai-ort/cuda",
-    "onnx-runtime-session?/cuda",
+native-cuda = [
+    "native-backend",
+    "ort-cuda",
+    "onnx-runtime-session/cuda",
     "dep:onnx-runtime-ep-cuda",
 ]
 # ONNX Runtime CUDA only: enable ONNX Runtime's built-in CUDAExecutionProvider
@@ -133,6 +125,7 @@ cuda-13000 = [
 
 [dependencies]
 onnx-genai-metadata = { workspace = true }
+onnx-genai-preprocess = { workspace = true }
 onnx-genai-genai-config = { workspace = true }
 onnx-genai-kv = { workspace = true }
 onnx-runtime-memory-governor = { workspace = true }
@@ -162,10 +155,17 @@ half = { workspace = true, features = ["use-intrinsics"] }
 llguidance = "1.7.6"
 toktrie_hf_tokenizers = "1.7.6"
 
+[target.'cfg(unix)'.dependencies]
+# statvfs(3) for the disk-capacity probe. `libc` is already in this crate's
+# dependency graph via memmap2/tokio, and its `struct statvfs` is defined
+# per-platform upstream -- hand-declaring it got the macOS field widths wrong.
+libc = "0.2"
+
 [dev-dependencies]
-onnx-genai-preprocess = { workspace = true }
 async-trait = { workspace = true }
 proptest = "1.9"
+sha2 = { workspace = true }
+tempfile = "3"
 
 [lints]
 workspace = true

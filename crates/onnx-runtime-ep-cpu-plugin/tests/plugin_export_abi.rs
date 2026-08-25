@@ -311,6 +311,23 @@ mod mock_kernel_ctx {
     }
 
     /// Build a mock OrtApi with all the functions our Compute path needs.
+    /// Publish the mock table through the plugin's host-API global.
+    ///
+    /// That global is process-wide, so whatever it points at has to outlive
+    /// every test rather than just the one that published it. Passing a stack
+    /// local left it dangling the moment that test returned, and libtest runs
+    /// these in parallel: a test still inside `Compute` would read a frame
+    /// another test had already popped, and see an operand count of zero from
+    /// reused stack bytes. Leaking one table sidesteps the lifetime entirely,
+    /// and since every caller built an identical one there is nothing left for
+    /// the ordering to vary.
+    pub fn install_host_api() {
+        static API: std::sync::OnceLock<&'static ort::OrtApi> = std::sync::OnceLock::new();
+        let api: &'static ort::OrtApi = API.get_or_init(|| Box::leak(Box::new(mock_ort_api())));
+        // SAFETY: `api` is `'static`, and the plugin only reads through it.
+        unsafe { onnx_runtime_ep_plugin::status::set_host_api(api as *const ort::OrtApi) };
+    }
+
     pub fn mock_ort_api() -> ort::OrtApi {
         ort::OrtApi {
             CreateStatus: Some(mock_create_status),
@@ -342,10 +359,7 @@ fn compute_add_end_to_end() {
     use onnx_runtime_ir::DataType;
 
     // Set up mock API as the host.
-    let api = mock_ort_api();
-    let api_ptr: *const ort::OrtApi = &api;
-    // SAFETY: single-threaded test; set_host_api is safe to call before Compute.
-    unsafe { onnx_runtime_ep_plugin::status::set_host_api(api_ptr) };
+    install_host_api();
 
     // Prepare input tensors: a = [1.0, 2.0, 3.0, 4.0], b = [10.0, 20.0, 30.0, 40.0]
     STATE.with(|s| {
@@ -411,9 +425,7 @@ fn compute_add_broadcast() {
     };
     use onnx_runtime_ir::DataType;
 
-    let api = mock_ort_api();
-    let api_ptr: *const ort::OrtApi = &api;
-    unsafe { onnx_runtime_ep_plugin::status::set_host_api(api_ptr) };
+    install_host_api();
 
     STATE.with(|s| {
         *s.borrow_mut() = Some(MockKernelState {
@@ -460,6 +472,237 @@ fn compute_add_broadcast() {
             "broadcast output values"
         );
     });
+}
+
+/// Records the operand arity and absent-ness the plugin actually handed a
+/// kernel, so a test can assert on what the binding produced rather than only
+/// on the numbers that came out the other end.
+#[derive(Default)]
+struct SeenOperands {
+    /// One entry per operand: `None` when the slot arrived absent, otherwise
+    /// the operand's first element, which identifies *which* ORT input landed
+    /// there. Recording identity and not merely absent-ness is what makes a
+    /// mis-paired binding visible: a pattern of absent slots can be symmetric,
+    /// but the values are not.
+    inputs: Vec<Option<f32>>,
+    outputs: usize,
+}
+
+thread_local! {
+    static SEEN: std::cell::RefCell<SeenOperands> =
+        std::cell::RefCell::new(SeenOperands::default());
+}
+
+/// A kernel that records what it was given and writes its first present input
+/// through to output 0.
+#[derive(Debug)]
+struct RecordingKernel;
+
+impl onnx_runtime_ep_api::kernel::Kernel for RecordingKernel {
+    fn execute(
+        &self,
+        inputs: &[onnx_runtime_ep_api::tensor::TensorView],
+        outputs: &mut [onnx_runtime_ep_api::tensor::TensorMut],
+    ) -> onnx_runtime_ep_api::Result<()> {
+        SEEN.with(|c| {
+            let mut c = c.borrow_mut();
+            c.inputs = inputs
+                .iter()
+                .map(|v| {
+                    if v.is_absent() {
+                        None
+                    } else {
+                        // SAFETY: present operands in these tests are f32 with
+                        // at least one element.
+                        Some(unsafe { *v.data_ptr::<f32>() })
+                    }
+                })
+                .collect();
+            c.outputs = outputs.len();
+        });
+        let src = inputs.iter().find(|v| !v.is_absent()).ok_or_else(|| {
+            onnx_runtime_ep_api::EpError::KernelFailed("RecordingKernel: no present input".into())
+        })?;
+        let n = src.shape.iter().product::<usize>();
+        let src_ptr = src.data_ptr::<f32>();
+        // SAFETY: both operands are f32, host-resident and `n` elements long;
+        // the plugin sized output 0 from this kernel's shape inference.
+        unsafe {
+            std::ptr::copy_nonoverlapping(src_ptr, outputs[0].data_ptr_mut::<f32>(), n);
+        }
+        Ok(())
+    }
+}
+
+/// Drive one single-node `Compute` over `slots`, with `present` ORT inputs
+/// bound and one output, and return what the kernel saw.
+fn run_slots(slots: Vec<Option<usize>>, present: usize) -> (bool, Vec<Option<f32>>, usize) {
+    run_node(slots, present, 1)
+}
+
+/// As [`run_slots`], but with a chosen output arity so the output storage can
+/// be pushed past its inline width independently of the operand storage.
+fn run_node(
+    slots: Vec<Option<usize>>,
+    present: usize,
+    num_outputs: usize,
+) -> (bool, Vec<Option<f32>>, usize) {
+    use mock_kernel_ctx::*;
+    use onnx_runtime_ep_plugin::compute::{
+        CompiledKernelEntry, ExportedComputeInfo, ShapeInference,
+    };
+    use onnx_runtime_ir::DataType;
+
+    install_host_api();
+
+    STATE.with(|s| {
+        *s.borrow_mut() = Some(MockKernelState {
+            inputs: (0..present)
+                .map(|k| MockTensor {
+                    data: vec![1.0 + k as f32, 2.0, 3.0, 4.0],
+                    shape: vec![4],
+                })
+                .collect(),
+            outputs: vec![],
+        });
+    });
+    SEEN.with(|c| *c.borrow_mut() = SeenOperands::default());
+
+    let entry = CompiledKernelEntry {
+        kernel: Box::new(RecordingKernel),
+        num_inputs: slots.len(),
+        num_outputs,
+        output_dtypes: vec![DataType::Float32; num_outputs],
+        absent_output_slots: std::collections::HashSet::new(),
+        shape_inference: if num_outputs == 1 {
+            ShapeInference::ElementwiseBroadcast
+        } else {
+            ShapeInference::SameAsInputMultiOutput {
+                idx: 0,
+                count: num_outputs,
+            }
+        },
+        input_slots: slots,
+    };
+    let mut info = ExportedComputeInfo::new(vec![entry]);
+    let compute_fn = info.vtable.Compute.unwrap();
+    let info_ptr = &mut info.vtable as *mut ort::OrtNodeComputeInfo;
+    let dummy_ctx = 0xDEAD_BEEFusize as *mut ort::OrtKernelContext;
+    let status = unsafe { compute_fn(info_ptr, ptr::null_mut(), dummy_ctx) };
+    let ok = status.is_null();
+    let (seen_in, seen_out) = SEEN.with(|c| {
+        let c = c.borrow();
+        (c.inputs.clone(), c.outputs)
+    });
+    (ok, seen_in, seen_out)
+}
+
+/// A node with more outputs than the inline array holds spills them to the
+/// heap, and still gets exactly its own output arity.
+///
+/// The input and output storages have separate widths decided by separate
+/// lengths, so the operand spill test says nothing about this one. Without a
+/// case here the output heap arm inherits its confidence from the input arm by
+/// analogy, which is not evidence.
+#[test]
+fn a_node_wider_than_the_inline_array_spills_its_outputs_to_the_heap() {
+    for outs in [INLINE_OPERAND_WIDTH, INLINE_OPERAND_WIDTH + 1, 6] {
+        let (ok, seen, seen_outs) = run_node(vec![Some(0)], 1, outs);
+        assert!(ok, "{outs} outputs: Compute failed");
+        assert_eq!(seen_outs, outs, "{outs} outputs: kernel saw {seen_outs}");
+        assert_eq!(seen, vec![Some(1.0)], "{outs} outputs: operands disturbed");
+    }
+}
+
+/// Mirror of `compute::INLINE_OPERANDS`, which is private. A drift between the
+/// two only weakens the boundary cases below into ordinary ones, and the
+/// mutation harness raises the real constant to catch that.
+const INLINE_OPERAND_WIDTH: usize = 4;
+
+/// The kernel sees exactly as many operands as the node has slots.
+///
+/// The operand views are built in a fixed-width stack array, so the arity the
+/// kernel observes is a property of the slicing, not of the storage. A binding
+/// that handed over the whole array would show up here as extra absent
+/// operands.
+#[test]
+fn a_node_sees_exactly_its_own_operand_count() {
+    for arity in 1..=3usize {
+        let (ok, seen, _) = run_slots((0..arity).map(Some).collect(), arity);
+        assert!(ok, "arity {arity}: Compute failed");
+        assert_eq!(
+            seen.len(),
+            arity,
+            "arity {arity}: kernel saw {} operands, not {arity}",
+            seen.len()
+        );
+        assert!(
+            seen.iter().all(|v| v.is_some()),
+            "arity {arity}: a bound operand arrived absent: {seen:?}"
+        );
+    }
+}
+
+/// An unbound optional slot arrives at the kernel marked absent.
+///
+/// The stack array is seeded with the absent sentinel and the fill loop skips
+/// unbound slots, so this is what proves the seed is the right value and is
+/// actually reached — not merely that nothing crashed.
+#[test]
+fn an_unbound_slot_arrives_absent_and_in_position() {
+    // Asymmetric on purpose. `[present, absent, present]` reads as a fine
+    // test and is not one: it is a palindrome, so a binding that paired
+    // operands with slots in reverse order produces exactly the same absent
+    // pattern and the test passes. The values are what break the symmetry.
+    let (ok, seen, _) = run_slots(vec![Some(0), None, Some(1)], 2);
+    assert!(ok, "Compute failed with an unbound middle slot");
+    assert_eq!(
+        seen,
+        vec![Some(1.0), None, Some(2.0)],
+        "operands did not land in their own slots"
+    );
+
+    let (ok, seen, _) = run_slots(vec![None, Some(0), Some(1)], 2);
+    assert!(ok, "Compute failed with an unbound leading slot");
+    assert_eq!(
+        seen,
+        vec![None, Some(1.0), Some(2.0)],
+        "a leading unbound slot shifted the operands"
+    );
+}
+
+/// A node wider than the inline operand array still works, through the heap.
+///
+/// `INLINE_OPERANDS` is 4, so 6 forces the spill path. Without this the whole
+/// fallback branch would be untested and a node with many inputs would be the
+/// first thing to discover it.
+#[test]
+fn a_node_wider_than_the_inline_array_spills_to_the_heap() {
+    let arity = 6usize;
+    let (ok, seen, _) = run_slots((0..arity).map(Some).collect(), arity);
+    assert!(ok, "Compute failed for a {arity}-operand node");
+    assert_eq!(seen.len(), arity, "wide node lost or gained operands");
+    assert_eq!(
+        seen,
+        (0..arity).map(|k| Some(1.0 + k as f32)).collect::<Vec<_>>(),
+        "wide node: operands arrived absent or out of order"
+    );
+}
+
+/// The boundary itself: exactly `INLINE_OPERANDS` operands stays inline and
+/// one more spills, and both give the kernel the same arity.
+#[test]
+fn the_inline_operand_boundary_is_off_by_none() {
+    for arity in [4usize, 5] {
+        let (ok, seen, outs) = run_slots((0..arity).map(Some).collect(), arity);
+        assert!(ok, "arity {arity}: Compute failed at the inline boundary");
+        assert_eq!(
+            seen,
+            (0..arity).map(|k| Some(1.0 + k as f32)).collect::<Vec<_>>(),
+            "arity {arity}: operands arrived absent or out of order"
+        );
+        assert_eq!(outs, 1, "arity {arity}: wrong output count");
+    }
 }
 
 // ─── L1 — ABI surface: exported symbol audit ─────────────────────────────────
@@ -627,6 +870,20 @@ fn l1_no_symbol_leakage() {
                 && *name != "nxrt_ep_reset_executed_node_count"
                 && *name != "nxrt_ep_build_features"
                 && *name != "nxrt_ep_persistent_decode_pool_built"
+                // The dispatch probe is a research build. Its four exports
+                // exist only under the `dispatch_probe` feature, which no
+                // shipped build sets, so in a production cdylib these are
+                // absent and this arm never fires. Gated on the same `cfg` as
+                // the exports so that a future ungating fails this test rather
+                // than silently widening the shipped ABI.
+                && !(cfg!(feature = "dispatch_probe")
+                    && matches!(
+                        *name,
+                        "nxrt_dispatch_probe_snapshot"
+                            | "nxrt_dispatch_probe_reset"
+                            | "nxrt_dispatch_probe_available"
+                            | "nxrt_dispatch_probe_phase_name"
+                    ))
                 && !name.starts_with("_Z")
                 && !name.starts_with("__rust")
                 && !name.starts_with("__rdl_")

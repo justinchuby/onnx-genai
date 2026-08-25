@@ -1,4 +1,4 @@
-ir_version: 10
+ir_version: 11
 graph {
   node {
     input: "attention_mask"
@@ -12,14 +12,9 @@ graph {
   }
   node {
     input: "cast_input_ids"
+    input: "Unsqueeze_axes"
     output: "current_kv"
     op_type: "Unsqueeze"
-    attribute {
-      name: "axes"
-      ints: 1
-      ints: 3
-      type: INTS
-    }
   }
   node {
     output: "logits"
@@ -45,6 +40,12 @@ graph {
     input: "current_kv"
     output: "present.0.value"
     op_type: "Identity"
+  }
+  initializer {
+    dims: 2
+    data_type: 7
+    name: "Unsqueeze_axes"
+    raw_data: "\001\000\000\000\000\000\000\000\003\000\000\000\000\000\000\000"
   }
   input {
     name: "input_ids"
@@ -202,6 +203,19 @@ graph {
     }
   }
   value_info {
+    name: "Unsqueeze_axes"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 2
+          }
+        }
+      }
+    }
+  }
+  value_info {
     name: "cast_input_ids"
     type {
       tensor_type {
@@ -242,5 +256,5 @@ graph {
 }
 opset_import {
   domain: ""
-  version: 11
+  version: 24
 }

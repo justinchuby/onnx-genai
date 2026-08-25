@@ -1,0 +1,17 @@
+[package]
+name = "onnx-runtime-memory-abi"
+description = "Stable versioned C ABI for dynamic-plugin memory mechanisms (allocator, virtual backing, shared mapping)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["onnx", "memory", "allocator", "ffi", "abi"]
+categories = ["memory-management", "external-ffi-bindings"]
+
+# Deliberately dependency-free. A plugin author must be able to build against
+# this contract (or against `include/nxmem_memory_abi.h`) without linking any
+# other workspace crate.
+[dependencies]
+
+[lints]
+workspace = true

@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+pub mod decode_workload;
+
 use half::{bf16, f16};
 use onnx_runtime_ep_api::{
     DevicePtr, DevicePtrMut, ExecutionProvider, Kernel, TensorMut, TensorView,
@@ -20,6 +22,15 @@ impl FloatDType {
             Self::F32 => "f32",
             Self::F16 => "f16",
             Self::Bf16 => "bf16",
+        }
+    }
+
+    /// Bytes per element, so a bandwidth-bound bench can report the traffic
+    /// its route actually issues rather than a flop count.
+    pub fn size_of(self) -> usize {
+        match self {
+            Self::F32 => 4,
+            Self::F16 | Self::Bf16 => 2,
         }
     }
 
@@ -127,6 +138,18 @@ impl Tensor {
         }
     }
 
+    /// The f32 payload, for benches that need to compare results across cells.
+    ///
+    /// Panics on any other storage: a hash that silently skipped a non-f32
+    /// tensor would compare equal for every input, which is the vacuous-control
+    /// shape this is here to avoid.
+    pub fn f32s(&self) -> &[f32] {
+        match &self.storage {
+            Storage::F32(values) => values,
+            _ => panic!("f32s() on a non-f32 tensor"),
+        }
+    }
+
     pub fn view(&self) -> TensorView<'_> {
         TensorView::new(
             DevicePtr(self.const_ptr()),
@@ -192,5 +215,254 @@ pub fn assert_close(actual: &[f32], expected: &[f32], tolerance: f32) {
             (actual - expected).abs() <= tolerance,
             "element {index}: got {actual}, expected {expected} (tolerance {tolerance})"
         );
+    }
+}
+
+/// Put this benchmark process into the same decode thread topology a served
+/// session runs in.
+///
+/// `CpuExecutionProvider::initialize` is the earliest per-session hook and the
+/// only place an explicit `ONNX_GENAI_CPU_DECODE_THREADS` budget becomes a
+/// process-wide bound on prefill/MLAS Rayon parallelism and, on Linux, on CPU
+/// affinity. A benchmark that never calls it runs every row on an *unbounded*
+/// process, so a `t=N` row measures N decode workers competing with a
+/// full-width Rayon pool on every core -- not the configuration production runs
+/// (#1749).
+///
+/// Deliberately the real `CpuExecutionProvider::initialize` rather than a copy
+/// of what it currently does. A reimplementation would silently stop matching
+/// the moment `initialize` grows a second responsibility, which is exactly the
+/// drift that leaves a benchmark measuring a configuration nothing ships.
+///
+/// A no-op unless a budget is set, and idempotent: the underlying bound latches
+/// on first call. Benches that install their own fixed-width Rayon pool (see
+/// `kernels.rs`, which sweeps `[1, 8]`) will oversubscribe that pool onto a
+/// smaller budget's cores -- which is what production does with the same two
+/// settings, and is why this is applied there too rather than special-cased.
+/// Process-wide CPU time, split into user and system, in seconds.
+#[derive(Clone, Copy, Debug)]
+pub struct CpuTime {
+    pub user_s: f64,
+    pub sys_s: f64,
+}
+
+impl CpuTime {
+    pub fn total_s(self) -> f64 {
+        self.user_s + self.sys_s
+    }
+
+    /// `self - earlier`, for bracketing a measured window.
+    pub fn since(self, earlier: CpuTime) -> CpuTime {
+        CpuTime {
+            user_s: self.user_s - earlier.user_s,
+            sys_s: self.sys_s - earlier.sys_s,
+        }
+    }
+}
+
+/// CPU seconds consumed by **every thread of this process**, user and system
+/// separately.
+///
+/// Bracket a measured window with two reads and subtract. Wall time answers
+/// "how long did it take"; this answers "how much machine did it cost", and the
+/// two together decide a question wall time alone cannot: when a width doubling
+/// fails to halve the wall, are the extra workers *idle* (CPU flat, the loss is
+/// in dispatch, wake or join) or *busy* (CPU up, the loss is inside the kernel
+/// or is spin burned waiting)? Those want opposite fixes, and a throughput
+/// curve is consistent with both.
+///
+/// The user/system split is not decoration either. `sched_yield` in a park
+/// path is charged to **system**, so a spin-then-park barrier that ramps its
+/// yields with width shows up here as a rising `sys` fraction while `user`
+/// stays flat -- a signature that names the mechanism rather than just
+/// bounding it.
+///
+/// Robust to contention in a way wall time is not: another agent saturating
+/// the box steals wall from us but does not add to our `utime`. `/usr/bin/time`'s
+/// `Percent of CPU` is *not* an independent check on a wall-time result -- it is
+/// `(user+sys)/wall`, the same wall in the denominator, so it degrades exactly
+/// when wall does.
+///
+/// `/proc/self/stat`'s `utime`/`stime` are thread-group totals, so this covers
+/// the decode pool's workers without enumerating them. `comm` is arbitrary
+/// bytes in parentheses that may itself contain spaces and parentheses, so the
+/// field walk starts at the *last* `)` -- the same convention as
+/// `onnx_runtime_hostmon::own_jiffies_of_self_stat`, which this splits rather
+/// than sums.
+#[cfg(target_os = "linux")]
+pub fn process_cpu_time() -> Option<CpuTime> {
+    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+    let tail = &stat[stat.rfind(')')? + 1..];
+    let fields: Vec<&str> = tail.split_whitespace().collect();
+    let utime: u64 = fields.get(11)?.parse().ok()?;
+    let stime: u64 = fields.get(12)?.parse().ok()?;
+    let hz = onnx_runtime_hostmon::clock_tick_hz();
+    if hz <= 0.0 {
+        return None;
+    }
+    Some(CpuTime {
+        user_s: utime as f64 / hz,
+        sys_s: stime as f64 / hz,
+    })
+}
+
+/// Non-Linux hosts have no `/proc/self/stat`; a bench that wants this reports
+/// the row as unavailable rather than substituting a wall-derived stand-in.
+#[cfg(not(target_os = "linux"))]
+pub fn process_cpu_time() -> Option<CpuTime> {
+    None
+}
+
+pub fn init_decode_topology() {
+    CpuExecutionProvider::new()
+        .initialize(&Default::default())
+        .expect("the CPU EP must initialize");
+}
+
+/// Print the decode width the run actually realized, next to the width it asked
+/// for.
+///
+/// Call this **after** at least one decode has run. The persistent pool is built
+/// lazily at first decode and [`decode_width`] is deliberately non-forcing, so
+/// calling it earlier reports `path=unresolved` and no realized width -- and
+/// would build the pool if it were forcing, changing the very topology the
+/// benchmark is measuring.
+///
+/// Why every row needs this: three paths silently reduce the realized width
+/// below the request -- the pre-clamp to `available_parallelism` in
+/// `resolve_persistent_decode_threads_with_override`, `reserve_split_headroom`
+/// on a NUMA split, and the single-CPU-cpuset branch that drops decode to the
+/// flat path entirely. Only the last is even `NXRT_CALIB_DEBUG`-visible; the
+/// other two log nothing. Without this line a `t=N` row is an unverified
+/// *label*: a sweep that silently pins every width to the same realized value
+/// prints a flat line that reads exactly like "this kernel does not scale"
+/// (#1763).
+///
+/// `reserve_single_group_headroom` is deliberately not in that list. It reduces
+/// the *spawned thread* count, but only in the single-group case, which is
+/// exactly where the dispatcher takes a shard of its own and adds the lane back.
+/// A 2-lane budget on a 2-CPU cpuset spawns one thread and still realizes two
+/// lanes -- verified, not assumed.
+///
+/// Reports rather than asserts. A reduced width is legitimate when the host
+/// genuinely cannot honour the request (an 8-lane budget in a 2-CPU cpuset), and
+/// aborting there would make a constrained container unable to benchmark at all.
+/// The `WIDTH-MISMATCH` token is for the caller -- human or matrix script -- to
+/// discard or mark the row, the same way a contended cell is marked UNTRUSTED.
+pub fn report_decode_width() {
+    let width = onnx_runtime_ep_cpu::decode_spmd::decode_width();
+    let show = |v: Option<usize>| v.map_or("unknown".to_string(), |v| v.to_string());
+    // Three outcomes, not two: a width that was reduced is a different problem
+    // from a width that was never resolved, and a matrix script wants to treat
+    // them differently -- the first invalidates the row's label, the second says
+    // no decode reached the persistent pool at all.
+    let verdict = if width.is_as_requested() {
+        "as_requested"
+    } else if width.requested.is_some() && width.realized.is_some() {
+        "WIDTH-MISMATCH"
+    } else {
+        "WIDTH-UNRESOLVED"
+    };
+    // Reported from the built pool, not from the environment: a harness that
+    // sets a permutation and reads its own env back has verified nothing. This
+    // is the observable that makes `ONNX_GENAI_CPU_DECODE_CHUNK_PERMUTATION`
+    // checkable at benchmark time, so an arm that silently ran the default is a
+    // visible disagreement rather than a silent one.
+    let chunk_perm = onnx_runtime_ep_cpu::decode_spmd::decode_chunk_permutation()
+        .map_or_else(|| "none".to_string(), |perm| perm.label());
+    println!(
+        "decode_width requested={} realized={} path={} chunk_perm={chunk_perm} {verdict}",
+        show(width.requested),
+        show(width.realized),
+        width.path,
+    );
+}
+
+/// Report the dispatcher's reserved CPU against the CPU it is actually on.
+///
+/// The non-vacuity check for `ONNX_GENAI_CPU_DECODE_DISPATCHER_PIN`, and the
+/// measurement that motivated it. Two independent facts, never inferred from
+/// each other: which CPU the headroom reserve kept clear, and which CPU the
+/// dispatching thread is running on now.
+///
+/// Both come from the pool, which samples the dispatcher from *inside* the
+/// dispatch path. Neither can be obtained here. The first version of this read
+/// `sched_getcpu()` on the reporting thread and was exactly inverted: the
+/// reporter is idle while the pool works, so with the dispatcher unpinned the
+/// scheduler parks the reporter on the one free core, and pinning the
+/// dispatcher *evicts* it -- so "unpinned" read as on-the-reserved-CPU and
+/// "pinned" read as off it. Reading the wrong thread does not merely add noise,
+/// it can invert the sign. The second version read the dispatcher's own
+/// `/proc/self/task/<tid>/stat`, which parses correctly but almost always
+/// returns nothing: the dispatcher is a transient thread and has usually exited
+/// by the time a bench reports.
+///
+/// `PIN-TOOK` only when the knob was asked for and the two agree; `PIN-MISSED`
+/// when it was asked for and they do not, which is a failed intervention and
+/// must not be scored as a control. With the knob off this is pure
+/// observation -- `observed` is where the scheduler left the dispatcher, which
+/// is the quantity the experiment is about.
+pub fn report_dispatcher_cpu() {
+    let pools = onnx_runtime_ep_cpu::decode_spmd::pools();
+    let reserved = pools.and_then(|p| p.dispatcher_cpu());
+    let observed = pools.and_then(|p| p.dispatcher_observed_cpu());
+    let tid = pools.and_then(|p| p.dispatcher_thread_id());
+    let moves = pools.map(|p| p.dispatcher_cpu_changes());
+    let requested = onnx_runtime_ep_cpu::decode_spmd::dispatcher_pin_requested();
+    let verdict = match (requested, reserved, observed) {
+        (false, _, _) => "PIN-OFF",
+        (true, None, _) => "PIN-UNRESERVED",
+        (true, Some(_), None) => "PIN-UNOBSERVABLE",
+        (true, Some(r), Some(o)) if r == o => "PIN-TOOK",
+        (true, Some(_), Some(_)) => "PIN-MISSED",
+    };
+    let show = |v: Option<usize>| v.map_or("none".to_string(), |v| v.to_string());
+    println!(
+        "dispatcher reserved_cpu={} requested={} tid={} observed_cpu={} moves={} {verdict}",
+        show(reserved),
+        u8::from(requested),
+        tid.map_or("none".to_string(), |v| v.to_string()),
+        show(observed),
+        moves.map_or("none".to_string(), |v| v.to_string()),
+    );
+}
+
+/// Open the measurement window for the advisory host lock.
+///
+/// Call this first thing in `main`, before warmup and before any model is
+/// built. The window has to cover everything a co-tenant could have perturbed,
+/// not just the timed region: a warmup that shares cores with somebody else's
+/// `cargo test` leaves caches and frequency in a state the timed region then
+/// inherits.
+///
+/// Pair it with [`report_host_lock`]. The window reads the lock again on close,
+/// and the two readings are what make `changed` reportable -- a single
+/// end-of-run read names a credible holder for a run that changed hands, which
+/// is worse than saying nothing because it convinces.
+pub fn open_host_lock_window() -> onnx_runtime_hostmon::window::Window {
+    onnx_runtime_hostmon::window::Window::open()
+}
+
+/// Report what the advisory lock said about the whole run.
+///
+/// The `foreign_%` and `sib_%` columns measure what the host *did*; this
+/// reports what anyone *declared* they were doing to it, from
+/// `scripts/hostlock.sh`. Different questions, and a run wants both: contention
+/// sampling reads instants and can miss a co-tenant that starts and finishes
+/// between two snapshots, while a declaration covers the whole window and
+/// proves nothing about load.
+///
+/// Reports rather than aborts, for the same reason [`report_decode_width`]
+/// does. Refusing to print a matrix because nobody took a lock would mostly
+/// teach people to stop taking the lock, and an unlocked run on a genuinely
+/// idle box is fine. What is not fine is a row that cannot be told apart from
+/// one taken beside somebody else's benchmark.
+pub fn report_host_lock(window: onnx_runtime_hostmon::window::Window) {
+    let report = window.close();
+    println!("{report}");
+    if let Some(warning) = report.warning() {
+        // stderr, and loud, because the failure this guards against is a row
+        // that looks entirely normal.
+        eprintln!("{warning}");
     }
 }

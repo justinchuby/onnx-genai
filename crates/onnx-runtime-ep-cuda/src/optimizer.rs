@@ -5,6 +5,11 @@ use onnx_runtime_optimizer::{
     OptimizationPass, OptimizerError, PassContext, Result as OptimizerResult,
 };
 
+use crate::kernels::linear_attention::{
+    FUSE_BETA_SIGMOID_ATTR, FUSE_DECAY_SOFTPLUS_ATTR, FUSE_NEG_EXP_ATTR,
+};
+use crate::runtime::CudaDeviceCapabilities;
+
 pub(crate) const SILU_MUL_FUSION_ATTR: &str = "_cuda_silu_mul";
 pub(crate) const DECOMPOSED_SILU_ATTR: &str = "_cuda_decomposed_silu";
 
@@ -98,7 +103,9 @@ pub(crate) struct CudaSwiGluFusion;
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct CudaSiluFusion;
 
-pub(crate) fn cuda_optimization_passes() -> Vec<Box<dyn OptimizationPass>> {
+pub(crate) fn cuda_optimization_passes(
+    device: Option<CudaDeviceCapabilities>,
+) -> Vec<Box<dyn OptimizationPass>> {
     vec![
         Box::new(CudaSiluFusion),
         // Collapse the SSM/linear-attention `Reciprocal(Sqrt(x))` normalize-scale
@@ -106,6 +113,19 @@ pub(crate) fn cuda_optimization_passes() -> Vec<Box<dyn OptimizationPass>> {
         // reciprocal kernel + its fp16 intermediate round-trip, ~1.2% of decode
         // GPU-kernel time on qwen3.5-0.8b-hybrid; see the profiling drop).
         Box::new(CudaRsqrtFusion),
+        // Collapse the Gated-DeltaNet Q/K L2-normalize glue
+        // `Div(x, Sqrt(ReduceSumSquare(x, axis)))` into a single fused
+        // `LpNormalization` (p=2) kernel — one pass over HBM instead of three
+        // launches (ReduceSumSquare + Sqrt + Div) per site, 96 sites/token on
+        // Qwen3.8-27B. The fused node runs a byte-faithful kernel that replays the
+        // chain's intermediate rounding, so greedy decode stays token-identical.
+        Box::new(CudaL2NormalizeFusion),
+        // Fold the gated-delta `LinearAttention` beta-`Sigmoid` and decay
+        // `Softplus` gate chains into the kernel while they are still in their
+        // pristine exported form (before the cast-dropping passes run). Drops a
+        // handful of tiny per-layer elementwise nodes from the captured decode
+        // graph; byte-identical (the kernel reproduces each op's rounding).
+        Box::new(CudaLinearAttentionGatingFusion),
         Box::new(CudaFoldConstantTranspose),
         Box::new(CudaFoldConstantCast),
         // Fuse the per-layer Q/K/V projections into one wider MatMulNBits while
@@ -124,7 +144,7 @@ pub(crate) fn cuda_optimization_passes() -> Vec<Box<dyn OptimizationPass>> {
         Box::new(CudaMatMulNBitsBiasFusion),
         Box::new(CudaSwiGluFusion),
         Box::new(CudaGateUpSwiGluFusion),
-        Box::new(CudaSkipRmsNormMatMulFusion),
+        Box::new(CudaSkipRmsNormMatMulFusion::for_device(device)),
         // Lower a capture-unsafe LongRoPE-style `If(Greater, const, const)` cos/sin
         // cache selector into an on-device `Where`, collapsing the per-token host
         // cond readback / graph split so decode captures as a single graph.
@@ -313,6 +333,555 @@ impl OptimizationPass for CudaRsqrtFusion {
                 .insert(CUDA_RSQRT_ATTR.into(), Attribute::Int(1));
             graph.replace_node(recip_id, rsqrt);
             graph.remove_node(sqrt_id);
+            changed = true;
+        }
+
+        if changed {
+            graph.validate().map_err(OptimizerError::from)?;
+        }
+        Ok(())
+    }
+}
+
+/// Environment opt-out for [`CudaL2NormalizeFusion`]. Setting
+/// `ONNX_GENAI_CUDA_L2NORM_FUSION=0` keeps the exported unfused
+/// `ReduceSumSquare → Sqrt → Div` chain — for A/B measurement or rollback.
+fn l2_normalize_fusion_disabled() -> bool {
+    std::env::var_os("ONNX_GENAI_CUDA_L2NORM_FUSION").is_some_and(|v| v == "0")
+}
+
+/// Collapse the Gated-DeltaNet query/key **L2 normalization** glue
+/// `Div(x, Sqrt(ReduceSumSquare(x, axis)))` into a single fused
+/// `LpNormalization` (`p = 2`) node.
+///
+/// ## The pattern (Qwen3.8 / Qwen3-Next Gated-DeltaNet, exported by mobius)
+///
+/// Each linear-attention sublayer L2-normalizes its query and key head vectors
+/// along the last (`head_dim`) axis:
+///
+/// ```text
+///   sq  = ReduceSumSquare(x, axes=[axis], keepdims=1)   // Σ x²
+///   nrm = Sqrt(sq)                                        // ‖x‖₂
+///   y   = Div(x, nrm)                                     // x / ‖x‖₂
+/// ```
+///
+/// That is exactly `LpNormalization(x, p=2, axis)`, for which the CUDA EP
+/// already has a single fused NVRTC kernel (`global_reduction::lp_normalization`)
+/// that does the sum-of-squares reduction, the `sqrt`, and the divide in **one**
+/// pass over a single HBM read — replacing three separate kernel launches (and
+/// two intermediate tensor round-trips) per site. On Qwen3.8-27B there are 96
+/// such sites per decode step (48 linear-attention layers × {query, key}), so the
+/// fold removes ~192 tiny launches from the captured decode graph.
+///
+/// ## Numerics
+///
+/// The fused node is tagged so the CUDA EP runs a **byte-faithful** L2-normalize
+/// kernel (`global_reduction::l2_normalize_faithful`) that reproduces the exported
+/// chain's arithmetic *exactly*: it accumulates `Σ x²` in fp32 with the same
+/// 256-way shared-memory tree reduce the EP already uses to lower
+/// `ReduceSumSquare`, then rounds the sum to the activation dtype, takes the fp32
+/// `sqrt` and rounds again, and finally divides in fp32 and rounds the result —
+/// matching the intermediate rounds of the separate `ReduceSumSquare`, `Sqrt`,
+/// and `Div` ops. The output is therefore **bit-identical** to the unfused graph
+/// (greedy decode stays token-identical on the validated 27B models), while
+/// collapsing three launches into one. The fold is refused unless the activation
+/// dtype is one the kernel serves (f32/f16/bf16) and the reduce is a single-axis
+/// `keepdims=1` reduction.
+pub(crate) struct CudaL2NormalizeFusion;
+
+impl CudaL2NormalizeFusion {
+    /// The single reduced axis of a `ReduceSumSquare`, if it reduces exactly one
+    /// axis with `keepdims=1` (so the following `Div` broadcasts cleanly). Reads
+    /// the `axes` attribute (opset < 18) or the `axes` initializer input (opset
+    /// ≥ 18); falls back to deriving it from the input/output static shapes. The
+    /// returned axis may be negative — [`LpNormalizationKernel`] normalizes it
+    /// against the input rank at launch.
+    fn reduce_axis(graph: &Graph, rss: &Node) -> Option<i64> {
+        if rss
+            .attr("keepdims")
+            .and_then(Attribute::as_int)
+            .unwrap_or(1)
+            != 1
+        {
+            return None;
+        }
+        // opset < 18: axes attribute.
+        if let Some(axes) = rss.attr("axes").and_then(Attribute::as_ints) {
+            return (axes.len() == 1).then(|| axes[0]);
+        }
+        // opset >= 18: axes is the second (optional) input, an int64 initializer.
+        if let Some(Some(axes_val)) = rss.inputs.get(1) {
+            if let Some(WeightRef::Inline(t)) = graph.initializers.get(axes_val)
+                && t.dtype == DataType::Int64
+                && t.numel() == 1
+                && t.data.len() >= 8
+            {
+                let mut bytes = [0u8; 8];
+                bytes.copy_from_slice(&t.data[..8]);
+                return Some(i64::from_le_bytes(bytes));
+            }
+            // An axes input we cannot statically read (dynamic or external) —
+            // refuse rather than guess the reduced axis.
+            return None;
+        }
+        // No axes given: derive from the static shapes (the one dim reduced to 1).
+        let x = rss.inputs.first().copied().flatten()?;
+        let in_shape = &graph.value(x).shape;
+        let out_shape = &graph.value(rss.outputs[0]).shape;
+        if in_shape.len() != out_shape.len() {
+            return None;
+        }
+        let mut axis = None;
+        for (index, (a, b)) in in_shape.iter().zip(out_shape.iter()).enumerate() {
+            let (Some(a), Some(b)) = (a.as_static(), b.as_static()) else {
+                return None;
+            };
+            if a != b {
+                if b != 1 || axis.is_some() {
+                    return None;
+                }
+                axis = Some(index as i64);
+            }
+        }
+        axis
+    }
+}
+
+impl OptimizationPass for CudaL2NormalizeFusion {
+    fn name(&self) -> &str {
+        "CudaL2NormalizeFusion"
+    }
+
+    fn run(&self, graph: &mut Graph, _ctx: &PassContext) -> OptimizerResult<()> {
+        if l2_normalize_fusion_disabled() {
+            return Ok(());
+        }
+        let div_ids: Vec<NodeId> = graph
+            .nodes
+            .iter()
+            .filter_map(|(id, node)| {
+                (node.op_type == "Div"
+                    && node.is_default_domain()
+                    && node.inputs.len() == 2
+                    && node.outputs.len() == 1)
+                    .then_some(id)
+            })
+            .collect();
+        let mut changed = false;
+
+        for div_id in div_ids {
+            let Some(div) = graph.try_node(div_id) else {
+                continue;
+            };
+            let (Some(x), Some(nrm)) = (div.inputs[0], div.inputs[1]) else {
+                continue;
+            };
+            // The activation dtype must be one the LpNormalization kernel serves.
+            if !matches!(
+                graph.value(x).dtype,
+                DataType::Float32 | DataType::Float16 | DataType::BFloat16
+            ) {
+                continue;
+            }
+            // `nrm` must be a sole-consumer `Sqrt(sq)`.
+            let Some(sqrt_id) = graph.value(nrm).producer else {
+                continue;
+            };
+            let sqrt = graph.node(sqrt_id);
+            if sqrt.op_type != "Sqrt"
+                || !sqrt.is_default_domain()
+                || sqrt.inputs.len() != 1
+                || sqrt.outputs.len() != 1
+                || graph.value(nrm).is_graph_output
+                || graph.consumers(nrm).len() != 1
+            {
+                continue;
+            }
+            let Some(sq) = sqrt.inputs[0] else {
+                continue;
+            };
+            // `sq` must be a sole-consumer `ReduceSumSquare(x, axis)` over the
+            // *same* `x` the Div divides — the true L2-normalize shape.
+            let Some(rss_id) = graph.value(sq).producer else {
+                continue;
+            };
+            let rss = graph.node(rss_id);
+            if rss.op_type != "ReduceSumSquare"
+                || !rss.is_default_domain()
+                || rss.inputs.first().copied().flatten() != Some(x)
+                || rss.outputs.len() != 1
+                || graph.value(sq).is_graph_output
+                || graph.consumers(sq).len() != 1
+            {
+                continue;
+            }
+            let Some(axis) = Self::reduce_axis(graph, rss) else {
+                continue;
+            };
+
+            // Rewrite the Div into a single fused LpNormalization(p=2) that reads
+            // `x` directly and keeps the Div's output value (downstream untouched);
+            // then drop the now-dead Sqrt and ReduceSumSquare.
+            let mut lpnorm = div.clone();
+            lpnorm.op_type = "LpNormalization".to_string();
+            lpnorm.domain = String::new();
+            lpnorm.version = None;
+            lpnorm.inputs = vec![Some(x)];
+            lpnorm.attributes.clear();
+            lpnorm.attributes.insert("p".into(), Attribute::Int(2));
+            lpnorm
+                .attributes
+                .insert("axis".into(), Attribute::Int(axis));
+            // Private marker: route to the byte-faithful L2-normalize kernel that
+            // reproduces the exported chain's intermediate rounding, so greedy
+            // decode stays token-identical to the unfused graph.
+            lpnorm
+                .attributes
+                .insert("fused_reduce_chain".into(), Attribute::Int(1));
+            graph.replace_node(div_id, lpnorm);
+            graph.remove_node(sqrt_id);
+            graph.remove_node(rss_id);
+            changed = true;
+        }
+
+        if changed {
+            graph.validate().map_err(OptimizerError::from)?;
+        }
+        Ok(())
+    }
+}
+
+/// Fold the standalone gate chains that feed a gated-delta `LinearAttention`
+/// (Gated DeltaNet, Qwen3.5 / Qwen3-Next hybrid family) into the CUDA
+/// `LinearAttention` kernel itself, so the per-layer decode graph loses a handful
+/// of tiny elementwise nodes per layer:
+///
+/// * **`beta = Sigmoid(x)`** — the delta-rule mixing gate. The kernel already
+///   consumes `beta`; the fold rewires it onto the pre-`Sigmoid` value and marks
+///   [`FUSE_BETA_SIGMOID_ATTR`], so the kernel applies the sigmoid inline.
+/// * **`g = exp(neg_exp_A · Softplus(a + dt_bias))`** — the per-head decay gate.
+///   The exported chain is `Add(a, dt_bias) → Softplus → Mul(neg_exp_A, ·) →
+///   [Cast]`, feeding the kernel's `exp`. The fold rewires the decay slot onto
+///   `a`, appends `dt_bias` and `neg_exp_A` as trailing inputs, and marks
+///   [`FUSE_DECAY_SOFTPLUS_ATTR`]; the kernel recomputes the whole chain.
+///
+/// ## Byte-identity
+///
+/// The kernel reproduces each folded op's device function bit-for-bit
+/// (`la_sigmoid`/`la_softplus` mirror `op_sigmoid`/`op_softplus`) **and** rounds
+/// every intermediate through the storage dtype (`round_store<T>`) exactly where
+/// the standalone `Add`/`Softplus`/`Mul`/`Sigmoid` kernels round. So on the fp32
+/// text export (chain runs in f32, rounding is a no-op) and the fp16-I/O hybrid
+/// (chain rounds to f16 at every op boundary) greedy tokens stay identical. The
+/// fold is refused unless every folded operand shares the kernel's I/O dtype, so
+/// a dtype-changing `Cast` is never silently skipped.
+///
+/// ## Generality and safety
+///
+/// The match is purely structural — driven by op type, single-consumer /
+/// no-escape topology, and which `Mul`/`Add` operand is a graph initializer — so
+/// it fires for any head count and layer count and never bakes in a Qwen3.5
+/// shape. Each rewritten gate requires its whole chain to be single-consumer and
+/// not a graph output, so no value another node still observes is removed. When
+/// any condition fails the gate is left exactly as exported.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct CudaLinearAttentionGatingFusion;
+
+/// Environment opt-out for [`CudaLinearAttentionGatingFusion`], mirroring the
+/// other CUDA-fusion switches. Any value other than unset/empty/`0` restores the
+/// exact exported (unfused) gate chains — for A/B measurement or rollback.
+const LINEAR_ATTENTION_GATING_DISABLE_ENV: &str = "ONNX_GENAI_CUDA_DISABLE_LINATTN_GATING_FUSION";
+
+fn linear_attention_gating_disabled() -> bool {
+    std::env::var_os(LINEAR_ATTENTION_GATING_DISABLE_ENV)
+        .is_some_and(|value| value != "0" && !value.is_empty())
+}
+
+/// A `Sigmoid` gate folded into the kernel: `sigmoid_id` is removed and the
+/// beta slot is rewired onto `raw` (its pre-`Sigmoid` source).
+struct BetaSigmoidFold {
+    sigmoid_id: NodeId,
+    raw: ValueId,
+}
+
+/// A decay `Softplus` chain folded into the kernel.
+struct DecaySoftplusFold {
+    /// Pre-chain activation `a` (the `Add`'s non-initializer operand).
+    a: ValueId,
+    dt_bias: ValueId,
+    /// The decay coefficient operand passed in the kernel's `neg_exp_A` slot.
+    /// When `fuse_neg_exp` is false this is the precomputed `neg_exp_A`
+    /// initializer; when true it is the raw `A_log` initializer and the kernel
+    /// folds the `Neg(Exp(A_log))` constant chain inline.
+    neg_exp_a: ValueId,
+    /// Whether the exported `neg_exp_A = Neg(Exp(A_log))` constant chain was also
+    /// absorbed (so `neg_exp_a` above is `A_log`).
+    fuse_neg_exp: bool,
+    /// Chain nodes to delete, consumer-first so each is orphaned before removal.
+    dead: Vec<NodeId>,
+}
+
+impl CudaLinearAttentionGatingFusion {
+    /// A `LinearAttention` node in the `com.microsoft` domain with at least the
+    /// `q, k, v, past, decay, beta` slots.
+    fn is_gated_delta_la(node: &Node) -> bool {
+        node.op_type == "LinearAttention"
+            && node.domain == MICROSOFT_DOMAIN
+            && node.inputs.len() >= 6
+            && node.outputs.len() == 2
+    }
+
+    /// The single producer of `value`, if `value` is single-consumer (by
+    /// `consumer_id`), not a graph output, and produced by exactly one node.
+    fn sole_producer(graph: &Graph, value: ValueId, consumer_id: NodeId) -> Option<NodeId> {
+        if graph.outputs.contains(&value) {
+            return None;
+        }
+        let consumers = graph.consumers(value);
+        if consumers.len() != 1 || consumers[0] != consumer_id {
+            return None;
+        }
+        graph.value(value).producer
+    }
+
+    /// Match `beta = Sigmoid(raw)` where `raw` shares `io_dtype`.
+    fn match_beta_sigmoid(
+        graph: &Graph,
+        beta: ValueId,
+        la_id: NodeId,
+        io_dtype: DataType,
+    ) -> Option<BetaSigmoidFold> {
+        let sigmoid_id = Self::sole_producer(graph, beta, la_id)?;
+        let sigmoid = graph.node(sigmoid_id);
+        if sigmoid.op_type != "Sigmoid"
+            || !sigmoid.is_default_domain()
+            || sigmoid.inputs.len() != 1
+            || sigmoid.outputs.len() != 1
+        {
+            return None;
+        }
+        let raw = sigmoid.inputs[0]?;
+        if graph.value(raw).dtype != io_dtype {
+            return None;
+        }
+        Some(BetaSigmoidFold { sigmoid_id, raw })
+    }
+
+    /// Match the exported `neg_exp_A = Neg(Exp(A_log))` constant chain feeding
+    /// `mul_id`, where `A_log` is an `io_dtype` graph initializer and both ops
+    /// are single-consumer and not graph outputs. Returns the `A_log` value and
+    /// the `[Neg, Exp]` node ids to delete (consumer-first). Some exporters emit
+    /// `neg_exp_A` as a ready initializer (nothing to fold here); others — the
+    /// Qwen3.8 / Qwen3-Next hybrids — emit these two elementwise ops on the
+    /// per-head `A_log` weight, which then run every decode step on a constant.
+    fn match_neg_exp_chain(
+        graph: &Graph,
+        neg_exp_a: ValueId,
+        consumer_id: NodeId,
+        io_dtype: DataType,
+    ) -> Option<(ValueId, [NodeId; 2])> {
+        let neg_id = Self::sole_producer(graph, neg_exp_a, consumer_id)?;
+        let neg = graph.node(neg_id);
+        if neg.op_type != "Neg"
+            || !neg.is_default_domain()
+            || neg.inputs.len() != 1
+            || neg.outputs.len() != 1
+        {
+            return None;
+        }
+        let exp_out = neg.inputs[0]?;
+        let exp_id = Self::sole_producer(graph, exp_out, neg_id)?;
+        let exp = graph.node(exp_id);
+        if exp.op_type != "Exp"
+            || !exp.is_default_domain()
+            || exp.inputs.len() != 1
+            || exp.outputs.len() != 1
+        {
+            return None;
+        }
+        let a_log = exp.inputs[0]?;
+        if !graph.initializers.contains_key(&a_log) || graph.value(a_log).dtype != io_dtype {
+            return None;
+        }
+        Some((a_log, [neg_id, exp_id]))
+    }
+
+    /// Match `decay = [Cast](Mul(neg_exp_A, Softplus(Add(a, dt_bias))))` with an
+    /// optional identity `Cast` tail, every intermediate single-consumer and of
+    /// `io_dtype`, `dt_bias` a graph initializer, and `neg_exp_A` either a graph
+    /// initializer or the foldable `Neg(Exp(A_log))` constant chain.
+    fn match_decay_softplus(
+        graph: &Graph,
+        decay: ValueId,
+        la_id: NodeId,
+        io_dtype: DataType,
+    ) -> Option<DecaySoftplusFold> {
+        let mut dead = Vec::new();
+        // Optional trailing identity `Cast` (never a dtype-changing one).
+        let (mul_out, mul_consumer) = {
+            let producer = Self::sole_producer(graph, decay, la_id)?;
+            let node = graph.node(producer);
+            if node.op_type == "Cast"
+                && node.is_default_domain()
+                && node.inputs.len() == 1
+                && node.outputs.len() == 1
+                && graph.value(node.inputs[0]?).dtype == io_dtype
+            {
+                dead.push(producer);
+                (node.inputs[0]?, producer)
+            } else {
+                (decay, la_id)
+            }
+        };
+        // `Mul(neg_exp_A, Softplus(...))` — order-independent.
+        let mul_id = Self::sole_producer(graph, mul_out, mul_consumer)?;
+        let mul = graph.node(mul_id);
+        if mul.op_type != "Mul"
+            || !mul.is_default_domain()
+            || mul.inputs.len() != 2
+            || mul.outputs.len() != 1
+        {
+            return None;
+        }
+        let (a0, a1) = (mul.inputs[0]?, mul.inputs[1]?);
+        // The decay coefficient operand is either a precomputed `neg_exp_A`
+        // graph initializer, or the exported `Neg(Exp(A_log))` constant chain
+        // (A_log an initializer) which is folded into the kernel; the other
+        // operand is the `Softplus(...)` result. `dead` stays consumer-first, so
+        // `mul_id` is pushed before the coefficient chain it consumes.
+        dead.push(mul_id);
+        let (neg_exp_a, softplus_out, fuse_neg_exp) = if graph.initializers.contains_key(&a0) {
+            (a0, a1, false)
+        } else if graph.initializers.contains_key(&a1) {
+            (a1, a0, false)
+        } else if let Some((a_log, chain)) = Self::match_neg_exp_chain(graph, a0, mul_id, io_dtype)
+        {
+            dead.extend(chain);
+            (a_log, a1, true)
+        } else if let Some((a_log, chain)) = Self::match_neg_exp_chain(graph, a1, mul_id, io_dtype)
+        {
+            dead.extend(chain);
+            (a_log, a0, true)
+        } else {
+            return None;
+        };
+        // The initializer path still checks the coefficient dtype here; the
+        // chain path already checked `A_log`'s dtype inside `match_neg_exp_chain`.
+        if !fuse_neg_exp && graph.value(neg_exp_a).dtype != io_dtype {
+            return None;
+        }
+        // `Softplus(Add(...))`.
+        let softplus_id = Self::sole_producer(graph, softplus_out, mul_id)?;
+        let softplus = graph.node(softplus_id);
+        if softplus.op_type != "Softplus"
+            || !softplus.is_default_domain()
+            || softplus.inputs.len() != 1
+            || softplus.outputs.len() != 1
+        {
+            return None;
+        }
+        let add_out = softplus.inputs[0]?;
+        dead.push(softplus_id);
+        // `Add(a, dt_bias)` — order-independent.
+        let add_id = Self::sole_producer(graph, add_out, softplus_id)?;
+        let add = graph.node(add_id);
+        if add.op_type != "Add"
+            || !add.is_default_domain()
+            || add.inputs.len() != 2
+            || add.outputs.len() != 1
+        {
+            return None;
+        }
+        let (b0, b1) = (add.inputs[0]?, add.inputs[1]?);
+        let (dt_bias, a) = if graph.initializers.contains_key(&b1) {
+            (b1, b0)
+        } else if graph.initializers.contains_key(&b0) {
+            (b0, b1)
+        } else {
+            return None;
+        };
+        if graph.value(dt_bias).dtype != io_dtype || graph.value(a).dtype != io_dtype {
+            return None;
+        }
+        dead.push(add_id);
+        Some(DecaySoftplusFold {
+            a,
+            dt_bias,
+            neg_exp_a,
+            fuse_neg_exp,
+            dead,
+        })
+    }
+}
+
+impl OptimizationPass for CudaLinearAttentionGatingFusion {
+    fn name(&self) -> &str {
+        "CudaLinearAttentionGatingFusion"
+    }
+
+    fn run(&self, graph: &mut Graph, _ctx: &PassContext) -> OptimizerResult<()> {
+        if linear_attention_gating_disabled() {
+            return Ok(());
+        }
+        let la_ids: Vec<NodeId> = graph
+            .nodes
+            .iter()
+            .filter_map(|(id, node)| Self::is_gated_delta_la(node).then_some(id))
+            .collect();
+        let mut changed = false;
+
+        for la_id in la_ids {
+            let Some(la) = graph.try_node(la_id) else {
+                continue;
+            };
+            // The kernel widens every input to f32 and rounds folded gates back
+            // through this storage dtype, so all folded operands must match it.
+            let Some(io_dtype) = la.inputs[0].map(|v| graph.value(v).dtype) else {
+                continue;
+            };
+            let beta_slot = la.inputs.get(5).copied().flatten();
+            let decay_slot = la.inputs.get(4).copied().flatten();
+            // Only fold decay when no trailing operands are present yet, so the
+            // rewrite owns input slots 6/7.
+            let decay_foldable = la.inputs.len() == 6;
+
+            let beta_fold =
+                beta_slot.and_then(|beta| Self::match_beta_sigmoid(graph, beta, la_id, io_dtype));
+            let decay_fold = if decay_foldable {
+                decay_slot
+                    .and_then(|decay| Self::match_decay_softplus(graph, decay, la_id, io_dtype))
+            } else {
+                None
+            };
+            if beta_fold.is_none() && decay_fold.is_none() {
+                continue;
+            }
+
+            let mut new_la = la.clone();
+            let mut dead = Vec::new();
+            if let Some(fold) = beta_fold {
+                new_la.inputs[5] = Some(fold.raw);
+                new_la
+                    .attributes
+                    .insert(FUSE_BETA_SIGMOID_ATTR.into(), Attribute::Int(1));
+                dead.push(fold.sigmoid_id);
+            }
+            if let Some(fold) = decay_fold {
+                new_la.inputs[4] = Some(fold.a);
+                new_la.inputs.push(Some(fold.dt_bias));
+                new_la.inputs.push(Some(fold.neg_exp_a));
+                new_la
+                    .attributes
+                    .insert(FUSE_DECAY_SOFTPLUS_ATTR.into(), Attribute::Int(1));
+                if fold.fuse_neg_exp {
+                    new_la
+                        .attributes
+                        .insert(FUSE_NEG_EXP_ATTR.into(), Attribute::Int(1));
+                }
+                dead.extend(fold.dead);
+            }
+            graph.replace_node(la_id, new_la);
+            graph.remove_nodes(&dead);
             changed = true;
         }
 
@@ -1383,7 +1952,12 @@ impl OptimizationPass for CudaMatMulNBitsBiasFusion {
                 plan.matmul_inputs[0],
                 plan.matmul_inputs[1],
                 plan.matmul_inputs[2],
-                None,
+                // Zero-points, when the source node had them. The folded bias is
+                // an output-side epilogue and does not interact with dequant, so
+                // this input passes straight through.
+                plan.matmul_inputs[3],
+                // Group index: the fold declines any node that has one, so this
+                // slot is always empty here.
                 None,
                 Some(plan.bias),
             ];
@@ -1403,7 +1977,7 @@ impl OptimizationPass for CudaMatMulNBitsBiasFusion {
 struct BiasFoldPlan {
     add_id: NodeId,
     matmul_id: NodeId,
-    matmul_inputs: [Option<ValueId>; 3],
+    matmul_inputs: [Option<ValueId>; 4],
     matmul_out: ValueId,
     add_out: ValueId,
     bias: ValueId,
@@ -1436,12 +2010,39 @@ impl CudaMatMulNBitsBiasFusion {
         }
 
         let matmul = graph.node(matmul_id);
-        // Only the plain A/B/scales form is eligible: no zero-points, group
-        // index, or pre-existing bias.
-        let present: Vec<ValueId> = matmul.input_values().collect();
-        if present.len() != 3 || matmul.inputs.iter().skip(3).any(Option::is_some) {
+        // The folded bias is an output-side epilogue — the kernel reproduces
+        // `fp16(fp16(acc) + bias)` after the GEMV completes (see
+        // `fold_bias_post_round`) — so it is orthogonal to how the weights were
+        // dequantized. Zero-points are therefore fine; what must be absent is a
+        // group index (input 4, which the fused entry does not thread through)
+        // and a pre-existing bias (input 5, which this fold would double-apply).
+        //
+        // This gate used to require exactly the A/B/scales form, which silently
+        // excluded every asymmetrically-quantized model. On qwen2.5-0.5B that
+        // left 72 QKV bias `Add`s running as separate kernels at ~24% of decode
+        // time, each costing about as much as the int4 GEMV it followed.
+        const MATMUL_NBITS_ZERO_POINTS_INPUT: usize = 3;
+        const MATMUL_NBITS_GROUP_INDEX_INPUT: usize = 4;
+        if matmul.inputs.len() > MATMUL_NBITS_GROUP_INDEX_INPUT
+            && matmul
+                .inputs
+                .iter()
+                .skip(MATMUL_NBITS_GROUP_INDEX_INPUT)
+                .any(Option::is_some)
+        {
             return None;
         }
+        if matmul.inputs.first().copied().flatten().is_none()
+            || matmul.inputs.get(1).copied().flatten().is_none()
+            || matmul.inputs.get(2).copied().flatten().is_none()
+        {
+            return None;
+        }
+        let zero_points = matmul
+            .inputs
+            .get(MATMUL_NBITS_ZERO_POINTS_INPUT)
+            .copied()
+            .flatten();
         let n = matmul.attr("N").and_then(Attribute::as_int)? as usize;
 
         // Bias must be a persistent 1-D `[N]` initializer whose element type
@@ -1468,7 +2069,12 @@ impl CudaMatMulNBitsBiasFusion {
         Some(BiasFoldPlan {
             add_id,
             matmul_id,
-            matmul_inputs: [matmul.inputs[0], matmul.inputs[1], matmul.inputs[2]],
+            matmul_inputs: [
+                matmul.inputs[0],
+                matmul.inputs[1],
+                matmul.inputs[2],
+                zero_points,
+            ],
             matmul_out,
             add_out,
             bias,
@@ -1519,35 +2125,92 @@ fn rmsnorm_fusion_disabled() -> bool {
         .is_some_and(|value| value != "0" && !value.is_empty())
 }
 
-/// Minimum hidden width (`norm_size`) at which folding the standalone
-/// `SkipSimplifiedLayerNormalization` into its following GEMV(s) is projected to
-/// be a net win. Below this floor the fusion keeps the standalone norm. See
-/// [`fusion_benefit_is_positive`] for the derivation and calibration.
+/// The **single calibrated anchor point** for the fold's M=1 hidden-size floor,
+/// and the fallback used when the device is unknown. See
+/// [`fusion_benefit_is_positive`] for how the live per-device floor is derived
+/// from this one measurement rather than applied globally (#1421).
 ///
 /// Expressed as ten [`RMSNORM_FUSION_WARP_HALF4_MULTIPLE`]-wide reduction chunks
-/// (`10 * 128 == 1280`): the measured throughput crossover sits between a hidden
-/// of seven chunks (896, which regresses) and twelve chunks (1536, which wins),
-/// so the floor is the granularity-aligned midpoint. It is a property of the
-/// kernel's 128-lane reduction, never of any model.
+/// (`10 * 128 == 1280`): on the calibration device the measured M=1 throughput
+/// crossover sits between a hidden of seven chunks (896, which regressed) and
+/// twelve chunks (1536, which won), so the anchor is the granularity-aligned
+/// midpoint. It is a property of the kernel's 128-lane reduction, never of any
+/// model.
 ///
-/// Caveat — this floor was calibrated on **M=1 single-stream** throughput on an
-/// **H200** (commit `05e1fd10`: 0.5B hidden-896 regressed -2.7% folded), and it
-/// predates the capture-safe batch-decode path (#1404). At **M>=2** the fold
-/// makes the gate/up node capture-safe and collapses the batch-decode CUDA-graph
-/// segmentation (25 -> 1 segments), saving ~20 ms/step — which dwarfs the M=1
-/// prologue cost. The fold is byte-identical, so keeping the standalone norm
-/// below 1280 leaves that batch win on the table for small resident models
-/// (0.5B at 896, granite-1B MoE at 1024). The M=1 cost is also hardware-
-/// dependent: on RTX 4060 the same hidden-896 fold measured neutral-to-faster,
-/// not a regression. Making this gate batch/device-aware is tracked in #1421;
-/// until then the override below enables it. See the operator-knob section of
+/// **Regime this anchor was measured in** (per §40.3 of
+/// `docs/benchmarks/2026-08-15-cpu-ep-vs-ort-attention-moe.md`, "a tuning
+/// constant should carry the regime it was calibrated in"):
+/// * **What was varied:** hidden width (896 vs 1536).
+/// * **What was held fixed:** **M=1 single-stream** decode, greedy, one following
+///   GEMV, on an **H200** (`sm_90`, 132 SMs), commit `05e1fd10`.
+/// * **Workload shape:** resident (not streaming) decode, M=1.
+///
+/// Two facts make a *global* 1280 the wrong default outside that regime, and both
+/// are handled by [`fusion_benefit_is_positive`] instead of here:
+/// * **Batch.** At **M>=2** the fold makes the gate/up node capture-safe and
+///   collapses the batch-decode CUDA-graph segmentation (25 -> 1 segments),
+///   saving ~20 ms/step — dwarfing the M=1 prologue cost. This is a *structural*
+///   win independent of hidden width. It changes the fp16 reduction order (not
+///   bit-identical — see [`CudaSkipRmsNormMatMulFusion`]) but preserves greedy
+///   tokens except at rare argmax near-ties. The optimizer cannot see M
+///   (the decode graph is shared across all batch sizes; batch dims are
+///   symbolic), so M cannot gate the fold per-step — see the note in
+///   [`fusion_benefit_is_positive`].
+/// * **Device.** The M=1 cost is hardware-dependent: on an RTX 4060 (`sm_89`,
+///   24 SMs) the same hidden-896 fold measured neutral-to-faster, not a
+///   regression, because a small GPU has far less parallel slack to make the
+///   standalone norm "almost free". The live floor is therefore *derived from SM
+///   count*, anchored on this H200 point.
+///
+/// See the operator-knob section of
 /// `docs/benchmarks/2026-08-19-batch-decode-mge2-capture-segmentation.md`.
 const RMSNORM_FUSION_MIN_HIDDEN: usize = 10 * RMSNORM_FUSION_WARP_HALF4_MULTIPLE;
-/// Optional environment override for [`RMSNORM_FUSION_MIN_HIDDEN`]. Beyond
-/// calibrating the floor against measured throughput, this is the documented
-/// interim knob (#1421) an operator lowers to force the byte-identical fold on a
-/// small resident model so **batched** decode gets #1404's capture-safe path;
-/// set it only when batching (see the constant's caveat on the M=1 cost).
+
+/// SM count of the device the [`RMSNORM_FUSION_MIN_HIDDEN`] anchor was calibrated
+/// on (H200, `sm_90`, 132 streaming multiprocessors). The derived per-device
+/// floor scales linearly from this `(sm_count, floor)` anchor.
+const RMSNORM_FUSION_ANCHOR_SM_COUNT: u32 = 132;
+
+/// Derive the M=1 fold hidden-size floor for a device from its SM count, anchored
+/// on the one calibrated point ([`RMSNORM_FUSION_MIN_HIDDEN`] on
+/// [`RMSNORM_FUSION_ANCHOR_SM_COUNT`] SMs).
+///
+/// **Physics (from [`fusion_benefit_is_positive`]'s cost model):** the fold's
+/// only M=1 downside is the added serialized single-warp prologue latency; its
+/// upside is eliminating the standalone norm launch, which is "almost free"
+/// exactly to the extent the device has parallel slack to absorb it. That slack
+/// scales with the number of SMs, so the hidden width at which the upside
+/// overtakes the fixed downside — the crossover floor — scales with SM count:
+/// more SMs make the standalone norm cheaper to keep, pushing the floor up.
+///
+/// This is a **one-point anchor plus a proportionality**, not a two-point fit:
+/// the slope is fixed by the single H200 calibration, and the RTX 4060 point only
+/// *corroborates* it (24 SMs → `round(10 * 24 / 132) = 2` chunks = 256, so
+/// hidden 896 folds — consistent with the measured neutral-to-faster there). The
+/// result is rounded to whole 128-wide chunks (the fold only fires on 128
+/// multiples anyway) and clamped to at least one chunk (a device with very few
+/// SMs folds essentially always). An unseen device gets a floor from its own SM
+/// count — a big datacenter part inherits the protective H200-class floor, a
+/// small edge part folds aggressively — with no per-device table.
+fn derived_min_hidden(sm_count: u32) -> usize {
+    let sm_count = sm_count.max(1);
+    let anchor_chunks = (RMSNORM_FUSION_MIN_HIDDEN / RMSNORM_FUSION_WARP_HALF4_MULTIPLE) as u64;
+    let anchor_sm = u64::from(RMSNORM_FUSION_ANCHOR_SM_COUNT);
+    // Round-nearest so the anchor reproduces itself exactly (132 SM -> 10 chunks).
+    let chunks = (anchor_chunks * u64::from(sm_count) + anchor_sm / 2) / anchor_sm;
+    (chunks.max(1) as usize) * RMSNORM_FUSION_WARP_HALF4_MULTIPLE
+}
+
+/// Optional environment override for the derived fold floor. It short-circuits
+/// the whole [`fusion_benefit_is_positive`] decision with an explicit hidden-size
+/// floor, so an operator can still force or suppress the byte-identical fold for
+/// A/B measurement or to cover the one case the derivation cannot reach on its
+/// own: **batched decode of a small model on a large GPU**, where the SM-derived
+/// floor stays high (protecting M=1) but M>=2 would benefit from folding, and the
+/// optimizer cannot see M to decide automatically. Lower it (e.g. to the model's
+/// hidden size) when serving such a workload. The fold changes the fp16 reduction
+/// order (not bit-identical; see [`CudaSkipRmsNormMatMulFusion`]), so greedy
+/// tokens are unchanged except at rare argmax near-ties.
 const RMSNORM_FUSION_MIN_HIDDEN_ENV: &str = "ONNX_GENAI_RMSNORM_MIN_HIDDEN";
 
 fn env_usize(name: &str, default: usize) -> usize {
@@ -1574,12 +2237,49 @@ fn env_usize(name: &str, default: usize) -> usize {
 /// with how memory bound the model is, while on a tiny decoder the standalone
 /// norm is already almost free under decode graph capture and the added serial
 /// prologue latency dominates. Measured throughput bears this out: the fusion
-/// regresses at a hidden of 896 but wins from 1536 upward, so the gate keeps the
-/// standalone norm whenever `norm_size` is below [`RMSNORM_FUSION_MIN_HIDDEN`].
+/// regresses at a hidden of 896 but wins from 1536 upward *on the H200 anchor*,
+/// so the gate keeps the standalone norm whenever `norm_size` is below the
+/// floor derived for `device` by [`derived_min_hidden`].
+///
+/// **The floor is now per-device, derived from SM count** ([`derived_min_hidden`]),
+/// rather than the historical global 1280. Rationale, and what each axis buys:
+/// * **Device-aware (derived).** The M=1 downside is a fixed serialized-prologue
+///   latency; the upside — eliminating the standalone norm — is only "almost
+///   free" in proportion to the device's parallel slack (∝ SM count). So the
+///   crossover floor scales with SM count, anchored on the one H200 calibration.
+///   A small GPU (few SMs) gets a low floor and folds aggressively; a large GPU
+///   keeps the protective H200-class floor at M=1. This also *captures the M>=2
+///   structural win by default on small/edge GPUs*, which is where batching small
+///   models is most common.
+/// * **Batch-aware — as far as the optimizer can be.** At M>=2 the fold is a
+///   large, *structural* win (segmentation 25 -> 1; a reduction-order change,
+///   not bit-identical), independent of hidden width. Ideally M>=2 would fold
+///   unconditionally. **But the
+///   optimizer does not know M**: this pass runs once at model-load on a decode
+///   graph whose batch dimension is symbolic and shared across every batch size,
+///   so there is no per-step M to test here. Plumbing M would require a
+///   deployment-wide "batched decode expected" hint threaded from session config
+///   → EP → [`cuda_optimization_passes`] into this pass, and even then it would
+///   be a build-time hint, not a per-step value. Until such a hint exists, the
+///   SM-derived floor covers the common (small-GPU) batch case automatically, and
+///   the `ONNX_GENAI_RMSNORM_MIN_HIDDEN` override covers the residual case of a
+///   small model batched on a large GPU.
+///
 /// The `fanout`/`following_min_n` signals are accepted for completeness but the
-/// hidden floor is the decisive, measurement-calibrated term.
-fn fusion_benefit_is_positive(norm_size: usize, _fanout: usize, _following_min_n: usize) -> bool {
-    let floor = env_usize(RMSNORM_FUSION_MIN_HIDDEN_ENV, RMSNORM_FUSION_MIN_HIDDEN);
+/// hidden floor is the decisive term. `device == None` (device unknown, e.g. in
+/// unit tests) falls back to [`RMSNORM_FUSION_MIN_HIDDEN`], reproducing the
+/// historical global behavior. The `ONNX_GENAI_RMSNORM_MIN_HIDDEN` override, when
+/// set, wins over both.
+fn fusion_benefit_is_positive(
+    norm_size: usize,
+    _fanout: usize,
+    _following_min_n: usize,
+    device: Option<CudaDeviceCapabilities>,
+) -> bool {
+    let derived = device
+        .map(|caps| derived_min_hidden(caps.multiprocessor_count()))
+        .unwrap_or(RMSNORM_FUSION_MIN_HIDDEN);
+    let floor = env_usize(RMSNORM_FUSION_MIN_HIDDEN_ENV, derived);
     norm_size >= floor
 }
 
@@ -1600,10 +2300,37 @@ fn fusion_benefit_is_positive(norm_size: usize, _fanout: usize, _following_min_n
 ///
 /// The fusion is gated on exactly the conditions under which the standalone norm
 /// uses `skip_rmsnorm_f16_warp_half4` (dense skip, fp16 input/gamma, no norm
-/// bias, hidden % 128 == 0), so the fused arithmetic is bit-for-bit identical.
-/// Any other shape safely keeps the standalone norm.
+/// bias, hidden % 128 == 0). The residual epilogue is bit-identical
+/// (`fp16(fp16(acc) + residual)` == `skip_rmsnorm`'s `__hadd2`), but folding the
+/// RMS normalization into the following GEMV's prologue **changes the fp16
+/// reduction order, so the fused result is not bit-for-bit identical** to the
+/// standalone norm — at a greedy-argmax near-tie it can flip a token. This was
+/// long claimed to be byte-identical; it is not, and that claim had never been
+/// checked. Measured on qwen0.5B (hidden 896): 1 of 6 sampled prompts flipped one
+/// token (at index 49, a 0.0156-nats gap between the top-2 logits). A CPU-EP
+/// full-prefill oracle over the 60-token prefix put the *folded* token (`448`)
+/// closer to the high-precision reference than the unfused one (`304`) — i.e. the
+/// reorder rounded toward the more accurate result, not away from it, so this is
+/// a reduction-order effect, not a fusion bug. Any other shape safely keeps the
+/// standalone norm.
 #[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct CudaSkipRmsNormMatMulFusion;
+pub(crate) struct CudaSkipRmsNormMatMulFusion {
+    /// Device capabilities used to derive the batch-agnostic hidden-size floor
+    /// (see [`fusion_benefit_is_positive`]). `None` means "device unknown" — the
+    /// pass then falls back to the H200-calibrated [`RMSNORM_FUSION_MIN_HIDDEN`],
+    /// reproducing the historical global behavior (used by the unit tests and any
+    /// non-provider construction path).
+    device: Option<CudaDeviceCapabilities>,
+}
+
+impl CudaSkipRmsNormMatMulFusion {
+    /// Construct the pass for a specific device (or `None` when the device is
+    /// unknown). The provider passes `Some(runtime.capabilities())` so the fold
+    /// floor is derived from this GPU's SM count rather than a global constant.
+    pub(crate) fn for_device(device: Option<CudaDeviceCapabilities>) -> Self {
+        Self { device }
+    }
+}
 
 struct SkipRmsNormPlan {
     skip_id: NodeId,
@@ -1806,14 +2533,28 @@ impl CudaSkipRmsNormMatMulFusion {
 
         // Identify which data input is produced by a fusable preceding GEMV; the
         // other is the residual.
-        let (preceding_out, residual) = match (
-            self.preceding_gemv(graph, input_value, norm_size),
-            self.preceding_gemv(graph, skip_value, norm_size),
-        ) {
-            (Some(_), Some(_)) => return None,
-            (Some(_), None) => (input_value, skip_value),
-            (None, Some(_)) => (skip_value, input_value),
-            (None, None) => return None,
+        let input_probe = self.preceding_gemv_attributed(graph, input_value, norm_size);
+        let skip_probe = self.preceding_gemv_attributed(graph, skip_value, norm_size);
+        if std::env::var_os("ONNX_GENAI_CUDA_DEBUG_RMSNORM_FOLD").is_some() {
+            let describe = |r: &Result<NodeId, &'static str>| match r {
+                Ok(_) => "OK".to_string(),
+                Err(reason) => (*reason).to_string(),
+            };
+            eprintln!(
+                "rmsnorm_fold_probe: norm={} input={} skip={}",
+                graph
+                    .try_node(skip_id)
+                    .map(|n| n.name.as_str())
+                    .unwrap_or("<unnamed>"),
+                describe(&input_probe),
+                describe(&skip_probe),
+            );
+        }
+        let (preceding_out, residual) = match (input_probe.is_ok(), skip_probe.is_ok()) {
+            (true, true) => return None,
+            (true, false) => (input_value, skip_value),
+            (false, true) => (skip_value, input_value),
+            (false, false) => return None,
         };
         let preceding_id = self.preceding_gemv(graph, preceding_out, norm_size)?;
         if graph.value(residual).dtype != DataType::Float16 {
@@ -1839,6 +2580,17 @@ impl CudaSkipRmsNormMatMulFusion {
         }
         for following_id in &following_ids {
             if !self.following_gemv_is_fusable(graph, *following_id) {
+                if std::env::var_os("ONNX_GENAI_CUDA_DEBUG_RMSNORM_FOLD").is_some() {
+                    let n = graph.node(*following_id);
+                    eprintln!(
+                        "rmsnorm_fold_decline: following GEMV not prologue-capable: op={} name={} inputs={} K={:?} N={:?}",
+                        n.op_type,
+                        n.name,
+                        n.input_values().count(),
+                        n.attr("K").and_then(Attribute::as_int),
+                        n.attr("N").and_then(Attribute::as_int),
+                    );
+                }
                 return None;
             }
         }
@@ -1855,7 +2607,8 @@ impl CudaSkipRmsNormMatMulFusion {
             .min()
             .unwrap_or(0)
             .max(0) as usize;
-        if !fusion_benefit_is_positive(norm_size, following_ids.len(), following_min_n) {
+        if !fusion_benefit_is_positive(norm_size, following_ids.len(), following_min_n, self.device)
+        {
             return None;
         }
 
@@ -1884,41 +2637,64 @@ impl CudaSkipRmsNormMatMulFusion {
     /// only consumer is the norm, it is not a graph output, and its output width
     /// equals the hidden size (so the residual add is well-shaped).
     fn preceding_gemv(&self, graph: &Graph, value: ValueId, norm_size: usize) -> Option<NodeId> {
-        let producer = graph.try_value(value)?.producer?;
-        let node = graph.try_node(producer)?;
+        self.preceding_gemv_attributed(graph, value, norm_size).ok()
+    }
+
+    /// [`Self::preceding_gemv`] with the decline reason retained.
+    ///
+    /// The reasons are what turns "half the norms do not fold" into an
+    /// actionable finding: inferring them from the pre-optimization graph is
+    /// guesswork, because several of these predicates depend on what earlier
+    /// passes already did to the producer.
+    fn preceding_gemv_attributed(
+        &self,
+        graph: &Graph,
+        value: ValueId,
+        norm_size: usize,
+    ) -> Result<NodeId, &'static str> {
+        let producer = graph
+            .try_value(value)
+            .and_then(|v| v.producer)
+            .ok_or("no producer")?;
+        let node = graph.try_node(producer).ok_or("producer missing")?;
         if node.op_type != "MatMulNBits" || node.domain != MICROSOFT_DOMAIN {
-            return None;
+            return Err("producer is not a com.microsoft MatMulNBits");
         }
-        if node.attr(GATE_UP_SWIGLU_FUSION_ATTR).is_some()
-            || node.attr(MATMUL_NBITS_RMSNORM_PROLOGUE_ATTR).is_some()
-        {
-            return None;
+        if node.attr(GATE_UP_SWIGLU_FUSION_ATTR).is_some() {
+            return Err("producer already carries the gate/up SwiGLU fusion");
+        }
+        if node.attr(MATMUL_NBITS_RMSNORM_PROLOGUE_ATTR).is_some() {
+            return Err("producer already carries an RMSNorm prologue");
         }
         // A/B/scales with an optional asymmetric zero point (slot 3); no group
         // index (slot 4) or pre-existing bias (slot 5), which the residual fold
         // reuses.
         let value_count = node.input_values().count();
-        if !(value_count == 3 || value_count == 4)
-            || node.inputs.iter().skip(4).any(Option::is_some)
-        {
-            return None;
+        if !(value_count == 3 || value_count == 4) {
+            return Err("producer is not the A/B/scales(+zero-points) form");
+        }
+        if node.inputs.iter().skip(4).any(Option::is_some) {
+            return Err("producer has a group index or pre-existing bias");
         }
         // A present zero point (slot 3) must be uint8.
         if let Some(zero_points) = node.inputs.get(3).copied().flatten()
             && graph.try_value(zero_points).map(|value| value.dtype) != Some(DataType::Uint8)
         {
-            return None;
+            return Err("producer zero-points are not uint8");
         }
         if !self.is_fusable_bits_fp16_matmul(graph, node) {
-            return None;
+            return Err("producer is not a fusable int4/int8 fp16 GEMV");
         }
-        if node.attr("N").and_then(Attribute::as_int)? as usize != norm_size {
-            return None;
+        if node.attr("N").and_then(Attribute::as_int).ok_or("no N")? as usize != norm_size {
+            return Err("producer N does not equal the hidden size");
         }
-        if graph.consumers(value).len() != 1 || graph.value(value).is_graph_output {
-            return None;
+        if graph.consumers(value).len() != 1 {
+            return Err("producer output has more than one consumer");
         }
-        Some(producer)
+        if graph.value(value).is_graph_output {
+            return Err("producer output is a graph output");
+        }
+        Ok(producer)
     }
 
     /// A following GEMV is prologue-capable when it is a general int4/int8 fp16
@@ -2002,6 +2778,37 @@ impl CudaSkipRmsNormMatMulFusion {
     }
 }
 
+impl CudaSwiGluFusion {
+    /// The SwiGLU gate activation, in either spelling this fusion accepts.
+    ///
+    /// `com.microsoft.Silu` is the contrib spelling. Standard-domain `Swish` is
+    /// the same function whenever its `alpha` is 1 (`Swish(x) = x *
+    /// sigmoid(alpha * x)`, and `alpha` defaults to 1), which is how current
+    /// exporters emit SwiGLU — Muse-Glimmer's decoder carries 52 of them, one
+    /// per layer. Matching only the contrib spelling is what left those models
+    /// on the unfused `swish` + `mul` path and, transitively, blocked
+    /// `CudaGateUpSwiGluFusion` too, since that pass keys off the marker this
+    /// one writes (#1528).
+    fn is_silu(node: &Node) -> bool {
+        if node.inputs.len() != 1 || node.outputs.len() != 1 {
+            return false;
+        }
+        match node.op_type.as_str() {
+            "Silu" => node.domain == MICROSOFT_DOMAIN,
+            "Swish" => {
+                matches!(node.domain.as_str(), "" | "ai.onnx")
+                    && node.attributes.keys().all(|name| name.as_str() == "alpha")
+                    && node
+                        .attr("alpha")
+                        .and_then(Attribute::as_float)
+                        .unwrap_or(1.0)
+                        == 1.0
+            }
+            _ => false,
+        }
+    }
+}
+
 impl OptimizationPass for CudaSwiGluFusion {
     fn name(&self) -> &str {
         "CudaSwiGluFusion"
@@ -2011,13 +2818,7 @@ impl OptimizationPass for CudaSwiGluFusion {
         let silu_nodes: Vec<NodeId> = graph
             .nodes
             .iter()
-            .filter_map(|(id, node)| {
-                (node.op_type == "Silu"
-                    && node.domain == MICROSOFT_DOMAIN
-                    && node.inputs.len() == 1
-                    && node.outputs.len() == 1)
-                    .then_some(id)
-            })
+            .filter_map(|(id, node)| Self::is_silu(node).then_some(id))
             .collect();
 
         let mut changed = false;
@@ -2304,12 +3105,21 @@ impl CudaGateUpSwiGluFusion {
         let weight = matmul.inputs[1]?;
         let scales = matmul.inputs[2]?;
 
-        // fp16 activation + output, fp16 scales, persistent (initializer)
-        // weights/scales: the exact form the paired kernel reproduces bit-for-bit
-        // and the only form that is capture-safe with a fixed device signature.
-        if graph.value(activation).dtype != DataType::Float16
-            || graph.value(matmul.outputs[0]).dtype != DataType::Float16
-            || graph.value(scales).dtype != DataType::Float16
+        // A single half-precision dtype shared by activation, output and scales,
+        // plus persistent (initializer) weights/scales: the exact form the paired
+        // kernel reproduces bit-for-bit and the only form that is capture-safe
+        // with a fixed device signature.
+        //
+        // BFloat16 qualifies because `MatMulNBits::run_bf16` stages every dynamic
+        // BFloat16 operand into an fp16 arena and caches the two constant scale
+        // slots (2 and 4 — the gate/up pair's slots, reserved for exactly this
+        // fusion) before dispatching the same fp16 paired kernel. Restricting the
+        // gate to Float16 was what kept every BFloat16 decode model on the
+        // unfused two-GEMV + `swish` + `mul` path (#1528).
+        let activation_dtype = graph.value(activation).dtype;
+        if !matches!(activation_dtype, DataType::Float16 | DataType::BFloat16)
+            || graph.value(matmul.outputs[0]).dtype != activation_dtype
+            || graph.value(scales).dtype != activation_dtype
         {
             return None;
         }
@@ -3126,12 +3936,38 @@ fn dims_bytes(dims: &[usize], elem: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::EnvVarGuard;
     use onnx_runtime_ir::{Dim, Node, NodeId, ValueId};
 
-    /// Serializes the [`CudaDropIdentityCast`] tests: one mutates the process-wide
-    /// `IDENTITY_CAST_FOLD_DISABLE_ENV`, which the others read through the pass, so
-    /// they must not run concurrently (mirrors `TEST_SINGLE_SPLIT_LOCK`).
-    static IDENTITY_CAST_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// Falsifiable guard against re-introducing the parallel-test env race this
+    /// module was fixed for: every environment mutation in `optimizer.rs` must go
+    /// through [`EnvVarGuard`] (which serialises on a process-global lock and
+    /// restores on drop), never a bare `std::env` setter. If a future edit adds a
+    /// direct `set_var`/`remove_var` here, this test fails at once instead of the
+    /// flake resurfacing under the parallel harness.
+    ///
+    /// The needles are assembled from fragments so this assertion never matches
+    /// itself. Production code in this file only *reads* the environment
+    /// (`env::var`/`env::var_os`), which is race-free, so a zero-mutation source
+    /// is the correct invariant.
+    #[test]
+    fn optimizer_source_routes_all_env_mutation_through_guard() {
+        let src = include_str!("optimizer.rs");
+        let set_needle = format!("env::{}", ["set", "_var"].concat());
+        let remove_needle = format!("env::{}", ["remove", "_var"].concat());
+        assert!(
+            !src.contains(&set_needle),
+            "found a direct `env::{}` in optimizer.rs; route it through \
+             EnvVarGuard (test_support) so it cannot race parallel tests",
+            ["set", "_var"].concat()
+        );
+        assert!(
+            !src.contains(&remove_needle),
+            "found a direct `env::{}` in optimizer.rs; route it through \
+             EnvVarGuard (test_support) so it cannot race parallel tests",
+            ["remove", "_var"].concat()
+        );
+    }
 
     fn value(graph: &mut Graph, name: &str, dtype: DataType, width: usize) -> ValueId {
         graph.create_named_value(name, dtype, vec![Dim::Static(1), Dim::Static(width)])
@@ -3205,6 +4041,12 @@ mod tests {
 
     #[test]
     fn folds_bf16_residual_add_norm_into_skip_node() {
+        // The fold is opt-in, and this test asserts BOTH the default (flag unset)
+        // and the enabled path. It holds the env lock for its whole body and
+        // toggles the flag through the guard, which restores the prior value on
+        // drop, so it never races a concurrent reader of the default.
+        let mut env = EnvVarGuard::acquire();
+        env.unset(SKIP_RMSNORM_FUSION_ENABLE_ENV);
         for gamma_dtype in [DataType::BFloat16, DataType::Float32] {
             let mut graph = bf16_skip_seam_graph(6656, gamma_dtype);
             let a = value_id_by_name(&graph, "a");
@@ -3226,10 +4068,9 @@ mod tests {
                 "default (flag unset) leaves the standalone norm (gamma={gamma_dtype:?})"
             );
 
-            // SAFETY: single-threaded test; env is restored before returning.
-            unsafe { std::env::set_var(SKIP_RMSNORM_FUSION_ENABLE_ENV, "1") };
+            env.set(SKIP_RMSNORM_FUSION_ENABLE_ENV, "1");
             let result = CudaSkipRmsNormFusion.run(&mut graph, &PassContext::new());
-            unsafe { std::env::remove_var(SKIP_RMSNORM_FUSION_ENABLE_ENV) };
+            env.unset(SKIP_RMSNORM_FUSION_ENABLE_ENV);
             result.unwrap();
             assert!(
                 graph
@@ -3287,10 +4128,10 @@ mod tests {
             let id = value_id_by_name(&graph, name);
             graph.value_mut(id).dtype = DataType::Float16;
         }
-        // SAFETY: single-threaded test; env is restored before returning.
-        unsafe { std::env::set_var(SKIP_RMSNORM_FUSION_ENABLE_ENV, "1") };
+        // Enabled via the guard, which holds the env lock for the set→run→restore
+        // window and returns the flag to its prior value on drop.
+        let _env = EnvVarGuard::with_var(SKIP_RMSNORM_FUSION_ENABLE_ENV, "1");
         let result = CudaSkipRmsNormFusion.run(&mut graph, &PassContext::new());
-        unsafe { std::env::remove_var(SKIP_RMSNORM_FUSION_ENABLE_ENV) };
         result.unwrap();
         assert!(
             graph
@@ -3328,6 +4169,79 @@ mod tests {
         ));
         graph.add_output(output);
         graph
+    }
+
+    /// `swiglu_graph`, but with the gate spelled as the standard-domain `Swish`
+    /// that current exporters emit (Muse-Glimmer's decoder carries one per
+    /// layer) instead of the `com.microsoft.Silu` contrib op.
+    fn swish_swiglu_graph(alpha: Option<f32>) -> Graph {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 24);
+        let gate = value(&mut graph, "gate", DataType::BFloat16, 7);
+        let up = value(&mut graph, "up", DataType::BFloat16, 7);
+        let swish_output = value(&mut graph, "swish", DataType::BFloat16, 7);
+        let output = value(&mut graph, "output", DataType::BFloat16, 7);
+        graph.add_input(gate);
+        graph.add_input(up);
+        let mut swish = Node::new(NodeId(0), "Swish", vec![Some(gate)], vec![swish_output]);
+        if let Some(alpha) = alpha {
+            swish
+                .attributes
+                .insert("alpha".into(), Attribute::Float(alpha));
+        }
+        graph.insert_node(swish);
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Mul",
+            vec![Some(swish_output), Some(up)],
+            vec![output],
+        ));
+        graph.add_output(output);
+        graph
+    }
+
+    #[test]
+    fn fuses_standard_domain_swish_as_the_swiglu_gate() {
+        // #1528: `Swish` with a default (or explicit unit) alpha is exactly
+        // SiLU, so it must fuse like the contrib spelling. Matching only
+        // `com.microsoft.Silu` left these models running a standalone `swish`
+        // kernel per layer and, because `CudaGateUpSwiGluFusion` keys off the
+        // marker this pass writes, also blocked the paired gate/up GEMV.
+        for alpha in [None, Some(1.0)] {
+            let mut graph = swish_swiglu_graph(alpha);
+            CudaSwiGluFusion
+                .run(&mut graph, &PassContext::new())
+                .unwrap();
+
+            assert_eq!(graph.num_nodes(), 1, "alpha={alpha:?}");
+            let fused = graph.nodes.values().next().unwrap();
+            assert_eq!(fused.op_type, "Mul");
+            assert_eq!(
+                fused.attr(SILU_MUL_FUSION_ATTR).and_then(Attribute::as_int),
+                Some(1),
+                "alpha={alpha:?}"
+            );
+            assert!(graph.validate().is_ok());
+        }
+    }
+
+    #[test]
+    fn leaves_non_unit_alpha_swish_unfused() {
+        // `Swish(x) = x * sigmoid(alpha * x)`; only alpha == 1 is SiLU, and the
+        // fused kernel hard-codes that. Anything else must stay separate rather
+        // than silently computing a different activation.
+        let mut graph = swish_swiglu_graph(Some(1.702));
+        CudaSwiGluFusion
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+
+        assert_eq!(graph.num_nodes(), 2);
+        assert!(
+            graph
+                .nodes
+                .values()
+                .all(|node| node.attr(SILU_MUL_FUSION_ATTR).is_none())
+        );
     }
 
     #[test]
@@ -3540,6 +4454,168 @@ mod tests {
         );
     }
 
+    // === L2 normalize fold (Gated-DeltaNet Q/K norm) ===
+
+    /// Build the Gated-DeltaNet Q/K L2-normalize glue the
+    /// [`CudaL2NormalizeFusion`] targets: `ReduceSumSquare(x, axes=[-1],
+    /// keepdims=1) → Sqrt → Div(x, ·) → output`. Returns the graph plus the
+    /// intermediate `sq`/`nrm` values so escape tests can add a second consumer.
+    fn l2_norm_glue_graph(dtype: DataType, width: usize) -> (Graph, ValueId, ValueId) {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 13);
+        let x = value(&mut graph, "x", dtype, width);
+        let sq = graph.create_named_value("sq", dtype, vec![Dim::Static(1), Dim::Static(1)]);
+        let nrm = graph.create_named_value("nrm", dtype, vec![Dim::Static(1), Dim::Static(1)]);
+        let output = value(&mut graph, "output", dtype, width);
+        graph.add_input(x);
+        let mut rss = Node::new(NodeId(0), "ReduceSumSquare", vec![Some(x)], vec![sq]);
+        rss.attributes
+            .insert("axes".into(), Attribute::Ints(vec![-1]));
+        rss.attributes.insert("keepdims".into(), Attribute::Int(1));
+        graph.insert_node(rss);
+        graph.insert_node(Node::new(NodeId(0), "Sqrt", vec![Some(sq)], vec![nrm]));
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Div",
+            vec![Some(x), Some(nrm)],
+            vec![output],
+        ));
+        graph.add_output(output);
+        (graph, sq, nrm)
+    }
+
+    #[test]
+    fn fuses_l2_normalize_into_lpnormalization() {
+        let (mut graph, _sq, _nrm) = l2_norm_glue_graph(DataType::BFloat16, 8);
+        let x = value_id_by_name(&graph, "x");
+        let output = value_id_by_name(&graph, "output");
+        CudaL2NormalizeFusion
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+
+        // ReduceSumSquare and Sqrt are gone; a single LpNormalization remains.
+        assert_eq!(
+            graph.num_nodes(),
+            1,
+            "only the fused LpNormalization remains"
+        );
+        assert!(
+            graph
+                .nodes
+                .values()
+                .all(|n| n.op_type != "ReduceSumSquare" && n.op_type != "Sqrt"),
+            "ReduceSumSquare and Sqrt must be removed"
+        );
+        let lp = graph
+            .nodes
+            .values()
+            .find(|n| n.op_type == "LpNormalization")
+            .expect("Div must be rewritten to LpNormalization");
+        assert!(
+            lp.is_default_domain(),
+            "LpNormalization stays default domain"
+        );
+        assert_eq!(lp.inputs, vec![Some(x)], "reads the pre-norm activation x");
+        assert_eq!(lp.outputs, vec![output], "keeps the Div output value");
+        assert_eq!(
+            lp.attr("p").and_then(Attribute::as_int),
+            Some(2),
+            "L2 norm ⇒ p = 2"
+        );
+        assert_eq!(
+            lp.attr("axis").and_then(Attribute::as_int),
+            Some(-1),
+            "axis carried over from the ReduceSumSquare axes"
+        );
+        assert_eq!(
+            lp.attr("fused_reduce_chain").and_then(Attribute::as_int),
+            Some(1),
+            "fused node is marked to run the byte-faithful L2-normalize kernel"
+        );
+        assert!(graph.validate().is_ok());
+    }
+
+    #[test]
+    fn l2_normalize_derives_axis_from_shapes_without_axes_attr() {
+        // No `axes` attribute or input: the pass must derive the single reduced
+        // axis from the input/output static shapes (the dim reduced to 1).
+        let (mut graph, _sq, _nrm) = l2_norm_glue_graph(DataType::BFloat16, 8);
+        let rss_id = graph
+            .nodes
+            .iter()
+            .find(|(_, n)| n.op_type == "ReduceSumSquare")
+            .map(|(id, _)| id)
+            .unwrap();
+        // Strip the axes attribute, forcing the shape-difference fallback.
+        let mut rss = graph.node(rss_id).clone();
+        rss.attributes.remove("axes");
+        graph.replace_node(rss_id, rss);
+
+        CudaL2NormalizeFusion
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+        let lp = graph
+            .nodes
+            .values()
+            .find(|n| n.op_type == "LpNormalization")
+            .expect("shape-derived axis must still fuse");
+        assert_eq!(
+            lp.attr("axis").and_then(Attribute::as_int),
+            Some(1),
+            "reduced axis (dim 1 → 1) derived from shapes"
+        );
+    }
+
+    #[test]
+    fn does_not_fuse_l2_when_norm_escapes() {
+        // The Sqrt output (‖x‖₂) also feeds a second consumer, so it escapes the
+        // L2-normalize shape and the chain must be left intact.
+        let (mut graph, _sq, nrm) = l2_norm_glue_graph(DataType::BFloat16, 8);
+        let sink = value(&mut graph, "sink", DataType::BFloat16, 1);
+        graph.insert_node(Node::new(NodeId(0), "Neg", vec![Some(nrm)], vec![sink]));
+        graph.add_output(sink);
+
+        CudaL2NormalizeFusion
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+        assert!(
+            graph.nodes.values().any(|n| n.op_type == "ReduceSumSquare")
+                && graph.nodes.values().any(|n| n.op_type == "Sqrt")
+                && graph.nodes.values().any(|n| n.op_type == "Div"),
+            "an escaping norm must leave the ReduceSumSquare/Sqrt/Div chain intact"
+        );
+        assert!(
+            graph.nodes.values().all(|n| n.op_type != "LpNormalization"),
+            "no fusion when the norm escapes"
+        );
+    }
+
+    #[test]
+    fn does_not_fuse_l2_with_mismatched_div_numerator() {
+        // Div's numerator differs from the ReduceSumSquare input: this is a plain
+        // division, not an L2 normalize, and must not be rewritten.
+        let (mut graph, _sq, _nrm) = l2_norm_glue_graph(DataType::BFloat16, 8);
+        let other = value(&mut graph, "other", DataType::BFloat16, 8);
+        graph.add_input(other);
+        let div_id = graph
+            .nodes
+            .iter()
+            .find(|(_, n)| n.op_type == "Div")
+            .map(|(id, _)| id)
+            .unwrap();
+        let mut div = graph.node(div_id).clone();
+        div.inputs[0] = Some(other); // divide a *different* tensor by ‖x‖₂
+        graph.replace_node(div_id, div);
+
+        CudaL2NormalizeFusion
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+        assert!(
+            graph.nodes.values().all(|n| n.op_type != "LpNormalization"),
+            "Div numerator ≠ ReduceSumSquare input ⇒ not an L2 normalize"
+        );
+    }
+
     // === QKV bias fold ===
 
     use onnx_runtime_ir::{TensorData, WeightRef};
@@ -3687,6 +4763,8 @@ mod tests {
 
     #[test]
     fn folds_constant_cast_bf16_to_f32_byte_identical() {
+        // Asserts the fold fires by default; serialise against the disable-env test.
+        let _env = EnvVarGuard::without_var(CONST_CAST_FOLD_DISABLE_ENV);
         // bf16 → f32 widening is exact. Element i holds bf16(i * 1.5).
         let n = 6usize;
         let mut bytes = Vec::with_capacity(n * 2);
@@ -3726,9 +4804,11 @@ mod tests {
 
     #[test]
     fn folds_constant_cast_f32_to_bf16_round_to_nearest_even() {
+        // Asserts the fold fires by default; serialise against the disable-env test.
+        let _env = EnvVarGuard::without_var(CONST_CAST_FOLD_DISABLE_ENV);
         // f32 → bf16 narrowing must match the kernel's round-to-nearest-even
         // (`half::bf16::from_f32`).
-        let values = [0.0f32, 1.0, 1.5, -2.75, 3.141_592_7, 65_504.0];
+        let values = [0.0f32, 1.0, 1.5, -2.75, std::f32::consts::PI, 65_504.0];
         let mut bytes = Vec::new();
         for v in values {
             bytes.extend_from_slice(&v.to_le_bytes());
@@ -3821,7 +4901,6 @@ mod tests {
 
     #[test]
     fn const_cast_fold_respects_disable_env() {
-        // SAFETY: single-threaded test; env is restored before returning.
         let n = 4usize;
         let mut bytes = Vec::new();
         for i in 0..n {
@@ -3829,9 +4908,8 @@ mod tests {
         }
         let (mut graph, _cast_out) =
             const_cast_graph(n, DataType::BFloat16, bytes, DataType::Float32);
-        unsafe { std::env::set_var(CONST_CAST_FOLD_DISABLE_ENV, "1") };
+        let _env = EnvVarGuard::with_var(CONST_CAST_FOLD_DISABLE_ENV, "1");
         let result = CudaFoldConstantCast.run(&mut graph, &PassContext::new());
-        unsafe { std::env::remove_var(CONST_CAST_FOLD_DISABLE_ENV) };
         result.unwrap();
         assert_eq!(
             graph
@@ -4052,6 +5130,75 @@ mod tests {
         graph
     }
 
+    /// `qkv_bias_graph` with one extra optional `MatMulNBits` input wired at
+    /// `slot` (3 = zero-points, 4 = group index), built as part of the node so
+    /// the graph's input edges stay consistent. Returns the graph and the id of
+    /// the extra input.
+    fn qkv_bias_graph_with_extra_input(dtype: DataType, n: usize, slot: usize) -> (Graph, ValueId) {
+        let k = 896usize;
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+        graph.opset_imports.insert(MICROSOFT_DOMAIN.into(), 1);
+        let x = value(&mut graph, "x", dtype, k);
+        let packed = vec1d(&mut graph, "packed", DataType::Uint8, n * (k / 32) * 16);
+        let scales = vec1d(&mut graph, "scales", dtype, n * (k / 32));
+        let is_group_index = slot == 4;
+        let extra_dtype = if is_group_index {
+            DataType::Int32
+        } else {
+            DataType::Uint8
+        };
+        let extra_elems = if is_group_index { k } else { n * (k / 32) };
+        let extra_bytes = extra_elems * if is_group_index { 4 } else { 1 };
+        let extra = vec1d(&mut graph, "extra", extra_dtype, extra_elems);
+        let mm_out = value(&mut graph, "mm_out", dtype, n);
+        let bias = vec1d(&mut graph, "bias", dtype, n);
+        let out = value(&mut graph, "out", dtype, n);
+        graph.add_input(x);
+        graph.set_initializer(
+            packed,
+            WeightRef::Inline(TensorData::from_raw(
+                DataType::Uint8,
+                vec![n * (k / 32) * 16],
+                vec![0u8; n * (k / 32) * 16],
+            )),
+        );
+        graph.set_initializer(
+            scales,
+            WeightRef::Inline(TensorData::from_raw(
+                dtype,
+                vec![n * (k / 32)],
+                vec![0u8; n * (k / 32) * 2],
+            )),
+        );
+        graph.set_initializer(
+            extra,
+            WeightRef::Inline(TensorData::from_raw(
+                extra_dtype,
+                vec![extra_elems],
+                vec![0u8; extra_bytes],
+            )),
+        );
+        graph.set_initializer(
+            bias,
+            WeightRef::Inline(TensorData::from_raw(dtype, vec![n], vec![0u8; n * 2])),
+        );
+        let mut inputs = vec![Some(x), Some(packed), Some(scales)];
+        while inputs.len() < slot {
+            inputs.push(None);
+        }
+        inputs.push(Some(extra));
+        graph.insert_node(matmul_nbits(inputs, mm_out, k, n));
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Add",
+            vec![Some(mm_out), Some(bias)],
+            vec![out],
+        ));
+        graph.add_output(out);
+        (graph, extra)
+    }
+
     #[test]
     fn folds_qkv_bias_into_matmul_nbits() {
         let mut graph = qkv_bias_graph(DataType::Float16, 1152, true);
@@ -4259,6 +5406,53 @@ mod tests {
         graph.insert_node(mul);
         graph.add_output(out);
         graph
+    }
+
+    #[test]
+    fn fuses_paired_gate_up_swiglu_for_bfloat16_projections() {
+        // #1528: every BFloat16 decode model was held on the unfused two-GEMV +
+        // `swish` + `mul` path because the gate demanded Float16. `run_bf16`
+        // stages the dynamic operands into an fp16 arena and caches slots 2/4 —
+        // which exist only for this fusion — so BFloat16 reaches the very same
+        // paired kernel and must fuse exactly like Float16 does.
+        let mut graph = gate_up_graph_dtype(QWEN_GATE_UP_K, QWEN_GATE_UP_N, DataType::BFloat16);
+        CudaGateUpSwiGluFusion
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+
+        assert_eq!(
+            graph.num_nodes(),
+            1,
+            "a BFloat16 gate/up pair must collapse into one node just like fp16"
+        );
+        let fused = graph.nodes.values().next().unwrap();
+        assert_eq!(fused.op_type, "MatMulNBits");
+        assert_eq!(
+            fused
+                .attr(GATE_UP_SWIGLU_FUSION_ATTR)
+                .and_then(Attribute::as_int),
+            Some(1),
+            "the BFloat16 pair must carry the paired-kernel marker"
+        );
+    }
+
+    #[test]
+    fn does_not_fuse_gate_up_with_mismatched_activation_and_scale_dtypes() {
+        // Widening the gate to accept BFloat16 must not widen it to accept a
+        // *mixed* pair: the paired kernel has one fixed device signature, and
+        // `run_bf16` stages on the strength of a single uniform dtype.
+        let mut graph = gate_up_graph_dtype(QWEN_GATE_UP_K, QWEN_GATE_UP_N, DataType::BFloat16);
+        let scales = graph
+            .nodes
+            .values()
+            .find(|node| node.op_type == "MatMulNBits")
+            .and_then(|node| node.inputs[2])
+            .expect("the projection carries a scales input");
+        graph.value_mut(scales).dtype = DataType::Float16;
+        CudaGateUpSwiGluFusion
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+        asserts_not_fused(&graph);
     }
 
     #[test]
@@ -4488,7 +5682,7 @@ mod tests {
         ));
         graph.add_output(out);
 
-        for pass in cuda_optimization_passes() {
+        for pass in cuda_optimization_passes(None) {
             pass.run(&mut graph, &PassContext::new()).unwrap();
         }
 
@@ -4603,7 +5797,7 @@ mod tests {
         let residual = value_id_by_name(&graph, "residual");
         let gamma = value_id_by_name(&graph, "gamma");
 
-        CudaSkipRmsNormMatMulFusion
+        CudaSkipRmsNormMatMulFusion::default()
             .run(&mut graph, &PassContext::new())
             .unwrap();
 
@@ -4674,7 +5868,7 @@ mod tests {
         let pre_out = value_id_by_name(&graph, "pre_out");
         let gamma = value_id_by_name(&graph, "gamma");
 
-        CudaSkipRmsNormMatMulFusion
+        CudaSkipRmsNormMatMulFusion::default()
             .run(&mut graph, &PassContext::new())
             .unwrap();
 
@@ -4709,7 +5903,7 @@ mod tests {
         // 1288 % 128 != 0 → warp_half4 byte-identity does not hold, so no fusion.
         // Kept above the size floor so the `% 128` check is the sole reason.
         let mut graph = skip_rms_graph(1288, RMSNORM_FUSION_MIN_HIDDEN + 256);
-        CudaSkipRmsNormMatMulFusion
+        CudaSkipRmsNormMatMulFusion::default()
             .run(&mut graph, &PassContext::new())
             .unwrap();
         assert!(
@@ -4726,7 +5920,7 @@ mod tests {
         // Following K(1280) > N(1152): the tall-skinny down variant has no
         // prologue. Hidden is at the floor so the down variant is the sole reason.
         let mut graph = skip_rms_graph(RMSNORM_FUSION_MIN_HIDDEN, RMSNORM_FUSION_MIN_HIDDEN - 128);
-        CudaSkipRmsNormMatMulFusion
+        CudaSkipRmsNormMatMulFusion::default()
             .run(&mut graph, &PassContext::new())
             .unwrap();
         assert!(
@@ -4762,7 +5956,7 @@ mod tests {
         skip.inputs.push(Some(bias));
         graph.replace_node(skip_id, skip);
 
-        CudaSkipRmsNormMatMulFusion
+        CudaSkipRmsNormMatMulFusion::default()
             .run(&mut graph, &PassContext::new())
             .unwrap();
         assert!(
@@ -4785,7 +5979,7 @@ mod tests {
         graph.insert_node(Node::new(NodeId(0), "Neg", vec![Some(pre_out)], vec![sink]));
         graph.add_output(sink);
 
-        CudaSkipRmsNormMatMulFusion
+        CudaSkipRmsNormMatMulFusion::default()
             .run(&mut graph, &PassContext::new())
             .unwrap();
         assert!(
@@ -4805,7 +5999,7 @@ mod tests {
         let residual = value_id_by_name(&graph, "residual");
         graph.value_mut(residual).shape = vec![Dim::Static(1), Dim::Static(1)];
 
-        CudaSkipRmsNormMatMulFusion
+        CudaSkipRmsNormMatMulFusion::default()
             .run(&mut graph, &PassContext::new())
             .unwrap();
         assert!(
@@ -4837,7 +6031,7 @@ mod tests {
             graph.value_mut(id).shape = symbolic.clone();
         }
 
-        CudaSkipRmsNormMatMulFusion
+        CudaSkipRmsNormMatMulFusion::default()
             .run(&mut graph, &PassContext::new())
             .unwrap();
 
@@ -4864,7 +6058,7 @@ mod tests {
         // End-to-end through the registered CUDA passes: the fusion is the last
         // pass and must fire on the eligible chain.
         let mut graph = skip_rms_graph(RMSNORM_FUSION_MIN_HIDDEN, RMSNORM_FUSION_MIN_HIDDEN + 256);
-        for pass in cuda_optimization_passes() {
+        for pass in cuda_optimization_passes(None) {
             pass.run(&mut graph, &PassContext::new()).unwrap();
         }
         assert!(
@@ -4885,7 +6079,7 @@ mod tests {
         // ~free graph-captured standalone launch it would remove).
         let hidden = RMSNORM_FUSION_MIN_HIDDEN - RMSNORM_FUSION_WARP_HALF4_MULTIPLE;
         let mut graph = skip_rms_graph(hidden, hidden + 256);
-        CudaSkipRmsNormMatMulFusion
+        CudaSkipRmsNormMatMulFusion::default()
             .run(&mut graph, &PassContext::new())
             .unwrap();
         assert!(
@@ -4903,7 +6097,7 @@ mod tests {
         // only thing the smaller case tripped (not any structural mismatch).
         let hidden = RMSNORM_FUSION_MIN_HIDDEN;
         let mut graph = skip_rms_graph(hidden, hidden + 256);
-        CudaSkipRmsNormMatMulFusion
+        CudaSkipRmsNormMatMulFusion::default()
             .run(&mut graph, &PassContext::new())
             .unwrap();
         assert!(
@@ -4916,7 +6110,117 @@ mod tests {
         assert!(graph.validate().is_ok());
     }
 
-    /// Build the post-attention decode chain the fan-out-2 fold targets:
+    #[test]
+    fn derived_min_hidden_reproduces_h200_anchor_and_scales_with_sm_count() {
+        // The one calibrated point reproduces itself exactly (round-nearest).
+        assert_eq!(
+            derived_min_hidden(RMSNORM_FUSION_ANCHOR_SM_COUNT),
+            RMSNORM_FUSION_MIN_HIDDEN,
+            "the H200 anchor (132 SM) must map back to its calibrated 1280 floor"
+        );
+        // RTX 4060 laptop: 24 SM -> round(10 * 24 / 132) = 2 chunks = 256. This is
+        // a *corroboration*, not a fit: the slope came only from the H200 anchor,
+        // and 256 <= 896 predicts the measured neutral-to-faster hidden-896 fold.
+        assert_eq!(derived_min_hidden(24), 256);
+        // Monotonic in SM count, and never below one 128-wide chunk.
+        assert!(derived_min_hidden(1) >= RMSNORM_FUSION_WARP_HALF4_MULTIPLE);
+        assert_eq!(derived_min_hidden(0), RMSNORM_FUSION_WARP_HALF4_MULTIPLE);
+        assert!(derived_min_hidden(264) > derived_min_hidden(132));
+        // Every derived floor is a whole 128 chunk (the fold only fires on those).
+        for sm in [1u32, 8, 24, 60, 132, 200, 264] {
+            assert_eq!(
+                derived_min_hidden(sm) % RMSNORM_FUSION_WARP_HALF4_MULTIPLE,
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn fusion_benefit_gate_is_device_derived() {
+        // Serialise against the parallel harness: this reads the real
+        // `ONNX_GENAI_RMSNORM_MIN_HIDDEN` default through `fusion_benefit_is_positive`.
+        let _env = EnvVarGuard::without_var(RMSNORM_FUSION_MIN_HIDDEN_ENV);
+        let h200 = CudaDeviceCapabilities::for_test((9, 0), 132, 0);
+        let rtx4060 = CudaDeviceCapabilities::for_test((8, 9), 24, 0);
+        // Hidden 896 (== qwen 0.5B, granite-1B MoE is 1024): below the H200 floor
+        // (1280) but above the RTX 4060 floor (256), so the two devices disagree —
+        // exactly the batch/device split #1421 is about.
+        assert!(!fusion_benefit_is_positive(896, 1, 896, Some(h200)));
+        assert!(fusion_benefit_is_positive(896, 1, 896, Some(rtx4060)));
+        // Device unknown falls back to the H200-calibrated global constant, so the
+        // historical behavior (and every existing unit test) is preserved.
+        assert!(!fusion_benefit_is_positive(896, 1, 896, None));
+        assert!(fusion_benefit_is_positive(
+            RMSNORM_FUSION_MIN_HIDDEN,
+            1,
+            0,
+            None
+        ));
+    }
+
+    #[test]
+    fn device_aware_gate_folds_small_hidden_on_consumer_gpu() {
+        // Serialise against the parallel harness: the pass reads the real
+        // `ONNX_GENAI_RMSNORM_MIN_HIDDEN` default through `fusion_benefit_is_positive`.
+        let _env = EnvVarGuard::without_var(RMSNORM_FUSION_MIN_HIDDEN_ENV);
+        // A fully fusable hidden-896 chain that the H200 floor (and the None
+        // fallback) keep unfused, but a 24-SM consumer GPU folds — capturing the
+        // M>=2 structural win on the exact small models (#1421). The fold changes
+        // the fp16 reduction order (not bit-identical; see the struct docs).
+        let hidden = 896;
+        let rtx4060 = CudaDeviceCapabilities::for_test((8, 9), 24, 0);
+
+        let mut folded = skip_rms_graph(hidden, hidden + 256);
+        CudaSkipRmsNormMatMulFusion::for_device(Some(rtx4060))
+            .run(&mut folded, &PassContext::new())
+            .unwrap();
+        assert!(
+            folded
+                .nodes
+                .values()
+                .all(|node| node.op_type != "SkipSimplifiedLayerNormalization"),
+            "a 24-SM device must fold hidden 896 (floor 256)"
+        );
+        assert!(folded.validate().is_ok());
+
+        let mut kept = skip_rms_graph(hidden, hidden + 256);
+        CudaSkipRmsNormMatMulFusion::default()
+            .run(&mut kept, &PassContext::new())
+            .unwrap();
+        assert!(
+            kept.nodes
+                .values()
+                .any(|node| node.op_type == "SkipSimplifiedLayerNormalization"),
+            "device-unknown (H200 fallback) must keep the standalone norm at 896"
+        );
+    }
+
+    #[test]
+    fn rmsnorm_min_hidden_env_override_wins_over_device_derivation() {
+        // `fusion_benefit_is_positive` resolves its floor as
+        // `env_usize(RMSNORM_FUSION_MIN_HIDDEN_ENV, derived_min_hidden(sm))`, so the
+        // override precedence is exactly `env_usize`'s: a set value replaces the
+        // derived default. Exercise that mechanism through a dedicated throwaway
+        // var so this test cannot perturb the real floor other tests read. The
+        // EnvVarGuard serialises on the process-global env lock and restores the
+        // probe var on drop, so it cannot race the parallel harness.
+        const PROBE: &str = "ONNX_GENAI_TEST_RMSNORM_OVERRIDE_PROBE";
+        let mut env = EnvVarGuard::without_var(PROBE);
+        let derived = derived_min_hidden(24); // 256, the RTX 4060 default
+        assert_eq!(
+            env_usize(PROBE, derived),
+            derived,
+            "unset -> derived default"
+        );
+        env.set(PROBE, "4096");
+        assert_eq!(env_usize(PROBE, derived), 4096, "set -> override wins");
+        env.unset(PROBE);
+        assert_eq!(
+            env_usize(PROBE, derived),
+            derived,
+            "removed -> back to derived"
+        );
+    }
     /// `o_proj MatMulNBits (N == hidden)` → `SkipSimplifiedLayerNormalization`
     /// → gate + up `MatMulNBits` → `Silu(gate)` → `Mul(silu, up)`. Running the
     /// full CUDA pass list first collapses gate+up into one SwiGLU node, then the
@@ -4994,7 +6298,7 @@ mod tests {
         let intermediate = hidden * 2;
         let mut graph = post_attention_swiglu_graph(hidden, intermediate);
 
-        for pass in cuda_optimization_passes() {
+        for pass in cuda_optimization_passes(None) {
             pass.run(&mut graph, &PassContext::new()).unwrap();
         }
 
@@ -5049,7 +6353,7 @@ mod tests {
         let intermediate = hidden * 2;
         let mut graph = post_attention_swiglu_graph(hidden, intermediate);
 
-        for pass in cuda_optimization_passes() {
+        for pass in cuda_optimization_passes(None) {
             pass.run(&mut graph, &PassContext::new()).unwrap();
         }
 
@@ -5158,7 +6462,7 @@ mod tests {
         ));
         graph.add_output(sum1_sink);
 
-        CudaSkipRmsNormMatMulFusion
+        CudaSkipRmsNormMatMulFusion::default()
             .run(&mut graph, &PassContext::new())
             .unwrap();
 
@@ -5353,7 +6657,7 @@ mod tests {
         // End-to-end through the registered CUDA passes: the cast-drop pass runs
         // and removes every wrapper, leaving the norm in fp16-native form.
         let (mut graph, ..) = cast_wrapped_skip_norm_graph(128);
-        for pass in cuda_optimization_passes() {
+        for pass in cuda_optimization_passes(None) {
             pass.run(&mut graph, &PassContext::new()).unwrap();
         }
         assert_eq!(
@@ -6275,9 +7579,11 @@ mod tests {
     fn qkv_fusion_is_opt_in_and_disabled_by_default() {
         // The pass must not fire unless the opt-in env flag is set, so the
         // default release binary keeps the three separate GEMVs (no regression).
-        // SAFETY: single-threaded test; env is restored before returning.
+        // Holds the env lock for the whole body and toggles the flag through the
+        // guard, which restores the prior value on drop.
+        let mut env = EnvVarGuard::acquire();
         let mut g = qkv_graph(64, 8, 4, 4, true);
-        unsafe { std::env::remove_var(QKV_FUSION_ENABLE_ENV) };
+        env.unset(QKV_FUSION_ENABLE_ENV);
         CudaQkvProjectionFusion
             .run(&mut g.graph, &PassContext::new())
             .unwrap();
@@ -6293,9 +7599,8 @@ mod tests {
         );
 
         // With the flag set, `run` performs the fusion.
-        unsafe { std::env::set_var(QKV_FUSION_ENABLE_ENV, "1") };
+        env.set(QKV_FUSION_ENABLE_ENV, "1");
         let result = CudaQkvProjectionFusion.run(&mut g.graph, &PassContext::new());
-        unsafe { std::env::remove_var(QKV_FUSION_ENABLE_ENV) };
         result.unwrap();
         let fused = g
             .graph
@@ -6310,9 +7615,9 @@ mod tests {
     /// and `Relu` is rewired directly onto `x`, leaving a byte-identical graph.
     #[test]
     fn drops_identity_cast_and_rewires_consumer() {
-        let _serial = IDENTITY_CAST_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Default-reader of the identity-cast disable flag; serialise against the
+        // opt-out test that sets it.
+        let _env = EnvVarGuard::without_var(IDENTITY_CAST_FOLD_DISABLE_ENV);
         let mut g = Graph::new();
         g.opset_imports.insert(String::new(), 17);
         let x = value(&mut g, "x", DataType::Float32, 4);
@@ -6344,9 +7649,9 @@ mod tests {
     /// identity, so the pass must leave it untouched.
     #[test]
     fn keeps_narrowing_cast() {
-        let _serial = IDENTITY_CAST_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Default-reader of the identity-cast disable flag; serialise against the
+        // opt-out test that sets it.
+        let _env = EnvVarGuard::without_var(IDENTITY_CAST_FOLD_DISABLE_ENV);
         let mut g = Graph::new();
         g.opset_imports.insert(String::new(), 17);
         let x = value(&mut g, "x", DataType::Float32, 4);
@@ -6368,9 +7673,9 @@ mod tests {
     /// runtime's output binding (by value id) is never disturbed.
     #[test]
     fn keeps_identity_cast_feeding_graph_output() {
-        let _serial = IDENTITY_CAST_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Default-reader of the identity-cast disable flag; serialise against the
+        // opt-out test that sets it.
+        let _env = EnvVarGuard::without_var(IDENTITY_CAST_FOLD_DISABLE_ENV);
         let mut g = Graph::new();
         g.opset_imports.insert(String::new(), 17);
         let x = value(&mut g, "x", DataType::Float32, 4);
@@ -6391,9 +7696,7 @@ mod tests {
     /// The opt-out env restores the exported identity casts for A/B / rollback.
     #[test]
     fn opt_out_env_preserves_identity_cast() {
-        let _serial = IDENTITY_CAST_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = EnvVarGuard::with_var(IDENTITY_CAST_FOLD_DISABLE_ENV, "1");
         let mut g = Graph::new();
         g.opset_imports.insert(String::new(), 17);
         let x = value(&mut g, "x", DataType::Float32, 4);
@@ -6403,14 +7706,368 @@ mod tests {
         g.insert_node(Node::new(NodeId(0), "Relu", vec![Some(y)], vec![out]));
         g.add_output(out);
 
-        unsafe { std::env::set_var(IDENTITY_CAST_FOLD_DISABLE_ENV, "1") };
         let result = CudaDropIdentityCast.run(&mut g, &PassContext::new());
-        unsafe { std::env::remove_var(IDENTITY_CAST_FOLD_DISABLE_ENV) };
         result.unwrap();
         assert_eq!(
             g.nodes.values().filter(|n| n.op_type == "Cast").count(),
             1,
             "opt-out preserves the identity cast"
         );
+    }
+
+    /// Build a single gated-delta `LinearAttention` (`com.microsoft`) fed by its
+    /// exported standalone gate chains:
+    /// * beta: `Sigmoid(raw) → LA.input[5]`
+    /// * decay: `Add(a, dt_bias) → Softplus → Mul(neg_exp_A, ·) → [Cast] → LA.input[4]`
+    ///
+    /// `trailing_cast` toggles the optional identity `Cast` between the decay
+    /// `Mul` and the kernel (present on the fp32 text export).
+    fn gated_delta_la_graph(heads: usize, trailing_cast: bool) -> Graph {
+        gated_delta_la_graph_ext(heads, trailing_cast, false)
+    }
+
+    /// `neg_exp_from_a_log`: when true the decay coefficient is the exported
+    /// `Neg(Exp(A_log))` constant chain (A_log the initializer) instead of a
+    /// ready `neg_exp_A` initializer, exercising the inline constant-chain fold.
+    fn gated_delta_la_graph_ext(
+        heads: usize,
+        trailing_cast: bool,
+        neg_exp_from_a_log: bool,
+    ) -> Graph {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+        graph.opset_imports.insert(MICROSOFT_DOMAIN.into(), 1);
+
+        let q = value(&mut graph, "q", DataType::Float32, heads);
+        let k = value(&mut graph, "k", DataType::Float32, heads);
+        let v = value(&mut graph, "v", DataType::Float32, heads);
+        let past = value(&mut graph, "past", DataType::Float32, heads);
+        let a = value(&mut graph, "a", DataType::Float32, heads);
+        let raw = value(&mut graph, "raw", DataType::Float32, heads);
+        for input in [q, k, v, past, a, raw] {
+            graph.add_input(input);
+        }
+
+        // dt_bias is always a graph initializer. The decay coefficient is either
+        // a ready `neg_exp_A` initializer, or `A_log` (initializer) feeding an
+        // `Exp → Neg` chain that produces the `neg_exp_A` value.
+        let dt_bias = vec1d(&mut graph, "dt_bias", DataType::Float32, heads);
+        let coeff_init_name = if neg_exp_from_a_log {
+            "A_log"
+        } else {
+            "neg_exp_A"
+        };
+        let coeff_init = vec1d(&mut graph, coeff_init_name, DataType::Float32, heads);
+        for init in [dt_bias, coeff_init] {
+            graph.set_initializer(
+                init,
+                WeightRef::Inline(TensorData::from_raw(
+                    DataType::Float32,
+                    vec![heads],
+                    vec![0u8; heads * DataType::Float32.byte_size()],
+                )),
+            );
+        }
+        let neg_exp_a = if neg_exp_from_a_log {
+            let exp_out = value(&mut graph, "exp_out", DataType::Float32, heads);
+            graph.insert_node(Node::new(
+                NodeId(0),
+                "Exp",
+                vec![Some(coeff_init)],
+                vec![exp_out],
+            ));
+            let neg_out = value(&mut graph, "neg_exp_A", DataType::Float32, heads);
+            graph.insert_node(Node::new(
+                NodeId(0),
+                "Neg",
+                vec![Some(exp_out)],
+                vec![neg_out],
+            ));
+            neg_out
+        } else {
+            coeff_init
+        };
+
+        // decay chain.
+        let add_out = value(&mut graph, "add_out", DataType::Float32, heads);
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Add",
+            vec![Some(a), Some(dt_bias)],
+            vec![add_out],
+        ));
+        let sp_out = value(&mut graph, "sp_out", DataType::Float32, heads);
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Softplus",
+            vec![Some(add_out)],
+            vec![sp_out],
+        ));
+        let mul_out = value(&mut graph, "mul_out", DataType::Float32, heads);
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Mul",
+            vec![Some(neg_exp_a), Some(sp_out)],
+            vec![mul_out],
+        ));
+        let decay = if trailing_cast {
+            let cast_out = value(&mut graph, "decay", DataType::Float32, heads);
+            let mut cast = Node::new(NodeId(0), "Cast", vec![Some(mul_out)], vec![cast_out]);
+            cast.attributes.insert(
+                "to".into(),
+                Attribute::Int(DataType::Float32.to_onnx() as i64),
+            );
+            graph.insert_node(cast);
+            cast_out
+        } else {
+            mul_out
+        };
+
+        // beta chain.
+        let beta = value(&mut graph, "beta", DataType::Float32, heads);
+        graph.insert_node(Node::new(NodeId(0), "Sigmoid", vec![Some(raw)], vec![beta]));
+
+        let out = value(&mut graph, "out", DataType::Float32, heads);
+        let present = value(&mut graph, "present", DataType::Float32, heads);
+        let mut la = Node::new(
+            NodeId(0),
+            "LinearAttention",
+            vec![
+                Some(q),
+                Some(k),
+                Some(v),
+                Some(past),
+                Some(decay),
+                Some(beta),
+            ],
+            vec![out, present],
+        );
+        la.domain = MICROSOFT_DOMAIN.into();
+        graph.insert_node(la);
+        graph.add_output(out);
+        graph.add_output(present);
+        graph
+    }
+
+    #[test]
+    fn folds_beta_sigmoid_and_decay_softplus_into_linear_attention() {
+        // Depends on the gating fusion being enabled by default, so serialise
+        // against `opt_out_env_preserves_exported_gate_chains`, which disables it.
+        let _env = EnvVarGuard::without_var(LINEAR_ATTENTION_GATING_DISABLE_ENV);
+        for trailing_cast in [false, true] {
+            let mut graph = gated_delta_la_graph(4, trailing_cast);
+            let a = value_id_by_name(&graph, "a");
+            let raw = value_id_by_name(&graph, "raw");
+            let dt_bias = value_id_by_name(&graph, "dt_bias");
+            let neg_exp_a = value_id_by_name(&graph, "neg_exp_A");
+
+            CudaLinearAttentionGatingFusion
+                .run(&mut graph, &PassContext::new())
+                .unwrap();
+
+            // Every folded elementwise node is gone.
+            for op in ["Sigmoid", "Softplus", "Add", "Mul", "Cast"] {
+                assert!(
+                    graph.nodes.values().all(|n| n.op_type != op),
+                    "{op} must be folded away (trailing_cast={trailing_cast})"
+                );
+            }
+
+            let la = graph
+                .nodes
+                .values()
+                .find(|n| n.op_type == "LinearAttention")
+                .unwrap();
+            assert_eq!(
+                la.attr(FUSE_BETA_SIGMOID_ATTR).and_then(Attribute::as_int),
+                Some(1)
+            );
+            assert_eq!(
+                la.attr(FUSE_DECAY_SOFTPLUS_ATTR)
+                    .and_then(Attribute::as_int),
+                Some(1)
+            );
+            // beta slot rewired onto the pre-Sigmoid value; decay slot onto `a`;
+            // dt_bias / neg_exp_A appended as trailing operands.
+            assert_eq!(la.inputs[5], Some(raw));
+            assert_eq!(la.inputs[4], Some(a));
+            assert_eq!(la.inputs.len(), 8);
+            assert_eq!(la.inputs[6], Some(dt_bias));
+            assert_eq!(la.inputs[7], Some(neg_exp_a));
+        }
+    }
+
+    #[test]
+    fn folds_neg_exp_a_log_chain_into_linear_attention() {
+        // Depends on the gating fusion default; serialise against the opt-out test.
+        let _env = EnvVarGuard::without_var(LINEAR_ATTENTION_GATING_DISABLE_ENV);
+        for trailing_cast in [false, true] {
+            let mut graph = gated_delta_la_graph_ext(4, trailing_cast, true);
+            let a = value_id_by_name(&graph, "a");
+            let dt_bias = value_id_by_name(&graph, "dt_bias");
+            let a_log = value_id_by_name(&graph, "A_log");
+
+            CudaLinearAttentionGatingFusion
+                .run(&mut graph, &PassContext::new())
+                .unwrap();
+
+            // The whole decay chain, including the `Exp`/`Neg` constant ops, is
+            // folded into the kernel.
+            for op in ["Sigmoid", "Softplus", "Add", "Mul", "Cast", "Exp", "Neg"] {
+                assert!(
+                    graph.nodes.values().all(|n| n.op_type != op),
+                    "{op} must be folded away (trailing_cast={trailing_cast})"
+                );
+            }
+
+            let la = graph
+                .nodes
+                .values()
+                .find(|n| n.op_type == "LinearAttention")
+                .unwrap();
+            assert_eq!(
+                la.attr(FUSE_DECAY_SOFTPLUS_ATTR)
+                    .and_then(Attribute::as_int),
+                Some(1)
+            );
+            // The new marker signals the kernel to compute `-exp(A_log)` inline.
+            assert_eq!(
+                la.attr(FUSE_NEG_EXP_ATTR).and_then(Attribute::as_int),
+                Some(1)
+            );
+            // The neg_exp_A slot now carries the raw `A_log` initializer.
+            assert_eq!(la.inputs[4], Some(a));
+            assert_eq!(la.inputs.len(), 8);
+            assert_eq!(la.inputs[6], Some(dt_bias));
+            assert_eq!(la.inputs[7], Some(a_log));
+        }
+    }
+
+    #[test]
+    fn precomputed_neg_exp_a_initializer_does_not_set_neg_exp_marker() {
+        // When the exporter already provides `neg_exp_A` as an initializer, the
+        // decay fold fires but the inline `Neg(Exp)` marker must stay absent.
+        // This asserts the gating fusion's *default* (enabled) behaviour, so it
+        // must hold the env lock to serialise against the opt-out test that
+        // disables the fusion process-wide.
+        let _env = EnvVarGuard::without_var(LINEAR_ATTENTION_GATING_DISABLE_ENV);
+        let mut graph = gated_delta_la_graph(4, false);
+        CudaLinearAttentionGatingFusion
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+        let la = graph
+            .nodes
+            .values()
+            .find(|n| n.op_type == "LinearAttention")
+            .unwrap();
+        assert_eq!(
+            la.attr(FUSE_DECAY_SOFTPLUS_ATTR)
+                .and_then(Attribute::as_int),
+            Some(1)
+        );
+        assert!(la.attr(FUSE_NEG_EXP_ATTR).is_none());
+    }
+
+    #[test]
+    fn leaves_beta_gate_when_it_escapes_to_a_second_consumer() {
+        // Depends on the gating fusion default; serialise against the opt-out test.
+        let _env = EnvVarGuard::without_var(LINEAR_ATTENTION_GATING_DISABLE_ENV);
+        let mut graph = gated_delta_la_graph(4, false);
+        // A second consumer of `beta` means the Sigmoid output escapes, so the
+        // beta gate must be left exactly as exported; decay still folds.
+        let beta = value_id_by_name(&graph, "beta");
+        let sink = value(&mut graph, "beta_sink", DataType::Float32, 4);
+        graph.insert_node(Node::new(NodeId(0), "Relu", vec![Some(beta)], vec![sink]));
+        graph.add_output(sink);
+
+        CudaLinearAttentionGatingFusion
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+
+        assert!(
+            graph.nodes.values().any(|n| n.op_type == "Sigmoid"),
+            "the escaping beta Sigmoid is preserved"
+        );
+        let la = graph
+            .nodes
+            .values()
+            .find(|n| n.op_type == "LinearAttention")
+            .unwrap();
+        assert!(la.attr(FUSE_BETA_SIGMOID_ATTR).is_none());
+        // Decay still folds independently.
+        assert_eq!(
+            la.attr(FUSE_DECAY_SOFTPLUS_ATTR)
+                .and_then(Attribute::as_int),
+            Some(1)
+        );
+        assert_eq!(la.inputs.len(), 8);
+    }
+
+    #[test]
+    fn opt_out_env_preserves_exported_gate_chains() {
+        let mut graph = gated_delta_la_graph(4, true);
+        // Holds the process-global env lock for the whole set→run→restore window,
+        // so no concurrent test observes the disable flag; the guard restores the
+        // prior value on drop.
+        let _env = EnvVarGuard::with_var(LINEAR_ATTENTION_GATING_DISABLE_ENV, "1");
+        let result = CudaLinearAttentionGatingFusion.run(&mut graph, &PassContext::new());
+        result.unwrap();
+        for op in ["Sigmoid", "Softplus", "Add", "Mul", "Cast"] {
+            assert!(
+                graph.nodes.values().any(|n| n.op_type == op),
+                "opt-out preserves the standalone {op}"
+            );
+        }
+        let la = graph
+            .nodes
+            .values()
+            .find(|n| n.op_type == "LinearAttention")
+            .unwrap();
+        assert!(la.attr(FUSE_BETA_SIGMOID_ATTR).is_none());
+        assert!(la.attr(FUSE_DECAY_SOFTPLUS_ATTR).is_none());
+        assert_eq!(la.inputs.len(), 6);
+    }
+    #[test]
+    fn folds_bias_for_asymmetrically_quantized_weights() {
+        // The folded bias is an output-side epilogue, so it is orthogonal to how
+        // the weights were dequantized: a zero-points input must not block it.
+        // Requiring exactly the A/B/scales form silently excluded every
+        // asymmetrically-quantized model — on qwen2.5-0.5B that left 72 QKV bias
+        // `Add`s as separate kernels at ~24% of decode time.
+        let (mut graph, zp) = qkv_bias_graph_with_extra_input(DataType::Float16, 1152, 3);
+
+        CudaMatMulNBitsBiasFusion
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+
+        assert_eq!(graph.num_nodes(), 1, "the Add must be folded away");
+        let fused = graph.nodes.values().next().expect("fused node");
+        assert_eq!(
+            fused
+                .attr(MATMUL_NBITS_FOLDED_BIAS_ATTR)
+                .and_then(Attribute::as_int),
+            Some(1)
+        );
+        assert_eq!(
+            fused.inputs[3],
+            Some(zp),
+            "zero-points must survive the fold"
+        );
+        assert!(fused.inputs[5].is_some(), "bias must be wired at index 5");
+        assert!(graph.validate().is_ok());
+    }
+
+    #[test]
+    fn does_not_fold_bias_when_a_group_index_is_present() {
+        // The fused entry does not thread a group index through, so that form
+        // must still decline — the widened gate must not have become "anything
+        // goes".
+        let (mut graph, _gidx) = qkv_bias_graph_with_extra_input(DataType::Float16, 1152, 4);
+
+        CudaMatMulNBitsBiasFusion
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+
+        assert_eq!(graph.num_nodes(), 2, "a group index must block the fold");
     }
 }

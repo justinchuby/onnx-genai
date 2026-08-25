@@ -1,4 +1,5 @@
-//! CUDA implementation of the frozen `pkg.nxrt::BlockQuantizedMoE` v1 operator.
+//! CUDA implementation of the `pkg.nxrt::BlockQuantizedMoE` operator
+//! (mixed-projection ABI).
 //!
 //! This is the CUDA counterpart to the CPU parity oracle
 //! ([`onnx_runtime_ep_cpu::kernels::block_quantized_moe`]). Expert weights stay
@@ -9,6 +10,14 @@
 //! block-for-block; only the reduction/accumulation order differs (both
 //! accumulate in f32).
 //!
+//! The mixed-projection ABI lets `fc1_format`, `fc2_format` and `fc3_format`
+//! differ per projection (real GLM-5.2 GGUF experts pack gate/up and down at
+//! different qtypes). The current device kernel decodes a single **uniform**
+//! format across all projections, so mixed-projection nodes are typed-rejected
+//! at the claim gate and fall back to the CPU oracle. A per-projection CUDA
+//! decoder is an explicit follow-up — this file makes **no** success claim for
+//! mixed-projection execution.
+//!
 //! The pipeline mirrors the CPU reference: host-free top-k routing, per-route
 //! expert GEMV for FC1 (and the optional FC3 gate), a fused
 //! activation/SwiGLU pass, the FC2 down-projection, and a weighted combine of
@@ -18,7 +27,7 @@
 
 use std::borrow::Cow;
 use std::ffi::c_void;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use cudarc::driver::sys::CUdeviceptr;
 use cudarc::driver::{LaunchConfig, PushKernelArg};
@@ -31,6 +40,9 @@ use onnx_runtime_memory_governor::MemoryRole;
 
 use crate::error::driver_err;
 use crate::kernels::block_quantized_matmul::{BlockFormat, decoder_prelude};
+use crate::kernels::expert_route_telemetry::{
+    ArmedTelemetry, MARK_DEVICE_SRC, RouteTelemetryConfig, TelemetrySnapshot, TelemetryUnsupported,
+};
 use crate::runtime::{CudaRuntime, cuptr};
 
 const OP: &str = "BlockQuantizedMoE";
@@ -54,6 +66,18 @@ const INPUT_NAMES: [&str; 9] = [
     "fc3_experts_bias",
     "router_weights",
 ];
+
+/// Planar block-scaled B2 formats (DeepSeek-V4): the packed weight carries its
+/// UE8M0 block scales in a *separate* aux tensor, so they are not part of the
+/// interleaved single-tensor [`BlockFormat`] family the CUDA device kernel
+/// decodes. The onnx-runtime-ep-cpu `planar_block_quant` oracle owns them
+/// numerically today; the CUDA planar decoder is a pending follow-up and must
+/// not claim a planar node without proven kernel parity. These strings are the
+/// stable runtime capability names emitted by the Mobius #602 / Deckard #593
+/// planar emitters — recognised here purely to produce an accurate typed
+/// rejection (never an "re-export as mxfp4" message, which would be wrong: the
+/// checkpoint genuinely is these formats).
+const PLANAR_B2_FORMAT_NAMES: [&str; 2] = ["block_fp8", "fp4_planar"];
 
 // Kernels appended after the shared `decode_weight`/`block_sum` prelude. The
 // routing, activation, and combine kernels match the CPU oracle's arithmetic
@@ -84,7 +108,9 @@ extern "C" __global__ void bqmoe_route(
     const unsigned long long rows,
     const int experts,
     const int top_k,
-    const int normalize)
+    const int normalize,
+    unsigned int* route_telemetry_bitmap,
+    unsigned int* route_telemetry_header)
 {
     const unsigned long long first =
         (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -116,6 +142,14 @@ extern "C" __global__ void bqmoe_route(
             }
             indices[slot] = best_index;
         }
+
+        // Fused, inert route telemetry (issue #1810 Slice 7A): one thread owns
+        // this row and has finalized indices[0..top_k]. Mark once; the helper is
+        // a no-op when telemetry pointers are null (disarmed), so the outputs
+        // below are byte-identical.
+        route_telemetry_mark_row(
+            route_telemetry_bitmap, route_telemetry_header,
+            indices, top_k, experts);
 
         if (router_weights) {
             const float* aggregation =
@@ -311,6 +345,11 @@ fn module_source() -> &'static str {
     static SOURCE: OnceLock<String> = OnceLock::new();
     SOURCE.get_or_init(|| {
         let mut source = decoder_prelude();
+        // Shared route-telemetry `__device__` helpers (issue #1810 Slice 7A) so
+        // `bqmoe_route`'s fused `route_telemetry_mark_row` call resolves. Uses
+        // only integer atomics; inert when the route kernel is passed null
+        // telemetry pointers.
+        source.push_str(MARK_DEVICE_SRC);
         source.push_str(KERNELS);
         source
     })
@@ -378,11 +417,13 @@ impl MoeAttributes {
                     | "activation_alpha"
                     | "activation_beta"
                     | "swiglu_limit"
-                    | "format"
+                    | "fc1_format"
+                    | "fc2_format"
+                    | "fc3_format"
                     | "block_layout_version"
             ) {
                 return Err(error(format!(
-                    "attribute '{name}' is not part of the frozen v1 ABI"
+                    "attribute '{name}' is not part of the BlockQuantizedMoE ABI"
                 )));
             }
         }
@@ -440,12 +481,144 @@ fn parse_layout_version(node: &Node) -> Result<()> {
     Ok(())
 }
 
-fn parse_format(node: &Node) -> Result<BlockFormat> {
-    node.attr("format")
-        .ok_or_else(|| error("missing required string attribute 'format'"))?
+/// Per-projection native formats for the CUDA claim gate.
+///
+/// The mixed-projection ABI allows `fc1_format`, `fc2_format` and `fc3_format`
+/// to differ. The current device kernel decodes a single **uniform** format, so
+/// [`ProjectionFormats::uniform`] typed-rejects any mixed combination — those
+/// nodes fall back to the CPU oracle. This is an explicit CUDA follow-up with
+/// no success claim for mixed-projection execution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProjectionFormats {
+    fc1: BlockFormat,
+    fc2: BlockFormat,
+    fc3: Option<BlockFormat>,
+}
+
+impl ProjectionFormats {
+    /// The single format the uniform-projection device kernel decodes, or an
+    /// error describing the mixed-projection combination CUDA cannot yet run.
+    fn uniform(self) -> std::result::Result<BlockFormat, String> {
+        let mut mixed = self.fc1 != self.fc2;
+        if let Some(fc3) = self.fc3 {
+            mixed |= fc3 != self.fc1;
+        }
+        if mixed {
+            return Err(format!(
+                "CUDA does not yet support mixed per-projection block formats \
+                 (fc1={:?}, fc2={:?}, fc3={:?}); the CPU oracle owns this node",
+                self.fc1, self.fc2, self.fc3
+            ));
+        }
+        Ok(self.fc1)
+    }
+}
+
+fn parse_format_attr(node: &Node, name: &str) -> Result<BlockFormat> {
+    node.attr(name)
+        .ok_or_else(|| error(format!("missing required string attribute '{name}'")))?
         .as_str()
-        .ok_or_else(|| error("attribute 'format' must be a UTF-8 string"))
+        .ok_or_else(|| error(format!("attribute '{name}' must be a UTF-8 string")))
         .and_then(BlockFormat::parse)
+}
+
+fn optional_format_attr(node: &Node, name: &str) -> Result<Option<BlockFormat>> {
+    match node.attr(name) {
+        None => Ok(None),
+        Some(attribute) => attribute
+            .as_str()
+            .ok_or_else(|| error(format!("attribute '{name}' must be a UTF-8 string")))
+            .and_then(BlockFormat::parse)
+            .map(Some),
+    }
+}
+
+/// Parse the per-projection formats. `fc3_format` must be present exactly when
+/// the `fc3_experts_weights` input (index 6) is wired on the node.
+fn parse_projection_formats(node: &Node) -> Result<ProjectionFormats> {
+    let fc1 = parse_format_attr(node, "fc1_format")?;
+    let fc2 = parse_format_attr(node, "fc2_format")?;
+    let fc3_wired = node.inputs.get(6).is_some_and(Option::is_some);
+    let fc3_attr = optional_format_attr(node, "fc3_format")?;
+    match (fc3_wired, fc3_attr) {
+        (true, Some(fc3)) => Ok(ProjectionFormats {
+            fc1,
+            fc2,
+            fc3: Some(fc3),
+        }),
+        (true, None) => Err(error(
+            "fc3_experts_weights is wired but the required fc3_format attribute is missing",
+        )),
+        (false, Some(_)) => Err(error(
+            "fc3_format is only valid when fc3_experts_weights is wired",
+        )),
+        (false, None) => Ok(ProjectionFormats {
+            fc1,
+            fc2,
+            fc3: None,
+        }),
+    }
+}
+
+/// Claim-gate variant of [`parse_projection_formats`] that yields
+/// `Cow<'static, str>` rejection reasons (with the CUDA re-export guidance) so
+/// [`unsupported_reason`] can decline a node without constructing an [`EpError`].
+fn claim_projection_formats(
+    node: &Node,
+) -> std::result::Result<ProjectionFormats, Cow<'static, str>> {
+    let fc1 = claim_format_attr(node, "fc1_format")?.ok_or(Cow::Borrowed(
+        "BlockQuantizedMoE: missing required string attribute 'fc1_format' — export one of mxfp4, iq4_nl, iq4_xs, iq2_xxs, iq3_xxs, iq2_xs, iq2_s, iq3_s, iq1_s, or iq1_m",
+    ))?;
+    let fc2 = claim_format_attr(node, "fc2_format")?.ok_or(Cow::Borrowed(
+        "BlockQuantizedMoE: missing required string attribute 'fc2_format' — export one of mxfp4, iq4_nl, iq4_xs, iq2_xxs, iq3_xxs, iq2_xs, iq2_s, iq3_s, iq1_s, or iq1_m",
+    ))?;
+    let fc3 = claim_format_attr(node, "fc3_format")?;
+    let fc3_wired = node.inputs.get(6).is_some_and(Option::is_some);
+    match (fc3_wired, fc3) {
+        (true, Some(fc3)) => Ok(ProjectionFormats {
+            fc1,
+            fc2,
+            fc3: Some(fc3),
+        }),
+        (true, None) => Err(Cow::Borrowed(
+            "BlockQuantizedMoE: fc3_experts_weights is wired but the required fc3_format attribute is missing",
+        )),
+        (false, Some(_)) => Err(Cow::Borrowed(
+            "BlockQuantizedMoE: fc3_format is only valid when fc3_experts_weights is wired",
+        )),
+        (false, None) => Ok(ProjectionFormats {
+            fc1,
+            fc2,
+            fc3: None,
+        }),
+    }
+}
+
+/// Parse one projection-format attribute for the claim gate. `Ok(None)` means
+/// the attribute is absent; a present-but-invalid value is a typed rejection.
+fn claim_format_attr(
+    node: &Node,
+    name: &str,
+) -> std::result::Result<Option<BlockFormat>, Cow<'static, str>> {
+    let Some(attribute) = node.attr(name) else {
+        return Ok(None);
+    };
+    let Some(text) = attribute.as_str() else {
+        return Err(Cow::Owned(format!(
+            "BlockQuantizedMoE: attribute '{name}' must be a string naming a CUDA-supported block format"
+        )));
+    };
+    if PLANAR_B2_FORMAT_NAMES.contains(&text) {
+        return Err(Cow::Owned(format!(
+            "BlockQuantizedMoE: CUDA has no exact decoder yet for planar B2 format '{text}' at '{name}' (DeepSeek-V4) — it is a recognised runtime ABI currently owned by the onnx-runtime-ep-cpu planar_block_quant oracle; the CUDA planar decoder is a pending follow-up and must not claim without proven kernel parity"
+        )));
+    }
+    match BlockFormat::parse(text) {
+        Ok(format) => Ok(Some(format)),
+        Err(_) => Err(Cow::Owned(format!(
+            "BlockQuantizedMoE: CUDA does not support format '{text}' for '{name}' — re-export weights as mxfp4, iq4_nl, iq4_xs, iq2_xxs, iq3_xxs, iq2_xs, iq2_s, iq3_s, iq1_s, or iq1_m"
+        ))),
+    }
 }
 
 pub struct BlockQuantizedMoEFactory {
@@ -453,47 +626,58 @@ pub struct BlockQuantizedMoEFactory {
 }
 
 impl KernelFactory for BlockQuantizedMoEFactory {
-    fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+    fn create(&self, node: &Node, input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+        Ok(Box::new(self.create_kernel(node, input_shapes)?))
+    }
+}
+
+impl BlockQuantizedMoEFactory {
+    /// Build a concrete [`BlockQuantizedMoEKernel`]. Exposed so route-telemetry
+    /// tests (issue #1810 Slice 7A) can obtain the concrete kernel and call its
+    /// `#[doc(hidden)]` arming API — the trait object returned by
+    /// [`KernelFactory::create`] cannot expose it. Crate-internal / test seam
+    /// only.
+    #[doc(hidden)]
+    pub fn create_kernel(
+        &self,
+        node: &Node,
+        _input_shapes: &[Vec<usize>],
+    ) -> Result<BlockQuantizedMoEKernel> {
         parse_layout_version(node)?;
         let attributes = MoeAttributes::from_node(node)?;
-        let format = parse_format(node)?;
-        Ok(Box::new(BlockQuantizedMoEKernel {
+        // The device kernel decodes a single uniform format; mixed-projection
+        // nodes are typed-rejected at the claim gate before reaching here.
+        let format = parse_projection_formats(node)?.uniform().map_err(error)?;
+        Ok(BlockQuantizedMoEKernel {
             runtime: self.runtime.clone(),
             attributes,
             format,
-        }))
+            telemetry: Mutex::new(None),
+        })
     }
 }
 
 /// Placement declaration for the CUDA claim gate. The CUDA kernel implements the
-/// full frozen v1 ABI over the ten CUDA-supported GGUF block formats with f32
-/// activations. It declines any node the kernel cannot execute (unsupported
-/// format, wrong layout version, or non-f32 activation/router dtypes) so those
+/// BlockQuantizedMoE ABI over the ten CUDA-supported GGUF block formats with f32
+/// activations, but only for **uniform** per-projection formats. It declines any
+/// node the kernel cannot execute (unsupported format, mixed per-projection
+/// formats, wrong layout version, or non-f32 activation/router dtypes) so those
 /// nodes fall back to the CPU oracle rather than mis-executing.
 pub(crate) fn unsupported_reason(
     node: &Node,
     shapes: &[Shape],
     input_dtypes: &[DataType],
 ) -> Option<Cow<'static, str>> {
-    let format = match node.attr("format") {
-        Some(attribute) => match attribute.as_str() {
-            Some(format) => format,
-            None => {
-                return Some(Cow::Borrowed(
-                    "BlockQuantizedMoE: attribute 'format' must be a string naming a CUDA-supported block format",
-                ));
-            }
-        },
-        None => {
-            return Some(Cow::Borrowed(
-                "BlockQuantizedMoE: missing required string attribute 'format' — export one of mxfp4, iq4_nl, iq4_xs, iq2_xxs, iq3_xxs, iq2_xs, iq2_s, iq3_s, iq1_s, or iq1_m",
-            ));
-        }
+    let formats = match claim_projection_formats(node) {
+        Ok(formats) => formats,
+        Err(reason) => return Some(reason),
     };
-    if BlockFormat::parse(format).is_err() {
-        return Some(Cow::Owned(format!(
-            "BlockQuantizedMoE: CUDA does not support format '{format}' — re-export weights as mxfp4, iq4_nl, iq4_xs, iq2_xxs, iq3_xxs, iq2_xs, iq2_s, iq3_s, iq1_s, or iq1_m"
-        )));
+    // The device kernel decodes one uniform format; real GLM-5.2 GGUF experts
+    // carry different qtypes per projection. Typed-reject the mixed case (no
+    // success claim) so the CPU oracle owns it — a per-projection CUDA decoder
+    // is an explicit follow-up.
+    if let Err(reason) = formats.uniform() {
+        return Some(Cow::Owned(format!("BlockQuantizedMoE: {reason}")));
     }
     if let Some(attribute) = node.attr("block_layout_version") {
         match attribute.as_int() {
@@ -540,6 +724,133 @@ pub struct BlockQuantizedMoEKernel {
     runtime: Arc<CudaRuntime>,
     attributes: MoeAttributes,
     format: BlockFormat,
+    /// Inert, default-disabled route telemetry (issue #1810 Slice 7A). `None`
+    /// unless explicitly armed via
+    /// [`BlockQuantizedMoEKernel::arm_route_telemetry`]; while `None` the route
+    /// kernel receives null telemetry pointers and produces byte-identical
+    /// outputs.
+    telemetry: Mutex<Option<ArmedTelemetry>>,
+}
+
+impl BlockQuantizedMoEKernel {
+    /// Arm inert route telemetry (issue #1810 Slice 7A). Allocates the
+    /// persistent stable-VA record through the existing runtime allocator,
+    /// stamps request/device identity, and opens the first accumulation window
+    /// (`epoch = 1`); subsequent executions whose expert count matches
+    /// `config.num_experts` accumulate their routes into the current window via
+    /// the fused route-kernel marks. The window advances only at
+    /// [`reset_route_telemetry_boundary`](Self::reset_route_telemetry_boundary).
+    /// Returns a typed [`TelemetryUnsupported`] on a device mismatch or
+    /// unsupported property, in which case telemetry stays disabled and ordinary
+    /// inference is unaffected. Session/kernel-scoped, crate-internal/test only
+    /// and default-off.
+    ///
+    /// Caveat: re-arming (or [`disarm_route_telemetry`](Self::disarm_route_telemetry))
+    /// frees the previous record's device buffers, whose pointers an
+    /// instantiated CUDA graph bakes into its nodes; the caller MUST
+    /// `reset_graph` any capture that referenced the old record before
+    /// re-arming or disarming. Every current caller does so, and there is no
+    /// production caller.
+    #[doc(hidden)]
+    pub fn arm_route_telemetry(
+        &self,
+        config: RouteTelemetryConfig,
+    ) -> std::result::Result<(), TelemetryUnsupported> {
+        let armed = ArmedTelemetry::arm(&self.runtime, config)?;
+        let mut telemetry = self
+            .telemetry
+            .lock()
+            .expect("cuda_ep BQMoE telemetry poisoned");
+        if let Some(previous) = telemetry.take() {
+            previous.free(&self.runtime);
+        }
+        *telemetry = Some(armed);
+        Ok(())
+    }
+
+    /// Disarm and release any armed route-telemetry record. Idempotent. The
+    /// caller must first `reset_graph` any capture that referenced the record —
+    /// see [`arm_route_telemetry`](Self::arm_route_telemetry).
+    #[doc(hidden)]
+    pub fn disarm_route_telemetry(&self) {
+        let mut telemetry = self
+            .telemetry
+            .lock()
+            .expect("cuda_ep BQMoE telemetry poisoned");
+        if let Some(previous) = telemetry.take() {
+            previous.free(&self.runtime);
+        }
+    }
+
+    /// Advance route telemetry to the next accumulation window at an explicit
+    /// **coarse safe boundary** (issue #1810 Slice 7A; design §2.3/§3). The
+    /// *only* place the epoch advances and the record is re-zeroed — the
+    /// execute path never resets it, so eager calls in a window accumulate the
+    /// routed-expert union and in-range count with a fixed epoch. Rejected
+    /// (returns `Err`) while the EP stream is capturing; otherwise drains prior
+    /// stream work through `drain_for_unmap` before re-stamping the header on the
+    /// host. No-op (`Ok`) when disarmed. Allocates nothing, moves no pointer.
+    /// Crate-internal / test-only; no production boundary-policy caller yet.
+    #[doc(hidden)]
+    pub fn reset_route_telemetry_boundary(&self) -> Result<()> {
+        let mut telemetry = self
+            .telemetry
+            .lock()
+            .expect("cuda_ep BQMoE telemetry poisoned");
+        match telemetry.as_mut() {
+            Some(armed) => armed.reset_boundary(&self.runtime),
+            None => Ok(()),
+        }
+    }
+
+    /// Copy the current telemetry record to the host (test/observability only —
+    /// not the production CONSUME path; self-synchronizes). Returns `None` when
+    /// telemetry is not armed.
+    #[doc(hidden)]
+    pub fn route_telemetry_snapshot(&self) -> Result<Option<TelemetrySnapshot>> {
+        let telemetry = self
+            .telemetry
+            .lock()
+            .expect("cuda_ep BQMoE telemetry poisoned");
+        match telemetry.as_ref() {
+            Some(armed) => Ok(Some(armed.snapshot(&self.runtime)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Total device bytes held by the armed telemetry record (teardown /
+    /// accounting tests); `0` when disarmed.
+    #[doc(hidden)]
+    pub fn route_telemetry_footprint_bytes(&self) -> usize {
+        self.telemetry
+            .lock()
+            .expect("cuda_ep BQMoE telemetry poisoned")
+            .as_ref()
+            .map_or(0, ArmedTelemetry::footprint_bytes)
+    }
+
+    /// Stable device VA of the armed telemetry bitmap (isolation / accounting
+    /// tests); `None` when disarmed.
+    #[doc(hidden)]
+    pub fn route_telemetry_bitmap_addr(&self) -> Option<u64> {
+        self.telemetry
+            .lock()
+            .expect("cuda_ep BQMoE telemetry poisoned")
+            .as_ref()
+            .map(ArmedTelemetry::bitmap_addr)
+    }
+}
+
+impl Drop for BlockQuantizedMoEKernel {
+    fn drop(&mut self) {
+        // Release any armed route-telemetry record (issue #1810 Slice 7A).
+        // `free` drains in-flight launches before returning the buffers.
+        if let Ok(telemetry) = self.telemetry.get_mut()
+            && let Some(armed) = telemetry.take()
+        {
+            armed.free(&self.runtime);
+        }
+    }
 }
 
 const WORKSPACE_ALIGNMENT: usize = 256;
@@ -966,6 +1277,31 @@ impl Kernel for BlockQuantizedMoEKernel {
         let activated = ptr(4);
         let route_output = ptr(5);
 
+        // Inert route telemetry (issue #1810 Slice 7A). When armed for this
+        // expert count, hand the stable-VA record pointers to the fused route
+        // kernel so its `atomicOr`/`atomicAdd` marks accumulate this call's
+        // routes into the *current window* (union bitmap + saturating count).
+        // There is deliberately **no reset/epoch launch here** — the window and
+        // its epoch advance only at an explicit `reset_route_telemetry_boundary`
+        // (design §2.3/§3), so consecutive eager calls accumulate rather than
+        // resetting per call. When disarmed — or armed for a different capacity —
+        // the pointers are null and the route kernel is byte-identical; a
+        // capacity mismatch leaves telemetry inert for this call and never fails
+        // inference. (BlockQuantizedMoE is not capture-capable — its trailing
+        // host sync predates this slice — so this adds no new synchronization.)
+        let (telemetry_bitmap, telemetry_header) = {
+            let telemetry = self
+                .telemetry
+                .lock()
+                .expect("cuda_ep BQMoE telemetry poisoned");
+            match telemetry.as_ref() {
+                Some(armed) if armed.matches_experts(experts) => {
+                    (armed.bitmap_ptr(), armed.header_ptr())
+                }
+                _ => (0u64, 0u64),
+            }
+        };
+
         self.launch_route(
             &inputs[1],
             router_weights,
@@ -973,6 +1309,8 @@ impl Kernel for BlockQuantizedMoEKernel {
             route_weights_ptr,
             rows,
             experts,
+            telemetry_bitmap,
+            telemetry_header,
         )?;
         self.launch_linear(
             tensor_ptr(&inputs[0]),
@@ -1043,6 +1381,7 @@ impl BlockQuantizedMoEKernel {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn launch_route(
         &self,
         router_logits: &TensorView,
@@ -1051,6 +1390,8 @@ impl BlockQuantizedMoEKernel {
         route_weights: CUdeviceptr,
         rows: usize,
         experts: usize,
+        route_telemetry_bitmap: CUdeviceptr,
+        route_telemetry_header: CUdeviceptr,
     ) -> Result<()> {
         let function = self
             .runtime
@@ -1071,9 +1412,12 @@ impl BlockQuantizedMoEKernel {
             .arg(&rows_u64)
             .arg(&experts_i32)
             .arg(&top_k)
-            .arg(&normalize);
+            .arg(&normalize)
+            .arg(&route_telemetry_bitmap)
+            .arg(&route_telemetry_header);
         // SAFETY: scratch buffers cover rows*top_k entries and the scalar ABI
-        // matches `bqmoe_route`.
+        // matches `bqmoe_route`. Telemetry pointers are null when disarmed, which
+        // the kernel treats as inert.
         unsafe { builder.launch(config) }
             .map(|_| ())
             .map_err(|err| driver_err("launch BlockQuantizedMoE routing", err))
@@ -1376,5 +1720,143 @@ mod workspace_tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("exceeds usize limits"));
+    }
+}
+
+#[cfg(test)]
+mod claim_gate_tests {
+    use super::*;
+    use onnx_runtime_ir::{Attribute, NodeId, ValueId};
+
+    /// Build a minimal `BlockQuantizedMoE` node carrying only the attributes the
+    /// claim gate reads. `fc3` set means the `fc3_experts_weights` input (index
+    /// 6) is wired and an `fc3_format` attribute is emitted. These nodes are not
+    /// executable — they exist purely to exercise `unsupported_reason` /
+    /// `claim_projection_formats`, which are pure functions over node metadata
+    /// and never touch a CUDA device, so this runs on a host without a GPU.
+    fn claim_node(fc1: &str, fc2: &str, fc3: Option<&str>) -> Node {
+        let mut inputs: Vec<Option<ValueId>> = (0..6).map(|i| Some(ValueId(i as u32))).collect();
+        if fc3.is_some() {
+            // Indices 6..=8: fc3 weights wired, then two optional trailing slots.
+            inputs.push(Some(ValueId(6)));
+        }
+        let mut node = Node::new(NodeId(0), "BlockQuantizedMoE", inputs, vec![ValueId(100)]);
+        node.attributes.insert(
+            "fc1_format".into(),
+            Attribute::String(fc1.as_bytes().to_vec()),
+        );
+        node.attributes.insert(
+            "fc2_format".into(),
+            Attribute::String(fc2.as_bytes().to_vec()),
+        );
+        if let Some(fc3) = fc3 {
+            node.attributes.insert(
+                "fc3_format".into(),
+                Attribute::String(fc3.as_bytes().to_vec()),
+            );
+        }
+        node
+    }
+
+    #[test]
+    fn mixed_fc1_fc2_formats_are_typed_rejected_without_a_success_claim() {
+        // The real GLM-5.2 UD-IQ1_S combo: gate/up IQ1_S, down IQ3_XXS.
+        let node = claim_node("iq1_s", "iq3_xxs", None);
+        let reason = unsupported_reason(&node, &[], &[])
+            .expect("mixed per-projection formats must be declined by the CUDA claim gate");
+        assert!(
+            reason.contains("mixed per-projection block formats"),
+            "unexpected rejection reason: {reason}"
+        );
+    }
+
+    #[test]
+    fn mixed_fc3_gate_format_is_typed_rejected() {
+        // Unfused gate carried at a different qtype than fc1/fc2.
+        let node = claim_node("iq1_s", "iq1_s", Some("iq2_xxs"));
+        let reason = unsupported_reason(&node, &[], &[])
+            .expect("a mismatched fc3_format must be declined by the CUDA claim gate");
+        assert!(
+            reason.contains("mixed per-projection block formats"),
+            "unexpected rejection reason: {reason}"
+        );
+    }
+
+    #[test]
+    fn uniform_projection_formats_remain_claimable() {
+        // Uniform format across every projection stays claimable by the device
+        // kernel — the mixed-rejection must not over-reject the supported case.
+        let node = claim_node("iq1_s", "iq1_s", Some("iq1_s"));
+        assert!(
+            unsupported_reason(&node, &[], &[]).is_none(),
+            "uniform-format node must not be declined by the CUDA claim gate"
+        );
+        let fused = claim_node("iq4_nl", "iq4_nl", None);
+        assert!(
+            unsupported_reason(&fused, &[], &[]).is_none(),
+            "uniform fused-projection node must not be declined by the CUDA claim gate"
+        );
+    }
+
+    #[test]
+    fn unsupported_native_format_is_typed_rejected_at_the_claim_gate() {
+        // A native GGUF qtype outside BlockFormat (e.g. Q2_K) is declined, not
+        // dequantized or dense-fallback executed.
+        let node = claim_node("q2_k", "q2_k", None);
+        let reason = unsupported_reason(&node, &[], &[])
+            .expect("an unsupported native format must be declined by the CUDA claim gate");
+        assert!(
+            reason.contains("q2_k"),
+            "unexpected rejection reason: {reason}"
+        );
+    }
+
+    #[test]
+    fn fc3_format_without_wired_gate_is_typed_rejected() {
+        // fc3_format present but the fc3 weights input is not wired: reject.
+        let mut node = claim_node("iq1_s", "iq1_s", None);
+        node.attributes
+            .insert("fc3_format".into(), Attribute::String(b"iq1_s".to_vec()));
+        let reason = unsupported_reason(&node, &[], &[])
+            .expect("fc3_format without a wired gate must be declined");
+        assert!(
+            reason.contains("fc3_format is only valid when fc3_experts_weights is wired"),
+            "unexpected rejection reason: {reason}"
+        );
+    }
+
+    #[test]
+    fn planar_b2_formats_are_typed_rejected_without_a_success_claim() {
+        // DeepSeek-V4 B2: block-FP8 shared/attention, planar-FP4 routed experts.
+        // Both are recognised planar ABI names but have no exact CUDA decoder
+        // yet — the claim gate must decline them (CPU oracle owns them) rather
+        // than mis-executing or emitting misleading "re-export as mxfp4" advice.
+        for planar in ["block_fp8", "fp4_planar"] {
+            let node = claim_node(planar, planar, None);
+            let reason = unsupported_reason(&node, &[], &[]).unwrap_or_else(|| {
+                panic!("planar B2 format '{planar}' must be declined by the CUDA claim gate")
+            });
+            assert!(
+                reason.contains(planar) && reason.contains("planar B2 format"),
+                "unexpected rejection reason for {planar}: {reason}"
+            );
+            assert!(
+                !reason.contains("re-export"),
+                "planar rejection must not advise a lossy re-export: {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn planar_b2_format_on_a_single_projection_is_typed_rejected() {
+        // A mixed node where only the routed (fc2) projection is planar-FP4 must
+        // still be declined; the planar recognition fires per projection.
+        let node = claim_node("iq1_s", "fp4_planar", None);
+        let reason = unsupported_reason(&node, &[], &[])
+            .expect("a planar projection anywhere must be declined by the CUDA claim gate");
+        assert!(
+            reason.contains("fp4_planar"),
+            "unexpected rejection reason: {reason}"
+        );
     }
 }

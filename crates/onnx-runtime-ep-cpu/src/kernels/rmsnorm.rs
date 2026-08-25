@@ -273,7 +273,7 @@ mod tests {
             let widened_input = input.to_bf16_as_f32();
             let widened_scale = scale.to_bf16_as_f32();
             let mut expected = Vec::with_capacity(element_count);
-            for row in widened_input.chunks_exact(8) {
+            for row in widened_input.as_chunks::<8>().0 {
                 expected.extend(reference(row, &widened_scale, 1e-5));
             }
             for (index, (actual, expected)) in output
@@ -497,7 +497,7 @@ mod tests {
         .execute(&[x.view(), scale.view()], &mut [out.view_mut()])
         .unwrap();
         let mut want = Vec::with_capacity(x_data.len());
-        for row in x_data.chunks_exact(12) {
+        for row in x_data.as_chunks::<12>().0 {
             let inverse_rms =
                 1.0 / (crate::kernels::simd_sumsq::sum_of_squares(row) / 12.0 + 1e-5).sqrt();
             want.extend(

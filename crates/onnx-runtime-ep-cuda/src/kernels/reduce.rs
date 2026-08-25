@@ -1,15 +1,19 @@
 //! GPU **reductions** over arbitrary axes with `keepdims`
 //! (`docs/execution/CUDA_COVERAGE.md`, "Normalization & softmax" / reduce rows).
 //!
-//! `ReduceSum` and `ReduceMean` use `cudnnReduceTensor` for f32 (native f32
-//! comp type). f16 and bf16 use the typed NVRTC block reduction, which does
-//! fp16/bf16 IO with f32 register accumulation in a single capture-safe kernel.
-//! For f16 this deliberately avoids cuDNN's fp16↔fp32 `op_tensor` cast +
-//! fp32-ReduceSum round-trip (cuDNN rejects a half `reduceTensorCompType` and
-//! forces `CUDNN_DATA_FLOAT`); bf16 cannot be reduced by cuDNN at all (rejected
-//! even with an f32 comp type — `CUDNN_STATUS_NOT_SUPPORTED`). That same NVRTC
-//! path also runs for f32 when cuDNN is absent.
-//! `ReduceMax`/`ReduceMin` always use NVRTC.
+//! `ReduceSum` and `ReduceMean` prefer the typed NVRTC block reduction, which
+//! does f32/fp16/bf16 IO with f32 register accumulation in a single
+//! capture-safe kernel (one block per output element). f16 and bf16 always take
+//! it: cuDNN rejects a half `reduceTensorCompType` and forces
+//! `CUDNN_DATA_FLOAT` (an fp16↔fp32 `op_tensor` cast + fp32-ReduceSum
+//! round-trip), and bf16 is rejected entirely (`CUDNN_STATUS_NOT_SUPPORTED`).
+//! f32 also takes it whenever the reduction is well-parallelised (enough output
+//! elements to fill the SMs, or a small per-output group) — the common decode
+//! case — where cuDNN's generic reduce carries dominant per-launch overhead;
+//! f32 falls back to `cudnnReduceTensor` only for the low-parallelism
+//! "few outputs, huge group" regime (e.g. a global reduce-all), where cuDNN's
+//! multi-block reduce beats a single serialising block. It also uses NVRTC for
+//! f32 when cuDNN is absent. `ReduceMax`/`ReduceMin` always use NVRTC.
 //!
 //! `cub::DeviceReduce` / `DeviceSegmentedReduce` are the vendor primitives for
 //! reductions, and a segmented block reduction is exactly the shape they use.
@@ -52,10 +56,16 @@ use std::sync::{Arc, Mutex};
 use cudarc::driver::PushKernelArg;
 use cudarc::driver::sys::CUdeviceptr;
 
-use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
+use onnx_runtime_ep_api::{
+    EpError, Kernel, KernelFactory, Result, TensorMetadata, TensorMut, TensorView,
+    WorkspaceRequirement, WorkspaceView,
+};
 use onnx_runtime_ir::{DataType, Node};
 
-use crate::cudnn::{CudnnBufferPair, CudnnReduceCache, CudnnReduceOp, TensorDescriptorSpec};
+use crate::cudnn::{
+    CudnnBufferPair, CudnnReduceCache, CudnnReduceOp, TensorDescriptorSpec,
+    governed_workspace_requirement,
+};
 use crate::error::{driver_err, not_implemented};
 use crate::runtime::{CudaRuntime, cuptr};
 
@@ -657,8 +667,9 @@ macro_rules! reduce_factory {
                     noop_with_empty_axes,
                     runtime: self.runtime.clone(),
                     reduce_metadata: Mutex::new(ReductionMetadataCache::new(self.runtime.clone())),
-                    cudnn_reduce: Mutex::new(CudnnReduceCache::new(self.runtime.stream().clone())),
+                    cudnn_reduce: Mutex::new(CudnnReduceCache::new()),
                     warmed_axes: Mutex::new(None),
+                    prepared_axes: Mutex::new(None),
                     last_call_capture_safe: AtomicBool::new(false),
                 }))
             }
@@ -694,14 +705,18 @@ pub struct ReduceKernel {
     /// into a captured CUDA graph segment instead of shredding it with a
     /// per-call `alloc`/`htod`/`sync`/`free`.
     reduce_metadata: Mutex<ReductionMetadataCache>,
-    /// Cached cuDNN descriptors + device workspace for the float (f32/f16)
-    /// cuDNN reduce path, so a shape-stable decode reduce allocates nothing
-    /// per call and can be captured into a CUDA graph.
+    /// Cached cuDNN descriptors + exact workspace bytes for the float cuDNN
+    /// reduce path. The executor owns the actual persistent workspace.
     cudnn_reduce: Mutex<CudnnReduceCache>,
     /// Axes resolved from the optional axes **input** on the last eager call,
     /// reused during CUDA graph capture where a device read of that input is
     /// illegal. `None` until the first 2-input eager call warms it.
     warmed_axes: Mutex<Option<Vec<i64>>>,
+    /// Axes prepared for the immediately-following dispatch. Execution-time
+    /// workspace planning can resolve a runtime axes input before
+    /// `execute_with_workspace`; stash the exact axes here so the launch path
+    /// can reuse them without a second device→host read.
+    prepared_axes: Mutex<Option<Vec<i64>>>,
     last_call_capture_safe: AtomicBool,
 }
 
@@ -907,7 +922,157 @@ impl ReduceKernel {
         }
     }
 
-    fn run(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+    fn resolve_axes_for_dispatch(
+        &self,
+        op: &str,
+        inputs: &[TensorView],
+        capturing: bool,
+    ) -> Result<Option<Vec<i64>>> {
+        if inputs.len() == 2 && capturing {
+            if inputs[1].dtype != DataType::Int64 {
+                return Err(EpError::KernelFailed(
+                    "cuda_ep ReduceSum: captured axes input must be Int64".into(),
+                ));
+            }
+            let cached_axes = self
+                .reduce_metadata
+                .lock()
+                .map_err(|_| {
+                    EpError::KernelFailed(
+                        "cuda_ep ReduceSum: metadata cache lock was poisoned".into(),
+                    )
+                })?
+                .key
+                .as_ref()
+                .map(|key| key.axes.clone());
+            let axes = match cached_axes {
+                Some(axes) => axes,
+                None => self
+                    .warmed_axes
+                    .lock()
+                    .map_err(|_| {
+                        EpError::KernelFailed(
+                            "cuda_ep ReduceSum: warmed-axes cache lock was poisoned".into(),
+                        )
+                    })?
+                    .clone()
+                    .ok_or_else(|| {
+                        EpError::KernelFailed(
+                            "cuda_ep ReduceSum: axes were not warmed before CUDA graph capture"
+                                .into(),
+                        )
+                    })?,
+            };
+            Ok(Some(axes))
+        } else if inputs.len() == 2 {
+            let axes = self.read_axes_input(op, &inputs[1])?;
+            *self.warmed_axes.lock().map_err(|_| {
+                EpError::KernelFailed(
+                    "cuda_ep ReduceSum: warmed-axes cache lock was poisoned".into(),
+                )
+            })? = Some(axes.clone());
+            Ok(Some(axes))
+        } else {
+            Ok(self.axes_attr.clone())
+        }
+    }
+
+    fn cudnn_workspace_requirement_for_shape(
+        &self,
+        dtype: DataType,
+        shape: &[usize],
+        reduce: &[bool],
+        capturing: bool,
+    ) -> Result<WorkspaceRequirement> {
+        let Some(cudnn_op) = self.op.cudnn_op() else {
+            return Ok(WorkspaceRequirement::NONE);
+        };
+        if dtype != DataType::Float32 || !self.runtime.cudnn().is_available() {
+            return Ok(WorkspaceRequirement::NONE);
+        }
+
+        let reduce_count_hint: usize = shape
+            .iter()
+            .zip(reduce.iter())
+            .filter(|&(_, &r)| r)
+            .map(|(&d, _)| d)
+            .product();
+        let out_count_hint: usize = shape
+            .iter()
+            .zip(reduce.iter())
+            .filter(|&(_, &r)| !r)
+            .map(|(&d, _)| d)
+            .product();
+        let sm_count = self.runtime.capabilities().multiprocessor_count() as usize;
+        let block_reduction_parallel =
+            out_count_hint >= sm_count || reduce_count_hint <= REDUCE_BLOCK as usize;
+        if block_reduction_parallel {
+            return Ok(WorkspaceRequirement::NONE);
+        }
+
+        let (input_spec, output_spec) = cudnn_reduce_specs(dtype, shape, reduce)?;
+        let mut cache = self.cudnn_reduce.lock().map_err(|_| {
+            EpError::KernelFailed("cuda_ep ReduceSum: cuDNN reduce cache lock was poisoned".into())
+        })?;
+        let bytes = self.runtime.cudnn().with_handle(|handle| {
+            handle.reduce_workspace_bytes(
+                &mut cache,
+                &input_spec,
+                &output_spec,
+                cudnn_op,
+                capturing,
+            )
+        })?;
+        Ok(governed_workspace_requirement(bytes))
+    }
+
+    fn workspace_requirement_from_metadata(
+        &self,
+        inputs: &[TensorMetadata<'_>],
+        capturing: bool,
+    ) -> Result<WorkspaceRequirement> {
+        let Some(x) = inputs.first() else {
+            return Ok(WorkspaceRequirement::NONE);
+        };
+        if !x.present {
+            return Ok(WorkspaceRequirement::NONE);
+        }
+        if self.op.cudnn_op().is_none()
+            || x.dtype != DataType::Float32
+            || !self.runtime.cudnn().is_available()
+        {
+            return Ok(WorkspaceRequirement::NONE);
+        }
+        let axes_raw = if inputs.len() == 2 {
+            self.warmed_axes
+                .lock()
+                .map_err(|_| {
+                    EpError::KernelFailed(
+                        "cuda_ep ReduceSum: warmed-axes cache lock was poisoned".into(),
+                    )
+                })?
+                .clone()
+        } else {
+            self.axes_attr.clone()
+        };
+        let reduce = resolve_reduce_mask(
+            self.op.name(),
+            &axes_raw,
+            x.shape.len(),
+            self.noop_with_empty_axes,
+        )?;
+        if x.shape.is_empty() || !reduce.iter().any(|&axis| axis) {
+            return Ok(WorkspaceRequirement::NONE);
+        }
+        self.cudnn_workspace_requirement_for_shape(x.dtype, x.shape, &reduce, capturing)
+    }
+
+    fn run(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
         let op = self.op.name();
         if !(1..=2).contains(&inputs.len()) || outputs.len() != 1 {
             return Err(EpError::KernelFailed(format!(
@@ -958,58 +1123,18 @@ impl ReduceKernel {
         // Resolve axes: input 1 (opset 13/18+) beats the attribute; both absent
         // means reduce-all (unless noop_with_empty_axes selects identity).
         let capturing = self.runtime.is_capturing()?;
-        let axes_raw: Option<Vec<i64>> = if inputs.len() == 2 && capturing {
-            if inputs[1].dtype != DataType::Int64 {
-                return Err(EpError::KernelFailed(
-                    "cuda_ep ReduceSum: captured axes input must be Int64".into(),
-                ));
-            }
-            // A device read of the axes input is illegal during capture, so
-            // reuse the axes warmed on the pre-capture eager call. The NVRTC
-            // reduce path (Int64 DATA and every float/bf16 block reduce) records
-            // the resolved axes in its metadata cache; the float cuDNN path warms
-            // `warmed_axes` on every eager 2-input call. Prefer the cached
-            // metadata axes when present, else the warmed copy.
-            let cached_axes = self
-                .reduce_metadata
-                .lock()
-                .map_err(|_| {
-                    EpError::KernelFailed(
-                        "cuda_ep ReduceSum: metadata cache lock was poisoned".into(),
-                    )
-                })?
-                .key
-                .as_ref()
-                .map(|key| key.axes.clone());
-            let axes = match cached_axes {
-                Some(axes) => axes,
-                None => self
-                    .warmed_axes
-                    .lock()
-                    .map_err(|_| {
-                        EpError::KernelFailed(
-                            "cuda_ep ReduceSum: warmed-axes cache lock was poisoned".into(),
-                        )
-                    })?
-                    .clone()
-                    .ok_or_else(|| {
-                        EpError::KernelFailed(
-                            "cuda_ep ReduceSum: axes were not warmed before CUDA graph capture"
-                                .into(),
-                        )
-                    })?,
-            };
-            Some(axes)
-        } else if inputs.len() == 2 {
-            let axes = self.read_axes_input(op, &inputs[1])?;
-            *self.warmed_axes.lock().map_err(|_| {
+        let axes_raw = match self
+            .prepared_axes
+            .lock()
+            .map_err(|_| {
                 EpError::KernelFailed(
-                    "cuda_ep ReduceSum: warmed-axes cache lock was poisoned".into(),
+                    "cuda_ep ReduceSum: prepared-axes cache lock was poisoned".into(),
                 )
-            })? = Some(axes.clone());
-            Some(axes)
-        } else {
-            self.axes_attr.clone()
+            })?
+            .take()
+        {
+            Some(axes) => Some(axes),
+            None => self.resolve_axes_for_dispatch(op, inputs, capturing)?,
         };
         let reduce = resolve_reduce_mask(op, &axes_raw, rank, self.noop_with_empty_axes)?;
         let expected_shape = reduced_output_shape(x.shape, &reduce, self.keepdims);
@@ -1036,26 +1161,58 @@ impl ReduceKernel {
             return Ok(());
         }
 
-        // cuDNN reduces f32 with a native f32 comp type — byte-identical to the
-        // typed NVRTC block reduction but on cuDNN's tuned kernels — so f32 sum/
-        // mean stays here. f16 does **not**: `cudnnReduceTensor` rejects a half
+        // f32 sum/mean routing: cuDNN vs the typed NVRTC block reduction.
+        //
+        // The NVRTC block reduction assigns **one block per output element** and
+        // does a cooperative f32 tree-reduce over that element's group. It beats
+        // cuDNN's generic `cudnnReduceTensor` whenever the work is
+        // well-parallelised — either there are enough output elements to fill
+        // the SMs, or the per-output reduction group is small enough that one
+        // block sweep finishes cheaply. cuDNN only wins the pathological
+        // "few outputs, huge group" regime (e.g. a global reduce-all over a
+        // large tensor), where a single block would serialise the whole
+        // reduction; there we keep cuDNN's multi-block reduce.
+        //
+        // On the qwen3.5-0.8b-hybrid decode the gated-delta q/k L2-norm SumSq is
+        // an f32 `ReduceSum` over `d_k` (16 outputs × 128 elements, 36×/step) and
+        // is the single **largest** decode op (~11-13% of forward op time,
+        // Deckard `.squad/decisions/inbox/deckard-fair-hybrid-gap.md`). cuDNN's
+        // generic reduce carries per-launch overhead that dominates at that tiny
+        // decode shape; the block reduction runs it as one capture-safe kernel.
+        // Routing f32 here is the exact fp32 analogue of the f16/bf16 routing
+        // that already falls through below (#1486), and the choice is a general
+        // parallelism property (SM count + group size), never a per-model shape.
+        //
+        // f16/bf16 never enter this branch: `cudnnReduceTensor` rejects a half
         // `reduceTensorCompType` and forces `CUDNN_DATA_FLOAT`, which cuDNN
         // implements as an fp16→fp32 `op_tensor` cast, an fp32 ReduceSum, and an
         // fp32→fp16 cast — a three-kernel round-trip through a full-size fp32
-        // temporary. A captured-graph node trace of the qwen3.5-0.8b-hybrid
-        // decode (Deckard, `.squad/decisions/inbox/deckard-fair-hybrid-gap.md`)
-        // measured that fragmentation at ~20.7% of decode GPU-kernel time on the
-        // SSM/linear-attention path (cudnn ReduceSum 8.1% + fp16↔fp32 op_tensor
-        // casts 2.7%, firing 18× per step). The typed NVRTC block reduction
-        // below already does fp16 IO with fp32 register accumulation — the exact
-        // ONNX accumulate-in-f32-then-cast rule — in a **single** capture-safe
-        // kernel, with no fp32 temporary and half the memory traffic, so f16
-        // sum/mean is routed there instead. This is general across all shapes/
-        // axes/dims (the same path already serves bf16 and every extended f16
-        // reduction), not a per-model special case. bf16 cannot be reduced by
-        // cuDNN at all (`CUDNN_STATUS_NOT_SUPPORTED`, cuDNN 9.10/9.20) and also
-        // falls through below.
+        // temporary — while bf16 cannot be reduced by cuDNN at all
+        // (`CUDNN_STATUS_NOT_SUPPORTED`, cuDNN 9.10/9.20). Both take the single
+        // fused fp16/bf16-IO f32-accumulation block reduction below instead.
+        //
+        // `out_count_hint`/`reduce_count_hint` mirror `build_plan`'s
+        // `base.len()`/`delta.len()` (product of kept / reduced dims); the
+        // identity (no-axis) case already returned above.
+        let reduce_count_hint: usize = x
+            .shape
+            .iter()
+            .zip(reduce.iter())
+            .filter(|&(_, &r)| r)
+            .map(|(&d, _)| d)
+            .product();
+        let out_count_hint: usize = x
+            .shape
+            .iter()
+            .zip(reduce.iter())
+            .filter(|&(_, &r)| !r)
+            .map(|(&d, _)| d)
+            .product();
+        let sm_count = self.runtime.capabilities().multiprocessor_count() as usize;
+        let block_reduction_parallel =
+            out_count_hint >= sm_count || reduce_count_hint <= REDUCE_BLOCK as usize;
         if x.dtype == DataType::Float32
+            && !block_reduction_parallel
             && let Some(cudnn_op) = cudnn_op
             && self.runtime.cudnn().is_available()
         {
@@ -1068,7 +1225,7 @@ impl ReduceKernel {
                 )
             })?;
             self.runtime.cudnn().with_handle(|handle| {
-                handle.reduce_cached(
+                handle.reduce_with_workspace(
                     &mut cache,
                     &input_spec,
                     &output_spec,
@@ -1079,6 +1236,7 @@ impl ReduceKernel {
                         input_numel: x.numel(),
                         output_numel: outputs[0].numel(),
                     },
+                    workspace,
                     capturing,
                 )
             })?;
@@ -1288,7 +1446,61 @@ fn as_i64_bytes(v: &[i64]) -> Vec<u8> {
 
 impl Kernel for ReduceKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
-        self.run(inputs, outputs)
+        self.run(inputs, outputs, None)
+    }
+
+    fn workspace_requirement(&self, inputs: &[TensorMetadata<'_>]) -> Result<WorkspaceRequirement> {
+        self.workspace_requirement_from_metadata(inputs, self.runtime.is_capturing()?)
+    }
+
+    fn workspace_requirement_for_execution(
+        &self,
+        inputs: &[TensorView],
+        metadata: &[TensorMetadata<'_>],
+    ) -> Result<WorkspaceRequirement> {
+        if self.op.cudnn_op().is_none()
+            || inputs.first().map(|input| input.dtype) != Some(DataType::Float32)
+            || !self.runtime.cudnn().is_available()
+        {
+            *self.prepared_axes.lock().map_err(|_| {
+                EpError::KernelFailed(
+                    "cuda_ep ReduceSum: prepared-axes cache lock was poisoned".into(),
+                )
+            })? = None;
+            return self
+                .workspace_requirement_from_metadata(metadata, self.runtime.is_capturing()?);
+        }
+        let capturing = self.runtime.is_capturing()?;
+        let axes_raw = self.resolve_axes_for_dispatch(self.op.name(), inputs, capturing)?;
+        *self.prepared_axes.lock().map_err(|_| {
+            EpError::KernelFailed("cuda_ep ReduceSum: prepared-axes cache lock was poisoned".into())
+        })? = axes_raw.clone();
+        let reduce = resolve_reduce_mask(
+            self.op.name(),
+            &axes_raw,
+            inputs.first().map_or(0, |input| input.shape.len()),
+            self.noop_with_empty_axes,
+        )?;
+        if inputs.first().is_some_and(|input| input.shape.is_empty())
+            || !reduce.iter().any(|&axis| axis)
+        {
+            return Ok(WorkspaceRequirement::NONE);
+        }
+        self.cudnn_workspace_requirement_for_shape(
+            inputs[0].dtype,
+            inputs[0].shape,
+            &reduce,
+            capturing,
+        )
+    }
+
+    fn execute_with_workspace(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
+        self.run(inputs, outputs, workspace)
     }
 
     fn supports_strided_input(&self, _idx: usize) -> bool {
@@ -1300,7 +1512,7 @@ impl Kernel for ReduceKernel {
             onnx_runtime_ep_api::CaptureSupport::Supported
         } else {
             onnx_runtime_ep_api::CaptureSupport::unsupported(
-                "requires a warmed fixed-shape ReduceSum path with stable device-resident axes metadata",
+                "requires a warmed fixed-shape ReduceSum path with warmed axes metadata and prepared persistent cuDNN workspace",
             )
         }
     }
@@ -1463,13 +1675,7 @@ mod claim_probes {
     use crate::runtime::CudaRuntime;
 
     fn maybe_runtime() -> Option<Arc<CudaRuntime>> {
-        let previous = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-        let rt = std::panic::catch_unwind(|| CudaRuntime::new(0).ok().map(Arc::new))
-            .ok()
-            .flatten();
-        std::panic::set_hook(previous);
-        rt
+        crate::test_support::maybe_runtime()
     }
 
     fn kernel(runtime: &Arc<CudaRuntime>, op: ReduceOp) -> ReduceKernel {
@@ -1480,8 +1686,9 @@ mod claim_probes {
             noop_with_empty_axes: false,
             runtime: runtime.clone(),
             reduce_metadata: Mutex::new(ReductionMetadataCache::new(runtime.clone())),
-            cudnn_reduce: Mutex::new(CudnnReduceCache::new(runtime.stream().clone())),
+            cudnn_reduce: Mutex::new(CudnnReduceCache::new()),
             warmed_axes: Mutex::new(None),
+            prepared_axes: Mutex::new(None),
             last_call_capture_safe: AtomicBool::new(false),
         }
     }

@@ -13,7 +13,7 @@
           "device": "cpu",
           "executor_info": {
             "ort": {
-              "model_file": "model.onnx"
+              "model_file": "model.onnx.textproto"
             },
             "nxrt": "nxrt_info.json"
           },
@@ -28,7 +28,7 @@
           "executor_info": {
             "nxrt": {
               "schema_version": "1.0",
-              "model_file": "model.onnx",
+              "model_file": "model.onnx.textproto",
               "genai_config": "genai_config.json"
             }
           },
@@ -44,7 +44,7 @@
           "executor_info": {
             "nxrt": {
               "schema_version": "1.3",
-              "model_file": "model.onnx"
+              "model_file": "model.onnx.textproto"
             }
           },
           "additional_metadata": {

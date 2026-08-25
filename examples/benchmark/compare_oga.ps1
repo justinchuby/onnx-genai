@@ -23,7 +23,7 @@
 
 .NOTES
     Requires:
-      * profile_decode built:  cargo build --release -p onnx-genai-bench --features cuda-ort --bin profile_decode
+      * profile_decode built:  cargo build --release -p onnx-genai-bench --features ort-cuda --bin profile_decode
       * oga installed:         pip install onnxruntime-genai-cuda
       * $env:ORT_ROOT and the CUDA env set (see repo docs).
 #>

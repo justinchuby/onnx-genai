@@ -27,7 +27,7 @@ use std::ptr;
 use std::sync::{Arc, Mutex};
 
 use onnx_genai_ort_sys as ort;
-use onnx_runtime_ep_api::provider::ExecutionProvider;
+use onnx_runtime_ep_api::provider::{DeviceBuffer, ExecutionProvider};
 use onnx_runtime_ir::DeviceType;
 
 use crate::status::fail_status;
@@ -165,10 +165,13 @@ pub struct DeviceAllocator {
     pub(crate) ep_ref: EpRef,
     /// Memory info pointer. Borrowed from ORT; NOT freed by this allocator.
     pub memory_info: *const ort::OrtMemoryInfo,
-    /// Tracks allocation sizes so `Free` can pass the true size to the EP's
-    /// `deallocate`. Keyed by pointer address. (Fixes defect #4: Free was
-    /// passing size=0, violating the allocator contract.)
-    pub alloc_sizes: Mutex<HashMap<usize, usize>>,
+    /// Retains each exact EP-issued buffer until ORT calls `Free`.
+    ///
+    /// Keeping the handle, rather than reconstructing one from `(pointer, size)`,
+    /// preserves binding identity and allocation generation for providers whose
+    /// release path is generation-checked. The pointer is only the lookup key;
+    /// it is never treated as release authority.
+    pub allocations: Mutex<HashMap<usize, DeviceBuffer>>,
 }
 
 // SAFETY: The EP behind the raw pointer is Send+Sync per ExecutionProvider trait bound.
@@ -202,7 +205,7 @@ impl DeviceAllocator {
             vtable: Self::vtable(),
             ep_ref: EpRef::Shared(shared),
             memory_info,
-            alloc_sizes: Mutex::new(HashMap::new()),
+            allocations: Mutex::new(HashMap::new()),
         })
     }
 
@@ -220,7 +223,7 @@ impl DeviceAllocator {
             vtable: Self::vtable(),
             ep_ref: EpRef::Owned(ep),
             memory_info,
-            alloc_sizes: Mutex::new(HashMap::new()),
+            allocations: Mutex::new(HashMap::new()),
         })
     }
 }
@@ -280,13 +283,11 @@ unsafe extern "C" fn device_alloc(
                 // leak. The guarded data is a plain `HashMap` whose only
                 // mutations here are `insert`/`remove`, so it cannot be left
                 // logically inconsistent by a panic elsewhere.
-                let mut sizes = alloc
-                    .alloc_sizes
+                let mut allocations = alloc
+                    .allocations
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                // Record what we actually asked the EP for, so `Free`
-                // returns the identical size.
-                sizes.insert(p as usize, request);
+                allocations.insert(p as usize, buf);
                 p
             }
             _ => ptr::null_mut(),
@@ -301,30 +302,22 @@ unsafe extern "C" fn device_free(this: *mut ort::OrtAllocator, p: *mut std::os::
             return;
         }
         let alloc = unsafe { &*(this.cast::<DeviceAllocator>()) };
-        // Look up the true allocation size from our tracking table.
+        // Recover the exact EP-issued owner from the tracking table.
         // S1 fix: if the pointer is unknown, skip the free rather than
-        // passing a fabricated size=0 to deallocate.
+        // fabricating release authority from a raw address.
         // Poison recovery (see `device_alloc`): a poisoned lock must not turn
         // every subsequent free into a no-op.
-        let size = alloc
-            .alloc_sizes
+        let buffer = alloc
+            .allocations
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&(p as usize));
-        let size = match size {
-            Some(s) => s,
+        let buffer = match buffer {
+            Some(buffer) => buffer,
             None => return, // unknown pointer — no-op (S1)
         };
         let _ = alloc.ep_ref.with_ep(|ep| {
-            let buf = unsafe {
-                onnx_runtime_ep_api::provider::DeviceBuffer::from_raw_parts(
-                    p,
-                    ep.device_id(),
-                    size,
-                    DEVICE_ALLOC_ALIGNMENT,
-                )
-            };
-            let _ = ep.deallocate(buf);
+            let _ = ep.deallocate(buffer);
         });
     }));
 }
@@ -727,7 +720,41 @@ mod tests {
     /// A mock GPU execution provider for testing device surfaces without hardware.
     struct MockGpuEp;
 
+    fn mock_gpu_binding() -> &'static onnx_runtime_memory_governor::MemoryBinding {
+        static BINDING: std::sync::OnceLock<onnx_runtime_memory_governor::MemoryBinding> =
+            std::sync::OnceLock::new();
+        BINDING.get_or_init(|| {
+            use onnx_runtime_memory_governor::{
+                BindingRegistry, BindingResource, DeviceAllocator as MemoryAllocator, DeviceKey,
+                HostAllocator,
+            };
+
+            let registry = BindingRegistry::new().expect("mock binding registry");
+            let context = registry
+                .register_provider_context(
+                    DeviceKey::HOST,
+                    Arc::new(()) as Arc<dyn BindingResource>,
+                )
+                .expect("mock provider context");
+            let authority = registry
+                .register_authority(DeviceKey::HOST, Arc::new(()) as Arc<dyn BindingResource>)
+                .expect("mock authority");
+            registry
+                .register_allocator(
+                    context,
+                    authority,
+                    Arc::new(HostAllocator) as Arc<dyn MemoryAllocator>,
+                )
+                .expect("mock allocator");
+            registry.bind(DeviceKey::HOST).expect("mock binding")
+        })
+    }
+
     impl ExecutionProvider for MockGpuEp {
+        fn consume_route_residency_at_boundary(&self) -> EpResult<()> {
+            Ok(())
+        }
+
         fn name(&self) -> &str {
             "mock_gpu_ep"
         }
@@ -776,37 +803,38 @@ mod tests {
         fn allocate(
             &self,
             size: usize,
-            _alignment: usize,
+            alignment: usize,
         ) -> EpResult<onnx_runtime_ep_api::provider::DeviceBuffer> {
-            let layout = std::alloc::Layout::from_size_align(size.max(1), 16).unwrap();
-            let ptr = unsafe { std::alloc::alloc(layout) };
-            if ptr.is_null() {
-                return Err(EpError::OutOfMemory {
-                    requested: size,
-                    available: 0,
-                });
-            }
-            Ok(unsafe {
-                onnx_runtime_ep_api::provider::DeviceBuffer::from_raw_parts(
-                    ptr.cast(),
+            let owner = mock_gpu_binding()
+                .allocate_owning(size, alignment)
+                .map_err(|error| EpError::KernelFailed(error.to_string()))?;
+            Ok(
+                onnx_runtime_ep_api::provider::DeviceBuffer::from_owning_allocation(
+                    owner,
                     DeviceId::cuda(0),
-                    size,
-                    16,
-                )
-            })
+                ),
+            )
         }
 
         fn deallocate(&self, buffer: onnx_runtime_ep_api::provider::DeviceBuffer) -> EpResult<()> {
-            let ptr = buffer.as_ptr();
-            let size = buffer.len();
-            // DeviceBuffer has no Drop impl: binding to `_` discards the handle
-            // metadata without invoking any destructor (there is none).
-            let _ = buffer;
-            if !ptr.is_null() && size > 0 {
-                let layout = std::alloc::Layout::from_size_align(size, 16).unwrap();
-                unsafe { std::alloc::dealloc(ptr as *mut u8, layout) };
+            let owner = buffer.into_bound_owner().map_err(|_| {
+                EpError::KernelFailed("mock GPU buffer lost its bound owner".into())
+            })?;
+            let outcome = match owner {
+                onnx_runtime_ep_api::BoundBufferOwnership::Binding(owner) => owner
+                    .release_now()
+                    .map_err(|error| EpError::KernelFailed(error.to_string()))?,
+                onnx_runtime_ep_api::BoundBufferOwnership::Managed(owner) => owner
+                    .release_now()
+                    .map_err(|error| EpError::KernelFailed(error.to_string()))?,
+            };
+            if outcome.is_complete() {
+                Ok(())
+            } else {
+                Err(EpError::KernelFailed(format!(
+                    "mock GPU release did not complete: {outcome:?}"
+                )))
             }
-            Ok(())
         }
 
         fn copy(
@@ -836,6 +864,10 @@ mod tests {
     struct MockCpuEp;
 
     impl ExecutionProvider for MockCpuEp {
+        fn consume_route_residency_at_boundary(&self) -> EpResult<()> {
+            Ok(())
+        }
+
         fn name(&self) -> &str {
             "mock_cpu_ep"
         }
@@ -1098,6 +1130,15 @@ mod tests {
         // Allocate
         let ptr = unsafe { device_alloc(alloc_ptr.cast(), 1024) };
         assert!(!ptr.is_null(), "allocation must succeed");
+        assert!(
+            unsafe { &*alloc_ptr }
+                .allocations
+                .lock()
+                .unwrap()
+                .get(&(ptr as usize))
+                .is_some_and(DeviceBuffer::is_bound),
+            "the adapter must retain the exact binding-issued owner"
+        );
 
         // Free
         unsafe { device_free(alloc_ptr.cast(), ptr) };
@@ -1192,6 +1233,10 @@ mod tests {
         }
 
         impl ExecutionProvider for CountingEp {
+            fn consume_route_residency_at_boundary(&self) -> EpResult<()> {
+                Ok(())
+            }
+
             fn name(&self) -> &str {
                 "counting_ep"
             }
@@ -1384,6 +1429,10 @@ mod tests {
     struct ZeroHostileEp;
 
     impl ExecutionProvider for ZeroHostileEp {
+        fn consume_route_residency_at_boundary(&self) -> EpResult<()> {
+            Ok(())
+        }
+
         fn name(&self) -> &str {
             "zero_hostile_ep"
         }
@@ -1543,7 +1592,12 @@ mod tests {
         let recorded = {
             // SAFETY: `alloc_ptr` is a live `DeviceAllocator`.
             let a = unsafe { &*alloc_ptr };
-            *a.alloc_sizes.lock().unwrap().get(&(p as usize)).unwrap()
+            a.allocations
+                .lock()
+                .unwrap()
+                .get(&(p as usize))
+                .unwrap()
+                .len()
         };
         assert_eq!(recorded, 256);
         // SAFETY: `p` came from `device_alloc` on this allocator.
@@ -1552,10 +1606,10 @@ mod tests {
         unsafe { drop(Box::from_raw(alloc_ptr)) };
     }
 
-    /// A poisoned `alloc_sizes` lock must not silently turn every later `Free`
+    /// A poisoned `allocations` lock must not silently turn every later `Free`
     /// into a no-op: that is a device-memory leak, not a safe degradation.
     #[test]
-    fn poisoned_alloc_sizes_lock_still_frees() {
+    fn poisoned_allocations_lock_still_frees() {
         let alloc_ptr = zero_hostile_allocator();
 
         // Poison the tracking lock exactly the way a panic-in-callback would.
@@ -1563,11 +1617,11 @@ mod tests {
             // SAFETY: `alloc_ptr` is a live `DeviceAllocator`.
             let a = unsafe { &*alloc_ptr };
             let poisoner = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let _guard = a.alloc_sizes.lock().unwrap();
-                panic!("poison the alloc_sizes mutex");
+                let _guard = a.allocations.lock().unwrap();
+                panic!("poison the allocations mutex");
             }));
             assert!(poisoner.is_err(), "the poisoning panic must be observed");
-            assert!(a.alloc_sizes.is_poisoned(), "lock must now be poisoned");
+            assert!(a.allocations.is_poisoned(), "lock must now be poisoned");
         }
 
         // SAFETY: `alloc_ptr` is a live `DeviceAllocator`.
@@ -1579,11 +1633,11 @@ mod tests {
         let recorded = {
             // SAFETY: `alloc_ptr` is a live `DeviceAllocator`.
             let a = unsafe { &*alloc_ptr };
-            a.alloc_sizes
+            a.allocations
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .get(&(p as usize))
-                .copied()
+                .map(DeviceBuffer::len)
         };
         assert_eq!(
             recorded,
@@ -1598,7 +1652,7 @@ mod tests {
         let still_tracked = {
             // SAFETY: `alloc_ptr` is a live `DeviceAllocator`.
             let a = unsafe { &*alloc_ptr };
-            a.alloc_sizes
+            a.allocations
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .contains_key(&(p as usize))
@@ -1684,6 +1738,10 @@ mod tests {
             }
         }
         impl ExecutionProvider for CountingEp {
+            fn consume_route_residency_at_boundary(&self) -> EpResult<()> {
+                Ok(())
+            }
+
             fn name(&self) -> &str {
                 "counting_ep_notif"
             }

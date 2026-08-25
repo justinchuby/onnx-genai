@@ -275,32 +275,6 @@ fn native_workspace_query_rows(
     prompt_rows.max(verify_rows)
 }
 
-fn metadata_eos_token_ids(metadata: &InferenceMetadata) -> Vec<TokenId> {
-    metadata
-        .tokens
-        .as_ref()
-        .and_then(|tokens| tokens.eos_token_id.as_ref())
-        .into_iter()
-        .flatten()
-        .filter_map(|&id| TokenId::try_from(id).ok())
-        .collect()
-}
-
-#[cfg(test)]
-mod eos_tests {
-    use super::*;
-
-    #[test]
-    fn metadata_eos_token_ids_preserves_multiple_valid_ids() {
-        let metadata: InferenceMetadata = serde_json::from_value(serde_json::json!({
-            "tokens": { "eos_token_id": [151645, -1, 4294967296_u64, 151643] }
-        }))
-        .unwrap();
-
-        assert_eq!(metadata_eos_token_ids(&metadata), vec![151645, 151643]);
-    }
-}
-
 impl Engine {
     fn admit_generate_request_with_scheduler(
         &mut self,
@@ -344,31 +318,85 @@ impl Engine {
         Ok(scheduled)
     }
 
-    fn default_eos_token_ids(&self) -> Vec<TokenId> {
-        let mut ids = metadata_eos_token_ids(&self.metadata);
-        for id in self.tokenizer.eos_token_ids() {
+    /// Every token id this model ends generation on.
+    ///
+    /// A model may end a turn with one token and a message with another; both
+    /// stop it. The package's own declaration comes first because it is the
+    /// package speaking about itself — a package that ships no tokenizer
+    /// side-files still states its EOS — and the tokenizer's ids extend it
+    /// rather than replacing it, so neither source can silently drop the
+    /// other's.
+    pub(crate) fn default_eos_token_ids(&self) -> anyhow::Result<Vec<TokenId>> {
+        let mut ids = self.declared_eos_token_ids()?;
+        for id in self
+            .tokenizer
+            .as_ref()
+            .map(Tokenizer::eos_token_ids)
+            .unwrap_or_default()
+        {
             if !ids.contains(&id) {
                 ids.push(id);
             }
         }
-        ids
+        Ok(ids)
     }
 
-    fn apply_eos_defaults(&self, options: &mut GenerateOptions) {
-        if !options.stop_on_eos || options.eos_token_id.is_some() {
-            return;
-        }
-        let ids = self.default_eos_token_ids();
-        if let Some(&id) = ids.first() {
-            options.eos_token_id = Some(id);
-        }
-        for id in ids {
-            push_unique_stop_sequence(&mut options.stop_sequences, StopSequence::Tokens(vec![id]));
-        }
+    /// EOS ids the package's workflow declares, via the `eos_token_ids` role.
+    ///
+    /// Read from the workflow's own literal default, so a package states its
+    /// stop condition in the one place it states everything else. Without this
+    /// the declaration is inert: it would be materialized into the graph's
+    /// inputs and never reach the runtime's stop policy, which is what "declared
+    /// but dead" meant.
+    fn declared_eos_token_ids(&self) -> anyhow::Result<Vec<TokenId>> {
+        let workflow = self.workflow.workflow_spec();
+        workflow
+            .inputs
+            .values()
+            .filter(|input| {
+                matches!(
+                    &input.role,
+                    onnx_genai_metadata::SemanticInputRole::Runtime { role, .. }
+                        if *role == onnx_genai_metadata::RuntimeInputRole::EosTokenIds
+                )
+            })
+            .filter_map(|input| input.default.as_ref())
+            .map(literal_token_ids)
+            .collect::<anyhow::Result<Vec<_>>>()
+            .map(|groups| groups.concat())
+    }
+
+    /// Apply the model's stop condition to a request.
+    ///
+    /// Every declared EOS id becomes a stop sequence, not just the first. A
+    /// model with two end tokens is stopped by either, which a single
+    /// `eos_token_id` field cannot express — and silently dropping the rest
+    /// means generation runs past its end and emits control tokens as text.
+    ///
+    /// A caller's explicit `eos_token_id` selects which id is *reported* as the
+    /// EOS, and does not suppress the others: the model's end tokens are facts
+    /// about the model, and a request narrowing them would make the runtime emit
+    /// tokens the model meant as terminal.
+    fn apply_eos_defaults(&self, options: &mut GenerateOptions) -> anyhow::Result<()> {
+        apply_eos_policy(options, &self.default_eos_token_ids()?);
+        Ok(())
     }
 
     /// Effective context limit for a request, combining model metadata,
     /// per-request override, and decode-path capacity.
+    /// The package's tokenizer, or an error naming why text decode is
+    /// unavailable.
+    ///
+    /// A workflow package may ship no tokenizer at all (an image-generation
+    /// pipeline, for instance). Making that an explicit error here keeps the
+    /// absence a diagnosable load-time fact rather than a panic deep in the
+    /// decode loop.
+    pub(crate) fn require_tokenizer(&self) -> anyhow::Result<&Tokenizer> {
+        self.tokenizer
+            .as_ref()
+            .context("this package declares no tokenizer, so it cannot tokenize or decode text")
+    }
+
     pub fn effective_max_context(&self, options: &GenerateOptions) -> Option<usize> {
         self.max_context_for_request(options)
     }
@@ -381,19 +409,19 @@ impl Engine {
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
         self.last_speculative_stats = SpeculativeStats::default();
-        if request.options.speculative_mode.is_none() && self.native_shared_kv_proposer.is_some() {
+        if request.options.speculative_mode.is_none() && self.mtp.is_some() {
             request.options.speculative_mode = Some(self.speculative_mode.clone());
         }
         reject_native_request_speculation(&request.options)?;
         request.options.validate()?;
         let mut options = request.options;
-        self.apply_eos_defaults(&mut options);
+        self.apply_eos_defaults(&mut options)?;
         let prompt_tokens = self.tokenize_prompt(&request.prompt)?;
         if prompt_tokens.is_empty() {
             anyhow::bail!("prompt must contain at least one token");
         }
         options.max_context = self.max_context_for_request(&options);
-        let chain = build_processor_chain(&options, Some(&self.tokenizer))?;
+        let chain = build_processor_chain(&options, Some(self.require_tokenizer()?), false)?;
         let speculation_plan = native_speculation_plan(&options, &chain);
         let scheduler_session_id = self.next_native_session_id();
         let scheduled = self.admit_generate_request_with_scheduler(
@@ -426,7 +454,23 @@ impl Engine {
         // Speculation ON (implemented greedy prompt-lookup) → the native
         // speculative driver. Every other request stays on the untouched plain
         // M=1 fast path below, preserving the 762 tok/s non-regression guarantee.
+        // Borrowed before the mutable native-session borrows below.
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .context("this package declares no tokenizer, so it cannot decode text")?;
+        let runtime = &*self.workflow;
+        // The authored block body this request iterates, read from the
+        // package's own declared loop. Resolved before the mutable native
+        // session borrow below, which the driver holds for the whole drive.
+        let block_runtime = match speculation_plan.as_ref() {
+            Some(_) => Some(self.workflow.iteration_runtime(
+                onnx_genai_metadata::decoder_workflow::IterationPolicy::SpeculativeBlock,
+            )?),
+            None => None,
+        };
         let result = if let Some(plan) = speculation_plan {
+            let block_runtime = block_runtime.expect("a speculation plan resolves a block body");
             let mut stats = SpeculativeStats::default();
             let result = (|| {
                 let native_session = self
@@ -442,16 +486,39 @@ impl Engine {
                             plan.width,
                         )?
                     }
-                    NativeSpeculationKind::SharedKv => {
-                        let proposer = self.native_shared_kv_proposer.as_mut().context(
-                            "native shared-KV speculation requested without a loaded proposer session",
+                    NativeSpeculationKind::Mtp => {
+                        let mtp = self.mtp.as_ref().context(
+                            "native MTP speculation requested without a loaded MTP head",
                         )?;
-                        crate::native_speculative::NativeSpeculativeDriver::new_shared_kv(
+                        // Reuse the generic MtpProposer (guaranteed target token +
+                        // K speculative drafts from the ORT MTP head) through the
+                        // native driver; the head runs on the ORT CUDA EP while the
+                        // hybrid GDN target runs natively. The recurrent-state
+                        // commit-by-accepted primitive (#1633) advances the target's
+                        // GDN/conv state on accept.
+                        let proposer = MtpProposer::new_owned(
+                            std::sync::Arc::clone(&mtp.session),
+                            onnx_genai_ort::MtpDecodeOptions {
+                                kv_mode: mtp.kv_mode,
+                                batch_size: 1,
+                                hc_mult: mtp.runtime_config.hc_mult,
+                                hidden_state_rank4: mtp.runtime_config.target_hidden_layout
+                                    == MtpHiddenLayout::Bshc,
+                                hidden_output: mtp.runtime_config.mtp_hidden_output.clone(),
+                                state_output: mtp.runtime_config.mtp_state_output.clone(),
+                            },
+                            mtp.embedder.clone(),
+                            mtp.lm_head.clone(),
+                            mtp.runtime_config.cache_scope,
+                        )?;
+                        let hidden_size = mtp
+                            .runtime_config
+                            .hc_mult
+                            .saturating_mul(mtp.config.hidden_size);
+                        crate::native_speculative::NativeSpeculativeDriver::new_mtp(
                             native_session,
-                            &mut proposer.session,
-                            &proposer.embedder,
-                            &proposer.groups,
-                            proposer.hidden_size,
+                            proposer,
+                            hidden_size,
                             plan.width,
                         )?
                     }
@@ -460,7 +527,8 @@ impl Engine {
                     &prompt_tokens,
                     &options,
                     &chain,
-                    &self.tokenizer,
+                    tokenizer,
+                    &block_runtime,
                     &mut stats,
                     callback,
                 )
@@ -476,7 +544,8 @@ impl Engine {
                 &prompt_tokens,
                 &options,
                 &chain,
-                &self.tokenizer,
+                tokenizer,
+                runtime,
                 callback,
             )
         };
@@ -500,8 +569,7 @@ impl Engine {
 
     #[cfg(feature = "native-backend")]
     fn next_native_session_id(&mut self) -> SessionId {
-        self.native_session_counter = self.native_session_counter.saturating_add(1);
-        SessionId::from(self.native_session_counter)
+        self.native_session_ids.mint()
     }
 
     /// Stamp a session as most-recently-used and return the new stamp.
@@ -653,6 +721,195 @@ impl Engine {
         self.native_session.as_mut()
     }
 
+    /// Teacher-forced native generation over an exact token prefix.
+    ///
+    /// Divergence and decode-lock audits feed a fixed prefix and read the top
+    /// log-probabilities of the single next token, which the ordinary text
+    /// entry points cannot express: they tokenize a prompt, and the whole point
+    /// is to pin the *exact* ids an oracle agreed on. Exposed here rather than
+    /// on the native session so a caller never needs the interpreter type.
+    #[cfg(feature = "native-backend")]
+    pub fn generate_native_from_token_ids(
+        &mut self,
+        prompt_tokens: &[TokenId],
+        options: &GenerateOptions,
+        chain: &crate::logits::ProcessorChain,
+        tokenizer: &Tokenizer,
+    ) -> anyhow::Result<GenerateResult> {
+        let runtime = &*self.workflow;
+        let session = self
+            .native_session
+            .as_mut()
+            .context("native decoder session is unavailable")?;
+        session.generate(prompt_tokens, options, chain, tokenizer, runtime)
+    }
+
+    /// Whether this runtime holds the fused decode session that implements the
+    /// declared `onnx-genai.autoregressive-decode` step.
+    ///
+    /// A question about which executor exists, not about what kind of package
+    /// was loaded: a package whose decode step this runtime has no fused
+    /// session for still runs the same declared loop, with the interpreter
+    /// invoking the component from its own artifact.
+    pub(crate) fn holds_decode_core(&self) -> bool {
+        #[cfg(feature = "native-backend")]
+        if self.native_session.is_some() {
+            return true;
+        }
+        self.session.is_some()
+    }
+
+    /// Continue a conversation the interpreter keeps in session-scoped state.
+    ///
+    /// The session id is bound into the request rather than looked up in a
+    /// decode core: a workflow's `scope: session` cells are keyed by it, and
+    /// that is where this package's conversation lives.
+    pub(crate) fn generate_in_workflow_session(
+        &mut self,
+        session_id: SessionId,
+        request: crate::pipeline::PipelineGenerateRequest,
+        on_admitted: Option<&mut dyn FnMut()>,
+        callback: Option<&mut GenerateTokenCallback<'_>>,
+    ) -> anyhow::Result<GenerateResult> {
+        anyhow::ensure!(
+            self.workflow_sessions.contains_key(&session_id),
+            "session {session_id} not found"
+        );
+        let result = self.generate_with_pipeline_callbacks(
+            request.with_session_id(session_id.to_string()),
+            on_admitted,
+            callback,
+        )?;
+        // A package that declares its conversation knows how long it is; asking
+        // it is what keeps `session_token_count` the same number a decode-core
+        // session reports — prompt and generated tokens both — rather than the
+        // generated ones alone.
+        //
+        // The cost of that conversation is stated rather than hidden: a package
+        // whose lease is a prompt prefix re-prefills every earlier turn on each
+        // new one, because its invocation-scoped cache is released when the
+        // invocation ends. Over a conversation of N tokens that is O(N²) prefill
+        // work, against O(N) for a decode core whose paged KV survives the turn.
+        // It is the cost of continuing a conversation a package can express
+        // rather than one it cannot, and a package that wants the linear cost
+        // declares its cache session-scoped and is executed by a core that keeps
+        // it.
+        let declared = self
+            .workflow
+            .session_conversation_len(&session_id.to_string());
+        if let Some(count) = self.workflow_sessions.get_mut(&session_id) {
+            match declared {
+                Some(length) => *count = length,
+                None => *count += result.token_ids.len(),
+            }
+        }
+        Ok(result)
+    }
+
+    /// Generate by interpreting every declared component from its artifact.
+    ///
+    /// The same drive the decode-core path uses, with no core: the interpreter
+    /// walks the same declared loop, honours the same bound and predicate, and
+    /// publishes the same `tokens` output. What it does not have is a fused
+    /// session to route the decode step to, so it invokes the component the
+    /// package names.
+    fn generate_interpreted(
+        &mut self,
+        request: GenerateRequest,
+        on_admitted: Option<&mut dyn FnMut()>,
+        callback: Option<&mut GenerateTokenCallback<'_>>,
+    ) -> anyhow::Result<GenerateResult> {
+        self.generate_with_pipeline_callbacks(
+            crate::pipeline::PipelineGenerateRequest::new(request),
+            on_admitted,
+            callback,
+        )
+    }
+
+    /// Admit a workflow-driven request through the scheduler.
+    ///
+    /// A workflow-driven request still shares this runtime's scheduler, and —
+    /// when the process configured one — its KV byte budget: components own
+    /// their own caches, but the byte accounting a shared budget protects is
+    /// shared regardless of which executor a step names. Called from
+    /// [`crate::engine::workflow_api::Engine::generate_with_pipeline_callbacks`]'s
+    /// workflow branch — the one place every request that runs the declared
+    /// workflow passes through, whether it arrived cold
+    /// ([`Self::generate_interpreted`]), through a continuing workflow session
+    /// ([`Self::generate_in_workflow_session`]), or carrying tensors no prompt
+    /// can express — this gives the path
+    /// the same "reject at the door" guarantee
+    /// [`Self::generate_native_cold_with_callback`] already has instead of
+    /// letting the request fail deep inside node execution once a value the
+    /// loop needed never arrives.
+    pub(crate) fn admit_interpreted_generate_request(
+        &mut self,
+        session_id: SessionId,
+        prompt: &GeneratePrompt,
+        max_new_tokens: usize,
+    ) -> anyhow::Result<(Option<GenerationBudgetCap>, usize)> {
+        // What this request costs is its prompt plus whatever the runtime will
+        // put in front of it, which for a package continuing its conversation by
+        // prepending is every earlier turn. Admitting on the request alone
+        // under-reserves for exactly the turns that need the most.
+        let carried = if self.workflow_sessions.contains_key(&session_id) {
+            self.workflow
+                .session_prepended_prompt_len(&session_id.to_string())
+        } else {
+            0
+        };
+        let prompt_tokens = self.interpreted_prompt_token_count(prompt)? + carried;
+        let scheduled = self.admit_generate_request_with_scheduler(
+            session_id,
+            prompt_tokens,
+            max_new_tokens,
+            Priority::Normal,
+        )?;
+        Ok((
+            scheduled.budget_cap.map(generation_budget_cap),
+            scheduled.max_tokens,
+        ))
+    }
+
+    /// Prompt length for scheduler admission before a workflow-driven
+    /// request has bound any input.
+    ///
+    /// The interpreter tokenizes a text prompt itself once the workflow runs
+    /// (from the package's own tokenizer, since this engine owns none for a
+    /// workflow package); admission needs that count earlier, to gate the run
+    /// rather than join it, so it is derived the same way here rather than
+    /// waiting for the loop to do it.
+    fn interpreted_prompt_token_count(&self, prompt: &GeneratePrompt) -> anyhow::Result<usize> {
+        match prompt {
+            GeneratePrompt::TokenIds(tokens) => Ok(tokens.len()),
+            // Equal-length rows bind into one `[rows, columns]` tensor and run
+            // as a single batched step (see
+            // `workflow.rs::workflow_request_value`'s `PromptTokens` binding),
+            // so the KV byte budget a batch of `rows` sequences needs scales
+            // with the whole rectangle, not just its widest row.
+            GeneratePrompt::TokenRows(rows) => {
+                Ok(rows.iter().map(Vec::len).max().unwrap_or(0) * rows.len())
+            }
+            // The package's tokenizer and no other, because it is the one
+            // `run_declared_workflow_generation` will encode with: a count
+            // taken from a different vocabulary would gate the run on a length
+            // the run never produces. It is also why a package that ships none
+            // is refused here rather than admitted and failed at encode two
+            // frames later -- the two sites agree on when a text prompt is
+            // encodable, so the gate is the first thing to say so.
+            GeneratePrompt::Text(text) => {
+                let tokenizer = self.workflow.package_tokenizer().context(
+                    "this package declares a prompt_tokens input but ships no tokenizer, so a \
+                     text prompt cannot be encoded for it; supply token ids instead",
+                )?;
+                tokenizer
+                    .encode(text)
+                    .map(|ids| ids.len())
+                    .map_err(|e| anyhow::anyhow!("Failed to tokenize prompt: {e}"))
+            }
+        }
+    }
+
     /// Access the engine-owned Resource Governor handle.
     pub fn governor(&self) -> &EngineResourceGovernor {
         &self.governor
@@ -660,12 +917,12 @@ impl Engine {
 
     /// Convenience snapshot of configured and live resource state.
     pub fn resource_snapshot(&self) -> GovernorSnapshot {
-        self.governor.snapshot()
+        self.governor().snapshot()
     }
 
     /// Bytes by which the device memory ledger exceeds its live ceiling.
     pub fn device_oversubscribed_bytes(&self) -> u64 {
-        self.governor.device_oversubscribed_bytes()
+        self.governor().device_oversubscribed_bytes()
     }
 
     /// Static weight placement computed from `device_policy` at model load.
@@ -689,7 +946,7 @@ impl Engine {
         &self,
         limit: ResourceLimit,
     ) -> Result<GovernorReconfigureOutcome, EngineGovernorError> {
-        self.governor.set_vram_limit(limit)
+        self.governor().set_vram_limit(limit)
     }
 
     /// Cumulative KV page activity: allocations, frees, and evictions.
@@ -794,7 +1051,7 @@ impl Engine {
     ) -> anyhow::Result<GenerateResult> {
         let prompt = fim_config.format_prompt(prefix.as_ref(), suffix.as_ref());
         let mut request = GenerateRequest::new(prompt);
-        request.options = self.fim_options(fim_config, options);
+        request.options = self.fim_options(fim_config, options)?;
         self.generate_with_callbacks(request, admission_callback, token_callback)
     }
 
@@ -815,6 +1072,14 @@ impl Engine {
         admission_callback: Option<&mut dyn FnMut()>,
         token_callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
+        // One entry point, one interpreter, one declared loop. What varies is
+        // whether this runtime holds the fused decode session that implements
+        // the package's declared `autoregressive-decode` step. Without one, the
+        // interpreter invokes every declared component from the artifact the
+        // package names — the same loop, the same emits, the same stop.
+        if !self.holds_decode_core() {
+            return self.generate_interpreted(request, admission_callback, token_callback);
+        }
         #[cfg(feature = "native-backend")]
         if self.decode_backend == EngineDecodeBackend::Native {
             // Speculation still runs cold: the native speculative paths own
@@ -822,7 +1087,8 @@ impl Engine {
             // cold and session-reusing paths still admit through the scheduler
             // before touching the native backend.
             let native_spec_requested = request.options.speculative_mode.is_some()
-                || request.options.num_speculative_tokens.is_some();
+                || request.options.num_speculative_tokens.is_some()
+                || self.mtp.is_some();
             if request.options.cold_start || native_spec_requested {
                 let result = self.generate_native_cold_with_callback(
                     request,
@@ -956,6 +1222,24 @@ impl Engine {
         mut admission_callback: Option<&mut dyn FnMut()>,
         mut callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
+        // A package with no decode core keeps its conversation in the
+        // session-scoped cells its workflow declares. Routing here rather than
+        // in one of the wrappers above is what makes every `generate_in_session`
+        // variant reach it — a caller that picked the priority form should not
+        // get a different answer about whether sessions exist.
+        if !self.holds_decode_core() {
+            anyhow::ensure!(
+                custom_sampler.is_none(),
+                "a package whose components the interpreter invokes declares its sampler; a \
+                 caller-supplied one would replace a step the package states in its own graph"
+            );
+            return self.generate_in_workflow_session(
+                session_id,
+                crate::pipeline::PipelineGenerateRequest::new(request),
+                admission_callback,
+                callback,
+            );
+        }
         #[cfg(feature = "native-backend")]
         if self.decode_backend == EngineDecodeBackend::Native {
             if priority != Priority::Normal {
@@ -974,7 +1258,7 @@ impl Engine {
         self.last_speculative_stats = SpeculativeStats::default();
         request.options.validate()?;
         let mut options = request.options.clone();
-        self.apply_eos_defaults(&mut options);
+        self.apply_eos_defaults(&mut options)?;
         let prompt_tokens = self.tokenize_prompt(&request.prompt)?;
         if prompt_tokens.is_empty() {
             anyhow::bail!("prompt must contain at least one token");
@@ -984,7 +1268,11 @@ impl Engine {
         }
 
         let max_context = self.max_context_for_request(&options);
-        let chain = build_processor_chain(&options, Some(&self.tokenizer))?;
+        let chain = build_processor_chain(
+            &options,
+            Some(self.require_tokenizer()?),
+            custom_sampler.is_some(),
+        )?;
 
         let scheduled = self.admit_generate_request_with_scheduler(
             session_id,
@@ -1027,6 +1315,15 @@ impl Engine {
                 });
             }
 
+            // Borrow the tokenizer and the canonical workflow before the
+            // disjoint mutable borrows below: the decode backend takes
+            // `&mut self.kv_cache` / `&mut self.scheduler`, so a later `&self`
+            // accessor call would overlap.
+            let tokenizer = self
+                .tokenizer
+                .as_ref()
+                .context("this package declares no tokenizer, so it cannot decode text")?;
+            let runtime = &*self.workflow;
             let mut backend = SessionDecodeLoopBackend {
                 session: self
                     .session
@@ -1038,13 +1335,23 @@ impl Engine {
                 session_id,
                 state: &mut state,
             };
-            run_decode_loop(
+            // Every generated token comes out of the interpreter walking the
+            // package's declared loop. The backend below is the executor the
+            // interpreter routes the declared `autoregressive-decode` step to
+            // -- one forward pass, KV stays its business -- and the token
+            // policy beside it is the single sampling/stopping implementation,
+            // shared with every other package.
+            crate::pipeline::generation::generate_with_decode_core(
+                runtime,
                 &mut backend,
                 &mut loop_state,
-                &options,
-                &chain,
-                &self.tokenizer,
-                max_context,
+                &prompt_tokens,
+                crate::pipeline::generation::GenerationRequest {
+                    options: &options,
+                    chain: &chain,
+                    tokenizer,
+                    max_context,
+                },
                 callback.as_deref_mut(),
             )
         })()
@@ -1191,6 +1498,36 @@ impl Engine {
 
     /// Create a new generation session.
     pub fn create_session(&mut self) -> anyhow::Result<SessionId> {
+        // A package whose components the interpreter invokes has no paged KV
+        // sequence to open, but it does have sessions: its workflow may declare
+        // `scope: session` state, and this is the id that state is keyed by.
+        // Refusing here would have made "sessions" a property of which executor
+        // runs the decode step, which is not what a caller is asking about.
+        if !self.holds_decode_core() {
+            // What a caller opening a session asks for is that the next turn
+            // continue this one. A package that publishes a token stream is one
+            // whose turns are a conversation, so a session over it that carries
+            // nothing would silently restart every turn — a wrong answer that
+            // reads like a forgetful model. Say so instead, and name what the
+            // package has to declare. A package that publishes no tokens has no
+            // conversation to lose, and its session is an ordinary handle.
+            let workflow = self.workflow.workflow_spec();
+            let publishes_tokens = workflow
+                .outputs
+                .values()
+                .any(|output| output.role == onnx_genai_metadata::WorkflowOutputRole::Tokens);
+            if publishes_tokens && !crate::pipeline::workflow_carries_session_state(workflow) {
+                // A typed refusal, not a formatted string: what a front end has
+                // to decide is whether the caller asked for something this
+                // package cannot do, or whether the server failed. Matching on
+                // prose would make that a guess, and it was being reported as a
+                // 500 for a package that is simply stateless.
+                return Err(PackageCapabilityError::NoSessionState.into());
+            }
+            let id = self.workflow_session_ids.mint();
+            self.workflow_sessions.insert(id, 0);
+            return Ok(id);
+        }
         #[cfg(feature = "native-backend")]
         if self.decode_backend == EngineDecodeBackend::Native {
             return self.create_native_session_state();
@@ -1321,6 +1658,21 @@ impl Engine {
 
     /// Reset a persistent session, freeing its current state while keeping the id usable.
     pub fn reset_session(&mut self, session_id: SessionId) -> anyhow::Result<()> {
+        // Resetting is the same promise for every package: the id stays usable
+        // and everything the conversation accumulated is gone. For an
+        // interpreted package that is exactly its session-scoped cells, so the
+        // lease is dropped and the token count returns to zero.
+        if !self.holds_decode_core() {
+            anyhow::ensure!(
+                self.workflow_sessions.contains_key(&session_id),
+                "session {session_id} not found"
+            );
+            self.workflow.forget_session(&session_id.to_string());
+            if let Some(count) = self.workflow_sessions.get_mut(&session_id) {
+                *count = 0;
+            }
+            return Ok(());
+        }
         #[cfg(feature = "native-backend")]
         if self.decode_backend == EngineDecodeBackend::Native {
             return session_state::reset(&mut NativeSessions(self), session_id);
@@ -1335,15 +1687,11 @@ impl Engine {
             .as_deref()
             .context("ORT decoder session is unavailable")?;
         // Bind ports from explicit metadata or unambiguous tensor shapes.
-        let io = self
-            .metadata
-            .model
-            .as_ref()
-            .and_then(|model| model.io.as_ref());
-        let fixed_state_budget_bytes = self.governor.snapshot().resolved_limits.host_ram_bytes;
+        let io = self.metadata.decoder_io();
+        let fixed_state_budget_bytes = self.governor().snapshot().resolved_limits.host_ram_bytes;
         if matches!(
             &self.speculative_mode,
-            SpeculativeMode::Mtp(_) | SpeculativeMode::Eagle3(_) | SpeculativeMode::SharedKv(_)
+            SpeculativeMode::Mtp(_) | SpeculativeMode::Eagle3(_)
         ) {
             DecodeState::new_with_io_positions_and_state_budget(
                 session,
@@ -1364,6 +1712,14 @@ impl Engine {
 
     /// Close a persistent session and free its associated state.
     pub fn close_session(&mut self, session_id: SessionId) -> anyhow::Result<()> {
+        if !self.holds_decode_core() {
+            anyhow::ensure!(
+                self.workflow_sessions.remove(&session_id).is_some(),
+                "session {session_id} not found"
+            );
+            self.workflow.forget_session(&session_id.to_string());
+            return Ok(());
+        }
         #[cfg(feature = "native-backend")]
         if self.decode_backend == EngineDecodeBackend::Native {
             return session_state::close(&mut NativeSessions(self), session_id);
@@ -1372,14 +1728,119 @@ impl Engine {
         session_state::close(&mut OrtSessions(self), session_id)
     }
 
-    /// Number of logical tokens retained in a persistent session.
+    /// Logical tokens this session's conversation holds — prompts and
+    /// generations alike, oldest turn first.
+    ///
+    /// One meaning for every backend. A decode core reports the tokens its KV
+    /// sequence covers; an interpreted package reports the length of the
+    /// conversation its workflow declares, or, for a package whose session state
+    /// is not a token conversation, the tokens its turns have generated. In
+    /// every case it is "how much has this session heard", never "how much did
+    /// the last turn produce".
     pub fn session_token_count(&self, session_id: SessionId) -> anyhow::Result<usize> {
+        if !self.holds_decode_core() {
+            return self
+                .workflow_sessions
+                .get(&session_id)
+                .copied()
+                .with_context(|| format!("session {session_id} not found"));
+        }
         #[cfg(feature = "native-backend")]
         if self.decode_backend == EngineDecodeBackend::Native {
             return session_state::token_count(&NativeSessionsRef(self), session_id);
         }
         self.require_ort_backend("persistent sessions")?;
         session_state::token_count(&OrtSessionsRef(self), session_id)
+    }
+
+    /// Whether the loaded package continues a conversation by putting it in
+    /// front of the next turn's prompt.
+    ///
+    /// This answers only whether the authored workflow explicitly prepends a
+    /// token conversation. It is **false** for everything else:
+    ///
+    /// * a **decode core** keeps its conversation in KV, which the request does
+    ///   not carry and the prefill does not repeat;
+    /// * a **loop-carried** or **group-held** lease is handed back inside the
+    ///   graph, so the tokens it stands for live in a cache the package bounds
+    ///   itself rather than in front of a prompt;
+    /// * a package with no session state has no conversation at all.
+    ///
+    /// Answered from the shared classifier, never from "does this session hold
+    /// state": those are different questions with the same shape.
+    pub fn prepends_session_conversation(&self) -> bool {
+        if self.holds_decode_core() {
+            return false;
+        }
+        self.workflow.prepends_session_conversation()
+    }
+
+    /// What this session contributes ahead of the next prompt.
+    ///
+    /// ORT decode-core sessions append a turn to their retained sequence, so
+    /// that sequence is attended but served from KV rather than re-prefilled.
+    /// Native decode-core sessions replace their cached prefix with the
+    /// incoming prompt, so their retained tokens contribute neither value.
+    /// Prompt continuation contributes both; graph-carried state contributes
+    /// neither because the package bounds that cache itself.
+    pub fn session_prefill_carry(
+        &self,
+        session_id: SessionId,
+    ) -> anyhow::Result<SessionPrefillCarry> {
+        if self.holds_decode_core() {
+            let retained = self.session_token_count(session_id)?;
+            #[cfg(feature = "native-backend")]
+            if self.decode_backend == EngineDecodeBackend::Native {
+                return Ok(SessionPrefillCarry::default());
+            }
+            return Ok(SessionPrefillCarry {
+                attended: retained,
+                reprefilled: 0,
+            });
+        }
+        anyhow::ensure!(
+            self.workflow_sessions.contains_key(&session_id),
+            "session {session_id} not found"
+        );
+        let prepended = self
+            .workflow
+            .session_prepended_prompt_len(&session_id.to_string());
+        Ok(SessionPrefillCarry {
+            attended: prepended,
+            reprefilled: prepended,
+        })
+    }
+
+    /// The tokens a session's conversation holds, oldest first.
+    ///
+    /// `None` when the package carries its conversation somewhere a token list
+    /// cannot describe — a decode core's KV sequence, or a workflow whose
+    /// session state is not a declared prompt continuation. A caller reads this
+    /// to see what a session has heard without keeping a second copy of it,
+    /// which is the copy that drifts.
+    pub fn session_conversation(
+        &self,
+        session_id: SessionId,
+    ) -> anyhow::Result<Option<Vec<TokenId>>> {
+        if self.holds_decode_core() {
+            return Ok(None);
+        }
+        anyhow::ensure!(
+            self.workflow_sessions.contains_key(&session_id),
+            "session {session_id} not found"
+        );
+        self.workflow
+            .session_conversation(&session_id.to_string())
+            .map(|conversation| {
+                conversation
+                    .into_iter()
+                    .map(|token| {
+                        TokenId::try_from(token)
+                            .context("a conversation token id does not fit the token type")
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()
+            })
+            .transpose()
     }
 
     /// Get the loaded metadata.
@@ -1403,10 +1864,12 @@ impl Engine {
     /// it from requested settings, so explicit CPU fallbacks and skipped
     /// providers are visible to status/profile output.
     pub fn execution_provider_status(&self) -> String {
-        self.session.as_deref().map_or_else(
-            || "native".to_string(),
-            |session| session.execution_provider_status().summary(),
-        )
+        // Reported by whoever owns the sessions: the decode core when it holds
+        // the package's one graph, the interpreter's components otherwise.
+        match self.session.as_deref() {
+            Some(session) => session.execution_provider_status().summary(),
+            None => self.workflow.execution_provider_status(),
+        }
     }
     /// Latest native activation-memory planner measurement, if the current
     /// backend is native and has executed far enough to resolve concrete shapes.
@@ -1437,7 +1900,7 @@ impl Engine {
     /// anything (`reserved_bytes > 0, commits == 0`), which is the bug #659 hid
     /// behind a log line for an entire release.
     pub fn vmm_arena_stats(&self) -> Option<crate::VmmArenaStats> {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "native-cuda")]
         {
             let stats = onnx_runtime_ep_cuda::vmm_allocator::global_vmm_stats();
             Some(crate::VmmArenaStats {
@@ -1452,7 +1915,7 @@ impl Engine {
                 unaccounted_committed_bytes: stats.unaccounted_committed_bytes,
             })
         }
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "native-cuda"))]
         {
             None
         }
@@ -1463,8 +1926,12 @@ impl Engine {
         self.fim_config.as_ref()
     }
 
-    fn fim_options(&self, fim_config: &FimConfig, mut options: GenerateOptions) -> GenerateOptions {
-        self.apply_eos_defaults(&mut options);
+    fn fim_options(
+        &self,
+        fim_config: &FimConfig,
+        mut options: GenerateOptions,
+    ) -> anyhow::Result<GenerateOptions> {
+        self.apply_eos_defaults(&mut options)?;
         for token in [
             fim_config.prefix_token.as_str(),
             fim_config.middle_token.as_str(),
@@ -1473,14 +1940,18 @@ impl Engine {
             "<|endoftext|>",
             "<|file_sep|>",
         ] {
-            if let Some(token_id) = self.tokenizer.token_id(token) {
+            if let Some(token_id) = self
+                .tokenizer
+                .as_ref()
+                .and_then(|tokenizer| tokenizer.token_id(token))
+            {
                 push_unique_stop_sequence(
                     &mut options.stop_sequences,
                     StopSequence::Tokens(vec![token_id]),
                 );
             }
         }
-        options
+        Ok(options)
     }
 
     fn max_context_for_request(&self, options: &GenerateOptions) -> Option<usize> {
@@ -1506,7 +1977,7 @@ impl Engine {
                 max_len,
                 ..
             } => max_len,
-            ModelDecodePath::PastPresent { .. } | ModelDecodePath::Legacy => None,
+            ModelDecodePath::PastPresent { .. } | ModelDecodePath::Generic => None,
         }
     }
 
@@ -1517,7 +1988,13 @@ impl Engine {
     /// `max_length`, or to feed [`Engine::embed`] and the generation APIs). It
     /// uses the same tokenizer path as the engine's internal prompt handling.
     pub fn tokenize(&self, text: &str) -> anyhow::Result<Vec<TokenId>> {
-        self.tokenizer.encode(text).map_err(|e| {
+        // Whoever owns the package's tokenizer answers. The decode core opens
+        // one when it holds the package's graph; a package whose components the
+        // interpreter invokes keeps its tokenizer with those components.
+        let Some(tokenizer) = self.tokenizer.as_ref() else {
+            return self.workflow.tokenize(text);
+        };
+        tokenizer.encode(text).map_err(|e| {
             anyhow::anyhow!(
                 "failed to tokenize input text with the model's tokenizer: {e}; \
                  verify the model directory contains a valid tokenizer.json"
@@ -1528,8 +2005,11 @@ impl Engine {
     fn tokenize_prompt(&self, prompt: &GeneratePrompt) -> anyhow::Result<Vec<TokenId>> {
         match prompt {
             GeneratePrompt::TokenIds(tokens) => Ok(tokens.clone()),
+            GeneratePrompt::TokenRows(_) => {
+                anyhow::bail!("multi-row prompts are supported only by workflow pipelines")
+            }
             GeneratePrompt::Text(text) => self
-                .tokenizer
+                .require_tokenizer()?
                 .encode(text)
                 .map_err(|e| anyhow::anyhow!("Failed to tokenize prompt: {e}")),
         }
@@ -1728,7 +2208,7 @@ impl Engine {
     ) -> anyhow::Result<ActiveGenerate> {
         request.request.options.validate()?;
         let mut options = request.request.options.clone();
-        self.apply_eos_defaults(&mut options);
+        self.apply_eos_defaults(&mut options)?;
         let prompt_tokens = self.tokenize_prompt(&request.request.prompt)?;
         if prompt_tokens.is_empty() {
             anyhow::bail!("prompt must contain at least one token");
@@ -1743,7 +2223,19 @@ impl Engine {
         }
 
         let max_context = self.max_context_for_request(&options);
-        let chain = build_processor_chain(&options, Some(&self.tokenizer))?;
+        let chain = build_processor_chain(&options, Some(self.require_tokenizer()?), false)?;
+        // The declared loop is bound and its setup run before scheduler
+        // admission: a package this drive cannot advance is refused without
+        // having admitted the request or touched its session state.
+        let cursor = crate::pipeline::WorkflowGenerationCursor::start(
+            &self.workflow,
+            crate::pipeline::PipelineGenerateRequest::new(GenerateRequest {
+                prompt: crate::GeneratePrompt::TokenIds(prompt_tokens.clone()),
+                options: options.clone(),
+            }),
+            crate::pipeline::generation::DECODE_CORE_CONTRACTS,
+            &mut None,
+        )?;
         let mut state = self
             .sessions
             .remove(&request.session_id)
@@ -1759,6 +2251,7 @@ impl Engine {
             request.priority,
         );
         Ok(ActiveGenerate {
+            cursor,
             session_id: request.session_id,
             state,
             options,
@@ -1789,6 +2282,13 @@ impl Engine {
             custom_sampler: None,
         };
         let step_result = {
+            // Borrowed before the disjoint mutable borrows the backend takes.
+            let tokenizer = self
+                .tokenizer
+                .as_ref()
+                .context("this package declares no tokenizer, so it cannot decode text")?;
+            let runtime = &*self.workflow;
+            let cursor = &mut active.cursor;
             let mut backend = SessionDecodeLoopBackend {
                 session: self
                     .session
@@ -1800,15 +2300,51 @@ impl Engine {
                 session_id: active.session_id,
                 state: &mut active.state,
             };
-            step_decode_loop(
+            // One iteration of the *declared* loop, advanced through the same
+            // interpreter method the run-to-completion path drives in a `for`.
+            // The scheduler owns which request runs next; the workflow owns
+            // what one step of that request is.
+            let mut host = crate::pipeline::generation::GenerationNodeHost::new(
                 &mut backend,
                 &mut loop_state,
-                &active.options,
-                &active.chain,
-                &self.tokenizer,
-                active.max_context,
+                &crate::pipeline::generation::GenerationRequest {
+                    options: &active.options,
+                    chain: &active.chain,
+                    tokenizer,
+                    max_context: active.max_context,
+                },
                 None,
-            )?
+            );
+            let (ran, finish) = {
+                let mut host_ref: Option<&mut dyn crate::pipeline::WorkflowNodeHost> =
+                    Some(&mut host);
+                let ran = cursor.advance(runtime, &mut host_ref)?;
+                (ran, host.reached_finish())
+            };
+            let finish = match (ran, finish) {
+                (_, Some(reason)) => Some(reason),
+                // The predicate ended the loop without this iteration running a
+                // step, which means the previous one already reported why.
+                (false, None) => Some(FinishReason::MaxTokens),
+                (true, None) => None,
+            };
+            match finish {
+                Some(finish_reason) => {
+                    ensure_constrained_finish(
+                        &active.options,
+                        &loop_state.generated_text,
+                        finish_reason.clone(),
+                    )?;
+                    Some(crate::decode_loop::finish_result(
+                        tokenizer,
+                        &loop_state.generated_tokens,
+                        finish_reason,
+                        loop_state.prefix_cache_hit_len,
+                        loop_state.logprobs.as_deref(),
+                    )?)
+                }
+                None => None,
+            }
         };
         active.generated_tokens = loop_state.generated_tokens;
         active.generated_text = loop_state.generated_text;
@@ -1842,6 +2378,15 @@ impl Engine {
     }
 
     fn finish_active_generate(&mut self, mut active: ActiveGenerate) -> anyhow::Result<()> {
+        // The workflow's own emit and the tokens this drive committed describe
+        // the same generation; if they disagree, one is wrong and nothing
+        // outside can tell which.
+        crate::pipeline::generation::verify_emitted_tokens(
+            &self.workflow,
+            &active.cursor,
+            &active.generated_tokens,
+        )?;
+        active.cursor.finish(&self.workflow)?;
         if !exceeded_context_limit(active.state.tokens.len(), active.max_context) {
             self.ensure_session_kv_current(active.session_id, &mut active.state)?;
             self.insert_cached_prefixes(active.session_id, &active.state, active.prompt_len)?;
@@ -1871,11 +2416,7 @@ impl Engine {
         let Some(session) = self.session.as_deref() else {
             return false;
         };
-        let io = self
-            .metadata
-            .model
-            .as_ref()
-            .and_then(|model| model.io.as_ref());
+        let io = self.metadata.decoder_io();
         ort_session_has_recurrent_state(session, io)
     }
 
@@ -2006,7 +2547,7 @@ impl Engine {
     ) -> anyhow::Result<GenerateResult> {
         Ok(GenerateResult {
             text: self
-                .tokenizer
+                .require_tokenizer()?
                 .decode(generated_tokens)
                 .map_err(|e| anyhow::anyhow!("Failed to detokenize generated tokens: {e}"))?,
             token_ids: generated_tokens.to_vec(),
@@ -2096,39 +2637,6 @@ impl DecodeLoopBackend for SessionDecodeLoopBackend<'_> {
 
 #[cfg(feature = "native-backend")]
 impl Engine {
-    /// Deprecated native-only shim. Use [`Engine::create_session`] for both ORT
-    /// and native backends.
-    pub fn create_native_session(&mut self) -> anyhow::Result<SessionId> {
-        if self.decode_backend != EngineDecodeBackend::Native {
-            anyhow::bail!("create_native_session requires the native decode backend");
-        }
-        self.create_session()
-    }
-
-    /// Deprecated native-only shim. Use [`Engine::close_session`].
-    pub fn close_native_session(&mut self, session_id: SessionId) -> anyhow::Result<()> {
-        self.close_session(session_id)
-    }
-
-    /// Deprecated native-only shim. Use [`Engine::generate_in_session`].
-    pub fn generate_native_in_session(
-        &mut self,
-        session_id: SessionId,
-        request: GenerateRequest,
-    ) -> anyhow::Result<GenerateResult> {
-        self.generate_in_session(session_id, request)
-    }
-
-    /// Deprecated native-only shim. Use [`Engine::generate_in_session_with_callback`].
-    pub fn generate_native_in_session_with_callback(
-        &mut self,
-        session_id: SessionId,
-        request: GenerateRequest,
-        callback: Option<&mut GenerateTokenCallback<'_>>,
-    ) -> anyhow::Result<GenerateResult> {
-        self.generate_native_in_session_with_callbacks(session_id, request, None, callback)
-    }
-
     fn generate_native_in_session_with_callbacks(
         &mut self,
         session_id: SessionId,
@@ -2140,13 +2648,13 @@ impl Engine {
         request.options.validate()?;
         let mut options = request.options;
         reject_native_request_speculation(&options)?;
-        self.apply_eos_defaults(&mut options);
+        self.apply_eos_defaults(&mut options)?;
         let prompt_tokens = self.tokenize_prompt(&request.prompt)?;
         if prompt_tokens.is_empty() {
             anyhow::bail!("prompt must contain at least one token");
         }
         options.max_context = self.max_context_for_request(&options);
-        let chain = build_processor_chain(&options, Some(&self.tokenizer))?;
+        let chain = build_processor_chain(&options, Some(self.require_tokenizer()?), false)?;
         if native_speculation_plan(&options, &chain).is_some() {
             anyhow::bail!(
                 "native session generation does not support speculative decoding; use stateless generate() for native prompt-lookup/shared-KV speculation"
@@ -2250,9 +2758,14 @@ impl Engine {
                 };
                 match snapshot {
                     Ok(snapshot) => {
+                        // Borrow the governor field directly, not through
+                        // `governor()`: the closure below runs while
+                        // `self.prefix_cache` is mutably borrowed, and a
+                        // whole-`self` accessor borrow would conflict.
+                        let governor_memory = self.governor.memory();
                         let reserve_snapshot = || {
                             onnx_runtime_memory_governor::MemoryGovernor::reserve(
-                                self.governor.memory(),
+                                governor_memory,
                                 onnx_runtime_memory_governor::Tier::Host,
                                 snapshot.bytes(),
                                 Holder::RecurrentPrefixSnapshot.role(),
@@ -2306,6 +2819,12 @@ impl Engine {
             }
 
             let mut result = {
+                // Borrowed before the mutable native-session borrow below.
+                let tokenizer = self
+                    .tokenizer
+                    .as_ref()
+                    .context("this package declares no tokenizer, so it cannot decode text")?;
+                let runtime = &*self.workflow;
                 let native = self
                     .native_session
                     .as_mut()
@@ -2327,7 +2846,8 @@ impl Engine {
                     resume_from,
                     &options,
                     &chain,
-                    &self.tokenizer,
+                    tokenizer,
+                    runtime,
                     callback,
                 )?
             };
@@ -2349,15 +2869,36 @@ impl Engine {
         self.scheduler.complete(session_id);
         result
     }
+}
 
-    /// Deprecated native-only shim. Use [`Engine::rewind_session_by`].
-    pub fn rewind_native_session(
-        &mut self,
-        session_id: SessionId,
-        token_count: RewindTokenCount,
-    ) -> anyhow::Result<SessionPosition> {
-        self.rewind_session_by(session_id, token_count)
-    }
+/// Token ids carried by a workflow literal, scalar or list.
+///
+/// A package may declare one end token or several with the same field; reading
+/// both shapes here is what keeps "declare your EOS" from having two spellings.
+fn literal_token_ids(literal: &onnx_genai_metadata::LiteralValue) -> anyhow::Result<Vec<TokenId>> {
+    use onnx_genai_metadata::{LiteralValue, ScalarValue};
+    let scalars = match literal {
+        LiteralValue::Scalar(scalar) => std::slice::from_ref(scalar),
+        LiteralValue::Elements(elements) => elements.as_slice(),
+    };
+    scalars
+        .iter()
+        .map(|scalar| match scalar {
+            // Dropping a malformed id would be the worst outcome: the package
+            // says "these tokens end me", the runtime silently keeps a subset,
+            // and generation runs past an end token the author declared. A
+            // package that cannot state its stop condition must fail to load,
+            // not load with a quietly smaller one.
+            ScalarValue::Integer(value) => TokenId::try_from(*value).map_err(|_| {
+                anyhow::anyhow!(
+                    "declared end-of-generation token id {value} is not a valid token id"
+                )
+            }),
+            other => anyhow::bail!(
+                "declared end-of-generation token ids must be integers; found {other:?}"
+            ),
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -2407,27 +2948,73 @@ mod tests {
         );
 
         options.num_speculative_tokens = None;
-        options.speculative_mode = Some(SpeculativeMode::SharedKv(
-            crate::config::SharedKvProposerConfig {
-                assistant_model: PathBuf::from("assistant.onnx"),
-                target_hidden_output: "hidden".to_string(),
-                input_embedding_weights: PathBuf::from("embedding.bin"),
-                backbone_hidden_size: 1,
-                vocab_size: 1,
-                num_speculative_tokens: 3,
-                shared_kv: Vec::new(),
-            },
-        ));
-        let shared_kv = native_speculation_plan(&options, &chain).unwrap();
-        assert_eq!(shared_kv.width, 4);
-        assert_eq!(native_workspace_query_rows(1, Some(&shared_kv), 8, None), 4);
+        options.speculative_mode = Some(SpeculativeMode::Mtp(crate::config::MtpConfig {
+            head_model: PathBuf::from("mtp.onnx"),
+            target_hidden_output: "hidden".to_string(),
+            embedding_weights: PathBuf::from("embedding.bin"),
+            lm_head_weights: PathBuf::from("lm_head.bin"),
+            vocab_size: 1,
+            hidden_size: 1,
+            kv_mode: onnx_genai_ort::MtpDraftKvMode::GrowCache,
+            num_speculative_tokens: 3,
+        }));
+        let mtp = native_speculation_plan(&options, &chain).unwrap();
+        assert_eq!(mtp.width, 4);
+        assert_eq!(native_workspace_query_rows(1, Some(&mtp), 8, None), 4);
 
         assert_eq!(native_workspace_query_rows(3, None, 8, None), 3);
     }
 
+    /// An engine whose package the interpreter drives, sharing one scheduler.
+    ///
+    /// `holds_decode_core()` is false here (no `session`, no `native_session`),
+    /// so generation takes the no-decode-core branch #1723 introduced and #1900
+    /// wired admission into. `budget_bytes` is the whole KV byte budget, which
+    /// is what decides whether a request is admitted at all.
+    ///
+    /// This literal was written out three times across these tests before it
+    /// was a helper; every field but the budget was identical in all three, and
+    /// a fixture that is copied is a fixture that drifts.
     #[cfg(feature = "native-backend")]
-    #[test]
-    fn native_generate_rejects_over_kv_byte_budget_before_backend_run() -> anyhow::Result<()> {
+    fn interpreted_engine_with_byte_budget(budget_bytes: u64) -> anyhow::Result<Engine> {
+        interpreted_engine_inner(
+            budget_bytes,
+            crate::pipeline::generation::TestSessionShape::Stateless,
+        )
+    }
+
+    /// The same fixture over a package that declares session-scoped state.
+    ///
+    /// `create_session` refuses a package that publishes tokens and declares no
+    /// conversation, so a test that opens a session needs one that does. Kept
+    /// as a separate constructor rather than a flag on every call site: the
+    /// stateless fixture is the right one everywhere a session is not opened,
+    /// and the two differ in exactly one declared property.
+    #[cfg(feature = "native-backend")]
+    fn interpreted_session_engine_with_byte_budget(budget_bytes: u64) -> anyhow::Result<Engine> {
+        interpreted_engine_inner(
+            budget_bytes,
+            crate::pipeline::generation::TestSessionShape::LoopCarriedSession,
+        )
+    }
+
+    /// An engine whose package carries its conversation as a prompt prefix,
+    /// which is the only shape whose turns cost more than the request states.
+    #[cfg(feature = "native-backend")]
+    fn interpreted_conversation_engine_with_byte_budget(
+        budget_bytes: u64,
+    ) -> anyhow::Result<Engine> {
+        interpreted_engine_inner(
+            budget_bytes,
+            crate::pipeline::generation::TestSessionShape::PromptPrefixConversation,
+        )
+    }
+
+    #[cfg(feature = "native-backend")]
+    fn interpreted_engine_inner(
+        budget_bytes: u64,
+        shape: crate::pipeline::generation::TestSessionShape,
+    ) -> anyhow::Result<Engine> {
         let tokenizer_path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/tiny-llm/tokenizer.json")
             .canonicalize()?;
@@ -2443,7 +3030,20 @@ mod tests {
             ModelKvConfig::known(10, 1),
             0,
         )?;
-        let mut engine = Engine {
+        Ok(Engine {
+            workflow: Box::new(match shape {
+                crate::pipeline::generation::TestSessionShape::Stateless => {
+                    crate::pipeline::generation::test_decoder_runtime()?
+                }
+                crate::pipeline::generation::TestSessionShape::LoopCarriedSession => {
+                    crate::pipeline::generation::test_session_decoder_runtime()?
+                }
+                crate::pipeline::generation::TestSessionShape::PromptPrefixConversation => {
+                    crate::pipeline::generation::test_conversation_decoder_runtime()?
+                }
+            }),
+            workflow_sessions: HashMap::new(),
+            workflow_session_ids: SharedSessionIds::new(),
             decode_backend: EngineDecodeBackend::Native,
             metadata: InferenceMetadata::default(),
             metadata_hints: MetadataHints::default(),
@@ -2451,10 +3051,10 @@ mod tests {
             prefix_cache: PrefixCache::new(),
             token_prefix_cache: Vec::new(),
             kv_model: None,
-            decode_path: ModelDecodePath::Legacy,
+            decode_path: ModelDecodePath::Generic,
             scheduler: Scheduler::with_byte_budget(
                 scheduler_config,
-                onnx_genai_scheduler::ByteBudget::new(10),
+                onnx_genai_scheduler::ByteBudget::new(budget_bytes),
             ),
             governor,
             sessions: HashMap::new(),
@@ -2464,24 +3064,28 @@ mod tests {
             memory_strategy_plan: MemoryStrategyPlan::unknown(0, None, "test engine fixture"),
             native_sessions: HashMap::new(),
             native_active_session: None,
-            native_session_counter: 0,
+            native_session_ids: SharedSessionIds::new(),
             native_access_counter: 0,
             native_default_session: None,
             native_max_sessions: 8,
-            native_shared_kv_proposer: None,
             native_recurrent_prefix_stats: RecurrentPrefixCacheStats::default(),
             draft: None,
             mtp: None,
             eagle3: None,
-            shared_kv_proposer: None,
-            tokenizer,
+            tokenizer: Some(tokenizer),
             fim_config: None,
             num_speculative_tokens: 1,
             speculative_mode: SpeculativeMode::None,
             last_speculative_stats: SpeculativeStats::default(),
             connector: ConnectorBridge::null(),
             _environment: None,
-        };
+        })
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn native_generate_rejects_over_kv_byte_budget_before_backend_run() -> anyhow::Result<()> {
+        let mut engine = interpreted_engine_with_byte_budget(10)?;
         let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![1]));
         request.options.max_new_tokens = 1;
         request.options.stop_on_eos = false;
@@ -2505,6 +3109,435 @@ mod tests {
         Ok(())
     }
 
+    /// The reject direction for the fixture the test below accepts.
+    ///
+    /// That test needs a package declaring `scope: session` state, so it uses a
+    /// fixture built to have some. A fixture that grants what it is meant to
+    /// test is worth exactly nothing unless the ungranted case is shown to be
+    /// refused, and both fixtures come from one builder differing in one flag —
+    /// so this pins that the flag is what the refusal turns on.
+    ///
+    /// It is also the only unit test of the refusal itself. #1892 added the
+    /// gate; how it was discovered to be load-bearing is that it silently broke
+    /// a test written for something else, which is a slower way to find out.
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn create_session_refuses_a_package_that_declares_no_conversation() -> anyhow::Result<()> {
+        let mut engine = interpreted_engine_with_byte_budget(10)?;
+        assert!(!engine.holds_decode_core());
+
+        let error = engine
+            .create_session()
+            .expect_err("a package publishing tokens with no session state cannot hold a session");
+
+        assert_eq!(
+            crate::engine::package_capability_error(&error),
+            Some(PackageCapabilityError::NoSessionState),
+            "the refusal must be the typed one a front end reads for its status code, \
+             not prose that happens to say something similar: {error}"
+        );
+        Ok(())
+    }
+
+    /// The cold-call test above exercises `generate_interpreted`; a
+    /// continuing workflow session reaches the exact same no-decode-core
+    /// branch through [`Engine::generate_in_workflow_session`] instead (the
+    /// path a server session-continuation route uses), and must be admitted
+    /// through the identical scheduler mechanism rather than skip it because
+    /// the request already names a session.
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn native_generate_in_workflow_session_rejects_over_kv_byte_budget() -> anyhow::Result<()> {
+        let mut engine = interpreted_session_engine_with_byte_budget(10)?;
+
+        // No decode core: this engine's sessions are workflow sessions,
+        // opened through the same public `create_session` a real caller
+        // (e.g. a server session-continuation route) would use.
+        assert!(!engine.holds_decode_core());
+        let session_id = engine.create_session()?;
+
+        let mut request = crate::pipeline::PipelineGenerateRequest::new(GenerateRequest::new(
+            GeneratePrompt::TokenIds(vec![1]),
+        ));
+        request.request.options.max_new_tokens = 1;
+        request.request.options.stop_on_eos = false;
+
+        let mut admitted = false;
+        let mut on_admitted = || admitted = true;
+        let error = engine
+            .generate_in_workflow_session(session_id, request, Some(&mut on_admitted), None)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("scheduler admission failed: KV byte budget"),
+            "{error}"
+        );
+        assert!(
+            !error.contains("references unavailable value"),
+            "a continuing session must be rejected at admission, not deep inside node \
+             execution once an unbound loop value goes missing: {error}"
+        );
+        assert!(!admitted, "refused requests must not signal admission");
+        Ok(())
+    }
+
+    /// A continuing turn is admitted for the conversation it carries, not just
+    /// for the tokens the request states.
+    ///
+    /// `generate_with_pipeline_callbacks` reuses the session's own scheduler id
+    /// when the request names a live workflow session, and mints a fresh one
+    /// otherwise. That choice is not bookkeeping: it is the whole input to the
+    /// carry lookup in `admit_interpreted_generate_request`, which adds
+    /// `session_prepended_prompt_len` only when the id it was handed is a
+    /// session it knows. Under a fresh id the carry silently reads 0 and turn N
+    /// of a conversation is admitted as though it were turn 1 -- verbatim the
+    /// under-reservation that function's own comment warns about, on exactly
+    /// the turns that need the most.
+    ///
+    /// Nothing caught that. Making the reuse arm unreachable
+    /// (`Some(id) if false && ...`) left the whole lib suite green, because the
+    /// only other test reaching this branch asserts a *refusal* -- and a
+    /// refusal arrives identically under a reused id and a fresh one.
+    ///
+    /// Both arms open a real session on one engine and differ **only** by
+    /// whether that session has heard anything. Not "session vs no session":
+    /// that would also change which branch runs, and a refusal could then be
+    /// blamed on the path rather than on the prefix. Holding the path fixed is
+    /// what makes the carried conversation the sole explanation for the
+    /// difference between them.
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn a_continuing_turn_is_admitted_for_the_conversation_it_carries() -> anyhow::Result<()> {
+        // 10 B/token, so this budget holds 3 tokens. A turn stating 1 prompt
+        // token and 1 new token needs 2 of them and fits. The same turn on a
+        // session already holding 3 tokens needs 5 and cannot.
+        let mut engine = interpreted_conversation_engine_with_byte_budget(30)?;
+        assert!(!engine.holds_decode_core());
+
+        let fresh = engine.create_session()?;
+        let continuing = engine.create_session()?;
+        engine
+            .workflow
+            .seed_session_conversation(&continuing.to_string(), &[7, 8, 9])?;
+
+        // The seed has to be readable through the declaration the scheduler
+        // reads, or both arms would cost the same and this test would be
+        // pinning the budget rather than the carry.
+        assert_eq!(
+            engine
+                .workflow
+                .session_prepended_prompt_len(&continuing.to_string()),
+            3,
+            "the seeded conversation must be visible to the accounting under test"
+        );
+        assert_eq!(
+            engine
+                .workflow
+                .session_prepended_prompt_len(&fresh.to_string()),
+            0,
+            "a session that has heard nothing carries nothing"
+        );
+
+        let mut wrong = Vec::new();
+        for (label, session_id, refuse) in [
+            ("a session that has heard nothing", fresh, false),
+            ("a session holding 3 tokens", continuing, true),
+        ] {
+            let mut request = crate::pipeline::PipelineGenerateRequest::new(GenerateRequest::new(
+                GeneratePrompt::TokenIds(vec![1]),
+            ));
+            request.request.options.max_new_tokens = 1;
+            request.request.options.stop_on_eos = false;
+
+            let mut admitted = false;
+            let mut on_admitted = || admitted = true;
+            let error = engine
+                .generate_in_workflow_session(session_id, request, Some(&mut on_admitted), None)
+                .map(|_| String::from("<generation succeeded>"))
+                .unwrap_or_else(|error| error.to_string());
+            // The fixture's interpreted decoder cannot finish a generation, so
+            // the admitted arm still returns `Err`. Matching the admission
+            // refusal specifically is what keeps "was not refused" from being
+            // satisfied by any other failure.
+            let refused = error.contains("scheduler admission failed: KV byte budget");
+            match (refuse, refused) {
+                (true, false) => wrong.push(format!(
+                    "{label}: a turn whose carried conversation exceeds the budget was \
+                     admitted; got: {error}"
+                )),
+                (false, true) => wrong.push(format!(
+                    "{label}: a turn the budget has room for was refused: {error}"
+                )),
+                _ => {}
+            }
+            if admitted == refuse {
+                wrong.push(format!(
+                    "{label}: on_admitted() {} the scheduler {} this turn",
+                    if admitted {
+                        "fired although"
+                    } else {
+                        "stayed silent although"
+                    },
+                    if refuse { "refused" } else { "admitted" }
+                ));
+            }
+        }
+
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+        Ok(())
+    }
+
+    /// The half of #1900 that a rejection test cannot reach: the reservation an
+    /// admitted request takes is handed back when it finishes.
+    ///
+    /// Both tests above assert a *refusal*, and a refusal is equally consistent
+    /// with an engine that admits nothing and with one that admits correctly
+    /// but never releases. So `scheduler.complete()` on this path was not under
+    /// test: deleting that one line left the whole 618-test lib suite green.
+    ///
+    /// The observable chosen here is the user-visible consequence rather than
+    /// the internal counter. On a budget sized for exactly one request, a leak
+    /// makes the *second* request fail admission -- the first never let go.
+    /// A test that asserts "refused because over budget" and a test that
+    /// asserts "not refused, because the previous request released" are
+    /// falsified by opposite mutations, which is the point of having both.
+    ///
+    /// The fixture cannot complete a generation -- its interpreted decoder
+    /// wants a KV value no component produces -- so neither call returns `Ok`.
+    /// That is exactly the case the release has to survive: `complete()` runs
+    /// on the error path too, and a request that admits and then fails must not
+    /// strand its bytes.
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn an_admitted_interpreted_request_releases_its_reservation_for_the_next_one()
+    -> anyhow::Result<()> {
+        // One prompt token plus one new token at 10 bytes each, and nothing to
+        // spare: enough for a single request at a time, never for two at once.
+        let mut engine = interpreted_engine_with_byte_budget(20)?;
+        assert!(!engine.holds_decode_core());
+
+        let mut refusals = Vec::new();
+        let mut admissions = 0usize;
+        for _ in 0..2 {
+            let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![1]));
+            request.options.max_new_tokens = 1;
+            request.options.stop_on_eos = false;
+            let mut on_admitted = || admissions += 1;
+            if let Err(error) =
+                engine.generate_with_callbacks(request, Some(&mut on_admitted), None)
+            {
+                let error = error.to_string();
+                if error.contains("scheduler admission failed") {
+                    refusals.push(error);
+                }
+            }
+        }
+
+        assert!(
+            refusals.is_empty(),
+            "a request must not be refused for bytes an earlier finished request still holds: {}",
+            refusals.join(" | ")
+        );
+        assert_eq!(
+            admissions, 2,
+            "the admission callback fires once per request the scheduler accepted"
+        );
+        assert_eq!(
+            engine.scheduler.running_count(),
+            0,
+            "no sequence may still be running once every request has finished"
+        );
+        Ok(())
+    }
+
+    /// The accept direction for a tensor-bound request: it is admitted, and it
+    /// signals admission exactly once.
+    ///
+    /// `on_admitted` carries two contracts at that call site. To the server it
+    /// means "you may begin streaming": `run_generation`'s success arm never
+    /// touches the admission sender (only its error arm does), so this callback
+    /// is the *only* thing that ever resolves that oneshot with `Ok` on a
+    /// request that succeeds. Drop the call and every successful tensor-bound
+    /// request becomes a 500 at the awaiting end while the generation itself
+    /// completes perfectly. To the engine it means "the scheduler admitted
+    /// this".
+    ///
+    /// #1964 added this test when those two had come apart: the branch fired
+    /// the callback without taking a reservation, so the engine contract was
+    /// false and only the server one held. #1891 closed that, and the test is
+    /// kept because it now pins *both* -- which is strictly more than it could
+    /// pin before, and it is the only guard on the server-facing half.
+    ///
+    /// The asymmetry #1964 identified is why the obvious falsifier is still the
+    /// wrong one. Asserting `!admitted` passes under the change that deletes
+    /// the call, and therefore goes green exactly when serving breaks. This
+    /// asserts the contract a mutation can actually violate.
+    ///
+    /// The budget is the load-bearing number: it must leave room, or the
+    /// request is now refused and never reaches the callback at all. That is
+    /// itself the discriminator between the two behaviours -- shrink it to `1`
+    /// and this test passes on the pre-#1891 branch and fails after it, which
+    /// is how the fix was verified rather than assumed. Its sibling
+    /// [`a_bound_tensor_does_not_exempt_a_request_from_scheduler_admission`]
+    /// owns the refuse direction.
+    ///
+    /// Limitation, stated rather than implied: this fixture's interpreted
+    /// decoder cannot complete a generation, so what is pinned is that the
+    /// branch signals admission, not that it does so on a run returning `Ok`.
+    /// The signal is unconditional and precedes the work, so it is the same
+    /// line either way -- but an end-to-end version needs a package the
+    /// interpreter can finish, and that fixture does not exist yet.
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn a_tensor_bound_request_signals_admission_exactly_once() -> anyhow::Result<()> {
+        // Room for the request: after #1891 a tensor-bound request takes a real
+        // reservation, so a budget that refuses it would never reach the
+        // callback this test exists to pin.
+        let mut engine = interpreted_engine_with_byte_budget(20)?;
+        assert!(!engine.holds_decode_core());
+
+        let mut request = crate::pipeline::PipelineGenerateRequest::new(GenerateRequest::new(
+            GeneratePrompt::TokenIds(vec![1]),
+        ));
+        request.request.options.max_new_tokens = 1;
+        request.request.options.stop_on_eos = false;
+        let request = request.with_input(
+            "pixel_values",
+            onnx_genai_ort::Value::from_slice_i64(&[0], &[1])?,
+        );
+
+        // Assert the precondition rather than trusting the test's name: a
+        // request that lost its inputs takes the prompt path instead, where a
+        // different call site signals admission, and this test would then pass
+        // for a reason that has nothing to do with binding tensors.
+        assert!(
+            !request.inputs.is_empty(),
+            "this test is only about the branch a tensor-carrying request takes"
+        );
+
+        let mut admissions = 0usize;
+        {
+            let mut on_admitted = || admissions += 1;
+            let _ = engine.generate_with_pipeline_callbacks(request, Some(&mut on_admitted), None);
+        }
+
+        assert_eq!(
+            admissions, 1,
+            "a tensor-bound request must signal admission exactly once: the server's \
+             admission oneshot has no other resolver on a successful generation"
+        );
+        Ok(())
+    }
+
+    /// #1891's residual, and the one case none of the three tests above can
+    /// reach: a request that binds a tensor.
+    ///
+    /// Every admission test written for #1900/#1904 sends a *prompt*, and
+    /// `generate_with_pipeline_callbacks` splits on exactly that -- a request
+    /// carrying inputs or component overrides is not prompt-only, takes the
+    /// `!prompt_only` branch, and that branch fires `on_admitted()` and runs
+    /// the workflow without ever consulting the scheduler. So the byte budget
+    /// #1900 wired in is enforced for `generate("hello")` and not for the same
+    /// engine, same budget, same prompt plus one bound tensor.
+    ///
+    /// The control is the point: both arms use one engine constructor and one
+    /// budget, and differ only by the tensor. If the fixture simply failed for
+    /// its own reasons, or the budget refused everything, both arms would read
+    /// the same. They do not, and the arm that differs is the one that skipped
+    /// admission.
+    ///
+    /// The second assertion is the one that cannot be satisfied by a symptom
+    /// fix: `on_admitted()` firing when nothing admitted is a lie to whatever
+    /// is on the other end of it -- for the server driver that callback is a
+    /// oneshot that tells a waiting client "you are in", so it must not be sent
+    /// by a path that made no such decision.
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn a_bound_tensor_does_not_exempt_a_request_from_scheduler_admission() -> anyhow::Result<()> {
+        // Same shape as `native_generate_rejects_over_kv_byte_budget_before_backend_run`:
+        // one prompt token plus one new token at 10 bytes each needs 20, and
+        // this engine has 10. Every arm below is over budget by construction.
+        fn over_budget_request() -> crate::pipeline::PipelineGenerateRequest {
+            let mut request = crate::pipeline::PipelineGenerateRequest::new(GenerateRequest::new(
+                GeneratePrompt::TokenIds(vec![1]),
+            ));
+            request.request.options.max_new_tokens = 1;
+            request.request.options.stop_on_eos = false;
+            request
+        }
+
+        // Both ways a request stops being prompt-only, because a fix that
+        // admits bound tensors and forgets overrides leaves the same hole open
+        // through the other door. The last arm is the other polarity: three
+        // refusals are equally consistent with a path that admits correctly and
+        // with one that refuses everything it cannot recognise, and only an arm
+        // that must be *accepted* tells those apart.
+        fn bound_tensor() -> anyhow::Result<onnx_genai_ort::Value> {
+            Ok(onnx_genai_ort::Value::from_slice_i64(&[0], &[1])?)
+        }
+        let arms = vec![
+            ("prompt-only (control)", 10u64, true, over_budget_request()),
+            (
+                "one bound tensor",
+                10,
+                true,
+                over_budget_request().with_input("pixel_values", bound_tensor()?),
+            ),
+            (
+                "one component override",
+                10,
+                true,
+                over_budget_request().with_component_override("decoder", "decoder"),
+            ),
+            (
+                "one bound tensor, inside budget",
+                10_000,
+                false,
+                over_budget_request().with_input("pixel_values", bound_tensor()?),
+            ),
+        ];
+
+        let mut wrong = Vec::new();
+        for (label, budget, refuse, request) in arms {
+            let mut engine = interpreted_engine_with_byte_budget(budget)?;
+            assert!(!engine.holds_decode_core());
+            let mut admitted = false;
+            let mut on_admitted = || admitted = true;
+            let error = engine
+                .generate_with_pipeline_callbacks(request, Some(&mut on_admitted), None)
+                .map(|_| String::from("<generation succeeded>"))
+                .unwrap_or_else(|error| error.to_string());
+            let refused = error.contains("scheduler admission failed: KV byte budget");
+            match (refuse, refused) {
+                (true, false) => wrong.push(format!(
+                    "{label}: over-budget request was not refused at the door; got: {error}"
+                )),
+                (false, true) => wrong.push(format!(
+                    "{label}: a request the budget has room for was refused: {error}"
+                )),
+                _ => {}
+            }
+            // The callback reports the decision the scheduler made, so it fires
+            // exactly when the request was admitted -- never on a refusal, and
+            // never on a path that reached the workflow without asking.
+            if admitted == refuse {
+                wrong.push(format!(
+                    "{label}: on_admitted() {} the scheduler {} this request",
+                    if admitted {
+                        "fired although"
+                    } else {
+                        "stayed silent although"
+                    },
+                    if refuse { "refused" } else { "admitted" }
+                ));
+            }
+        }
+
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+        Ok(())
+    }
+
     #[cfg(feature = "native-backend")]
     #[test]
     fn native_backend_batching_capability_reports_single_sequence() -> anyhow::Result<()> {
@@ -2525,6 +3558,9 @@ mod tests {
         // model. This is the honesty guarantee -- capability is not read off the
         // decode_path alone.
         let mut engine = Engine {
+            workflow: Box::new(crate::pipeline::generation::test_decoder_runtime()?),
+            workflow_sessions: HashMap::new(),
+            workflow_session_ids: SharedSessionIds::new(),
             decode_backend: EngineDecodeBackend::Native,
             metadata: InferenceMetadata::default(),
             metadata_hints: MetadataHints::default(),
@@ -2545,17 +3581,15 @@ mod tests {
             memory_strategy_plan: MemoryStrategyPlan::unknown(0, None, "test engine fixture"),
             native_sessions: HashMap::new(),
             native_active_session: None,
-            native_session_counter: 0,
+            native_session_ids: SharedSessionIds::new(),
             native_access_counter: 0,
             native_default_session: None,
             native_max_sessions: 8,
-            native_shared_kv_proposer: None,
             native_recurrent_prefix_stats: RecurrentPrefixCacheStats::default(),
             draft: None,
             mtp: None,
             eagle3: None,
-            shared_kv_proposer: None,
-            tokenizer,
+            tokenizer: Some(tokenizer),
             fim_config: None,
             num_speculative_tokens: 1,
             speculative_mode: SpeculativeMode::None,
@@ -2585,5 +3619,127 @@ mod tests {
             "native backend must not build a >1 continuous batch manager"
         );
         Ok(())
+    }
+}
+
+/// Apply a model's end tokens to a request.
+///
+/// The one implementation, shared by the single-row path, the continuous batch
+/// manager and static batching. Three copies of this is how a model stops
+/// correctly on one route and runs past its end on another — which is
+/// unobservable from the API and shows up as a serving-only bug.
+pub(crate) fn apply_eos_policy(options: &mut GenerateOptions, ids: &[TokenId]) {
+    if !options.stop_on_eos {
+        return;
+    }
+    if options.eos_token_id.is_none()
+        && let Some(&id) = ids.first()
+    {
+        options.eos_token_id = Some(id);
+    }
+    for &id in ids {
+        if !options.eos_token_ids.contains(&id) {
+            options.eos_token_ids.push(id);
+        }
+    }
+}
+
+/// The legacy direct decode path cannot be selected.
+///
+/// There is no flag, mode, or constructor that reaches generation without a
+/// declared workflow. That used to be a runtime guard on every decode entry
+/// point; it is now a property of the type — [`Engine`] holds one
+/// non-optional interpreter, and the loader refuses a package that declares no
+/// workflow before an engine exists at all.
+///
+/// These cases pin the two halves that remain checkable: a package with no
+/// workflow does not load, and every constructor presents the workflow the
+/// package shipped.
+#[cfg(test)]
+mod canonical_refusal_tests {
+    use crate::{Engine, EngineConfig};
+    use std::path::PathBuf;
+
+    fn decoder_package() -> PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm")
+    }
+
+    /// A package declaring no workflow is refused at load, naming the fix.
+    ///
+    /// This is what makes the missing-workflow state unreachable rather than
+    /// merely guarded: nothing downstream has to check, because no engine with
+    /// that state is ever constructed.
+    #[test]
+    fn a_package_without_a_workflow_does_not_load() -> anyhow::Result<()> {
+        let staging = std::env::current_dir()?.join("target/no-workflow-package");
+        let _ = std::fs::remove_dir_all(&staging);
+        std::fs::create_dir_all(&staging)?;
+        for name in ["model.onnx.textproto", "tokenizer.json"] {
+            std::fs::copy(decoder_package().join(name), staging.join(name))?;
+        }
+        let Err(error) = Engine::from_dir(&staging, EngineConfig::default()) else {
+            panic!("a package declaring no pipeline.workflow must not load");
+        };
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("declares no pipeline.workflow"),
+            "the refusal must name what is missing: {message}"
+        );
+        assert!(
+            message.contains("migrate_model_io"),
+            "the refusal must name the offline conversion: {message}"
+        );
+        std::fs::remove_dir_all(&staging)?;
+        Ok(())
+    }
+
+    /// No public constructor skips the workflow.
+    #[test]
+    fn every_constructor_presents_the_declared_workflow() -> anyhow::Result<()> {
+        for engine in [
+            Engine::from_dir(&decoder_package(), EngineConfig::default())?,
+            Engine::from_dir_with_session_options(
+                &decoder_package(),
+                EngineConfig::default(),
+                onnx_genai_ort::SessionOptions::default(),
+            )?,
+        ] {
+            let workflow = engine
+                .package_workflow()
+                .expect("a decoder package always presents its declared workflow");
+            assert_eq!(
+                onnx_genai_metadata::sole_decoder_component(workflow),
+                Some(onnx_genai_metadata::decoder_workflow::DECODER_COMPONENT)
+            );
+        }
+        Ok(())
+    }
+
+    /// A package whose declared end tokens are malformed fails loudly.
+    ///
+    /// Filtering them out would mean the package says "these tokens end me" and
+    /// the runtime silently keeps a subset — generation then runs past an end
+    /// token its author declared, which is invisible from the API.
+    #[test]
+    fn a_malformed_end_token_declaration_is_an_error() {
+        use onnx_genai_metadata::{LiteralValue, ScalarValue};
+        let error = super::literal_token_ids(&LiteralValue::Elements(vec![
+            ScalarValue::Integer(2),
+            ScalarValue::Integer(-1),
+        ]))
+        .expect_err("a negative token id is not a token id");
+        assert!(
+            format!("{error:#}").contains("not a valid token id"),
+            "{error:#}"
+        );
+
+        let error = super::literal_token_ids(&LiteralValue::Scalar(ScalarValue::String(
+            "eos".to_string(),
+        )))
+        .expect_err("a string is not a token id");
+        assert!(
+            format!("{error:#}").contains("must be integers"),
+            "{error:#}"
+        );
     }
 }

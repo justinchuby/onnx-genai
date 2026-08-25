@@ -6,6 +6,7 @@ use std::ptr::NonNull;
 use onnx_runtime_ir::{
     DataType, DeviceId, DeviceType, Graph, GraphView, Node, NodeId, NodeIndex, Shape, TensorLayout,
 };
+use onnx_runtime_memory_governor::{ManagedAllocation, MemoryLease, MemoryRole, OwningAllocation};
 
 use crate::epcontext::EpContext;
 use crate::error::{EpError, Result};
@@ -44,6 +45,49 @@ impl ArgmaxTieBreak {
     }
 }
 
+/// Which captured device-graph slot an EP graph operation targets.
+///
+/// A decode EP historically owns exactly one captured graph (the `Primary`
+/// slot): the shape-invariant M=1 decode step it replays every token. MTP
+/// self-speculative decode adds a *second*, differently-shaped forward — the
+/// fixed-width `M = k+1` verify step — that must be captured and replayed
+/// independently of the M=1 step, because the two graphs bake different query
+/// geometries and cannot share one slot without invalidating each other every
+/// step (the empirically-measured `replays=0` MTP blocker; see
+/// `gaff-mtp-graph-retain-capture-unsafe-blocker.md`). `Verify` names that
+/// second slot so the executor can hold and replay both graphs by shape key on
+/// the same EP/stream (one CUDA graph per shape, no per-step recapture).
+///
+/// EPs that support only a single captured graph (the historical behaviour)
+/// accept `Primary` and reject `Verify`; the CUDA EP owns one
+/// [`CudaGraphLifecycle`](../../onnx_runtime_ep_cuda) per slot.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub enum DeviceGraphSlot {
+    /// The shape-invariant M=1 decode graph (the only slot before MTP).
+    #[default]
+    Primary,
+    /// The fixed-width `M = k+1` speculative verify graph.
+    Verify,
+}
+
+impl DeviceGraphSlot {
+    /// Number of distinct captured-graph slots. Used to size per-slot host
+    /// capture-state arrays on the executor so `Primary` (M=1 decode) and
+    /// `Verify` (M=k+1) graphs can coexist without clobbering each other.
+    pub const COUNT: usize = 2;
+
+    /// Dense array index for this slot (`Primary` = 0, `Verify` = 1). `Primary`
+    /// is index 0 so the historical single-slot code path — which only ever
+    /// touches `Primary` — maps to slot 0 and stays byte-identical.
+    #[inline]
+    pub const fn index(self) -> usize {
+        match self {
+            DeviceGraphSlot::Primary => 0,
+            DeviceGraphSlot::Verify => 1,
+        }
+    }
+}
+
 /// Opaque, namespaced configuration passed to [`ExecutionProvider::initialize`].
 #[derive(Clone, Debug, Default)]
 pub struct EpConfig {
@@ -63,6 +107,21 @@ pub struct EpConfig {
 /// to a different EP. Ownership is unique — no two `DeviceBuffer`s ever alias
 /// the same allocation.
 ///
+/// # Two owning representations
+///
+/// * **Raw owning** ([`DeviceBuffer::from_raw_parts`]) — an address plus size
+///   and alignment. The EP is trusted to pair it with exactly one free. This is
+///   what the CPU EP and adapter/plugin paths use.
+/// * **Bound owning** ([`DeviceBuffer::from_owning_allocation`]) — the exact
+///   [`OwningAllocation`] that minted the address, carrying its binding identity
+///   and allocation generation. Final release goes back through that owner, so
+///   a stale handle over a reused address cannot free anything, and a release
+///   can never be attributed to the wrong mechanism.
+///
+/// A bound buffer is still non-`Clone` and still has no `Drop`: the generation
+/// is what makes the release safe, and the owner's own `Drop` quarantines
+/// rather than frees.
+///
 /// # No `Drop`
 ///
 /// `DeviceBuffer` deliberately does **not** implement [`Drop`]. Freeing device
@@ -70,7 +129,8 @@ pub struct EpConfig {
 /// queue, an allocator arena) that this bare handle does not carry, so a silent
 /// drop could not free correctly. Consequences:
 /// * Dropping a `DeviceBuffer` without passing it to `deallocate` **leaks** the
-///   allocation. It can never *double-free*, which is the memory-safety
+///   allocation (a bound buffer instead quarantines it, so the bytes stay
+///   accounted for). It can never *double-free*, which is the memory-safety
 ///   property we prioritize (plan §4.4).
 /// * The session layer owns the discipline of pairing every `allocate` with
 ///   exactly one `deallocate`. Higher layers may wrap this handle in an
@@ -100,20 +160,28 @@ pub struct DeviceBuffer {
     ///
     /// [`BufferOwner::Owned`] (the default for [`DeviceBuffer::from_raw_parts`])
     /// is the original contract: the owning EP must free it exactly once in
-    /// `deallocate`. Borrowed handles alias memory owned by *someone else*.
-    /// Read-only aliases come from [`DeviceBuffer::from_borrowed_parts`];
-    /// exclusive writable aliases come from
-    /// [`DeviceBuffer::from_borrowed_mut_parts`]. `deallocate` must **not** free
-    /// either kind.
+    /// `deallocate`. [`BufferOwner::Bound`] carries the generation-checked
+    /// owner instead of trusting the raw triple. Borrowed handles alias memory
+    /// owned by *someone else*. Read-only aliases come from
+    /// [`DeviceBuffer::from_borrowed_parts`]; exclusive writable aliases come
+    /// from [`DeviceBuffer::from_borrowed_mut_parts`]. `deallocate` must **not**
+    /// free either borrowed kind.
     owner: BufferOwner,
 }
 
 /// Whether a [`DeviceBuffer`] owns the allocation it names, or merely borrows
 /// (aliases) memory owned elsewhere.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 enum BufferOwner {
     /// This handle is the sole owner; the owning EP frees it in `deallocate`.
     Owned,
+    /// This handle is the sole owner *and* carries the binding-issued owner
+    /// that minted the address. Release consumes that owner, so it is validated
+    /// against the binding identity and the allocation generation.
+    Bound(Box<OwningAllocation>),
+    /// Binding-issued ownership whose authority/process charges remain pinned
+    /// until the Phase-4 structured release outcome settles.
+    Managed(Box<ManagedAllocation>),
     /// This handle aliases foreign memory (e.g. an mmap). `deallocate` must be
     /// a no-op free; the real owner must outlive the buffer and every use of it.
     Borrowed,
@@ -233,6 +301,106 @@ impl DeviceBuffer {
         matches!(self.owner, BufferOwner::Borrowed | BufferOwner::BorrowedMut)
     }
 
+    /// Wrap a **binding-issued owning allocation** in a `DeviceBuffer`.
+    ///
+    /// The buffer's address, size, and alignment are taken from `owner`, so a
+    /// bound buffer can never describe a different region than the owner it
+    /// carries. Final release consumes that owner
+    /// ([`into_bound_owner`](Self::into_bound_owner)), which matches the binding
+    /// identity and the allocation generation before anything is freed: a stale
+    /// handle over a reused device address is refused instead of freeing a live
+    /// allocation.
+    ///
+    /// This is safe to call — the safety obligations were discharged when the
+    /// binding issued (or adopted) the allocation.
+    pub fn from_owning_allocation(owner: OwningAllocation, device: DeviceId) -> Self {
+        let ptr = owner.as_ptr();
+        let size = owner.len();
+        let align = owner.alignment().max(1);
+        Self {
+            device,
+            size,
+            align,
+            ptr: NonNull::new(ptr.as_ptr().cast::<c_void>())
+                .expect("an owning allocation holds a non-null address"),
+            owner: BufferOwner::Bound(Box::new(owner)),
+        }
+    }
+
+    /// Wrap a process-manager transaction result in a device buffer.
+    ///
+    /// The manager settlement token stays inseparable from physical ownership;
+    /// consuming release must use [`into_bound_ownership`](Self::into_bound_ownership).
+    pub fn from_managed_allocation(owner: ManagedAllocation, device: DeviceId) -> Self {
+        let ptr = owner.as_ptr();
+        let size = owner.len();
+        let align = owner.alignment().max(1);
+        Self {
+            device,
+            size,
+            align,
+            ptr: NonNull::new(ptr.as_ptr().cast::<c_void>())
+                .expect("a managed allocation holds a non-null address"),
+            owner: BufferOwner::Managed(Box::new(owner)),
+        }
+    }
+
+    /// Whether this handle carries a binding-issued owner whose release is
+    /// generation-validated.
+    pub fn is_bound(&self) -> bool {
+        matches!(self.owner, BufferOwner::Bound(_) | BufferOwner::Managed(_))
+    }
+
+    /// Borrow the binding-issued owner, for a bound capability call (commit,
+    /// decommit, mapped-byte queries) that must be validated against the
+    /// allocation generation.
+    ///
+    /// Returns `None` for raw-owning and borrowed buffers, which is how a
+    /// generation-checked path fails closed on foreign memory.
+    pub fn bound_owner(&self) -> Option<&OwningAllocation> {
+        match &self.owner {
+            BufferOwner::Bound(owner) => Some(owner),
+            BufferOwner::Managed(owner) => Some(owner.owner_ref()),
+            _ => None,
+        }
+    }
+
+    /// Borrow process-manager ownership when this buffer carries it.
+    pub fn managed_owner(&self) -> Option<&ManagedAllocation> {
+        match &self.owner {
+            BufferOwner::Managed(owner) => Some(owner),
+            _ => None,
+        }
+    }
+
+    /// Allocation-specific release settlement when this buffer is manager-owned.
+    pub fn managed_settlement_wait(
+        &self,
+    ) -> Option<onnx_runtime_memory_governor::AllocationSettlementWait> {
+        self.managed_owner().map(ManagedAllocation::settlement_wait)
+    }
+
+    /// Consume the handle and recover its complete binding-issued ownership.
+    ///
+    /// This is the only way a bound buffer's ownership leaves the handle, and it
+    /// is what a provider's `deallocate` calls before preparing or deferring the
+    /// physical release. `Err` hands the buffer back untouched when it is not
+    /// bound, so a caller that requires generation-checked release can refuse
+    /// foreign memory without losing it.
+    pub fn into_bound_owner(self) -> std::result::Result<BoundBufferOwnership, Self> {
+        match self.owner {
+            BufferOwner::Bound(owner) => Ok(BoundBufferOwnership::Binding(*owner)),
+            BufferOwner::Managed(owner) => Ok(BoundBufferOwnership::Managed(*owner)),
+            owner => Err(Self { owner, ..self }),
+        }
+    }
+
+    /// Consume either binding-issued owning representation without discarding a
+    /// process-manager settlement token.
+    pub fn into_bound_ownership(self) -> std::result::Result<BoundBufferOwnership, Self> {
+        self.into_bound_owner()
+    }
+
     /// The device this allocation lives on (and whose EP must free it).
     pub fn device(&self) -> DeviceId {
         self.device
@@ -273,8 +441,138 @@ impl DeviceBuffer {
     /// [`DeviceBuffer::from_borrowed_parts`]) the pointer must **not** be freed;
     /// check [`is_borrowed`](DeviceBuffer::is_borrowed) first if the caller
     /// intends to free.
+    ///
+    /// # Panics
+    ///
+    /// For a **bound** buffer ([`DeviceBuffer::from_owning_allocation`]) this
+    /// panics rather than silently downgrading generation-checked ownership to
+    /// a bare address. Handing out the raw pointer alone would let a caller free
+    /// it without matching the binding identity or the allocation generation —
+    /// exactly the stale-pointer free the binding exists to prevent — while the
+    /// owner it left behind would quarantine the same bytes. Use
+    /// [`into_raw_with_owner`](Self::into_raw_with_owner) when the raw address
+    /// *and* the owner are both wanted, or
+    /// [`into_bound_owner`](Self::into_bound_owner) to take ownership back.
     pub fn into_raw(self) -> *mut c_void {
+        assert!(
+            !self.is_bound(),
+            "DeviceBuffer::into_raw: this buffer carries a binding-issued owning allocation, so \
+             returning the raw pointer alone would bypass binding-identity and allocation-\
+             generation validation on release. Use into_raw_with_owner or into_bound_owner."
+        );
         self.ptr.as_ptr()
+    }
+
+    /// Consume the handle, returning the raw pointer **together with** the
+    /// binding-issued owner when there is one.
+    ///
+    /// This is the explicit escape hatch [`into_raw`](Self::into_raw) refuses to
+    /// be: the caller receives the address and the generation-checked ownership
+    /// in the same step, so the release obligation travels with the pointer
+    /// instead of being dropped on the floor. `None` means the buffer was raw
+    /// owning or borrowed and the historical raw contract applies.
+    pub fn into_raw_with_owner(self) -> (*mut c_void, Option<BoundBufferOwnership>) {
+        let ptr = self.ptr.as_ptr();
+        match self.owner {
+            BufferOwner::Bound(owner) => (ptr, Some(BoundBufferOwnership::Binding(*owner))),
+            BufferOwner::Managed(owner) => (ptr, Some(BoundBufferOwnership::Managed(*owner))),
+            _ => (ptr, None),
+        }
+    }
+
+    /// Consume the buffer into its raw address and complete binding ownership.
+    pub fn into_raw_with_bound_ownership(self) -> (*mut c_void, Option<BoundBufferOwnership>) {
+        let ptr = self.ptr.as_ptr();
+        match self.owner {
+            BufferOwner::Bound(owner) => (ptr, Some(BoundBufferOwnership::Binding(*owner))),
+            BufferOwner::Managed(owner) => (ptr, Some(BoundBufferOwnership::Managed(*owner))),
+            _ => (ptr, None),
+        }
+    }
+}
+
+/// Complete binding-issued ownership carried by a [`DeviceBuffer`].
+#[derive(Debug)]
+pub enum BoundBufferOwnership {
+    Binding(OwningAllocation),
+    Managed(ManagedAllocation),
+}
+
+impl BoundBufferOwnership {
+    pub fn owner(&self) -> &OwningAllocation {
+        match self {
+            Self::Binding(owner) => owner,
+            Self::Managed(owner) => owner.owner_ref(),
+        }
+    }
+}
+
+/// Executor workspace allocation with any compatibility lease it still needs.
+///
+/// Manager-aware providers retain charges inside the buffer's managed owner and
+/// leave `lease` empty. The default adapter preserves the older
+/// reserve-then-allocate contract for providers not yet migrated.
+#[derive(Debug)]
+pub struct WorkspaceAllocation {
+    buffer: DeviceBuffer,
+    lease: Option<MemoryLease>,
+}
+
+static QUARANTINED_WORKSPACE_LEASES: std::sync::OnceLock<std::sync::Mutex<Vec<MemoryLease>>> =
+    std::sync::OnceLock::new();
+
+fn quarantine_failed_workspace_lease(lease: MemoryLease) {
+    eprintln!(
+        "execution provider workspace deallocation failed before physical release was proven; \
+         retaining its {} byte {:?} lease in compatibility quarantine",
+        lease.bytes(),
+        lease.tier()
+    );
+    QUARANTINED_WORKSPACE_LEASES
+        .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(lease);
+}
+
+#[cfg(test)]
+fn quarantined_workspace_lease_count() -> usize {
+    QUARANTINED_WORKSPACE_LEASES
+        .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .len()
+}
+
+impl WorkspaceAllocation {
+    pub fn new(buffer: DeviceBuffer, lease: Option<MemoryLease>) -> Self {
+        Self { buffer, lease }
+    }
+
+    pub fn buffer(&self) -> &DeviceBuffer {
+        &self.buffer
+    }
+
+    pub fn buffer_mut(&mut self) -> &mut DeviceBuffer {
+        &mut self.buffer
+    }
+
+    pub fn into_parts(self) -> (DeviceBuffer, Option<MemoryLease>) {
+        (self.buffer, self.lease)
+    }
+}
+
+impl std::ops::Deref for WorkspaceAllocation {
+    type Target = DeviceBuffer;
+
+    fn deref(&self) -> &Self::Target {
+        &self.buffer
+    }
+}
+
+impl std::ops::DerefMut for WorkspaceAllocation {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.buffer
     }
 }
 
@@ -393,6 +691,19 @@ pub trait HostToDeviceCopier: Send + Sync {
     unsafe fn copy_host_to_device(&self, src: &[u8], dst: *mut c_void) -> Result<()>;
 }
 
+/// Source-attributed device allocations made outside an EP's allocator seam.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RawDeviceAllocationSiteStats {
+    pub file: &'static str,
+    pub line: u32,
+    pub requests: u64,
+    pub requested_bytes: u64,
+    pub driver_allocations: u64,
+    pub driver_bytes: u64,
+    pub pool_hits: u64,
+    pub pool_hit_bytes: u64,
+}
+
 /// The core EP interface. Every backend crate implements this (§4.1).
 pub trait ExecutionProvider: Send + Sync {
     /// EP identifier (snake_case, e.g. `"cpu_ep"`, `"cuda_ep"`).
@@ -443,6 +754,29 @@ pub trait ExecutionProvider: Send + Sync {
         source: &dyn crate::MmapRegionSource,
     ) -> Result<Option<crate::PagedWeight>> {
         let _ = (key, weight, source);
+        Ok(None)
+    }
+
+    /// Prove routed-bank residency for a QMoE-family dispatch and mint a
+    /// guard the executor keeps alive for the kernel's lifetime, exactly like
+    /// [`Self::page_lazy_weight`]'s `PagedWeight`.
+    ///
+    /// `requirement` names what the caller (today, always
+    /// [`crate::RoutedResidencyRequirement::FusedRoutingUnknown`] — no QMoE or
+    /// BlockQuantizedMoE kernel in this codebase surfaces routed expert ids to
+    /// the host before or during dispatch) can prove before launch; `catalog`
+    /// is the same per-boundary [`onnx_runtime_loader::WeightRegionCatalog`]
+    /// `page_lazy_weight` callers already have from `expert_region_candidates`.
+    /// The default returns `None`: stock EPs (and the CUDA EP when offload is
+    /// disabled) never mint a guard and the executor does not gate resize on
+    /// one, matching every other lazy-weight default in this trait.
+    fn acquire_routed_residency(
+        &self,
+        key: u64,
+        requirement: crate::RoutedResidencyRequirement,
+        catalog: &onnx_runtime_loader::WeightRegionCatalog,
+    ) -> Result<Option<Box<dyn crate::RoutedResidencyGuardHandle>>> {
+        let _ = (key, requirement, catalog);
         Ok(None)
     }
 
@@ -565,6 +899,51 @@ pub trait ExecutionProvider: Send + Sync {
         Ok(allocation)
     }
 
+    /// Allocate executor workspace as one reserve/allocate/commit transaction.
+    ///
+    /// Providers with a process manager override this so the charge travels with
+    /// physical ownership through deferred release. The default is the existing
+    /// compatibility sequence for synchronous providers.
+    fn allocate_workspace(
+        &self,
+        size: usize,
+        alignment: usize,
+        role: MemoryRole,
+    ) -> Result<WorkspaceAllocation> {
+        let target_mapped = self.mapped_bytes_for_allocation(size, alignment)?;
+        let mut grant = self.prepare_mapped_growth(target_mapped, role)?;
+        let lease = match self.reserve_workspace(size as u64, role) {
+            Ok(lease) => lease,
+            Err(error) => {
+                drop(grant);
+                return Err(error);
+            }
+        };
+        let buffer = match grant.take() {
+            Some(grant) => self.allocate_with_mapped_growth(size, alignment, grant)?,
+            None => self.allocate(size, alignment)?,
+        };
+        Ok(WorkspaceAllocation::new(buffer, lease))
+    }
+
+    /// Replace executor workspace without granting the replacement until the
+    /// old allocation's provider-specific release boundary is satisfied.
+    ///
+    /// Synchronous providers use this default. Deferred providers override it
+    /// to await a structured release outcome with a finite deadline.
+    fn replace_workspace(
+        &self,
+        old: Option<WorkspaceAllocation>,
+        size: usize,
+        alignment: usize,
+        role: MemoryRole,
+    ) -> Result<WorkspaceAllocation> {
+        if let Some(old) = old {
+            self.deallocate_workspace(old)?;
+        }
+        self.allocate_workspace(size, alignment, role)
+    }
+
     /// Allocate device address space while committing only selected byte ranges.
     ///
     /// Providers whose allocator cannot reserve without committing should use
@@ -622,8 +1001,9 @@ pub trait ExecutionProvider: Send + Sync {
     }
 
     /// Release physical backing from a byte range in an existing allocation
-    /// while preserving its virtual address. Eager providers keep the default
-    /// no-op; lazy providers use this for transactional growth rollback.
+    /// while preserving its virtual address. Lazy providers use this for
+    /// transactional growth rollback. Eager providers return an actionable
+    /// unsupported error: unlike commit, decommit has no eager equivalent.
     /// Returns the bytes actually unmapped after shared references are applied.
     fn decommit_allocation_range(
         &self,
@@ -632,7 +1012,10 @@ pub trait ExecutionProvider: Send + Sync {
         bytes: usize,
     ) -> Result<u64> {
         let _ = (buffer, offset, bytes);
-        Ok(0)
+        Err(EpError::KernelFailed(format!(
+            "{}: partial decommit requires a VirtualBacking capability",
+            self.name()
+        )))
     }
 
     /// Physical bytes currently claimed by `buffer`. Eager providers return
@@ -643,6 +1026,27 @@ pub trait ExecutionProvider: Send + Sync {
 
     /// Free device memory.
     fn deallocate(&self, buffer: DeviceBuffer) -> Result<()>;
+
+    /// Release an executor workspace and then its compatibility lease.
+    ///
+    /// The default is only for providers whose `deallocate` settles synchronously.
+    /// An asynchronous provider must override this method and keep accounting
+    /// attached to its own structured settlement.
+    fn deallocate_workspace(&self, workspace: WorkspaceAllocation) -> Result<()> {
+        let (buffer, lease) = workspace.into_parts();
+        match self.deallocate(buffer) {
+            Ok(()) => {
+                drop(lease);
+                Ok(())
+            }
+            Err(error) => {
+                if let Some(lease) = lease {
+                    quarantine_failed_workspace_lease(lease);
+                }
+                Err(error)
+            }
+        }
+    }
 
     /// Free device memory and report mapped-zone bytes actually unmapped.
     ///
@@ -831,20 +1235,146 @@ pub trait ExecutionProvider: Send + Sync {
         Ok(false)
     }
 
-    /// Read (without clearing) any latching device-side capture-safety error a
-    /// captured kernel recorded during graph replay, as a raw violation bitmask
-    /// (zero when none). EPs without device graphs report no error.
+    /// Slot-parameterized [`begin_device_graph_capture`]. The default routes the
+    /// [`DeviceGraphSlot::Primary`] slot to the single-slot method and rejects
+    /// any other slot, so EPs that own only one captured graph are unchanged.
+    /// Multi-slot EPs (the CUDA EP) override this to record into the named slot.
     ///
-    /// The decode loop calls this at the per-step logits device→host sync so an
-    /// out-of-range bounds violation becomes a hard error before the produced
-    /// token is consumed, without adding a separate synchronization.
+    /// [`begin_device_graph_capture`]: ExecutionProvider::begin_device_graph_capture
+    fn begin_device_graph_capture_in(
+        &self,
+        slot: DeviceGraphSlot,
+        kernels: &[&dyn Kernel],
+    ) -> Result<()> {
+        match slot {
+            DeviceGraphSlot::Primary => self.begin_device_graph_capture(kernels),
+            other => Err(unsupported_graph_slot(self.name(), other)),
+        }
+    }
+
+    /// Slot-parameterized [`end_device_graph_capture`].
+    ///
+    /// [`end_device_graph_capture`]: ExecutionProvider::end_device_graph_capture
+    fn end_device_graph_capture_in(&self, slot: DeviceGraphSlot) -> Result<()> {
+        match slot {
+            DeviceGraphSlot::Primary => self.end_device_graph_capture(),
+            other => Err(unsupported_graph_slot(self.name(), other)),
+        }
+    }
+
+    /// Slot-parameterized [`abort_device_graph_capture`].
+    ///
+    /// [`abort_device_graph_capture`]: ExecutionProvider::abort_device_graph_capture
+    fn abort_device_graph_capture_in(&self, slot: DeviceGraphSlot) -> Result<()> {
+        match slot {
+            DeviceGraphSlot::Primary => self.abort_device_graph_capture(),
+            other => Err(unsupported_graph_slot(self.name(), other)),
+        }
+    }
+
+    /// Slot-parameterized [`replay_device_graph`].
+    ///
+    /// [`replay_device_graph`]: ExecutionProvider::replay_device_graph
+    fn replay_device_graph_in(&self, slot: DeviceGraphSlot) -> Result<()> {
+        match slot {
+            DeviceGraphSlot::Primary => self.replay_device_graph(),
+            other => Err(unsupported_graph_slot(self.name(), other)),
+        }
+    }
+
+    /// Slot-parameterized [`replay_device_graph_segment`].
+    ///
+    /// [`replay_device_graph_segment`]: ExecutionProvider::replay_device_graph_segment
+    fn replay_device_graph_segment_in(&self, slot: DeviceGraphSlot, index: usize) -> Result<()> {
+        match slot {
+            DeviceGraphSlot::Primary => self.replay_device_graph_segment(index),
+            other => Err(unsupported_graph_slot(self.name(), other)),
+        }
+    }
+
+    /// Slot-parameterized [`reset_device_graph`]. A multi-slot EP resets only the
+    /// named slot, leaving the other slot's installed graph intact.
+    ///
+    /// [`reset_device_graph`]: ExecutionProvider::reset_device_graph
+    fn reset_device_graph_in(&self, slot: DeviceGraphSlot) -> Result<bool> {
+        match slot {
+            DeviceGraphSlot::Primary => self.reset_device_graph(),
+            // No graph is ever installed in a non-Primary slot on a single-slot
+            // EP, so there is nothing to reset (mirrors `reset_device_graph`'s
+            // "no graph" return rather than erroring, so unconditional
+            // per-slot reset sweeps are safe on every EP).
+            DeviceGraphSlot::Verify => Ok(false),
+        }
+    }
+
+    /// Whether the named slot currently holds a replayable installed graph
+    /// executable.
+    ///
+    /// The executor uses this as a pre-replay liveness check: an installed graph
+    /// can be reset out-of-band (e.g. a kernel-variant eviction retires kernels
+    /// baked into a captured graph and resets its slot) while the executor's
+    /// host-side capture signature/schedule stays live. Replaying an emptied slot
+    /// would hard-error; querying this first lets the executor detect the
+    /// desync and re-warm/re-capture gracefully instead.
+    ///
+    /// The default reports `true` ("assume present, replay as usual") so EPs that
+    /// never lose an installed graph out-of-band keep their existing behavior;
+    /// only EPs whose slots can be emptied out-of-band (the CUDA EP) override this
+    /// with the real per-slot check.
+    fn has_device_graph_in(&self, slot: DeviceGraphSlot) -> Result<bool> {
+        let _ = slot;
+        Ok(true)
+    }
+
+    /// Clear the provider's latching device-side validation error.
+    ///
+    /// Session executors call this at top-level request boundaries. Implementations
+    /// must make the reset safe for both eager and captured execution; providers
+    /// without a device validation latch keep the no-op default.
+    fn reset_device_validation_error(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Read (without clearing) any latching device-side validation error as a
+    /// raw violation bitmask (zero when none). The compatibility name predates
+    /// deferred eager validation; EPs without device validation report no error.
+    ///
+    /// The caller must first establish a host synchronization boundary so all
+    /// kernels from the request have completed before this value is observed.
     fn check_device_capture_error(&self) -> Result<u32> {
         Ok(0)
     }
 
+    /// Consume any completed coarse-boundary route-telemetry window and apply
+    /// the resulting per-expert residency plan through the provider's existing
+    /// coarse-residency lifecycle (issue #1810 Slice 7C).
+    ///
+    /// This is a required part of the EP lifecycle contract — there is no
+    /// compatibility default, so every provider states its boundary behaviour
+    /// explicitly. Session executors call it **once per top-level request**, at
+    /// the single request-level host boundary that runs after [`Self::sync`] —
+    /// i.e. after every kernel and captured replay from the request has
+    /// completed and the stream is no longer capturing. It is never called per
+    /// token, per replay, or from a nested control-flow subgraph run.
+    ///
+    /// An EP with no coarse-residency lifecycle (every stock EP, and the CUDA EP
+    /// whenever device weight offload or the coarse-residency profile is
+    /// disabled — the shipped default) returns `Ok(())` and does nothing here.
+    /// A provider that participates must remain fail-closed and must perform no
+    /// mapping change during capture/replay — it reuses its own already-validated
+    /// safe-boundary authority to decide whether the boundary is safe before it
+    /// consumes or resets anything, and surfaces a typed outcome to its own
+    /// diagnostics rather than failing silently.
+    fn consume_route_residency_at_boundary(&self) -> Result<()>;
+
     /// Explicit device allocation/free counters, when the EP exposes them.
     fn device_allocation_counts(&self) -> Option<(u64, u64)> {
         None
+    }
+
+    /// Opt-in attribution for allocations made outside [`Self::allocate`].
+    fn raw_device_allocation_site_stats(&self) -> Vec<RawDeviceAllocationSiteStats> {
+        Vec::new()
     }
 
     /// Reserve governed bytes for executor-owned kernel workspace.
@@ -906,14 +1436,16 @@ pub trait ExecutionProvider: Send + Sync {
     /// If the tier cannot afford what the provider already holds. That is worth
     /// failing on: it says the model does not fit *before* the pool is used,
     /// rather than at an allocation somewhere unrelated later.
+    ///
     /// Whether the memory this provider hands out commits physically as it is
     /// used rather than when it is requested.
     ///
-    /// A forwarder, not a fact of its own: the property belongs to
-    /// [`DeviceAllocator::commits_on_demand`], and a provider should answer by
-    /// asking whichever allocator it is currently using. It is repeated here
-    /// only because a caller holding a session reaches the allocator through
-    /// the provider.
+    /// A forwarder, not a fact of its own: a provider should preserve the
+    /// selected allocator's explicit [`DeviceAllocator::commits_on_demand`]
+    /// signal. That signal requires both lazy physical mapping and governor
+    /// charging; optional `VirtualBacking` capability presence alone is not
+    /// enough. It is repeated here only because a caller holding a session
+    /// reaches the allocator through the provider.
     ///
     /// `false` is the safe default -- a consumer that believes `true` will
     /// under-reserve.
@@ -1042,6 +1574,30 @@ pub trait ExecutionProvider: Send + Sync {
     /// Block until all pending work on this EP completes.
     fn sync(&self) -> Result<()>;
 
+    /// Copy `bytes` device→device, from `src[src_offset..]` into
+    /// `dst[dst_offset..]`, both allocations owned by this EP.
+    ///
+    /// The default errors: only device EPs with a native device-to-device copy
+    /// (CUDA) implement it. Used by the speculative recurrent-state snapshot to
+    /// stage the destructive GDN/conv state into device scratch WITHOUT a PCIe
+    /// round-trip through host memory. The copy is stream-ordered on the EP's
+    /// compute stream, so it composes with the surrounding forward passes
+    /// (snapshot before the verify overwrites the state; restore before the
+    /// accepted-token re-advance) with no host synchronization.
+    fn copy_device_to_device(
+        &self,
+        _src: &DeviceBuffer,
+        _src_offset: usize,
+        _dst: &mut DeviceBuffer,
+        _dst_offset: usize,
+        _bytes: usize,
+    ) -> Result<()> {
+        Err(EpError::KernelFailed(format!(
+            "{}: device-to-device copy is not implemented",
+            self.name()
+        )))
+    }
+
     /// EP-specific optimization passes, run after the generic optimizer.
     fn custom_passes(&self) -> Vec<Box<dyn onnx_runtime_optimizer::OptimizationPass>> {
         Vec::new()
@@ -1080,6 +1636,13 @@ pub trait ExecutionProvider: Send + Sync {
             ep: self.name().to_string(),
         })
     }
+}
+
+/// Error for a graph-slot operation on an EP that does not own that slot.
+fn unsupported_graph_slot(ep: &str, slot: DeviceGraphSlot) -> EpError {
+    EpError::KernelFailed(format!(
+        "{ep}: device graph slot {slot:?} is not supported (this EP owns only the Primary slot)"
+    ))
 }
 
 fn is_control_flow_or_sequence(node: &Node) -> bool {
@@ -1189,6 +1752,396 @@ mod tests {
         assert!(backing.iter().all(|&b| b == 7));
         backing[0] = 9;
         assert_eq!(backing[0], 9);
+    }
+
+    /// A host-backed binding, so the bound-ownership contract can be exercised
+    /// without a device.
+    fn host_binding() -> onnx_runtime_memory_governor::MemoryBinding {
+        use onnx_runtime_memory_governor::{BindingRegistry, DeviceKey, HostAllocator};
+        use std::sync::Arc;
+
+        #[derive(Debug)]
+        struct Pin;
+
+        let registry = BindingRegistry::new().expect("registry");
+        let context = registry
+            .register_provider_context(DeviceKey::HOST, Arc::new(Pin))
+            .expect("provider context");
+        let authority = registry
+            .register_authority(DeviceKey::HOST, Arc::new(Pin))
+            .expect("authority");
+        let mechanism = registry
+            .register_allocator(context, authority, Arc::new(HostAllocator))
+            .expect("allocator");
+        registry.select(mechanism).expect("selection");
+        registry.bind(DeviceKey::HOST).expect("binding")
+    }
+
+    /// Give back the host bytes a test deliberately left quarantined.
+    ///
+    /// Quarantine is retention, not release: the runtime keeps the address and
+    /// discharges it only at confirmed context termination, which makes no
+    /// allocator call because the device state is gone by then. That is right
+    /// for device memory and wrong for the host heap, where nothing else ever
+    /// reclaims those bytes -- so a test that asserts quarantine happened is,
+    /// under Miri's leak check, a test that leaks. Rather than exempt these
+    /// tests from that check or weaken it globally, the test reclaims what it
+    /// asked the runtime to retain.
+    fn reclaim_quarantined(binding: &onnx_runtime_memory_governor::MemoryBinding) -> usize {
+        use onnx_runtime_memory_governor::{DeviceAllocator, HostAllocator};
+
+        let quarantined = binding.quarantined().expect("quarantine list");
+        for record in &quarantined {
+            let Some(ptr) = std::ptr::NonNull::new(record.address as *mut u8) else {
+                continue;
+            };
+            // SAFETY: the record carries the exact address, size and alignment
+            // `HostAllocator` handed out, the runtime has stopped tracking it as
+            // live, and quarantined ownership is by construction not aliased by
+            // any surviving handle.
+            unsafe { HostAllocator.deallocate(ptr, record.bytes, record.align) };
+        }
+        quarantined.len()
+    }
+
+    #[test]
+    fn a_bound_buffer_carries_the_owner_that_minted_it() {
+        let binding = host_binding();
+        let owner = binding.allocate_owning(256, 64).expect("owning allocation");
+        let identity = owner.identity();
+        let address = owner.as_ptr().as_ptr() as usize;
+        let buffer = DeviceBuffer::from_owning_allocation(owner, DeviceId::cpu());
+        assert!(buffer.is_bound());
+        assert!(!buffer.is_borrowed(), "a bound buffer owns its allocation");
+        assert_eq!(buffer.len(), 256);
+        assert_eq!(buffer.alignment(), 64);
+        assert_eq!(buffer.as_ptr() as usize, address);
+        assert_eq!(
+            buffer.bound_owner().expect("bound owner").identity(),
+            identity,
+            "the buffer never describes a different allocation than its owner"
+        );
+        // The only way ownership leaves the handle is the consuming extractor,
+        // and what comes back is the same generation-checked owner.
+        let BoundBufferOwnership::Binding(recovered) = buffer.into_bound_owner().expect("bound")
+        else {
+            panic!("plain binding owner changed representation");
+        };
+        assert_eq!(recovered.identity(), identity);
+        let outcome = recovered.release_now().expect("release");
+        assert!(outcome.is_complete());
+    }
+
+    #[test]
+    fn a_managed_buffer_keeps_charge_attached_to_bound_ownership() {
+        use onnx_runtime_memory_governor::{
+            AllocationPublication, AllocationRequest, DeviceKey, HostAllocator, LeaseLedger,
+            LedgerGovernor, MemoryGovernor, MemoryRole, ProcessMemoryManager, Tier,
+        };
+        use std::sync::Arc;
+
+        #[derive(Debug)]
+        struct Pin;
+
+        let manager = ProcessMemoryManager::new().unwrap();
+        let context = manager
+            .register_provider_context(DeviceKey::HOST, "host context", Arc::new(Pin))
+            .unwrap();
+        let governor = Arc::new(LedgerGovernor::new(LeaseLedger::new_for_device(
+            DeviceKey::HOST,
+            0,
+            1024,
+            0,
+        )));
+        let authority = manager
+            .register_authority(
+                DeviceKey::HOST,
+                "host authority",
+                Arc::new(Pin),
+                governor.clone() as Arc<dyn MemoryGovernor + Send + Sync>,
+            )
+            .unwrap();
+        let holder = manager
+            .register_holder(&authority, "workspace", None)
+            .unwrap();
+        let mechanism = manager
+            .register_allocator(
+                &context,
+                &authority,
+                "host allocator",
+                Arc::new(HostAllocator),
+            )
+            .unwrap();
+        let owner = manager
+            .bind_registered(&mechanism)
+            .unwrap()
+            .allocate(
+                AllocationRequest::managed(
+                    128,
+                    16,
+                    Tier::Host,
+                    MemoryRole::Workspace { step_scoped: false },
+                    holder,
+                    128,
+                ),
+                AllocationPublication::exclusive(128, 128, 128),
+            )
+            .unwrap();
+        assert_eq!(governor.used(Tier::Host), 128);
+        let buffer = DeviceBuffer::from_managed_allocation(owner, DeviceId::cpu());
+        assert!(buffer.is_bound());
+        assert!(buffer.managed_owner().is_some());
+        let BoundBufferOwnership::Managed(owner) =
+            buffer.into_bound_owner().expect("managed ownership")
+        else {
+            panic!("manager ownership changed representation");
+        };
+        owner.release_now().unwrap();
+        assert_eq!(governor.used(Tier::Host), 0);
+    }
+
+    #[test]
+    fn failed_workspace_deallocation_quarantine_keeps_compatibility_charge() {
+        use onnx_runtime_memory_governor::{
+            DeviceKey, HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor, MemoryRole, Tier,
+        };
+
+        #[derive(Debug)]
+        struct WorkspaceDeallocationEp {
+            fail: bool,
+        }
+
+        impl ExecutionProvider for WorkspaceDeallocationEp {
+            fn consume_route_residency_at_boundary(&self) -> Result<()> {
+                Ok(())
+            }
+
+            fn name(&self) -> &str {
+                "workspace-deallocation-test"
+            }
+
+            fn device_type(&self) -> DeviceType {
+                DeviceType::Cpu
+            }
+
+            fn device_id(&self) -> DeviceId {
+                DeviceId::cpu()
+            }
+
+            fn initialize(&mut self, _config: &EpConfig) -> Result<()> {
+                Ok(())
+            }
+
+            fn shutdown(&mut self) -> Result<()> {
+                Ok(())
+            }
+
+            fn supports_op(
+                &self,
+                _op: &Node,
+                _opset: u64,
+                _shapes: &[Shape],
+                _input_dtypes: &[DataType],
+                _layouts: &[TensorLayout],
+            ) -> KernelMatch {
+                KernelMatch::unsupported("unused test provider")
+            }
+
+            fn get_kernel(
+                &self,
+                _op: &Node,
+                _shapes: &[Vec<usize>],
+                _opset: u64,
+            ) -> Result<Box<dyn Kernel>> {
+                Err(EpError::KernelFailed("unused test kernel".into()))
+            }
+
+            fn allocate(&self, _size: usize, _alignment: usize) -> Result<DeviceBuffer> {
+                Err(EpError::KernelFailed("unused test allocation".into()))
+            }
+
+            fn deallocate(&self, _buffer: DeviceBuffer) -> Result<()> {
+                if self.fail {
+                    Err(EpError::KernelFailed(
+                        "injected workspace deallocation failure".into(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+
+            fn copy(
+                &self,
+                _src: &DeviceBuffer,
+                _dst: &mut DeviceBuffer,
+                _size: usize,
+            ) -> Result<()> {
+                Err(EpError::KernelFailed("unused test copy".into()))
+            }
+
+            fn copy_async(
+                &self,
+                _src: &DeviceBuffer,
+                _dst: &mut DeviceBuffer,
+                _size: usize,
+            ) -> Result<Fence> {
+                Err(EpError::KernelFailed("unused test async copy".into()))
+            }
+
+            fn sync(&self) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        fn borrowed_workspace(lease: MemoryLease, backing: &mut [u8]) -> WorkspaceAllocation {
+            // SAFETY: `backing` outlives the synchronous deallocation call, and
+            // the test EP never reads, writes, or frees the borrowed pointer.
+            let buffer = unsafe {
+                DeviceBuffer::from_borrowed_parts(
+                    backing.as_mut_ptr().cast(),
+                    DeviceId::cpu(),
+                    backing.len(),
+                    1,
+                )
+            };
+            WorkspaceAllocation::new(buffer, Some(lease))
+        }
+
+        let failed_governor =
+            LedgerGovernor::new(LeaseLedger::new_for_device(DeviceKey::HOST, 0, 1024, 0));
+        let failed_lease = failed_governor
+            .reserve(
+                Tier::Host,
+                64,
+                MemoryRole::Workspace { step_scoped: true },
+                HolderId::new(9),
+            )
+            .unwrap();
+        let before = quarantined_workspace_lease_count();
+        let mut failed_backing = vec![0_u8; 64];
+        let error = WorkspaceDeallocationEp { fail: true }
+            .deallocate_workspace(borrowed_workspace(failed_lease, &mut failed_backing))
+            .unwrap_err();
+        assert!(error.to_string().contains("injected"));
+        assert_eq!(quarantined_workspace_lease_count(), before + 1);
+        assert_eq!(
+            failed_governor.used(Tier::Host),
+            64,
+            "failed deallocation must not advertise unsettled bytes as free"
+        );
+
+        let success_governor =
+            LedgerGovernor::new(LeaseLedger::new_for_device(DeviceKey::HOST, 0, 1024, 0));
+        let success_lease = success_governor
+            .reserve(
+                Tier::Host,
+                64,
+                MemoryRole::Workspace { step_scoped: true },
+                HolderId::new(10),
+            )
+            .unwrap();
+        let mut success_backing = vec![0_u8; 64];
+        WorkspaceDeallocationEp { fail: false }
+            .deallocate_workspace(borrowed_workspace(success_lease, &mut success_backing))
+            .unwrap();
+        assert_eq!(
+            success_governor.used(Tier::Host),
+            0,
+            "successful synchronous deallocation must refund its outer lease"
+        );
+        assert_eq!(
+            quarantined_workspace_lease_count(),
+            before + 1,
+            "success and failure paths must not be swapped"
+        );
+    }
+
+    #[test]
+    fn a_raw_or_borrowed_buffer_has_no_bound_owner() {
+        let raw = host_alloc(64, 16);
+        assert!(!raw.is_bound());
+        assert!(raw.bound_owner().is_none());
+        // Failing to extract hands the buffer back untouched rather than losing
+        // it, which is what lets a generation-checked path fail closed.
+        let raw = raw.into_bound_owner().expect_err("not bound");
+        assert_eq!(raw.len(), 64);
+        host_free(raw);
+    }
+
+    #[test]
+    fn into_raw_refuses_to_strip_bound_ownership() {
+        let binding = host_binding();
+        let owner = binding.allocate_owning(128, 16).expect("owning allocation");
+        let buffer = DeviceBuffer::from_owning_allocation(owner, DeviceId::cpu());
+        // Handing out the address alone would let a caller free it without
+        // matching the binding identity or the allocation generation.
+        //
+        // Caught rather than `#[should_panic]` so the test can still run after
+        // the unwind: the buffer's `Drop` quarantines on the way out, and those
+        // host bytes are the test's to give back.
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = buffer.into_raw();
+        }))
+        .expect_err("into_raw must refuse a bound buffer");
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .expect("panic payload is a string");
+        assert!(
+            message.contains("would bypass binding-identity"),
+            "unexpected panic message: {message}"
+        );
+        assert_eq!(
+            reclaim_quarantined(&binding),
+            1,
+            "the refused buffer is retained, not silently freed"
+        );
+    }
+
+    #[test]
+    fn into_raw_with_owner_is_the_explicit_escape_hatch() {
+        let binding = host_binding();
+        let owner = binding.allocate_owning(128, 16).expect("owning allocation");
+        let expected = owner.as_ptr().as_ptr() as usize;
+        let buffer = DeviceBuffer::from_owning_allocation(owner, DeviceId::cpu());
+        let (ptr, owner) = buffer.into_raw_with_owner();
+        assert_eq!(ptr as usize, expected);
+        let BoundBufferOwnership::Binding(owner) =
+            owner.expect("the release obligation travels with the pointer")
+        else {
+            panic!("plain binding owner changed representation");
+        };
+        assert!(owner.release_now().expect("release").is_complete());
+
+        // A raw-owning buffer keeps the historical contract: no owner, and the
+        // caller still owes the free.
+        let raw = host_alloc(32, 8);
+        let (ptr, owner) = raw.into_raw_with_owner();
+        assert!(owner.is_none());
+        // SAFETY: reconstruct the exact `Box<[u8]>` leaked in `host_alloc`.
+        unsafe {
+            drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                ptr as *mut u8,
+                32,
+            )));
+        }
+    }
+
+    #[test]
+    fn dropping_a_bound_buffer_quarantines_instead_of_freeing() {
+        let binding = host_binding();
+        let owner = binding.allocate_owning(64, 16).expect("owning allocation");
+        let buffer = DeviceBuffer::from_owning_allocation(owner, DeviceId::cpu());
+        drop(buffer);
+        let quarantined = binding.quarantined().expect("quarantine list");
+        assert_eq!(
+            quarantined.len(),
+            1,
+            "a dropped bound buffer stays accounted for instead of being freed"
+        );
+        assert_eq!(quarantined[0].retained_bytes, 64);
+        assert_eq!(reclaim_quarantined(&binding), 1);
     }
 
     #[test]

@@ -7,7 +7,7 @@ use super::*;
 /// Locate the logits output selected by the resolved I/O contract.
 fn logits_output_index(session: &Session, logits_output: Option<&str>) -> anyhow::Result<usize> {
     let declared = logits_output.context(
-        "decoder logits role is unresolved; declare model.io.logits_output when output shapes are ambiguous",
+        "decoder logits role is unresolved; declare logits_output by giving the port the logits role in pipeline.workflow.components.<component>.ports.roles",
     )?;
     session
         .output_names()

@@ -20,8 +20,6 @@ pub(crate) mod kv_sizing;
 pub mod logits;
 mod memory_authority;
 #[cfg(feature = "native-backend")]
-pub mod native_component;
-#[cfg(feature = "native-backend")]
 pub mod native_decode;
 pub mod native_decode_device;
 #[cfg(feature = "native-backend")]
@@ -39,11 +37,12 @@ pub mod speculative;
 pub use onnx_genai_scheduler::SchedulerAdmissionError;
 
 pub use batched::{
-    BatchingCapability, ContinuousBatchAdmission, ContinuousBatchEvent, ContinuousBatchHandle,
-    ContinuousBatchManager,
+    BatchOccupancy, BatchingCapability, ContinuousBatchAdmission, ContinuousBatchEvent,
+    ContinuousBatchHandle, ContinuousBatchManager,
 };
 pub use connector_bridge::{ConnectorLookupOutcome, ConnectorStats};
 pub use embedding::{EmbeddingOptions, EmbeddingPooling};
+pub use engine::graph_port_contracts;
 pub use engine::{
     DecisionSource, DevicePolicy, DevicePolicyParseError, DryConfig, Eagle3Config, Engine,
     EngineConfig, EngineConfigError, EngineDecodeBackend, EngineGovernorError,
@@ -52,11 +51,11 @@ pub use engine::{
     KvConnectorBackend, KvConnectorConfig, LayerWeightBytes, LimitParseError,
     MemoryPolicyApplication, MemoryStrategy, MemoryStrategyDecision, MemoryStrategyPlan,
     MirostatConfig, MirostatVersion, MtpCacheScope, MtpConfig, MtpHiddenLayout, MtpWeightSource,
-    PrioritizedGenerateRequest, PrioritizedGenerateResult, RewindTokenCount, SamplingOverrides,
-    ScheduledGenerateArrival, SessionCheckpoint, SessionForkCapability, SessionId, SessionPosition,
-    SharedKvBinding, SharedKvProposerConfig, SpeculativeMode, TokenLogprob, WeightAccessPattern,
-    WeightPlacementReport, XtcConfig, parse_device_policy, parse_resource_limit,
-    resolve_device_vram_limit_bytes,
+    PackageCapabilityError, PrioritizedGenerateRequest, PrioritizedGenerateResult,
+    RewindTokenCount, SamplingOverrides, ScheduledGenerateArrival, SessionCheckpoint,
+    SessionForkCapability, SessionId, SessionPosition, SessionPrefillCarry, SpeculativeMode,
+    TokenLogprob, WeightAccessPattern, WeightPlacementReport, XtcConfig, package_capability_error,
+    parse_device_policy, parse_resource_limit, resolve_device_vram_limit_bytes,
 };
 pub use fim::{FimConfig, FimFormat};
 pub use logits::{
@@ -67,18 +66,20 @@ pub use memory_authority::{
     DeviceCompatibilityDomain, DeviceMemoryAuthority, MemoryAuthorityProvider,
 };
 #[cfg(feature = "native-backend")]
-pub use native_component::NativeComponentSession;
-#[cfg(feature = "native-backend")]
 pub use native_decode::{
     CudaGraphDebugStats, CudaKvDebugStats, NATIVE_DECODER_CAPTURED_STEP_INPUT_DECODES,
     NATIVE_SESSION_INCREMENTAL_PREFILL_TEST_HITS, NativeDecodeCudaOptions, NativeDecodeDevice,
-    NativeDecodeSession,
+    NativeDecodeSession, NativeRecurrentSnapshot,
 };
 pub use onnx_genai_kv::{
     Applicability, CachePriority, KvDType, KvNotApplicable, KvTelemetry, KvTelemetrySnapshot,
     LocalTieredConfig,
 };
 pub use onnx_genai_metadata::GenerationDefaults;
+/// Re-exported so every caller reads one classification. This is layer 1 —
+/// "this workflow executes one ONNX graph and that graph is a decoder" — and
+/// the loader's executor choice is layer 2 of the same classification.
+pub use onnx_genai_metadata::is_single_decoder_workflow;
 pub use onnx_genai_scheduler::{
     FixedCapacity, GovernorReconfigureOutcome, GovernorSnapshot, ResourceLimit, ResourceLimits,
     resolve_limit,
@@ -86,6 +87,7 @@ pub use onnx_genai_scheduler::{
 #[cfg(feature = "native-backend")]
 pub use onnx_runtime_ep_cpu::set_decode_thread_budget as set_cpu_decode_thread_budget;
 pub use onnx_runtime_memory_governor::MappedGrowthMetrics;
+pub use onnx_runtime_memory_governor::ProcessMemoryManager;
 
 /// Executor phase costs from the native runtime, as `(phase, total_ns, calls)`.
 ///
@@ -169,10 +171,9 @@ pub struct VmmArenaStats {
 #[cfg(feature = "native-backend")]
 pub use onnx_runtime_session::DecodePrecision;
 pub use pipeline::{
-    ImageOutput, ImageRequest, ImageStep, ImageStepCallback, ImageStream, IterativeOverrides,
-    PipelineEngine, PipelineGenerateRequest, PipelineSynthesis, PipelineTensors, Scheduler,
-    SchedulerFactory, SchedulerRegistry, is_missing_required_input,
-    validate_pipeline_backend_request,
+    AdapterActivation, AdapterLifecycleDiagnostic, AdapterSelection, EncodedAudio,
+    PipelineGenerateRequest, PipelineTensors, RowScopedState, RowTable, WorkflowSessionCheckpoint,
+    is_missing_required_input, validate_pipeline_backend_request,
 };
 pub use sampling::{CategoricalSampler, GreedySampler, Sampler};
 pub use speculative::{

@@ -2,9 +2,10 @@
 
 use crate::{
     CacheCheckpoint, Device, EvictionPolicy, KvCacheOps, KvError, SequenceId,
-    page_table::{KvQuantConfig, LayerTensorConfig, PageId, PageTable, PageTensorConfig},
+    page_table::{
+        KvQuantConfig, KvQuantPolicy, LayerTensorConfig, PageId, PageTable, PageTensorConfig,
+    },
 };
-use onnx_genai_metadata::KvCacheSpec;
 
 /// Borrowed per-layer K/V tensors for one token.
 ///
@@ -167,13 +168,17 @@ impl PagedKvCache {
         })
     }
 
-    /// Create a tensor cache using the KV precision policy in model metadata.
-    pub fn new_with_metadata(
+    /// Create a tensor cache using a runtime-owned KV storage precision policy.
+    ///
+    /// `native_dtype` is the graph-visible dtype at the model's past/present
+    /// ports; the policy is the runtime's deployment choice layered over it.
+    pub fn new_with_quant_policy(
         config: PageTensorConfig,
-        spec: &KvCacheSpec,
+        native_dtype: crate::KvDType,
+        policy: &KvQuantPolicy,
         num_gpu_pages: usize,
     ) -> Result<Self, KvError> {
-        let quant_config = KvQuantConfig::from_metadata(spec, config.num_layers)?;
+        let quant_config = KvQuantConfig::from_policy(policy, native_dtype, config.num_layers)?;
         Self::new_with_quant_config(config, quant_config, num_gpu_pages)
     }
 
@@ -195,6 +200,19 @@ impl PagedKvCache {
         self.next_seq_id += 1;
         self.page_table.create_sequence(id);
         id
+    }
+
+    /// Emit the token-major PagedAttention index tensors for `requests`.
+    ///
+    /// A read-only view over this cache's page authority; it never allocates,
+    /// frees, or mutates pages. See [`crate::PagedIndexPlan::build`] for the
+    /// exact contract and typed rejections. The caller must have appended the
+    /// query tokens (allocating their pages) before emitting their slots.
+    pub fn emit_paged_index_plan(
+        &self,
+        requests: &[crate::PagedRequest],
+    ) -> Result<crate::PagedIndexPlan, KvError> {
+        crate::PagedIndexPlan::build(&self.page_table, requests)
     }
 
     /// Append one token of per-layer K/V tensors at the sequence tail.
@@ -650,7 +668,10 @@ impl PagedKvCache {
     /// store transactionally, so [`restore_sequence`](Self::restore_sequence)
     /// brings back byte-identical KV and a preempted-then-restored sequence
     /// decodes the same tokens as if it had never been preempted. Both stores
-    /// remain host-backed emulation until Stage 3. Returns pages demoted.
+    /// are host-backed: "hot" and "cold" are declared residencies, not devices,
+    /// and they stay that way -- #721 stage 3 is superseded, so no in-crate CUDA
+    /// store is coming to make the hot tier device-resident. Returns pages
+    /// demoted.
     pub fn preempt_sequence(&mut self, seq: SequenceId) -> Result<usize, KvError> {
         // Validate the sequence exists so a bogus id surfaces as an error
         // rather than a silent no-op.
@@ -1314,9 +1335,9 @@ mod tests {
             })
         }
     }
-    use crate::{KvDType, KvKind, PageTensorConfig};
-    use onnx_genai_metadata::{
-        KvCacheSpec, KvComponentTolerance, KvQuantTolerance, LayerPrecisionOverride,
+    use crate::{
+        KvComponentPolicy, KvDType, KvKind, KvQuantAxis, KvQuantPolicy, LayerPrecisionRule,
+        PageTensorConfig,
     };
 
     fn config() -> PageTensorConfig {
@@ -2556,29 +2577,21 @@ mod tests {
     }
 
     #[test]
-    fn metadata_precision_policy_honors_overrides_and_sensitive_layers() {
-        let spec = KvCacheSpec {
-            native_dtype: Some("float8_e4m3fn".to_owned()),
-            quantization_tolerance: Some(KvQuantTolerance {
-                key: Some(KvComponentTolerance {
-                    default: Some("float8_e5m2".to_owned()),
-                    per_layer: Some(vec![LayerPrecisionOverride {
-                        layers: vec![1],
-                        min_precision: "fp16".to_owned(),
-                    }]),
-                    quantization_axis: Some("per_token".to_owned()),
-                }),
-                value: Some(KvComponentTolerance {
-                    default: None,
-                    per_layer: None,
-                    quantization_axis: Some("per_token".to_owned()),
-                }),
-            }),
-            sensitive_layers: Some(vec![0, -1]),
-            operations: None,
+    fn runtime_precision_policy_honors_overrides_and_high_precision_layers() {
+        let policy = KvQuantPolicy {
+            key: KvComponentPolicy {
+                default: Some(KvDType::Fp8E5M2),
+                per_layer: vec![LayerPrecisionRule {
+                    layers: vec![1],
+                    min_precision: KvDType::F32,
+                }],
+            },
+            value: KvComponentPolicy::default(),
+            high_precision_layers: vec![0, -1],
+            quantization_axis: KvQuantAxis::PerToken,
         };
 
-        let quant = KvQuantConfig::from_metadata(&spec, 4).unwrap();
+        let quant = KvQuantConfig::from_policy(&policy, KvDType::Fp8E4M3Fn, 4).unwrap();
         assert_eq!(
             quant.layer(0),
             Some(crate::LayerKvDType {
@@ -2614,7 +2627,7 @@ mod tests {
     }
 
     #[test]
-    fn sensitive_layer_storage_bypasses_fp8_quantization() {
+    fn high_precision_layer_storage_bypasses_fp8_quantization() {
         let config = PageTensorConfig {
             num_layers: 2,
             num_kv_heads: 1,
@@ -2622,13 +2635,12 @@ mod tests {
             page_size: 1,
             dtype: KvDType::Fp8E4M3Fn,
         };
-        let spec = KvCacheSpec {
-            native_dtype: Some("float8_e4m3fn".to_owned()),
-            quantization_tolerance: None,
-            sensitive_layers: Some(vec![1]),
-            operations: None,
+        let policy = KvQuantPolicy {
+            high_precision_layers: vec![1],
+            ..KvQuantPolicy::default()
         };
-        let mut cache = PagedKvCache::new_with_metadata(config, &spec, 1).unwrap();
+        let mut cache =
+            PagedKvCache::new_with_quant_policy(config, KvDType::Fp8E4M3Fn, &policy, 1).unwrap();
         let seq = cache.create_sequence();
         let token = vec![
             (vec![0.1, 0.2, 0.3, 0.4], vec![1.1, 1.2, 1.3, 1.4]),
@@ -2828,38 +2840,19 @@ mod tests {
     }
 
     #[test]
-    fn metadata_rejects_per_channel_quantization_axis() {
-        let spec = KvCacheSpec {
-            native_dtype: Some("float8_e4m3fn".to_owned()),
-            quantization_tolerance: Some(KvQuantTolerance {
-                key: Some(KvComponentTolerance {
-                    default: None,
-                    per_layer: None,
-                    quantization_axis: Some("per_channel".to_owned()),
-                }),
-                value: None,
-            }),
-            sensitive_layers: None,
-            operations: None,
+    fn runtime_policy_rejects_per_channel_quantization_axis() {
+        let per_channel = KvQuantPolicy {
+            quantization_axis: KvQuantAxis::PerChannel,
+            ..KvQuantPolicy::default()
         };
         assert!(matches!(
-            KvQuantConfig::from_metadata(&spec, 2),
+            KvQuantConfig::from_policy(&per_channel, KvDType::Fp8E4M3Fn, 2),
             Err(KvError::UnsupportedQuantizationAxis(axis)) if axis == "per_channel"
         ));
 
-        // per_token (and an unspecified axis) remain accepted.
-        let per_token = KvCacheSpec {
-            quantization_tolerance: Some(KvQuantTolerance {
-                key: Some(KvComponentTolerance {
-                    default: None,
-                    per_layer: None,
-                    quantization_axis: Some("per_token".to_owned()),
-                }),
-                value: None,
-            }),
-            ..spec
-        };
-        assert!(KvQuantConfig::from_metadata(&per_token, 2).is_ok());
+        // per_token, which is the default, remains accepted.
+        let per_token = KvQuantPolicy::default();
+        assert!(KvQuantConfig::from_policy(&per_token, KvDType::Fp8E4M3Fn, 2).is_ok());
     }
 
     #[test]

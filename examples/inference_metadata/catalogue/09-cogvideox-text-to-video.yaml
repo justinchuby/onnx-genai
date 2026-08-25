@@ -1,0 +1,252 @@
+# CogVideoX text-to-video denoising loop with a temporal latent and video output.
+schema_version: v1
+pipeline:
+  workflow:
+    manifest:
+      capabilities:
+      - workflow_ssa
+      - linear_effects
+      - typed_emit
+      - nested_control_flow
+      - loop_induction_values
+    inputs:
+      request.latent:
+        contract:
+          dtype: float32
+          rank: 5
+          shape:
+          - batch
+          - 16
+          - frames
+          - latent_height
+          - latent_width
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: request.latent
+        required: true
+      request.max_iterations:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - 1
+        role:
+          kind: runtime
+          version: '1.0'
+          role: max_iterations
+        source:
+          kind: request
+        required: false
+        default: 20
+      package.continue:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - 1
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: true
+      request.input_ids:
+        contract:
+          dtype: int64
+          rank: 2
+          shape:
+          - batch
+          - prompt_sequence
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: runtime
+          version: '1.0'
+          role: prompt_tokens
+        source:
+          kind: request
+        required: true
+    outputs:
+      video:
+        contract:
+          dtype: float32
+          rank: 5
+          shape:
+          - batch
+          - 3
+          - frames
+          - height
+          - width
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role: video
+        stage: pre_adapter
+    components:
+      denoiser:
+        implementation:
+          kind: onnx
+          artifact: cogvideox/denoiser.onnx.textproto
+        ports:
+          inputs:
+            sample:
+              dtype: float32
+              rank: 5
+              shape:
+              - batch
+              - 16
+              - frames
+              - latent_height
+              - latent_width
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            step:
+              dtype: int64
+              rank: 1
+              shape:
+              - 1
+            encoder_hidden_states:
+              dtype: float16
+              rank: 3
+              shape:
+              - batch
+              - prompt_sequence
+              - hidden
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            next_sample:
+              dtype: float32
+              rank: 5
+              shape:
+              - batch
+              - 16
+              - frames
+              - latent_height
+              - latent_width
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+      decoder:
+        implementation:
+          kind: onnx
+          artifact: cogvideox/decoder.onnx.textproto
+        ports:
+          inputs:
+            latent:
+              dtype: float32
+              rank: 5
+              shape:
+              - batch
+              - 16
+              - frames
+              - latent_height
+              - latent_width
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            video:
+              dtype: float32
+              rank: 5
+              shape:
+              - batch
+              - 3
+              - frames
+              - height
+              - width
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+      text_encoder:
+        implementation:
+          kind: onnx
+          artifact: cogvideox/text_encoder.onnx.textproto
+        ports:
+          inputs:
+            input_ids:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - prompt_sequence
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            encoder_hidden_states:
+              dtype: float16
+              rank: 3
+              shape:
+              - batch
+              - prompt_sequence
+              - hidden
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+    state:
+      latent:
+        contract:
+          dtype: float32
+          rank: 5
+          shape:
+          - batch
+          - 16
+          - frames
+          - latent_height
+          - latent_width
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        scope: invocation
+        initializer: request.latent
+        recurrence:
+          kind: invariant
+    steps:
+    - kind: loop
+      steps:
+      - kind: invoke
+        component: denoiser
+        inputs:
+          sample: latent
+          step: loop.iteration
+          encoder_hidden_states: conditioning.text
+        outputs:
+          next_sample: body.latent
+      continue_when: package.continue
+      max_iterations: request.max_iterations
+      carried:
+      - cell: latent
+        next: body.latent
+      iteration:
+        value: loop.iteration
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - 1
+      setup:
+      - kind: invoke
+        component: text_encoder
+        inputs:
+          input_ids: request.input_ids
+        outputs:
+          encoder_hidden_states: conditioning.text
+    - kind: invoke
+      component: decoder
+      inputs:
+        latent: request.latent
+      outputs:
+        video: decoded.output
+    - kind: emit
+      value: decoded.output
+      output: video
+      mode: replace

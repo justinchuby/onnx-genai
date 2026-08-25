@@ -1,28 +1,20 @@
-ir_version: 4
+ir_version: 11
 producer_name: "pytorch"
 producer_version: "1.1"
 graph {
   node {
     input: "input_mask"
+    input: "Unsqueeze_0_axes"
     output: "97"
     name: "Unsqueeze_0"
     op_type: "Unsqueeze"
-    attribute {
-      name: "axes"
-      ints: 1
-      type: INTS
-    }
   }
   node {
     input: "97"
+    input: "Unsqueeze_1_axes"
     output: "98"
     name: "Unsqueeze_1"
     op_type: "Unsqueeze"
-    attribute {
-      name: "axes"
-      ints: 2
-      type: INTS
-    }
   }
   node {
     input: "98"
@@ -125,14 +117,10 @@ graph {
   }
   node {
     input: "111"
+    input: "ReduceMean_15_axes"
     output: "112"
     name: "ReduceMean_15"
     op_type: "ReduceMean"
-    attribute {
-      name: "axes"
-      ints: -1
-      type: INTS
-    }
     attribute {
       name: "keepdims"
       i: 1
@@ -168,14 +156,10 @@ graph {
   }
   node {
     input: "115"
+    input: "ReduceMean_19_axes"
     output: "116"
     name: "ReduceMean_19"
     op_type: "ReduceMean"
-    attribute {
-      name: "axes"
-      ints: -1
-      type: INTS
-    }
     attribute {
       name: "keepdims"
       i: 1
@@ -437,14 +421,10 @@ graph {
   }
   node {
     input: "200"
+    input: "ReduceMean_104_axes"
     output: "201"
     name: "ReduceMean_104"
     op_type: "ReduceMean"
-    attribute {
-      name: "axes"
-      ints: -1
-      type: INTS
-    }
     attribute {
       name: "keepdims"
       i: 1
@@ -480,14 +460,10 @@ graph {
   }
   node {
     input: "204"
+    input: "ReduceMean_108_axes"
     output: "205"
     name: "ReduceMean_108"
     op_type: "ReduceMean"
-    attribute {
-      name: "axes"
-      ints: -1
-      type: INTS
-    }
     attribute {
       name: "keepdims"
       i: 1
@@ -658,14 +634,10 @@ graph {
   }
   node {
     input: "227"
+    input: "ReduceMean_131_axes"
     output: "228"
     name: "ReduceMean_131"
     op_type: "ReduceMean"
-    attribute {
-      name: "axes"
-      ints: -1
-      type: INTS
-    }
     attribute {
       name: "keepdims"
       i: 1
@@ -701,14 +673,10 @@ graph {
   }
   node {
     input: "231"
+    input: "ReduceMean_135_axes"
     output: "232"
     name: "ReduceMean_135"
     op_type: "ReduceMean"
-    attribute {
-      name: "axes"
-      ints: -1
-      type: INTS
-    }
     attribute {
       name: "keepdims"
       i: 1
@@ -970,14 +938,10 @@ graph {
   }
   node {
     input: "316"
+    input: "ReduceMean_220_axes"
     output: "317"
     name: "ReduceMean_220"
     op_type: "ReduceMean"
-    attribute {
-      name: "axes"
-      ints: -1
-      type: INTS
-    }
     attribute {
       name: "keepdims"
       i: 1
@@ -1013,14 +977,10 @@ graph {
   }
   node {
     input: "320"
+    input: "ReduceMean_224_axes"
     output: "321"
     name: "ReduceMean_224"
     op_type: "ReduceMean"
-    attribute {
-      name: "axes"
-      ints: -1
-      type: INTS
-    }
     attribute {
       name: "keepdims"
       i: 1
@@ -1191,14 +1151,10 @@ graph {
   }
   node {
     input: "343"
+    input: "ReduceMean_247_axes"
     output: "344"
     name: "ReduceMean_247"
     op_type: "ReduceMean"
-    attribute {
-      name: "axes"
-      ints: -1
-      type: INTS
-    }
     attribute {
       name: "keepdims"
       i: 1
@@ -1234,14 +1190,10 @@ graph {
   }
   node {
     input: "347"
+    input: "ReduceMean_251_axes"
     output: "348"
     name: "ReduceMean_251"
     op_type: "ReduceMean"
-    attribute {
-      name: "axes"
-      ints: -1
-      type: INTS
-    }
     attribute {
       name: "keepdims"
       i: 1
@@ -1503,14 +1455,10 @@ graph {
   }
   node {
     input: "432"
+    input: "ReduceMean_336_axes"
     output: "433"
     name: "ReduceMean_336"
     op_type: "ReduceMean"
-    attribute {
-      name: "axes"
-      ints: -1
-      type: INTS
-    }
     attribute {
       name: "keepdims"
       i: 1
@@ -1546,14 +1494,10 @@ graph {
   }
   node {
     input: "436"
+    input: "ReduceMean_340_axes"
     output: "437"
     name: "ReduceMean_340"
     op_type: "ReduceMean"
-    attribute {
-      name: "axes"
-      ints: -1
-      type: INTS
-    }
     attribute {
       name: "keepdims"
       i: 1
@@ -1724,14 +1668,10 @@ graph {
   }
   node {
     input: "459"
+    input: "ReduceMean_363_axes"
     output: "460"
     name: "ReduceMean_363"
     op_type: "ReduceMean"
-    attribute {
-      name: "axes"
-      ints: -1
-      type: INTS
-    }
     attribute {
       name: "keepdims"
       i: 1
@@ -1767,14 +1707,10 @@ graph {
   }
   node {
     input: "463"
+    input: "ReduceMean_367_axes"
     output: "464"
     name: "ReduceMean_367"
     op_type: "ReduceMean"
-    attribute {
-      name: "axes"
-      ints: -1
-      type: INTS
-    }
     attribute {
       name: "keepdims"
       i: 1
@@ -2036,14 +1972,10 @@ graph {
   }
   node {
     input: "548"
+    input: "ReduceMean_452_axes"
     output: "549"
     name: "ReduceMean_452"
     op_type: "ReduceMean"
-    attribute {
-      name: "axes"
-      ints: -1
-      type: INTS
-    }
     attribute {
       name: "keepdims"
       i: 1
@@ -2079,14 +2011,10 @@ graph {
   }
   node {
     input: "552"
+    input: "ReduceMean_456_axes"
     output: "553"
     name: "ReduceMean_456"
     op_type: "ReduceMean"
-    attribute {
-      name: "axes"
-      ints: -1
-      type: INTS
-    }
     attribute {
       name: "keepdims"
       i: 1
@@ -2257,14 +2185,10 @@ graph {
   }
   node {
     input: "575"
+    input: "ReduceMean_479_axes"
     output: "576"
     name: "ReduceMean_479"
     op_type: "ReduceMean"
-    attribute {
-      name: "axes"
-      ints: -1
-      type: INTS
-    }
     attribute {
       name: "keepdims"
       i: 1
@@ -2300,14 +2224,10 @@ graph {
   }
   node {
     input: "579"
+    input: "ReduceMean_483_axes"
     output: "580"
     name: "ReduceMean_483"
     op_type: "ReduceMean"
-    attribute {
-      name: "axes"
-      ints: -1
-      type: INTS
-    }
     attribute {
       name: "keepdims"
       i: 1
@@ -2569,14 +2489,10 @@ graph {
   }
   node {
     input: "664"
+    input: "ReduceMean_568_axes"
     output: "665"
     name: "ReduceMean_568"
     op_type: "ReduceMean"
-    attribute {
-      name: "axes"
-      ints: -1
-      type: INTS
-    }
     attribute {
       name: "keepdims"
       i: 1
@@ -2612,14 +2528,10 @@ graph {
   }
   node {
     input: "668"
+    input: "ReduceMean_572_axes"
     output: "669"
     name: "ReduceMean_572"
     op_type: "ReduceMean"
-    attribute {
-      name: "axes"
-      ints: -1
-      type: INTS
-    }
     attribute {
       name: "keepdims"
       i: 1
@@ -2790,14 +2702,10 @@ graph {
   }
   node {
     input: "691"
+    input: "ReduceMean_595_axes"
     output: "692"
     name: "ReduceMean_595"
     op_type: "ReduceMean"
-    attribute {
-      name: "axes"
-      ints: -1
-      type: INTS
-    }
     attribute {
       name: "keepdims"
       i: 1
@@ -2833,14 +2741,10 @@ graph {
   }
   node {
     input: "695"
+    input: "ReduceMean_599_axes"
     output: "696"
     name: "ReduceMean_599"
     op_type: "ReduceMean"
-    attribute {
-      name: "axes"
-      ints: -1
-      type: INTS
-    }
     attribute {
       name: "keepdims"
       i: 1
@@ -3044,14 +2948,10 @@ graph {
   }
   node {
     input: "718"
+    input: "ReduceMean_622_axes"
     output: "719"
     name: "ReduceMean_622"
     op_type: "ReduceMean"
-    attribute {
-      name: "axes"
-      ints: -1
-      type: INTS
-    }
     attribute {
       name: "keepdims"
       i: 1
@@ -3087,14 +2987,10 @@ graph {
   }
   node {
     input: "722"
+    input: "ReduceMean_626_axes"
     output: "723"
     name: "ReduceMean_626"
     op_type: "ReduceMean"
-    attribute {
-      name: "axes"
-      ints: -1
-      type: INTS
-    }
     attribute {
       name: "keepdims"
       i: 1
@@ -4181,6 +4077,162 @@ graph {
     data_type: 1
     name: "cls.predictions.transform.dense.weight_transposed"
     raw_data: "ye\216<\222\034\335\272>\201\245<\257=4;\340\313\323<\251$6\274\024\206C<\264\003\273<GC\030;\260\2263\274x\016\276<z\357\203<\2574\303\274\302\354>;\320\244\340<}r\005=7\376\010\2759A\202\274\246\002\272;\217m\240\274\001Ak<:|\220\274\324\202\334<\ty\013\275\346[z<\260\245\201\274g\322:<\323\"\256;\242D\302\274!s1=\364G\356;\355\t\021<Y\353H\274\204\004\233<Y\317H;O\347\305\272\tEk<\367\272\001\275\263\t7;\000u^\2742\252]<\014\260\213<\307;&\274g\037;\274\342A\310\274\312\255\244\273\367\354\303\2749^5\274\255\313\030\274\030\204\031<p\037\353;\323\353\256<M\3337\274u1B<U\217w\274j\036\262;\325a\241\274\002\334,<2\272\275;\306i \274B\204\312\274\325\374\375;\370\326\345<S\221\263;t!\273\273\327\266\203\273\244\002\321\274B\253\222<\205\007\357\274\027\013\270:\200Z0<\013\374\223\273\265\214\007\275\236]\007\273\211\026\r\275\323.\322\274\331\2368<\271\213\026<;m\342\274#\351s<L\223\232<\323\237\370\273^\002\270;2\237\343\274J\0227=ifR<\211\340\346\274\355\253\306\273\007\335\214<\344\204\224\272S\3222\272\356\311\253<\343\342\222\274\035\222\304\274\252^2\274\320I\005=\r\375\311<\302p\245\273=\004\031<\020\202\221<\'\034|<4\344\241<\335\340\207<\224\245\006=D\271\245\2740%\232;\246S\261;\311i\253<)\263a\274.@\202<K^\026\273^\335\367\272-\312\224<\277F!\274\264%7:\033\360F\274\236\3222<\255\270\231;i\233{<.\355\010\274\031\364h\272\363\253\357:}\005\003\275\225\355\273\273\246\376\317;\263\272\367:f\205\303;xv\365\274\037\375\214<I\331\007\274\324l\223\273\235\365\362\274\3360N=j\024\303;\r2\265<J\004b<\300\243\336\272 \242,:b\234\360<bv9<\322\002\025\275Ox\036;8N\030<U\334\350;f\375\341\273.]b<\334\313\312\274r\276\344\273Y*i;\237h\220\274sO\177\273\246N\275<\204.\004<\360\244-=\304\323]<\303^\351\274w\207\\\274\276\341\371<\331\"\355\274\n\2708=\316\251\340\274B)T\274\022\316\364:sj\272;[q\006<)[\004\274\345\313p\274P\256\222\274W<\367\274\n\335\354<4\305\247\274\346:\023\273\035\361\036\27543\035\272\266k\000=9c\204\2734\027\246;\326C&\273\340\260\013\274\341u\270\274\365\234\266\274\0029\337\274\036\350\344;WEg;a\177)<\3354\020=\257\306\025<\364\274\354;\307\351\037<\355\241\252\274Te\216;\362:H\274\262\323\264<\251|\313\274\220\002\"<5-\227\274z\324\027;\025\3134<\017\372\301\274\007\376\222\273\213\221\326\271\325\236\306;\336\272\001=e\374*\274\300\345y\274\nf\344\274|1\203\274.\212\262\274\224H\321\273&l\026\275tb\346;R\205\032<^\266|\273\033?\2319//\225<xV\252\2747\327\204\274T\326\267\274\213&{\273\246H\002<\246\241\267\274_d\203\275\234\254\021;\343\231\016\274\235\222\303\274\347\020\243<\244\010\273;\2274\036<\254\267\\:\265\3146\275\374\030\005\275y\356\257<\244t\201:i\033\025\274\316\226\377\273\302`\177<\375uY={99\275P\371g<\242\r\005\2724\256\203<\337\230\225;\203\177\212<$\364\234\274\n|\261<$oc<\347X\337\274\006\324\021=\251\350?:\223\360\224:\266\033\206<.\336\245\274\200i\0248o\355K\274\305\2215:\247\364\266\273\3275\254\274\333\344\002\274Nk\320\274t\346\351\274d\000C\274O\340\007\274n\274G\273\225?\006\275\241\267\220<dE]<\'Z]\274\206^B<\017\004V\274\357\2157\274\343*k;\227\021[;\347\355\033\274_!\007<X4\306\271\324\206\231\2732\230\226\273\277\212\207<Y\226\365<\nx\312\273N\370\222;\351\2212;\301\354\311\273^\031\006\275K\206\032;\027\024\347\274\240,.=\260\217\235\274\027E*<\270\225b<\t\2007<\207\315\264\273\251\030\t\270\346l\3119\250\262\225\274{\2610\274].\004\274kw\027\274\020\221z\274\230\371$\2749\333\035=\201\315\341\273\351\366\345\274u\273W<e\2072=\222.\310<\212\365\332<\373$\222\272!0:\274/\307\367;\3518\254\274\256\327n<\001\306e\274\273\312\273\273\253\230\272;s\026`\271!\031)\271\324!R;\242U\265\274U\030\021<Lq!<\361\303\214\274N\027a<Bh\245;\205\002~\274\330N\252<\213\241\252;\367\006\217\273\277P\233\273.c\245\273\252\030\223;+[\026<O\013$<\347g\304\274\270\033C;=\212\244<o<Q\273c{j<\215\334E<\316E\207;W\253*=\313V\321\272\260\021\243;b4\005\275\322\215\030\275\311\352\202:\245tG<l\350r<\305a\360\274!\352\031\274\276{\027\2742\361\257<2\025\006=\311\230\220<\264\255\3457\2417\264;{\022\234\274\263\0147<~\356\204\273\001\255\314\274\035\3126\274\253g\331<\257;m\274\217\004Y<=@7;\034>>\274\r[7\275\234\317\002=\004dR\274m\361\232:\315&B\274\263o\300\274]\267\n\274\013k\310\274_\215\003\274tq\306<\302\036/=\367`Z<=\251\276<X\027\326<j\014\311<\204\312\320;\353e&<\315(\247\273\264\327\213<\345L\264:\2757\375\273p{\316\274\245\233\"\274\200\306\016<\342{\330\274\364\342\270<\246~K;R\366x\274\177\250\024\275 -\020\274\222\225\233\272\030N\'\273\031mj\274\304\245\006<TV\355:\223\265\346;\351\005\306\273T\r\037\274\362\215\216\274/q\302:K\010;=3p\207\273\246>\204<\026\344\002=/O\315\274\353m\331<TS$\275\371F\036\272\000U\036\273\024\t\352\274@\276\257\270\306\346\301;P_9<\356 \323<\031>N\274\223<U\275Y\247\004=\335\227\310\272\207\014\234\273\017@\214\274\014Qx<\304%P<\307[\037<.\205\320\2706\023\224\274\305\241N=Y\002\032\274\300\312a;\'\242\240<o\021\305\274I\350\217\274\215\302\237\273\341\020\255<\002T\036\2745\224\343:\027-9<\252/*\272\t\260\277\274\217\253\342\274\306\022t<}\030\337\274\313\265I\274\365j\270\274\245t\036<\230\271\230<\220v\214\273\325l\367;$\305E\274\3001\032\274D\262:\274\233\203\026=El\326<Y`\215\274\311\024\327<\'\332\307\274\371\220N\273\357\300v<<\322\264<}\027A\274\326\277\203\272\247y\261<\035O\322;v]\200<\374\332\301\272A/\r<\273\313\331\274\333\261h\274\342\223\302\274)X\026=\266\231\231\274R\020\220<\300rU;\217\001\272\274\036\345\241\273\027\354\t\275\263\365\257\273\025\331e<E\247\306\273\251\037C;$aR<[A,<\223\310\271\273\235b\017\274\001\237\202<\013\303\266<k\330\225\273\202\274^:\202y\227<\306\365\006\274&\003x\274\275\r%=\371Z\t\275\350g\230;\014\026\316\273\214\272\206\274\201\322b\274\335\314\'=\306\371B<2\364\243\274P4\343;!\014%;\"l\203<>\335t<\270~\006\2758\325<<\367\361\237<z\005\203<9;y\273\004\373\'\274\363_\250<\001J;\274\017\344\330\273.\340[<\227\305\000=\373D\253;V\251\234<[\023p9\340\002\366:\2704\244<uY\001=\322<\250:x\3152;>\325\262\272sW\320\273\001\261\246<\340\365\202;\313\240)\275\212bb<\253,X\274+T;\273\260q\014<\0030\231\274\302\336$<A\n\237;\233\311\002=\335\262\215\274\020\253;<8+\003=\030F\370;x\224!<\306\255\217\274\260\257(=\313\326\002=\'j\251<l]\000\275\360\372\223\2746\257 \274\213\203\003=\242\257\323\273\340}\035=\004\327G<D\202+= \202#\274.\000\370<lE\343\274\311\266^\274\275\314\267\274r7%\274\334G\205\274\300\022\024=\024\324\367<vs\205<G\277\240\274?\003\214;\327d\254\274U\210\350\272T\361\204\274\375\337\235<&\177\034;\327\336\n9\274\017r<\005\202\022\274\025C\274<\273\220\005<k\372}9g\362\336<Do]\275V\244\227\273\222[\030;t\004\232;\273^#<I(\236:\320\260\307:x\304\332\273\373\216\323\273\275\n\255<\336O[;\274\312\016<\016\r\316\273\3246b\275\205\000\377<\306\004\232\274\341\001\353\273\357\372\006=\366V$\275\207y\371<\240d\237<\007B\227:ab\211<\r\246@\274~\205k<\273\217\013\274\231\370\353\273\310{\235\273\375+6<\220\202\010=80\220\274\013\212:<\256zN\274\200\211\005=\231\210\221\274\241\207\342;\336\271\234\2748\177v\272\'\005o\272\033D(=\300\233\221\274\224\364d<\320\027\357;\316\302\232;r\277\036<\257J =Dy\260<WS\n\275o\002\023\274\225\213\r\275\325\216\261<\334@a\274\344l\266<E\262I<7\317\253<\202@5<\000\334\250\274\t\362\320<\201\344\247:\314V\224<b^\266\273I2\"\275a\356R< \016\265\274\315\363\236\273\"\234\001=\273@\246<\253\301\226\274<\t\202;\276F\312;\242\023%\274\235e\202;\025\325\212<\207\333\305\273\215\235\230\272\252\250\337<\375/};\323_N<\337\003\202\274*\375\247;\3421~\274\355\246\007=\305\023[\275y\275\266\273<\211\014\274\324\251+<\371\226\214\273i\307\016\275\363\322*\274\347\266\'\274\362\354*<\013+\212<\305\232\244<\307\204\327;\027R=<\022:\232\274+U\337\273B\316-;2g\016\275\0304A<\310L\206<\367\013\362\273\\\233\315\274\363{\312\274\233\264\275\267B\236\235;Ton\273\262D\030\275}S\007\272\344v\345<\215\275+<W\331\262<\r\n\273;9H\203<{\r!\274\211E=\275\305\301N\2734\036\217\275d\263^\273\247h1\274\323w\270\272\312\220\342:\t7\025<\2673\362\273\206o\016<\004F\345\271\367\222+<\333?$\273\355\301D=\231ie<\351B,\274Y\213\223<\220\000!:\355\320\2659ch\375<\312Y\212:\331G2\274\2625T\274\375)^<\275J\014\274\033U\027=\2458\245\274\373\216\245;\"\306\302\273eX\202<\300\317\313\274+s\345;MU\033=G\344Z<&\264\325\2748t\331<\030\022\035\274g\303\244;\271\327@<\267\223\224<\335\003\221<;\371\207<\220;\264<)\350\376\2732\240\263\273>K%<\000\355\002=\322s4=2\204P\275\031\037\214\274\320\223\264\274b\177A=\026\355\204;\223N\010\275)0s\274\305\025\304\273ff\263<4[\246</m\247\274\013jb\273\275\3175\274\034,(<\005]\314\273=0\002\275\352aq\274\367g\336;!\000;\273\304\3005\274\362d09\322\364\030;\276\200\277;\365\311\264;\347)\336\273\245\r\262\274\220\247\316:[\274#<\247\272\212\272\004\253\301\273\231\322\347\273\204KB<\345\202\270\274\346\221\004<tY\026\274\311\225\000\275\226\337\002\275\357\367\240<\004\263\241;\2173\004<\227\206\262\274\265\257\324\274\302\034\213;N\227\244;}\202%\2754\242\325<\303\377\3739\265\307y<+\t\313<`o\307\273@u;<\253\203\273<\274\215\262\274a\201\000<\020\346\026\274R\021\304<\032l\016\275\204A>\275\371\010$\274y\365\314;\032\355\n\274\307m\305\274\347\003z\274d~>\274D\364\226<\t\224\r\275\315#\213<\335S\r\275\037\274\t;\260\013\322\274;\264\212<.\034\326:\030\313\001\275\201\035\237\274\244\003\250\274@\350#\274\327~\236\274\036\2365\274*\212\350<|i\215\274O~\210<\223\344\037\274\236\305\314\273V\267\024\275y\3534\274n\216d<\227\232\020=U\345B;\342i\023\274 \rz\273\333r\021\274ni\201\274\262\254\210<\031-\332\274]g\006;J\031\016\275\216:\316\274jS\317\274\211(\343<\001_\013\274[V\003=\273!@<\335\223\325<\033\3474\274~\300s\274\361\031\"<D#\007\274\364>\331<t+~<\362\322\351\274\360\017z\275\207\325\223:\307\037\227\274\035\017\267<\240\217\365\273\223!\271\274\271|C<\3304\311\273*,\312<\034\022U\274&\325\006\272\247\251\336<\252>/<\326g\033=\n~\266<]\027q\274\025\205\262;;\374E<\204\230\036;\t\006y<\324\216\027=\2533\330\274R\371\022<\005S\230;dD\001:/\2222\274\271MS\274\322F\220;\341U\341\274A\023Q\274\352q\316\274\271\245)9;Y\365<;\314\213<\343\374\037\273\273\275\211<g|2\275\211|P;\340\316?;\204\t\316<\017\277 \274k$\360\273A\201\275\273\006\245\271\274\220a\210\274\223\262\371\273\004\300\230\274\333\217T<\t\214\031=\241\233r\274\200\311\020=xS\277<\215\244\214\273\225\341\200\273\250\351\036<\024#\215<\016\315\256<\251\202>=_n\210<J\306\345\274G\333\003\275\311K\254\273,L\177\272\033\273\311<\203\002\216<u\267\355\274\305\027\363<\200\212\204\273\031\307\270:CSu;\331\211\236<\251O\004=\211l\017\274fZ\372\273\202\021\320<RZ\005<)\234G<k\014\325<{\025\321<\373\2656\275aY\001=\351\266\340\274\220Z\351\273\222t\243\273[\265\237;I\013\336;Ww1:\262\350\037;\024\225s<\256s6\272\206-\020\274\206>\200\274\320\307\251\273=\270g<\324\375\334<A\237\371\273\027\362\311<+x\376\273y8o<gQq\275@\210\232\274\276\245h\274\356;\343<\342\253\334\273\ns\257\274a\370\027<e\230\346<R\372Q\274\000I\341\2735\231\313\274\334\325Y\274f\"\201:\371\205\017=\243\244\n\275\002\030\371\273Z\004\035<4\322*\273\346b\202\274\205u\n<@\r\201<DdQ\274|\210&\274\234>\262<]\2248<\020\246\233\273\256\342,\273\322\'\004\275\340\022\317\274E\025\267\274\000F\002\2738\270I\275\r\2116\274\217\312\353\271\316x\017<\322KM<\363\361:\274\311\341`\274FM\277\273|,\026\275\305\332\332<\372\340\235<[\005\243;%\212P<\257\303\204:\262\344\274;\231v\365<\355$\242\273\236-d<\007j\021\274\247\265\035\2754_U\274Vh\220<\371x\234;\320\270\032=aB/\274\0342(\274YvQ<\266\320\210=\202\337\365<\307\324S<\367\245b<\316]\243\273\256*!=\t\246\252\273\001\373\341<\327\203\274<\264f\025\275\224\235%\275\336\026 \275"
+  }
+  initializer {
+    dims: 1
+    data_type: 7
+    name: "Unsqueeze_0_axes"
+    raw_data: "\001\000\000\000\000\000\000\000"
+  }
+  initializer {
+    dims: 1
+    data_type: 7
+    name: "Unsqueeze_1_axes"
+    raw_data: "\002\000\000\000\000\000\000\000"
+  }
+  initializer {
+    dims: 1
+    data_type: 7
+    name: "ReduceMean_15_axes"
+    raw_data: "\377\377\377\377\377\377\377\377"
+  }
+  initializer {
+    dims: 1
+    data_type: 7
+    name: "ReduceMean_19_axes"
+    raw_data: "\377\377\377\377\377\377\377\377"
+  }
+  initializer {
+    dims: 1
+    data_type: 7
+    name: "ReduceMean_104_axes"
+    raw_data: "\377\377\377\377\377\377\377\377"
+  }
+  initializer {
+    dims: 1
+    data_type: 7
+    name: "ReduceMean_108_axes"
+    raw_data: "\377\377\377\377\377\377\377\377"
+  }
+  initializer {
+    dims: 1
+    data_type: 7
+    name: "ReduceMean_131_axes"
+    raw_data: "\377\377\377\377\377\377\377\377"
+  }
+  initializer {
+    dims: 1
+    data_type: 7
+    name: "ReduceMean_135_axes"
+    raw_data: "\377\377\377\377\377\377\377\377"
+  }
+  initializer {
+    dims: 1
+    data_type: 7
+    name: "ReduceMean_220_axes"
+    raw_data: "\377\377\377\377\377\377\377\377"
+  }
+  initializer {
+    dims: 1
+    data_type: 7
+    name: "ReduceMean_224_axes"
+    raw_data: "\377\377\377\377\377\377\377\377"
+  }
+  initializer {
+    dims: 1
+    data_type: 7
+    name: "ReduceMean_247_axes"
+    raw_data: "\377\377\377\377\377\377\377\377"
+  }
+  initializer {
+    dims: 1
+    data_type: 7
+    name: "ReduceMean_251_axes"
+    raw_data: "\377\377\377\377\377\377\377\377"
+  }
+  initializer {
+    dims: 1
+    data_type: 7
+    name: "ReduceMean_336_axes"
+    raw_data: "\377\377\377\377\377\377\377\377"
+  }
+  initializer {
+    dims: 1
+    data_type: 7
+    name: "ReduceMean_340_axes"
+    raw_data: "\377\377\377\377\377\377\377\377"
+  }
+  initializer {
+    dims: 1
+    data_type: 7
+    name: "ReduceMean_363_axes"
+    raw_data: "\377\377\377\377\377\377\377\377"
+  }
+  initializer {
+    dims: 1
+    data_type: 7
+    name: "ReduceMean_367_axes"
+    raw_data: "\377\377\377\377\377\377\377\377"
+  }
+  initializer {
+    dims: 1
+    data_type: 7
+    name: "ReduceMean_452_axes"
+    raw_data: "\377\377\377\377\377\377\377\377"
+  }
+  initializer {
+    dims: 1
+    data_type: 7
+    name: "ReduceMean_456_axes"
+    raw_data: "\377\377\377\377\377\377\377\377"
+  }
+  initializer {
+    dims: 1
+    data_type: 7
+    name: "ReduceMean_479_axes"
+    raw_data: "\377\377\377\377\377\377\377\377"
+  }
+  initializer {
+    dims: 1
+    data_type: 7
+    name: "ReduceMean_483_axes"
+    raw_data: "\377\377\377\377\377\377\377\377"
+  }
+  initializer {
+    dims: 1
+    data_type: 7
+    name: "ReduceMean_568_axes"
+    raw_data: "\377\377\377\377\377\377\377\377"
+  }
+  initializer {
+    dims: 1
+    data_type: 7
+    name: "ReduceMean_572_axes"
+    raw_data: "\377\377\377\377\377\377\377\377"
+  }
+  initializer {
+    dims: 1
+    data_type: 7
+    name: "ReduceMean_595_axes"
+    raw_data: "\377\377\377\377\377\377\377\377"
+  }
+  initializer {
+    dims: 1
+    data_type: 7
+    name: "ReduceMean_599_axes"
+    raw_data: "\377\377\377\377\377\377\377\377"
+  }
+  initializer {
+    dims: 1
+    data_type: 7
+    name: "ReduceMean_622_axes"
+    raw_data: "\377\377\377\377\377\377\377\377"
+  }
+  initializer {
+    dims: 1
+    data_type: 7
+    name: "ReduceMean_626_axes"
+    raw_data: "\377\377\377\377\377\377\377\377"
   }
   input {
     name: "input_ids"
@@ -5596,6 +5648,344 @@ graph {
     }
   }
   value_info {
+    name: "Unsqueeze_0_axes"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "Unsqueeze_1_axes"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "ReduceMean_15_axes"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "ReduceMean_19_axes"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "ReduceMean_104_axes"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "ReduceMean_108_axes"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "ReduceMean_131_axes"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "ReduceMean_135_axes"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "ReduceMean_220_axes"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "ReduceMean_224_axes"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "ReduceMean_247_axes"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "ReduceMean_251_axes"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "ReduceMean_336_axes"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "ReduceMean_340_axes"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "ReduceMean_363_axes"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "ReduceMean_367_axes"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "ReduceMean_452_axes"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "ReduceMean_456_axes"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "ReduceMean_479_axes"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "ReduceMean_483_axes"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "ReduceMean_568_axes"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "ReduceMean_572_axes"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "ReduceMean_595_axes"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "ReduceMean_599_axes"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "ReduceMean_622_axes"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "ReduceMean_626_axes"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  value_info {
     name: "106"
     type {
       tensor_type {
@@ -5614,5 +6004,5 @@ graph {
 }
 opset_import {
   domain: ""
-  version: 12
+  version: 24
 }

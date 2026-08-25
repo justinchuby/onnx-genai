@@ -1172,8 +1172,10 @@ mod tests {
     fn read_f32(buffer: &DeviceBuffer) -> Vec<f32> {
         buffer
             .as_slice()
-            .chunks_exact(4)
-            .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|bytes| f32::from_le_bytes(*bytes))
             .collect()
     }
 
@@ -1447,7 +1449,12 @@ mod tests {
                 *value += *partial;
             }
         }
-        let expected: Vec<Vec<u8>> = reduced.chunks_exact(2).map(f32_bytes).collect();
+        let expected: Vec<Vec<u8>> = reduced
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| f32_bytes(c))
+            .collect();
         let world = InProcessCommunicator::world(shards.len());
         let handles: Vec<_> = world
             .into_iter()
@@ -1714,8 +1721,10 @@ mod tests {
                     ))
                     .unwrap();
                     recv.as_slice()
-                        .chunks_exact(4)
-                        .map(|bytes| i32::from_le_bytes(bytes.try_into().unwrap()))
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|bytes| i32::from_le_bytes(*bytes))
                         .collect::<Vec<_>>()
                 })
             })

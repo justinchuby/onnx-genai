@@ -35,7 +35,7 @@
 //!   --features cuda,native-backend --test qwen35_0_8b_hybrid_native_cuda_e2e \
 //!   -- --ignored --nocapture
 //! ```
-#![cfg(all(feature = "cuda", feature = "native-backend"))]
+#![cfg(feature = "native-cuda")]
 
 use std::path::{Path, PathBuf};
 
@@ -91,7 +91,7 @@ fn generate(dir: &Path, native_decoder_device: Option<&str>) -> anyhow::Result<V
     }
 
     let result = (|| {
-        let mut engine = Engine::from_pipeline_dir(dir, EngineConfig::default())?;
+        let mut engine = Engine::from_dir(dir, EngineConfig::default())?;
         let mut request = GenerateRequest::new(GeneratePrompt::Text(PROMPT.to_string()));
         request.options.max_new_tokens = MAX_NEW_TOKENS;
         request.options.temperature = 0.0;

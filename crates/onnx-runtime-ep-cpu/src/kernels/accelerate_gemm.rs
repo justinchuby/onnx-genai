@@ -940,7 +940,7 @@ pub fn neon_thin_m_gemm_col_parallel(
 /// Checks: M in 2..=THIN_M_MAX and K×N exceeds the streaming threshold.
 #[inline]
 pub fn thin_m_gemm_eligible(m: usize, k: usize, n: usize) -> bool {
-    m >= 2 && m <= THIN_M_MAX && k.saturating_mul(n) > THIN_M_LARGE_B_THRESHOLD
+    (2..=THIN_M_MAX).contains(&m) && k.saturating_mul(n) > THIN_M_LARGE_B_THRESHOLD
 }
 
 /// Compute a tile of C columns [j0..j0+jn] for all M rows, writing into a

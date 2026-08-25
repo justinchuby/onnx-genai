@@ -137,7 +137,7 @@ pub(crate) fn quantize_fp4_e2m1_block(
         .ok_or_else(|| error("FP4 E2M1 E8M0 scale exponent is out of range"))?;
     *scale_exponent = exponent as u8;
     let scale = 2.0f32.powi(scale_power);
-    for (pair, destination) in input.chunks_exact(2).zip(packed.iter_mut()) {
+    for (pair, destination) in input.as_chunks::<2>().0.iter().zip(packed.iter_mut()) {
         let low = encode_e2m1((pair[0] / scale).clamp(-6.0, 6.0));
         let high = encode_e2m1((pair[1] / scale).clamp(-6.0, 6.0));
         *destination = low | (high << 4);

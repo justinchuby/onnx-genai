@@ -63,11 +63,7 @@ impl Engine {
             .session
             .as_deref()
             .context("embeddings are not supported by the native decoder backend")?;
-        let io = self
-            .metadata
-            .model
-            .as_ref()
-            .and_then(|model| model.io.as_ref());
+        let io = self.metadata.decoder_io();
         let mut decode_state = DecodeState::new_with_io(session, io)
             .context("failed to initialize embedding model inputs")?;
         // Prefer the caller's explicit request, then the declared hidden-output role.
@@ -115,7 +111,7 @@ fn resolve_hidden_state_output<'a>(
     }
 
     anyhow::bail!(
-        "model does not expose a usable per-token hidden-state output; set model.io.hidden_output or EmbeddingOptions::hidden_state_output (available outputs: {:?})",
+        "model does not expose a usable per-token hidden-state output; set hidden_output or EmbeddingOptions::hidden_state_output (available outputs: {:?})",
         session.output_names()
     )
 }
@@ -301,11 +297,9 @@ mod tests {
         let session = engine.session.as_deref().expect("ORT test engine");
         let io = engine
             .metadata
-            .model
-            .as_ref()
-            .and_then(|model| model.io.as_ref())
+            .decoder_io()
             .cloned()
-            .expect("fixture declares model.io");
+            .expect("fixture declares a decode ABI");
         let output_name =
             resolve_hidden_state_output(session, io.hidden_output.as_deref())?.to_string();
         let mut decode_state = DecodeState::new_with_io(session, Some(&io))?;
@@ -389,7 +383,7 @@ mod tests {
         let ids = engine.tokenize("hello world")?;
         assert!(!ids.is_empty(), "tokenizer produced no ids");
         // The public seam must agree with the tokenizer path the engine owns.
-        let expected = engine.tokenizer.encode("hello world")?;
+        let expected = engine.require_tokenizer()?.encode("hello world")?;
         assert_eq!(ids, expected);
         Ok(())
     }

@@ -498,6 +498,40 @@ impl WeightRegionCatalog {
     }
 }
 
+/// Derive the expert-major [`ExpertTensorLayout`] for one `com.microsoft::QMoE`
+/// input tensor (a packed weight, scale, or zero-point tensor), given the
+/// node-level quantization attributes and this tensor's own dims.
+///
+/// This is the single source of truth for "which axis is which" on a QMoE
+/// expert-bank tensor, shared by advisory host/device placement
+/// (`onnx-genai-engine::engine::placement`) and the lazy-weight paging seam
+/// (`onnx-runtime-session::executor::build`) so the two call sites cannot
+/// silently drift onto different byte-range formulas. Returns `None` when
+/// `dims` is not rank-3 (i.e. not an expert-major tensor at all); callers
+/// treat that as "not applicable", not as a paging failure.
+pub fn qmoe_expert_tensor_layout(
+    bits: usize,
+    block_size: usize,
+    blocks_per_row: usize,
+    dims: &[usize],
+) -> Option<ExpertTensorLayout> {
+    if dims.len() != 3 {
+        return None;
+    }
+    Some(ExpertTensorLayout {
+        version: 1,
+        experts: dims[0],
+        rows_per_expert: dims[1],
+        storage_elements_per_row: dims[2],
+        order: ExpertStorageOrder::ExpertMajor,
+        quantization: Some(ExpertQuantization {
+            bits,
+            block_size,
+            blocks_per_row,
+        }),
+    })
+}
+
 /// Overflow error shared by loader range catalogs and paging-aware kernels.
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
 #[error("{0}")]
@@ -1295,5 +1329,101 @@ mod tests {
             Pageability::NonPageable(NonPageableReason::Range(message))
                 if message.contains("endpoint")
         ));
+    }
+
+    #[test]
+    fn qmoe_expert_tensor_layout_rejects_non_rank3_dims() {
+        assert_eq!(qmoe_expert_tensor_layout(4, 32, 2, &[8, 16]), None);
+        assert_eq!(qmoe_expert_tensor_layout(4, 32, 2, &[8, 16, 4, 2]), None);
+        assert_eq!(qmoe_expert_tensor_layout(4, 32, 2, &[]), None);
+    }
+
+    #[test]
+    fn qmoe_expert_tensor_layout_populates_expert_major_fields_for_rank3_dims() {
+        let layout = qmoe_expert_tensor_layout(4, 32, 3, &[8, 16, 24])
+            .expect("rank-3 dims must derive a layout");
+        assert_eq!(layout.version, 1);
+        assert_eq!(layout.experts, 8);
+        assert_eq!(layout.rows_per_expert, 16);
+        assert_eq!(layout.storage_elements_per_row, 24);
+        assert_eq!(layout.order, ExpertStorageOrder::ExpertMajor);
+        assert_eq!(
+            layout.quantization,
+            Some(ExpertQuantization {
+                bits: 4,
+                block_size: 32,
+                blocks_per_row: 3,
+            })
+        );
+    }
+
+    #[test]
+    fn qmoe_expert_tensor_layout_classifies_as_pageable_and_partitions_the_bank() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::current_dir().expect("cwd").join("target");
+        std::fs::create_dir_all(&dir).expect("create target");
+        let path = dir.join(format!(
+            "qmoe-expert-region-catalog-{}-{stamp}.bin",
+            std::process::id()
+        ));
+        // 4 experts * 16 rows * 24 storage elements (Uint8) per row.
+        let tensor_len = 4 * 16 * 24;
+        std::fs::write(&path, vec![0u8; tensor_len]).expect("write external data");
+
+        let weight = WeightRef::External {
+            path,
+            offset: 0,
+            length: tensor_len,
+            dtype: DataType::Uint8,
+            dims: vec![4, 16, 24],
+        };
+        let layout = qmoe_expert_tensor_layout(4, 32, 3, weight.dims())
+            .expect("rank-3 dims must derive a layout");
+        let catalog = WeightRegionCatalog::classify(&weight, layout);
+        assert!(catalog.is_pageable());
+
+        // Regions exactly partition the tensor: contiguous, non-overlapping,
+        // and covering exactly `tensor_len` bytes across the 4 experts.
+        let mut expected_offset = 0usize;
+        let per_expert_len = 16 * 24;
+        for expert in 0..4 {
+            let range = catalog
+                .relative_range(expert)
+                .unwrap_or_else(|| panic!("expert {expert} must have a region"));
+            assert_eq!(range.start, expected_offset);
+            assert_eq!(range.end, expected_offset + per_expert_len);
+            expected_offset = range.end;
+        }
+        assert_eq!(expected_offset, tensor_len);
+        assert!(catalog.region(4).is_none());
+
+        std::fs::remove_file(weight_path_for_test(&catalog)).ok();
+    }
+
+    /// Test-only helper: re-derive the external file path a catalog built in
+    /// this module's own tests was classified from, so the test can clean up
+    /// after itself without threading the path through every assertion.
+    fn weight_path_for_test(catalog: &WeightRegionCatalog) -> PathBuf {
+        catalog.path.clone().unwrap_or_default()
+    }
+
+    #[test]
+    fn qmoe_expert_tensor_layout_rejects_inline_tensor_with_reason() {
+        let inline = WeightRef::Inline(TensorData::from_raw(
+            DataType::Uint8,
+            vec![2, 4, 8],
+            vec![0u8; 2 * 4 * 8],
+        ));
+        let layout = qmoe_expert_tensor_layout(4, 32, 1, inline.dims())
+            .expect("rank-3 dims must derive a layout");
+        let catalog = WeightRegionCatalog::classify(&inline, layout);
+        assert!(!catalog.is_pageable());
+        assert_eq!(
+            catalog.pageability(),
+            &Pageability::NonPageable(NonPageableReason::InlineTensor)
+        );
     }
 }

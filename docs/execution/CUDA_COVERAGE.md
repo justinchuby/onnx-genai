@@ -1,7 +1,7 @@
 # CUDA Execution Provider — Op Coverage & Library Mapping
 
 **Crate:** `onnx-runtime-ep-cuda` · **Target:** NVIDIA Hopper (SM90, H100/H200) ·
-**Backend stack:** `cudarc` (dynamic-loading: driver + cuBLASLt + NVRTC).
+**Backend stack:** `cudarc` plus dynamic-loaded cuBLASLt, cuFFT, cuDNN, and NVRTC.
 
 This is the **roadmap and source of truth** for which ops the CUDA EP covers,
 which off-the-shelf library backs each one, and which ops justify a custom fused
@@ -76,6 +76,7 @@ being unconditional.
 | Tag | Backend | When it is the right choice |
 |-----|---------|-----------------------------|
 | **cuBLASLt** | `cudarc::cublaslt` (`blas.rs`) | GEMM / batched GEMM, incl. fused bias/act epilogues (`CUBLASLT_EPILOGUE_*`). |
+| **cuFFT** | dynamically loaded NVIDIA cuFFT (`cufft.rs`) | Batched Fourier transforms over caller-owned EP workspace. |
 | **cuDNN** | `cudarc` `cudnn` feature | conv, pooling, softmax, activations, batch/instance/layer norm, LRN. Vendor-tuned, PyTorch's own backend. |
 | **CUTLASS/CuTe** | NVRTC-compiled device templates | GEMM epilogue fusions cuBLASLt can't express; flash-attention-class kernels. |
 | **thrust/cub** | `cudarc` (device primitives) | reductions, cumsum/scan, sort, topk, argmax. |
@@ -102,7 +103,7 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | `FusedMatMulBias` | `com.microsoft` | ✅ | **cuBLASLt** `CUBLASLT_EPILOGUE_BIAS` | Dense rank-2 f32/f16/bf16 with an exact per-N bias vector; bias add is fused into GEMM with no elementwise pass. |
 | `FusedGemm` | `com.microsoft` | ✅ | **cuBLASLt** `CUBLASLT_EPILOGUE_{BIAS,RELU_BIAS,GELU_BIAS}` | Dense rank-2 f32/f16/bf16; transA/transB and α. CUDA 13's `GELU_BIAS` is the tanh/0.044715 GELU approximation (H200 output differs from exact-erf at the expected ~2.2e-4 for x=1.5); cuBLASLt exposes no exact-erf selector, so this deliberately follows the vendor epilogue rather than adding a separate pass. Bias must be per-N and `beta=1` because `BIAS_POINTER` is unscaled; other β values fail explicitly. Missing `activation` defaults to Relu for the repository optimizer's existing `FusedGemm` contract; empty/Identity selects plain BIAS. |
 | `MatMulNBits` | `com.microsoft` | ✅ | **NVRTC-custom + cuBLASLt** | Standard packed INT4 `[N, ceil(K/block_size), block_size/2]` weights are block-wise dequantized to f32 on-device, then multiplied by f32 activations with full-f32 accumulation. Supports optional packed zero points, group indices, and fused per-N bias. |
-| `QMoE` | `com.microsoft` | ✅ | **NVRTC grouped block-dequant expert GEMV/GEMM** | Single-GPU resident: exact ORT expert-major affine INT1/INT2/INT4/INT8 layouts, optional packed zero points and expert biases, top-k routing/normalization, Relu/Gelu/Silu/Identity and fused or separate-gate SwiGLU. Decode uses per-route GEMV; prefill counts and prefix-groups routes by expert, gathers contiguous rows, runs a tiled dequant-GEMM for experts with at least two tokens, then deterministically combines weighted route outputs. f32/f16/bf16 activations use f32 accumulation; tile width, shared-memory fallback, launch width, and saturation grid derive from detected device limits. Native IQ/MXFP4 blocks remain explicitly unsupported because the ORT QMoE affine inputs cannot encode those layouts; they require a block-quantized MoE operator. Weight paging/prefetch and expert-parallel sharding are deferred. |
+| `QMoE` | `com.microsoft` | ✅ | **NVRTC grouped block-dequant expert GEMV/GEMM** | Single-GPU resident: exact ORT expert-major affine INT1/INT2/INT4/INT8 layouts, optional packed zero points and expert biases, top-k routing/normalization, Relu/Gelu/Silu/Identity and fused or separate-gate SwiGLU. Decode uses per-route GEMV; prefill counts and prefix-groups routes by expert, gathers contiguous rows, runs a tiled dequant-GEMM for experts with at least two tokens, then deterministically combines weighted route outputs. f32/f16/bf16 activations use f32 accumulation; the other T-typed float operands (router_probs, fc1/fc2/fc3 scales, expert biases, and the optional aggregation weights) may independently be f32 or the same half type as the input — matching ORT's single type parameter `T` — and any half operand is losslessly widened to f32 before the unchanged f32 routing/dequant kernels run, so an all-fp16 fused QMoE export runs natively and the pure-f32 path stays byte-identical. tile width, shared-memory fallback, launch width, and saturation grid derive from detected device limits. Native IQ/MXFP4 blocks remain explicitly unsupported because the ORT QMoE affine inputs cannot encode those layouts; they require a block-quantized MoE operator. Weight paging/prefetch and expert-parallel sharding are deferred. |
 
 ### Convolution
 
@@ -230,25 +231,46 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | `Range` | `` | ✅ | **NVRTC-custom** | Scalar-driven f32/f16/bf16/Int64 sequence construction with positive/negative steps and CPU-matched output-count validation (`range.rs`). |
 | `ScatterND` (v11/v16/v18) | `` | ✅ | **NVRTC-custom** | Deterministic slice updates in row-major tuple order for f32/f16/bf16/Int64 data and Int64 indices; negative indices and `none`/`add`/`mul`/`min`/`max` reductions match the CPU EP (`indexing.rs`). |
 | `HannWindow`, `HammingWindow`, `BlackmanWindow` (v17) | `` | ✅ | **NVRTC-custom** | Periodic or symmetric signal windows generated directly on device in f16/bf16/f32/f64, with the scalar size and `output_datatype` contract matched to the CPU EP (`window.rs`). |
+| `DFT` (v17/v20) | `` | ✅ | **cuFFT + NVRTC pack/unpack** | f32 real/complex input, forward/inverse, full/onesided output, arbitrary signal axis, and truncating/zero-padding `dft_length`. A bounded 16-entry plan cache reuses stream-bound C2C plans; execution scratch and packed data use governed EP workspace. Plan selection and scalar staging deliberately decline CUDA-graph capture (`dft.rs`, `cufft.rs`). |
 | `CenterCropPad` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic fixed-width centered crop/zero-pad over all or selected axes, including negative axes and CPU-matched odd-difference placement (`index_transform.rs`). |
 | `Col2Im` | `` | ✅ | **NVRTC-custom** | Arbitrary spatial-rank f32/f16/bf16 inverse image-column transform with overlap accumulation, dilation, strides, and padding; accumulation is widened to f32 (`index_transform.rs`). |
 
-## Source-derived coverage audit (2026-07-29)
+## Source-derived coverage audit
 
-This snapshot is derived directly from `build_cpu_registry`,
-`build_cuda_registry`, and `CUDA_COVERED_OPS`. It supersedes the stale
-pre-batch counts retained in the historical wave notes below.
+The authoritative statement of coverage is the **gap set below**, and it is
+enforced by a test: `every_cpu_only_op_is_named_in_the_coverage_doc` in
+`crates/onnx-runtime-ep-cuda/src/kernels/mod.rs` builds the real CPU registry,
+subtracts `CUDA_COVERED_OPS`, and fails if any operator in the difference is not
+named in this file.
 
-| Measure | Count |
-|---------|------:|
-| CPU registry `(domain, op_type)` pairs | **173** |
-| CPU standard-domain (`ai.onnx`) op types | **145** |
-| CUDA registry `(domain, op_type)` pairs | **169** |
-| CUDA advertised op names (`CUDA_COVERED_OPS`) | **164** |
-| CPU pairs implemented by CUDA in the same domain | **166 / 173** |
-| CPU standard-domain op types implemented by CUDA | **143 / 145** |
+This section used to carry a table of six hand-maintained counts and the claim
+that *"the 2 remaining CPU `ai.onnx` gaps are `NonMaxSuppression` and `Unique`"*.
+Both went stale without anything noticing — the header of this very section
+already said it "supersedes the stale pre-batch counts retained in the
+historical wave notes below", which is the same failure one layer down. By the
+time it was re-measured, the advertised count was five short of the registry and
+`ai.onnx::DFT` was a third standard-domain gap that appeared nowhere in this
+document at all.
 
-The **2 remaining CPU `ai.onnx` gaps** are `NonMaxSuppression` and `Unique`.
+The counts are gone rather than corrected. A number no test derives will drift
+again, and a wrong number is worse than no number because it reads as evidence.
+For a current count, read `CUDA_COVERED_OPS` or run the test above; for what is
+missing and why, read the entries in this file. This follows the same reasoning
+as #1923: pin the set, not the count, because a count cannot detect a rename or
+the arrival of a gap nobody wrote down.
+
+The wave notes further down this file also open with "Current source-derived
+coverage is *N*". Those are point-in-time records of what each wave landed, and
+are correct as history — they are not a statement about today.
+
+### Remaining CPU-only operators
+
+`ai.onnx`: `NonMaxSuppression`, `Unique`.
+`com.microsoft`: `FusedAttention`, `MoE`, `PackedMultiHeadAttention`.
+
+Each is either explained as a deliberate non-gap in this file or is open work
+with a tracking entry. `DFT` was found by the re-measurement described above and
+has since been closed with the cuFFT implementation in `kernels/dft.rs`.
 
 Issue #67 batch (2026-07-30): a data-driven placement audit over the real target
 decode models (Qwen2.5 0.5b/1.5b/7b, Phi-4-mini, Qwen3.6-27B, Qwen3.5-35B-A3B)
@@ -273,8 +295,82 @@ For `com.microsoft`, the remaining CPU-only gap is `FusedAttention`;
 additionally exposes `com.microsoft::Attention`. CUDA standard-domain extras not
 currently registered by the CPU EP include `Conv` (cuDNN).
 
+`com.microsoft::MoE` (the float/unquantized form, with dense f32/f16/bf16 FC
+weight tensors) is present in the CPU EP but is **not a real CUDA gap**: no
+Mobius-exported model fixture emits it — every MoE model we target uses
+`com.microsoft::QMoE` (INT4/INT8 packed weights, covered by `qmoe.rs`) or
+`pkg.nxrt::BlockQuantizedMoE`. The only `MoE` producers in the repo are synthetic
+benchmark harnesses (`scripts/ort_ab/gen_moe.py`) and CPU-EP-only e2e test
+fixtures. Registering a CUDA `MoE` kernel would be dead code for current targets;
+this non-gap is explicitly recorded here to prevent future re-investigation.
 
-### Library mapping for the remaining CPU gaps
+`com.microsoft::PackedMultiHeadAttention` is present in the CPU EP
+(`packed_multi_head_attention.rs`) but is **not a real CUDA gap** — for the same
+"no real producer" reason as `MoE`, though the failure surface is different and
+worth stating precisely:
+
+* **No target model emits it.** Upstream ONNX Runtime produces
+  `PackedMultiHeadAttention` only from its **opt-in packing-mode conversion
+  tool** (`python/tools/transformers/convert_to_packing_mode.py`, class
+  `PackingMultiHeadAttention`), which removes padding from variable-length
+  batched encoder sequences for throughput. This is a separate transformation a
+  user runs deliberately — **not** part of default graph optimization — so it
+  cannot arrive through an ordinary PyTorch/TF export. It never appears on the
+  decoder-only autoregressive LLM path this project targets, which uses
+  `Attention` / `MultiHeadAttention` / `GroupQueryAttention` with a KV cache. The
+  real Qwen3.5-0.8B hybrid decode graph (1289 nodes) places on CUDA with **zero
+  declines** (`tests/qwen35_0_8b_placement_lock.rs`, which panics rather than
+  passing if the GPU or model is absent), so it contains no such node.
+  Encoder-decoder models in scope are unaffected for the same reason: Whisper's
+  encoder consumes fixed-length 1500-frame mel features, so there is no padding
+  to pack out, and its exports carry `MultiHeadAttention`. Across every
+  `*.textproto` fixture in the repo the attention ops are `Attention`,
+  `GroupQueryAttention` and `MultiHeadAttention` — never the packed variant.
+  This project's own packed variable-length attention is the runtime-invented
+  `pkg.nxrt::PackedVarlenAttention` (already CUDA-covered,
+  `packed_varlen_attention.rs`) — the exact analogue of `MoE`→`QMoE` /
+  `BlockQuantizedMoE`. The only producer of `com.microsoft::PackedMultiHeadAttention`
+  in the repo is one synthetic CPU-EP e2e fixture
+  (`crates/onnx-runtime-ep-cpu-plugin/tests/fixtures/packed_mha_assignment_f32/`).
+
+* **Why the CPU EP still implements it, and why CUDA need not.** ORT has **no CPU
+  kernel** for this op (verified upstream and recorded in
+  `packed_multi_head_attention.rs` and the `plugin_ort_e2e.rs` assignment table),
+  so a CPU-EP decline of a node that *did* appear would be a hard *session-load*
+  failure rather than a slow fallback — hence the CPU EP carries it defensively.
+  ORT **does** ship a native CUDA kernel
+  (`contrib_ops/cuda/bert/packed_multihead_attention.cc`), so when a session that
+  contains this op also has ORT's native CUDA EP available, a CUDA-plugin decline
+  is harmless (ORT runs its own CUDA kernel). Because no target model contains the
+  node at all, the harder `[plugin-CUDA-EP, ORT-CPU-EP-only]` failure mode is
+  unreachable for current workloads.
+
+* **This is a riskier non-gap than `MoE`, so state the trigger plainly.** For
+  `MoE`, ORT *does* have a CPU kernel, so calling it a non-gap wrongly would cost
+  only a slow fallback. Here there is no CPU kernel anywhere, so a wrong call
+  costs a hard session-load failure. Exactly one condition flips this decision:
+  **a model that was pre-converted with ORT's packing-mode tool, loaded on a
+  session that does not have ORT's native CUDA EP in its fallback chain.** If
+  that combination ever ships, implement the adapter below. Note that the
+  "declining is harmless" argument rests on that fallback chain, which has not
+  been verified end to end in production configurations — the load-bearing
+  evidence for this decision is the absence of any producer, not the fallback.
+
+* **If it ever became real, it is a small adapter, not new kernels.** The CUDA
+  `PackedVarlenAttention` kernel already runs cumulative-seqlen packed SDPA over
+  the shared attention core, so a `PackedMultiHeadAttention` kernel would be an
+  input-reshaping adapter onto that core (separate Q/K/V `[total_tokens, hidden]`
+  + `cumulative_sequence_length`, non-causal), mirroring the CPU adapter. It is
+  left unimplemented because it would be dead code for current targets; this
+  non-gap is recorded here (and pinned by a unit test in `kernels/mod.rs`) to
+  prevent future re-investigation.
+
+`ai.onnx::DFT` is now implemented for CUDA in `kernels/dft.rs`. The CUDA path
+packs arbitrary ONNX signal axes into contiguous complex f32 batches, executes
+cuFFT C2C, and unpacks to the requested full or half spectrum. This common
+packed-batch/plan-cache seam is the reusable FFT foundation for STFT; STFT still
+needs framing/windowing, optional window input handling, hop length, and its
+specified output layout.
 
 | Backend | CPU-covered gaps mapped here | Rationale |
 |---------|------------------------------|-----------|

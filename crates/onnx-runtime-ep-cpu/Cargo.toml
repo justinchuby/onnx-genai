@@ -82,7 +82,40 @@ windows-sys = { version = "0.61", features = [
 
 [dev-dependencies]
 criterion = "0.5"
+onnx-runtime-hostmon = { workspace = true }
 onnx-runtime-operator-selection = { workspace = true }
+
+[[bench]]
+name = "half_prefill_route_ab"
+harness = false
+
+[[bench]]
+name = "half_decode_gemv_ab"
+harness = false
+
+[[bench]]
+name = "int4_prefill_route_ab"
+harness = false
+
+[[bench]]
+name = "int4_decode_loop_ab"
+harness = false
+
+# The gap-aware companion to `int4_decode_loop_ab`: same workload, verbatim,
+# with a configurable inter-token gap. `int4_decode_loop_ab` is its zero-gap
+# row, which is the one workload where parking can never pay off -- so the
+# blocktime window cannot be tuned from it.
+[[bench]]
+name = "decode_gap_park_ab"
+harness = false
+
+[[bench]]
+name = "int4_acc0_attribution"
+harness = false
+
+[[bench]]
+name = "int8_prefill_route_ab"
+harness = false
 
 [[bench]]
 name = "kernels"
@@ -99,6 +132,9 @@ harness = false
 [[bench]]
 name = "sdpa_simd"
 harness = false
+
+[[bench]]
+name = "matmul_nbits_prefill_ab"
 
 # The absorption gate. Native and the MLAS reference in one binary, interleaved,
 # so a claimed native win is measured against the route it claims to replace.

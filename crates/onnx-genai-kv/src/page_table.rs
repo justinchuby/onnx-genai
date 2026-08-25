@@ -5,7 +5,6 @@ use crate::{
     fp8::{Fp8Format, decode_f32 as decode_fp8, encode_f32 as encode_fp8},
     telemetry::KvTelemetry,
 };
-use onnx_genai_metadata::{KvCacheSpec, KvComponentTolerance, LayerPrecisionOverride};
 use std::sync::Arc;
 use std::{
     collections::{BTreeMap, HashMap},
@@ -21,11 +20,18 @@ pub type PageId = u32;
 ///
 /// The pointer is never dereferenced by `onnx-genai-kv`; it is only a stable
 /// handle that a backend can pass to its kernels together with the byte range
-/// occupied by this logical page. A future `CudaPageStore` backed by the VMM
-/// arena would reserve a stable virtual range, map committed granules behind it,
-/// and return a span inside that range. Prefix sharing would map the same
-/// physical handles into multiple virtual ranges, and CoW would copy/remap at
-/// the VMM granule boundary described in issue #721.
+/// occupied by this logical page.
+///
+/// This span is **not** a staging post for a CUDA store inside this crate.
+/// #721 stage 3 (`CudaPageStore` backed by the VMM arena) is superseded: on
+/// native CUDA, device KV paging is owned by the VMM layer -- `CudaVmmAllocator`
+/// with its physical-handle pool (#740), committed-granule admission (#745) and
+/// growth grants (#748) -- which already reserves a stable virtual range and
+/// maps committed granules behind it. Building a second page allocator here
+/// would duplicate that ownership, not complete it. The span stays because the
+/// trait boundary is what lets a third party supply a device store without
+/// patching this crate, and because it is the reason `head_token_row()` is not
+/// on the store contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DevicePageSpan {
     pub device: Device,
@@ -86,8 +92,11 @@ impl PageStoreLayout {
 
 /// Creates an empty target store for a transactional page migration.
 ///
-/// Cache callers depend only on this contract. Stage 3 can supply a factory
-/// that creates `CudaPageStore` for GPU locations without changing them.
+/// Cache callers depend only on this contract, which is why a third-party or
+/// out-of-tree store can be supplied without changing them. It is not a hook
+/// waiting for an in-crate CUDA store: #721 stage 3 is superseded, and device
+/// KV paging on native CUDA belongs to the VMM layer (`CudaVmmAllocator`,
+/// #740/#745/#748) rather than to this crate.
 pub trait KvPageStoreFactory: fmt::Debug + Send + Sync {
     /// Maximum bytes allocated by `create` for this layout and residency.
     ///
@@ -322,47 +331,31 @@ impl KvQuantConfig {
         }
     }
 
-    /// Build a precision policy from `kv_cache` metadata.
+    /// Build a precision policy from a runtime-owned KV storage policy.
     ///
-    /// Component defaults override `native_dtype`, per-layer minimum precision
-    /// overrides component defaults, and `sensitive_layers` remain in f32.
-    pub fn from_metadata(spec: &KvCacheSpec, num_layers: usize) -> Result<Self, KvError> {
-        let native_dtype = spec
-            .native_dtype
-            .as_deref()
-            .map(KvDType::from_metadata_name)
-            .transpose()?
-            .unwrap_or(KvDType::F32);
-        let key_tolerance = spec
-            .quantization_tolerance
-            .as_ref()
-            .and_then(|tolerance| tolerance.key.as_ref());
-        let value_tolerance = spec
-            .quantization_tolerance
-            .as_ref()
-            .and_then(|tolerance| tolerance.value.as_ref());
-        validate_quant_axis(key_tolerance)?;
-        validate_quant_axis(value_tolerance)?;
-        let key_dtype = component_default(key_tolerance, native_dtype)?;
-        let value_dtype = component_default(value_tolerance, native_dtype)?;
+    /// Cache storage precision is a deployment decision, not a package fact:
+    /// the same model runs with an f32, f16, or fp8 cache depending on the
+    /// runtime's memory budget and accuracy target. `native_dtype` is the
+    /// graph-visible dtype at the model's past/present ports and is the
+    /// fallback when the policy expresses no preference.
+    pub fn from_policy(
+        policy: &KvQuantPolicy,
+        native_dtype: KvDType,
+        num_layers: usize,
+    ) -> Result<Self, KvError> {
+        policy.validate_axis()?;
         let mut config = Self {
             layers: vec![
                 LayerKvDType {
-                    key: key_dtype,
-                    value: value_dtype,
+                    key: policy.key.default.unwrap_or(native_dtype),
+                    value: policy.value.default.unwrap_or(native_dtype),
                 };
                 num_layers
             ],
         };
-
-        apply_layer_overrides(&mut config.layers, key_tolerance, num_layers, KvKind::Key)?;
-        apply_layer_overrides(
-            &mut config.layers,
-            value_tolerance,
-            num_layers,
-            KvKind::Value,
-        )?;
-        for &layer in spec.sensitive_layers.as_deref().unwrap_or_default() {
+        apply_layer_overrides(&mut config.layers, &policy.key, num_layers, KvKind::Key)?;
+        apply_layer_overrides(&mut config.layers, &policy.value, num_layers, KvKind::Value)?;
+        for &layer in &policy.high_precision_layers {
             let layer = resolve_layer_index(layer, num_layers)?;
             config.layers[layer] = LayerKvDType {
                 key: KvDType::F32,
@@ -389,59 +382,91 @@ impl KvQuantConfig {
     }
 }
 
-/// Validate a component's declared `quantization_axis`.
+/// Runtime-owned KV cache storage precision policy.
 ///
-/// Only per-token quantization (one scale per token, computed across `head_dim`)
-/// can satisfy the append invariant that previously-stored tokens are never
-/// requantized. Per-channel quantization derives each scale across the token
-/// axis, so appending a new token would change the scale and force a rewrite of
-/// every stored token; it is therefore rejected explicitly rather than silently
-/// ignored. `None` defaults to per-token.
-fn validate_quant_axis(tolerance: Option<&KvComponentTolerance>) -> Result<(), KvError> {
-    let Some(axis) = tolerance.and_then(|component| component.quantization_axis.as_deref()) else {
-        return Ok(());
-    };
-    let normalized = axis.trim().to_ascii_lowercase().replace('-', "_");
-    match normalized.as_str() {
-        "per_token" | "token" => Ok(()),
-        _ => Err(KvError::UnsupportedQuantizationAxis(axis.to_owned())),
+/// This is deployment policy, not model metadata: it describes how a particular
+/// runtime chooses to store cache bytes. The package never selects it, and the
+/// runtime validates it against the graph-visible dtype before use.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct KvQuantPolicy {
+    /// Storage precision for keys.
+    pub key: KvComponentPolicy,
+    /// Storage precision for values.
+    pub value: KvComponentPolicy,
+    /// Layers pinned to f32 regardless of component defaults; negative indices
+    /// count from the end.
+    pub high_precision_layers: Vec<i32>,
+    /// Axis the runtime derives quantization scales along.
+    pub quantization_axis: KvQuantAxis,
+}
+
+impl KvQuantPolicy {
+    /// Only per-token scales satisfy the append invariant.
+    fn validate_axis(&self) -> Result<(), KvError> {
+        match self.quantization_axis {
+            KvQuantAxis::PerToken => Ok(()),
+            KvQuantAxis::PerChannel => Err(KvError::UnsupportedQuantizationAxis(
+                "per_channel".to_string(),
+            )),
+        }
     }
 }
 
-fn component_default(
-    tolerance: Option<&KvComponentTolerance>,
-    fallback: KvDType,
-) -> Result<KvDType, KvError> {
-    tolerance
-        .and_then(|component| component.default.as_deref())
-        .map(KvDType::from_metadata_name)
-        .transpose()
-        .map(|dtype| dtype.unwrap_or(fallback))
+/// Storage precision policy for one KV component (keys or values).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct KvComponentPolicy {
+    /// Precision for every layer without an override.
+    pub default: Option<KvDType>,
+    /// Per-layer minimum precision, applied over the default.
+    pub per_layer: Vec<LayerPrecisionRule>,
+}
+
+/// Minimum storage precision for a set of layers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LayerPrecisionRule {
+    /// Layer indices; negative indices count from the end.
+    pub layers: Vec<i32>,
+    /// Precision floor for those layers.
+    pub min_precision: KvDType,
+}
+
+/// Axis a runtime derives KV quantization scales along.
+///
+/// Only per-token quantization (one scale per token, computed across
+/// `head_dim`) can satisfy the append invariant that previously-stored tokens
+/// are never requantized. Per-channel quantization derives each scale across
+/// the token axis, so appending a new token would change the scale and force a
+/// rewrite of every stored token; it is rejected explicitly rather than
+/// silently ignored.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum KvQuantAxis {
+    /// One scale per token, computed across `head_dim`.
+    #[default]
+    PerToken,
+    /// One scale per channel, computed across the token axis. Unsupported.
+    PerChannel,
 }
 
 fn apply_layer_overrides(
     layers: &mut [LayerKvDType],
-    tolerance: Option<&KvComponentTolerance>,
+    policy: &KvComponentPolicy,
     num_layers: usize,
     kind: KvKind,
 ) -> Result<(), KvError> {
-    let Some(overrides) = tolerance.and_then(|component| component.per_layer.as_deref()) else {
-        return Ok(());
-    };
-    for precision_override in overrides {
-        apply_layer_override(layers, precision_override, num_layers, kind)?;
+    for rule in &policy.per_layer {
+        apply_layer_override(layers, rule, num_layers, kind)?;
     }
     Ok(())
 }
 
 fn apply_layer_override(
     layers: &mut [LayerKvDType],
-    precision_override: &LayerPrecisionOverride,
+    rule: &LayerPrecisionRule,
     num_layers: usize,
     kind: KvKind,
 ) -> Result<(), KvError> {
-    let dtype = KvDType::from_metadata_name(&precision_override.min_precision)?;
-    for &layer in &precision_override.layers {
+    let dtype = rule.min_precision;
+    for &layer in &rule.layers {
         let layer = resolve_layer_index(layer, num_layers)?;
         let slot = match kind {
             KvKind::Key => &mut layers[layer].key,

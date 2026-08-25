@@ -111,7 +111,17 @@ enum TensorBacking {
     /// the backend-neutral component-session seam, which carries host tensors as
     /// opaque bytes).
     Bytes(ElementBytes),
-    Alias(Arc<Value>),
+    /// A no-copy view over `element_offset..element_offset + numel` of an owner.
+    ///
+    /// The offset is carried rather than folded into the pointer alone, because
+    /// re-aliasing has to reproduce the *same window*. An alias that recorded
+    /// only its shape would re-alias to the owner's prefix — same shape, same
+    /// dtype, different bytes, no error — and every carried value in the
+    /// interpreter passes through `try_alias_clone`.
+    Alias {
+        owner: Arc<Value>,
+        element_offset: usize,
+    },
     /// Memory this `Value` does not own.
     ///
     /// Used when a caller hands ORT a buffer it allocated itself — typically
@@ -126,6 +136,15 @@ enum TensorBacking {
     /// consult this rather than trying and faulting.
     External {
         host_accessible: bool,
+        /// Optional shared owner kept alive for as long as this `Value` **or any
+        /// alias derived from it**: dropping the last sharer drops this after the
+        /// `OrtValue` is released, so an external allocation this `Value` wraps
+        /// (e.g. a native `Tensor`'s device memory) is freed only once ORT and
+        /// every alias are done with it. `Arc` (not `Box`) so a device value can
+        /// be alias-cloned in O(1) — [`Value::try_alias_clone`] hands out another
+        /// `External` sharing this owner instead of a host byte copy. `None` when
+        /// the caller owns the memory elsewhere (a pure borrow).
+        owner: Option<Arc<dyn core::any::Any + Send + Sync>>,
     },
     None,
 }
@@ -219,8 +238,13 @@ impl Value {
     /// steps and eliminates the per-step host<->device copies that the default
     /// CPU allocator would incur under an accelerator EP. The contents are
     /// uninitialized; callers must ensure unwritten regions are masked out.
-    pub fn empty_in(shape: &[i64], dtype: DataType, allocator: &crate::Allocator) -> Result<Self> {
+    pub fn empty_in(
+        shape: &[i64],
+        dtype: DataType,
+        allocator: &crate::Allocator<'_>,
+    ) -> Result<Self> {
         validate_shape(shape, None)?;
+        let _access = allocator.enter("allocate tensor")?;
         let mut ptr = std::ptr::null_mut();
         let api = crate::error::api()?;
         let create = api
@@ -367,8 +391,49 @@ impl Value {
             ptr,
             shape: shape.to_vec(),
             dtype,
-            backing: TensorBacking::External { host_accessible },
+            backing: TensorBacking::External {
+                host_accessible,
+                owner: None,
+            },
         })
+    }
+
+    /// Wrap external memory whose backing allocation this `Value` should keep
+    /// alive.
+    ///
+    /// Identical to [`Value::from_external_memory`], but the returned `Value`
+    /// takes ownership of `owner` and drops it only after the underlying
+    /// `OrtValue` is released (see the [`Drop`] impl). Use this when the buffer
+    /// behind `data` is owned by a Rust object — for example a native runtime
+    /// `Tensor` holding device memory — so that ORT keeps the allocation valid
+    /// for exactly as long as the `Value` (and any alias derived from it) can
+    /// still reach it, with no early free and no leak.
+    ///
+    /// # Safety
+    ///
+    /// The same requirements as [`Value::from_external_memory`] apply to `data`,
+    /// `bytes`, `shape`, `dtype`, and `memory_info`. The one obligation this
+    /// method discharges for you is lifetime: `owner` must be the object that
+    /// actually keeps `data` allocated, so keeping it alive keeps `data` valid.
+    pub unsafe fn from_external_memory_with_owner(
+        data: *mut std::ffi::c_void,
+        bytes: usize,
+        shape: &[i64],
+        dtype: DataType,
+        memory_info: &MemoryInfo,
+        owner: Box<dyn core::any::Any + Send + Sync>,
+    ) -> Result<Self> {
+        // SAFETY: forwarded verbatim to `from_external_memory`; the caller
+        // upholds its contract, and `owner` only extends how long `data` lives.
+        let mut value =
+            unsafe { Self::from_external_memory(data, bytes, shape, dtype, memory_info)? };
+        match &mut value.backing {
+            TensorBacking::External { owner: slot, .. } => *slot = Some(Arc::from(owner)),
+            // `from_external_memory` always yields `External`; anything else is
+            // an internal contract break, not a caller error.
+            _ => unreachable!("from_external_memory produced a non-external backing"),
+        }
+        Ok(value)
     }
 
     /// Whether this value's bytes can be read or written through a host
@@ -380,7 +445,8 @@ impl Value {
         !matches!(
             self.backing,
             TensorBacking::External {
-                host_accessible: false
+                host_accessible: false,
+                ..
             }
         )
     }
@@ -392,13 +458,12 @@ impl Value {
     /// device tensor that address is not dereferenceable from the CPU, so the
     /// alternative to this check is a wild read or store rather than a fault.
     fn ensure_host_accessible(&self, operation: &str) -> Result<()> {
-        if self.is_host_accessible() {
+        if self.is_host_accessible() && self.is_host_resident()? {
             return Ok(());
         }
         Err(OrtError::InvalidArgument(format!(
             "{operation} needs to reach this tensor's bytes through a host pointer, but it \
-             wraps external memory that was declared as living on a device; copy it to the \
-             host first, or use the device-side helpers"
+             lives on a device; copy it to the host first, or use the device-side helpers"
         )))
     }
 
@@ -539,6 +604,9 @@ impl Value {
         let get_device_type = api
             .MemoryInfoGetDeviceType
             .ok_or(OrtError::ApiUnavailable("MemoryInfoGetDeviceType"))?;
+        let get_name = api
+            .MemoryInfoGetName
+            .ok_or(OrtError::ApiUnavailable("MemoryInfoGetName"))?;
         let mut memory_info = std::ptr::null();
         // SAFETY: `self.ptr` is a valid tensor OrtValue. ORT owns the returned
         // OrtMemoryInfo for the lifetime of the value, so it must not be freed.
@@ -552,7 +620,44 @@ impl Value {
         // SAFETY: `memory_info` is the non-null table ORT just returned, and
         // `device_type` is a valid out-parameter for the duration of the call.
         unsafe { get_device_type(memory_info, &mut device_type) };
-        Ok(device_type == onnx_genai_ort_sys::OrtMemoryInfoDeviceType_CPU)
+        if device_type != onnx_genai_ort_sys::OrtMemoryInfoDeviceType_CPU {
+            return Ok(false);
+        }
+        let mut name = std::ptr::null();
+        // SAFETY: `memory_info` is valid and `name` is a live out-parameter.
+        crate::error::check_status(unsafe { get_name(memory_info, &mut name) })?;
+        if name.is_null() {
+            return Err(OrtError::NullPointer);
+        }
+        // `CreateMemoryInfo`, used by the built-in CUDA allocator, does not
+        // encode an OrtDevice type and ORT reports CPU here despite returning
+        // a device pointer. The allocator name remains authoritative.
+        let name = unsafe { std::ffi::CStr::from_ptr(name) }.to_string_lossy();
+        Ok(!matches!(name.as_ref(), "Cuda" | "DML" | "WebGPU_Buffer"))
+    }
+
+    /// Return the allocator device ID recorded on this tensor.
+    pub fn device_id(&self) -> Result<i32> {
+        let api = crate::error::api()?;
+        let get_memory_info = api
+            .GetTensorMemoryInfo
+            .ok_or(OrtError::ApiUnavailable("GetTensorMemoryInfo"))?;
+        let get_device_id = api
+            .MemoryInfoGetId
+            .ok_or(OrtError::ApiUnavailable("MemoryInfoGetId"))?;
+        let mut memory_info = std::ptr::null();
+        // SAFETY: `self.ptr` is a valid tensor OrtValue. ORT owns the returned
+        // OrtMemoryInfo for the lifetime of the value.
+        crate::error::check_status(unsafe {
+            get_memory_info(self.ptr.as_ptr(), &mut memory_info)
+        })?;
+        if memory_info.is_null() {
+            return Err(OrtError::NullPointer);
+        }
+        let mut device_id = 0;
+        // SAFETY: `memory_info` is valid and `device_id` is a live out-parameter.
+        crate::error::check_status(unsafe { get_device_id(memory_info, &mut device_id) })?;
+        Ok(device_id)
     }
 
     /// Borrow the tensor's raw little-endian element bytes.
@@ -761,6 +866,300 @@ impl Value {
     /// decode-session diagnostics that need to verify buffer reuse.
     pub fn data_ptr_addr(&self) -> Result<usize> {
         Ok(tensor_data_ptr(self.ptr.as_ptr())? as usize)
+    }
+
+    /// Copy a host tensor into this existing host tensor without changing its
+    /// OrtValue or buffer address. Stable workflow-island bindings use this to
+    /// refresh request/loop inputs while preserving CUDA Graph replay addresses.
+    pub fn copy_from_host(&self, source: &Value) -> Result<()> {
+        self.ensure_host_accessible("copy_from_host destination")?;
+        source.ensure_host_accessible("copy_from_host source")?;
+        if self.dtype != source.dtype || self.shape != source.shape {
+            return Err(OrtError::InvalidArgument(format!(
+                "copy_from_host requires identical tensors, destination {:?} {:?}, source {:?} {:?}",
+                self.dtype, self.shape, source.dtype, source.shape
+            )));
+        }
+        let bytes = self
+            .numel()
+            .checked_mul(self.dtype.size_of())
+            .ok_or_else(|| {
+                OrtError::InvalidArgument("copy_from_host tensor byte size overflows".into())
+            })?;
+        let destination = tensor_data_ptr(self.ptr.as_ptr())?;
+        let source = tensor_data_ptr(source.ptr.as_ptr())?;
+        // SAFETY: shape/dtype equality guarantees both tensor buffers contain
+        // at least `bytes` bytes and do not overlap (distinct OrtValues).
+        unsafe { std::ptr::copy_nonoverlapping(source, destination, bytes) };
+        Ok(())
+    }
+
+    /// Copy an identically typed/shaped tensor between host and CUDA memory.
+    ///
+    /// CPU-to-CPU copies use ordinary host memory. Any copy involving device
+    /// memory uses the selected CUDA device explicitly so callers can refresh
+    /// stable graph-capture buffers without replacing their addresses.
+    pub fn copy_from_cuda(&self, source: &Value, device_id: i32) -> Result<()> {
+        if self.shape != source.shape || self.dtype != source.dtype {
+            return Err(OrtError::InvalidArgument(format!(
+                "CUDA tensor copy requires identical tensors, destination {:?} {:?}, source {:?} {:?}",
+                self.dtype, self.shape, source.dtype, source.shape
+            )));
+        }
+
+        let destination_host = self.is_host_resident()?;
+        let source_host = source.is_host_resident()?;
+        if destination_host && source_host {
+            return self.copy_from_host(source);
+        }
+        #[cfg(feature = "cuda")]
+        {
+            let bytes = self
+                .numel()
+                .checked_mul(self.dtype.size_of())
+                .ok_or_else(|| {
+                    OrtError::InvalidArgument("CUDA tensor copy byte size overflows".into())
+                })?;
+            let destination = self.data_ptr_addr()?;
+            let source_ptr = source.data_ptr_addr()?;
+            let _guard = crate::cuda_rt::DeviceGuard::set(device_id)?;
+            match (destination_host, source_host) {
+                (false, true) => {
+                    crate::cuda_rt::memcpy_host_to_device(destination, source.as_raw_bytes()?)?
+                }
+                (true, false) => {
+                    // SAFETY: destination is a host tensor with exactly `bytes`
+                    // writable bytes and remains alive for the copy.
+                    let destination_bytes =
+                        unsafe { std::slice::from_raw_parts_mut(destination as *mut u8, bytes) };
+                    crate::cuda_rt::memcpy_device_to_host(destination_bytes, source_ptr)?
+                }
+                (false, false) => {
+                    crate::cuda_rt::memcpy_device_to_device(destination, source_ptr, bytes)?
+                }
+                (true, true) => unreachable!(),
+            }
+            Ok(())
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = device_id;
+            Err(OrtError::InvalidArgument(
+                "tensor copy involves CUDA memory but this build has no CUDA support".into(),
+            ))
+        }
+    }
+
+    /// Enqueue a same-device CUDA copy without synchronizing the device.
+    pub fn copy_from_cuda_async(&self, source: &Value, device_id: i32) -> Result<()> {
+        if self.shape != source.shape || self.dtype != source.dtype {
+            return Err(OrtError::InvalidArgument(format!(
+                "asynchronous CUDA tensor copy requires identical tensors, destination {:?} {:?}, source {:?} {:?}",
+                self.dtype, self.shape, source.dtype, source.shape
+            )));
+        }
+        if self.is_host_resident()? || source.is_host_resident()? {
+            return Err(OrtError::InvalidArgument(
+                "asynchronous CUDA tensor copy requires device-resident tensors".into(),
+            ));
+        }
+        #[cfg(feature = "cuda")]
+        {
+            let bytes = self
+                .numel()
+                .checked_mul(self.dtype.size_of())
+                .ok_or_else(|| {
+                    OrtError::InvalidArgument("CUDA tensor copy byte size overflows".into())
+                })?;
+            let _guard = crate::cuda_rt::DeviceGuard::set(device_id)?;
+            crate::cuda_rt::memcpy_device_to_device_async(
+                self.data_ptr_addr()?,
+                source.data_ptr_addr()?,
+                bytes,
+            )
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = device_id;
+            Err(OrtError::InvalidArgument(
+                "asynchronous CUDA copy requires the cuda feature".into(),
+            ))
+        }
+    }
+
+    /// Copy this tensor into a newly allocated CPU tensor.
+    pub fn to_host_from_cuda(&self, device_id: i32) -> Result<Self> {
+        let host = Self::empty(&self.shape, self.dtype)?;
+        host.copy_from_cuda(self, device_id)?;
+        Ok(host)
+    }
+
+    /// Allocate an uninitialized tensor in CUDA device memory on `device_id`.
+    ///
+    /// The returned value *owns* its allocation: the backing
+    /// [`crate::cuda_rt::CudaAllocation`] travels with the value and frees the
+    /// device memory only when the value — and every
+    /// [`alias_with_offset`](Self::alias_with_offset) view derived from it —
+    /// has dropped.
+    ///
+    /// This exists so an interpreter construct can build a tensor *where its
+    /// operands already are*. A destination that has to be allocated on the
+    /// host and uploaded is a host round trip by another name, and the fused
+    /// input of a speculative proposal step is exactly that destination.
+    ///
+    /// The contents are whatever the device last left there; every caller here
+    /// overwrites the whole buffer, and [`fill_zero_device`](Self::fill_zero_device)
+    /// is available for one that cannot.
+    #[cfg(feature = "cuda")]
+    pub fn empty_cuda(shape: &[i64], dtype: DataType, device_id: i32) -> Result<Self> {
+        validate_shape(shape, None)?;
+        let numel = shape.iter().try_fold(1usize, |acc, &dim| {
+            acc.checked_mul(dim as usize).ok_or_else(|| {
+                OrtError::InvalidArgument(format!("tensor shape too large: {shape:?}"))
+            })
+        })?;
+        let bytes = numel.checked_mul(dtype.size_of()).ok_or_else(|| {
+            OrtError::InvalidArgument(format!("tensor {shape:?} byte size overflows usize"))
+        })?;
+        if bytes == 0 {
+            return Err(OrtError::InvalidArgument(format!(
+                "cannot allocate a device tensor with no elements (shape {shape:?}); an empty \
+                 tensor has no device address to publish, so build it on the host instead"
+            )));
+        }
+        let allocation = crate::cuda_rt::CudaAllocation::new(device_id, bytes)?;
+        let device_ptr = allocation.device_ptr() as *mut std::ffi::c_void;
+        let memory_info = MemoryInfo::cuda(device_id)?;
+        // SAFETY: `device_ptr` is this process's own `cudaMalloc` allocation on
+        // `device_id`, valid for exactly `bytes`, and the returned value takes
+        // ownership of the guard that frees it — so the allocation outlives the
+        // value and every ORT use of it.
+        unsafe {
+            Self::from_external_memory_with_owner(
+                device_ptr,
+                bytes,
+                shape,
+                dtype,
+                &memory_info,
+                Box::new(allocation),
+            )
+        }
+    }
+
+    /// Zero every byte of a device-resident tensor.
+    ///
+    /// The companion to [`empty_cuda`](Self::empty_cuda): a buffer a caller
+    /// cannot prove it fully overwrites is zeroed rather than left holding
+    /// whatever the device last wrote there.
+    #[cfg(feature = "cuda")]
+    pub fn fill_zero_device(&self, device_id: i32) -> Result<()> {
+        if self.is_host_resident()? {
+            return Err(OrtError::InvalidArgument(
+                "fill_zero_device requires a device-resident tensor; this one is on the host"
+                    .into(),
+            ));
+        }
+        let bytes = self
+            .numel()
+            .checked_mul(self.dtype.size_of())
+            .ok_or_else(|| {
+                OrtError::InvalidArgument("device zero-fill byte size overflows usize".into())
+            })?;
+        if bytes == 0 {
+            return Ok(());
+        }
+        let _guard = crate::cuda_rt::DeviceGuard::set(device_id)?;
+        crate::cuda_rt::memset_zero(self.data_ptr_addr()?, bytes)
+    }
+
+    /// Borrow this tensor's elements as `f32`.
+    ///
+    /// The borrowing counterpart of [`to_vec_f32`](Self::to_vec_f32), for a
+    /// reader that scans a large table (an embedding matrix, above all) and
+    /// would otherwise pay a full copy of it to read one row.
+    ///
+    /// Errors for a non-`Float32` or device-resident tensor rather than
+    /// reinterpreting bytes the caller did not ask for.
+    pub fn as_slice_f32(&self) -> Result<&[f32]> {
+        if self.dtype != DataType::Float32 {
+            return Err(OrtError::InvalidArgument(format!(
+                "as_slice_f32 requires a Float32 tensor, got {:?}",
+                self.dtype
+            )));
+        }
+        let bytes = self.as_raw_bytes()?;
+        if bytes.is_empty() {
+            return Ok(&[]);
+        }
+        // SAFETY-adjacent: `align_to` is safe, and the prefix/suffix check below
+        // turns a hypothetically misaligned ORT allocation into an error rather
+        // than undefined behaviour. ORT allocates tensors at least element
+        // aligned, so the prefix is empty in practice.
+        let (prefix, elements, suffix) = unsafe { bytes.align_to::<f32>() };
+        if !prefix.is_empty() || !suffix.is_empty() {
+            return Err(OrtError::InvalidArgument(
+                "this tensor's buffer is not f32-aligned, so its elements cannot be borrowed; \
+                 copy it with to_vec_f32 instead"
+                    .into(),
+            ));
+        }
+        Ok(elements)
+    }
+
+    /// Overwrite `bytes.len()` bytes starting `element_offset` elements into
+    /// this host-resident tensor, leaving its OrtValue and buffer address
+    /// unchanged.
+    ///
+    /// The dtype-agnostic scatter primitive: an interpreter construct
+    /// assembling a tensor out of segments (the `concat(embed(token), carry)`
+    /// fused input of a speculative proposal step) writes each segment into
+    /// place rather than allocating a fresh buffer per step. The offset is in
+    /// elements so a caller cannot produce a misaligned write by forgetting the
+    /// dtype width.
+    ///
+    /// `bytes` must be a whole number of elements and must land entirely inside
+    /// the tensor; both are errors rather than a truncated or wrapping write.
+    pub fn write_raw_bytes_at(&self, element_offset: usize, bytes: &[u8]) -> Result<()> {
+        self.ensure_host_accessible("write_raw_bytes_at")?;
+        let element = self.dtype.size_of();
+        if !bytes.len().is_multiple_of(element) {
+            return Err(OrtError::InvalidArgument(format!(
+                "write_raw_bytes_at got {} bytes, which is not a whole number of {:?} elements \
+                 ({element} bytes each)",
+                bytes.len(),
+                self.dtype
+            )));
+        }
+        let count = bytes.len() / element;
+        let end = element_offset.checked_add(count).ok_or_else(|| {
+            OrtError::InvalidArgument("write_raw_bytes_at range overflows usize".into())
+        })?;
+        if end > self.numel() {
+            return Err(OrtError::InvalidArgument(format!(
+                "write_raw_bytes_at would write elements {element_offset}..{end} of a tensor with \
+                 {} elements (shape {:?})",
+                self.numel(),
+                self.shape
+            )));
+        }
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let base = tensor_data_ptr(self.ptr.as_ptr())?;
+        // SAFETY: `base` points at this host-resident tensor's row-major
+        // allocation of `numel() * element` bytes, and the destination window
+        // was bounds-checked above; `u8` has alignment 1, so any non-null
+        // `base` is suitably aligned. `copy` rather than `copy_nonoverlapping`
+        // because nothing in the signature stops `bytes` from borrowing a
+        // tensor that aliases this one -- an `alias_with_offset` view of the
+        // same allocation is an ordinary `Value` -- and an overlapping
+        // `copy_nonoverlapping` would be undefined behaviour rather than a
+        // wrong answer.
+        unsafe {
+            let destination = base.cast::<u8>().add(element_offset * element);
+            std::ptr::copy(bytes.as_ptr(), destination, bytes.len());
+        }
+        Ok(())
     }
 
     /// Overwrite the leading `data.len()` Int64 elements of this tensor in
@@ -997,7 +1396,7 @@ impl Value {
                     )));
                 }
             },
-            TensorBacking::I64(_) | TensorBacking::Bytes(_) | TensorBacking::Alias(_) => {
+            TensorBacking::I64(_) | TensorBacking::Bytes(_) | TensorBacking::Alias { .. } => {
                 return Err(OrtError::InvalidArgument(
                     "cannot zero row for non-owned or non-KV tensor".into(),
                 ));
@@ -1095,7 +1494,7 @@ impl Value {
                     )));
                 }
             },
-            TensorBacking::I64(_) | TensorBacking::Bytes(_) | TensorBacking::Alias(_) => {
+            TensorBacking::I64(_) | TensorBacking::Bytes(_) | TensorBacking::Alias { .. } => {
                 return Err(OrtError::InvalidArgument(
                     "cannot pack rows for non-owned or non-KV tensor".into(),
                 ));
@@ -1114,28 +1513,78 @@ impl Value {
         Ok(())
     }
 
-    /// Create a no-copy CPU tensor alias over the prefix of an existing tensor.
+    /// Create a no-copy tensor alias over the prefix of an existing tensor.
     ///
     /// The returned OrtValue has its own shape but points at the same underlying
     /// tensor data as `owner`. `owner` is kept alive by the alias backing.
     pub fn alias_with_shape(owner: Arc<Value>, shape: &[i64]) -> Result<Self> {
+        Self::alias_with_offset(owner, 0, shape)
+    }
+
+    /// Create a no-copy tensor view starting `element_offset` elements into
+    /// `owner`.
+    ///
+    /// The offset is in *elements*, not bytes, so a caller cannot accidentally
+    /// produce a misaligned view by forgetting the dtype width — the one class
+    /// of mistake a byte offset invites and that a device pointer will not
+    /// diagnose until a kernel reads garbage.
+    ///
+    /// The view is backed by `TensorBacking::Alias(owner)`, so the owner — and
+    /// with it any device allocation or IO binding it holds — outlives every
+    /// value derived from it. That is the same guarantee an output binding's
+    /// alias relies on, and it is what makes a device-resident slice safe to
+    /// hold across a step without copying it anywhere.
+    ///
+    /// Residency is preserved: this never moves bytes and never consults the
+    /// host, so a view of a device tensor is a device tensor. What it cannot do
+    /// is express a *strided* window — a slice along an inner axis is not a
+    /// contiguous range, and asking for one here would silently return the
+    /// wrong elements. Callers that need one must copy on whatever owns the
+    /// buffer.
+    pub fn alias_with_offset(
+        owner: Arc<Value>,
+        element_offset: usize,
+        shape: &[i64],
+    ) -> Result<Self> {
         validate_shape(shape, None)?;
         let alias_numel = shape.iter().try_fold(1usize, |acc, &dim| {
             acc.checked_mul(dim as usize).ok_or_else(|| {
                 OrtError::InvalidArgument(format!("tensor shape too large: {shape:?}"))
             })
         })?;
-        if alias_numel > owner.numel() {
+        let window_end = element_offset.checked_add(alias_numel).ok_or_else(|| {
+            OrtError::InvalidArgument(format!(
+                "alias offset {element_offset} plus {alias_numel} elements overflows"
+            ))
+        })?;
+        if window_end > owner.numel() {
             return Err(OrtError::InvalidArgument(format!(
-                "alias shape {:?} has {} elements, larger than owner shape {:?} with {} elements",
+                "alias shape {:?} at element offset {} needs {} elements, past the end of owner \
+                 shape {:?} with {} elements",
                 shape,
-                alias_numel,
+                element_offset,
+                window_end,
                 owner.shape(),
                 owner.numel()
             )));
         }
-        let data = tensor_data_ptr(owner.ptr.as_ptr())?;
-        let ptr = create_tensor_with_data(
+        let memory_info = tensor_memory_info(owner.ptr.as_ptr())?;
+        // A zero-element alias borrows no bytes, and ORT is entitled to report a
+        // null data pointer for a tensor that owns none. Such an alias is still
+        // a real tensor -- a workflow's growing state starts empty and an
+        // island's outputs are aliased before anything has been appended -- so
+        // give ORT an aligned address it will never dereference instead of
+        // asking the owner for one.
+        let data = if alias_numel == 0 {
+            dangling_aligned(owner.dtype)
+        } else {
+            let base = tensor_data_ptr(owner.ptr.as_ptr())?;
+            // Pointer arithmetic only; the bytes are never read here, so this is
+            // valid for a device address the host cannot dereference.
+            unsafe { base.byte_add(element_offset * owner.dtype.size_of()) }
+        };
+        let ptr = create_tensor_with_data_at(
+            memory_info,
             data,
             alias_numel * owner.dtype.size_of(),
             shape,
@@ -1145,8 +1594,22 @@ impl Value {
             ptr,
             shape: shape.to_vec(),
             dtype: owner.dtype,
-            backing: TensorBacking::Alias(owner),
+            backing: TensorBacking::Alias {
+                owner,
+                element_offset,
+            },
         })
+    }
+
+    /// Convert an owned tensor into a no-copy alias with the requested shape.
+    #[allow(clippy::arc_with_non_send_sync)]
+    pub fn into_alias_with_shape(owner: Value, shape: &[i64]) -> Result<Self> {
+        Self::alias_with_shape(Arc::new(owner), shape)
+    }
+
+    /// Create a no-copy tensor view while retaining a shared allocation owner.
+    pub fn alias_from_shared_owner(owner: Arc<Value>, shape: &[i64]) -> Result<Self> {
+        Self::alias_with_shape(owner, shape)
     }
 
     /// If this value is a no-copy alias over a shared owner, produce another
@@ -1158,11 +1621,64 @@ impl Value {
     /// reallocating or memcpy-ing the underlying buffer.
     pub fn try_alias_clone(&self) -> Option<Result<Value>> {
         match &self.backing {
-            TensorBacking::Alias(owner) => {
-                Some(Value::alias_with_shape(Arc::clone(owner), &self.shape))
-            }
+            // Re-aliasing reproduces the *same window*, offset included: an
+            // alias that carried only its shape would silently rebase to the
+            // owner's prefix.
+            TensorBacking::Alias {
+                owner,
+                element_offset,
+            } => Some(Value::alias_with_offset(
+                Arc::clone(owner),
+                *element_offset,
+                &self.shape,
+            )),
+            // An external allocation this value *owns* (e.g. a native `Tensor`'s
+            // device memory) can be aliased in O(1): re-wrap the same allocation
+            // as another external value sharing the owner `Arc`, so both keep it
+            // alive with no byte copy. This is what lets a device-resident value
+            // flow through the interpreter's `clone_value` fast path instead of
+            // failing a host read. A pure borrow (`owner: None`) has no lifetime
+            // guarantee to share, so it is not alias-cloneable.
+            TensorBacking::External {
+                host_accessible,
+                owner: Some(owner),
+            } => Some(self.alias_external_with_owner(*host_accessible, Arc::clone(owner))),
             _ => None,
         }
+    }
+
+    /// Re-wrap this value's external allocation as another `External` value that
+    /// shares `owner`, keeping the same shape/dtype/memory. O(1), no byte copy.
+    fn alias_external_with_owner(
+        &self,
+        host_accessible: bool,
+        owner: Arc<dyn core::any::Any + Send + Sync>,
+    ) -> Result<Value> {
+        let memory_info = tensor_memory_info(self.ptr.as_ptr())?;
+        let numel = self.numel();
+        // A zero-element alias dereferences no data pointer; hand ORT an aligned
+        // address it will never read rather than the owner's (possibly null) one.
+        let data = if numel == 0 {
+            dangling_aligned(self.dtype)
+        } else {
+            tensor_data_ptr(self.ptr.as_ptr())?
+        };
+        let ptr = create_tensor_with_data_at(
+            memory_info,
+            data,
+            numel * self.dtype.size_of(),
+            &self.shape,
+            self.dtype,
+        )?;
+        Ok(Self {
+            ptr,
+            shape: self.shape.clone(),
+            dtype: self.dtype,
+            backing: TensorBacking::External {
+                host_accessible,
+                owner: Some(owner),
+            },
+        })
     }
 
     pub(crate) unsafe fn from_raw(ptr: *mut onnx_genai_ort_sys::OrtValue) -> Result<Self> {
@@ -1184,8 +1700,10 @@ impl Drop for Value {
             TensorBacking::F16(data) => data.len(),
             TensorBacking::I64(data) => data.len(),
             TensorBacking::Bytes(data) => data.len(),
-            TensorBacking::Alias(owner) => owner.numel(),
-            // Borrowed memory: nothing here keeps it alive, by construction.
+            TensorBacking::Alias { owner, .. } => owner.numel(),
+            // Borrowed memory. Any `_owner` here is a struct field, so drop glue
+            // frees it *after* this body releases the `OrtValue` below — ORT is
+            // always done with the allocation before the owner frees it.
             TensorBacking::External { .. } => 0,
             TensorBacking::None => 0,
         };
@@ -1243,6 +1761,16 @@ fn create_tensor_with_data_in(
     dtype: DataType,
     memory_info: &MemoryInfo,
 ) -> Result<NonNull<onnx_genai_ort_sys::OrtValue>> {
+    create_tensor_with_data_at(memory_info.as_ptr(), data, bytes, shape, dtype)
+}
+
+fn create_tensor_with_data_at(
+    memory_info: *const onnx_genai_ort_sys::OrtMemoryInfo,
+    data: *mut std::ffi::c_void,
+    bytes: usize,
+    shape: &[i64],
+    dtype: DataType,
+) -> Result<NonNull<onnx_genai_ort_sys::OrtValue>> {
     let mut ptr = std::ptr::null_mut();
     let api = crate::error::api()?;
     let create = api
@@ -1253,7 +1781,7 @@ fn create_tensor_with_data_in(
     // the caller's contract for the external one. `shape` is valid for the call.
     crate::error::check_status(unsafe {
         create(
-            memory_info.as_ptr(),
+            memory_info,
             data,
             bytes,
             shape.as_ptr(),
@@ -1263,6 +1791,23 @@ fn create_tensor_with_data_in(
         )
     })?;
     NonNull::new(ptr).ok_or(OrtError::NullPointer)
+}
+
+fn tensor_memory_info(
+    value: *const onnx_genai_ort_sys::OrtValue,
+) -> Result<*const onnx_genai_ort_sys::OrtMemoryInfo> {
+    let api = crate::error::api()?;
+    let get_memory_info = api
+        .GetTensorMemoryInfo
+        .ok_or(OrtError::ApiUnavailable("GetTensorMemoryInfo"))?;
+    let mut memory_info = std::ptr::null();
+    // SAFETY: `value` is a valid tensor OrtValue and ORT owns the returned
+    // memory-info object for the tensor's lifetime.
+    crate::error::check_status(unsafe { get_memory_info(value, &mut memory_info) })?;
+    if memory_info.is_null() {
+        return Err(OrtError::NullPointer);
+    }
+    Ok(memory_info)
 }
 
 fn tensor_shape_and_type(
@@ -1475,6 +2020,15 @@ fn argmax_bf16_bits(bits: &[u16]) -> usize {
     argmax_half_bits(halves)
 }
 
+/// A non-null, correctly aligned address for a tensor that owns no bytes.
+///
+/// ORT requires a non-null data pointer even when the tensor has zero elements,
+/// and every reader casts that pointer to the element type, so it has to carry
+/// the element alignment even though nothing may dereference it.
+fn dangling_aligned(dtype: DataType) -> *mut std::ffi::c_void {
+    std::ptr::without_provenance_mut::<u8>(dtype.size_of().max(1)).cast()
+}
+
 fn tensor_data_ptr(value: *mut onnx_genai_ort_sys::OrtValue) -> Result<*mut std::ffi::c_void> {
     let api = crate::error::api()?;
     let get_data = api
@@ -1495,9 +2049,23 @@ mod host_residency_tests {
     use super::*;
 
     #[test]
+    fn an_empty_tensor_can_be_aliased_and_read_back() {
+        // Workflow state that grows along an axis starts at length zero, and the
+        // engine aliases every island output before running it. Both have to
+        // work for a tensor that owns no bytes.
+        let owner = Value::empty(&[1, 4, 0, 2, 2], DataType::Float32).expect("empty tensor");
+        let alias = Value::into_alias_with_shape(owner, &[1, 4, 0, 2, 2]).expect("alias");
+        assert_eq!(alias.shape(), [1, 4, 0, 2, 2]);
+        assert_eq!(alias.numel(), 0);
+        assert!(alias.to_vec_f32().expect("read back").is_empty());
+        assert!(alias.as_raw_bytes().expect("borrow bytes").is_empty());
+    }
+
+    #[test]
     fn a_host_tensor_reports_host_residency_and_lends_its_bytes() {
         let value = Value::from_slice_f32(&[1.0, 2.0], &[2]).expect("build a host tensor");
         assert!(value.is_host_resident().expect("memory info is available"));
+        assert_eq!(value.device_id().expect("device ID is available"), 0);
         assert_eq!(
             value.as_raw_bytes().expect("host bytes are borrowable"),
             &[1.0f32, 2.0]
@@ -1812,10 +2380,11 @@ mod cuda_device_write_tests {
     use super::{DataType, Value};
     use crate::{Allocator, Environment, Session, SessionOptions, ep_selection};
     use std::path::Path;
+    use std::sync::Arc;
 
     const TINY_LLM: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../tests/fixtures/tiny-llm/model.onnx"
+        "/../../tests/fixtures/tiny-llm-sharedbuffer/model.onnx.textproto"
     );
 
     /// Build a CUDA session and return its device KV allocator together with the
@@ -1825,15 +2394,17 @@ mod cuda_device_write_tests {
     /// The `Environment` is returned (not dropped here) on purpose: ORT requires
     /// the `OrtEnv` to outlive every `OrtSession`. Releasing the session after
     /// its environment is a use-after-free that crashes with STATUS_ACCESS_VIOLATION
-    /// at `ReleaseSession`. Keeping the env in the returned tuple lets the caller
-    /// release everything in the correct order (value -> allocator -> session ->
-    /// environment).
-    fn cuda_device_allocator() -> Option<(Environment, Session, Allocator, i32)> {
+    /// at `ReleaseSession`.
+    ///
+    /// The session comes back as an `Arc` because the allocator co-owns it:
+    /// that is what guarantees `ReleaseAllocator` precedes `ReleaseSession`
+    /// no matter what order the caller drops the tuple in.
+    fn cuda_device_allocator() -> Option<(Environment, Arc<Session>, Allocator<'static>, i32)> {
         let env = Environment::new("cuda-device-write-test").expect("env");
         let options =
             SessionOptions::with_execution_provider(ep_selection("cuda")).with_intra_op_threads(1);
         let session = match Session::new(&env, Path::new(TINY_LLM), options) {
-            Ok(session) => session,
+            Ok(session) => Arc::new(session),
             Err(error) => {
                 eprintln!("cuda session build failed: {error}");
                 return None;
@@ -1843,7 +2414,7 @@ mod cuda_device_write_tests {
             eprintln!("cuda_device_id() is None (CUDA EP not attached?)");
             return None;
         };
-        match session.device_kv_allocator() {
+        match Session::shared_device_allocator(&session) {
             Ok(Some(allocator)) => Some((env, session, allocator, device_id)),
             Ok(None) => {
                 eprintln!(
@@ -1875,18 +2446,6 @@ mod cuda_device_write_tests {
     /// `OrtEnv` outlive every `OrtSession`; releasing them out of order (e.g.
     /// dropping the environment first) is a use-after-free that crashes with
     /// STATUS_ACCESS_VIOLATION. Dropping in this order releases cleanly.
-    fn release_cuda_resources_in_order(
-        tensor: Value,
-        allocator: Allocator,
-        session: Session,
-        env: Environment,
-    ) {
-        drop(tensor);
-        drop(allocator);
-        drop(session);
-        drop(env);
-    }
-
     #[test]
     #[ignore = "requires a CUDA GPU + CUDA-enabled ONNX Runtime"]
     fn cuda_device_write_prefix_round_trips_through_device_memory() {
@@ -1911,7 +2470,49 @@ mod cuda_device_write_tests {
         assert_eq!(&read_back[..prefix.len()], &prefix);
         assert_eq!(&read_back[prefix.len()..], &[-1_i64, -1]);
 
-        release_cuda_resources_in_order(tensor, allocator, session, env);
+        // Scope-end drops run in reverse declaration order (tensor, allocator,
+        // session, env), and the allocator's `Arc<Session>` makes the
+        // allocator-before-session half of that a guarantee rather than a habit.
+        drop((tensor, allocator, session, env));
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA GPU + CUDA-enabled ONNX Runtime"]
+    fn cuda_alias_preserves_device_residency_without_copying() {
+        let Some((env, session, allocator, device_id)) = cuda_device_allocator() else {
+            return;
+        };
+        let owner = Value::empty_in(&[4], DataType::Int64, &allocator).expect("device allocation");
+        assert!(!owner.is_host_resident().expect("device residency"));
+        let host = Value::from_slice_i64(&[9, 8, 7, 6], &[4]).expect("host tensor");
+        let error = owner
+            .copy_from_host(&host)
+            .expect_err("CUDA allocation must not be host-accessible");
+        assert!(
+            error.to_string().contains("lives on a device"),
+            "unexpected error: {error}"
+        );
+        let bytes = [1_i64, 2, 3, 4]
+            .into_iter()
+            .flat_map(i64::to_ne_bytes)
+            .collect::<Vec<_>>();
+        crate::cuda_rt::memcpy_host_to_device(owner.data_ptr_addr().unwrap(), &bytes)
+            .expect("host-to-device copy");
+        let owner_ptr = owner.data_ptr_addr().unwrap();
+        let alias = Value::into_alias_with_shape(owner, &[2]).expect("device alias");
+        let alias_clone = alias
+            .try_alias_clone()
+            .expect("alias backing")
+            .expect("alias clone");
+        assert_eq!(alias.device_id().expect("alias device"), device_id);
+        assert_eq!(alias.data_ptr_addr().unwrap(), owner_ptr);
+        assert_eq!(alias_clone.data_ptr_addr().unwrap(), owner_ptr);
+        assert_eq!(read_device_i64(&alias, 2), vec![1, 2]);
+        drop(alias_clone);
+        drop(alias);
+        drop(allocator);
+        drop(session);
+        drop(env);
     }
 
     #[test]
@@ -1935,7 +2536,7 @@ mod cuda_device_write_tests {
         let read_back = read_device_i64(&mask, capacity);
         assert_eq!(read_back, vec![1, 1, 1, 1, 1, 0, 0, 0]);
 
-        release_cuda_resources_in_order(mask, allocator, session, env);
+        drop((mask, allocator, session, env));
     }
 }
 
@@ -2405,5 +3006,87 @@ mod element_alignment_tests {
             Value::from_raw_bytes(Vec::new(), &[0, 8], DataType::Float16).expect("empty fp16");
         assert!(value.as_raw_bytes().expect("borrowed bytes").is_empty());
         assert!(value.to_raw_bytes().expect("copied bytes").is_empty());
+    }
+}
+
+#[cfg(test)]
+// A `Value` is deliberately neither Send nor Sync: an OrtValue belongs to
+// the thread that created it. `Arc` is nonetheless what the alias backing
+// takes, so these cases build one exactly the way the production path does.
+#[allow(clippy::arc_with_non_send_sync)]
+mod alias_offset_tests {
+    use super::*;
+
+    /// An offset alias sees the window it named, and nothing before it.
+    #[test]
+    fn an_offset_alias_reads_from_the_offset() {
+        let owner = Arc::new(Value::from_slice_i64(&[10, 11, 12, 13, 14, 15], &[6]).unwrap());
+        let view = Value::alias_with_offset(Arc::clone(&owner), 2, &[3]).unwrap();
+        assert_eq!(view.shape(), &[3]);
+        assert_eq!(view.to_vec_i64().unwrap(), vec![12, 13, 14]);
+    }
+
+    /// A zero offset is the prefix alias, so one implementation serves both.
+    #[test]
+    fn a_zero_offset_alias_is_the_prefix() {
+        let owner = Arc::new(Value::from_slice_i64(&[1, 2, 3, 4], &[4]).unwrap());
+        let prefix = Value::alias_with_shape(Arc::clone(&owner), &[2]).unwrap();
+        let offset = Value::alias_with_offset(owner, 0, &[2]).unwrap();
+        assert_eq!(prefix.to_vec_i64().unwrap(), offset.to_vec_i64().unwrap());
+    }
+
+    /// A window running past the owner is refused, naming both extents.
+    ///
+    /// Silently clamping would hand a kernel a shorter tensor than its contract
+    /// declares; reading past the end would hand it another allocation's bytes.
+    #[test]
+    fn a_window_past_the_end_is_refused() {
+        let owner = Arc::new(Value::from_slice_i64(&[1, 2, 3, 4], &[4]).unwrap());
+        let Err(error) = Value::alias_with_offset(owner, 3, &[2]) else {
+            panic!("a window past the end of the owner must be refused");
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("past the end"),
+            "the refusal must say the window leaves the allocation: {message}"
+        );
+    }
+
+    /// Re-aliasing an offset view reproduces the same window.
+    ///
+    /// Every carried value in the interpreter passes through
+    /// `try_alias_clone`. An alias that recorded only its shape would re-alias
+    /// to the owner's *prefix* — same shape, same dtype, another tensor's
+    /// bytes, and no error anywhere to notice it.
+    #[test]
+    fn re_aliasing_an_offset_view_keeps_the_offset() {
+        let owner = Arc::new(Value::from_slice_i64(&[10, 11, 12, 13, 14, 15], &[6]).unwrap());
+        let view = Value::alias_with_offset(owner, 2, &[3]).unwrap();
+        let cloned = view
+            .try_alias_clone()
+            .expect("an alias is alias-cloneable")
+            .unwrap();
+        assert_eq!(cloned.to_vec_i64().unwrap(), vec![12, 13, 14]);
+        assert_eq!(cloned.to_vec_i64().unwrap(), view.to_vec_i64().unwrap());
+    }
+
+    /// Offsets compose, so narrowing twice narrows twice.
+    #[test]
+    fn offsets_compose_through_a_re_alias() {
+        let owner = Arc::new(Value::from_slice_i64(&[0, 1, 2, 3, 4, 5, 6, 7], &[8]).unwrap());
+        let first = Value::alias_with_offset(owner, 2, &[4]).unwrap();
+        let re_aliased = Arc::new(first.try_alias_clone().expect("aliasable").unwrap());
+        let second = Value::alias_with_offset(re_aliased, 1, &[2]).unwrap();
+        assert_eq!(second.to_vec_i64().unwrap(), vec![3, 4]);
+    }
+
+    /// The owner outlives every view derived from it.
+    #[test]
+    fn a_view_keeps_its_owner_alive() {
+        let view = {
+            let owner = Arc::new(Value::from_slice_i64(&[7, 8, 9], &[3]).unwrap());
+            Value::alias_with_offset(owner, 1, &[2]).unwrap()
+        };
+        assert_eq!(view.to_vec_i64().unwrap(), vec![8, 9]);
     }
 }

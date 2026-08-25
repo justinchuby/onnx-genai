@@ -309,6 +309,60 @@ fn configs() -> Vec<Config> {
             beta_shared: false,
             with_past: false,
         },
+        // Real Qwen3.5 hybrid decode head size (d_k = d_v = 128): the warp
+        // width exactly, so the warp-cooperative kernel stores 4 state rows per
+        // lane (128 / 32 slots) and reduces across a full warp with no tail
+        // guard. Multi-step recurrence with a non-zero past_state.
+        Config {
+            label: "gated_delta/dk128",
+            batch: 1,
+            seq: 3,
+            d_k: 128,
+            d_v: 128,
+            q_num_heads: 2,
+            kv_num_heads: 2,
+            n_k_heads: 2,
+            update_rule: "gated_delta",
+            scale: 0.0, // 1/sqrt(128)
+            decay_per_key_dim: true,
+            beta_shared: false,
+            with_past: true,
+        },
+        // d_k = 96 (3 full warps): a multi-slot column whose row count is a
+        // multiple of the warp but > one warp, per-key-dim decay.
+        Config {
+            label: "gated_delta/dk96",
+            batch: 1,
+            seq: 3,
+            d_k: 96,
+            d_v: 40,
+            q_num_heads: 4,
+            kv_num_heads: 2,
+            n_k_heads: 2,
+            update_rule: "gated_delta",
+            scale: 0.5,
+            decay_per_key_dim: false,
+            beta_shared: false,
+            with_past: true,
+        },
+        // d_k = 130 (NOT a multiple of the warp): exercises the `i < d_k` tail
+        // guard — lanes 0..1 own 5 rows, lanes 2..31 own 4 — so the warp
+        // reduction folds in zero partials from the idle tail lanes.
+        Config {
+            label: "gated_delta/dk130_tail",
+            batch: 1,
+            seq: 3,
+            d_k: 130,
+            d_v: 20,
+            q_num_heads: 2,
+            kv_num_heads: 2,
+            n_k_heads: 2,
+            update_rule: "gated_delta",
+            scale: 0.9,
+            decay_per_key_dim: true,
+            beta_shared: false,
+            with_past: true,
+        },
     ]
 }
 
@@ -470,6 +524,7 @@ fn linear_attention_state_carry_matches_chained() {
             dtype: t.dtype,
             shape: vec![t.shape[0], len, per],
             bytes,
+            absent: false,
         }
     };
 
@@ -507,6 +562,7 @@ fn linear_attention_state_carry_matches_chained() {
             dtype,
             shape: vec![batch, heads, d_k, d_v],
             bytes: first[1].clone(),
+            absent: false,
         });
         v.push(slice_seq(&full_inputs[4], split_at, 6 - split_at));
         v.push(slice_seq(&full_inputs[5], split_at, 6 - split_at));

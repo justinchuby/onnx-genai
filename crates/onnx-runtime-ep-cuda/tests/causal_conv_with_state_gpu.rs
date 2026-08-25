@@ -197,3 +197,65 @@ fn causal_conv_with_state_matches_cpu_for_batched_decode() {
         }
     }
 }
+
+/// The standard `ai.onnx` opset-27 spelling reaches the same fused kernel.
+///
+/// ONNX standardized this op in opset 27 with a contract identical to the
+/// `com.microsoft` one we already served, so it is registered against the same
+/// factory rather than growing a second implementation to keep in step. This
+/// checks the claim two ways: the standard-domain CUDA result matches the
+/// standard-domain CPU oracle, and it matches the contrib-domain CUDA result
+/// bit for bit — if the registration were missing, `run_cuda` would find no
+/// kernel and the node would never reach this EP at all.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn the_standard_domain_spelling_reaches_the_same_kernel() {
+    let ep = require_cuda();
+    // Prefill with a carry state and a bias: the shape that exercises the
+    // concatenation, the per-channel bias, and the emitted present state.
+    let x: Vec<f32> = vec![0.5, -1.0, 2.0, -0.25, 1.5, 0.75, -0.5, 0.25];
+    let weight: Vec<f32> = vec![0.5, 0.25, 1.0, -0.75, 0.5, 0.125];
+    let bias: Vec<f32> = vec![0.25, -0.5];
+    let state: Vec<f32> = vec![0.1, -0.2, 0.3, 0.4];
+
+    let inputs = vec![
+        float_input(DataType::Float32, &[1, 2, 4], &x),
+        float_input(DataType::Float32, &[2, 1, 3], &weight),
+        float_input(DataType::Float32, &[2], &bias),
+        float_input(DataType::Float32, &[1, 2, 2], &state),
+    ];
+    let outputs = vec![
+        (DataType::Float32, vec![1, 2, 4]),
+        (DataType::Float32, vec![1, 2, 2]),
+    ];
+    // The standard op defines only `activation`; it has no `ndim`.
+    let standard_attrs = vec![("activation", Attribute::String(b"silu".to_vec()))];
+    let contrib_attrs = vec![
+        ("ndim", Attribute::Int(1)),
+        ("activation", Attribute::String(b"silu".to_vec())),
+    ];
+
+    let standard_cuda = run_cuda(&ep, OP, "", 27, &inputs, &outputs, &standard_attrs);
+    let standard_cpu = run_cpu(OP, "", 27, &inputs, &outputs, &standard_attrs);
+    let contrib_cuda = run_cuda(&ep, OP, DOMAIN, OPSET, &inputs, &outputs, &contrib_attrs);
+
+    for slot in 0..outputs.len() {
+        let got = decode_floats(&standard_cuda[slot], DataType::Float32);
+        let expected = decode_floats(&standard_cpu[slot], DataType::Float32);
+        assert_close(
+            &format!("standard-domain CUDA vs CPU, output {slot}"),
+            DataType::Float32,
+            &got,
+            &expected,
+            2e-5,
+        );
+        // Same kernel, same inputs: the two spellings must not merely be close.
+        assert_eq!(
+            standard_cuda[slot], contrib_cuda[slot],
+            "the standard and contrib spellings must resolve to one kernel, output {slot}"
+        );
+    }
+}

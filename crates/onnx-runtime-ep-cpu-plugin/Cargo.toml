@@ -20,22 +20,32 @@ crate-type = ["cdylib", "lib"]
 # resolved graph and the built cdylib's symbol table.
 mlas = ["onnx-runtime-ep-cpu/mlas"]
 
+# Compile the dispatch probe into the cdylib and install the counting allocator
+# as its global allocator, so a harness can attribute allocations to dispatch
+# phases across the ORT boundary. Never enabled for a shipped build: it adds a
+# thread-local read and two counter updates to every allocation in the library,
+# and the probe's `no_mangle` exports exist only under this feature precisely so
+# the shipped cdylib keeps exporting the ORT plugin ABI and nothing else
+# (`plugin_export_abi::l1_no_symbol_leakage` pins that).
+dispatch_probe = ["onnx-runtime-ep-plugin/dispatch_probe"]
+
 [dependencies]
 onnx-runtime-ep-cpu = { workspace = true }
 onnx-runtime-ep-plugin = { path = "../onnx-runtime-ep-plugin", version = "=0.1.0-dev.5" }
 
 [dev-dependencies]
+onnx-runtime-shape-inference = { workspace = true }
 onnx-runtime-ort-testkit = { workspace = true }
 libloading = { workspace = true }
 onnx-genai-ort-sys = { workspace = true }
-onnx-runtime-ep-plugin = { path = "../onnx-runtime-ep-plugin", version = "=0.1.0-dev.5" }
+onnx-runtime-ep-plugin = { path = "../onnx-runtime-ep-plugin", version = "=0.1.0-dev.5", features = ["testutil"] }
 onnx-runtime-ep-cpu = { workspace = true }
 onnx-runtime-ep-api = { workspace = true }
 onnx-runtime-ir = { workspace = true }
 onnx-std = { workspace = true }
 serde_yaml = { workspace = true }
-# `default_artifacts_are_mlas_free.rs` reads the resolved dependency graph from
-# `cargo metadata`, which is JSON.
+# `default_artifacts_are_mlas_free.rs` deterministically resolves the workspace
+# declarations from `cargo metadata --no-deps`, which is JSON.
 serde_json = { workspace = true }
 
 [lints]

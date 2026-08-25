@@ -16,7 +16,10 @@ a deliberately non-conventional name:
 | present KV out  | `present.0.*`           | `cache_k_out.0`, `cache_v_out.0` |
 
 Because none of these match the historical name conventions, the runtime can
-only decode this graph by reading the explicit `model.io` block in
-`inference_metadata.yaml`. The graph was produced from `tiny-llm` by renaming
+only decode this graph by reading the port roles its workflow declares —
+`components.decoder.ports.roles` for the semantic inputs and outputs, and the
+`state_service` group for the cache pairs. A runtime that fell back to guessing
+a port from its spelling would fail here and nowhere else, which is exactly what
+this fixture exists to catch. The graph was produced from `tiny-llm` by renaming
 the tensor names consistently across the textproto; no Mobius regeneration is
 required.

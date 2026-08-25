@@ -69,7 +69,8 @@
 # ----------
 #   0 — all checked crates compiled cleanly
 #   1 — compilation errors detected (the interesting case)
-#   2 — setup failure (target not installable, cargo missing, etc.)
+#   2 — setup failure (target not installable, cargo missing, vendored cpuinfo
+#       submodule not populated, etc.)
 
 set -euo pipefail
 
@@ -80,7 +81,6 @@ ARCH_TARGET="aarch64-unknown-linux-gnu"
 # tree contains no ort-sys/CUDA dependency that needs a native toolchain.
 # Matches ci.yml lines 91–118 minus mlas-sys (Linux-only, needs native gcc).
 CRATES_FULL=(
-    onnx-genai-comfyui-config
     onnx-genai-metadata
     onnx-genai-genai-config
     onnx-genai-kv
@@ -106,6 +106,7 @@ CRATES_FULL=(
     onnx-runtime-dlpack
     onnx-runtime-comm
     onnx-std-python
+    onnx-runtime-hostmon
 )
 
 # Subset that compiles without ort-sys or cmake-based build scripts.
@@ -120,7 +121,6 @@ CRATES_FULL=(
 #   onnx-runtime-cpuinfo                     — cmake build script needs gcc
 #   mlas-sys                                 — Linux-only native build
 CRATES_NO_FFI=(
-    onnx-genai-comfyui-config
     onnx-genai-metadata
     onnx-genai-genai-config
     onnx-genai-kv
@@ -140,6 +140,7 @@ CRATES_NO_FFI=(
     onnx-runtime-dlpack
     onnx-runtime-comm
     onnx-std-python
+    onnx-runtime-hostmon
 )
 
 # ─── Target installation ───────────────────────────────────────────────────
@@ -208,6 +209,61 @@ else
     echo "   To check onnx-runtime-ep-cpu locally, install a Linux sysroot or"
     echo "   rely on CI (ubuntu-latest) where this script runs the full set."
     echo ""
+fi
+
+# ─── Preconditions: the vendored cpuinfo submodule ────────────────────────
+#
+# `git worktree add` does not populate submodules, and neither does a clone
+# without `--recurse-submodules`.  Every agent on this repo works from a
+# worktree, so this is on almost everyone's path, repeatedly.
+# onnx-runtime-cpuinfo's build script then hands an empty directory to cmake,
+# which reports a missing CMakeLists.txt inside a third-party vendor tree and
+# never says "submodule" — classifying that as environmental rather than a
+# code or toolchain break has cost a full benchmark validation-matrix re-run
+# (#1816).
+#
+# The crate's build script now names the cause itself, so this check is not
+# the only thing standing between a reader and the answer.  It is here because
+# a gate should be able to say it cannot run at full scope BEFORE it starts,
+# rather than by failing several minutes into a clippy run — the same
+# principle as the reduced-scope warnings above.
+#
+# Exit 2 (setup failure), never 1: an environment fault must stay separable
+# from a genuine compile error in automation.
+#
+# Checked against both crate lists because the two passes select scope
+# independently: on a Linux host without the aarch64 cross toolchain the OS
+# pass includes onnx-runtime-cpuinfo while the arch pass does not.
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CPUINFO_VENDOR="crates/onnx-runtime-cpuinfo/vendor/cpuinfo"
+
+if printf '%s\n' "${CRATES[@]}" "${ARCH_CRATES[@]}" | grep -qx onnx-runtime-cpuinfo; then
+    # The same two files the crate's build script requires: cmake opens the
+    # first, bindgen parses the second.  A tree with only one of them fails
+    # later and just as opaquely, so both are named.
+    CPUINFO_MISSING=()
+    for f in CMakeLists.txt include/cpuinfo.h; do
+        [ -f "$REPO_ROOT/$CPUINFO_VENDOR/$f" ] || CPUINFO_MISSING+=("$f")
+    done
+    if [ ${#CPUINFO_MISSING[@]} -ne 0 ]; then
+        echo "✗ Vendored cpuinfo submodule is not populated." >&2
+        echo "" >&2
+        echo "  directory: $REPO_ROOT/$CPUINFO_VENDOR" >&2
+        echo "  missing:   ${CPUINFO_MISSING[*]}" >&2
+        echo "" >&2
+        echo "  'git worktree add' does not populate submodules, and neither" >&2
+        echo "  does a clone without --recurse-submodules.  onnx-runtime-cpuinfo" >&2
+        echo "  is in scope for this run, so cmake would fail on a missing" >&2
+        echo "  CMakeLists.txt in a third-party directory without ever" >&2
+        echo "  mentioning submodules." >&2
+        echo "" >&2
+        echo "  This is an environment fault, not a compile error." >&2
+        echo "" >&2
+        echo "  Fix, from the repository root:" >&2
+        echo "" >&2
+        echo "      git submodule update --init $CPUINFO_VENDOR" >&2
+        exit 2
+    fi
 fi
 
 # ─── Build the -p flags ───────────────────────────────────────────────────

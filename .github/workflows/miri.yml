@@ -8,9 +8,11 @@ on:
       - .github/workflows/miri.yml
       - crates/onnx-runtime-ep-api/**
       - crates/onnx-runtime-ep-cpu/**
+      - crates/onnx-runtime-ep-plugin/**
       - crates/onnx-runtime-session/**
       - crates/onnx-runtime-capi/**
       - crates/onnx-runtime-memory/**
+      - crates/onnx-runtime-memory-api/**
       - crates/onnx-runtime-dlpack/**
   push:
     branches:
@@ -22,9 +24,11 @@ on:
       - .github/workflows/miri.yml
       - crates/onnx-runtime-ep-api/**
       - crates/onnx-runtime-ep-cpu/**
+      - crates/onnx-runtime-ep-plugin/**
       - crates/onnx-runtime-session/**
       - crates/onnx-runtime-capi/**
       - crates/onnx-runtime-memory/**
+      - crates/onnx-runtime-memory-api/**
       - crates/onnx-runtime-dlpack/**
   schedule:
     - cron: "17 10 * * 1"
@@ -69,17 +73,14 @@ jobs:
         run: |
           set -euo pipefail
 
-          run_miri() {
-            local label="$1"
-            shift
-            local start end
-            start=$(date +%s)
-            echo "::group::Miri: ${label}"
-            "$@"
-            end=$(date +%s)
-            echo "MIRI_TIMING ${label}: $((end - start))s"
-            echo "::endgroup::"
-          }
+          # `run_miri` lives in a script so it can have a conformance suite:
+          # it is a gate whose failure mode is a green report. Most steps below
+          # select tests BY NAME, and libtest exits 0 on a filter that matches
+          # nothing, so a renamed test silently turns its step into a no-op that
+          # reports `ok`. The wrapper fails the step when it executed no tests.
+          # See scripts/test_step.sh and scripts/test_step_test.sh.
+          # shellcheck source=scripts/test_step.sh
+          . ./scripts/test_step.sh
 
           # Keep Stacked Borrows (Miri default) instead of Tree Borrows so the raw
           # pointer ownership checks stay maximally strict. Only ep-api/session/C
@@ -89,6 +90,15 @@ jobs:
             cargo +nightly miri test --locked -p onnx-runtime-memory
           run_miri "onnx-runtime-dlpack full" \
             cargo +nightly miri test --locked -p onnx-runtime-dlpack
+
+          # onnx-runtime-memory-api is the binding/ownership seam: raw addresses
+          # crossing an allocator trait, generation-checked release, and
+          # quarantine that deliberately retains ownership instead of freeing.
+          # Miri's leak check is the only thing here that distinguishes
+          # "deliberately retained" from "lost", which is exactly the property
+          # this crate claims, so it runs the full crate rather than a subset.
+          run_miri "onnx-runtime-memory-api full" \
+            cargo +nightly miri test --locked -p onnx-runtime-memory-api
 
           # onnx-runtime-ep-api has Linux-only legacy plugin-loader tests that
           # compile and dlopen C fixtures; Miri cannot execute that native path.
@@ -191,12 +201,60 @@ jobs:
           # and (2) retag read of type `[u64]` on thread `nxrt-task-0`".
           run_miri "onnx-runtime-ep-cpu task runtime nested dispatch (integration)" \
             env MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-num-cpus=4 -Zmiri-tree-borrows -Zmiri-ignore-leaks" cargo +nightly miri test --locked -p onnx-runtime-ep-cpu --test task_runtime_latency -- --ignored nested_dispatch_slot_pressure
+          # The persistent SPMD decode pool publishes a `Job` that holds a raw
+          # pointer to a closure borrowed off the *dispatcher's stack frame*,
+          # and the workers read through it until the barrier drains. Since
+          # #1746 the dispatcher also computes a shard inline, so a panic in
+          # that shard can unwind the frame the workers are still reading --
+          # a use-after-free that no native run reliably observes, because it
+          # depends on the worker being scheduled inside the unwind window.
+          # Only the panic-safety test is covered: the rest of the module does
+          # OS affinity and is not Miri-tractable.
+          #
+          # `-Zmiri-ignore-leaks` because the pool's workers are resident by
+          # design, and `-Zmiri-num-cpus=4` so the shards land on distinct
+          # threads instead of collapsing onto one.
+          #
+          # Verified both ways: as written it reports `test result: ok` in
+          # ~23s; removing the `catch_unwind` around the dispatcher's shard
+          # reports "Undefined Behavior: Data race detected between (1)
+          # non-atomic read on thread `onnx-genai-spmd` and (2) retag write of
+          # type `{closure@decode_spmd.rs}`".
+          run_miri "onnx-runtime-ep-cpu decode pool dispatcher shard" \
+            env MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-num-cpus=4 -Zmiri-ignore-leaks" cargo +nightly miri test --locked -p onnx-runtime-ep-cpu --lib decode_spmd::tests::a_panic_in_the_dispatcher
           run_miri "onnx-runtime-ep-cpu strided" \
             cargo +nightly miri test --locked -p onnx-runtime-ep-cpu --lib strided::tests
           run_miri "onnx-runtime-ep-cpu provider" \
             cargo +nightly miri test --locked -p onnx-runtime-ep-cpu --lib provider::tests
           run_miri "onnx-runtime-ep-cpu dtype" \
             cargo +nightly miri test --locked -p onnx-runtime-ep-cpu --lib dtype::tests
+
+          # onnx-runtime-ep-plugin marshals ORT `OrtValue`s across the C ABI.
+          # Since #1246 `read_inputs` borrows the value's *own* shape array
+          # instead of copying it, and ORT spells a scalar as a null pointer
+          # with count 0 — `slice::from_raw_parts` on that is UB that no native
+          # run can observe. Miri is the only thing here that checks the guard,
+          # so `kernel_ctx::` is covered directly. The rest of the crate dlopens
+          # ORT and is not Miri-tractable.
+          run_miri "onnx-runtime-ep-plugin kernel context" \
+            cargo +nightly miri test --locked -p onnx-runtime-ep-plugin --lib kernel_ctx::
+
+          # `host_pool` hands ORT the address of a live Rust allocation and
+          # lets ORT read through it for the length of the compute call, while
+          # this side keeps owning and moving that allocation. That is exactly
+          # the shape Stacked Borrows exists to check, and it was wrong: a
+          # `Box` there asserts uniqueness on every move, ORT's first read
+          # through the alias invalidates the assertion, and the next move --
+          # `Option::take` in `Guard::drop` -- retags from a tag that no longer
+          # exists. Present since the module was written, on both sides of
+          # #1526, and no native run can observe it.
+          #
+          # Since #2018 the module has no `#[cfg_attr(miri,
+          # ignore)]` tests at all: the two that used to assert on wall clock
+          # (`PROBE_STALL`) now assert on a stall *count*, which an interpreter
+          # can represent perfectly well. All 24 run here.
+          run_miri "onnx-runtime-ep-plugin host pool" \
+            cargo +nightly miri test --locked -p onnx-runtime-ep-plugin --lib host_pool::
 
           run_miri "onnx-runtime-session tensor" \
             env MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri test --locked -p onnx-runtime-session --lib tensor::tests

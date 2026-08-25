@@ -255,9 +255,19 @@ fn model_node(config: &Config, inputs: &[Option<HostTensor>]) -> (Graph, NodeId)
         Attribute::Int(config.swiglu_fusion as i64),
     );
     node.attributes.insert(
-        "format".into(),
+        "fc1_format".into(),
         Attribute::String(FORMAT.as_bytes().to_vec()),
     );
+    node.attributes.insert(
+        "fc2_format".into(),
+        Attribute::String(FORMAT.as_bytes().to_vec()),
+    );
+    if config.needs_fc3() {
+        node.attributes.insert(
+            "fc3_format".into(),
+            Attribute::String(FORMAT.as_bytes().to_vec()),
+        );
+    }
     node.attributes
         .insert("block_layout_version".into(), Attribute::Int(1));
     if config.activation == "swiglu" {
@@ -626,7 +636,7 @@ fn block_quantized_moe_claim_gate_matches_implemented_config() {
     bad_format
         .node_mut(node)
         .attributes
-        .insert("format".into(), Attribute::String(b"q4_0".to_vec()));
+        .insert("fc1_format".into(), Attribute::String(b"q4_0".to_vec()));
     let bad_model = Model::new(&bad_format);
     assert!(matches!(
         ep.supports_op(bad_model.graph.node(node), 1, &shapes, &dtypes, &[]),
@@ -661,4 +671,511 @@ fn label_seed(label: &str) -> u64 {
     label.bytes().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
         (hash ^ byte as u64).wrapping_mul(0x0000_0100_0000_01b3)
     })
+}
+
+// ---------------------------------------------------------------------------
+// Fused, inert route-telemetry coverage (issue #1810 Slice 7A).
+//
+// BlockQuantizedMoE is not capture-capable (its trailing host synchronization
+// predates this slice), so the capture/replay matrix lives in the QMoE suite;
+// here we cover the producer fused into `bqmoe_route`: default disabled,
+// byte-identical outputs off vs on, a device bitmap that matches a CPU oracle
+// for decode and M>1, fresh epochs across consecutive eager calls, typed
+// fail-closed rejection on a device mismatch, inert behavior on a capacity
+// mismatch (never fails inference), and multi-instance request/device isolation
+// with teardown accounting.
+mod route_telemetry {
+    use super::*;
+    use onnx_runtime_ep_api::Kernel;
+    use onnx_runtime_ep_cuda::kernels::block_quantized_moe::{
+        BlockQuantizedMoEFactory, BlockQuantizedMoEKernel,
+    };
+    use onnx_runtime_ep_cuda::kernels::expert_route_telemetry::{
+        H_DEVICE, H_REQUEST, RouteTelemetryConfig, TelemetryUnsupported, cpu_bitmap,
+    };
+
+    fn telemetry_config(rows: usize) -> Config {
+        Config {
+            rows,
+            hidden: 32,
+            inter: 32,
+            experts: 8,
+            k: 2,
+            activation: "relu",
+            swiglu_fusion: 0,
+            with_bias: false,
+            with_router_weights: false,
+            normalize: false,
+        }
+    }
+
+    /// Row `r` gives experts `(r + shift + i) % E` strictly descending values, so
+    /// its top-`k` selection is deterministic and tie-break independent.
+    fn shifted_router(config: &Config, shift: usize) -> HostTensor {
+        let mut values = vec![0f32; config.rows * config.experts];
+        for row in 0..config.rows {
+            for rank in 0..config.experts {
+                let expert = (row + shift + rank) % config.experts;
+                values[row * config.experts + expert] = (config.experts - rank) as f32;
+            }
+        }
+        HostTensor::f32(&[config.rows, config.experts], &values)
+    }
+
+    fn oracle_bitmap(router: &HostTensor, config: &Config) -> Vec<u32> {
+        let values: Vec<f32> = router
+            .bytes
+            .chunks_exact(4)
+            .map(|bytes| f32::from_ne_bytes(bytes.try_into().unwrap()))
+            .collect();
+        let mut routes = Vec::new();
+        for row in 0..config.rows {
+            let logits = &values[row * config.experts..(row + 1) * config.experts];
+            let mut order: Vec<usize> = (0..config.experts).collect();
+            order.sort_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap().then(a.cmp(&b)));
+            for &expert in order.iter().take(config.k) {
+                routes.push(expert as i32);
+            }
+        }
+        cpu_bitmap(&routes, config.experts).0
+    }
+
+    /// CPU oracle for a coarse-boundary *window*: the union of every call's route
+    /// bitmap accumulated with no reset in between.
+    fn oracle_union(routers: &[HostTensor], config: &Config) -> Vec<u32> {
+        let mut acc = vec![0u32; config.experts.div_ceil(32)];
+        for router in routers {
+            for (word, bit) in acc.iter_mut().zip(oracle_bitmap(router, config)) {
+                *word |= bit;
+            }
+        }
+        acc
+    }
+
+    fn build_kernel(
+        ep: &CudaExecutionProvider,
+        config: &Config,
+        inputs: &[Option<HostTensor>],
+    ) -> BlockQuantizedMoEKernel {
+        let (graph, node) = model_node(config, inputs);
+        let model = Model::new(&graph);
+        let concrete_shapes: Vec<Vec<usize>> = inputs
+            .iter()
+            .filter_map(|input| input.as_ref().map(|input| input.shape.clone()))
+            .collect();
+        let factory = BlockQuantizedMoEFactory {
+            runtime: ep.runtime().clone(),
+        };
+        factory
+            .create_kernel(model.graph.node(node), &concrete_shapes)
+            .expect("concrete BlockQuantizedMoE kernel")
+    }
+
+    /// Upload inputs, run the concrete kernel once through its workspace, return
+    /// the raw output bytes.
+    fn exec_eager(
+        ep: &CudaExecutionProvider,
+        kernel: &BlockQuantizedMoEKernel,
+        config: &Config,
+        inputs: &[Option<HostTensor>],
+    ) -> onnx_runtime_ep_api::Result<Vec<u8>> {
+        let runtime = ep.runtime();
+        let mut buffers = Vec::<Option<DeviceBuffer>>::new();
+        for input in inputs {
+            if let Some(input) = input {
+                let buffer = ep.allocate(input.bytes.len(), 256)?;
+                // SAFETY: allocation size equals the source tensor byte length.
+                unsafe { runtime.htod(&input.bytes, cuptr(buffer.as_ptr()))? };
+                buffers.push(Some(buffer));
+            } else {
+                buffers.push(None);
+            }
+        }
+        let strides: Vec<_> = inputs
+            .iter()
+            .map(|input| {
+                input
+                    .as_ref()
+                    .map(|input| compute_contiguous_strides(&input.shape))
+            })
+            .collect();
+        let views = build_views(inputs, &strides, Some(&buffers), ep.device_id());
+        let output_shape = [config.rows, config.hidden];
+        let output_len = config.rows * config.hidden;
+        let mut output_buffer = ep.allocate(output_len * 4, 256)?;
+        let output_strides = compute_contiguous_strides(&output_shape);
+        let output_view = TensorMut::new(
+            DevicePtrMut(output_buffer.as_mut_ptr()),
+            DataType::Float32,
+            &output_shape,
+            &output_strides,
+            ep.device_id(),
+        );
+        let metadata = views
+            .iter()
+            .map(|view| TensorMetadata::new(view.dtype, view.shape, !view.is_absent()))
+            .collect::<Vec<_>>();
+        let requirement = kernel.workspace_requirement(&metadata)?;
+        let workspace_bytes = usize::try_from(requirement.bytes).unwrap();
+        let mut workspace = ep.allocate(workspace_bytes, requirement.alignment)?;
+        kernel.execute_with_workspace(
+            &views,
+            &mut [output_view],
+            Some(WorkspaceView::new(
+                DevicePtrMut(workspace.as_mut_ptr()),
+                workspace_bytes,
+            )),
+        )?;
+        let mut output = vec![0u8; output_len * 4];
+        // SAFETY: destination exactly covers the f32 output allocation.
+        unsafe { runtime.dtoh(&mut output, cuptr(output_buffer.as_ptr()))? };
+        drop(views);
+        for buffer in buffers.into_iter().flatten() {
+            ep.deallocate(buffer)?;
+        }
+        ep.deallocate(output_buffer)?;
+        ep.deallocate(workspace)?;
+        Ok(output)
+    }
+
+    fn ordinal(ep: &CudaExecutionProvider) -> u32 {
+        ep.runtime().ordinal()
+    }
+
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+    )]
+    #[test]
+    fn telemetry_off_on_output_is_byte_identical() {
+        let ep = require_cuda();
+        for rows in [1usize, 5] {
+            let config = telemetry_config(rows);
+            let mut inputs = build_inputs(&config, 0xA11CE ^ rows as u64);
+            inputs[1] = Some(shifted_router(&config, 0));
+
+            let kernel = build_kernel(&ep, &config, &inputs);
+            let off = exec_eager(&ep, &kernel, &config, &inputs).unwrap();
+            assert!(kernel.route_telemetry_snapshot().unwrap().is_none());
+
+            kernel
+                .arm_route_telemetry(RouteTelemetryConfig {
+                    request_id: 42,
+                    device_id: ordinal(&ep),
+                    num_experts: config.experts,
+                })
+                .expect("arm telemetry");
+            let on = exec_eager(&ep, &kernel, &config, &inputs).unwrap();
+            assert_eq!(
+                off, on,
+                "route outputs must be byte-identical with telemetry off vs on (rows={rows})"
+            );
+        }
+    }
+
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+    )]
+    #[test]
+    fn telemetry_bitmap_matches_cpu_oracle_decode_and_prefill() {
+        let ep = require_cuda();
+        for rows in [1usize, 6] {
+            let config = telemetry_config(rows);
+            let mut inputs = build_inputs(&config, 0xB0B ^ rows as u64);
+            let router = shifted_router(&config, 0);
+            inputs[1] = Some(router.clone());
+
+            let kernel = build_kernel(&ep, &config, &inputs);
+            kernel
+                .arm_route_telemetry(RouteTelemetryConfig {
+                    request_id: 7,
+                    device_id: ordinal(&ep),
+                    num_experts: config.experts,
+                })
+                .expect("arm telemetry");
+            exec_eager(&ep, &kernel, &config, &inputs).unwrap();
+
+            let snapshot = kernel.route_telemetry_snapshot().unwrap().unwrap();
+            assert_eq!(snapshot.header[H_DEVICE], ordinal(&ep));
+            assert_eq!(snapshot.header[H_REQUEST], 7);
+            assert_eq!(snapshot.epoch(), 1, "first armed launch stamps epoch 1");
+            assert!(!snapshot.poison());
+            assert!(!snapshot.overflow());
+            assert_eq!(snapshot.count() as usize, config.rows * config.k);
+            assert_eq!(
+                snapshot.bitmap,
+                oracle_bitmap(&router, &config),
+                "device bitmap must match CPU oracle (rows={rows})"
+            );
+        }
+    }
+
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+    )]
+    #[test]
+    fn telemetry_eager_calls_accumulate_union_within_window() {
+        let ep = require_cuda();
+        let config = telemetry_config(4);
+        let mut inputs = build_inputs(&config, 0xC0FFEE);
+        let kernel = build_kernel(&ep, &config, &inputs);
+        kernel
+            .arm_route_telemetry(RouteTelemetryConfig {
+                request_id: 3,
+                device_id: ordinal(&ep),
+                num_experts: config.experts,
+            })
+            .expect("arm telemetry");
+
+        // Multiple eager calls with different deterministic routes and NO reset
+        // in between accumulate the route union and count over the window; the
+        // epoch stays fixed (advances only at an explicit coarse boundary).
+        let routers: Vec<HostTensor> = (0..3usize)
+            .map(|shift| shifted_router(&config, shift))
+            .collect();
+        let mut expected_count = 0u32;
+        for (index, router) in routers.iter().enumerate() {
+            inputs[1] = Some(router.clone());
+            exec_eager(&ep, &kernel, &config, &inputs).unwrap();
+            expected_count += (config.rows * config.k) as u32;
+            let snapshot = kernel.route_telemetry_snapshot().unwrap().unwrap();
+            assert_eq!(
+                snapshot.epoch(),
+                1,
+                "epoch is fixed within a window (call {index})"
+            );
+            assert_eq!(
+                snapshot.count(),
+                expected_count,
+                "count accumulates across calls with no per-call reset (call {index})"
+            );
+            assert_eq!(
+                snapshot.bitmap,
+                oracle_union(&routers[..=index], &config),
+                "bitmap accumulates the routed union across calls (call {index})"
+            );
+            assert!(!snapshot.poison());
+            assert!(!snapshot.overflow());
+        }
+
+        // An explicit coarse boundary opens a fresh, empty window at a new epoch.
+        kernel.reset_route_telemetry_boundary().unwrap();
+        let after = kernel.route_telemetry_snapshot().unwrap().unwrap();
+        assert_eq!(after.epoch(), 2, "boundary reset increments the epoch");
+        assert_eq!(after.count(), 0, "next window starts empty");
+        assert!(
+            after.bitmap.iter().all(|&word| word == 0),
+            "no stale carryover"
+        );
+
+        // The next window accumulates only its own routes.
+        let router = shifted_router(&config, 5);
+        inputs[1] = Some(router.clone());
+        exec_eager(&ep, &kernel, &config, &inputs).unwrap();
+        let window2 = kernel.route_telemetry_snapshot().unwrap().unwrap();
+        assert_eq!(window2.epoch(), 2, "still window 2");
+        assert_eq!(window2.count(), (config.rows * config.k) as u32);
+        assert_eq!(
+            window2.bitmap,
+            oracle_bitmap(&router, &config),
+            "window 2 records only its own routes, with no window-1 carryover"
+        );
+    }
+
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+    )]
+    #[test]
+    fn telemetry_boundary_reset_increments_epoch_and_starts_empty_window() {
+        let ep = require_cuda();
+        let config = telemetry_config(4);
+        let mut inputs = build_inputs(&config, 0xB0);
+        inputs[1] = Some(shifted_router(&config, 0));
+        let kernel = build_kernel(&ep, &config, &inputs);
+        kernel
+            .arm_route_telemetry(RouteTelemetryConfig {
+                request_id: 9,
+                device_id: ordinal(&ep),
+                num_experts: config.experts,
+            })
+            .expect("arm telemetry");
+
+        exec_eager(&ep, &kernel, &config, &inputs).unwrap();
+        let before = kernel.route_telemetry_snapshot().unwrap().unwrap();
+        assert_eq!(before.epoch(), 1);
+        assert!(before.count() > 0);
+        assert!(before.bitmap.iter().any(|&word| word != 0));
+
+        kernel.reset_route_telemetry_boundary().unwrap();
+        let after = kernel.route_telemetry_snapshot().unwrap().unwrap();
+        assert_eq!(
+            after.epoch(),
+            before.epoch() + 1,
+            "reset bumps epoch by one"
+        );
+        assert_eq!(after.count(), 0, "next window starts with a zero count");
+        assert!(
+            after.bitmap.iter().all(|&word| word == 0),
+            "next window starts empty (no stale carryover)"
+        );
+        assert_eq!(after.header[H_REQUEST], 9, "request identity is preserved");
+        assert_eq!(
+            after.header[H_DEVICE],
+            ordinal(&ep),
+            "device identity preserved"
+        );
+        assert!(!after.poison());
+        assert!(!after.overflow());
+    }
+
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+    )]
+    #[test]
+    fn telemetry_bqmoe_route_matches_oracle_for_m_1_2_4_8() {
+        // BQMoE token counts M in {1,2,4,8} (issue #1810 §5): the fused route
+        // bitmap and count must match the CPU oracle at every M.
+        let ep = require_cuda();
+        for rows in [1usize, 2, 4, 8] {
+            let config = telemetry_config(rows);
+            let mut inputs = build_inputs(&config, 0x3A5 ^ rows as u64);
+            let router = shifted_router(&config, 1);
+            inputs[1] = Some(router.clone());
+
+            let kernel = build_kernel(&ep, &config, &inputs);
+            kernel
+                .arm_route_telemetry(RouteTelemetryConfig {
+                    request_id: 300 + rows as u32,
+                    device_id: ordinal(&ep),
+                    num_experts: config.experts,
+                })
+                .expect("arm telemetry");
+            exec_eager(&ep, &kernel, &config, &inputs).unwrap();
+
+            let snapshot = kernel.route_telemetry_snapshot().unwrap().unwrap();
+            assert_eq!(snapshot.epoch(), 1, "M={rows}: arm opened window 1");
+            assert_eq!(
+                snapshot.count() as usize,
+                config.rows * config.k,
+                "M={rows}: count must equal rows*k"
+            );
+            assert_eq!(
+                snapshot.bitmap,
+                oracle_bitmap(&router, &config),
+                "M={rows}: bitmap must match the CPU oracle"
+            );
+            assert!(!snapshot.poison(), "M={rows}: in-range routes never poison");
+            assert!(!snapshot.overflow(), "M={rows}: count never overflows");
+        }
+    }
+
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+    )]
+    #[test]
+    fn telemetry_device_mismatch_fails_closed_without_failing_inference() {
+        let ep = require_cuda();
+        let config = telemetry_config(2);
+        let inputs = build_inputs(&config, 0xD00D);
+        let kernel = build_kernel(&ep, &config, &inputs);
+
+        let wrong_device = ordinal(&ep).wrapping_add(1);
+        let error = kernel
+            .arm_route_telemetry(RouteTelemetryConfig {
+                request_id: 1,
+                device_id: wrong_device,
+                num_experts: config.experts,
+            })
+            .expect_err("device mismatch must be rejected");
+        assert!(matches!(error, TelemetryUnsupported::DeviceMismatch { .. }));
+
+        assert!(kernel.route_telemetry_snapshot().unwrap().is_none());
+        let out = exec_eager(&ep, &kernel, &config, &inputs).unwrap();
+        assert_eq!(out.len(), config.rows * config.hidden * 4);
+        assert!(kernel.route_telemetry_snapshot().unwrap().is_none());
+    }
+
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+    )]
+    #[test]
+    fn telemetry_capacity_mismatch_is_inert_and_never_fails_inference() {
+        let ep = require_cuda();
+        let config = telemetry_config(2);
+        let mut inputs = build_inputs(&config, 0xFEED);
+        inputs[1] = Some(shifted_router(&config, 0));
+        let kernel = build_kernel(&ep, &config, &inputs);
+
+        kernel
+            .arm_route_telemetry(RouteTelemetryConfig {
+                request_id: 5,
+                device_id: ordinal(&ep),
+                num_experts: config.experts + 4,
+            })
+            .expect("arming with any positive capacity succeeds");
+
+        let out = exec_eager(&ep, &kernel, &config, &inputs).unwrap();
+        assert_eq!(out.len(), config.rows * config.hidden * 4);
+        let snapshot = kernel.route_telemetry_snapshot().unwrap().unwrap();
+        assert_eq!(snapshot.epoch(), 1, "arm opened window 1; execute is inert");
+        assert_eq!(snapshot.count(), 0);
+        assert!(snapshot.bitmap.iter().all(|&word| word == 0));
+    }
+
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+    )]
+    #[test]
+    fn telemetry_multi_instance_request_isolation_and_accounting() {
+        let ep = require_cuda();
+        let config = telemetry_config(3);
+        let mut inputs = build_inputs(&config, 0x5EED);
+        inputs[1] = Some(shifted_router(&config, 0));
+
+        let kernel_a = build_kernel(&ep, &config, &inputs);
+        let kernel_b = build_kernel(&ep, &config, &inputs);
+        kernel_a
+            .arm_route_telemetry(RouteTelemetryConfig {
+                request_id: 100,
+                device_id: ordinal(&ep),
+                num_experts: config.experts,
+            })
+            .unwrap();
+        kernel_b
+            .arm_route_telemetry(RouteTelemetryConfig {
+                request_id: 200,
+                device_id: ordinal(&ep),
+                num_experts: config.experts,
+            })
+            .unwrap();
+
+        assert_ne!(
+            kernel_a.route_telemetry_bitmap_addr(),
+            kernel_b.route_telemetry_bitmap_addr()
+        );
+        let footprint = 4 * config.experts.div_ceil(32) + 6 * 4;
+        assert_eq!(kernel_a.route_telemetry_footprint_bytes(), footprint);
+
+        exec_eager(&ep, &kernel_a, &config, &inputs).unwrap();
+        exec_eager(&ep, &kernel_b, &config, &inputs).unwrap();
+
+        let snap_a = kernel_a.route_telemetry_snapshot().unwrap().unwrap();
+        let snap_b = kernel_b.route_telemetry_snapshot().unwrap().unwrap();
+        assert_eq!(snap_a.header[H_REQUEST], 100);
+        assert_eq!(snap_b.header[H_REQUEST], 200);
+        assert_eq!(snap_a.header[H_DEVICE], ordinal(&ep));
+
+        kernel_a.disarm_route_telemetry();
+        assert_eq!(kernel_a.route_telemetry_footprint_bytes(), 0);
+        assert!(kernel_a.route_telemetry_snapshot().unwrap().is_none());
+        let out = exec_eager(&ep, &kernel_a, &config, &inputs).unwrap();
+        assert_eq!(out.len(), config.rows * config.hidden * 4);
+    }
 }

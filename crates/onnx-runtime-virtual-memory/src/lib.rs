@@ -67,7 +67,11 @@ use std::ptr::NonNull;
 mod sys;
 
 /// Why a virtual range could not be reserved, mapped, or unmapped.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+///
+/// Not `Clone`/`PartialEq`: a refusal that carries the cause underneath it
+/// cannot be meaningfully duplicated or compared, and keeping the cause is
+/// worth more than either.
+#[derive(Debug, thiserror::Error)]
 pub enum VirtualMemoryError {
     /// The requested size or offset is not a multiple of the mapping
     /// granularity.
@@ -89,6 +93,27 @@ pub enum VirtualMemoryError {
         granularity: usize,
         /// The next legal value at or above `value`.
         rounded: usize,
+    },
+    /// A layer this call delegated to refused the request.
+    ///
+    /// Distinct from [`VirtualMemoryError::Os`], which means the *kernel*
+    /// refused it. Keeping the two apart matters because they call for
+    /// opposite responses: a governor that declines a reservation is telling
+    /// the caller to ask for less or free something first, while a driver that
+    /// fails a mapping is telling it that the request cannot be served at all.
+    /// Flattening a decision into an OS error also has to invent an `errno`,
+    /// and `os error 0` in a log sends the next reader hunting for a kernel
+    /// fault that never happened.
+    ///
+    /// The refusal is kept whole rather than stringified so callers can still
+    /// match on it after it has crossed this boundary.
+    #[error("{operation} failed: {source}")]
+    Delegated {
+        /// Which call was being made when the lower layer refused.
+        operation: &'static str,
+        /// The refusal itself, kept whole so it survives `downcast_ref`.
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
     },
     /// The operating system refused the request.
     #[error("{operation} failed: {reason} (os error {code})")]
@@ -123,6 +148,24 @@ pub enum VirtualMemoryError {
     AlreadyMapped {
         /// The offset in question.
         offset: usize,
+    },
+    /// A caller-supplied `PhysicalLocation` (or platform-specific stand-in for
+    /// it) did not match the physical backing a pool/handle actually holds.
+    ///
+    /// Rejected before any lease charge, handle acquisition, mapping, or
+    /// accounting mutation happens: this is a caller-programming-error check,
+    /// not a driver refusal, and must not have any side effect on the pool it
+    /// was refused against.
+    #[error(
+        "requested location {requested} does not match this pool's backing location {actual}; \
+         a mismatched location must never be silently accepted, ask the pool for its own \
+         `location()` instead of asserting one"
+    )]
+    LocationMismatch {
+        /// What the caller asked to commit against.
+        requested: String,
+        /// What the pool is actually backed by.
+        actual: String,
     },
 }
 
@@ -321,6 +364,38 @@ fn check_aligned(what: &'static str, value: usize) -> Result<(), VirtualMemoryEr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `Delegated` and `Os` are kept apart because they call for opposite
+    /// responses, and flattening the first into the second has to invent an
+    /// `errno` -- an `os error 0` in a log sends the next reader hunting for a
+    /// kernel fault that never happened.
+    #[test]
+    fn a_delegated_refusal_is_reported_as_itself_not_as_an_os_error() {
+        #[derive(Debug, thiserror::Error)]
+        #[error("the tier is full")]
+        struct TierFull;
+
+        let error = VirtualMemoryError::Delegated {
+            operation: "growing physical handle pool lease",
+            source: Box::new(TierFull),
+        };
+
+        let rendered = error.to_string();
+        assert_eq!(
+            rendered,
+            "growing physical handle pool lease failed: the tier is full"
+        );
+        assert!(
+            !rendered.contains("os error"),
+            "a refusal from a lower layer must not be dressed up as a kernel failure: {rendered}"
+        );
+
+        let cause = std::error::Error::source(&error).expect("the refusal must be reachable");
+        assert!(
+            cause.downcast_ref::<TierFull>().is_some(),
+            "the cause must arrive as itself, not as a box around itself: {cause}"
+        );
+    }
 
     /// Two separately mapped blocks must read back as one flat buffer.
     ///

@@ -2069,7 +2069,7 @@ mod tests {
         let fc2_packed_shape = [EXPERTS, HIDDEN, PACKED];
         let fc2_scale_shape = [EXPERTS, HIDDEN, BLOCKS];
         let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/qmoe_weight_offload/model.onnx");
+            .join("tests/fixtures/qmoe_weight_offload/model.onnx.textproto");
         let (graph, fixture_store) =
             load_model_with_weights(&fixture).expect("load ONNX IR QMoE fixture");
         let node = graph
@@ -3417,6 +3417,195 @@ mod tests {
     #[test]
     fn qmoe_top2_normalized_matches_float_moe() {
         run_equivalence(4, 16, 16, 16, 2, true, false);
+    }
+
+    /// Independent oracle for the clipped-SwiGLU formula this kernel must
+    /// match, transcribed directly from the CUDA reference
+    /// (`swiglu_value` in `onnx-runtime-ep-cuda/src/kernels/qmoe.rs`):
+    /// `min(gate, limit) * sigmoid(alpha * min(gate, limit)) * (clamp(linear, -limit, limit) + beta)`.
+    /// Kept deliberately separate from `MoeAttributes::swiglu` so a bug
+    /// introduced into the production formula does not silently pass by
+    /// comparing against itself.
+    fn reference_clipped_swiglu(gate: f32, linear: f32, alpha: f32, beta: f32, limit: f32) -> f32 {
+        let bounded_gate = gate.min(limit);
+        let bounded_linear = linear.clamp(-limit, limit);
+        let sigmoid = 1.0 / (1.0 + (-(alpha * bounded_gate)).exp());
+        bounded_gate * sigmoid * (bounded_linear + beta)
+    }
+
+    /// Builds a single-expert, unfused-gate (fc3) QMoE node quantized at
+    /// `expert_weight_bits=8` (so the dequantization is exact and the test
+    /// isolates activation-formula correctness, not quantization noise), runs
+    /// it with the given `activation_alpha`/`activation_beta`/`swiglu_limit`,
+    /// and returns the CPU kernel's output alongside an oracle computed
+    /// directly from `reference_clipped_swiglu`.
+    fn run_clipped_swiglu(alpha: f32, beta: f32, limit: f32) -> (Vec<f32>, Vec<f32>) {
+        const HIDDEN: usize = 16;
+        const INTER: usize = 16;
+        const EXPERTS: usize = 1;
+        const BLOCK: usize = 16;
+        const BITS: usize = 8;
+
+        let fc1 = quantize(EXPERTS, INTER, HIDDEN, BITS, BLOCK, false);
+        let fc2 = quantize(EXPERTS, HIDDEN, INTER, BITS, BLOCK, false);
+        let fc3 = quantize(EXPERTS, INTER, HIDDEN, BITS, BLOCK, false);
+        let input: Vec<f32> = (0..HIDDEN).map(|i| (i as f32 * 0.2) - 1.5).collect();
+        let router = vec![1.0f32];
+
+        let q_shapes = [
+            Some((DataType::Float32, &[1, HIDDEN][..])),
+            Some((DataType::Float32, &[1, EXPERTS])),
+            Some((DataType::Uint8, &[EXPERTS, INTER, HIDDEN])),
+            Some((DataType::Float32, &[EXPERTS, INTER, 1])),
+            None,
+            Some((DataType::Uint8, &[EXPERTS, HIDDEN, INTER])),
+            Some((DataType::Float32, &[EXPERTS, HIDDEN, 1])),
+            None,
+            Some((DataType::Uint8, &[EXPERTS, INTER, HIDDEN])),
+            Some((DataType::Float32, &[EXPERTS, INTER, 1])),
+        ];
+        let q_attrs = vec![
+            ("expert_weight_bits", Attribute::Int(BITS as i64)),
+            ("block_size", Attribute::Int(BLOCK as i64)),
+            ("k", Attribute::Int(1)),
+            ("activation_type", Attribute::String(b"swiglu".to_vec())),
+            ("swiglu_fusion", Attribute::Int(0)),
+            ("activation_alpha", Attribute::Float(alpha)),
+            ("activation_beta", Attribute::Float(beta)),
+            ("swiglu_limit", Attribute::Float(limit)),
+        ];
+        let (q_graph, q_node) = model_node("QMoE", &q_shapes, &[1, HIDDEN], &q_attrs);
+        let x = Owned::f32(&[1, HIDDEN], &input);
+        let router_tensor = Owned::f32(&[1, EXPERTS], &router);
+        let fc1_packed = Owned::u8(&[EXPERTS, INTER, HIDDEN], &fc1.packed);
+        let fc1_scales = Owned::f32(&[EXPERTS, INTER, 1], &fc1.scales);
+        let fc2_packed = Owned::u8(&[EXPERTS, HIDDEN, INTER], &fc2.packed);
+        let fc2_scales = Owned::f32(&[EXPERTS, HIDDEN, 1], &fc2.scales);
+        let fc3_packed = Owned::u8(&[EXPERTS, INTER, HIDDEN], &fc3.packed);
+        let fc3_scales = Owned::f32(&[EXPERTS, INTER, 1], &fc3.scales);
+        let mut q_output = Owned::zeros_f32(&[1, HIDDEN]);
+        kernel(&q_graph, q_node)
+            .unwrap()
+            .execute(
+                &[
+                    x.view(),
+                    router_tensor.view(),
+                    fc1_packed.view(),
+                    fc1_scales.view(),
+                    TensorView::absent(DataType::Float32),
+                    fc2_packed.view(),
+                    fc2_scales.view(),
+                    TensorView::absent(DataType::Float32),
+                    fc3_packed.view(),
+                    fc3_scales.view(),
+                ],
+                &mut [q_output.view_mut()],
+            )
+            .unwrap();
+
+        // Reference: dequantized dense matmuls, then the clipped-SwiGLU
+        // oracle applied elementwise, matching `run_expert`'s unfused-gate
+        // path with the exact same weights.
+        let (gate, linear_part): (Vec<f32>, Vec<f32>) = (0..INTER)
+            .map(|row| {
+                let mut g = 0.0f32;
+                let mut l = 0.0f32;
+                for (col, &x) in input.iter().enumerate() {
+                    g += x * fc1.dequantized[row * HIDDEN + col];
+                    l += x * fc3.dequantized[row * HIDDEN + col];
+                }
+                (g, l)
+            })
+            .unzip();
+        let activated: Vec<f32> = gate
+            .iter()
+            .zip(&linear_part)
+            .map(|(&g, &l)| reference_clipped_swiglu(g, l, alpha, beta, limit))
+            .collect();
+        let oracle: Vec<f32> = (0..HIDDEN)
+            .map(|row| {
+                activated
+                    .iter()
+                    .enumerate()
+                    .map(|(col, &a)| a * fc2.dequantized[row * INTER + col])
+                    .sum()
+            })
+            .collect();
+        (q_output.to_f32(), oracle)
+    }
+
+    /// Default clipped-SwiGLU attributes (`alpha=1`, `beta=0`,
+    /// `limit=+inf`) must match the independent formula oracle. This pins
+    /// the baseline shape of the activation before non-default attributes
+    /// are exercised.
+    #[test]
+    fn qmoe_swiglu_default_clip_attrs_match_reference_formula() {
+        let (got, want) = run_clipped_swiglu(1.0, 0.0, f32::INFINITY);
+        assert_close(&got, &want);
+    }
+
+    /// Non-default `activation_alpha`/`activation_beta`/`swiglu_limit` (the
+    /// GLM-5.2/DeepSeek-V4-style clipped-SwiGLU parameters CUDA already
+    /// supports) must be honored by the CPU kernel and match the same
+    /// independent formula oracle, not merely run without error.
+    #[test]
+    fn qmoe_swiglu_non_default_clip_attrs_match_reference_formula() {
+        let (got, want) = run_clipped_swiglu(1.702, 1.0, 3.5);
+        assert_close(&got, &want);
+    }
+
+    /// Regression guard for the silent-ignore failure mode: if the kernel
+    /// ever stopped reading `activation_alpha`/`activation_beta`/
+    /// `swiglu_limit` from the node (e.g. a future refactor drops them from
+    /// the parsed attributes or from the formula), this would produce the
+    /// *same* output as the default attributes above and this test would
+    /// catch that by asserting the non-default output differs.
+    #[test]
+    fn qmoe_swiglu_non_default_clip_attrs_change_output_vs_defaults() {
+        let (default_output, _) = run_clipped_swiglu(1.0, 0.0, f32::INFINITY);
+        let (non_default_output, _) = run_clipped_swiglu(1.702, 1.0, 3.5);
+        assert_ne!(
+            default_output, non_default_output,
+            "non-default activation_alpha/activation_beta/swiglu_limit must change QMoE output"
+        );
+    }
+
+    /// A non-finite `activation_alpha`/`activation_beta`/`swiglu_limit`
+    /// attribute must fail loudly at kernel-creation time rather than
+    /// silently producing NaN/Inf-poisoned output.
+    #[test]
+    fn qmoe_rejects_non_finite_clip_attrs() {
+        let inputs = [
+            Some((DataType::Float32, &[1, 16][..])),
+            Some((DataType::Float32, &[1, 1])),
+            Some((DataType::Uint8, &[1, 16, 16])),
+            Some((DataType::Float32, &[1, 16, 1])),
+            None,
+            Some((DataType::Uint8, &[1, 16, 16])),
+            Some((DataType::Float32, &[1, 16, 1])),
+        ];
+        for (name, value) in [
+            ("activation_alpha", f32::NAN),
+            ("activation_beta", f32::NAN),
+            ("swiglu_limit", f32::NAN),
+        ] {
+            let mut attrs = vec![
+                ("expert_weight_bits", Attribute::Int(8)),
+                ("block_size", Attribute::Int(16)),
+                ("k", Attribute::Int(1)),
+                ("activation_type", Attribute::String(b"swiglu".to_vec())),
+                ("swiglu_fusion", Attribute::Int(1)),
+            ];
+            attrs.push((name, Attribute::Float(value)));
+            let (graph, node) = model_node("QMoE", &inputs, &[1, 16], &attrs);
+            let error = kernel(&graph, node)
+                .err()
+                .unwrap_or_else(|| panic!("{name}=NaN must be rejected"));
+            assert!(
+                error.to_string().contains(name),
+                "error for {name}=NaN should name the offending attribute, got: {error}"
+            );
+        }
     }
 
     #[test]

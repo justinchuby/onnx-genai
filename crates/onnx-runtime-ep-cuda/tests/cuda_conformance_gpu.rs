@@ -1051,6 +1051,7 @@ fn cast_like_case(target: DataType) -> Case {
         dtype: target,
         shape: vec![1],
         bytes: vec![0u8; target.storage_bytes(1)],
+        absent: false,
     };
     Case {
         label: format!("CastLike[f32->{target:?}]"),
@@ -2464,6 +2465,11 @@ fn conformance_profile() -> Vec<ProfileEntry> {
         "GQA with KV cache",
     ));
     p.push(dedicated(
+        "MultiHeadAttention",
+        "multi_head_attention_gpu.rs",
+        "separate-QKV MHA with bias / mask / KV cache",
+    ));
+    p.push(dedicated(
         "VarlenAttention",
         "varlen_attention_gpu.rs",
         "variable-length attention",
@@ -2492,6 +2498,11 @@ fn conformance_profile() -> Vec<ProfileEntry> {
         "RotaryEmbedding",
         "rope_capture_gpu.rs",
         "RoPE, graph-capture safe",
+    ));
+    p.push(dedicated(
+        "KvCacheCapacityAppend",
+        "kv_cache_capacity_append_gpu.rs",
+        "S3 capacity-emission KV append, graph-capture safe",
     ));
 
     // Normalization / softmax.
@@ -2651,6 +2662,11 @@ fn conformance_profile() -> Vec<ProfileEntry> {
 
     // Reduction / metadata / movement covered elsewhere.
     p.push(dedicated("ReduceSum", "movement_gpu.rs", "reduction"));
+    p.push(dedicated(
+        "DFT",
+        "dft_gpu.rs",
+        "cuFFT real/complex forward/inverse and arbitrary-axis parity",
+    ));
     p.push(dedicated("Gather", "movement_gpu.rs", "indexed gather"));
     p.push(dedicated("Shape", "movement_gpu.rs", "shape metadata"));
     p.push(dedicated(

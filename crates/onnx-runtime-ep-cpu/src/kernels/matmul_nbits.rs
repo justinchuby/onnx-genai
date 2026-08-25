@@ -35,6 +35,7 @@ use onnx_runtime_ep_api::{
 use onnx_runtime_ir::{Attribute, DataType, Graph, Node};
 use rayon::prelude::*;
 
+use super::int4_nibble;
 use super::matmul::gemm;
 use super::{check_arity, to_dense_bytes, to_dense_f32, to_dense_i64, write_dense_f32};
 use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
@@ -96,6 +97,18 @@ mod mm_profile {
     pub fn time_gemv<T>(f: impl FnOnce() -> T) -> T {
         timed(&GEMV_NS, f)
     }
+
+    /// The default build shares the NT prefill call site with MLAS but has no
+    /// reporter for the `gemv` phase — [`tick`] is the MLAS f16 decode split —
+    /// so this is a pass-through rather than a counter nothing ever prints. It
+    /// exists so the shared call site stays `cfg`-free; the phase that carries
+    /// the default build's story (`dequant-nk` vs `dequant-kn`) is reported by
+    /// [`time_prepack`], which is not gated.
+    #[cfg(not(feature = "mlas"))]
+    #[inline]
+    pub fn time_gemv<T>(f: impl FnOnce() -> T) -> T {
+        f()
+    }
     #[cfg(feature = "mlas")]
     pub fn time_narrow<T>(f: impl FnOnce() -> T) -> T {
         timed(&NARROW_NS, f)
@@ -152,7 +165,7 @@ mod mm_profile {
 
 /// Overrides the bounded M=1 decode pool size; set to `0` to use the global
 /// Rayon pool as an escape hatch.
-const DECODE_THREADS_ENV: &str = "ONNX_GENAI_CPU_DECODE_THREADS";
+pub(crate) const DECODE_THREADS_ENV: &str = "ONNX_GENAI_CPU_DECODE_THREADS";
 
 /// `mlas-sys` reads the same knob to size its standalone pool. Fail the build
 /// rather than let the two names drift apart silently.
@@ -709,6 +722,58 @@ pub struct MatMulNBitsKernel {
     mlas_shards: OnceLock<Option<Arc<Vec<Option<MlasShard>>>>>,
     #[cfg(feature = "mlas")]
     mlas_packed: OnceLock<Option<Arc<MlasPreparedPacked>>>,
+    /// The shared-store keys this kernel *installed*, and is therefore
+    /// responsible for evicting when it drops (#1735). Empty when it only
+    /// shared an entry a sibling instance had already built.
+    #[cfg(feature = "mlas")]
+    mlas_owned: MlasPackedOwnership,
+}
+
+/// Packed weights a kernel installed in the process-global store must not
+/// outlive it (#1735) -- the same lifetime defect #1726 fixed for the
+/// weight-transpose caches, in the store that holds MLAS SQNBit packs.
+///
+/// The store is keyed on the operands' addresses and holds no claim on the
+/// buffers there. An address only names a weight while that weight is live;
+/// once freed, the next allocation of matching shape and pack parameters to
+/// land on it is served the previous weight's packed bytes, with the right
+/// route and silently foreign numbers. `clear_mlas_packed_caches` closes only
+/// the cross-*model* case, at `Executor` drop; this closes the transient weight
+/// freed while the process lives on.
+///
+/// Ownership is the installing call, never a hit: a kernel that shared its
+/// sibling's pack evicts nothing, so a prefill instance retiring cannot force
+/// the live decode instance to re-pack.
+///
+/// A separate type rather than a `Drop` on the kernel itself: `MatMulNBitsKernel`
+/// is built throughout the tests with functional-update syntax
+/// (`..test_kernel(..)`), and a type that implements `Drop` cannot be moved out
+/// of. Holding the responsibility in a field keeps the kernel freely movable
+/// while still running the eviction exactly once, when the kernel dies.
+#[cfg(feature = "mlas")]
+#[derive(Default)]
+struct MlasPackedOwnership {
+    shards: OnceLock<MlasPackedKey>,
+    packed: OnceLock<MlasPackedKey>,
+}
+
+#[cfg(feature = "mlas")]
+impl Drop for MlasPackedOwnership {
+    fn drop(&mut self) {
+        let shards = self.shards.get();
+        let packed = self.packed.get();
+        if shards.is_none() && packed.is_none() {
+            return;
+        }
+        with_mlas_packed_caches(|caches| {
+            if let Some(key) = shards {
+                caches.remove_shards(key);
+            }
+            if let Some(key) = packed {
+                caches.remove_packed(key);
+            }
+        });
+    }
 }
 
 /// One contiguous output-column shard of an MLAS SQNBit-packed weight: columns
@@ -762,10 +827,13 @@ impl MlasPreparedPacked {
 ///
 /// `addr` alone is **not** an identity: an allocator recycles a freed weight's
 /// address for a later same-shaped weight (the #845/#1079 hazard that cost a
-/// full debugging cycle). The shape fields close the different-shape case; the
-/// remaining same-address, same-shape, across-model-lifetimes window is a
-/// lifetime problem, closed by [`clear_mlas_packed_caches`] on `Executor` drop
-/// -- the exact boundary at which `weight_transpose::clear_all` runs. The
+/// full debugging cycle). The shape fields close the different-shape case, and
+/// the operand addresses close the same-shape-different-scales case. What no
+/// key can close is the *lifetime* case -- an address names a weight only while
+/// that weight is live -- so the entry is bounded by its installer instead:
+/// `MatMulNBitsKernel::drop` evicts what it installed (#1735), and
+/// [`clear_mlas_packed_caches`] clears the rest at `Executor` drop, the exact
+/// boundary at which `weight_transpose::clear_all` runs. The
 /// N-shard partition is *not* a field because it is a pure function of the fixed
 /// process topology and `n` (see [`MatMulNBitsKernel::mlas_shard_segments`]), so
 /// two instances of one node always partition identically.
@@ -773,6 +841,13 @@ impl MlasPreparedPacked {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 struct MlasPackedKey {
     addr: usize,
+    /// Address of the scales tensor, and of the zero-points tensor when present
+    /// (`0` when absent). The pack is a function of all three operands -- an
+    /// `Int8` pack bakes scale and zero-point into per-block sums -- so keying
+    /// on the quantized weight alone would let two nodes that share a `B`
+    /// initializer but carry different scales be served each other's pack.
+    scales_addr: usize,
+    zero_points_addr: usize,
     n: usize,
     k: usize,
     bits: usize,
@@ -783,8 +858,11 @@ struct MlasPackedKey {
 
 #[cfg(feature = "mlas")]
 impl MlasPackedKey {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         addr: usize,
+        scales_addr: usize,
+        zero_points_addr: usize,
         n: usize,
         k: usize,
         bits: usize,
@@ -794,6 +872,8 @@ impl MlasPackedKey {
     ) -> Self {
         Self {
             addr,
+            scales_addr,
+            zero_points_addr,
             n,
             k,
             bits,
@@ -822,6 +902,12 @@ struct MlasPackedCaches {
     packed: Mutex<HashMap<MlasPackedKey, Arc<MlasPreparedPacked>>>,
 }
 
+/// A store lookup's result: the shared entry, and whether *this* call installed
+/// it. Only the installer owns the eviction (#1735), so the flag has to survive
+/// all the way back to the caller rather than being folded into the `Arc`.
+#[cfg(feature = "mlas")]
+type MlasStoreEntry<T> = Result<Option<(Arc<T>, bool)>>;
+
 #[cfg(feature = "mlas")]
 impl MlasPackedCaches {
     /// Return the shared N-sharded pack for `key`, building it on a miss with
@@ -833,7 +919,7 @@ impl MlasPackedCaches {
         &self,
         key: MlasPackedKey,
         build: impl FnOnce() -> Result<Option<Vec<Option<MlasShard>>>>,
-    ) -> Result<Option<Arc<Vec<Option<MlasShard>>>>> {
+    ) -> MlasStoreEntry<Vec<Option<MlasShard>>> {
         if let Some(hit) = self
             .shards
             .lock()
@@ -841,7 +927,7 @@ impl MlasPackedCaches {
             .get(&key)
             .cloned()
         {
-            return Ok(Some(hit));
+            return Ok(Some((hit, false)));
         }
         let Some(built) = build()? else {
             return Ok(None);
@@ -849,14 +935,19 @@ impl MlasPackedCaches {
         let arc = Arc::new(built);
         // A concurrent racer may have inserted an identical entry meanwhile;
         // keep whichever landed first so every reader shares one allocation.
-        Ok(Some(
-            self.shards
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .entry(key)
-                .or_insert(arc)
-                .clone(),
-        ))
+        match self
+            .shards
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(key)
+        {
+            std::collections::hash_map::Entry::Occupied(occupied) => {
+                Ok(Some((occupied.get().clone(), false)))
+            }
+            std::collections::hash_map::Entry::Vacant(vacant) => {
+                Ok(Some((vacant.insert(arc).clone(), true)))
+            }
+        }
     }
 
     /// Full-width analogue of [`Self::get_or_build_shards`].
@@ -864,7 +955,7 @@ impl MlasPackedCaches {
         &self,
         key: MlasPackedKey,
         build: impl FnOnce() -> Result<Option<MlasPreparedPacked>>,
-    ) -> Result<Option<Arc<MlasPreparedPacked>>> {
+    ) -> MlasStoreEntry<MlasPreparedPacked> {
         if let Some(hit) = self
             .packed
             .lock()
@@ -872,20 +963,47 @@ impl MlasPackedCaches {
             .get(&key)
             .cloned()
         {
-            return Ok(Some(hit));
+            return Ok(Some((hit, false)));
         }
         let Some(built) = build()? else {
             return Ok(None);
         };
         let arc = Arc::new(built);
-        Ok(Some(
-            self.packed
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .entry(key)
-                .or_insert(arc)
-                .clone(),
-        ))
+        match self
+            .packed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(key)
+        {
+            std::collections::hash_map::Entry::Occupied(occupied) => {
+                Ok(Some((occupied.get().clone(), false)))
+            }
+            std::collections::hash_map::Entry::Vacant(vacant) => {
+                Ok(Some((vacant.insert(arc).clone(), true)))
+            }
+        }
+    }
+
+    /// Drop the entry `key` names from the sharded store, if still present.
+    ///
+    /// The caller is the kernel that *installed* it. Entries are keyed on the
+    /// operands' addresses, and nothing in the key proves the bytes there are
+    /// still the ones that were packed, so an entry outliving its source is
+    /// served to whatever lands on that address next -- the #1726 defect, in a
+    /// store whose values are packed weights rather than transposes.
+    fn remove_shards(&self, key: &MlasPackedKey) {
+        self.shards
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(key);
+    }
+
+    /// [`Self::remove_shards`] for the full-width store.
+    fn remove_packed(&self, key: &MlasPackedKey) {
+        self.packed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(key);
     }
 
     fn clear(&self) {
@@ -902,6 +1020,9 @@ impl MlasPackedCaches {
 
 /// The process-global packed store, the **only** store production uses.
 #[cfg(feature = "mlas")]
+// Under `cfg(test)` every kernel installs into the thread-local store below,
+// so this one is genuinely unreachable there; it is the production store.
+#[cfg_attr(test, allow(dead_code))]
 static MLAS_PACKED_GLOBAL: LazyLock<MlasPackedCaches> = LazyLock::new(MlasPackedCaches::default);
 
 #[cfg(all(test, feature = "mlas"))]
@@ -936,19 +1057,47 @@ fn with_mlas_packed_caches<R>(f: impl FnOnce(&MlasPackedCaches) -> R) -> R {
     }
 }
 
+/// Test-only: how many entries the active packed store holds, as
+/// `(shards, packed)`. Used to assert that a retiring kernel evicts exactly what
+/// it installed and nothing a live sibling still needs (#1735).
+#[cfg(all(test, feature = "mlas"))]
+fn mlas_store_len() -> (usize, usize) {
+    with_mlas_packed_caches(|caches| {
+        (
+            caches
+                .shards
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len(),
+            caches
+                .packed
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len(),
+        )
+    })
+}
+
 /// Evict every shared MLAS SQNBit packed weight.
 ///
 /// **Must** run when an `Executor` drops, for the same reason
 /// `weight_transpose::clear_all` does: the store is keyed on `(address, shape,
 /// pack params)`, which makes a stale hit impossible for a *different-shaped*
 /// weight, but a later model whose mmap places a same-shaped weight at a
-/// recycled address would still match. Clearing on `Executor` drop closes that
-/// window and bounds the store across model lifetimes. In production only the
+/// recycled address would still match. Clearing on `Executor` drop bounds the
+/// store across model lifetimes; a kernel outliving nothing but its own weight
+/// is handled earlier, by `MatMulNBitsKernel::drop` evicting what it installed
+/// (#1735). This runs *before* the executor frees its weight buffers, which is
+/// what makes the teardown ordering safe rather than merely lucky. In production only the
 /// global store exists; the per-test thread-locals are cleared by their threads
 /// ending, so this is a no-op for them.
 #[cfg(feature = "mlas")]
 pub fn clear_mlas_packed_caches() {
-    MLAS_PACKED_GLOBAL.clear();
+    // Through `with_mlas_packed_caches`, not `MLAS_PACKED_GLOBAL` directly: under
+    // `cfg(test)` the kernels install into the thread-local store, so clearing
+    // the global one would drain a store nothing in the test ever touched and
+    // silently leave the real entries resident.
+    with_mlas_packed_caches(|caches| caches.clear());
 }
 
 /// No-op stand-in when the `mlas` feature is off, so the executor's drop path
@@ -1038,6 +1187,17 @@ static KAI_SDOT_M1_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
 static DISPATCH_PROBE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[cfg(all(test, feature = "mlas"))]
 static MLAS_SQNBIT_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
+/// Counts entries to the register-blocked int4 decode kernel, so a test can
+/// assert the `accuracy_level = 0` default actually *reaches* it. #1104 added
+/// the kernel behind a default-off toggle and nothing asserted which route
+/// production took, so it stayed dormant; this makes the default route a
+/// checked property instead of a comment.
+///
+/// `target_arch` is part of the gate because the N-blocked kernel is x86-only,
+/// so on aarch64 this static would be dead code and the cross-compile lane
+/// builds tests with `-D warnings`.
+#[cfg(all(test, target_arch = "x86_64"))]
+static BORROWED_INT4_NBLOCK_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
 /// Positive-proof counters for the zero-copy borrowed int4 decode path (#979).
 /// Split by symmetry so a test can assert the *symmetric* branch is the one that
 /// executed, not merely that some path avoided the resident `weight_nk` f32
@@ -1047,6 +1207,26 @@ static MLAS_SQNBIT_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
 static BORROWED_INT4_SYMMETRIC_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(test)]
 static BORROWED_INT4_ASYMMETRIC_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
+/// Positive-proof counter for the fused-dequant 8-bit prefill GEBP.
+///
+/// The route it replaces produces the same numbers to the last bit, so a test
+/// comparing values cannot tell which one ran. Incremented once per `execute`
+/// that routes into [`x86_sgemm::quant_prefill_gebp`] with an
+/// [`x86_sgemm::Int8Weight`].
+#[cfg(all(test, target_arch = "x86_64"))]
+static INT8_PREFILL_GEBP_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
+/// Positive-proof counter for the fused-dequant 4-bit prefill GEBP.
+///
+/// The same argument as [`INT8_PREFILL_GEBP_TEST_CALLS`]: the routes either
+/// side of `int4_prefill_gebp_min_rows` agree to within a few f32 ulps, so a
+/// test that only compares values passes whether or not GEBP ran. Without this
+/// counter a threshold retune silently changes what the parity test covers --
+/// which is how `matmulnbits_int4_prefill_gebp_matches_reference_and_stays_borrowed`
+/// came to claim a dispatch threshold of 4 for an L2-resident weight gated at
+/// 6. Incremented once per `execute` that routes into
+/// [`x86_sgemm::quant_prefill_gebp`] with an [`x86_sgemm::Int4Weight`].
+#[cfg(all(test, target_arch = "x86_64"))]
+static INT4_PREFILL_GEBP_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
 /// Counts entries into [`with_decode_pool_lazy`], so a test can assert *which*
 /// shapes defer building the decode pool and which still install it eagerly.
 #[cfg(test)]
@@ -1070,6 +1250,18 @@ enum BorrowedScales<'a> {
 }
 
 impl BorrowedScales<'_> {
+    /// Only the x86-64 fused-dequant GEBP bounds-checks the borrowed scale
+    /// slice up front; every other reader indexes it through [`Self::get`].
+    #[cfg(target_arch = "x86_64")]
+    #[inline]
+    fn len(&self) -> usize {
+        match self {
+            Self::F32(values) => values.len(),
+            Self::F16(values) => values.len(),
+            Self::Bf16(values) => values.len(),
+        }
+    }
+
     #[inline]
     fn get(&self, index: usize) -> f32 {
         match self {
@@ -1125,6 +1317,40 @@ impl NBitsLayout {
     #[inline]
     fn zero_point(self, zero_points: Option<&[u8]>, block: usize) -> u8 {
         zero_points.map_or(1u8 << (self.bits - 1), |points| self.unpack(points, block))
+    }
+}
+
+/// Decode one **int4** zero point without the generic layout's integer divisions.
+///
+/// [`NBitsLayout::zero_point`] is generic over `bits`, so it reaches
+/// `unpack`, which computes `8 / bits`, `index / values_per_byte` and
+/// `index % values_per_byte` from a runtime field. Every int4 decode kernel
+/// carries `#[target_feature(enable = "avx2,fma")]`, which stops it being
+/// inlined into its un-annotated caller, so `bits` stays opaque across that
+/// boundary and LLVM cannot fold those into shifts. The result is real integer
+/// division in an epilogue that runs once per `(block, column)` -- for a
+/// 4096-deep row at `block_size = 32` that is 128 blocks x 4 columns of
+/// division per output group, and `div` is both long-latency and poorly
+/// pipelined.
+///
+/// With `bits == 4` the whole computation is a shift and a mask. This is
+/// **bit-identical** to `layout.zero_point(points, block)` for `bits == 4`, not
+/// an approximation: `values_per_byte` is `8 / 4 == 2`, so `index / 2` is
+/// `index >> 1` and `index % 2` is `index & 1`; the shift amount
+/// `(index % 2) * bits` is `(block & 1) << 2`; `mask()` is `0x0f`; and the
+/// absent-zero-point default `1 << (bits - 1)` is `8`. Indexing is the same
+/// element, so out-of-range blocks still panic identically.
+///
+/// `int4_zero_point_matches_the_generic_layout` pins the equivalence over every
+/// block index and both zero-point states, so a future change to either
+/// definition cannot silently diverge. Exactness matters here beyond tidiness:
+/// this feeds the acc0 route, whose contract is exact agreement with the scalar
+/// reference (#1676).
+#[inline(always)]
+fn int4_zero_point(zero_points: Option<&[u8]>, block: usize) -> u8 {
+    match zero_points {
+        Some(points) => (points[block >> 1] >> ((block & 1) << 2)) & 0x0f,
+        None => 8,
     }
 }
 
@@ -1279,6 +1505,8 @@ impl KernelFactory for MatMulNBitsFactory {
             packed_u8_n16_weight: OnceLock::new(),
             packed_kai_qsi8_weight: OnceLock::new(),
             #[cfg(feature = "mlas")]
+            mlas_owned: MlasPackedOwnership::default(),
+            #[cfg(feature = "mlas")]
             mlas_shards: OnceLock::new(),
             #[cfg(feature = "mlas")]
             mlas_packed: OnceLock::new(),
@@ -1422,7 +1650,7 @@ impl Kernel for MatMulNBitsKernel {
             && !self.mlas_sqnbit_owns_fp32_compute(can_prepack, zero_points.is_some())
             && let Some(packed) = contiguous_host_slice::<u8>(&inputs[1])
             && let Some(scales) = borrowed_scales(&inputs[2])
-            && let Some(borrowed_zero_points) = borrow_optional_int4_zero_points(zero_points)
+            && let Some(borrowed_zero_points) = borrow_optional_packed_zero_points(zero_points)
         {
             // Gate on *symmetry* explicitly, not on "a zero_points input happens
             // to exist". Symmetric int4 (no zero_points) has the implicit
@@ -1436,6 +1664,47 @@ impl Kernel for MatMulNBitsKernel {
                 BORROWED_INT4_SYMMETRIC_TEST_CALLS.fetch_add(1, Ordering::Relaxed);
             } else {
                 BORROWED_INT4_ASYMMETRIC_TEST_CALLS.fetch_add(1, Ordering::Relaxed);
+            }
+            // Prefill wide enough to amortize the pack runs on the *global*
+            // pool, not the decode pool, and so is dispatched before the
+            // `with_decode_pool` installation below. The decode pool is
+            // deliberately narrow (the flat default caps at eight workers,
+            // sized for per-token latency where a wider fork/join loses); a
+            // prefill GEMM is the opposite regime -- one bulk parallel region
+            // per call that wants the whole machine, exactly like the f32
+            // dense fallback's `sgemm_simd_packed`. Running it inside the
+            // decode pool measured 2.4x slower purely from the narrower pool.
+            #[cfg(target_arch = "x86_64")]
+            if m >= int4_prefill_gebp_min_rows(self.k * self.n / 2, self.block_size)
+                && self.block_size.is_multiple_of(2)
+                && crate::backend::has_simd_x86()
+                && int4_prefill_gebp_enabled()
+            {
+                let weight = crate::kernels::matmul::x86_sgemm::Int4Weight {
+                    packed,
+                    zero_points: borrowed_zero_points,
+                    block_size: self.block_size,
+                    block_count: self.k.div_ceil(self.block_size),
+                };
+                #[cfg(test)]
+                INT4_PREFILL_GEBP_TEST_CALLS.fetch_add(1, Ordering::Relaxed);
+                // SAFETY (feature contract): `has_simd_x86()` above is the
+                // AVX2 + FMA check the packed microkernel requires.
+                crate::kernels::matmul::x86_sgemm::quant_prefill_gebp(
+                    &activations,
+                    &weight,
+                    |index| scales.get(index),
+                    bias.as_deref(),
+                    result,
+                    m,
+                    self.k,
+                    self.n,
+                );
+                return if direct_result {
+                    Ok(())
+                } else {
+                    write_compute_f32(&mut outputs[0], result)
+                };
             }
             // `m == 1` is what makes the deferral provable rather than hopeful.
             // Every kernel reachable from this closure at `m == 1`
@@ -1471,6 +1740,8 @@ impl Kernel for MatMulNBitsKernel {
                     && !matches!(dot_kernel, DotKernel::Scalar)
                     && self.block_size.is_multiple_of(32)
                 {
+                    #[cfg(all(test, target_arch = "x86_64"))]
+                    BORROWED_INT4_NBLOCK_TEST_CALLS.fetch_add(1, Ordering::Relaxed);
                     borrowed_affine_int4_matmul_nblock(
                         &activations,
                         packed,
@@ -1678,7 +1949,50 @@ impl Kernel for MatMulNBitsKernel {
                     );
                 })?;
             }
+        } else if self.bits == 4
+            && self.accuracy_level == 4
+            && group_indices.is_none()
+            && !self.weight_prepacked
+            && m <= INT4_NIBBLE_MAX_ROWS
+            && !dot_kernel.uses_vnni_int4_direct()
+            && int4_nibble::supported(self.block_size)
+        {
+            // No VNNI on this host, so the alternative below is
+            // `prepack_int8_weight`, which expands every nibble to a whole
+            // `i8`. Decode reads each weight exactly once, so that expansion
+            // doubles the only stream that matters. This route consumes the
+            // wire layout at 0.5 B/weight instead -- see `int4_nibble`.
+            let owned_weight;
+            let packed_weight = if can_prepack {
+                if let Some(weight) = self.packed_nbits_weight.get() {
+                    weight
+                } else {
+                    let weight = self.prepack_nbits_weight(&inputs[1], &inputs[2], zero_points)?;
+                    let weight = numa_place_nbits(weight, self.n);
+                    let _ = self.packed_nbits_weight.set(weight);
+                    self.packed_nbits_weight
+                        .get()
+                        .expect("constant MatMulNBits packed nibble weight was just initialized")
+                }
+            } else {
+                let built = self.prepack_nbits_weight(&inputs[1], &inputs[2], zero_points)?;
+                owned_weight = numa_place_nbits(built, self.n);
+                &owned_weight
+            };
+            record_int4_route(Int4Route::PackedNibble);
+            with_decode_pool(|| {
+                int4_nibble_matmul(
+                    &activations,
+                    packed_weight,
+                    result,
+                    m,
+                    self.k,
+                    self.n,
+                    self.block_size,
+                );
+            })?;
         } else if self.bits == 4 && self.accuracy_level == 4 && group_indices.is_none() {
+            record_int4_route(Int4Route::ExpandedInt8);
             let owned_weight;
             let int8_weight = if can_prepack {
                 if let Some(weight) = self.int8_weight.get() {
@@ -1936,35 +2250,105 @@ impl Kernel for MatMulNBitsKernel {
             // strided-scatter transpose (each K step writes at stride N), which
             // thrashes cache and dominated prefill wall time (~95% of the
             // MatMulNBits cost, measured ~45 ms/node on Qwen3-0.6B). Instead,
-            // on the MLAS backend dequantize once into the natural, contiguous
-            // `Nk` layout -- cached in the same `weight_nk` slot the m==1
-            // generic path uses, so constant weights pay the dequant once -- and
-            // let MLAS's cache-tiled `sgemm` consume it transposed (`trans_b`,
-            // `ldb = k`). MLAS then streams each weight row once and reuses it
-            // across all m activation rows, the amortization a per-row GEMV
-            // lacks. Non-MLAS hosts keep the previous direct-`Kn` dense path.
-            let used_fast_nt = self.try_prefill_mlas_nt(
-                &inputs[1],
-                &inputs[2],
-                zero_points,
-                group_indices,
-                can_prepack,
-                &activations,
-                m,
-                result,
-            )?;
-            if !used_fast_nt {
-                let weight_kn =
-                    mm_profile::time_prepack("dequant-kn", self.nbits_weight_bytes(), || {
-                        self.dequantize_weight(
-                            &inputs[1],
-                            &inputs[2],
-                            zero_points,
-                            group_indices,
-                            WeightLayout::Kn,
-                        )
-                    })?;
-                gemm(&activations, &weight_kn, result, m, self.k, self.n)?;
+            // dequantize once into the natural, contiguous `Nk` layout -- cached
+            // in the same `weight_nk` slot the m==1 generic path uses, so
+            // constant weights pay the dequant once -- and let a transposed-B
+            // ("NT") dense GEMM consume it directly (`B_nk[n, k]^T`). The GEMM
+            // then streams each weight row once and reuses it across all m
+            // activation rows, the amortization a per-row GEMV lacks. Available
+            // on every backend with an NT GEMM: MLAS (`trans_b`) and, on the
+            // default build, the native `SimdX86` NT packer (#959, #1091).
+            // Backends without one keep the previous direct-`Kn` dense path.
+            // Ordering against the NT route (#1176) turns on whether NT
+            // actually keeps its dequantized `Nk` weight resident. When it
+            // does, NT wins outright: one dequant for the whole session, then
+            // a cache-tiled NT GEMM that streams each weight row once.
+            //
+            // When the memory governor declined that cache (#971 -- the
+            // expanded f32 footprint did not fit the budget), NT has no cache
+            // to amortize into and rebuilds the entire `k * n` f32 panel on
+            // *every* call. That is precisely the cost this fused GEBP exists
+            // to remove, and it is worst in exactly the configuration that
+            // caused the decline: memory is scarce, yet the NT route would
+            // materialize ~51 MB per prefill for a 3584x3584 8-bit node. The
+            // fused pack allocates only per-strip scratch, so consult it first
+            // whenever NT would not keep the weight resident.
+            let nt_keeps_weight_resident = can_prepack && resident_dequant_f32_cache_enabled();
+            #[cfg(target_arch = "x86_64")]
+            let used_gebp_first = !nt_keeps_weight_resident
+                && self.try_int8_prefill_gebp(
+                    &inputs[1],
+                    &inputs[2],
+                    zero_points,
+                    group_indices,
+                    &activations,
+                    m,
+                    result,
+                );
+            // Non-x86-64 has no fused GEBP microkernel, so the NT route is
+            // consulted unconditionally there and the residency verdict has no
+            // consumer; bind it so it is not an unused variable.
+            #[cfg(not(target_arch = "x86_64"))]
+            let used_gebp_first = {
+                let _ = nt_keeps_weight_resident;
+                false
+            };
+            let used_fast_nt = !used_gebp_first
+                && self.try_prefill_nk_nt(
+                    &inputs[1],
+                    &inputs[2],
+                    zero_points,
+                    group_indices,
+                    can_prepack,
+                    &activations,
+                    m,
+                    result,
+                )?;
+            if !used_gebp_first && !used_fast_nt {
+                // 8-bit prefill: fuse the dequant into the GEBP's B pack
+                // instead of materializing a `k * n` f32 weight per call.
+                //
+                // This is the only route left for `bits == 8, m > 1` on a
+                // native (non-MLAS) build, and it is the *worst* shape of the
+                // whole fallback: `dequantize_weight(Kn)` writes four bytes of
+                // f32 for every one byte of weight read, into a buffer far
+                // larger than any cache, at stride `n` -- and does it again on
+                // every call, because nothing here caches the `Kn` layout. A
+                // 3584x3584 8-bit node materializes 51 MB per prefill to
+                // multiply it once. Fusing dequant into the pack reads each
+                // packed byte once per call into an L1-resident panel that all
+                // `m` rows reuse, which is the same fix #1117 made for 4-bit,
+                // and it allocates only the per-strip scratch.
+                //
+                // Numerics are unchanged: same `(q - zero_point) * scale`, same
+                // f32 accumulation, applied in the same depth order. It is
+                // therefore not gated on `accuracy_level` -- the route it
+                // replaces was full-f32 compute at every level, and so is this.
+                #[cfg(target_arch = "x86_64")]
+                let used_gebp = self.try_int8_prefill_gebp(
+                    &inputs[1],
+                    &inputs[2],
+                    zero_points,
+                    group_indices,
+                    &activations,
+                    m,
+                    result,
+                );
+                #[cfg(not(target_arch = "x86_64"))]
+                let used_gebp = false;
+                if !used_gebp {
+                    let weight_kn =
+                        mm_profile::time_prepack("dequant-kn", self.nbits_weight_bytes(), || {
+                            self.dequantize_weight(
+                                &inputs[1],
+                                &inputs[2],
+                                zero_points,
+                                group_indices,
+                                WeightLayout::Kn,
+                            )
+                        })?;
+                    gemm(&activations, &weight_kn, result, m, self.k, self.n)?;
+                }
             }
         }
         if let Some(bias) = bias {
@@ -2002,6 +2386,94 @@ impl MatMulNBitsKernel {
             scales: to_dense_compute_f32(scales)?,
             zero_points: zero_points.map(to_dense_bytes).transpose()?,
         })
+    }
+
+    /// Fused-dequant GEBP for an 8-bit `MatMulNBits` prefill, or `false` if this
+    /// call is not one it can serve.
+    ///
+    /// Ordered against the NT route ([`Self::try_prefill_nk_nt`]) on whether
+    /// that route keeps its dequantized `Nk` weight **resident**. When it does
+    /// -- a constant weight and the #971 governor admitting the f32 cache -- NT
+    /// keeps priority and nothing measured there changes: it pays one dequant
+    /// for the session and then streams each weight row once.
+    ///
+    /// What this claims is the case where NT has no cache to amortize into and
+    /// so rebuilds the whole `k * n` f32 weight on *every* call: a non-constant
+    /// weight, or the governor declining the resident cache because the
+    /// expanded footprint did not fit the budget. Materializing ~51 MB per
+    /// prefill is worst precisely there, so this fused route is consulted first
+    /// in that configuration.
+    ///
+    /// Declines, in order: a non-x86-64 host or one without AVX2 + FMA (the
+    /// `6x16` microkernel's contract); `bits != 8`; per-row `g_idx`, which the
+    /// column-contiguous pack cannot express; too few rows to amortize the pack
+    /// ([`INT8_PREFILL_GEBP_MIN_ROWS`]); the kill switch; and any operand that
+    /// cannot be borrowed in place, since copying it would give back the
+    /// allocation this route exists to avoid.
+    #[cfg(target_arch = "x86_64")]
+    #[allow(clippy::too_many_arguments)]
+    fn try_int8_prefill_gebp(
+        &self,
+        packed: &TensorView,
+        scales: &TensorView,
+        zero_points: Option<&TensorView>,
+        group_indices: Option<&TensorView>,
+        activations: &[f32],
+        m: usize,
+        result: &mut [f32],
+    ) -> bool {
+        if self.bits != 8
+            || group_indices.is_some()
+            || m < INT8_PREFILL_GEBP_MIN_ROWS
+            || !crate::backend::has_simd_x86()
+            || !int8_prefill_gebp_enabled()
+        {
+            return false;
+        }
+        let Some(packed) = contiguous_host_slice::<u8>(packed) else {
+            return false;
+        };
+        let Some(scales) = borrowed_scales(scales) else {
+            return false;
+        };
+        let Some(borrowed_zero_points) = borrow_optional_packed_zero_points(zero_points) else {
+            return false;
+        };
+        let block_count = self.k.div_ceil(self.block_size);
+        // The pack indexes `packed[col * block_count * block_size + depth]` and
+        // `zero_points[col * block_count + block]` directly, so a short operand
+        // would be an out-of-bounds read rather than a wrong answer. `k` need
+        // not divide `block_size`; the trailing partial block is still stored
+        // full width, which is why this is `block_count * block_size` and not
+        // `k`.
+        if packed.len() < self.n * block_count * self.block_size
+            || scales.len() < self.n * block_count
+            || borrowed_zero_points.is_some_and(|zp| zp.len() < self.n * block_count)
+        {
+            return false;
+        }
+        let weight = crate::kernels::matmul::x86_sgemm::Int8Weight {
+            packed,
+            zero_points: borrowed_zero_points,
+            block_size: self.block_size,
+            block_count,
+        };
+        #[cfg(test)]
+        INT8_PREFILL_GEBP_TEST_CALLS.fetch_add(1, Ordering::Relaxed);
+        // SAFETY (feature contract): `has_simd_x86()` above is the AVX2 + FMA
+        // check the packed microkernel requires. Bias is added by the caller
+        // for every branch of this fallback, so it is not passed here.
+        crate::kernels::matmul::x86_sgemm::quant_prefill_gebp(
+            activations,
+            &weight,
+            |index| scales.get(index),
+            None,
+            result,
+            m,
+            self.k,
+            self.n,
+        );
+        true
     }
 
     /// Route the blockwise-quantized MatMul through MLAS's `MlasQNBitGemmBatch`
@@ -2313,16 +2785,24 @@ impl MatMulNBitsKernel {
 
     /// Prefill / batched (`m > 1`) fast path for the dense-dequantize fallback:
     /// dequantize the constant weight once into the natural, contiguous `Nk`
-    /// (`[n, k]`) layout, cache it, and run MLAS's cache-tiled `sgemm` with
-    /// `trans_b` so each weight row is streamed once and reused across all `m`
-    /// activation rows. Returns `Ok(true)` when it handled the GEMM, `Ok(false)`
-    /// when the host GEMM backend is not MLAS (the caller then uses the previous
-    /// direct-`Kn` dense path). Bit-identical to a no-transpose dense GEMM: MLAS
-    /// with `trans_b` computes `C = A * B_nk^T` where `B_nk[n, k]` is the same
-    /// weight the `Kn` path stores transposed.
-    #[cfg(feature = "mlas")]
+    /// (`[n, k]`) layout, cache it in the same `weight_nk` slot the `m == 1`
+    /// decode path uses, and run a **transposed-B ("NT") dense GEMM** so each
+    /// weight row is streamed once and reused across all `m` activation rows.
+    /// Returns `Ok(true)` when it handled the GEMM, `Ok(false)` when the host
+    /// GEMM backend has no NT variant (the caller then uses the previous
+    /// direct-`Kn` dense path).
+    ///
+    /// This replaces the strided-scatter `Kn` dequant (each K step writing at
+    /// stride N) that dominated large-model time-to-first-token (#959, #1091).
+    /// It is available on every backend with an NT GEMM — MLAS's cache-tiled
+    /// `sgemm` with `trans_b`, and, now, the native `SimdX86` packer that reads
+    /// `B_nk` row-wise into an L1-resident pack tile (the same idea, ported off
+    /// MLAS). [`super::matmul::nt_gemm_supported`] is the single legality
+    /// predicate; [`super::matmul::gemm_nt_with_backend`] is proven
+    /// bit-identical to the `Kn` dense route for the same inputs, because
+    /// `B_nk[n, k]` is exactly the weight the `Kn` path stores transposed.
     #[allow(clippy::too_many_arguments)]
-    fn try_prefill_mlas_nt(
+    fn try_prefill_nk_nt(
         &self,
         packed: &TensorView,
         scales: &TensorView,
@@ -2335,7 +2815,8 @@ impl MatMulNBitsKernel {
     ) -> Result<bool> {
         use crate::backend::CpuBackend;
 
-        if CpuBackend::auto_detect() != CpuBackend::Mlas {
+        let backend = CpuBackend::auto_detect();
+        if !super::matmul::nt_gemm_supported(backend) {
             return Ok(false);
         }
 
@@ -2344,13 +2825,16 @@ impl MatMulNBitsKernel {
             if let Some(weight) = self.weight_nk.get() {
                 weight
             } else {
-                let weight = self.dequantize_weight(
-                    packed,
-                    scales,
-                    zero_points,
-                    group_indices,
-                    WeightLayout::Nk,
-                )?;
+                let weight =
+                    mm_profile::time_prepack("dequant-nk", self.nbits_weight_bytes(), || {
+                        self.dequantize_weight(
+                            packed,
+                            scales,
+                            zero_points,
+                            group_indices,
+                            WeightLayout::Nk,
+                        )
+                    })?;
                 let weight = numa_place_nk(weight, self.n);
                 let _ = self.weight_nk.set(weight);
                 self.weight_nk
@@ -2358,55 +2842,30 @@ impl MatMulNBitsKernel {
                     .expect("constant MatMulNBits Nk prepack was just initialized")
             }
         } else {
-            let built = self.dequantize_weight(
-                packed,
-                scales,
-                zero_points,
-                group_indices,
-                WeightLayout::Nk,
-            )?;
+            let built = mm_profile::time_prepack("dequant-nk", self.nbits_weight_bytes(), || {
+                self.dequantize_weight(packed, scales, zero_points, group_indices, WeightLayout::Nk)
+            })?;
             owned_weight = numa_place_nk(built, self.n);
             &owned_weight
         };
 
-        // C[m, n] = A[m, k] * B_nk[n, k]^T. `trans_b` with `ldb = k` reads the
-        // Nk weight as the transposed operand without materializing a Kn copy.
+        // C[m, n] = A[m, k] * B_nk[n, k]^T -- reads the Nk weight as the
+        // transposed operand without materializing a Kn copy. Bit-identical to
+        // the direct-`Kn` dense GEMM the caller would otherwise run. Timed on
+        // the same `gemv` phase the `Kn` route reports, so a profile taken
+        // across the two routes compares like with like.
         mm_profile::time_gemv(|| {
-            mlas_sys::sgemm(
-                false,
-                true,
-                m,
-                self.n,
-                self.k,
-                1.0,
+            super::matmul::gemm_nt_with_backend(
+                backend,
                 activations,
-                self.k,
                 weight_nk,
-                self.k,
-                0.0,
                 result,
+                m,
+                self.k,
                 self.n,
-            );
-        });
+            )
+        })?;
         Ok(true)
-    }
-
-    /// Non-MLAS builds have no cache-tiled dense GEMM here, so the batched
-    /// fallback always uses the direct-`Kn` dense path.
-    #[cfg(not(feature = "mlas"))]
-    #[allow(clippy::too_many_arguments)]
-    fn try_prefill_mlas_nt(
-        &self,
-        _packed: &TensorView,
-        _scales: &TensorView,
-        _zero_points: Option<&TensorView>,
-        _group_indices: Option<&TensorView>,
-        _can_prepack: bool,
-        _activations: &[f32],
-        _m: usize,
-        _result: &mut [f32],
-    ) -> Result<bool> {
-        Ok(false)
     }
 
     /// Run a pre-partitioned MLAS SQNBit GEMV (`self.n` split into contiguous
@@ -2669,12 +3128,25 @@ impl MatMulNBitsKernel {
     fn mlas_packed_key(
         &self,
         packed: &TensorView,
+        scales: &TensorView,
+        zero_points: Option<&TensorView>,
         has_zero_points: bool,
         comp: mlas_sys::SQNBitComputeType,
     ) -> Option<MlasPackedKey> {
         let addr = contiguous_host_slice::<u8>(packed)?.as_ptr() as usize;
+        // The pack is a function of every operand that feeds it, so all of them
+        // are part of the identity. A non-contiguous or device-side scales
+        // tensor has no stable host address, which makes the whole weight
+        // unshareable rather than shareable under a partial identity.
+        let scales_addr = contiguous_host_addr(scales)?;
+        let zero_points_addr = match zero_points {
+            Some(view) => contiguous_host_addr(view)?,
+            None => 0,
+        };
         Some(MlasPackedKey::new(
             addr,
+            scales_addr,
+            zero_points_addr,
             self.n,
             self.k,
             self.bits,
@@ -2704,10 +3176,24 @@ impl MatMulNBitsKernel {
                 self.build_mlas_shards(packed, scales, zero_points, comp)
             })
         };
-        match self.mlas_packed_key(packed, zero_points.is_some(), comp) {
-            Some(key) => with_mlas_packed_caches(|caches| caches.get_or_build_shards(key, build)),
-            None => Ok(build()?.map(Arc::new)),
+        let Some(key) =
+            self.mlas_packed_key(packed, scales, zero_points, zero_points.is_some(), comp)
+        else {
+            return Ok(build()?.map(Arc::new));
+        };
+        let Some((shards, installed)) =
+            with_mlas_packed_caches(|caches| caches.get_or_build_shards(key, build))?
+        else {
+            return Ok(None);
+        };
+        if installed {
+            // Only the installing call owns the eviction (#1735). A kernel that
+            // merely shared its sibling's pack must leave it alone, or the first
+            // instance to drop would pull the packed weight out from under a
+            // live sibling and force it to re-pack.
+            let _ = self.mlas_owned.shards.set(key);
         }
+        Ok(Some(shards))
     }
 
     /// Full-width analogue of [`Self::shared_mlas_shards`] for the `NO_SHARD`
@@ -2725,10 +3211,20 @@ impl MatMulNBitsKernel {
                 self.build_mlas_packed(packed, scales, zero_points, comp)
             })
         };
-        match self.mlas_packed_key(packed, zero_points.is_some(), comp) {
-            Some(key) => with_mlas_packed_caches(|caches| caches.get_or_build_packed(key, build)),
-            None => Ok(build()?.map(Arc::new)),
+        let Some(key) =
+            self.mlas_packed_key(packed, scales, zero_points, zero_points.is_some(), comp)
+        else {
+            return Ok(build()?.map(Arc::new));
+        };
+        let Some((prepared, installed)) =
+            with_mlas_packed_caches(|caches| caches.get_or_build_packed(key, build))?
+        else {
+            return Ok(None);
+        };
+        if installed {
+            let _ = self.mlas_owned.packed.set(key);
         }
+        Ok(Some(prepared))
     }
 
     /// Full-width analogue of [`Self::shared_mlas_shards`] for the
@@ -2742,10 +3238,20 @@ impl MatMulNBitsKernel {
         comp: mlas_sys::SQNBitComputeType,
     ) -> Result<Option<Arc<MlasPreparedPacked>>> {
         let build = || self.build_mlas_prepacked(packed, scales, zero_points, comp);
-        match self.mlas_packed_key(packed, zero_points.is_some(), comp) {
-            Some(key) => with_mlas_packed_caches(|caches| caches.get_or_build_packed(key, build)),
-            None => Ok(build()?.map(Arc::new)),
+        let Some(key) =
+            self.mlas_packed_key(packed, scales, zero_points, zero_points.is_some(), comp)
+        else {
+            return Ok(build()?.map(Arc::new));
+        };
+        let Some((prepared, installed)) =
+            with_mlas_packed_caches(|caches| caches.get_or_build_packed(key, build))?
+        else {
+            return Ok(None);
+        };
+        if installed {
+            let _ = self.mlas_owned.packed.set(key);
         }
+        Ok(Some(prepared))
     }
 
     /// Pack the constant int4 weight into one MLAS SQNBit shard per entry of
@@ -3234,8 +3740,8 @@ fn configured_decode_threads() -> Option<usize> {
 ///
 /// It honors `ONNX_GENAI_CPU_DECODE_THREADS` when set (`0` opts out), but when
 /// the variable is unset it uses a *different, higher* default than the flat
-/// pool: [`default_persistent_threads`] (about half the logical CPUs) instead of
-/// the flat pool's eight-worker ceiling. The flat Rayon pool caps at eight
+/// pool: [`default_persistent_threads`] (one worker per allowed physical core)
+/// instead of the flat pool's eight-worker ceiling. The flat Rayon pool caps at eight
 /// because its per-op fork/join regresses beyond that; the persistent pool
 /// replaces that fork/join with one hot broadcast barrier, so it keeps scaling
 /// with cores until it hits the memory-bandwidth knee (measured plateau ~half
@@ -3249,6 +3755,7 @@ pub fn configured_persistent_decode_threads() -> Option<usize> {
         decode_threads_override(),
         value.as_deref(),
         available,
+        crate::core_topology::allowed_physical_cores(),
     );
     // Snapdragon/X Elite style ARM64 hosts have measured their decode roofline
     // at 6--8 workers, and the KAI-style packed SDOT path still scales from the
@@ -3769,6 +4276,57 @@ fn resolve_rayon_global_threads(
 /// most once and only its first attempt logs.
 static PROCESS_BUDGET_BOUND: OnceLock<()> = OnceLock::new();
 
+/// Whether an explicit decode budget asks for more workers than the host has
+/// physical cores, returning that core count when it does.
+///
+/// `None` whenever the topology is unknown or the request fits: an unknown
+/// topology is never an occasion to warn, and neither is a budget at or below
+/// the core count.
+///
+/// Split out as a pure function because the interesting part is the policy, and
+/// this way it is testable without a host to interrogate.
+fn budget_beyond_physical_cores(threads: usize, physical: Option<usize>) -> Option<usize> {
+    physical.filter(|&cores| cores > 0 && threads > cores)
+}
+
+/// Warn once when an explicit decode budget oversubscribes the physical cores.
+///
+/// Every pool this budget sizes -- the global Rayon pool built below, the decode
+/// pool, and the task runtime's lanes -- is a worker set that either spins or
+/// fork-joins. Past one worker per physical core the surplus workers are SMT
+/// siblings of workers that already exist, and
+/// [`crate::core_topology::cap_spinning_workers`] already refuses to spin that
+/// many for exactly this reason.
+///
+/// The cost is paid twice, and it is large. Measured on a 16-physical-core /
+/// 32-logical host, raising the budget from 16 to 32 for an int4 decode GEMM:
+///
+/// | budget | steady-state wall | CPU per inference | pool construction |
+/// | --- | --- | --- | --- |
+/// | 16 | 0.921 ms | 13.99 ms | 1.55 CPU-s |
+/// | 32 | 0.934 ms | 15.17 ms | 3.67 CPU-s |
+///
+/// No wall-clock gain at all, 8% more CPU per inference, and 2.4x the one-off
+/// construction cost -- which is futex and yield-spin churn while ~2x the
+/// threads come up, and which grows faster than linearly in the worker count.
+/// Larger prefill shapes in the same diagnostic harness measured the same way
+/// or worse. The runtime honours the request either way; this only makes a
+/// request that cannot pay for itself visible instead of silent.
+fn report_budget_beyond_physical_cores(threads: usize) {
+    let Some(cores) =
+        budget_beyond_physical_cores(threads, crate::core_topology::allowed_physical_cores())
+    else {
+        return;
+    };
+    eprintln!(
+        "onnx-genai: CPU decode budget {threads} exceeds the {cores} physical cores available \
+         to this process; the surplus workers are SMT siblings that contend rather than add \
+         throughput, and they cost both CPU per inference and a larger one-off pool \
+         construction. Consider {DECODE_THREADS_ENV}={cores} unless a measurement on this host \
+         says otherwise"
+    );
+}
+
 /// Confine the whole process to the explicit decode budget so a user who caps
 /// cores (via `--cpu-cores N`, `ONNX_GENAI_CPU_DECODE_THREADS=N`, or
 /// [`set_decode_thread_budget`]) disturbs at most `N` CPUs -- covering prefill
@@ -3805,6 +4363,10 @@ pub fn bound_process_to_decode_budget() {
         return;
     };
 
+    // Before the affinity mask narrows the allowed set, so the request is judged
+    // against the machine the caller was looking at when they chose the budget.
+    report_budget_beyond_physical_cores(threads);
+
     // Apply the process CPU affinity mask *before* building the Rayon global
     // pool so its worker threads inherit the restricted CPU set.
     #[cfg(target_os = "linux")]
@@ -3829,6 +4391,7 @@ pub fn bound_process_to_decode_budget() {
 
     match rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
+        .thread_name(prefill_worker_name)
         .build_global()
     {
         Ok(()) => eprintln!(
@@ -3843,6 +4406,25 @@ pub fn bound_process_to_decode_budget() {
     }
 }
 
+/// Name for a worker in the process-wide prefill/MLAS Rayon pool.
+///
+/// Rayon does not name `build_global` workers by default, and an unnamed
+/// thread's `comm` defaults to the *process* name — so an unnamed pool of
+/// `N` workers reads, in `ps`/`top`/`/proc/<pid>/task`, as `N` extra copies
+/// of the host binary rather than as a pool. That made this pool the single
+/// largest unattributed block of threads in a budgeted process (an explicit
+/// budget of `N` more than doubles the thread count, and until now `N` of
+/// those were anonymous).
+///
+/// Deliberately short: Linux truncates `comm` to 15 bytes, so the longer
+/// `onnx-genai-`-prefixed convention used elsewhere in this crate collapses
+/// to `onnx-genai-deco`/`onnx-genai-spmd` and loses the index. This form
+/// survives truncation intact for every width this pool is ever built at,
+/// which is the whole point of naming it.
+fn prefill_worker_name(index: usize) -> String {
+    format!("nxgn-prefill-{index}")
+}
+
 /// Default persistent-pool worker count for `available` logical CPUs: half of
 /// them (at least one), derived purely from topology (Rule 2).
 ///
@@ -3852,10 +4434,54 @@ pub fn bound_process_to_decode_budget() {
 /// *spin* before parking, a fully-subscribed pool starves the dispatcher and
 /// collapses throughput (measured 1.4 tok/s at 96 workers vs 28.7 at 48 on a
 /// 96-logical-CPU host); half sits at the measured plateau while avoiding that
-/// cliff, and on SMT hosts it maps to roughly the physical-core count.
-fn default_persistent_threads(available: usize) -> Option<usize> {
+/// cliff.
+///
+/// # Why `available / 2` is only a proxy
+///
+/// The rule the measurements actually support is *one worker per physical
+/// core*. Halving the CPU count is a stand-in that agrees with it only when the
+/// process can see every logical CPU on an SMT host. It disagrees badly the
+/// moment the allowed set is already one CPU per core: `taskset -c 0,2,...,30`
+/// on a 16-core/32-thread host leaves `available == 16`, all of them distinct
+/// cores, and halving builds an **8**-worker pool on 16 reserved cores. The
+/// operator asked for the machine and got half of it, silently, because the
+/// proxy cannot tell a 16-CPU SMT-free set from half of a 32-CPU SMT set.
+///
+/// So take the real answer when the topology is discoverable and the allowed
+/// set is known ([`crate::core_topology::allowed_physical_cores`]), and fall
+/// back to the halving proxy only when it is not. `None` from the topology
+/// means "unknown", never "one" — capping on a guess is how a 32-thread host
+/// silently becomes a 1-thread host.
+///
+/// # What this is *not* evidenced by
+///
+/// Both measurements behind the old rule — the plateau at "~half the logical
+/// CPUs" on a 2-socket Xeon 8480C, and the 1.4 tok/s at 96 workers against 28.7
+/// at 48 on a 96-logical-CPU host — were taken on SMT hosts, where half the
+/// logical CPUs *is* the physical-core count. Neither one distinguishes the two
+/// rules, so neither one supports this change on a **non-SMT** host, where
+/// `cores == available` and the default moves from half the machine to all of
+/// it. That case is an inference, not a measurement, and no non-SMT host was
+/// available to check it.
+///
+/// What makes the inference safe rather than merely plausible is that the
+/// consuming path reserves dispatcher headroom:
+/// `decode_spmd`'s `reserve_single_group_headroom` turns a request for `n`
+/// on `n` cores into `n - 1` spawned workers plus the inline dispatcher's own
+/// shard, so the fully-subscribed spinning layout that produced the 1.4 tok/s
+/// cliff is not reachable through this default. Verified on a 16-core host
+/// pinned to one CPU per core: 15 threads named `onnx-genai-spmd` on 15 leader
+/// CPUs, with the sixteenth core left free for the dispatcher.
+fn default_persistent_threads(
+    available: usize,
+    allowed_physical_cores: Option<usize>,
+) -> Option<usize> {
     let available = std::num::NonZeroUsize::new(available)?.get();
-    Some((available / 2).max(1))
+    let default = match allowed_physical_cores {
+        Some(cores) if cores > 0 => cores,
+        _ => available / 2,
+    };
+    Some(default.clamp(1, available))
 }
 
 /// Query the performance-core count on Apple Silicon via sysctl.
@@ -3889,16 +4515,17 @@ fn performance_core_count() -> Option<usize> {
 /// unparseable value falls back to [`default_persistent_threads`].
 #[cfg(test)]
 fn resolve_persistent_decode_threads(raw: Option<&str>, available: usize) -> Option<usize> {
-    resolve_persistent_decode_threads_with_override(None, raw, available)
+    resolve_persistent_decode_threads_with_override(None, raw, available, None)
 }
 
 fn resolve_persistent_decode_threads_with_override(
     override_threads: Option<usize>,
     raw: Option<&str>,
     available: usize,
+    allowed_physical_cores: Option<usize>,
 ) -> Option<usize> {
     let available = std::num::NonZeroUsize::new(available)?.get();
-    let default = default_persistent_threads(available)?;
+    let default = default_persistent_threads(available, allowed_physical_cores)?;
     let threads = match override_threads {
         Some(threads) => threads,
         None => match raw {
@@ -4073,7 +4700,7 @@ fn decode_affinity_cpus(threads: usize) -> std::result::Result<Option<Vec<usize>
 
 /// Log the decode-affinity auto-policy decision once (info): whether pinning was
 /// auto-enabled, declined (cpuset/single-node/unsupported OS), and why.
-fn report_decode_affinity_policy(message: &str) {
+pub(crate) fn report_decode_affinity_policy(message: &str) {
     static REPORTED: OnceLock<()> = OnceLock::new();
     if REPORTED.set(()).is_ok() {
         eprintln!(
@@ -4235,18 +4862,22 @@ thread_local! {
 /// The lazily built `numa-split` decode layout, or `None` when the mode is not
 /// requested or the host cannot be split (fallback, logged once).
 ///
-/// It is sized from [`configured_persistent_decode_threads`] (about half the
-/// logical CPUs), *not* the flat pool's eight-worker ceiling. `numa-split` is
+/// It is sized from [`configured_persistent_decode_threads`] (one worker per
+/// allowed physical core), *not* the flat pool's eight-worker ceiling. `numa-split` is
 /// the two-level, node-pinned mirror of the persistent SPMD pool (see
 /// [`crate::decode_spmd`]) and its whole purpose is to reach *both* sockets'
 /// memory bandwidth; the eight-worker flat ceiling would leave only ~four
 /// row-sharded workers per node, far too few to saturate either memory
 /// controller, so it could never realize the bandwidth win the layout exists
-/// for. Half the logical CPUs, split across the nodes, lands each per-node
-/// sub-pool at the measured bandwidth knee while leaving cores for the
-/// dispatcher and co-tenants (a *fully*-subscribed split oversubscribes the
-/// cores and collapses throughput). `ONNX_GENAI_CPU_DECODE_THREADS` still
-/// overrides the count (and `0` opts out).
+/// for. One worker per physical core, split across the nodes, lands each
+/// per-node sub-pool at the measured bandwidth knee; [`reserve_split_headroom`]
+/// is what then leaves room for the dispatcher, since a *fully*-subscribed split
+/// oversubscribes the cores and collapses throughput.
+/// `ONNX_GENAI_CPU_DECODE_THREADS` still overrides the count (and `0` opts out).
+///
+/// Note the per-node reserve frees one *logical* CPU rather than a physical
+/// core, so on an SMT host the on-node dispatcher gets a sibling rather than a
+/// free core; tracked separately as issue 1791.
 fn numa_pools() -> Option<&'static crate::decode_numa::NumaDecodePools> {
     static NUMA_POOLS: OnceLock<Option<crate::decode_numa::NumaDecodePools>> = OnceLock::new();
     NUMA_POOLS
@@ -4273,6 +4904,19 @@ pub(crate) fn spmd_decode_active() -> Option<&'static crate::decode_spmd::SpmdDe
     } else {
         None
     }
+}
+
+/// Whether *some* bounded decode pool owns this thread's forward pass.
+///
+/// The routing predicate for kernels that are not themselves decode
+/// projections but run inside a decode forward — attention, above all. When it
+/// is true the decode workers are resident and (under the SPMD scope) spinning,
+/// so a fan-out belongs on [`decode_parallel_output_row_blocks`] rather than on
+/// any second executor that would compete with them for the same cores. When it
+/// is false there is no decode pool to contend with and the task runtime is the
+/// right home. Keys off the active scope, never off op or model identity.
+pub(crate) fn decode_pool_active() -> bool {
+    spmd_decode_active().is_some() || numa_decode_active().is_some()
 }
 
 #[cfg(test)]
@@ -5469,7 +6113,9 @@ fn quantize_activation_qai8dxp(
         block_counts[block] += 1;
     }
     let group_words = values
-        .chunks_exact(KAI_SDOT_K_GROUP)
+        .as_chunks::<KAI_SDOT_K_GROUP>()
+        .0
+        .iter()
         .map(|group| {
             u32::from_le_bytes([
                 group[0] as u8,
@@ -6621,16 +7267,20 @@ fn packed_nbits_output_row(
     }
 }
 
-/// Borrow the optional int4 zero-point tensor for the zero-copy decode path.
+/// Borrow the optional zero-point tensor for the zero-copy borrowed paths.
 ///
 /// Returns `Some(None)` for a symmetric model (no zero_points input) — the
-/// borrowed kernel then uses the implicit midpoint 8. Returns `Some(Some(zp))`
-/// when an asymmetric uint8 zero_points input is present and host-contiguous.
-/// Returns `None` only when a zero_points input exists but cannot be borrowed
-/// in place, so the caller must fall through to another path. Gating on this
-/// (rather than on "a zero_points input happens to exist") is what lets
-/// symmetric int4 take the borrowed path instead of the resident f32 cache.
-fn borrow_optional_int4_zero_points<'a>(
+/// borrowed kernel then uses the implicit midpoint `1 << (bits - 1)`. Returns
+/// `Some(Some(zp))` when an asymmetric uint8 zero_points input is present and
+/// host-contiguous. Returns `None` only when a zero_points input exists but
+/// cannot be borrowed in place, so the caller must fall through to another
+/// path. Gating on this (rather than on "a zero_points input happens to exist")
+/// is what lets symmetric weights take the borrowed path instead of the
+/// resident f32 cache.
+///
+/// The bytes are handed back unpacked, so the *caller* owns the bit-width
+/// convention: 4-bit reads a nibble per block, 8-bit a whole byte.
+fn borrow_optional_packed_zero_points<'a>(
     zero_points: Option<&TensorView<'a>>,
 ) -> Option<Option<&'a [u8]>> {
     match zero_points {
@@ -6648,6 +7298,21 @@ fn contiguous_host_slice<'a, T>(view: &TensorView<'a>) -> Option<&'a [T]> {
     Some(unsafe { std::slice::from_raw_parts(view.data_ptr::<T>(), view.numel()) })
 }
 
+/// Address of a contiguous host-visible tensor's first byte, for use as part of
+/// a cache identity. Returns `None` for device or strided tensors, which have no
+/// stable host address to key on.
+///
+/// Deliberately not `contiguous_host_slice::<u8>`: that would build a slice of
+/// `numel` *elements* typed as bytes, understating the length for any wider
+/// dtype. Only the address is wanted here, so no slice is formed at all.
+#[cfg(feature = "mlas")]
+fn contiguous_host_addr(view: &TensorView) -> Option<usize> {
+    if !view.device.is_host_accessible() || !view.is_contiguous() {
+        return None;
+    }
+    Some(view.data_ptr::<u8>() as usize)
+}
+
 fn borrowed_scales<'a>(view: &TensorView<'a>) -> Option<BorrowedScales<'a>> {
     match view.dtype {
         DataType::Float32 => contiguous_host_slice(view).map(BorrowedScales::F32),
@@ -6659,20 +7324,51 @@ fn borrowed_scales<'a>(view: &TensorView<'a>) -> Option<BorrowedScales<'a>> {
 
 /// A/B toggle for the register-blocked ("N-blocked") borrowed int4 decode
 /// kernel that absorbs MLAS SQNBit CompFp32's activation-reuse locality without
-/// a resident packed copy. `1`/`on` enables it; unset or `0`/`off` keeps the
-/// per-column path. Default off so the shipped borrowed path is unchanged until
-/// the win is measured, exactly like the `ONNX_GENAI_CPU_MM_MLAS_QNBIT` and
-/// `#994` toggles that preceded it. Production is the only writer of process
-/// state here: this is a read-only env probe, never mutated at runtime.
+/// a resident packed copy. **On by default**; set
+/// `ONNX_GENAI_CPU_MM_INT4_NBLK=0` (or `off`) to fall back to the per-column
+/// path in the same binary. Production is the only writer of process state
+/// here: this is a read-only env probe, never mutated at runtime.
+///
+/// It shipped default *off* in #1104 "until the win is measured", and then the
+/// measurement never happened, so `accuracy_level = 0` — the production
+/// default — kept taking the per-column path for the whole time this kernel
+/// sat in the tree. Route counters instrumented from operator entry through
+/// the kernel confirm it: at `accuracy_level = 0` every call reached the
+/// borrowed guard and every one of them went to `borrowed_affine_int4_matmul`,
+/// with `nblock = 0`.
+///
+/// Measured on the decode A/B (`int4_decode_loop_ab`, `accuracy_level = 0`,
+/// block 32, min of 6 interleaved reps, pinned to physical cores):
+///
+/// | route | t=1 | t=4 | vs per-column |
+/// |---|---|---|---|
+/// | per-column (previous default) | 56.528 | 28.518 | 1.00x |
+/// | N-blocked, group of 1 | 55.156 | 27.861 | 1.02x |
+/// | N-blocked, group of 2 | 47.679 | 23.885 | 1.19x |
+/// | N-blocked, group of 4 | 38.114 | 19.238 | **1.48x** |
+///
+/// The group-of-1 row is the attribution, and it rules out the explanation
+/// the structure suggests. Restructuring the reduction — keeping the scale in
+/// a vector accumulator and reducing once per column instead of once per
+/// 32-weight block — is worth **1.02x, i.e. nothing measurable**, even though
+/// the per-column path's hreduce (`extractf128`/`movehl`/`shuffle`, each
+/// dependent on the last) sits on the critical path every four FMAs. The
+/// block loop has enough independent work across blocks for the out-of-order
+/// engine to hide it.
+///
+/// The win is entirely the **four-column activation reuse**: 1.45x from group
+/// 1 to group 4. At `m == 1` each activation vector is loaded once and fed to
+/// four columns' FMAs, so the load count per useful FMA drops 4x. That also
+/// matches #1104's independently measured 1.46x end-to-end on a 14B model.
 #[cfg(target_arch = "x86_64")]
 fn borrowed_int4_nblock_enabled() -> bool {
     std::env::var("ONNX_GENAI_CPU_MM_INT4_NBLK")
         .ok()
         .map(|value| {
             let value = value.trim();
-            !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("off")
+            value.is_empty() || (value != "0" && !value.eq_ignore_ascii_case("off"))
         })
-        .unwrap_or(false)
+        .unwrap_or(true)
 }
 
 /// Register-blocked borrowed int4 matmul. Reads the *same* zero-copy mmap int4
@@ -6784,6 +7480,12 @@ unsafe fn borrowed_int4_nblock4_avx2(
     k: usize,
     out: &mut [f32],
 ) {
+    debug_assert_eq!(
+        layout.bits, 4,
+        "int4_zero_point() below hard-codes the 4-bit pack; a wider layout \
+         would need the generic NBitsLayout::zero_point"
+    );
+
     use std::arch::x86_64::*;
 
     let group = packed_rows.len();
@@ -6802,7 +7504,7 @@ unsafe fn borrowed_int4_nblock4_avx2(
                 let block_values =
                     &packed_rows[c][block * packed_block_size..(block + 1) * packed_block_size];
                 let scale = scales.get(scale_bases[c] + block);
-                let zero_point = layout.zero_point(zp_rows[c], block) as f32;
+                let zero_point = int4_zero_point(zp_rows[c], block) as f32;
                 let mut dot = 0.0f32;
                 for (byte_index, &byte) in block_values.iter().enumerate() {
                     let within = byte_index * 2;
@@ -6855,7 +7557,7 @@ unsafe fn borrowed_int4_nblock4_avx2(
         }
         for c in 0..group {
             let scale = scales.get(scale_bases[c] + block);
-            let zero_point = layout.zero_point(zp_rows[c], block) as f32;
+            let zero_point = int4_zero_point(zp_rows[c], block) as f32;
             acc[c] = _mm256_fmadd_ps(blk[c], _mm256_set1_ps(scale), acc[c]);
             correction[c] += scale * zero_point * activation_sums[block];
         }
@@ -6898,6 +7600,11 @@ fn borrowed_int4_output_element(
     k: usize,
     dot_kernel: DotKernel,
 ) -> f32 {
+    debug_assert_eq!(
+        layout.bits, 4,
+        "int4_zero_point() below hard-codes the 4-bit pack; a wider layout \
+         would need the generic NBitsLayout::zero_point"
+    );
     // On non-x86 targets `dot_kernel` drives no fast path; discard it to keep
     // `-D warnings` happy, mirroring `borrowed_affine_int4_matmul`.
     #[cfg(not(target_arch = "x86_64"))]
@@ -6909,7 +7616,7 @@ fn borrowed_int4_output_element(
         let block_values = &packed_row
             [block * layout.packed_block_size()..(block + 1) * layout.packed_block_size()];
         let scale = scales.get(scale_base + block);
-        let zero_point = layout.zero_point(zp_row, block) as f32;
+        let zero_point = int4_zero_point(zp_row, block) as f32;
         let mut dot;
         #[cfg(target_arch = "aarch64")]
         if valid == 32 && block_size == 32 {
@@ -6953,21 +7660,423 @@ fn borrowed_int4_output_element(
     sum
 }
 
-/// A/B toggle for the structural borrowed int4 prefill matmul (issue #1117).
-/// `1`/`on` enables it for multi-row (prefill) activations; unset or `0`/`off`
-/// keeps the row-serial path. Default off so the shipped path is unchanged
-/// until the win is measured, exactly like the `#1104` N-block
-/// (`ONNX_GENAI_CPU_MM_INT4_NBLK`) and `#994` SIMD toggles. Read-only env probe
-/// -- production never mutates it at runtime.
+/// Row count from which the fused-dequant GEBP prefill (#1117) takes over from
+/// the borrowed column-blocked kernel for a weight too large to stay in L2.
+///
+/// Below this the pack is not amortized: the borrowed kernel re-decodes each
+/// packed byte per row block but never materializes an f32 panel, so at small
+/// `m` its total work is genuinely lower — the panels only pay off once enough
+/// rows reuse them.
+///
+/// This threshold has now been re-derived three times, because it is a
+/// property of the two kernels either side of it and the GEBP keeps moving. It
+/// was tuned at `4` against the *row-serial* borrowed kernel; #1356 replaced
+/// that with the column-blocked one, which amortizes its re-decode over a block
+/// of rows, so #1431 raised it to `12`; #1556 vectorized the pack and it fell
+/// to `5`. Cutting the pack's remaining fixed cost by a further 1.53x moves it
+/// again.
+///
+/// Measured at `4096x11008` over 5 interleaved reps, GEBP against the
+/// column-blocked route (`ONNX_GENAI_CPU_MM_INT4_GEBP=0`), with the gate forced
+/// to 1 so both routes run at every `m`:
+///
+/// | m | column-blocked | GEBP | GEBP / row |
+/// |---|---|---|---|
+/// | 1 | 2.094 ms | 1.787 ms | 0.853x |
+/// | 2 | 1.798 ms | 1.768 ms | 0.983x |
+/// | 3 | 1.944 ms | 1.798 ms | 0.925x |
+/// | 4 | 2.271 ms | 1.774 ms | 0.781x |
+/// | 5 | 3.747 ms | 1.802 ms | 0.481x |
+///
+/// GEBP is now ahead at every `m` on this shape, so the crossover has fallen
+/// off the bottom of the sweep. The value is set to `3` rather than `1`
+/// deliberately: `m = 2` is a 1.7% difference, inside the noise, and `m = 1` is
+/// decode, which has its own dedicated route and should not be re-pointed on
+/// the strength of a prefill bench. `3` is the smallest `m` with a margin
+/// worth acting on.
+#[cfg(target_arch = "x86_64")]
+const INT4_PREFILL_GEBP_MIN_ROWS: usize = 3;
+
+/// Row threshold for weights small enough to stay resident in L2, where the
+/// column-blocked kernel's re-decode is nearly free and the GEBP pack takes
+/// longer to pay off.
+///
+/// Re-derived alongside [`INT4_PREFILL_GEBP_MIN_ROWS`] each time the pack
+/// changes: `24`, then `12`, and now `6`. At `2048x2048` (2.1 MB packed) over
+/// 5 interleaved reps the column-blocked route still wins below the crossover,
+/// which is why this regime keeps a real threshold where the non-resident one
+/// has effectively lost its:
+///
+/// | m | column-blocked | GEBP | GEBP / row |
+/// |---|---|---|---|
+/// | 2 | 0.2020 ms | 0.3690 ms | 1.827x |
+/// | 4 | 0.2680 ms | 0.3660 ms | 1.366x |
+/// | 6 | 0.4150 ms | 0.3830 ms | 0.923x |
+/// | 8 | 0.5030 ms | 0.4810 ms | 0.956x |
+/// | 12 | 0.6800 ms | 0.4890 ms | 0.719x |
+#[cfg(target_arch = "x86_64")]
+const INT4_PREFILL_GEBP_MIN_ROWS_L2_RESIDENT: usize = 6;
+
+/// Packed-weight size above which the column-blocked kernel can no longer keep
+/// the weight in cache between rows. Sits between the two measured regimes:
+/// qwen3-0.6B QKV packs to 1.0 MB and stays with the column-blocked route
+/// until `m = 6`; llama3-8B QKV (12.6 MB) and MLP (29.4 MB) prefer the GEBP
+/// from `m = 3`. The two regimes have converged as the pack got cheaper, but
+/// they have not met.
+#[cfg(target_arch = "x86_64")]
+const INT4_PREFILL_GEBP_L2_RESIDENT_BYTES: usize = 4 << 20;
+
+/// Crossover for a weight whose block size the column-blocked kernels cannot
+/// take.
+///
+/// [`borrowed_affine_int4_matmul_prefill`] and
+/// [`borrowed_affine_int4_matmul_nblock`] both require 32-element blocks. For
+/// the ONNX-minimum block size of 16 the GEBP prefill is the only vectorised
+/// route there is, and everything below it is a scalar per-block dot running on
+/// the narrow decode pool. That asymmetry cuts the other way from the
+/// 32-element case: below this threshold the fallback is not a rival kernel to
+/// be beaten, it is `borrowed_affine_int4_matmul` doing per-block scalar work,
+/// so the threshold should sit as low as the surrounding invariants allow.
+///
+/// It had never been re-measured, because the `int4_prefill_route_ab` bench
+/// pinned `block_size` to 32 and so could not reach this branch at all (the
+/// same defect that hid the 8-bit control until `PROBE_BITS` arrived in
+/// #1558). Measured with `PROBE_BLOCK=16`, native-alone, steady phase, median
+/// of five interleaved reps, as GEBP's speedup over the per-block dot:
+///
+/// | m | 2048x2048 | 4096x11008 |
+/// |---|---|---|
+/// | 1 | 2.51x | 4.62x |
+/// | 2 | **4.06x** | **8.96x** |
+/// | 3 | 6.81x | 14.6x |
+/// | 4 | 10.4x | 18.1x |
+/// | 6 | 13.2x | 30.1x |
+/// | 8 | 13.8x | 30.6x |
+///
+/// GEBP is ahead at every `m` on both shapes, and by a margin that grows
+/// linearly because the dot arm's cost is linear in `m` (9.4 -> 76.9 ms on the
+/// large shape) while GEBP's is flat (~2 ms, the pack). The old value of 4 was
+/// therefore giving up 8.96x at `m = 2` and 14.6x at `m = 3`. Unlike the
+/// 32-element gates this one needs no residency split: both shapes agree.
+///
+/// Set to 1: decode goes through GEBP too. This gate is *only* reachable at
+/// `block_size = 16`. `MatMulNBits` rejects any block size that is not a power
+/// of two `>= 16`, and the only such size that is not a multiple of 32 is 16
+/// itself, so "unblocked" names exactly one shape.
+///
+/// The value was 2 while the `m = 1` evidence was a single-op prefill bench
+/// that could not see per-token pool contention. Re-measured with a decode-loop
+/// A/B (`int4_decode_loop_ab`, llama3-8B projection chain, `m = 1`, each token
+/// inside one `with_decode_pool_scope` exactly as `native_decode/cpu.rs` drives
+/// a single-token forward), aggregate tokens/s, steady phase, mean of three
+/// interleaved reps:
+///
+/// | sessions | GEBP | scalar dot | speedup | GEBP p90 | dot p90 |
+/// |---|---|---|---|---|---|
+/// | 1 | 97.3 | 30.6 | 3.2x | 10.3 ms | 29.7 ms |
+/// | 2 | 111.5 | 32.3 | 3.5x | 18.4 ms | 30.9 ms |
+/// | 4 | 122.8 | 29.7 | 4.1x | 35.7 ms | 233.3 ms |
+///
+/// The contention objection inverted: the advantage *grows* with session count
+/// and the tail improves 6.5x, because the arm this replaces is a scalar
+/// per-block dot with no vectorized route at all.
+///
+/// The same measurement says the opposite for every block size a column-blocked
+/// kernel accepts, which is why [`INT4_PREFILL_GEBP_MIN_ROWS`] and
+/// [`INT4_PREFILL_GEBP_MIN_ROWS_L2_RESIDENT`] stay above 1: at `m = 1` GEBP is
+/// 9% slower at block 32, 1.8x slower at 64 and 2.1x slower at 128.
+#[cfg(target_arch = "x86_64")]
+const INT4_PREFILL_GEBP_MIN_ROWS_UNBLOCKED: usize = 1;
+
+/// The `m` at which the fused-dequant GEBP overtakes the column-blocked
+/// borrowed kernel for this node's weight.
+///
+/// The crossover is not a single row count: it depends on whether the packed
+/// weight stays cache-resident across rows. Re-measured on a 32-core AVX2 host
+/// against the **vectorized** pack, native-alone, steady phase, median of five
+/// interleaved reps, as GEBP's speedup over the column-blocked kernel:
+///
+/// | m | 2048x2048 (2.1 MB, L2-resident) | 4096x11008 (22.5 MB) |
+/// |---|---|---|
+/// | 4 | 0.54x | 0.98x |
+/// | 5 | 0.89x | **1.48x** |
+/// | 6 | 0.89x | 1.52x |
+/// | 8 | 0.86x | 1.49x |
+/// | 12 | **1.19x** | 2.21x |
+/// | 16 | 1.38x | 2.60x |
+///
+/// After the pack's remaining fixed cost fell a further 1.53x, the
+/// large-weight crossover fell off the bottom of the sweep -- GEBP is ahead at
+/// every `m >= 1` there -- while the L2-resident one sits between 4 and 6. The
+/// sequence for the pair is (12, 24) against the scalar pack, (5, 12) against
+/// the vectorized one, and (3, 6) now.
+///
+/// The split is still load bearing, and by more than before: a flat `3` would
+/// hand the small shape a 1.37x regression at `m = 4` and 1.83x at `m = 2`; a
+/// flat `6` would give up 1.08x-2.08x on the large shape at `m = 3..5`.
+///
+/// Reproduce with `PROBE_M_LIST=1,2,3,4,5,6,8,12` on the
+/// `int4_prefill_route_ab` bench, once with the default env and once with
+/// `ONNX_GENAI_CPU_MM_INT4_GEBP=0`.
+///
+/// Both regimes were measured on `block_size = 32` weights, which is also the
+/// smallest block the kernels that win below the crossover can take; see
+/// [`INT4_PREFILL_GEBP_MIN_ROWS_UNBLOCKED`] for the ones that cannot.
+#[cfg(target_arch = "x86_64")]
+fn int4_prefill_gebp_min_rows(packed_weight_bytes: usize, block_size: usize) -> usize {
+    if !block_size.is_multiple_of(32) {
+        INT4_PREFILL_GEBP_MIN_ROWS_UNBLOCKED
+    } else if packed_weight_bytes > INT4_PREFILL_GEBP_L2_RESIDENT_BYTES {
+        INT4_PREFILL_GEBP_MIN_ROWS
+    } else {
+        INT4_PREFILL_GEBP_MIN_ROWS_L2_RESIDENT
+    }
+}
+
+/// Kill switch for the fused-dequant GEBP prefill (issue #1117). Default **on**
+/// -- unlike the earlier `ONNX_GENAI_CPU_MM_INT4_PREFILL` probe this is a
+/// measured 15-24x win on the shapes it covers, so the burden of proof runs the
+/// other way. Set `ONNX_GENAI_CPU_MM_INT4_GEBP=0` (or `off`) to fall back to the
+/// row-serial path if a host ever disagrees. Read-only env probe -- production
+/// never mutates it at runtime.
+#[cfg(target_arch = "x86_64")]
+fn int4_prefill_gebp_enabled() -> bool {
+    std::env::var("ONNX_GENAI_CPU_MM_INT4_GEBP")
+        .ok()
+        .map(|value| {
+            let value = value.trim();
+            value.is_empty() || (value != "0" && !value.eq_ignore_ascii_case("off"))
+        })
+        .unwrap_or(true)
+}
+
+/// Row count from which the fused-dequant GEBP takes over the **8-bit**
+/// prefill.
+///
+/// The 4-bit threshold ([`INT4_PREFILL_GEBP_MIN_ROWS`]) is a crossover against
+/// the row-serial *borrowed* kernel, which reads each packed byte once per row
+/// and so is genuinely cheaper at `m = 2`. There is no such competitor at
+/// 8 bits: the route this replaces materializes the entire `k * n` weight as
+/// f32 on every call regardless of `m`, so its cost is dominated by a term that
+/// does not shrink as rows are removed. Measured at `k = n = 3584`, the fused
+/// route is 17.0x faster at the smallest multi-row shape it can take
+/// (`m = 2`: 0.90 ms against 15.25 ms) and the ratio only grows from there, so
+/// the threshold is the GEBP's own lower bound rather than a crossover.
+/// `m = 1` never reaches here -- it is claimed earlier by the 8-bit decode
+/// GEMV -- so 2 is the smallest value this constant can express.
+///
+/// Derived in `benches/int8_prefill_route_ab.rs`; see
+/// `docs/benchmarks/2026-08-19-int8-prefill-gebp.md`.
+#[cfg(target_arch = "x86_64")]
+const INT8_PREFILL_GEBP_MIN_ROWS: usize = 2;
+
+/// Kill switch for the fused-dequant 8-bit prefill GEBP. Default **on**, like
+/// its 4-bit sibling: the route it replaces re-materializes the whole weight as
+/// f32 per call, so the burden of proof is on keeping that, not on removing it.
+/// Set `ONNX_GENAI_CPU_MM_INT8_GEBP=0` (or `off`) to fall back. Read-only env
+/// probe -- production never mutates it at runtime.
+#[cfg(target_arch = "x86_64")]
+fn int8_prefill_gebp_enabled() -> bool {
+    std::env::var("ONNX_GENAI_CPU_MM_INT8_GEBP")
+        .ok()
+        .map(|value| {
+            let value = value.trim();
+            value.is_empty() || (value != "0" && !value.eq_ignore_ascii_case("off"))
+        })
+        .unwrap_or(true)
+}
+
+/// Kill switch for the structural, column-blocked borrowed int4 prefill matmul
+/// (issues #1117 and #1435). `0`/`off` reverts multi-row activations to the
+/// row-serial path; unset or anything else keeps the blocked path.
+///
+/// **Default on.** It shipped off — "until the win is measured" — and then
+/// nothing measured it, so for its whole life the toggle meant the code was
+/// dead in every build anyone ran. The win is now measured: on the llama3-8b
+/// QKV cell (`k = 4096`, `n = 6144`, `m = 8`) at 32 threads, native-alone,
+/// 6.90 ms -> 1.11 ms, and the path is bit-identical to the one it replaces, so
+/// there is nothing left for the default to protect. The switch stays only so a
+/// bisect has something to flip. Read-only env probe -- production never
+/// mutates it at runtime.
 #[cfg(target_arch = "x86_64")]
 fn borrowed_int4_prefill_block_enabled() -> bool {
     std::env::var("ONNX_GENAI_CPU_MM_INT4_PREFILL")
         .ok()
         .map(|value| {
             let value = value.trim();
-            !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("off")
+            value.is_empty() || (value != "0" && !value.eq_ignore_ascii_case("off"))
         })
-        .unwrap_or(false)
+        .unwrap_or(true)
+}
+
+/// Activation rows a single [`borrowed_int4_rowblock_avx2`] call accumulates at
+/// once.
+///
+/// The int4 inner loop is dominated by *nibble decode*, not by arithmetic. Per
+/// 32-lane chunk of one column it costs one 16-byte load, two `and`s, a shift,
+/// two `unpack`s and eight widen/convert instructions — about 18 — to feed just
+/// four FMAs. So better than 80% of the instruction stream is unpacking, and
+/// the row-serial and `NCols4` kernels both pay all of it again for every
+/// activation row.
+///
+/// The decoded block is identical for every row, so hoisting the row loop
+/// *inside* the unpack amortises those 18 instructions over `4 x ROWS` FMAs
+/// instead of 4. The instruction budget per 32 MACs goes from ~22 to ~8.5.
+///
+/// Four is what the register file allows, and what the sweep picks. The chunk
+/// loop holds the decoded block (`w0..w3`, 4 `ymm`), a per-row in-block
+/// accumulator (`ROWS`) and the activation vectors it loads for the row it is
+/// on (4) — 12 of the 16 architectural `ymm` at `ROWS = 4`, leaving the per-row
+/// cross-block accumulators to live across the much colder block boundary.
+/// `ROWS = 8` needs 20 and spills.
+///
+/// Measured at 32 threads, native-alone, ms (`ROWS = 2` is uniformly worst and
+/// is dropped from the table; on the target cell it reads 3.514):
+///
+/// | cell | `ROWS = 4` | `ROWS = 8` |
+/// |---|---|---|
+/// | `llama3_8b_qkv_t8`   |   2.277 |   2.279 |
+/// | `llama3_8b_qkv_t128` |  26.697 |  23.201 |
+/// | `llama3_8b_qkv_t512` |  90.942 |  92.268 |
+/// | `llama3_8b_mlp_t8`   |   5.524 |   5.107 |
+/// | `llama3_8b_mlp_t128` |  52.886 |  54.392 |
+/// | `llama3_8b_mlp_t512` | 216.386 | 225.152 |
+/// | `qwen3_0p6b_qkv_t8`   |  0.325 |   0.275 |
+/// | `qwen3_0p6b_qkv_t128` |  4.480 |   4.829 |
+/// | `qwen3_0p6b_qkv_t512` | 10.526 |  13.786 |
+/// | `qwen3_0p6b_mlp_t8`   |  0.578 |   0.577 |
+/// | `qwen3_0p6b_mlp_t128` |  5.047 |   6.510 |
+/// | `qwen3_0p6b_mlp_t512` | 20.372 |  24.868 |
+///
+/// 4 takes eight of the twelve cells. 8 takes three `t8` cells (by up to 1.18x
+/// on `qwen3_0p6b_qkv_t8`) and one wide one, `llama3_8b_qkv_t128`, by 1.15x —
+/// which the register-pressure argument does not predict and I cannot explain.
+/// 4's wins are the larger ones (up to 1.31x on `qwen3_0p6b_qkv_t512`) and
+/// cover every other wide prefill. Since a `t8` tile at `ROWS = 8` is a single
+/// tile with no remainder, that is 8's most favourable possible shape and it
+/// still does not carry the table. 4 it is.
+#[cfg(target_arch = "x86_64")]
+const PREFILL_ROW_BLOCK: usize = 4;
+
+/// AVX2 + FMA int4 kernel for one output column and up to
+/// [`PREFILL_ROW_BLOCK`] activation rows.
+///
+/// Decodes each K block's nibbles **once** and drives every row in the tile
+/// through the decoded vectors, which is the whole point (see
+/// [`PREFILL_ROW_BLOCK`]). Within a row this is instruction-for-instruction the
+/// single-column case of [`borrowed_int4_nblock4_avx2`]: the same unpack, the
+/// same per-block `blk`, the same `acc = fma(blk, scale, acc)` fold, the same
+/// scalar affine `correction`, and one horizontal reduction per row at the end.
+/// A `rows == 1` call is therefore bit-identical to
+/// `borrowed_int4_nblock4_avx2` with `group == 1`, which
+/// `rowblock_matches_nblock_for_a_single_row` asserts, and results differ from
+/// the per-element path only by the f32 reassociation that kernel already
+/// documents — never in nibble decode.
+///
+/// `activations` and `activation_sums` are the tile's rows only; `out` is one
+/// value per row of the tile.
+#[allow(clippy::too_many_arguments)]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn borrowed_int4_rowblock_avx2(
+    activations: &[f32],
+    activation_sums: &[f32],
+    rows: usize,
+    packed_row: &[u8],
+    scales: &BorrowedScales<'_>,
+    scale_base: usize,
+    zp_row: Option<&[u8]>,
+    bias_value: f32,
+    layout: NBitsLayout,
+    block_count: usize,
+    block_size: usize,
+    k: usize,
+    out: &mut [f32],
+) {
+    debug_assert_eq!(
+        layout.bits, 4,
+        "int4_zero_point() below hard-codes the 4-bit pack; a wider layout \
+         would need the generic NBitsLayout::zero_point"
+    );
+
+    use std::arch::x86_64::*;
+
+    let mask = _mm_set1_epi8(0x0f);
+    let packed_block_size = layout.packed_block_size();
+    let mut acc = [_mm256_setzero_ps(); PREFILL_ROW_BLOCK];
+    let mut correction = [0.0f32; PREFILL_ROW_BLOCK];
+    let mut extra = [0.0f32; PREFILL_ROW_BLOCK];
+
+    for block in 0..block_count {
+        let depth_start = block * block_size;
+        let valid = k.saturating_sub(depth_start).min(block_size);
+        let scale = scales.get(scale_base + block);
+        let zero_point = int4_zero_point(zp_row, block) as f32;
+        let block_values = &packed_row[block * packed_block_size..(block + 1) * packed_block_size];
+
+        if valid != block_size || !block_size.is_multiple_of(32) {
+            // Ragged or non-32-multiple tail block: scalar, matching the
+            // per-column and `NCols4` paths' scalar fallback exactly.
+            for r in 0..rows {
+                let activation = &activations[r * k..(r + 1) * k];
+                let mut dot = 0.0f32;
+                for (byte_index, &byte) in block_values.iter().enumerate() {
+                    let within = byte_index * 2;
+                    if within < valid {
+                        dot += activation[depth_start + within] * (byte & 0x0f) as f32;
+                    }
+                    if within + 1 < valid {
+                        dot += activation[depth_start + within + 1] * (byte >> 4) as f32;
+                    }
+                }
+                extra[r] += dot * scale;
+                correction[r] += scale * zero_point * activation_sums[r * block_count + block];
+            }
+            continue;
+        }
+
+        let mut blk = [_mm256_setzero_ps(); PREFILL_ROW_BLOCK];
+        for chunk in 0..block_size / 32 {
+            // SAFETY: 16 packed bytes per 32-lane chunk are in bounds for this
+            // column's block slice; loadu permits unaligned pointers.
+            let bytes = unsafe { _mm_loadu_si128(block_values.as_ptr().add(chunk * 16).cast()) };
+            let low = _mm_and_si128(bytes, mask);
+            let high = _mm_and_si128(_mm_srli_epi16(bytes, 4), mask);
+            let inter_lo = _mm_unpacklo_epi8(low, high);
+            let inter_hi = _mm_unpackhi_epi8(low, high);
+            let w0 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(inter_lo));
+            let w1 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(inter_lo, 8)));
+            let w2 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(inter_hi));
+            let w3 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(inter_hi, 8)));
+
+            let base = depth_start + chunk * 32;
+            for (r, blk_r) in blk.iter_mut().enumerate().take(rows) {
+                // SAFETY: `base + 32 <= k` because this is a full block, and
+                // row `r` of the tile spans `r * k .. (r + 1) * k`.
+                let a = unsafe { activations.as_ptr().add(r * k + base) };
+                *blk_r = _mm256_fmadd_ps(unsafe { _mm256_loadu_ps(a) }, w0, *blk_r);
+                *blk_r = _mm256_fmadd_ps(unsafe { _mm256_loadu_ps(a.add(8)) }, w1, *blk_r);
+                *blk_r = _mm256_fmadd_ps(unsafe { _mm256_loadu_ps(a.add(16)) }, w2, *blk_r);
+                *blk_r = _mm256_fmadd_ps(unsafe { _mm256_loadu_ps(a.add(24)) }, w3, *blk_r);
+            }
+        }
+
+        let scale_vector = _mm256_set1_ps(scale);
+        for r in 0..rows {
+            acc[r] = _mm256_fmadd_ps(blk[r], scale_vector, acc[r]);
+            correction[r] += scale * zero_point * activation_sums[r * block_count + block];
+        }
+    }
+
+    for (r, out_r) in out.iter_mut().enumerate().take(rows) {
+        let vector = acc[r];
+        let lo = _mm256_castps256_ps128(vector);
+        let hi = _mm256_extractf128_ps(vector, 1);
+        let sum4 = _mm_add_ps(lo, hi);
+        let sum2 = _mm_add_ps(sum4, _mm_movehl_ps(sum4, sum4));
+        let sum1 = _mm_add_ss(sum2, _mm_shuffle_ps(sum2, sum2, 0x55));
+        *out_r = bias_value + _mm_cvtss_f32(sum1) + extra[r] - correction[r];
+    }
 }
 
 /// Structural borrowed int4 matmul for prefill (issue #1117). Reads the *same*
@@ -6982,18 +8091,24 @@ fn borrowed_int4_prefill_block_enabled() -> bool {
 ///    inside its per-row loop. Here it is hoisted to one allocation of
 ///    `m * block_count` floats, independent of the weight size.
 ///
-/// This is deliberately *not* GEMM blocking: rows are visited outer-most, so a
-/// column's packed bytes are still re-read once per row (same weight traffic as
-/// the row-serial path). Reusing a column's bytes across a tile of rows is a
-/// separate, so-far-unproven change tracked as a follow-up to #1117 -- on the
-/// 0.5B model the reuse effect sat within run-to-run noise, so it is kept out
-/// of this change until it clears the baseline spread on a large model.
+/// It is also **row-blocked** (see [`PREFILL_ROW_BLOCK`] and
+/// [`borrowed_int4_rowblock_avx2`]), which is what makes it more than a
+/// fork-join fix. This was originally left out as
+/// "a separate, so-far-unproven change tracked as a follow-up to #1117 -- on
+/// the 0.5B model the reuse effect sat within run-to-run noise, so it is kept
+/// out of this change until it clears the baseline spread on a large model."
+/// That caveat was exactly right: the 0.5B QKV weight is 3 MiB and lives in L3
+/// across the whole prefill, so there is nothing for reuse to save. The
+/// llama3-8b QKV weight is 12.58 MiB, and there the effect is not subtle --
+/// re-reading it per row was the entire reason that cell sat ~10x behind ORT
+/// with time scaling *linearly* in `m` (0.890 / 0.859 / 0.851 ms per row at
+/// `m` = 1 / 8 / 128, the signature of zero row reuse).
 ///
 /// Each output element is computed with the identical float sequence as the
-/// row-serial path (via [`borrowed_int4_output_element`]); only the fork-join
-/// structure and the allocation change, so results are byte-identical.
-/// Parallelism is over disjoint column strips, mirroring the column-strip GEMM
-/// in `accelerate_gemm`.
+/// row-serial path (via [`borrowed_int4_output_element`]); the loop nest only
+/// changes *when* an element is computed, never *how*, so results stay
+/// byte-identical. Parallelism is over disjoint column strips, mirroring the
+/// column-strip GEMM in `accelerate_gemm`.
 #[allow(clippy::too_many_arguments)]
 #[cfg(target_arch = "x86_64")]
 fn borrowed_affine_int4_matmul_prefill(
@@ -7011,6 +8126,17 @@ fn borrowed_affine_int4_matmul_prefill(
 ) {
     debug_assert_eq!(activations.len(), m * k);
     debug_assert_eq!(result.len(), m * n);
+    // The route only reaches here on an AVX2-capable host, which is the
+    // precondition [`borrowed_int4_rowblock_avx2`] relies on. `dot_kernel` is
+    // no longer read for dispatch (the row-blocked kernel replaces the
+    // per-element one outright), so assert the contract that made that legal
+    // rather than silently ignoring the argument.
+    debug_assert!(
+        !matches!(dot_kernel, DotKernel::Scalar),
+        "the blocked int4 prefill requires an AVX2 host; the caller must not \
+         route a Scalar dot kernel here"
+    );
+    let _ = dot_kernel;
     let bits = 4usize;
     let layout = NBitsLayout { bits, block_size };
     let block_count = k.div_ceil(block_size);
@@ -7041,36 +8167,50 @@ fn borrowed_affine_int4_matmul_prefill(
     let result_ptr = result.as_mut_ptr() as usize;
     let run_columns = |j0: usize, j1: usize| {
         let result_base = result_ptr as *mut f32;
-        // Rows outer-most: this keeps the per-element k-reduction order and the
-        // weight-traffic profile identical to the row-serial path; only the
-        // fork-join count and the allocation change.
-        for i in 0..m {
-            let activation = &activations[i * k..(i + 1) * k];
-            let sums = &activation_sums[i * block_count..(i + 1) * block_count];
-            for j in j0..j1 {
-                let packed_row = &packed[j * packed_row_size..(j + 1) * packed_row_size];
-                let zp_row = zero_points
-                    .map(|zp| &zp[j * zero_point_row_size..(j + 1) * zero_point_row_size]);
-                let bias_value = bias.map_or(0.0, |values| values[j]);
-                let value = borrowed_int4_output_element(
-                    activation,
-                    sums,
-                    packed_row,
-                    zp_row,
-                    &scales,
-                    j * block_count,
-                    bias_value,
-                    layout,
-                    block_count,
-                    block_size,
-                    k,
-                    dot_kernel,
-                );
-                // SAFETY: `i < m` and `j < n`, so `i * n + j < m * n ==
-                // result.len()`; this task owns column `j` exclusively.
+        // Columns outer, a tile of rows inner. The tile is what buys the
+        // win: `borrowed_int4_rowblock_avx2` decodes a K block's nibbles once
+        // and drives all `PREFILL_ROW_BLOCK` rows through the decoded vectors,
+        // where the row-serial path re-decoded the whole weight for every row.
+        // Decode is >80% of this kernel's instruction stream, so amortising it
+        // is worth far more than anything the fork-join structure can buy.
+        for j in j0..j1 {
+            let packed_row = &packed[j * packed_row_size..(j + 1) * packed_row_size];
+            let zp_row =
+                zero_points.map(|zp| &zp[j * zero_point_row_size..(j + 1) * zero_point_row_size]);
+            let bias_value = bias.map_or(0.0, |values| values[j]);
+            let mut row = 0usize;
+            while row < m {
+                let rows = (m - row).min(PREFILL_ROW_BLOCK);
+                let mut out_buf = [0.0f32; PREFILL_ROW_BLOCK];
+                // SAFETY: the caller's route guarantees an AVX2+FMA host (the
+                // same guard `borrowed_int4_nblock4_avx2` relies on); every
+                // slice below is bounds-checked by construction and the tile
+                // never runs past `m`.
                 unsafe {
-                    *result_base.add(i * n + j) = value;
+                    borrowed_int4_rowblock_avx2(
+                        &activations[row * k..(row + rows) * k],
+                        &activation_sums[row * block_count..(row + rows) * block_count],
+                        rows,
+                        packed_row,
+                        &scales,
+                        j * block_count,
+                        zp_row,
+                        bias_value,
+                        layout,
+                        block_count,
+                        block_size,
+                        k,
+                        &mut out_buf[..rows],
+                    );
                 }
+                for (r, value) in out_buf[..rows].iter().enumerate() {
+                    // SAFETY: `row + r < m` and `j < n`, so the index is inside
+                    // `m * n`; this task owns column `j` exclusively.
+                    unsafe {
+                        *result_base.add((row + r) * n + j) = *value;
+                    }
+                }
+                row += rows;
             }
         }
     };
@@ -7375,7 +8515,12 @@ unsafe fn affine_int4_block32_dot_neon(activation: &[f32], packed: &[u8]) -> f32
 fn deinterleave_activation_int4(activation: &[i8]) -> Vec<i8> {
     debug_assert_eq!(activation.len() % 32, 0);
     let mut out = vec![0i8; activation.len()];
-    for (block_in, block_out) in activation.chunks_exact(32).zip(out.chunks_exact_mut(32)) {
+    for (block_in, block_out) in activation
+        .as_chunks::<32>()
+        .0
+        .iter()
+        .zip(out.as_chunks_mut::<32>().0.iter_mut())
+    {
         for i in 0..16 {
             block_out[i] = block_in[2 * i];
             block_out[16 + i] = block_in[2 * i + 1];
@@ -7902,6 +9047,148 @@ fn quantize_activation(
             crate::kernels::simd_quant::quantize_block_u8_offset(src, &mut out_block[..src.len()]);
     }
     (quantized, scales)
+}
+
+/// Rows the packed-nibble route serves before the expanded-`i8` prefill path
+/// takes over.
+///
+/// The nibble kernel re-quantizes and deinterleaves the activation per row and
+/// re-reads the whole weight per row -- it is a GEMV repeated, with no `B`
+/// reuse. That is the right trade exactly while the weight stream dominates,
+/// which is decode and the short prefills that follow it; past that the
+/// expanded-`i8` path's packing amortizes and AMX/VNNI blocking becomes
+/// available. Swept in `docs/benchmarks/2026-08-21-int4-packed-nibble-avx2.md`.
+/// Largest `m` the packed-nibble route serves.
+///
+/// Every `m` up to and including this one was measured a win against the
+/// expanded-`i8` route it replaces (~2x at `m = 1..64`, `qwen3_8b_square`,
+/// `block_size = 32`, 8 threads); past it there is no measurement, so the gate
+/// is the largest `m` with evidence rather than a modelled crossover. The
+/// driver parallelizes over rows without weight reuse, so a real prefill
+/// geometry wants a blocked kernel rather than a wider gate here.
+const INT4_NIBBLE_MAX_ROWS: usize = 64;
+
+/// Which int4 `accuracy_level = 4` route a call took. Test-only: the counters
+/// exist so a route can be asserted rather than inferred from a timing.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Int4Route {
+    /// The packed-nibble AVX2 kernel, 0.5 B/weight.
+    PackedNibble,
+    /// `prepack_int8_weight` + `int8_matmul`, 1 B/weight.
+    ExpandedInt8,
+}
+
+#[cfg(test)]
+thread_local! {
+    static INT4_ROUTES: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+#[cfg(test)]
+fn record_int4_route(route: Int4Route) {
+    INT4_ROUTES.with(|routes| {
+        let (nibble, int8) = routes.get();
+        routes.set(match route {
+            Int4Route::PackedNibble => (nibble + 1, int8),
+            Int4Route::ExpandedInt8 => (nibble, int8 + 1),
+        });
+    });
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn record_int4_route(_route: Int4Route) {}
+
+#[cfg(not(test))]
+#[derive(Clone, Copy)]
+pub(crate) enum Int4Route {
+    PackedNibble,
+    ExpandedInt8,
+}
+
+/// `(packed nibble, expanded int8)` route counts since [`reset_int4_routes`].
+#[cfg(test)]
+pub(crate) fn int4_routes() -> (usize, usize) {
+    INT4_ROUTES.with(|routes| routes.get())
+}
+
+#[cfg(test)]
+pub(crate) fn reset_int4_routes() {
+    INT4_ROUTES.with(|routes| routes.set((0, 0)));
+}
+
+/// Packed-nibble int4 GEMV/short-GEMM driver.
+///
+/// Mirrors [`int8_matmul`]'s structure -- one quantized activation per row,
+/// column-parallel when the pool has workers the rows do not use -- but the
+/// weight is the untouched ONNX packed tensor.
+fn int4_nibble_matmul(
+    activations: &[f32],
+    weight: &PackedNBitsWeight,
+    result: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+    block_size: usize,
+) {
+    let k_blocks = k.div_ceil(block_size);
+    let padded_k = k_blocks * block_size;
+    debug_assert_eq!(weight.values.len(), n * k_blocks * (block_size / 2));
+    debug_assert_eq!(weight.scales.len(), n * k_blocks);
+
+    if m == 1 {
+        let prepared = int4_nibble::NibbleActivation::new(activations, padded_k, block_size);
+        int4_nibble_row(
+            &prepared, weight, result, k_blocks, block_size, padded_k, true,
+        );
+    } else {
+        let parallel_columns =
+            m < rayon::current_num_threads() && output_chunk_len(n, padded_k) < n;
+        result
+            .par_chunks_mut(n)
+            .zip(activations.par_chunks_exact(k))
+            .for_each(|(output, activation)| {
+                let prepared = int4_nibble::NibbleActivation::new(activation, padded_k, block_size);
+                int4_nibble_row(
+                    &prepared,
+                    weight,
+                    output,
+                    k_blocks,
+                    block_size,
+                    padded_k,
+                    parallel_columns,
+                );
+            });
+    }
+}
+
+fn int4_nibble_row(
+    prepared: &int4_nibble::NibbleActivation,
+    weight: &PackedNBitsWeight,
+    result: &mut [f32],
+    k_blocks: usize,
+    block_size: usize,
+    padded_k: usize,
+    parallel: bool,
+) {
+    let compute = |output_start: usize, outputs: &mut [f32]| {
+        let outputs_len = outputs.len();
+        int4_nibble::nibble_outputs(
+            prepared,
+            &weight.values,
+            &weight.scales,
+            weight.zero_points.as_deref(),
+            output_start..output_start + outputs_len,
+            outputs,
+            k_blocks,
+            block_size,
+        );
+    };
+    if parallel && output_chunk_len(result.len(), padded_k) < result.len() {
+        parallel_output_rows(result, padded_k, compute);
+    } else {
+        compute(0, result);
+    }
 }
 
 fn int8_matmul(
@@ -8496,7 +9783,7 @@ fn gemv_nk(activation: &[f32], weight_nk: &[f32], result: &mut [f32], k: usize, 
     let compute = |output_start: usize, outputs: &mut [f32]| {
         let weights = &weight_nk[output_start * k..(output_start + outputs.len()) * k];
         for (output, weight) in outputs.iter_mut().zip(weights.chunks_exact(k)) {
-            *output = activation.iter().zip(weight).map(|(&a, &b)| a * b).sum();
+            *output = dot_f32(activation, weight);
         }
     };
     let chunk = output_chunk_len(n, k);
@@ -8505,6 +9792,42 @@ fn gemv_nk(activation: &[f32], weight_nk: &[f32], result: &mut [f32], k: usize, 
     } else {
         compute(0, result);
     }
+}
+
+/// Multiply-accumulate two `f32` slices.
+///
+/// Sixteen independent accumulators, for the same reason [`dot_u8_f32`] has
+/// them: `f32` addition is not associative, so a plain `iter().map().sum()`
+/// forces LLVM to keep one serial accumulator. The loop then cannot vectorize
+/// and issues one FMA per FMA *latency* instead of one per issue slot, which is
+/// an order of magnitude off. This is the whole cost of the production-default
+/// int4 decode GEMV -- measured 5.3x-9.9x on llama/qwen projection shapes, at
+/// identical memory traffic. Before this, that path achieved 3.8-4.0 GB/s
+/// against a ~31-36 GB/s per-CCX ceiling: it was never bandwidth-bound, it was
+/// waiting on a dependency chain.
+///
+/// Reassociating the sum is a change in rounding, not in precision class: the
+/// compute type stays `f32` throughout, no operand is quantized, and the
+/// pairwise-shaped partial sums are *more* accurate than the serial chain they
+/// replace, not less. That is the same trade [`dot_u8_f32`] already makes on
+/// the `accuracy_level = 0` 8-bit decode route.
+#[inline]
+fn dot_f32(activation: &[f32], weight: &[f32]) -> f32 {
+    debug_assert_eq!(weight.len(), activation.len());
+    const LANES: usize = 16;
+    let mut acc = [0.0f32; LANES];
+    let (weight_chunks, weight_tail) = weight.as_chunks::<LANES>();
+    let (activation_chunks, activation_tail) = activation.as_chunks::<LANES>();
+    for (w, a) in weight_chunks.iter().zip(activation_chunks) {
+        for lane in 0..LANES {
+            acc[lane] += w[lane] * a[lane];
+        }
+    }
+    let mut tail = 0.0f32;
+    for (w, a) in weight_tail.iter().zip(activation_tail) {
+        tail += *w * *a;
+    }
+    tail + acc.iter().sum::<f32>()
 }
 
 /// Multiply-accumulate a `u8` weight slice against an `f32` activation slice.
@@ -8517,19 +9840,15 @@ fn dot_u8_f32(weight: &[u8], activation: &[f32]) -> f32 {
     debug_assert_eq!(weight.len(), activation.len());
     const LANES: usize = 16;
     let mut acc = [0.0f32; LANES];
-    let mut weight_chunks = weight.chunks_exact(LANES);
-    let mut activation_chunks = activation.chunks_exact(LANES);
-    for (w, a) in weight_chunks.by_ref().zip(activation_chunks.by_ref()) {
+    let (weight_chunks, weight_tail) = weight.as_chunks::<LANES>();
+    let (activation_chunks, activation_tail) = activation.as_chunks::<LANES>();
+    for (w, a) in weight_chunks.iter().zip(activation_chunks) {
         for lane in 0..LANES {
             acc[lane] += w[lane] as f32 * a[lane];
         }
     }
     let mut tail = 0.0f32;
-    for (w, a) in weight_chunks
-        .remainder()
-        .iter()
-        .zip(activation_chunks.remainder())
-    {
+    for (w, a) in weight_tail.iter().zip(activation_tail) {
         tail += *w as f32 * *a;
     }
     tail + acc.iter().sum::<f32>()
@@ -8980,7 +10299,33 @@ const MIN_OUTPUTS_PER_TASK: usize = 16;
 const MANY_THREAD_CUTOFF: usize = 48;
 
 pub(crate) fn output_chunk_len(n: usize, k: usize) -> usize {
-    let threads = effective_fan_out_width();
+    output_chunk_len_for(effective_fan_out_width(), n, k)
+}
+
+/// [`output_chunk_len`] for an executor whose width is known independently of
+/// the ambient Rayon pool.
+///
+/// The Rayon fan-outs partition the pool they are already installed on, so
+/// reading the width back out of Rayon is exactly right for them. The persistent
+/// SPMD pool is *not* a Rayon pool: it owns its own workers and dispatches
+/// through a broadcast barrier, so `rayon::current_num_threads()` describes an
+/// unrelated executor. Letting it choose the SPMD grain has two costs, both
+/// measured on a 32-vCPU/16-core EPYC 9V74:
+///
+/// 1. **A silent cliff.** `RAYON_NUM_THREADS=1` made `output_chunk_len` return
+///    the whole output, so [`crate::decode_spmd::SpmdDecodePools::dispatch_output_rows`]
+///    took its serial short-circuit and ran every projection on the dispatcher
+///    thread while 15 SPMD workers sat spinning: 2.82 ms/token to 39.97 ms/token
+///    (14.2x) on the `qwen` int4 decode loop, with the pool fully built.
+/// 2. **A pool nobody asked for.** `rayon::current_num_threads()` *builds* the
+///    global pool, so a decode that never touches Rayon still paid for
+///    `available_parallelism()` worth of threads: 49 process threads for a
+///    16-core budget (15 SPMD workers plus 32 global Rayon workers plus main).
+///
+/// Sizing the SPMD grain from `total_workers` fixes both: the partition matches
+/// the executor that will actually run it, and the decode path stops
+/// constructing a Rayon pool it never dispatches to.
+pub(crate) fn output_chunk_len_for(threads: usize, n: usize, k: usize) -> usize {
     let total_work = n.saturating_mul(k);
     // Small projections amortize Rayon well on one socket, but dispatching each
     // one across a larger pool costs more than its GEMV on the dual-socket host.
@@ -9136,6 +10481,135 @@ fn error(message: impl Into<String>) -> EpError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{
+        STATUS_ACCESS_VIOLATION, child_status_detail, is_environmental_access_violation_crash,
+    };
+
+    /// The reassociated `dot_f32` must be at least as accurate as the serial
+    /// chain it replaced, judged against an `f64` reference.
+    ///
+    /// This is the numerics half of the argument for breaking the reduction
+    /// chain. Reassociating an `f32` sum changes the result, so "it is still
+    /// `f32`" is not on its own a sufficient answer -- the question is which
+    /// order is *closer to the exact sum*. A long serial chain is the worst
+    /// case for `f32` accumulation: the running total grows while the addends
+    /// do not, so each new term is added at a progressively worse exponent and
+    /// error accumulates linearly in `k`. Sixteen accumulators each carry
+    /// `k/16` terms and are combined at the end, which is a shallow pairwise
+    /// tree and errs sublinearly.
+    ///
+    /// The shapes here are the ones where this bites: long `k`, same-sign
+    /// terms, so cancellation cannot mask the drift.
+    /// Pins `int4_zero_point` bit-identical to the generic
+    /// `NBitsLayout::zero_point` it specialises.
+    ///
+    /// The specialisation exists to delete two runtime integer divisions from
+    /// an epilogue that runs once per `(block, column)`; the divisions come
+    /// from `bits` being opaque across the kernels' `#[target_feature]`
+    /// boundary. That is a pure code-generation change and must not move a
+    /// single result bit, because it feeds the exact-accuracy acc0 route
+    /// (#1676), whose whole contract is agreeing with the scalar reference
+    /// exactly. A one-nibble divergence here would be an accuracy regression
+    /// disguised as an optimisation.
+    ///
+    /// Both zero-point states and every nibble position are covered: the packed
+    /// byte holds two blocks, so an off-by-one in the shift or the index swaps
+    /// even and odd blocks -- which a run of equal zero points would hide, hence
+    /// the distinct per-nibble values.
+    #[test]
+    fn int4_zero_point_matches_the_generic_layout() {
+        let layout = NBitsLayout {
+            bits: 4,
+            block_size: 32,
+        };
+        // Distinct low/high nibbles per byte, so even and odd blocks can never
+        // be confused for one another.
+        let packed: Vec<u8> = (0u8..64)
+            .map(|i| (i.wrapping_mul(7) & 0x0f) | ((i.wrapping_mul(11) & 0x0f) << 4))
+            .collect();
+
+        for block in 0..packed.len() * 2 {
+            assert_eq!(
+                int4_zero_point(Some(&packed), block),
+                layout.zero_point(Some(&packed), block),
+                "block {block}: specialised int4 decode diverged from the generic layout"
+            );
+        }
+
+        // The absent-zero-point default must also match, at every block, and be
+        // the int4 midpoint rather than whatever the last `Some` returned.
+        for block in 0..8 {
+            assert_eq!(int4_zero_point(None, block), layout.zero_point(None, block));
+            assert_eq!(int4_zero_point(None, block), 8);
+        }
+    }
+
+    #[test]
+    fn reassociated_dot_is_at_least_as_accurate_as_the_serial_chain() {
+        fn serial(a: &[f32], b: &[f32]) -> f32 {
+            a.iter().zip(b).map(|(&x, &y)| x * y).sum()
+        }
+        fn exact(a: &[f32], b: &[f32]) -> f64 {
+            a.iter()
+                .zip(b)
+                .map(|(&x, &y)| f64::from(x) * f64::from(y))
+                .sum()
+        }
+
+        for &k in &[1024usize, 4096, 14336] {
+            // Deterministic, all-positive, and deliberately spread across
+            // exponents so the serial chain's growing-accumulator problem is
+            // visible rather than incidental.
+            let mut state = 0x9E3779B97F4A7C15u64;
+            let mut next = || {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                ((state >> 40) as f32 / (1u64 << 24) as f32) + 0.5
+            };
+            let a: Vec<f32> = (0..k).map(|_| next()).collect();
+            let b: Vec<f32> = (0..k).map(|_| next()).collect();
+
+            let reference = exact(&a, &b);
+            let serial_err = (f64::from(serial(&a, &b)) - reference).abs();
+            let reassociated_err = (f64::from(dot_f32(&a, &b)) - reference).abs();
+
+            assert!(
+                reassociated_err <= serial_err,
+                "k={k}: reassociated dot is less accurate than the serial chain \
+                 ({reassociated_err:e} vs {serial_err:e} absolute error against \
+                 an f64 reference)"
+            );
+            // Guard against the test passing vacuously on a k where both orders
+            // happen to be exact.
+            assert!(
+                reference.abs() > 0.0,
+                "k={k}: degenerate reference, the comparison proves nothing"
+            );
+        }
+    }
+
+    /// `dot_f32` must agree with the scalar definition on tails and edges.
+    ///
+    /// The 16-lane body plus scalar tail has an obvious failure mode -- losing
+    /// or double-counting the `k % 16` remainder -- that a large-`k` accuracy
+    /// test would hide inside its tolerance. These lengths bracket the lane
+    /// width from every side, including empty.
+    #[test]
+    fn reassociated_dot_handles_every_tail_length() {
+        for k in [0usize, 1, 2, 15, 16, 17, 31, 32, 33, 47, 63, 64, 65] {
+            let a: Vec<f32> = (0..k).map(|i| (i as f32) * 0.25 + 1.0).collect();
+            let b: Vec<f32> = (0..k).map(|i| 2.0 - (i as f32) * 0.125).collect();
+            let reference: f64 = a
+                .iter()
+                .zip(&b)
+                .map(|(&x, &y)| f64::from(x) * f64::from(y))
+                .sum();
+            let got = f64::from(dot_f32(&a, &b));
+            assert!(
+                (got - reference).abs() <= reference.abs() * 1e-6 + 1e-6,
+                "k={k}: dot_f32 gave {got}, expected {reference}"
+            );
+        }
+    }
 
     /// Take the dispatch-probe lock for the duration of a test that reads or
     /// perturbs a `*_TEST_CALLS` counter. See `DISPATCH_PROBE_LOCK`.
@@ -9158,10 +10632,125 @@ mod tests {
     /// can move a probe counter -- directly, or through a helper that does --
     /// to take the lock. It is pure text analysis, so it holds on every target
     /// including the aarch64 lanes this host cannot execute.
+    ///
+    /// `borrowed_int4_prefill_block_enabled` is in the list for the same
+    /// reason even though it moves no counter: it reads process-global env,
+    /// and a test that pins the int4 prefill route while another test flips
+    /// `ONNX_GENAI_CPU_MM_INT4_PREFILL` reads whichever won the race.
     #[test]
     fn every_probe_perturbing_test_takes_the_dispatch_lock() {
         const SOURCE: &str = include_str!("matmul_nbits.rs");
-        const PERTURBS: [&str; 3] = [".execute(", "kai_sdot_matmul_m1(", "try_mlas_sqnbit("];
+        // Entry points that reach a probe counter indirectly, through dispatch
+        // rather than by incrementing one themselves. These cannot be derived
+        // from a `fetch_add` and so are still named by hand.
+        const PERTURBS_INDIRECT: [&str; 3] = [
+            ".execute(",
+            "try_mlas_sqnbit(",
+            "borrowed_int4_prefill_block_enabled(",
+        ];
+
+        // Every production function that increments a probe counter, derived
+        // from the source rather than listed by hand.
+        //
+        // This was a hand-written list, and it was wrong twice in a row: it
+        // named `kai_sdot_matmul_m1` but not `int4_matmul_m1` or
+        // `n16_sdot_matmul_m1`, and when those two were added by hand it still
+        // missed `n16_sdot_u8_i16_matmul_m1` -- a *second* incrementer of the
+        // same counter, which no substring of the first one matches. Each
+        // omission was invisible because a perturber only matters once
+        // something observes what it perturbs, so the guard stayed green while
+        // the hole stayed open.
+        //
+        // Deriving the set makes that failure mode structural rather than
+        // clerical: a new `fetch_add` on a probe counter joins this list by
+        // existing.
+        let production = SOURCE
+            .split_once("\nmod tests {")
+            .expect("this module defines `mod tests`")
+            .0;
+        let mut derived: Vec<String> = Vec::new();
+        let mut current_fn: Option<String> = None;
+        for line in production.lines() {
+            // Strip modifiers before looking for `fn`. Matching only a bare
+            // `fn ` would be blind to `pub fn`, `unsafe fn`, `const fn` and
+            // friends -- and the SIMD inner kernels next door to the counted
+            // functions (`kai_sdot_matmul_m1_neon_dot`,
+            // `n16_sdot_matmul_m1_neon_dot`, `n16_sdot_u8_i16_matmul_m1_neon_dot`)
+            // are all `unsafe fn`, which makes a counter added inside one of
+            // them the natural next mistake. An unrecognised header does not
+            // merely drop that site: it charges it to whatever function was
+            // last seen, which is worse than missing it because the derived
+            // list still looks populated.
+            let mut header = line.trim_start();
+            while let Some(rest) = [
+                "pub(crate) ",
+                "pub(super) ",
+                "pub ",
+                "unsafe ",
+                "async ",
+                "const ",
+                "extern ",
+            ]
+            .iter()
+            .find_map(|kw| header.strip_prefix(kw))
+            {
+                header = rest;
+            }
+            if let Some(rest) = header.strip_prefix("fn ") {
+                current_fn = Some(
+                    rest.chars()
+                        .take_while(|c| c.is_alphanumeric() || *c == '_')
+                        .collect(),
+                );
+            }
+            let code = line.split_once("//").map_or(line, |(code, _)| code);
+            let increments = code.contains("_TEST_CALLS.fetch_add")
+                || code.contains("_TEST_HITS.fetch_add")
+                || code.contains("_TEST_DISPATCHES.fetch_add");
+            if increments {
+                let name = current_fn.as_ref().expect(
+                    "a probe counter is incremented before any recognised `fn` header, so the \
+                     header parser is broken and every attribution below it is charged to the \
+                     wrong function",
+                );
+                let pattern = format!("{name}(");
+                if !derived.contains(&pattern) {
+                    derived.push(pattern);
+                }
+            }
+        }
+        // Pin the whole set, not a floor. "At least N" tolerates exactly the
+        // failure this derivation exists to prevent: one site misattributed to
+        // a neighbouring function keeps the count intact while silently
+        // guarding the wrong name. If this list needs editing, a probe counter
+        // moved -- check that whatever observes it still locks.
+        let mut expected: Vec<String> = [
+            "execute(",
+            "try_int8_prefill_gebp(",
+            "try_mlas_sqnbit(",
+            "with_decode_pool_lazy(",
+            "parallel_output_rows_repeated(",
+            "int4_matmul_m1(",
+            "kai_sdot_matmul_m1(",
+            "n16_sdot_matmul_m1(",
+            "n16_sdot_u8_i16_matmul_m1(",
+        ]
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect();
+        expected.sort();
+        let mut found = derived.clone();
+        found.sort();
+        assert_eq!(
+            found, expected,
+            "the set of functions incrementing a dispatch-probe counter changed; each one must \
+             stay reachable-checked, so update this list deliberately rather than loosening it"
+        );
+        let perturb_patterns: Vec<&str> = PERTURBS_INDIRECT
+            .iter()
+            .copied()
+            .chain(derived.iter().map(String::as_str))
+            .collect();
 
         // (name, is_test, body) for every fn declared in the tests module.
         let tests_module = SOURCE
@@ -9218,7 +10807,28 @@ mod tests {
             .map(|(name, is_test, body)| (name.clone(), *is_test, code_of(body)))
             .collect();
 
-        let perturbs = |body: &str| PERTURBS.iter().any(|pattern| body.contains(pattern));
+        // A body perturbs a counter if it calls something that moves one, or
+        // if it moves one itself. The call-based half alone would miss a test
+        // that pokes a counter directly instead of going through a dispatch
+        // function -- two such tests exist, and they happen to lock today, so
+        // the gap is latent rather than live. Close it anyway: "happens to be
+        // correct" is what the hand-maintained list was.
+        let touches_counter_directly = |body: &str| {
+            ["_TEST_CALLS", "_TEST_HITS", "_TEST_DISPATCHES"]
+                .iter()
+                .any(|counter| {
+                    body.match_indices(counter).any(|(at, _)| {
+                        let rest = &body[at..];
+                        rest.contains(".fetch_add") || rest.contains(".store(")
+                    })
+                })
+        };
+        let perturbs = |body: &str| {
+            perturb_patterns
+                .iter()
+                .any(|pattern| body.contains(pattern))
+                || touches_counter_directly(body)
+        };
         // Helpers reach counters through helpers too, so close the set rather
         // than looking one level deep -- a two-level chain would otherwise slip
         // through exactly the check that is supposed to prevent it.
@@ -9400,10 +11010,210 @@ mod tests {
             packed_u8_n16_weight: OnceLock::new(),
             packed_kai_qsi8_weight: OnceLock::new(),
             #[cfg(feature = "mlas")]
+            mlas_owned: MlasPackedOwnership::default(),
+            #[cfg(feature = "mlas")]
             mlas_shards: OnceLock::new(),
             #[cfg(feature = "mlas")]
             mlas_packed: OnceLock::new(),
         }
+    }
+
+    /// [`test_kernel`] with `bits = 8`, for tests that need to call a
+    /// bit-width-gated method directly rather than through `dyn Kernel`.
+    #[cfg(target_arch = "x86_64")]
+    fn test_kernel_8bit(k: usize, n: usize, block_size: usize) -> MatMulNBitsKernel {
+        MatMulNBitsKernel {
+            bits: 8,
+            ..test_kernel(k, n, block_size)
+        }
+    }
+
+    /// Reference dequant of a packed int4 weight against `f32` activations, in
+    /// `f64`.
+    ///
+    /// Independent of every production helper on purpose: it reads the ONNX
+    /// nibble layout literally (element `2i` is the low nibble of byte `i`) and
+    /// accumulates in `f64`, so it is a statement about what the operator
+    /// *means* rather than about how any kernel computes it.
+    fn int4_f64_reference(
+        activation: &[f32],
+        packed: &[u8],
+        scales: &[f32],
+        zero_points: Option<&[u8]>,
+        n: usize,
+        k: usize,
+        block_size: usize,
+    ) -> Vec<f64> {
+        let k_blocks = k.div_ceil(block_size);
+        let blob = block_size / 2;
+        let zp_row_bytes = k_blocks.div_ceil(2);
+        let mut out = vec![0.0f64; n];
+        for (column, value) in out.iter_mut().enumerate() {
+            let mut acc = 0.0f64;
+            for block in 0..k_blocks {
+                let scale = scales[column * k_blocks + block] as f64;
+                let zero_point = zero_points.map_or(8u8, |points| {
+                    let byte = points[column * zp_row_bytes + block / 2];
+                    if block.is_multiple_of(2) {
+                        byte & 0x0f
+                    } else {
+                        byte >> 4
+                    }
+                }) as f64;
+                let base = (column * k_blocks + block) * blob;
+                for offset in 0..block_size {
+                    let depth = block * block_size + offset;
+                    if depth >= k {
+                        break;
+                    }
+                    let byte = packed[base + offset / 2];
+                    let quantized = if offset.is_multiple_of(2) {
+                        byte & 0x0f
+                    } else {
+                        byte >> 4
+                    } as f64;
+                    acc += (quantized - zero_point) * scale * activation[depth] as f64;
+                }
+            }
+            *value = acc;
+        }
+        out
+    }
+
+    /// Pin how much accuracy `accuracy_level = 4` actually costs int4 decode,
+    /// measured against an `f64` reading of the operator rather than against
+    /// another kernel.
+    ///
+    /// # Why this is worth a test
+    ///
+    /// `accuracy_level = 4` is a *contract to be less accurate*, so no
+    /// output-comparison test can fail when it drifts: every existing check
+    /// either compares acc4 to itself or uses a tolerance wide enough to admit
+    /// it. That makes its real error a number nobody was tracking. Measuring it
+    /// found that int4 acc4 decode carries ~3e-3 relative error because it
+    /// quantizes activations to **int8**, while 8-bit acc4 decode quantizes to
+    /// **int16** (`gemv_nk_u8_i16`) and lands near 1e-5 -- a ~2 order-of-magnitude
+    /// asymmetry between two routes selected by the same attribute.
+    ///
+    /// The bounds are two-sided on purpose. The upper bound catches a silent
+    /// precision regression. The **lower** bound is what stops this test from
+    /// rotting into a tautology: if int4 acc4 ever becomes as accurate as the
+    /// 8-bit route, this test fails and forces the asymmetry above to be
+    /// re-documented rather than quietly closed. (A packed-nibble int16 kernel
+    /// does now serve this fixture on AVX2-without-VNNI x86 -- see
+    /// `docs/benchmarks/2026-08-21-int4-packed-nibble-avx2.md`, which supersedes
+    /// the earlier `2026-08-20-int4-nibble-i16-negative.md` rejection -- and the
+    /// band below is unchanged by it. The asymmetry is an `accuracy_level = 4`
+    /// property, not a property of any one kernel: int8 activation quantization
+    /// is what costs the accuracy, and every route here makes it.)
+    ///
+    /// # Scope
+    ///
+    /// `supports_int4_direct` requires `!has_zero_points` on x86_64 and this
+    /// fixture quantizes asymmetrically, so no x86 host takes the int4-direct
+    /// route and the result is identical across the whole Scalar/AVX2/VNNI
+    /// ladder. Which route *does* serve it depends on the host: an AVX2 host
+    /// without VNNI takes the packed-nibble kernel (`int4_nibble`), and every
+    /// other x86 host the int8-activation route (`prepack_int8_weight` ->
+    /// `int8_matmul`). Both quantize the activation to int8 per block, which is
+    /// where the band comes from, so the number below is a property of
+    /// `accuracy_level = 4` rather than of either kernel. Non-Apple aarch64
+    /// defaults `ONNX_GENAI_CPU_ARM64_INT4_DIRECT` on and routes
+    /// `accuracy_level = 4` to `kai_sdot_matmul_m1`, a different quantisation
+    /// scheme. That route has now been measured against this fixture and lands
+    /// at `2.839095278992024e-3` -- inside the band, and bit-identical on
+    /// Windows ARM64 (from the `Rust (Windows ARM64)` job log) and on Apple
+    /// aarch64 with `ONNX_GENAI_CPU_ARM64_INT4_DIRECT=1`. So the band is
+    /// asserted on both routes and the message names which one it measured.
+    ///
+    /// This previously asserted that the kai_sdot route was *not* taken, which
+    /// was a guaranteed failure on `Rust (Windows ARM64)` -- that job runs
+    /// these tests on exactly the default that selects it. The intent was right
+    /// (do not pin a number nobody measured); the resolution is to measure it.
+    #[test]
+    fn accuracy4_int4_decode_error_envelope_is_pinned_against_f64() {
+        let _probe = lock_dispatch_probe();
+        let (k, n, block_size) = (1024usize, 128usize, 32usize);
+        let weights: Vec<f32> = (0..n * k)
+            .map(|i| ((i * 2654435761usize) % 1000) as f32 / 500.0 - 1.0)
+            .collect();
+        let activations: Vec<f32> = (0..k)
+            .map(|i| ((i * 40503usize) % 1000) as f32 / 500.0 - 1.0)
+            .collect();
+        let (packed, scales, zero_points, _) = quantize(&weights, n, k, block_size, true);
+        let blocks = k.div_ceil(block_size);
+        let reference = int4_f64_reference(
+            &activations,
+            &packed,
+            &scales,
+            zero_points.as_deref(),
+            n,
+            k,
+            block_size,
+        );
+        let magnitude = reference.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+        assert!(magnitude > 1.0, "reference is degenerate: {magnitude}");
+
+        let mut errors = Vec::new();
+        let mut reduced_took_kai_sdot = false;
+        for accuracy_level in [0i64, 4] {
+            let mut kernel = MatMulNBitsKernel {
+                accuracy_level,
+                ..test_kernel(k, n, block_size)
+            };
+            kernel.set_constant_inputs(&[false, true, true, true]);
+            let a = Owned::f32(&[1, k], &activations);
+            let b = Owned::u8(&[n, blocks, block_size / 2], &packed);
+            let scales_t = Owned::f32(&[n, blocks], &scales);
+            let zp = zero_points
+                .as_ref()
+                .map(|z| Owned::u8(&[n, blocks.div_ceil(2)], z))
+                .expect("asymmetric quantize emits zero points");
+            let mut y = Owned::zeros_f32(&[1, n]);
+            let kai_before = KAI_SDOT_M1_TEST_CALLS.load(Ordering::Relaxed);
+            kernel
+                .execute(
+                    &[a.view(), b.view(), scales_t.view(), zp.view()],
+                    &mut [y.view_mut()],
+                )
+                .unwrap();
+            if accuracy_level == 4 {
+                reduced_took_kai_sdot = KAI_SDOT_M1_TEST_CALLS.load(Ordering::Relaxed) > kai_before;
+            }
+            let error = y
+                .to_f32()
+                .iter()
+                .zip(&reference)
+                .map(|(actual, want)| (*actual as f64 - want).abs())
+                .fold(0.0, f64::max)
+                / magnitude;
+            errors.push(error);
+        }
+        let (exact, reduced) = (errors[0], errors[1]);
+        assert!(
+            exact < 1e-5,
+            "accuracy_level 0 promises exact fp32 activations; relative error \
+             {exact:e} is too large to be rounding",
+        );
+        assert!(
+            reduced > 10.0 * exact,
+            "accuracy_level 4 must be measurably less accurate than level 0, \
+             otherwise this test is not measuring the trade it claims to \
+             (level0={exact:e}, level4={reduced:e})",
+        );
+        let route = if reduced_took_kai_sdot {
+            "aarch64 kai_sdot direct"
+        } else {
+            "int8-activation (prepack_int8_weight -> int8_matmul)"
+        };
+        assert!(
+            (1e-4..1e-2).contains(&reduced),
+            "int4 accuracy_level 4 relative error {reduced:e} left its pinned \
+             band on the {route} route; it quantizes activations to int8 \
+             (~3e-3). Below the band means the int8/int16 asymmetry with the \
+             8-bit route closed and the docs need updating; above means a \
+             precision regression",
+        );
     }
 
     fn accuracy4_kernel(k: usize, n: usize, block_size: usize) -> MatMulNBitsKernel {
@@ -9824,6 +11634,229 @@ mod tests {
         (packed, scales, asymmetric.then_some(zps), dequantized)
     }
 
+    /// #1104 shipped the register-blocked int4 decode kernel behind a
+    /// default-*off* env toggle, and nothing in the suite asserted which route
+    /// `accuracy_level = 0` actually took. The kernel therefore sat unused in
+    /// the tree while the production default kept paying the per-block
+    /// horizontal reduction it was written to remove. Every parity test still
+    /// passed, because they all call the kernel directly.
+    ///
+    /// This asserts the *route*, not the arithmetic: a plain decode-shaped
+    /// `accuracy_level = 0` call must land in the N-blocked kernel. Flipping
+    /// the default back off fails this test.
+    ///
+    /// Excluded under `feature = "mlas"`, where `mlas_sqnbit_owns_fp32_compute`
+    /// legitimately claims `accuracy_level = 0` before the borrowed guard is
+    /// reached, so the borrowed route is *correctly* not taken. The shipped
+    /// default artifact links no MLAS, which is the configuration this asserts.
+    #[cfg(all(target_arch = "x86_64", not(feature = "mlas")))]
+    #[test]
+    fn acc0_decode_reaches_the_nblocked_kernel_by_default() {
+        if matches!(selected_dot_kernel(), DotKernel::Scalar) {
+            return;
+        }
+        // Reads a process-global counter delta, so it must not be handed
+        // another test's dispatch.
+        let _probe = lock_dispatch_probe();
+        let (k, n, block_size) = (128usize, 8usize, 32usize);
+        let a_values: Vec<f32> = (0..k).map(|i| ((i % 13) as f32 - 6.0) / 7.0).collect();
+        let weights: Vec<f32> = (0..n * k)
+            .map(|i| ((i * 23 % 47) as f32 - 19.0) / 12.0)
+            .collect();
+        let (packed, scales, _, _) = quantize(&weights, n, k, block_size, false);
+        let dequantized = dequantize_reference(&packed, &scales, None, n, k, block_size);
+        let mut kernel = test_kernel(k, n, block_size);
+        kernel.set_constant_inputs(&[false, true, true]);
+
+        let a = Owned::f32(&[1, k], &a_values);
+        let b = Owned::u8(&[n, k / block_size, block_size / 2], &packed);
+        let scales_t = Owned::f32(&[n, k / block_size], &scales);
+        let mut y = Owned::zeros_f32(&[1, n]);
+        let before = BORROWED_INT4_NBLOCK_TEST_CALLS.load(Ordering::Relaxed);
+        kernel
+            .execute(&[a.view(), b.view(), scales_t.view()], &mut [y.view_mut()])
+            .unwrap();
+
+        assert_close(&y.to_f32(), &reference(&a_values, &dequantized, 1, k, n));
+        assert!(
+            BORROWED_INT4_NBLOCK_TEST_CALLS.load(Ordering::Relaxed) > before,
+            "accuracy_level=0 int4 decode must reach the register-blocked kernel \
+             by default; it is 1.48x the per-column path at block 32"
+        );
+    }
+
+    /// The N-blocked kernel becomes the `accuracy_level = 0` default, so
+    /// "matches the old path within 1e-3" is not a strong enough contract: it
+    /// would let a *less* accurate kernel ship as long as it stayed close to
+    /// the one it replaced. This measures both against an f64 reference.
+    ///
+    /// I expected the replacement to be *at least as accurate*. It is not, and
+    /// the guard below is sized to the measurement rather than to the hope.
+    /// Worst observed relative error, over the cases below:
+    ///
+    /// | case | per-column | N-blocked |
+    /// |---|---|---|
+    /// | k=4096 bs=32 asym | 6.739e-6 | 2.422e-5 |
+    /// | k=256 bs=32 asym | 1.676e-6 | 6.197e-6 |
+    /// | k=512 bs=32 sym gain=1024 | 2.899e-5 | 3.983e-5 |
+    /// | k=1024 bs=128 sym gain=256 | 1.186e-6 | 1.186e-6 |
+    ///
+    /// N-blocked is up to **3.70x** worse in relative terms. That is the
+    /// separated correction described below, and it is a real (if small) cost
+    /// of the 1.48x. It stays at 2.4e-5 worst case — two orders inside the
+    /// 1e-3 the borrowed-path parity tests already accept for this route, and
+    /// the `accuracy_level = 0` contract itself is preserved exactly: both
+    /// paths are pure f32 FMA over f32 activations, and neither is ever
+    /// diverted through an int8/int16 kernel.
+    ///
+    /// The two differ structurally, not just by reassociation. The per-column
+    /// path forms `(dot - actsum*zp) * scale` per block and accumulates that
+    /// in one serial f32 chain. The N-blocked path accumulates `sum(dot*scale)`
+    /// and `sum(actsum*zp*scale)` separately and subtracts once at the end,
+    /// which is where catastrophic cancellation would show up if it were a
+    /// problem: with unsigned nibbles `0..=15` and the symmetric midpoint 8,
+    /// those two running sums are of comparable magnitude and the answer is
+    /// their difference. The `hostile` case below is built to maximise exactly
+    /// that cancellation (large activations, near-midpoint quantised weights),
+    /// so the comparison is made where the separated form is weakest.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn nblock_holds_the_f32_contract_against_f64() {
+        if matches!(selected_dot_kernel(), DotKernel::Scalar) {
+            return;
+        }
+        let mut rng: u64 = 0xD1B54A32D192ED03;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            ((rng >> 40) as f32 / (1u32 << 24) as f32) - 0.5
+        };
+        // (m, k, n, block_size, activation_gain, hostile)
+        let cases: &[(usize, usize, usize, usize, f32, bool)] = &[
+            (1, 4096, 8, 32, 1.0, false),
+            (1, 4096, 8, 32, 1.0, true),
+            (1, 2048, 12, 64, 64.0, true),
+            (1, 1024, 5, 128, 1.0, false),
+            (1, 1024, 5, 128, 256.0, true),
+            (1, 512, 4, 32, 1024.0, true),
+            (2, 256, 9, 32, 1.0, false),
+            // Shapes that reach the kernel's scalar fallback: `k` not a
+            // multiple of `block_size` gives a ragged tail block, and
+            // `block_size = 16` (the one legal size that is not a multiple of
+            // 32) sends every block down it. The fallback accumulates into the
+            // same `extra`/`correction` pair as the vector path, so its
+            // cancellation behaviour belongs under this contract too -- every
+            // case above divides evenly and left it unmeasured.
+            (1, 1000, 7, 32, 1.0, true),
+            (1, 1024, 6, 16, 1.0, true),
+            (1, 1000, 5, 128, 256.0, true),
+        ];
+        for &(m, k, n, block_size, gain, hostile) in cases {
+            for &asymmetric in &[false, true] {
+                // A hostile case pins the quantised weights near the midpoint
+                // so `dot` and the zero-point correction nearly cancel.
+                let weights_nk: Vec<f32> = (0..n * k)
+                    .map(|_| if hostile { next() * 0.002 } else { next() })
+                    .collect();
+                let activations: Vec<f32> = (0..m * k).map(|_| next() * gain).collect();
+                let (packed, scales, zps, _dq) =
+                    quantize(&weights_nk, n, k, block_size, asymmetric);
+                let zp_slice = zps.as_deref();
+                let bias: Vec<f32> = (0..n).map(|_| next()).collect();
+                let layout = NBitsLayout {
+                    bits: 4,
+                    block_size,
+                };
+                let blocks = k.div_ceil(block_size);
+                let blob = layout.packed_block_size();
+
+                // f64 reference over the exact affine dequantisation contract.
+                let mut reference = vec![0.0f64; m * n];
+                for row in 0..m {
+                    for col in 0..n {
+                        let mut acc = bias[col] as f64;
+                        for block in 0..blocks {
+                            let scale = scales[col * blocks + block] as f64;
+                            let zp = layout.zero_point(
+                                zp_slice.map(|z| {
+                                    &z[col * layout.zero_point_row_size(blocks)
+                                        ..(col + 1) * layout.zero_point_row_size(blocks)]
+                                }),
+                                block,
+                            ) as f64;
+                            let start = block * block_size;
+                            let valid = k.saturating_sub(start).min(block_size);
+                            for j in 0..valid {
+                                let byte = packed[(col * blocks + block) * blob + j / 2];
+                                let q = if j % 2 == 0 { byte & 0x0f } else { byte >> 4 } as f64;
+                                acc += activations[row * k + start + j] as f64 * (q - zp) * scale;
+                            }
+                        }
+                        reference[row * n + col] = acc;
+                    }
+                }
+
+                let mut per_column = vec![0.0f32; m * n];
+                borrowed_affine_int4_matmul(
+                    &activations,
+                    &packed,
+                    BorrowedScales::F32(&scales),
+                    zp_slice,
+                    Some(&bias),
+                    &mut per_column,
+                    m,
+                    k,
+                    n,
+                    block_size,
+                    selected_dot_kernel(),
+                );
+                let mut nblocked = vec![0.0f32; m * n];
+                borrowed_affine_int4_matmul_nblock(
+                    &activations,
+                    &packed,
+                    BorrowedScales::F32(&scales),
+                    zp_slice,
+                    Some(&bias),
+                    &mut nblocked,
+                    m,
+                    k,
+                    n,
+                    block_size,
+                );
+
+                let err = |got: &[f32]| -> f64 {
+                    got.iter()
+                        .zip(reference.iter())
+                        .map(|(g, r)| {
+                            let scale = r.abs().max(1e-6);
+                            ((*g as f64) - r).abs() / scale
+                        })
+                        .fold(0.0f64, f64::max)
+                };
+                let (e_col, e_nbl) = (err(&per_column), err(&nblocked));
+                // Regression bound, not an equality claim: the measured
+                // worst ratio is 3.70x, and this fires if the separated
+                // correction ever degrades materially past that. Set at 8x so
+                // an AVX-512 host — where the per-column path uses the 512-bit
+                // block dot and so has its own error profile, while N-blocked
+                // is AVX2-only — does not trip it spuriously.
+                assert!(
+                    e_nbl <= e_col.max(1e-6) * 8.0,
+                    "m={m} k={k} n={n} block={block_size} asym={asymmetric} \
+                     gain={gain} hostile={hostile}: n-blocked rel err {e_nbl:e} \
+                     regressed past 8x per-column {e_col:e}"
+                );
+                assert!(
+                    e_nbl < 1e-3,
+                    "m={m} k={k} n={n} block={block_size} asym={asymmetric} \
+                     gain={gain} hostile={hostile}: n-blocked rel err {e_nbl:e} \
+                     exceeds the f32 contract"
+                );
+            }
+        }
+    }
+
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn nblock_matches_per_column_borrowed_path() {
@@ -9848,6 +11881,17 @@ mod tests {
             (1, 128, 8, 32),
             (2, 64, 7, 32),
             (1, 256, 16, 128),
+            // Ragged tail blocks (`k` not a multiple of `block_size`) and a
+            // block size that is not a multiple of 32. Both send whole blocks
+            // down the kernel's scalar fallback, which contributes to the same
+            // running zero-point correction as the vector path -- so a change
+            // that reorganises that correction has to keep the two branches
+            // agreeing. Every case above divides evenly, which left the
+            // fallback's share of the correction unexercised.
+            (1, 100, 9, 32),
+            (2, 72, 6, 32),
+            (1, 200, 7, 128),
+            (1, 80, 5, 16),
         ] {
             for &asymmetric in &[false, true] {
                 let weights_nk: Vec<f32> = (0..n * k).map(|_| next()).collect();
@@ -9898,15 +11942,32 @@ mod tests {
         }
     }
 
-    /// The structural prefill kernel must be *byte-identical* to the row-serial
-    /// per-column path, not merely close: it only changes the fork-join
-    /// structure and hoists the activation-sum allocation, computing each
-    /// element with the same `borrowed_int4_output_element` reduction (issue
-    /// #1117). Covers single-row (`m == 1`), multi-row, and an odd `m` for
-    /// symmetric and asymmetric int4 and an `N` that is not a multiple of 4.
+    /// The structural prefill kernel agrees with the row-serial per-column path
+    /// to within f32 reassociation, and is at least as accurate.
+    ///
+    /// This assertion used to be byte-identity, and was, for as long as the
+    /// prefill path differed from the row-serial one only in its fork-join
+    /// structure. Row blocking (#1435) ends that: the per-element path
+    /// horizontally reduces every 32-lane block and accumulates the scalar,
+    /// while [`borrowed_int4_rowblock_avx2`] keeps a lanewise `ymm`
+    /// accumulator across all blocks and reduces once at the end — the same
+    /// trade [`borrowed_int4_nblock4_avx2`] already documents. The nibble
+    /// decode is untouched, so the paths differ by a couple of ULP of f32
+    /// summation order and nothing else.
+    ///
+    /// Byte-identity still holds where it is load-bearing, and is asserted
+    /// elsewhere: across fan-out partitions
+    /// (`prefill_column_fan_out_matches_its_serial_self`), across row-tile
+    /// boundaries (`prefill_is_independent_of_the_row_tiling`), and against the
+    /// `NCols4` kernel for a single row
+    /// (`rowblock_matches_nblock_for_a_single_row`).
+    ///
+    /// Covers single-row (`m == 1`), multi-row, odd `m`, a `k` that leaves a
+    /// ragged tail block, symmetric and asymmetric int4, and an `N` that is not
+    /// a multiple of 4.
     #[cfg(target_arch = "x86_64")]
     #[test]
-    fn prefill_matches_per_column_borrowed_path_bit_identical() {
+    fn prefill_matches_per_column_borrowed_path_within_reassociation() {
         if matches!(selected_dot_kernel(), DotKernel::Scalar) {
             // No AVX2 on this host; the structural prefill path is never selected.
             return;
@@ -9919,18 +11980,21 @@ mod tests {
             ((rng >> 40) as f32 / (1u32 << 24) as f32) - 0.5
         };
         // `m` values below exercise a single row, several full-strip rows, and
-        // odd row counts so no dimension assumption sneaks in.
+        // odd row counts so no dimension assumption sneaks in. `m` of 5 and 6
+        // also straddle `PREFILL_ROW_BLOCK`, so the ragged final tile runs.
+        // `(7, 100, 9, 32)` leaves `k % block_size == 4`, the ragged tail block.
         for &(m, k, n, block_size) in &[
             (1usize, 96usize, 13usize, 32usize),
             (5, 128, 8, 32),
             (6, 64, 7, 32),
             (8, 256, 16, 128),
             (3, 96, 5, 32),
+            (7, 100, 9, 32),
         ] {
             for &asymmetric in &[false, true] {
                 let weights_nk: Vec<f32> = (0..n * k).map(|_| next()).collect();
                 let activations: Vec<f32> = (0..m * k).map(|_| next()).collect();
-                let (packed, scales, zps, _dequant) =
+                let (packed, scales, zps, dequant) =
                     quantize(&weights_nk, n, k, block_size, asymmetric);
                 let zp_slice = zps.as_deref();
                 let bias: Vec<f32> = (0..n).map(|_| next()).collect();
@@ -9965,15 +12029,249 @@ mod tests {
                     selected_dot_kernel(),
                 );
 
-                for (index, (a, b)) in expected.iter().zip(got.iter()).enumerate() {
+                // f64 oracle over the *dequantized* weights: the exact value
+                // both f32 paths are approximating, so "which one reassociates
+                // better" is a question with an answer rather than a matter of
+                // taste.
+                //
+                // Errors are normalised by `sum |a| * |w|`, not by the result.
+                // These dot products cancel heavily — a `k = 256` cell here
+                // sums terms of order 0.25 down to a result of order 0.005 —
+                // so dividing by the result measures the conditioning of the
+                // test data rather than the quality of the kernel. Dividing by
+                // the magnitude of the summands is the standard backward-error
+                // normalisation and is the quantity f32 summation order can
+                // actually be held to.
+                let mut serial_error = 0.0f64;
+                let mut blocked_error = 0.0f64;
+                let mut agreement = 0.0f64;
+                for row in 0..m {
+                    for column in 0..n {
+                        let mut reference = bias[column] as f64;
+                        let mut magnitude = (bias[column] as f64).abs();
+                        for depth in 0..k {
+                            let a = activations[row * k + depth] as f64;
+                            let w = dequant[column * k + depth] as f64;
+                            reference += a * w;
+                            magnitude += (a * w).abs();
+                        }
+                        let index = row * n + column;
+                        let magnitude = magnitude.max(1e-12);
+                        serial_error = serial_error
+                            .max((expected[index] as f64 - reference).abs() / magnitude);
+                        blocked_error =
+                            blocked_error.max((got[index] as f64 - reference).abs() / magnitude);
+                        agreement = agreement
+                            .max((expected[index] as f64 - got[index] as f64).abs() / magnitude);
+                    }
+                }
+                assert!(
+                    agreement < 1e-5,
+                    "m={m} k={k} n={n} block={block_size} asym={asymmetric}: the per-column \
+                     and blocked prefill paths disagree by {agreement} of the summand \
+                     magnitude, which is far more than f32 reassociation"
+                );
+                assert!(
+                    blocked_error <= serial_error * 4.0 + 1e-9,
+                    "m={m} k={k} n={n} block={block_size} asym={asymmetric}: the blocked \
+                     prefill's error against the f64 oracle ({blocked_error}) is materially \
+                     worse than the row-serial path's ({serial_error}); row blocking is \
+                     supposed to reassociate, not to lose accuracy"
+                );
+            }
+        }
+    }
+
+    /// A row's value must not depend on which tile it landed in.
+    ///
+    /// This is the invariant row blocking has to hold and the one a future
+    /// change to [`PREFILL_ROW_BLOCK`] would most plausibly break. Each row
+    /// carries its own `blk`/`acc` pair and walks the blocks in the same order
+    /// whatever the tile width, so the guarantee is *byte*-identity, not
+    /// tolerance: computing rows one at a time must reproduce the batched
+    /// result exactly.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn prefill_is_independent_of_the_row_tiling() {
+        if matches!(selected_dot_kernel(), DotKernel::Scalar) {
+            return;
+        }
+        let mut rng: u64 = 0x13198A2E03707344;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            ((rng >> 40) as f32 / (1u32 << 24) as f32) - 0.5
+        };
+        // 9 rows is more than two full tiles plus a remainder at
+        // `PREFILL_ROW_BLOCK == 4`, so rows land at every offset within a tile.
+        let (m, k, n, block_size) = (9usize, 128usize, 11usize, 32usize);
+        for &asymmetric in &[false, true] {
+            let weights_nk: Vec<f32> = (0..n * k).map(|_| next()).collect();
+            let activations: Vec<f32> = (0..m * k).map(|_| next()).collect();
+            let (packed, scales, zps, _dequant) =
+                quantize(&weights_nk, n, k, block_size, asymmetric);
+            let zp_slice = zps.as_deref();
+            let bias: Vec<f32> = (0..n).map(|_| next()).collect();
+
+            let mut batched = vec![0.0f32; m * n];
+            borrowed_affine_int4_matmul_prefill(
+                &activations,
+                &packed,
+                BorrowedScales::F32(&scales),
+                zp_slice,
+                Some(&bias),
+                &mut batched,
+                m,
+                k,
+                n,
+                block_size,
+                selected_dot_kernel(),
+            );
+
+            for row in 0..m {
+                // `m == 1` here, so this row is a tile of width one.
+                let mut alone = vec![0.0f32; n];
+                borrowed_affine_int4_matmul_prefill(
+                    &activations[row * k..(row + 1) * k],
+                    &packed,
+                    BorrowedScales::F32(&scales),
+                    zp_slice,
+                    Some(&bias),
+                    &mut alone,
+                    1,
+                    k,
+                    n,
+                    block_size,
+                    selected_dot_kernel(),
+                );
+                for column in 0..n {
                     assert_eq!(
-                        a.to_bits(),
-                        b.to_bits(),
-                        "m={m} k={k} n={n} block={block_size} asym={asymmetric} \
-                         index {index}: per-column {a} vs prefill {b} not bit-identical"
+                        batched[row * n + column].to_bits(),
+                        alone[column].to_bits(),
+                        "asym={asymmetric} row {row} column {column}: batched {} vs \
+                         single-row {} — a row's value depends on its tile",
+                        batched[row * n + column],
+                        alone[column]
                     );
                 }
             }
+        }
+    }
+
+    /// A one-row tile must reproduce the `NCols4` kernel exactly.
+    ///
+    /// [`borrowed_int4_rowblock_avx2`]'s documentation claims it is
+    /// instruction-for-instruction the single-column case of
+    /// [`borrowed_int4_nblock4_avx2`] within a row. That claim is what licenses
+    /// reusing the latter's numerics rationale, so it is asserted rather than
+    /// asserted-by-comment: same unpack, same `blk`, same scale fold, same
+    /// affine correction, same final reduction, therefore the same bits.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn rowblock_matches_nblock_for_a_single_row() {
+        if matches!(selected_dot_kernel(), DotKernel::Scalar) {
+            return;
+        }
+        let mut rng: u64 = 0xA4093822299F31D0;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            ((rng >> 40) as f32 / (1u32 << 24) as f32) - 0.5
+        };
+        for &(k, block_size) in &[(128usize, 32usize), (256, 128), (100, 32)] {
+            for &asymmetric in &[false, true] {
+                let n = 1usize;
+                let weights_nk: Vec<f32> = (0..n * k).map(|_| next()).collect();
+                let activation: Vec<f32> = (0..k).map(|_| next()).collect();
+                let (packed, scales, zps, _dequant) =
+                    quantize(&weights_nk, n, k, block_size, asymmetric);
+                let block_count = k.div_ceil(block_size);
+                let layout = NBitsLayout {
+                    bits: 4,
+                    block_size,
+                };
+                let sums: Vec<f32> = activation
+                    .chunks(block_size)
+                    .map(|block| block.iter().sum::<f32>())
+                    .collect();
+                let bias = next();
+                let zp_row = zps.as_deref();
+                let borrowed = BorrowedScales::F32(&scales);
+
+                let mut nblock_out = [0.0f32; 1];
+                // SAFETY: guarded by the `selected_dot_kernel` check above, and
+                // every slice is sized from `k`/`block_size`.
+                unsafe {
+                    borrowed_int4_nblock4_avx2(
+                        &activation,
+                        &sums,
+                        &[&packed[..]],
+                        &borrowed,
+                        &[0usize],
+                        &[zp_row],
+                        &[bias],
+                        layout,
+                        block_count,
+                        block_size,
+                        k,
+                        &mut nblock_out[..1],
+                    );
+                }
+
+                let mut rowblock_out = [0.0f32; 1];
+                // SAFETY: as above; `rows == 1` so the tile is one row.
+                unsafe {
+                    borrowed_int4_rowblock_avx2(
+                        &activation,
+                        &sums,
+                        1,
+                        &packed,
+                        &borrowed,
+                        0,
+                        zp_row,
+                        bias,
+                        layout,
+                        block_count,
+                        block_size,
+                        k,
+                        &mut rowblock_out[..1],
+                    );
+                }
+
+                assert_eq!(
+                    nblock_out[0].to_bits(),
+                    rowblock_out[0].to_bits(),
+                    "k={k} block={block_size} asym={asymmetric}: NCols4 {} vs row-blocked {} \
+                     are not bit-identical for a single row",
+                    nblock_out[0],
+                    rowblock_out[0]
+                );
+            }
+        }
+    }
+
+    /// The blocked prefill ships on. It spent its whole life behind a
+    /// default-off toggle "until the win is measured", which meant the code was
+    /// dead in every build anyone actually ran — the exact failure mode that
+    /// hid #1080's f16 fix behind a `mlas` feature gate. Now that it is
+    /// measured, the default is the thing worth pinning.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn the_blocked_int4_prefill_is_on_by_default() {
+        let _guard = lock_dispatch_probe();
+        let mut env = crate::test_support::EnvVarGuard::unset("ONNX_GENAI_CPU_MM_INT4_PREFILL");
+        assert!(
+            borrowed_int4_prefill_block_enabled(),
+            "the blocked int4 prefill must be enabled when the variable is unset"
+        );
+        for value in ["0", "off", "OFF"] {
+            env.set_var("ONNX_GENAI_CPU_MM_INT4_PREFILL", value);
+            assert!(
+                !borrowed_int4_prefill_block_enabled(),
+                "{value:?} must disable the blocked int4 prefill"
+            );
         }
     }
 
@@ -9984,9 +12282,9 @@ mod tests {
     /// pool, cannot change a bit.
     ///
     /// Uses a shape wide enough that the task runtime actually splits it —
-    /// `prefill_matches_per_column_borrowed_path_bit_identical` above covers
-    /// correctness, but its `n <= 16` cells fall under the grain floor and run
-    /// serially, so they never exercise the partition.
+    /// `prefill_matches_per_column_borrowed_path_within_reassociation` above
+    /// covers correctness, but its `n <= 16` cells fall under the grain floor
+    /// and run serially, so they never exercise the partition.
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn prefill_column_fan_out_matches_its_serial_self() {
@@ -10344,6 +12642,182 @@ mod tests {
         y.to_f32()
     }
 
+    /// [`run_decode_case`] with an explicit zero-point tensor.
+    ///
+    /// `run_decode_case` passes `None` for zero points, so a fixture quantized
+    /// asymmetrically silently runs against ONNX's default of 8 and disagrees
+    /// with its own dequantized reference. Anything asserting asymmetric
+    /// numerics has to go through here.
+    fn run_decode_case_zp(
+        activations: &[f32],
+        packed: &[u8],
+        scales: &[f32],
+        zero_points: &[u8],
+        n: usize,
+        block_size: usize,
+        accuracy_level: Option<i64>,
+    ) -> Vec<f32> {
+        let k = activations.len();
+        let blocks = k.div_ceil(block_size);
+        let zero_point_shape = [n * blocks.div_ceil(2)];
+        let (mut graph, node) = model_node(
+            &[1, k],
+            &[n, blocks, block_size / 2],
+            &[n, blocks],
+            Some(&zero_point_shape),
+            &[1, n],
+            k,
+            n,
+            block_size,
+        );
+        if let Some(level) = accuracy_level {
+            graph
+                .node_mut(node)
+                .attributes
+                .insert("accuracy_level".into(), Attribute::Int(level));
+        }
+        let model = Model::new(&graph);
+        let kernel = CpuExecutionProvider::new()
+            .get_kernel(model.graph.node(node), &[], 1)
+            .unwrap();
+        let a = Owned::f32(&[1, k], activations);
+        let b = Owned::u8(&[n, blocks, block_size / 2], packed);
+        let scales = Owned::f32(&[n, blocks], scales);
+        let points = Owned::u8(&zero_point_shape, zero_points);
+        let mut y = Owned::zeros_f32(&[1, n]);
+        kernel
+            .execute(
+                &[a.view(), b.view(), scales.view(), points.view()],
+                &mut [y.view_mut()],
+            )
+            .unwrap();
+        y.to_f32()
+    }
+
+    /// The `m > 1` nibble driver is production-reachable (the gate admits
+    /// `m <= INT4_NIBBLE_MAX_ROWS`), but every route test above uses `m = 1`,
+    /// and the pre-existing multi-row tests all have `k_blocks <= 3` -- so the
+    /// four-block tile, the nested column split and zero points were never
+    /// exercised together off the single-row path. This case does all three at
+    /// once: `k_blocks = 8` (two full tiles), asymmetric zero points, and `n`
+    /// wide enough to make the column split reachable.
+    ///
+    /// It asserts bit-identity with the same rows run one at a time through the
+    /// `m = 1` path, which is the stronger claim available here: both call
+    /// `int4_nibble_row`, and `parallel_columns` only partitions the output
+    /// range, so any per-output difference would be a real defect rather than a
+    /// reassociation. The `m = 1` path is itself pinned against the `f64`
+    /// oracle by `the_packed_nibble_route_stays_inside_the_accuracy_4_envelope`.
+    ///
+    /// The *route* half is derived from the dispatch predicate rather than
+    /// pinned to the nibble route, because `uses_vnni_int4_direct()` refuses
+    /// that route on a VNNI host and GitHub's x86 pools mix generations. The
+    /// bit-identity half is not gated: both drivers resolve the same route as
+    /// each other on any host, so the comparison is meaningful everywhere and
+    /// skipping it would delete the numeric check on the newest hardware.
+    ///
+    /// Scope, stated because bit-identity tests invite overclaiming: comparing
+    /// the two drivers is blind to any defect in the code they share, so this
+    /// covers row dispatch, chunking and the column split *only*. Mutating the
+    /// tile's `hadd` tree (swapping two lanes, so block dots meet the wrong
+    /// scales) leaves it green and is caught by the `f64` envelope test
+    /// instead. Mutating the row chunking (every row reading row 0's
+    /// activation) is caught here and by nothing else.
+    #[test]
+    fn the_packed_nibble_route_agrees_row_by_row_above_one_row() {
+        let _probe = lock_dispatch_probe();
+        if !int4_nibble::supported(32) {
+            return;
+        }
+        let (m, k, n, block_size) = (4usize, 256usize, 96usize, 32usize);
+        let blocks = k / block_size;
+        let packed: Vec<u8> = (0..n * blocks * (block_size / 2))
+            .map(|i| ((i * 2654435761usize) % 251) as u8)
+            .collect();
+        let scales: Vec<f32> = (0..n * blocks)
+            .map(|i| 0.01 + ((i * 40503usize) % 97) as f32 / 4000.0)
+            .collect();
+        let zero_points: Vec<u8> = (0..n * blocks.div_ceil(2))
+            .map(|i| ((i * 2246822519usize) % 253) as u8)
+            .collect();
+        let activations: Vec<f32> = (0..m * k)
+            .map(|i| ((i * 22695477usize) % 1000) as f32 / 500.0 - 1.0)
+            .collect();
+
+        let expected: Vec<f32> = (0..m)
+            .flat_map(|row| {
+                run_decode_case_zp(
+                    &activations[row * k..(row + 1) * k],
+                    &packed,
+                    &scales,
+                    &zero_points,
+                    n,
+                    block_size,
+                    Some(4),
+                )
+            })
+            .collect();
+
+        let zero_point_shape = [n * blocks.div_ceil(2)];
+        let (mut graph, node) = model_node(
+            &[m, k],
+            &[n, blocks, block_size / 2],
+            &[n, blocks],
+            Some(&zero_point_shape),
+            &[m, n],
+            k,
+            n,
+            block_size,
+        );
+        graph
+            .node_mut(node)
+            .attributes
+            .insert("accuracy_level".into(), Attribute::Int(4));
+        let model = Model::new(&graph);
+        let kernel = CpuExecutionProvider::new()
+            .get_kernel(model.graph.node(node), &[], 1)
+            .unwrap();
+        let a = Owned::f32(&[m, k], &activations);
+        let b = Owned::u8(&[n, blocks, block_size / 2], &packed);
+        let s = Owned::f32(&[n, blocks], &scales);
+        let z = Owned::u8(&zero_point_shape, &zero_points);
+        let mut y = Owned::zeros_f32(&[m, n]);
+        reset_int4_routes();
+        kernel
+            .execute(
+                &[a.view(), b.view(), s.view(), z.view()],
+                &mut [y.view_mut()],
+            )
+            .unwrap();
+        // Derived, not pinned. The nibble branch is gated on
+        // `!dot_kernel.uses_vnni_int4_direct()`, so a VNNI host refuses it and
+        // falls to the expanded-int8 route. Asserting `1` unconditionally made
+        // this test pass or fail on the *generation of the runner* that picked
+        // up the job -- see the `half_prefill_gebp` case for the same defect.
+        //
+        // The int4-direct branch is not the alternative here: this fixture has
+        // zero points, and `supports_int4_direct` is false whenever
+        // `has_zero_points`. So both this `m > 1` driver and the `m = 1` rows
+        // it is compared against take the *same* route as each other on any
+        // host, and the bit-identity assertion below stays meaningful
+        // everywhere. Only the route identity varies, so only it is derived.
+        let expects_nibble = !selected_dot_kernel().uses_vnni_int4_direct();
+        let (nibble, _) = int4_routes();
+        assert_eq!(
+            nibble,
+            usize::from(expects_nibble),
+            "the m = {m} case took {nibble} packed-nibble run(s); this host \
+             (VNNI int4-direct: {}) should take {}",
+            !expects_nibble,
+            usize::from(expects_nibble)
+        );
+        assert_eq!(
+            y.to_f32(),
+            expected,
+            "the multi-row driver must agree bit-for-bit with the same rows run singly"
+        );
+    }
+
     fn accuracy4_model(m: usize, k: usize, n: usize, block_size: usize) -> (Graph, NodeId) {
         let blocks = k.div_ceil(block_size);
         let (mut graph, node) = model_node(
@@ -10598,6 +13072,247 @@ mod tests {
         );
     }
 
+    /// The packed-nibble kernel reduces activation precision, so it is gated on
+    /// `accuracy_level = 4` and must be **structurally** unreachable below it.
+    ///
+    /// `accuracy_level` 0 and 1 mean "the implementation's choice" and "fp32"
+    /// respectively; ONNX defines neither as licence to quantize activations to
+    /// int8. This asserts the route counter, not a tolerance, because a
+    /// tolerance would pass for a route that merely happened to be accurate on
+    /// one fixture.
+    ///
+    /// Mutation check: widening the route's `self.accuracy_level == 4` to
+    /// `>= 0`, or deleting the term, fails every `accuracy_level` row here.
+    #[test]
+    fn the_packed_nibble_route_is_unreachable_below_accuracy_4() {
+        let _probe = lock_dispatch_probe();
+        let (k, n, block_size) = (128, 8, 32);
+        let activations: Vec<f32> = (0..k)
+            .map(|i| ((i * 11 % 37) as f32 - 18.0) / 9.0)
+            .collect();
+        let weights: Vec<f32> = (0..n * k)
+            .map(|i| ((i * 13 % 41) as f32 - 20.0) / 11.0)
+            .collect();
+        let (packed, scales, _, _) = quantize(&weights, n, k, block_size, false);
+        for level in [None, Some(0), Some(1), Some(2), Some(3)] {
+            reset_int4_routes();
+            let _ = run_decode_case(&activations, &packed, &scales, n, block_size, level);
+            assert_eq!(
+                int4_routes(),
+                (0, 0),
+                "accuracy_level={level:?} reached an accuracy-4 int4 route"
+            );
+        }
+    }
+
+    /// The route the packed-nibble kernel is supposed to take, taken -- and the
+    /// expanded-`i8` route it replaces, not taken.
+    ///
+    /// Skipped where the host has a direct int4 kernel (VNNI/SDOT), which keeps
+    /// priority and is a different route entirely.
+    ///
+    /// Mutation check: disabling the branch fails the first assertion. Note
+    /// that the route's `int4_nibble::supported(..)` term is *not* mutation-
+    /// testable from here: node validation already rejects a `block_size` that
+    /// is not a power of two or is below 16, so at the route that term is
+    /// load-bearing only for the runtime AVX2 detection, which an AVX2 host
+    /// cannot exercise negatively. The block-size half of `supported` is
+    /// covered directly by `int4_nibble::unsupported_block_sizes_are_refused`.
+    #[test]
+    fn accuracy4_decode_takes_the_packed_nibble_route() {
+        let _probe = lock_dispatch_probe();
+        if selected_dot_kernel().supports_int4_direct(32, false) || !int4_nibble::supported(32) {
+            return;
+        }
+        let n = 8;
+        for (k, block_size) in [(128usize, 16usize), (128, 32), (256, 64), (256, 128)] {
+            let activations: Vec<f32> = (0..k)
+                .map(|i| ((i * 11 % 37) as f32 - 18.0) / 9.0)
+                .collect();
+            let weights: Vec<f32> = (0..n * k)
+                .map(|i| ((i * 13 % 41) as f32 - 20.0) / 11.0)
+                .collect();
+            let (packed, scales, _, _) = quantize(&weights, n, k, block_size, false);
+            reset_int4_routes();
+            let _ = run_decode_case(&activations, &packed, &scales, n, block_size, Some(4));
+            assert_eq!(
+                int4_routes(),
+                (1, 0),
+                "k={k} block_size={block_size} did not take the packed-nibble route"
+            );
+        }
+    }
+
+    /// Steady-state decode must not repack per `Run`, and concurrent sessions
+    /// sharing one constant weight must fill the cache exactly once.
+    ///
+    /// The route counters are thread-local, so each session asserts its own
+    /// dispatches: every one of its runs took the packed-nibble route and none
+    /// fell through to the expanded-`i8` one. The cache pointer is compared
+    /// across sessions, which is what "packed once" actually means.
+    ///
+    /// Mutation check: taking the `owned_weight` arm unconditionally (i.e.
+    /// prepacking per call rather than through the `OnceLock`) leaves the cache
+    /// empty and fails the pointer assertion.
+    #[test]
+    fn concurrent_decode_sessions_share_one_packed_nibble_prepack() {
+        let _probe = lock_dispatch_probe();
+        if selected_dot_kernel().supports_int4_direct(32, false) || !int4_nibble::supported(32) {
+            return;
+        }
+        // With the `mlas` feature and no native int8 dot, MLAS SQNBit CompInt8
+        // takes accuracy-4 decode for a *constant* weight before this route is
+        // reached -- the same precedence
+        // `matmulnbits_accuracy4_prepack_reuses_selected_weight_format`
+        // documents. The shipped artifact is MLAS-free
+        // (`default_artifacts_are_mlas_free`), so the route under test is the
+        // one production takes; here it simply is not the route being run.
+        #[cfg(feature = "mlas")]
+        if !hand_int8_decode_has_native_dot() {
+            return;
+        }
+        const RUNS: usize = 8;
+        let (k, n, block_size) = (256usize, 16usize, 32usize);
+        let blocks = k / block_size;
+        let activations: Vec<f32> = (0..k)
+            .map(|i| ((i * 11 % 37) as f32 - 18.0) / 9.0)
+            .collect();
+        let weights: Vec<f32> = (0..n * k)
+            .map(|i| ((i * 13 % 41) as f32 - 20.0) / 11.0)
+            .collect();
+        let (packed, scales, _, _) = quantize(&weights, n, k, block_size, false);
+        let a = &Owned::f32(&[1, k], &activations);
+        let b = &Owned::u8(&[n, blocks, block_size / 2], &packed);
+        let scales = &Owned::f32(&[n, blocks], &scales);
+
+        let mut reference = accuracy4_kernel(k, n, block_size);
+        reference.set_constant_inputs(&[false, true, true]);
+        let mut y = Owned::zeros_f32(&[1, n]);
+        reference
+            .execute(&[a.view(), b.view(), scales.view()], &mut [y.view_mut()])
+            .unwrap();
+        let expected = y.to_f32();
+
+        for sessions in [1usize, 2, 4] {
+            let mut kernel = accuracy4_kernel(k, n, block_size);
+            kernel.set_constant_inputs(&[false, true, true]);
+            let kernel = &kernel;
+            let observed: Vec<(usize, Vec<f32>)> = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..sessions)
+                    .map(|_| {
+                        scope.spawn(move || {
+                            reset_int4_routes();
+                            let mut seen = 0usize;
+                            let mut out = Vec::new();
+                            for _ in 0..RUNS {
+                                let mut y = Owned::zeros_f32(&[1, n]);
+                                kernel
+                                    .execute(
+                                        &[a.view(), b.view(), scales.view()],
+                                        &mut [y.view_mut()],
+                                    )
+                                    .unwrap();
+                                out = y.to_f32();
+                                seen = prepack_cache_ptr(kernel)
+                                    .expect("a decode run must leave the weight cache populated")
+                                    as usize;
+                            }
+                            assert_eq!(
+                                int4_routes(),
+                                (RUNS, 0),
+                                "sessions={sessions}: a session did not take the \
+                                 packed-nibble route on every run"
+                            );
+                            (seen, out)
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|handle| handle.join().expect("a decode session must not panic"))
+                    .collect()
+            });
+            let settled =
+                prepack_cache_ptr(kernel).expect("the weight cache must be populated") as usize;
+            for (seen, out) in &observed {
+                assert_eq!(
+                    *seen, settled,
+                    "sessions={sessions}: a session decoded against a different prepack"
+                );
+                assert_eq!(
+                    out, &expected,
+                    "sessions={sessions}: concurrent decode changed the result"
+                );
+            }
+            assert!(
+                kernel.int8_weight.get().is_none(),
+                "sessions={sessions}: the expanded-i8 weight was built as well"
+            );
+            assert!(
+                kernel.weight_nk.get().is_none(),
+                "sessions={sessions}: the f32 expansion was built as well"
+            );
+        }
+    }
+
+    /// The packed-nibble route must land within the same accuracy envelope the
+    /// route it replaces does, at every block size and with and without an
+    /// explicit zero-point tensor.
+    ///
+    /// The bound is against the **fp32** dequantized reference, not against the
+    /// other int8 route, because the two quantize the activation differently
+    /// (signed vs the `+128` offset spelling) and are not expected to agree bit
+    /// for bit. What must hold is that neither is worse than int8 activation
+    /// quantization allows.
+    #[test]
+    fn the_packed_nibble_route_stays_inside_the_accuracy_4_envelope() {
+        let _probe = lock_dispatch_probe();
+        if !int4_nibble::supported(32) {
+            return;
+        }
+        let n = 8;
+        for (k, block_size) in [
+            (128usize, 16usize),
+            (128, 32),
+            (256, 64),
+            (256, 128),
+            (100, 32),
+        ] {
+            for asymmetric in [false, true] {
+                let activations: Vec<f32> = (0..k)
+                    .map(|i| ((i * 7 % 53) as f32 - 26.0) / 13.0)
+                    .collect();
+                let weights: Vec<f32> = (0..n * k)
+                    .map(|i| ((i * 13 % 41) as f32 - 20.0) / 11.0)
+                    .collect();
+                let (packed, scales, zero_points, dequantized) =
+                    quantize(&weights, n, k, block_size, asymmetric);
+                let expected = reference(&activations, &dequantized, 1, k, n);
+                let got = match &zero_points {
+                    Some(points) => run_decode_case_zp(
+                        &activations,
+                        &packed,
+                        &scales,
+                        points,
+                        n,
+                        block_size,
+                        Some(4),
+                    ),
+                    None => run_decode_case(&activations, &packed, &scales, n, block_size, Some(4)),
+                };
+                let magnitude = expected.iter().fold(0.0f32, |a, b| a.max(b.abs()));
+                for (index, (got, want)) in got.iter().zip(&expected).enumerate() {
+                    let tolerance = magnitude * 0.05 + 1.0e-2;
+                    assert!(
+                        (got - want).abs() <= tolerance,
+                        "k={k} block_size={block_size} asymmetric={asymmetric} \
+                         output={index} got={got} want={want} tolerance={tolerance}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn matmulnbits_accuracy4_prepack_reuses_selected_weight_format() {
         let _probe = lock_dispatch_probe();
@@ -10668,7 +13383,22 @@ mod tests {
                 },
             direct_int4
         );
-        assert_eq!(kernel.int8_weight.get().is_some(), !direct_int4);
+        // Without a direct int4 kernel the fallback is one of two formats, and
+        // which one is a property of the host: where the packed-nibble AVX2
+        // kernel applies it keeps the wire layout at 0.5 B/weight, and only
+        // otherwise is the weight expanded to a whole `i8` each. Exactly one
+        // must be built -- building both would mean the route was decided twice.
+        let nibble = int4_nibble::supported(block_size);
+        assert_eq!(
+            kernel.packed_nbits_weight.get().is_some(),
+            !direct_int4 && nibble,
+            "the packed-nibble cache must be populated exactly when its route runs"
+        );
+        assert_eq!(
+            kernel.int8_weight.get().is_some(),
+            !direct_int4 && !nibble,
+            "the expanded int8 weight must only be built when nothing cheaper applies"
+        );
     }
 
     #[cfg(all(
@@ -10684,15 +13414,12 @@ mod tests {
             .map(|i| ((i * 17 % 127) as f32 - 63.0) / 50.0)
             .collect();
         let _guard = backend_env_lock().lock().unwrap();
-        let previous = std::env::var("ONNX_GENAI_CPU_MM_MLAS_QNBIT").ok();
+        let mut env = crate::test_support::EnvVarGuard::new();
         for (label, override_value) in [("default", None), ("explicit", Some("1"))] {
-            // SAFETY: the backend env lock serializes readers/writers of this var in tests.
-            unsafe {
-                match override_value {
-                    Some(value) => std::env::set_var("ONNX_GENAI_CPU_MM_MLAS_QNBIT", value),
-                    None => std::env::remove_var("ONNX_GENAI_CPU_MM_MLAS_QNBIT"),
-                }
-            }
+            match override_value {
+                Some(value) => env.set_var("ONNX_GENAI_CPU_MM_MLAS_QNBIT", value),
+                None => env.remove_var("ONNX_GENAI_CPU_MM_MLAS_QNBIT"),
+            };
             for (bits, block_size) in [(4usize, 128usize), (8, 128)] {
                 let weights: Vec<f32> = (0..n * k)
                     .map(|i| ((i * 31 % 251) as f32 - 125.0) / 50.0)
@@ -10757,13 +13484,456 @@ mod tests {
                 );
             }
         }
-        // SAFETY: still holding the backend env lock; restore prior value.
-        unsafe {
-            match previous {
-                Some(value) => std::env::set_var("ONNX_GENAI_CPU_MM_MLAS_QNBIT", value),
-                None => std::env::remove_var("ONNX_GENAI_CPU_MM_MLAS_QNBIT"),
-            }
+    }
+
+    /// A freed quantized weight must not lend its MLAS pack to the next weight
+    /// that lands on its address (#1735).
+    ///
+    /// The shared store is keyed on the operands' addresses and holds no claim
+    /// on the buffers there, so a recycled allocation of matching shape and pack
+    /// parameters is served the *previous* weight's packed bytes. The route
+    /// counter still increments, because the right route did run -- it just
+    /// multiplied another weight's rows. This is #1726's defect in the packed
+    /// store rather than the transpose caches.
+    ///
+    /// The rounds matter. The packed weight here is ~2 MiB, which glibc serves
+    /// by `mmap` at first; freeing one raises the dynamic mmap threshold so
+    /// later same-size requests are cut from the brk heap, where the address is
+    /// promptly reused. The first rounds establish the recycling the later
+    /// rounds detect, which is why a single allocate/free pair sees nothing.
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn a_recycled_weight_address_must_not_serve_the_previous_weights_mlas_pack() {
+        let _probe = lock_dispatch_probe();
+        let _guard = backend_env_lock().lock().unwrap();
+        let (k, n, block_size) = (2048usize, 2048usize, 32usize);
+        let blocks = k.div_ceil(block_size);
+        let blob = block_size * 4 / 8;
+        let zp_blob = (blocks * 4).div_ceil(8);
+
+        // Two clearly different weights: a stale pack cannot be mistaken for
+        // accumulation-order noise, because the two produce different columns.
+        let first_w: Vec<f32> = (0..n * k)
+            .map(|i| ((i * 31 % 251) as f32 - 125.0) / 50.0)
+            .collect();
+        let second_w: Vec<f32> = (0..n * k)
+            .map(|i| ((i * 17 % 241) as f32 - 120.0) / 37.0)
+            .collect();
+        // m=4, not 1: MLAS refuses asymmetric CompInt8 at M=1 on hosts without
+        // a correct AVX2 kernel (`host_supports_mlas_sqnbit_m1_asym_int8`), and
+        // a refused route would make this test vacuous. The packed store under
+        // test is shared by every `m`.
+        let m = 4usize;
+        let activations: Vec<f32> = (0..m * k)
+            .map(|i| ((i * 17 % 127) as f32 - 63.0) / 50.0)
+            .collect();
+        let quantized: Vec<(Vec<u8>, Vec<f32>, Vec<u8>)> = [&first_w, &second_w]
+            .iter()
+            .map(|w| {
+                let (packed, scales, zps, _) = quantize(w, n, k, block_size, true);
+                (
+                    packed,
+                    scales,
+                    zps.expect("asymmetric quantization emits qzeros"),
+                )
+            })
+            .collect();
+
+        if mlas_sys::SQNBitPackedB::new(
+            n,
+            k,
+            4,
+            block_size,
+            mlas_sys::SQNBitComputeType::Int8,
+            &quantized[0].0,
+            &quantized[0].1,
+            Some(&quantized[0].2),
+        )
+        .is_none()
+        {
+            eprintln!("MLAS QNBit unavailable on this host; skipping #1735 falsifier");
+            return;
         }
+
+        // Forced so the MLAS route is reached on hosts (x86_64) whose default
+        // precedence prefers the native int4 kernel -- the store under test is
+        // MLAS-only, so a native win would silently make this test vacuous.
+        let _env = crate::test_support::EnvVarGuard::set("NXRT_CPU_GEMM_BACKEND", "mlas");
+
+        // Each round allocates the weight afresh so the allocator can hand back
+        // a retired round's address, then drops it -- exactly the lifetime the
+        // store must not outlive.
+        let decode = |which: usize| -> (Vec<f32>, [usize; 3], bool) {
+            let (packed, scales, zps) = &quantized[which];
+            let b = Owned::u8(&[n, blocks, blob], packed);
+            let scales_t = Owned::f32(&[n, blocks], scales);
+            let zero_points = Owned::u8(&[n, zp_blob], zps);
+            // The whole key, not just the weight: a stale hit needs all three
+            // operand addresses to collide, so tracking only the weight's would
+            // let the run report "recycled" while the key never matched -- the
+            // test would then pass without exercising anything.
+            let addr = [
+                b.view().data_ptr::<u8>() as usize,
+                scales_t.view().data_ptr::<u8>() as usize,
+                zero_points.view().data_ptr::<u8>() as usize,
+            ];
+            let mut result = vec![0.0f32; m * n];
+            let kernel = accuracy4_kernel(k, n, block_size);
+            let ran = kernel
+                .try_mlas_sqnbit(
+                    &b.view(),
+                    &scales_t.view(),
+                    Some(&zero_points.view()),
+                    None,
+                    true,
+                    &activations,
+                    m,
+                    None,
+                    &mut result,
+                )
+                .expect("the MLAS SQNBit route must not error");
+            (result, addr, ran.is_some())
+        };
+
+        // Reference outputs are taken against a *drained* store, so each is
+        // packed from its own weight by construction. Deriving them from the
+        // first round instead would let a stale hit poison the reference and
+        // turn the per-round comparison into a tautology.
+        let truth: Vec<Vec<f32>> = (0..2)
+            .map(|which| {
+                clear_mlas_packed_caches();
+                decode(which).0
+            })
+            .collect();
+        clear_mlas_packed_caches();
+        assert_ne!(
+            truth[0], truth[1],
+            "the two weights must produce different outputs, or a stale pack \
+             would be undetectable"
+        );
+
+        let mut seen: Vec<([usize; 3], usize)> = Vec::new();
+        let mut recycled_across_weights = false;
+        for round in 0..8 {
+            let which = round % 2;
+            // Allocator-independent, and the assertion that actually carries this
+            // test: the previous round's kernel has retired, so whatever it
+            // installed must be gone. Address recycling below is a second,
+            // stronger-but-hostier arm; this one holds on every allocator.
+            assert_eq!(
+                mlas_store_len(),
+                (0, 0),
+                "round {round}: the retired kernel left its pack in the store, \
+                 where a later weight at its address can inherit it"
+            );
+            let (got, addr, routed) = decode(which);
+            assert!(
+                routed,
+                "round {round}: the MLAS SQNBit route must run, or this test \
+                 cannot observe the store it exists to check"
+            );
+            // Only a *cross-weight* reuse recreates the hazard: a weight landing
+            // on its own former address would be served a pack of identical
+            // bytes and prove nothing.
+            let recycled = seen
+                .iter()
+                .any(|&(seen_addr, seen_which)| seen_addr == addr && seen_which != which);
+            recycled_across_weights |= recycled;
+            seen.push((addr, which));
+            assert_eq!(
+                got, truth[which],
+                "round {round} (weight {which}, key addresses {addr:#x?}, \
+                 recycled={recycled}): a pack cached for a previous weight at \
+                 these addresses was served to this one"
+            );
+        }
+        // Not an assertion. Address recycling is the allocator's choice, not the
+        // code's: glibc's brk heap reuses these sizes readily, but an allocator
+        // that serves each request fresh (ASan, valgrind, some musl and macOS
+        // configurations) would fail a *correct* implementation here. The
+        // per-round store-drain assertion above covers the mechanism without
+        // depending on it. Reported loudly so a run that skipped this arm is
+        // never mistaken for one that exercised it.
+        if !recycled_across_weights {
+            eprintln!(
+                "NOTE: no full key was reused across weights in {} rounds, so \
+                 this allocator did not exercise the recycling arm; the \
+                 per-round eviction assertion still covered the mechanism. \
+                 Key addresses: {:#x?}",
+                seen.len(),
+                seen
+            );
+        }
+    }
+
+    /// A pack must survive the drop of a kernel that merely *shared* it (#1735).
+    ///
+    /// Ownership is the installing call, not everyone who reaches the entry. A
+    /// node's prefill and decode instances key identically, so the sharing this
+    /// store exists for (#1056: one packed copy per weight, not one per shape
+    /// instantiation) only holds if a retiring sibling leaves the entry alone.
+    /// Evicting on any drop would make the survivor re-pack -- the cost the
+    /// shared store was built to remove.
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn a_shared_mlas_pack_outlives_the_sibling_that_only_shared_it() {
+        let _probe = lock_dispatch_probe();
+        let _guard = backend_env_lock().lock().unwrap();
+        let (k, n, block_size) = (128usize, 256usize, 32usize);
+        let blocks = k.div_ceil(block_size);
+        let blob = block_size * 4 / 8;
+        let zp_blob = (blocks * 4).div_ceil(8);
+        let weights: Vec<f32> = (0..n * k)
+            .map(|i| ((i * 31 % 251) as f32 - 125.0) / 50.0)
+            .collect();
+        // See the recycled-address test: M=1 asymmetric CompInt8 is refused on
+        // this host, so drive the store at m=4.
+        let m = 4usize;
+        let activations: Vec<f32> = (0..m * k)
+            .map(|i| ((i * 17 % 127) as f32 - 63.0) / 50.0)
+            .collect();
+        let (packed, scales, zps, _) = quantize(&weights, n, k, block_size, true);
+        let zps = zps.expect("asymmetric quantization emits qzeros");
+        if mlas_sys::SQNBitPackedB::new(
+            n,
+            k,
+            4,
+            block_size,
+            mlas_sys::SQNBitComputeType::Int8,
+            &packed,
+            &scales,
+            Some(&zps),
+        )
+        .is_none()
+        {
+            eprintln!("MLAS QNBit unavailable on this host; skipping #1735 sharing test");
+            return;
+        }
+
+        let b = Owned::u8(&[n, blocks, blob], &packed);
+        let scales_t = Owned::f32(&[n, blocks], &scales);
+        let zero_points = Owned::u8(&[n, zp_blob], &zps);
+        let _env = crate::test_support::EnvVarGuard::set("NXRT_CPU_GEMM_BACKEND", "mlas");
+        let run = || {
+            let mut result = vec![0.0f32; m * n];
+            let kernel = accuracy4_kernel(k, n, block_size);
+            let ran = kernel
+                .try_mlas_sqnbit(
+                    &b.view(),
+                    &scales_t.view(),
+                    Some(&zero_points.view()),
+                    None,
+                    true,
+                    &activations,
+                    m,
+                    None,
+                    &mut result,
+                )
+                .expect("the MLAS SQNBit route must not error");
+            assert!(ran.is_some(), "the MLAS SQNBit route must run");
+            (result, kernel)
+        };
+
+        let (first_out, installer) = run();
+        let (shared_out, sharer) = run();
+        assert_eq!(
+            first_out, shared_out,
+            "both instances of one weight must produce the same output"
+        );
+        assert!(
+            installer.mlas_owned.shards.get().is_some(),
+            "the first instance to reach the store must record that it installed \
+             the entry"
+        );
+        assert!(
+            sharer.mlas_owned.shards.get().is_none(),
+            "an instance that hit an existing entry must not claim ownership of \
+             it, or it would evict a live sibling's pack"
+        );
+
+        let resident = |label: &str| {
+            assert!(
+                mlas_store_len().0 > 0,
+                "{label}: the shared pack must still be resident"
+            );
+        };
+        resident("with both instances alive");
+        drop(sharer);
+        resident("after the sharing instance retired");
+        drop(installer);
+        assert_eq!(
+            mlas_store_len().0,
+            0,
+            "once the installing instance retires, nothing keyed on that weight \
+             may remain in the store"
+        );
+    }
+
+    /// A pack is a function of the scales too, not just the quantized blob (#1735).
+    ///
+    /// A CompInt8 pack bakes the scales (and zero points) into its per-block
+    /// sums, so keying only on the quantized weight's address makes two nodes
+    /// that share a `B` initializer but carry different scales serve each other
+    /// packs. Both operands are live here, so this is an identity gap rather
+    /// than the lifetime gap the recycled-address test covers.
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn one_quantized_blob_under_two_scale_tensors_must_not_share_a_pack() {
+        let _probe = lock_dispatch_probe();
+        let _guard = backend_env_lock().lock().unwrap();
+        let (k, n, block_size) = (128usize, 256usize, 32usize);
+        let blocks = k.div_ceil(block_size);
+        let blob = block_size * 4 / 8;
+        let zp_blob = (blocks * 4).div_ceil(8);
+        let weights: Vec<f32> = (0..n * k)
+            .map(|i| ((i * 31 % 251) as f32 - 125.0) / 50.0)
+            .collect();
+        let m = 4usize;
+        let activations: Vec<f32> = (0..m * k)
+            .map(|i| ((i * 17 % 127) as f32 - 63.0) / 50.0)
+            .collect();
+        let (packed, scales, zps, _) = quantize(&weights, n, k, block_size, true);
+        let zps = zps.expect("asymmetric quantization emits qzeros");
+        if mlas_sys::SQNBitPackedB::new(
+            n,
+            k,
+            4,
+            block_size,
+            mlas_sys::SQNBitComputeType::Int8,
+            &packed,
+            &scales,
+            Some(&zps),
+        )
+        .is_none()
+        {
+            eprintln!("MLAS QNBit unavailable on this host; skipping #1735 scales-identity test");
+            return;
+        }
+        let doubled: Vec<f32> = scales.iter().map(|s| s * 2.0).collect();
+
+        let b = Owned::u8(&[n, blocks, blob], &packed);
+        let zero_points = Owned::u8(&[n, zp_blob], &zps);
+        // Both scale tensors stay alive, so their addresses are distinct and
+        // neither can be mistaken for the other by recycling.
+        let first_scales = Owned::f32(&[n, blocks], &scales);
+        let second_scales = Owned::f32(&[n, blocks], &doubled);
+        let _env = crate::test_support::EnvVarGuard::set("NXRT_CPU_GEMM_BACKEND", "mlas");
+
+        let run = |scales_t: &Owned| {
+            let mut result = vec![0.0f32; m * n];
+            let kernel = accuracy4_kernel(k, n, block_size);
+            let ran = kernel
+                .try_mlas_sqnbit(
+                    &b.view(),
+                    &scales_t.view(),
+                    Some(&zero_points.view()),
+                    None,
+                    true,
+                    &activations,
+                    m,
+                    None,
+                    &mut result,
+                )
+                .expect("the MLAS SQNBit route must not error");
+            assert!(ran.is_some(), "the MLAS SQNBit route must run");
+            (result, kernel)
+        };
+
+        // References against a drained store, so each is packed from its own
+        // scales by construction.
+        clear_mlas_packed_caches();
+        let want_first = run(&first_scales).0;
+        clear_mlas_packed_caches();
+        let want_second = run(&second_scales).0;
+        clear_mlas_packed_caches();
+        assert_ne!(
+            want_first, want_second,
+            "doubling the scales must change the output, or this test has no power"
+        );
+
+        // The installer is held so its entry is still resident when the second
+        // scales tensor reaches the store on the same quantized blob.
+        let (got_first, _installer) = run(&first_scales);
+        let (got_second, _second) = run(&second_scales);
+        assert_eq!(
+            got_first, want_first,
+            "the installing pack must be unaffected"
+        );
+        assert_eq!(
+            got_second, want_second,
+            "a pack built for another scale tensor was served to this one: the \
+             store key does not close the operands the pack is a function of"
+        );
+    }
+
+    /// The store's insert/evict pair must stay consistent under concurrent use.
+    ///
+    /// Exercises `MlasPackedCaches` directly rather than through kernels: the
+    /// per-test store is thread-local (so kernels on different threads cannot
+    /// contend), while the production store is process-global and genuinely
+    /// shared. This drives the same `Mutex`/`entry`/`remove` paths the global
+    /// store uses, including an installer and a sharer racing for one key.
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn the_packed_store_stays_consistent_under_concurrent_install_and_evict() {
+        let caches = MlasPackedCaches::default();
+        let key_at = |addr: usize| {
+            MlasPackedKey::new(
+                addr,
+                addr + 1,
+                0,
+                8,
+                8,
+                4,
+                32,
+                false,
+                mlas_sys::SQNBitComputeType::Fp32,
+            )
+        };
+        std::thread::scope(|scope| {
+            for thread in 0..8usize {
+                let caches = &caches;
+                scope.spawn(move || {
+                    for round in 0..64usize {
+                        // Overlapping keys across threads, so installs and hits
+                        // race for the same entries.
+                        let key = key_at(round % 4);
+                        let installed_count = std::cell::Cell::new(0usize);
+                        let got = caches
+                            .get_or_build_shards(key, || {
+                                installed_count.set(installed_count.get() + 1);
+                                Ok(Some(Vec::new()))
+                            })
+                            .expect("building an empty shard vector cannot fail");
+                        let (_arc, installed) =
+                            got.expect("a build returning Some must yield an entry");
+                        assert!(
+                            installed_count.get() <= 1,
+                            "the build closure must run at most once per call"
+                        );
+                        if installed {
+                            caches.remove_shards(&key);
+                        }
+                        if thread % 2 == 0 {
+                            caches.remove_shards(&key_at(round % 4));
+                        }
+                    }
+                });
+            }
+        });
+        // Every installer removed its own entry, and `remove` of an absent key
+        // is a no-op, so the store must drain rather than leak.
+        for addr in 0..4usize {
+            caches.remove_shards(&key_at(addr));
+        }
+        assert_eq!(
+            (
+                caches.shards.lock().unwrap().len(),
+                caches.packed.lock().unwrap().len()
+            ),
+            (0, 0),
+            "the store must not leak entries after concurrent install/evict"
+        );
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -10870,6 +14040,7 @@ mod tests {
 
     #[test]
     fn n16_sdot_int4_block128_asymmetric_matches_int8_and_f32_reference() {
+        let _probe = lock_dispatch_probe();
         for &(k, n) in &[
             (1024usize, 1024usize),
             (1024, 3072),
@@ -10921,6 +14092,7 @@ mod tests {
                 block_size,
             );
             let mut n16_out = vec![0.0f32; n];
+            let before_n16 = N16_SDOT_M1_TEST_CALLS.load(Ordering::Relaxed);
             n16_sdot_matmul_m1(
                 &activations,
                 &n16,
@@ -10950,6 +14122,13 @@ mod tests {
                 DotKernel::Scalar,
             );
             assert_close(&n16_out, &int8_out);
+            // Positive proof the counter is wired, which the dispatch-side
+            // equality in the route test cannot give on a lane where the
+            // route is excluded.
+            assert!(
+                N16_SDOT_M1_TEST_CALLS.load(Ordering::Relaxed) > before_n16,
+                "n16_sdot_matmul_m1 must increment its own counter when it runs"
+            );
 
             let dequantized =
                 dequantize_reference(&packed, &scales, Some(&zero_points), n, k, block_size);
@@ -11044,6 +14223,101 @@ mod tests {
             let expected = reference(&activations, &dequantized, 1, k, n);
             assert_qai8dxp_close(&selected, &expected);
         }
+    }
+
+    /// `INT4_DIRECT_M1_TEST_CALLS` and `N16_SDOT_M1_TEST_CALLS` instrument the
+    /// two non-KAI arms of the int4-direct `m = 1` chain. Until
+    /// `check_dispatch_reachability.py` learned the `TEST_CALLS` suffix neither
+    /// had any test reading it: three `fetch_add` sites incrementing into the
+    /// void, on a route that is the default int4 decode path wherever VNNI is
+    /// present. The counters read as coverage and enforced nothing.
+    ///
+    /// The assertion is an equality against the route predicate rather than a
+    /// bare `assert!(reached)`, so it is a real test on every lane: on a
+    /// non-VNNI x86_64 host it proves the route is *excluded* (and that the
+    /// answer is still correct without it), and on a VNNI or aarch64 host it
+    /// proves the route is taken.
+    #[test]
+    fn int4_direct_m1_counters_track_their_dispatch_predicates() {
+        let _probe = lock_dispatch_probe();
+        let (k, n, block_size) = (128usize, 16usize, 32usize);
+        let blocks = k.div_ceil(block_size);
+        let activations: Vec<f32> = (0..k)
+            .map(|i| ((i * 17 % 127) as f32 - 63.0) / 50.0)
+            .collect();
+        let weights: Vec<f32> = (0..n * k)
+            .map(|i| ((i * 31 % 251) as f32 - 125.0) / 50.0)
+            .collect();
+        // Symmetric: the x86_64 int4-direct route refuses zero points.
+        let (packed, scales_values, zero_points, dequantized) =
+            quantize(&weights, n, k, block_size, false);
+        assert!(
+            zero_points.is_none(),
+            "symmetric quantization must not emit zero points"
+        );
+        let expected = reference(&activations, &dequantized, 1, k, n);
+
+        let dot = selected_dot_kernel();
+        let direct = dot.supports_int4_direct(block_size, false);
+        let expect_kai = direct && dot.uses_kai_sdot_direct(4, block_size);
+        let expect_n16 = direct && !expect_kai && dot.uses_n16_sdot_direct();
+        let expect_plain = direct && !expect_kai && !expect_n16;
+
+        let kernel = accuracy4_kernel(k, n, block_size);
+        let a = Owned::f32(&[1, k], &activations);
+        let b = Owned::u8(&[n, blocks, block_size / 2], &packed);
+        let scales = Owned::f32(&[n, blocks], &scales_values);
+        let mut y = Owned::zeros_f32(&[1, n]);
+
+        let before_plain = INT4_DIRECT_M1_TEST_CALLS.load(Ordering::Relaxed);
+        let before_n16 = N16_SDOT_M1_TEST_CALLS.load(Ordering::Relaxed);
+        kernel
+            .execute(&[a.view(), b.view(), scales.view()], &mut [y.view_mut()])
+            .unwrap();
+        let reached_plain = INT4_DIRECT_M1_TEST_CALLS.load(Ordering::Relaxed) > before_plain;
+        let reached_n16 = N16_SDOT_M1_TEST_CALLS.load(Ordering::Relaxed) > before_n16;
+
+        assert_eq!(
+            reached_plain, expect_plain,
+            "int4_matmul_m1 must run exactly when the int4-direct chain falls \
+             through to it (direct={direct} kai={expect_kai} n16={expect_n16})"
+        );
+        assert_eq!(
+            reached_n16, expect_n16,
+            "n16_sdot_matmul_m1 must run exactly when uses_n16_sdot_direct() \
+             selects it (direct={direct})"
+        );
+
+        // Whichever arm ran, the answer is the same one. `accuracy_level = 4`
+        // quantizes the activation to int8, so this is the tolerance the rest
+        // of that path's tests use, not an fp32 one.
+        assert_qai8dxp_close(&y.to_f32(), &expected);
+
+        // On a lane where the route is excluded, both equalities above are
+        // `false == false`, which cannot tell "route correctly excluded" apart
+        // from "counter never wired". Call the kernel directly to prove the
+        // instrumentation actually fires -- that is the difference between a
+        // reachability test and a comment.
+        let mut direct_result = vec![0.0f32; n];
+        let weight = PackedInt4Weight {
+            values: packed.clone(),
+            scales: scales_values.clone(),
+        };
+        let before_direct = INT4_DIRECT_M1_TEST_CALLS.load(Ordering::Relaxed);
+        int4_matmul_m1(
+            &activations,
+            &weight,
+            &mut direct_result,
+            k,
+            n,
+            block_size,
+            dot,
+        );
+        assert!(
+            INT4_DIRECT_M1_TEST_CALLS.load(Ordering::Relaxed) > before_direct,
+            "int4_matmul_m1 must increment its own counter when it runs"
+        );
+        assert_qai8dxp_close(&direct_result, &expected);
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -11156,7 +14430,9 @@ mod tests {
             .collect();
         let values: Vec<i8> = (0..384).map(|i| ((i * 11 % 16) as i8) - 8).collect();
         let block_sums = values
-            .chunks_exact(128)
+            .as_chunks::<128>()
+            .0
+            .iter()
             .map(|block| block.iter().map(|&value| value as i32).sum())
             .collect();
         let prepacked = Int8Weight {
@@ -11288,6 +14564,7 @@ mod tests {
 
     #[test]
     fn matmulnbits_direct_int4_gemv_matches_int8_reference() {
+        let _probe = lock_dispatch_probe();
         let (k, n, block_size) = (77usize, 9usize, 32usize);
         let blocks = k.div_ceil(block_size);
         let padded_k = blocks * block_size;
@@ -11417,6 +14694,7 @@ mod tests {
     /// dequantized-f32 oracle, and must be materially better than per-row.
     #[test]
     fn matmulnbits_compint8_per_block_activation_tracks_dequant_f32_oracle() {
+        let _probe = lock_dispatch_probe();
         let (k, n, block_size) = (256usize, 8usize, 32usize);
         let blocks = k.div_ceil(block_size);
 
@@ -11507,6 +14785,7 @@ mod tests {
     /// the output magnitude) so a passing argmax is a real accuracy result.
     #[test]
     fn matmulnbits_compint8_argmax_matches_dequant_f32_oracle_at_near_tie() {
+        let _probe = lock_dispatch_probe();
         let (k, n, block_size) = (128usize, 2usize, 32usize);
         let mut checked = 0usize;
         for seed in 1..=400u32 {
@@ -11582,6 +14861,7 @@ mod tests {
     /// exactly this greedy-token divergence, and this test would catch it.
     #[test]
     fn int4_decode_preserves_f32_argmax_where_per_row_int8_activation_flips() {
+        let _probe = lock_dispatch_probe();
         let (k, n, block_size) = (128usize, 2usize, 32usize);
         let mut near_ties = 0usize;
         let mut per_row_flips = 0usize;
@@ -11792,6 +15072,7 @@ mod tests {
 
     #[test]
     fn n16_sdot_bits8_block128_asymmetric_matches_i16_and_f32_reference() {
+        let _probe = lock_dispatch_probe();
         for &(k, n) in &[
             (1024usize, 1024usize),
             (1024, 3072),
@@ -13661,6 +16942,7 @@ mod tests {
 
     #[test]
     fn matmulnbits_direct_int4_parallel_partial_k_matches_serial() {
+        let _probe = lock_dispatch_probe();
         let (k, n, block_size) = (77usize, 1025usize, 32usize);
         let blocks = k.div_ceil(block_size);
         let activations: Vec<f32> = (0..k)
@@ -13801,18 +17083,44 @@ mod tests {
     }
 
     #[test]
-    fn persistent_decode_thread_default_is_half_the_logical_cpus() {
+    fn persistent_decode_thread_default_is_half_the_logical_cpus_when_topology_is_unknown() {
         // The persistent pool scales past the flat pool's 8-worker ceiling: unset
         // -> half the logical CPUs (topology-derived, rule 2), not the flat cap.
-        assert_eq!(default_persistent_threads(96), Some(48));
-        assert_eq!(default_persistent_threads(8), Some(4));
-        assert_eq!(default_persistent_threads(4), Some(2));
-        assert_eq!(default_persistent_threads(2), Some(1));
-        assert_eq!(default_persistent_threads(1), Some(1));
-        assert_eq!(default_persistent_threads(0), None);
+        // With no discoverable core count the halving proxy still applies.
+        assert_eq!(default_persistent_threads(96, None), Some(48));
+        assert_eq!(default_persistent_threads(8, None), Some(4));
+        assert_eq!(default_persistent_threads(4, None), Some(2));
+        assert_eq!(default_persistent_threads(2, None), Some(1));
+        assert_eq!(default_persistent_threads(1, None), Some(1));
+        assert_eq!(default_persistent_threads(0, None), None);
         // Distinct from the flat default on a big host (48 vs 8) -- proving the
         // persistent path does not inherit the fork/join-bound cap.
-        assert_ne!(default_persistent_threads(96), default_decode_threads(96));
+        assert_ne!(
+            default_persistent_threads(96, None),
+            default_decode_threads(96)
+        );
+    }
+
+    /// The halving proxy is wrong whenever the allowed set is *already* one CPU
+    /// per physical core, which is what `taskset -c 0,2,...` produces on an SMT
+    /// host and what every careful benchmark on such a host uses.
+    #[test]
+    fn persistent_decode_default_uses_physical_cores_not_half_the_cpuset() {
+        // 16 CPUs that are 16 distinct cores: the whole point of the pin is to
+        // get 16 workers. Halving would build 8 and report nothing.
+        assert_eq!(default_persistent_threads(16, Some(16)), Some(16));
+        // The unpinned SMT case must be unchanged: 32 CPUs, 16 cores -> 16,
+        // which is exactly what the halving proxy used to produce.
+        assert_eq!(default_persistent_threads(32, Some(16)), Some(16));
+        assert_eq!(default_persistent_threads(96, Some(48)), Some(48));
+        // A core count can never exceed the CPUs actually available, and can
+        // never round down to zero.
+        assert_eq!(default_persistent_threads(4, Some(9)), Some(4));
+        // `Some(0)` is nonsense from the topology layer; treat it as unknown
+        // rather than building a zero-worker pool.
+        assert_eq!(default_persistent_threads(8, Some(0)), Some(4));
+        // Unknown topology keeps the historical behaviour exactly.
+        assert_eq!(default_persistent_threads(16, None), Some(8));
     }
 
     #[test]
@@ -13862,13 +17170,41 @@ mod tests {
     }
 
     #[test]
+    fn prefill_worker_names_survive_linux_comm_truncation() {
+        // Linux stores `comm` in 15 bytes plus a NUL. A name longer than that
+        // is silently truncated, which is how the `onnx-genai-`-prefixed
+        // convention elsewhere in this crate loses its worker index. These
+        // names must stay legible for every width the pool is built at, so
+        // that a thread census can attribute them without guesswork.
+        const COMM_LEN: usize = 15;
+        for index in [0, 1, 9, 15, 31, 63, 99] {
+            let name = prefill_worker_name(index);
+            assert!(
+                name.len() <= COMM_LEN,
+                "`{name}` is {} bytes and would be truncated in /proc/<pid>/task/*/comm",
+                name.len()
+            );
+            assert!(
+                name.starts_with("nxgn-prefill-"),
+                "unexpected prefix: {name}"
+            );
+            assert!(
+                name.ends_with(&index.to_string()),
+                "`{name}` lost its worker index"
+            );
+        }
+        // Distinct workers must stay distinguishable.
+        assert_ne!(prefill_worker_name(0), prefill_worker_name(1));
+    }
+
+    #[test]
     fn explicit_budget_precedes_env_for_every_decode_pool() {
         assert_eq!(
             resolve_decode_threads_with_override(Some(6), Some("2"), 96),
             Some(6)
         );
         assert_eq!(
-            resolve_persistent_decode_threads_with_override(Some(8), Some("32"), 96),
+            resolve_persistent_decode_threads_with_override(Some(8), Some("32"), 96, None),
             Some(8)
         );
         assert_eq!(
@@ -13876,7 +17212,7 @@ mod tests {
             Some(12)
         );
         assert_eq!(
-            resolve_persistent_decode_threads_with_override(None, None, 96),
+            resolve_persistent_decode_threads_with_override(None, None, 96, None),
             Some(48),
             "the uncapped automatic default must remain unchanged"
         );
@@ -13901,7 +17237,7 @@ mod tests {
         assert_ne!(default_dense_decode_threads(96), default_decode_threads(96));
         assert_ne!(
             default_dense_decode_threads(96),
-            default_persistent_threads(96)
+            default_persistent_threads(96, None)
         );
     }
 
@@ -14225,6 +17561,499 @@ mod tests {
             kernel.weight_nk.get().is_none(),
             "batched asymmetric INT4 must not expand the weight to f32"
         );
+    }
+
+    /// The 8-bit prefill GEBP must equal the dequantized-f32 reference and must
+    /// actually be the route that ran.
+    ///
+    /// The route it replaces computes the same `(q - zp) * scale` in the same
+    /// depth order, so values alone cannot distinguish them -- hence the
+    /// counter. Covers symmetric and asymmetric, a `k` that is not a multiple
+    /// of `block_size` (partial trailing block, stored full width), an `n` that
+    /// is not a multiple of `NR = 16` (zero-padded panel), and row counts on
+    /// both sides of one `MR = 6` A panel.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn matmulnbits_int8_prefill_gebp_matches_reference_and_ran() {
+        let _probe = lock_dispatch_probe();
+        if !crate::backend::has_simd_x86() {
+            return;
+        }
+        for &(k, n, block_size) in &[(96usize, 20usize, 32usize), (100, 7, 32), (128, 16, 128)] {
+            let blocks = k.div_ceil(block_size);
+            let weights: Vec<f32> = (0..n * k)
+                .map(|i| ((i * 19 % 37) as f32 - 9.0) / 10.0)
+                .collect();
+            for &asymmetric in &[false, true] {
+                let (packed, scales, zero_points, dequantized) =
+                    quantize_8bit(&weights, n, k, block_size, asymmetric);
+                let zp_shape = [n, blocks];
+                for &m in &[2usize, 3, 5, 8, 37] {
+                    let activations: Vec<f32> = (0..m * k)
+                        .map(|i| ((i * 7 % 23) as f32 - 5.0) / 8.0)
+                        .collect();
+                    let (graph, node) = model_node(
+                        &[m, k],
+                        &[n, blocks, block_size],
+                        &[n, blocks],
+                        zero_points.as_ref().map(|_| &zp_shape[..]),
+                        &[m, n],
+                        k,
+                        n,
+                        block_size,
+                    );
+                    let mut graph = graph;
+                    graph
+                        .node_mut(node)
+                        .attributes
+                        .insert("bits".into(), Attribute::Int(8));
+                    let model = Model::new(&graph);
+                    let kernel = CpuExecutionProvider::new()
+                        .get_kernel(model.graph.node(node), &[], 1)
+                        .expect("bits=8 kernel must build");
+                    let a = Owned::f32(&[m, k], &activations);
+                    let b = Owned::u8(&[n, blocks, block_size], &packed);
+                    let scales_tensor = Owned::f32(&[n, blocks], &scales);
+                    let zp_owned = zero_points
+                        .as_ref()
+                        .map(|zp| Owned::u8(&[n, blocks], zp.as_slice()));
+                    let mut inputs = vec![a.view(), b.view(), scales_tensor.view()];
+                    if let Some(zp) = zp_owned.as_ref() {
+                        inputs.push(zp.view());
+                    }
+                    let mut y = Owned::zeros_f32(&[m, n]);
+                    let before = INT8_PREFILL_GEBP_TEST_CALLS.load(Ordering::Relaxed);
+                    kernel.execute(&inputs, &mut [y.view_mut()]).unwrap();
+                    assert_eq!(
+                        INT8_PREFILL_GEBP_TEST_CALLS.load(Ordering::Relaxed),
+                        before + 1,
+                        "k={k} n={n} m={m} asymmetric={asymmetric}: the fused 8-bit GEBP \
+                         must be the route that ran"
+                    );
+                    // Scaled tolerance rather than `assert_close`'s fixed
+                    // 1e-5: the packed microkernel reduces in panel order, so
+                    // it differs from the reference in the last f32 ulps.
+                    let got = y.to_f32();
+                    let expect = reference(&activations, &dequantized, m, k, n);
+                    for (index, (&got, &expect)) in got.iter().zip(&expect).enumerate() {
+                        let tol = 1e-5 * (1.0 + expect.abs());
+                        assert!(
+                            (got - expect).abs() <= tol,
+                            "k={k} n={n} m={m} asymmetric={asymmetric} index {index}: \
+                             got={got}, expect={expect}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The kill switch switches.
+    ///
+    /// [`INT8_PREFILL_GEBP_MIN_ROWS`] is 2, so every prefill this kernel sees
+    /// is eligible; the only way back to the previous `dequantize_weight(Kn)` +
+    /// `gemm` route is `ONNX_GENAI_CPU_MM_INT8_GEBP=0`. A knob documented as a
+    /// fallback that no longer reaches the fallback is worse than no knob, so
+    /// assert the counter stays put *and* the numbers still land.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn matmulnbits_int8_gebp_kill_switch_restores_the_dequant_route() {
+        let _probe = lock_dispatch_probe();
+        let (k, n, block_size, m) = (96usize, 20usize, 32usize, 8usize);
+        let blocks = k.div_ceil(block_size);
+        let weights: Vec<f32> = (0..n * k)
+            .map(|i| ((i * 19 % 37) as f32 - 9.0) / 10.0)
+            .collect();
+        let (packed, scales, _, dequantized) = quantize_8bit(&weights, n, k, block_size, false);
+        let activations: Vec<f32> = (0..m * k)
+            .map(|i| ((i * 7 % 23) as f32 - 5.0) / 8.0)
+            .collect();
+        let (graph, node) = model_node(
+            &[m, k],
+            &[n, blocks, block_size],
+            &[n, blocks],
+            None,
+            &[m, n],
+            k,
+            n,
+            block_size,
+        );
+        let mut graph = graph;
+        graph
+            .node_mut(node)
+            .attributes
+            .insert("bits".into(), Attribute::Int(8));
+        let model = Model::new(&graph);
+        let kernel = CpuExecutionProvider::new()
+            .get_kernel(model.graph.node(node), &[], 1)
+            .expect("bits=8 kernel must build");
+        let a = Owned::f32(&[m, k], &activations);
+        let b = Owned::u8(&[n, blocks, block_size], &packed);
+        let scales_tensor = Owned::f32(&[n, blocks], &scales);
+        let mut y = Owned::zeros_f32(&[m, n]);
+
+        let _env = crate::test_support::EnvVarGuard::set("ONNX_GENAI_CPU_MM_INT8_GEBP", "0");
+        let before = INT8_PREFILL_GEBP_TEST_CALLS.load(Ordering::Relaxed);
+        let executed = kernel.execute(
+            &[a.view(), b.view(), scales_tensor.view()],
+            &mut [y.view_mut()],
+        );
+        let after = INT8_PREFILL_GEBP_TEST_CALLS.load(Ordering::Relaxed);
+        executed.unwrap();
+        assert_eq!(
+            after, before,
+            "the kill switch must send this prefill back to dequantize_weight(Kn)"
+        );
+        assert_close(&y.to_f32(), &reference(&a.to_f32(), &dequantized, m, k, n));
+    }
+
+    /// Decode is not diverted to the GEBP.
+    ///
+    /// This is routing, not a threshold: `m == 1` is claimed by the 8-bit
+    /// decode GEMV before the prefill fallback is reached at all, so the
+    /// assertion is that the *outer* branch keeps decode, independently of
+    /// [`INT8_PREFILL_GEBP_MIN_ROWS`]. The row gate itself is exercised
+    /// directly in
+    /// [`matmulnbits_int8_gebp_row_gate_is_the_kernels_own_lower_bound`],
+    /// because no reachable prefill can trip it.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn matmulnbits_int8_gebp_leaves_decode_on_the_gemv() {
+        let _probe = lock_dispatch_probe();
+        let (k, n, block_size, m) = (96usize, 20usize, 32usize, 1usize);
+        let blocks = k.div_ceil(block_size);
+        let weights: Vec<f32> = (0..n * k)
+            .map(|i| ((i * 19 % 37) as f32 - 9.0) / 10.0)
+            .collect();
+        let (packed, scales, _, _) = quantize_8bit(&weights, n, k, block_size, false);
+        let activations: Vec<f32> = (0..m * k)
+            .map(|i| ((i * 7 % 23) as f32 - 5.0) / 8.0)
+            .collect();
+        let (graph, node) = model_node(
+            &[m, k],
+            &[n, blocks, block_size],
+            &[n, blocks],
+            None,
+            &[m, n],
+            k,
+            n,
+            block_size,
+        );
+        let mut graph = graph;
+        graph
+            .node_mut(node)
+            .attributes
+            .insert("bits".into(), Attribute::Int(8));
+        let model = Model::new(&graph);
+        let kernel = CpuExecutionProvider::new()
+            .get_kernel(model.graph.node(node), &[], 1)
+            .expect("bits=8 kernel must build");
+        let a = Owned::f32(&[m, k], &activations);
+        let b = Owned::u8(&[n, blocks, block_size], &packed);
+        let scales_tensor = Owned::f32(&[n, blocks], &scales);
+        let mut y = Owned::zeros_f32(&[m, n]);
+        let before = INT8_PREFILL_GEBP_TEST_CALLS.load(Ordering::Relaxed);
+        kernel
+            .execute(
+                &[a.view(), b.view(), scales_tensor.view()],
+                &mut [y.view_mut()],
+            )
+            .unwrap();
+        assert_eq!(
+            INT8_PREFILL_GEBP_TEST_CALLS.load(Ordering::Relaxed),
+            before,
+            "decode must stay on the GEMV, whose Nk weight is cached"
+        );
+    }
+
+    /// The row gate is the GEBP's own lower bound, and it is unreachable.
+    ///
+    /// `try_int8_prefill_gebp` is only consulted from the `m > 1` fallback, so
+    /// no prefill the dispatch can deliver is ever rejected by
+    /// [`INT8_PREFILL_GEBP_MIN_ROWS`]. Calling it directly is the only way to
+    /// show the guard is a guard and not a tuned threshold -- and to keep it
+    /// honest if the dispatch above it ever changes.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn matmulnbits_int8_gebp_row_gate_is_the_kernels_own_lower_bound() {
+        let _probe = lock_dispatch_probe();
+        if !crate::backend::has_simd_x86() {
+            return;
+        }
+        assert_eq!(
+            INT8_PREFILL_GEBP_MIN_ROWS, 2,
+            "m == 1 is the decode GEMV's, so 2 is the smallest row count this \
+             route can be offered"
+        );
+        let (k, n, block_size) = (96usize, 20usize, 32usize);
+        let blocks = k.div_ceil(block_size);
+        let weights: Vec<f32> = (0..n * k)
+            .map(|i| ((i * 19 % 37) as f32 - 9.0) / 10.0)
+            .collect();
+        let (packed, scales, _, _) = quantize_8bit(&weights, n, k, block_size, false);
+        let kernel = test_kernel_8bit(k, n, block_size);
+        let b = Owned::u8(&[n, blocks, block_size], &packed);
+        let scales_tensor = Owned::f32(&[n, blocks], &scales);
+        for (m, expected) in [(1usize, false), (2, true)] {
+            let activations: Vec<f32> = (0..m.max(1) * k)
+                .map(|i| ((i * 7 % 23) as f32 - 5.0) / 8.0)
+                .collect();
+            let mut result = vec![0.0f32; m * n];
+            assert_eq!(
+                kernel.try_int8_prefill_gebp(
+                    &b.view(),
+                    &scales_tensor.view(),
+                    None,
+                    None,
+                    &activations,
+                    m,
+                    &mut result,
+                ),
+                expected,
+                "m={m}: the row gate must accept exactly m >= {INT8_PREFILL_GEBP_MIN_ROWS}"
+            );
+        }
+    }
+
+    /// The fused route is **bit-identical** to the one it replaces, including
+    /// when `k` does not fill its last block.
+    ///
+    /// Both routes dequantize to the same f32 values and hand them to the same
+    /// packed microkernel in the same depth order, so "close" is the wrong
+    /// assertion -- anything short of equality would mean one of them reordered
+    /// the reduction. The partial trailing block is the case where the two
+    /// index the packed bytes most differently, so it is the one worth pinning.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn matmulnbits_int8_gebp_is_bit_identical_to_the_dequant_route() {
+        let _probe = lock_dispatch_probe();
+        if !crate::backend::has_simd_x86() {
+            return;
+        }
+        // k = 100 leaves a 4-wide trailing block; n = 7 leaves a partial NR=16
+        // panel.
+        for &(k, n, block_size) in &[(100usize, 7usize, 32usize), (96, 20, 32), (130, 33, 128)] {
+            let blocks = k.div_ceil(block_size);
+            let weights: Vec<f32> = (0..n * k)
+                .map(|i| ((i * 19 % 37) as f32 - 9.0) / 10.0)
+                .collect();
+            for &asymmetric in &[false, true] {
+                let (packed, scales, zero_points, _) =
+                    quantize_8bit(&weights, n, k, block_size, asymmetric);
+                let zp_shape = [n, blocks];
+                for &m in &[2usize, 7, 19] {
+                    let activations: Vec<f32> = (0..m * k)
+                        .map(|i| ((i * 7 % 23) as f32 - 5.0) / 8.0)
+                        .collect();
+                    let (graph, node) = model_node(
+                        &[m, k],
+                        &[n, blocks, block_size],
+                        &[n, blocks],
+                        zero_points.as_ref().map(|_| &zp_shape[..]),
+                        &[m, n],
+                        k,
+                        n,
+                        block_size,
+                    );
+                    let mut graph = graph;
+                    graph
+                        .node_mut(node)
+                        .attributes
+                        .insert("bits".into(), Attribute::Int(8));
+                    let model = Model::new(&graph);
+                    let kernel = CpuExecutionProvider::new()
+                        .get_kernel(model.graph.node(node), &[], 1)
+                        .expect("bits=8 kernel must build");
+                    let a = Owned::f32(&[m, k], &activations);
+                    let b = Owned::u8(&[n, blocks, block_size], &packed);
+                    let scales_tensor = Owned::f32(&[n, blocks], &scales);
+                    let zp_tensor = zero_points
+                        .as_ref()
+                        .map(|zp| Owned::u8(&[n, blocks], zp.as_slice()));
+                    let mut inputs = vec![a.view(), b.view(), scales_tensor.view()];
+                    if let Some(zp) = zp_tensor.as_ref() {
+                        inputs.push(zp.view());
+                    }
+
+                    let mut fused = Owned::zeros_f32(&[m, n]);
+                    let before = INT8_PREFILL_GEBP_TEST_CALLS.load(Ordering::Relaxed);
+                    kernel.execute(&inputs, &mut [fused.view_mut()]).unwrap();
+                    assert_eq!(
+                        INT8_PREFILL_GEBP_TEST_CALLS.load(Ordering::Relaxed),
+                        before + 1,
+                        "k={k} n={n} m={m}: the first arm must be the fused GEBP, or \
+                         this comparison is vacuous"
+                    );
+
+                    let _env =
+                        crate::test_support::EnvVarGuard::set("ONNX_GENAI_CPU_MM_INT8_GEBP", "0");
+                    let mut dequant = Owned::zeros_f32(&[m, n]);
+                    let executed = kernel.execute(&inputs, &mut [dequant.view_mut()]);
+                    executed.unwrap();
+                    assert_eq!(
+                        INT8_PREFILL_GEBP_TEST_CALLS.load(Ordering::Relaxed),
+                        before + 1,
+                        "k={k} n={n} m={m}: the second arm must be the dequant route"
+                    );
+
+                    assert_eq!(
+                        fused.to_f32(),
+                        dequant.to_f32(),
+                        "k={k} n={n} m={m} asymmetric={asymmetric}: the fused pack must \
+                         reproduce the dequantize-then-GEMM bytes exactly"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Prefill wide enough to reach the fused-dequant GEBP route (#1117) must
+    /// still equal the dequantized-f32 reference, for both symmetric and
+    /// asymmetric int4 -- and must still leave the weight borrowed, because the
+    /// whole point of fusing the dequant into the pack step is to buy GEMM
+    /// arithmetic intensity *without* the resident f32 cache #979 removed.
+    #[test]
+    fn matmulnbits_int4_prefill_gebp_matches_reference_and_stays_borrowed() {
+        let _probe = lock_dispatch_probe();
+        let (k, n, block_size) = (96usize, 20usize, 32usize);
+        let blocks = k.div_ceil(block_size);
+        let weights: Vec<f32> = (0..n * k)
+            .map(|i| ((i * 19 % 37) as f32 - 9.0) / 10.0)
+            .collect();
+        for &asymmetric in &[false, true] {
+            let (packed, scales, zero_points, dequantized) =
+                quantize(&weights, n, k, block_size, asymmetric);
+            // The dispatch threshold for this weight is
+            // `INT4_PREFILL_GEBP_MIN_ROWS_L2_RESIDENT` -- 960 packed bytes is
+            // far inside L2 -- so the GEBP route starts at 6, and the smaller
+            // `m` here cover the routes below it. The counter assertion is what
+            // keeps that statement honest across retunes.
+            for &m in &[4usize, 5, 8, 16, 37] {
+                let activations: Vec<f32> = (0..m * k)
+                    .map(|i| ((i * 7 % 23) as f32 - 5.0) / 8.0)
+                    .collect();
+                let kernel = test_kernel(k, n, block_size);
+                let a = Owned::f32(&[m, k], &activations);
+                let b = Owned::u8(&[n, blocks, block_size / 2], &packed);
+                let scales_tensor = Owned::f32(&[n * blocks], &scales);
+                let zp_owned = zero_points
+                    .as_ref()
+                    .map(|zp| Owned::u8(&[n, blocks.div_ceil(2)], zp));
+                let mut inputs = vec![a.view(), b.view(), scales_tensor.view()];
+                if let Some(zp) = zp_owned.as_ref() {
+                    inputs.push(zp.view());
+                }
+                let mut y = Owned::zeros_f32(&[m, n]);
+                // The counter and the threshold are both x86_64-only; this test
+                // is not, so the routing assertion has to be gated even though
+                // the numeric one below runs everywhere.
+                #[cfg(target_arch = "x86_64")]
+                let before = INT4_PREFILL_GEBP_TEST_CALLS.load(Ordering::Relaxed);
+                kernel.execute(&inputs, &mut [y.view_mut()]).unwrap();
+                #[cfg(target_arch = "x86_64")]
+                let took_gebp = INT4_PREFILL_GEBP_TEST_CALLS.load(Ordering::Relaxed) > before;
+                // Scaled tolerance, not `assert_close`'s fixed 1e-5: the GEBP
+                // route reduces in the packed microkernel's order, so it
+                // differs from the row-serial order in the last f32 ulps, and
+                // at these magnitudes one ulp already exceeds 1e-5.
+                let got = y.to_f32();
+                let expect = reference(&activations, &dequantized, m, k, n);
+                for (index, (&got, &expect)) in got.iter().zip(&expect).enumerate() {
+                    let tol = 1e-5 * (1.0 + expect.abs());
+                    assert!(
+                        (got - expect).abs() <= tol,
+                        "asymmetric={asymmetric} m={m} index {index}: got={got}, expect={expect}"
+                    );
+                }
+                assert!(
+                    kernel.weight_nk.get().is_none(),
+                    "asymmetric={asymmetric} m={m}: the GEBP prefill must keep the \
+                     weight borrowed, not materialize the f32 cache"
+                );
+                // What keeps the comment above honest across retunes: this
+                // weight is L2-resident, so the threshold it routes on is
+                // `INT4_PREFILL_GEBP_MIN_ROWS_L2_RESIDENT`, and the sweep
+                // straddles it. Without this the test passes whichever route
+                // ran, which is how it came to name a threshold of 4.
+                #[cfg(target_arch = "x86_64")]
+                assert_eq!(
+                    took_gebp,
+                    m >= INT4_PREFILL_GEBP_MIN_ROWS_L2_RESIDENT,
+                    "asymmetric={asymmetric} m={m}: an L2-resident weight must take \
+                     the GEBP prefill exactly when m >= \
+                     INT4_PREFILL_GEBP_MIN_ROWS_L2_RESIDENT"
+                );
+            }
+        }
+    }
+
+    /// A 16-element block reaches the GEBP prefill through
+    /// [`INT4_PREFILL_GEBP_MIN_ROWS_UNBLOCKED`], a branch neither this test's
+    /// 32-element sibling nor any other numeric test used to cover: with the
+    /// threshold at 4 the rows it now owns (`m = 1, 2, 3`) went to the
+    /// per-block dot instead. `m = 1` is decode, so this is also the only
+    /// numeric coverage of a decode row through the packed microkernel. The
+    /// block size also exercises a panel whose block boundary falls twice
+    /// inside one `DEQUANT_GROUP`-stepped run.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn matmulnbits_int4_prefill_gebp_covers_the_unblocked_block_size() {
+        let _probe = lock_dispatch_probe();
+        let (k, n, block_size) = (96usize, 20usize, 16usize);
+        let blocks = k.div_ceil(block_size);
+        let weights: Vec<f32> = (0..n * k)
+            .map(|i| ((i * 19 % 37) as f32 - 9.0) / 10.0)
+            .collect();
+        for &asymmetric in &[false, true] {
+            let (packed, scales, zero_points, dequantized) =
+                quantize(&weights, n, k, block_size, asymmetric);
+            for &m in &[1usize, 2, 3, 4, 8] {
+                let activations: Vec<f32> = (0..m * k)
+                    .map(|i| ((i * 7 % 23) as f32 - 5.0) / 8.0)
+                    .collect();
+                let kernel = test_kernel(k, n, block_size);
+                let a = Owned::f32(&[m, k], &activations);
+                let b = Owned::u8(&[n, blocks, block_size / 2], &packed);
+                let scales_tensor = Owned::f32(&[n * blocks], &scales);
+                let zp_owned = zero_points
+                    .as_ref()
+                    .map(|zp| Owned::u8(&[n, blocks.div_ceil(2)], zp));
+                let mut inputs = vec![a.view(), b.view(), scales_tensor.view()];
+                if let Some(zp) = zp_owned.as_ref() {
+                    inputs.push(zp.view());
+                }
+                let mut y = Owned::zeros_f32(&[m, n]);
+                let before = INT4_PREFILL_GEBP_TEST_CALLS.load(Ordering::Relaxed);
+                kernel.execute(&inputs, &mut [y.view_mut()]).unwrap();
+                let took_gebp = INT4_PREFILL_GEBP_TEST_CALLS.load(Ordering::Relaxed) > before;
+
+                // Same scaled tolerance as the 32-element case, and for the
+                // same reason: the packed microkernel reduces in a different
+                // order from the per-block dot.
+                let got = y.to_f32();
+                let expect = reference(&activations, &dequantized, m, k, n);
+                for (index, (&got, &expect)) in got.iter().zip(&expect).enumerate() {
+                    let tol = 1e-5 * (1.0 + expect.abs());
+                    assert!(
+                        (got - expect).abs() <= tol,
+                        "asymmetric={asymmetric} m={m} index {index}: got={got}, expect={expect}"
+                    );
+                }
+                // Positive proof the retune actually re-pointed these rows, and
+                // that it left decode where it was.
+                assert_eq!(
+                    took_gebp,
+                    m >= INT4_PREFILL_GEBP_MIN_ROWS_UNBLOCKED,
+                    "asymmetric={asymmetric} m={m}: block_size=16 must take the \
+                     GEBP prefill exactly when m >= \
+                     INT4_PREFILL_GEBP_MIN_ROWS_UNBLOCKED"
+                );
+                assert!(
+                    kernel.weight_nk.get().is_none(),
+                    "asymmetric={asymmetric} m={m}: must keep the weight borrowed"
+                );
+            }
+        }
     }
 
     #[test]
@@ -15668,6 +19497,103 @@ mod tests {
         })
     }
 
+    /// Prefix of the stage breadcrumb a pool-building child leaves behind.
+    ///
+    /// A #1745 report says the child faulted and nothing else. The child's
+    /// stdout carries a result marker, so the log distinguishes "finished" from
+    /// "did not finish" -- but between process start and that one line the
+    /// child builds a pool, runs a kernel, encodes bytes and then tears the
+    /// pool down, and a fault anywhere in that span produces the same report.
+    /// "Crashed doing the work" and "crashed at exit after the work" are
+    /// different bugs with different fixes, and today's output cannot separate
+    /// them.
+    ///
+    /// It is worth being explicit that the missing detail was never *printed
+    /// and lost*, because that is the natural suspicion when a child dies on a
+    /// pipe. It is not what happens: Rust's stdout is a `LineWriter` on every
+    /// platform, so a newline-terminated `println!` has already reached the
+    /// pipe before the fault. Checked rather than assumed -- a child that
+    /// writes one newline-terminated line, one unterminated `print!` and one
+    /// flushed stderr line and then `abort()`s under `Command::output()`
+    /// delivers the first and the third and loses only the unterminated
+    /// fragment. So the gap is that nothing is emitted between "started" and
+    /// "produced the result", which is what these breadcrumbs fill.
+    ///
+    /// They go to **stderr**, and that is deliberate rather than stylistic.
+    /// Both readers of these children key on stdout *by content*:
+    /// [`is_environmental_access_violation_crash`] treats the result marker's
+    /// presence as "the child produced its result", and
+    /// [`parity_child_output_mode`] scans stdout lines for the parity payload.
+    /// Extra stdout lines are therefore a change to two lanes' red/green
+    /// semantics; extra stderr lines are not, provided they never contain
+    /// `panicked at` or `assertion`, which are the only two strings that
+    /// classifier reads out of stderr. That constraint is asserted in
+    /// [`a_stage_breadcrumb_is_invisible_to_the_crash_classifier`].
+    const CHILD_STAGE_MARKER: &str = "NXRT_CHILD_STAGE:";
+
+    /// Record how far a pool-building child got, so the next fault says where.
+    ///
+    /// Best-effort by construction, like [`record_environmental_retry`]: a
+    /// diagnostic must never be the thing that fails a test, so the write and
+    /// the flush both discard their errors.
+    fn record_child_stage(site: &str, stage: &str) {
+        use std::io::Write;
+        let mut err = std::io::stderr();
+        let _ = writeln!(err, "{}", child_stage_line(site, stage));
+        let _ = err.flush();
+    }
+
+    /// The exact text [`record_child_stage`] writes.
+    ///
+    /// Split out so the wording can be asserted against the crash classifier
+    /// without spawning anything: what matters about a breadcrumb is not only
+    /// that it is emitted but that emitting it does not reclassify the fault it
+    /// is describing.
+    fn child_stage_line(site: &str, stage: &str) -> String {
+        format!("{CHILD_STAGE_MARKER} site={site} stage={stage}")
+    }
+
+    /// Stop and join the process-wide decode pool before a child process exits.
+    ///
+    /// The pool lives in a module-level `static`, which Rust never `Drop`s, so
+    /// without this the child's workers are still spinning or parked on
+    /// `Arc<SharedState>` while the process tears itself down. On Windows that
+    /// is a genuine hazard rather than a tidiness point: `ExitProcess`
+    /// terminates every other thread at an arbitrary instruction, including one
+    /// holding a CRT or heap lock that exit-time cleanup then takes.
+    ///
+    /// This is not a new theory. [`affinity_defer_routing_child`] already ends
+    /// this way and its comment names the same `STATUS_ACCESS_VIOLATION` on
+    /// native Windows ARM64 as the reason. The two other children that build
+    /// the same pool -- the parity child and the realized-width child -- never
+    /// got the same treatment, and #1745 is reported against exactly those.
+    /// Applying the existing remedy to them is the cheapest way to find out
+    /// whether it is the same bug.
+    ///
+    /// A no-op for a child that built no pool, so the `off` parity arm pays
+    /// nothing.
+    ///
+    /// **Where to call it.** In the two children that never had a teardown it
+    /// goes *after* the result marker, so that a crash inside our own teardown
+    /// is reported rather than retried away -- a bug in this code is not a
+    /// flaky runner. That ordering is only load-bearing for the realized-width
+    /// child, whose parent runs
+    /// [`is_environmental_access_violation_crash`] and retries: with the marker
+    /// already on stdout the crash reads as non-environmental and spends no
+    /// retries. [`parity_child_output_mode`] has no retry at all -- it asserts
+    /// `status.success()` directly -- so its teardown crashes were always going
+    /// to be reported; the same ordering is used there for consistency rather
+    /// than because it changes the verdict.
+    /// [`affinity_defer_routing_child`] keeps its existing marker-last order:
+    /// flipping it would change the red/green semantics of a lane that is
+    /// currently green, on a platform this workspace cannot execute, to test a
+    /// hypothesis that is not yet confirmed. Its `pools-stopped` breadcrumb
+    /// answers the same question without touching the verdict.
+    fn quiesce_pools_for_child_exit(site: &str) {
+        crate::decode_spmd::shutdown_pools();
+        record_child_stage(site, "pools-stopped");
+    }
+
     /// Which persistence policy the SPMD parity child runs under.
     #[derive(Clone, Copy)]
     enum SpmdParityMode {
@@ -15722,7 +19648,8 @@ mod tests {
         let output = command.output().expect("run SPMD parity child process");
         assert!(
             output.status.success(),
-            "SPMD parity child failed (persistent={persistent}):\nstdout:\n{}\nstderr:\n{}",
+            "SPMD parity child failed (persistent={persistent}, workers={workers}, status={}):\nstdout:\n{}\nstderr:\n{}",
+            child_status_detail(&output.status),
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
@@ -15737,7 +19664,9 @@ mod tests {
         assert_eq!(encoded.len() % 2, 0);
         encoded
             .as_bytes()
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| {
                 let pair = std::str::from_utf8(pair).unwrap();
                 u8::from_str_radix(pair, 16).unwrap()
@@ -15745,8 +19674,82 @@ mod tests {
             .collect()
     }
 
+    /// Breadcrumbs must not change how a fault is classified.
+    ///
+    /// [`is_environmental_access_violation_crash`] reads exactly two strings
+    /// out of stderr -- `panicked at` and `assertion` -- and treats either as
+    /// "this was a real test failure, do not retry". A stage breadcrumb is
+    /// written to stderr by three children covered by that classifier, so
+    /// wording that happened to contain either token would silently convert an
+    /// environmental crash into a hard failure and spend the retry budget on
+    /// the wrong verdict. The property is about the text, so it is asserted on
+    /// the text.
+    #[test]
+    fn a_stage_breadcrumb_is_invisible_to_the_crash_classifier() {
+        let line = child_stage_line("spmd_parity", "pools-stopped");
+        assert!(
+            line.starts_with(CHILD_STAGE_MARKER),
+            "a breadcrumb has to be greppable in a CI log: {line}"
+        );
+        assert!(
+            !line.contains("panicked at") && !line.contains("assertion"),
+            "this breadcrumb reads as a panic to the crash classifier: {line}"
+        );
+        // The real check: the classifier's verdict on a crash whose stderr is
+        // nothing but breadcrumbs must equal its verdict on an empty stderr.
+        const MARKER: &str = "NXRT_TEST_RESULT";
+        const ACCESS_VIOLATION: i32 = -1_073_741_819;
+        let breadcrumbs = format!(
+            "{}\n{}\n",
+            child_stage_line("spmd_parity", "body-complete"),
+            child_stage_line("spmd_parity", "pools-stopped")
+        );
+        let verdict = |stderr: &str, stdout: &str| {
+            crate::test_support::is_environmental_access_violation_crash(
+                false,
+                Some(ACCESS_VIOLATION),
+                stdout,
+                stderr,
+                MARKER,
+            )
+        };
+        for (stdout, expected) in [("", true), (MARKER, false)] {
+            assert_eq!(
+                verdict(&breadcrumbs, stdout),
+                verdict("", stdout),
+                "breadcrumbs changed the verdict for stdout {stdout:?}"
+            );
+            assert_eq!(verdict(&breadcrumbs, stdout), expected);
+        }
+    }
+
+    /// Each site/stage pair has to be distinguishable in a log.
+    ///
+    /// The whole value of a breadcrumb is answering "which child, and how far
+    /// did it get" from a CI log carrying all three children's stderr
+    /// interleaved. A formatter that dropped either field would still be
+    /// greppable and would still pass the classifier test above while
+    /// answering neither question.
+    #[test]
+    fn a_stage_breadcrumb_names_both_the_site_and_the_stage() {
+        let line = child_stage_line("spmd_realized_width", "pools-stopped");
+        assert!(line.contains("site=spmd_realized_width"), "{line}");
+        assert!(line.contains("stage=pools-stopped"), "{line}");
+        assert_ne!(
+            child_stage_line("spmd_parity", "pools-stopped"),
+            child_stage_line("affinity_defer", "pools-stopped"),
+            "two different children produce the same breadcrumb"
+        );
+        assert_ne!(
+            child_stage_line("spmd_parity", "body-complete"),
+            child_stage_line("spmd_parity", "pools-stopped"),
+            "two different stages of one child produce the same breadcrumb"
+        );
+    }
+
     #[test]
     fn spmd_real_int4_parity_subprocess() {
+        let _probe = lock_dispatch_probe();
         let Ok(mode) = std::env::var(SPMD_PARITY_CHILD_ENV) else {
             return;
         };
@@ -15794,8 +19797,10 @@ mod tests {
                 }
             }
         }
+        record_child_stage("spmd_parity", "body-complete");
         let encoded: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
         println!("{SPMD_PARITY_MARKER}{encoded}");
+        quiesce_pools_for_child_exit("spmd_parity");
     }
 
     #[test]
@@ -15807,6 +19812,1264 @@ mod tests {
             "odd-worker persistent SPMD output must be byte-identical to flag-OFF \
              across every sequential packed-int4 MatMulNBits op"
         );
+    }
+
+    /// The decode widths our published benchmark rows are labelled with.
+    ///
+    /// [`spmd_real_int4_parity_subprocess`] already asserts requested ==
+    /// realized, but only ever at [`parity_worker_count`] -- the largest odd
+    /// count that fits the host, which is 15 on a 16-core box. That is
+    /// precisely the one width nobody benchmarks. Every `t=1/2/4/8/16` row we
+    /// publish carries a width label that, until this test, nothing verified:
+    /// the harness reports the value it *requested* via
+    /// `ONNX_GENAI_CPU_DECODE_THREADS`, not the width the pool actually built.
+    const BENCHMARKED_DECODE_WIDTHS: [usize; 5] = [1, 2, 4, 8, 16];
+
+    /// Upper bound on the extra fully-subscribed probe width.
+    ///
+    /// The probe asks for as many lanes as the process has allowed CPUs so the
+    /// dispatcher-reservation path is reached, but on a many-core host that
+    /// would spin up ~one worker per core just to read a count. Above this many
+    /// allowed CPUs, skip it rather than make it cheap-but-meaningless: a
+    /// partial request lands back in the no-op branch the probe exists to
+    /// avoid, which would be coverage in name only.
+    const SPMD_WIDTH_FULL_SUBSCRIPTION_CAP: usize = 32;
+
+    /// Marker prefix for the realized-width child's single report line.
+    const SPMD_WIDTH_MARKER: &str = "SPMD_REALIZED_WIDTH:";
+
+    /// Set on the realized-width child; its value is the requested width, or
+    /// [`SPMD_WIDTH_CHILD_DEFAULT`] to exercise the *default* resolver instead.
+    const SPMD_WIDTH_CHILD_ENV: &str = "ONNX_GENAI_TEST_SPMD_REALIZED_WIDTH_CHILD";
+
+    /// Value of [`SPMD_WIDTH_CHILD_ENV`] that means "resolve the width yourself".
+    ///
+    /// The child restricts itself to one CPU per physical core and then builds
+    /// the pool with no explicit width, which is the shape every pinned
+    /// benchmark run on this host has. See
+    /// [`a_default_width_pool_on_leader_cpus_uses_every_core_it_was_given`].
+    const SPMD_WIDTH_CHILD_DEFAULT: &str = "default";
+
+    /// Set on a realized-width child to make it misreport its own placement.
+    /// See [`placement_is_honest`] and
+    /// [`a_pool_that_misreports_its_placement_is_caught_end_to_end`].
+    const PLACEMENT_DISHONEST_ENV: &str = "ONNX_GENAI_TEST_PLACEMENT_DISHONEST";
+
+    /// Attempts allowed for the realized-width child before a
+    /// `STATUS_ACCESS_VIOLATION` is treated as a real failure.
+    const SPMD_WIDTH_CHILD_MAX_ATTEMPTS: u32 = 3;
+
+    /// Grep anchor for a consumed environmental retry (#1745).
+    const ENVIRONMENTAL_RETRY_MARKER: &str = "NXRT_ENV_RETRY:";
+
+    /// Record that a bounded retry was consumed, in a way that survives a
+    /// *passing* test.
+    ///
+    /// The obvious `eprintln!` does not. libtest captures the `print!`/
+    /// `eprintln!` family per test thread and replays it only when the test
+    /// *fails*, so a retry followed by a green run destroys its own evidence —
+    /// and that is exactly the case needed to estimate the environmental crash
+    /// rate. Measured, plain `cargo test`, two passing tests: an `eprintln!`
+    /// marker never appears while a direct `io::stderr()` marker does.
+    ///
+    /// This matters more than it looks. With `max` attempts and a per-attempt
+    /// crash probability `p`, a lane only goes red when every attempt faults,
+    /// so the observed failure rate is `p^max` and the true rate is its
+    /// `max`th root — an observed 1-in-200 flake implies a per-attempt rate
+    /// near 17%. Retries do not merely hide the rate, they cube it, so the
+    /// number has to be recoverable from *green* runs or it is not recoverable
+    /// at all.
+    ///
+    /// Best-effort by construction: a diagnostic must never fail a test, so
+    /// both the write and the flush discard their errors.
+    ///
+    /// See [`a_consumed_retry_is_recorded_where_a_green_run_can_be_mined`].
+    fn record_environmental_retry(site: &str, detail: &str, attempt: u32, max: u32) {
+        use std::io::Write;
+        let mut err = std::io::stderr();
+        let _ = writeln!(
+            err,
+            "{ENVIRONMENTAL_RETRY_MARKER} site={site} {detail} attempt={attempt} max={max}"
+        );
+        let _ = err.flush();
+    }
+
+    /// The claim the Linux invariant in [`realized_width_report_with`] rests
+    /// on: no Linux exit status can be mistaken for the environmental crash.
+    ///
+    /// That assertion is a tripwire for a condition that cannot occur here, so
+    /// it can never fire on this host and no mutation of it is catchable. What
+    /// *is* catchable is the premise — a Linux child exits with `0..=255`, or
+    /// reports no code at all when signalled, and `STATUS_ACCESS_VIOLATION` is
+    /// none of those. Proving the premise is what makes the tripwire more than
+    /// an assertion nobody has tested.
+    #[test]
+    fn the_environmental_retry_cannot_trigger_on_a_linux_exit_status() {
+        for code in 0..=255i32 {
+            assert!(
+                !is_environmental_access_violation_crash(
+                    false,
+                    Some(code),
+                    "",
+                    "",
+                    SPMD_WIDTH_MARKER
+                ),
+                "exit code {code} was classified as the environmental crash, so the retry \
+                 is reachable on Linux and every `attempts == 1` invariant is unsound"
+            );
+        }
+        // A signalled child (SIGSEGV, SIGKILL, the OOM killer) reports no code.
+        assert!(
+            !is_environmental_access_violation_crash(false, None, "", "", SPMD_WIDTH_MARKER),
+            "a signalled child was classified as the environmental crash, which would retry \
+             away a real segfault or an OOM kill"
+        );
+    }
+
+    /// Set on the child half of
+    /// [`a_consumed_retry_is_recorded_where_a_green_run_can_be_mined`].
+    const RETRY_RECORD_CHILD_ENV: &str = "ONNX_GENAI_TEST_RETRY_RECORD_CHILD";
+
+    /// Emitted by that child through `eprintln!` as the control arm.
+    const RETRY_RECORD_CAPTURED_CONTROL: &str = "NXRT_ENV_RETRY_CAPTURED_CONTROL:";
+
+    /// Child half: emits both forms and then *passes*.
+    #[test]
+    fn retry_record_child() {
+        if std::env::var_os(RETRY_RECORD_CHILD_ENV).is_none() {
+            return;
+        }
+        // Control arm: the macro form the retry sites used to use.
+        eprintln!("{RETRY_RECORD_CAPTURED_CONTROL} control");
+        record_environmental_retry("selftest", "case=probe", 1, 3);
+    }
+
+    /// A retry that is followed by a green run must still leave a trace.
+    ///
+    /// This is the whole point of [`record_environmental_retry`]: the rate we
+    /// need for #1745 lives in runs that *passed* after retrying, so a record
+    /// that only survives failure records nothing we can use.
+    ///
+    /// The child is deliberately spawned **without** `--nocapture`, because
+    /// capture is the thing under test, and it is asserted to have passed,
+    /// because libtest replays captured output for a *failing* test and would
+    /// otherwise hand us a false positive.
+    ///
+    /// The control arm is what keeps this honest. If libtest ever stopped
+    /// capturing — or the child were spawned with `--nocapture` by mistake —
+    /// both markers would survive, the interesting assertion would hold for a
+    /// reason that has nothing to do with the fix, and the test would be
+    /// decorative. Asserting the `eprintln!` marker is *absent* means the test
+    /// fails rather than silently stops proving anything.
+    #[test]
+    fn a_consumed_retry_is_recorded_where_a_green_run_can_be_mined() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("kernels::matmul_nbits::tests::retry_record_child")
+            .arg("--test-threads=1")
+            // libtest honours `RUST_TEST_NOCAPTURE` as well as `--nocapture`,
+            // and `Command` inherits the parent environment. Without this a
+            // developer running the suite with `RUST_TEST_NOCAPTURE=1` — a
+            // legitimate way to watch test output — would disable capture in
+            // the child, let the control marker through, and fail this test for
+            // a reason unrelated to the fix. The premise has to be established
+            // here rather than inherited.
+            .env_remove("RUST_TEST_NOCAPTURE")
+            .env(RETRY_RECORD_CHILD_ENV, "1")
+            .output()
+            .expect("run the retry-record child process");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert!(
+            output.status.success(),
+            "the retry-record child failed (status={}):\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            child_status_detail(&output.status)
+        );
+        assert!(
+            stdout.contains("1 passed"),
+            "the child must have PASSED for this to say anything about a green run; \
+             libtest replays captured output on failure:\nstdout:\n{stdout}"
+        );
+        assert!(
+            stderr.contains(ENVIRONMENTAL_RETRY_MARKER),
+            "a consumed retry left no trace in a passing child, so the crash rate \
+             behind {SPMD_WIDTH_CHILD_MAX_ATTEMPTS} attempts stays unmeasurable \
+             (#1745):\nstderr:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains(RETRY_RECORD_CAPTURED_CONTROL)
+                && !stdout.contains(RETRY_RECORD_CAPTURED_CONTROL),
+            "the `eprintln!` control survived, so libtest is not capturing here and \
+             this test proves nothing about surviving capture:\nstdout:\n{stdout}\n\
+             stderr:\n{stderr}"
+        );
+    }
+
+    /// What a realized-width child observed about the pool it built.
+    #[derive(Debug)]
+    struct RealizedWidth {
+        requested: usize,
+        available: usize,
+        allowed: usize,
+        nodes: usize,
+        workers: usize,
+        pool_built: bool,
+        /// Physical cores covered by the child's allowed cpuset.
+        cores: usize,
+        /// Whether the workers' **planned** CPUs are on distinct physical cores.
+        /// `None` when the pool is unpinned or the topology is unreadable, so
+        /// there is no plan to check.
+        ///
+        /// This is the planner's output, not the machine's: it stays
+        /// `Some(true)` on a build whose pinning reports success and does
+        /// nothing. `realized` is the one that asks the kernel.
+        planned_distinct_cores: Option<bool>,
+        /// What the pool's workers *observed* about their own placement, as the
+        /// wire code of [`crate::decode_spmd::RealizedPlacement`]. The blind-spot
+        /// codes are distinct from `one-per-core`, so an unanswerable child can
+        /// never be read as a placed one.
+        realized: String,
+        /// Whether the placement the pool *reports* is the placement the OS
+        /// actually enforced, cross-checked against each worker's own observed
+        /// mask. `None` when the question is unanswerable (no affinity query on
+        /// this target, partially pinned pool, query failure). See
+        /// [`placement_is_honest`].
+        placement_honest: Option<bool>,
+        /// Whether every worker carries an applied pin. Distinct from
+        /// `planned_distinct_cores`, which answers `Some(false)` for a partially
+        /// pinned pool and so cannot say whether the cross-check is even
+        /// answerable.
+        fully_pinned: bool,
+        /// Whether every worker could read the affinity actually in force for
+        /// it.
+        ///
+        /// Named for the mechanism it now uses. It was `proc_readable` when the
+        /// cross-check scanned `/proc/self/task`; it is a per-thread
+        /// `sched_getaffinity` / `GetThreadGroupAffinity` now, and keeping the
+        /// old name would have left the parent's escape hatch below checking a
+        /// host fact that no longer has anything to do with it.
+        worker_masks_readable: bool,
+        /// Attempts the parent consumed to obtain this report. `1` on a clean
+        /// run; more means environmental crashes were retried away and this
+        /// number is the only in-band trace of them (#1745).
+        ///
+        /// On non-Linux targets the only *field access* is the Linux invariant
+        /// below, which `cfg` strips — and rustc's dead-code analysis
+        /// deliberately ignores the derived `Debug` that carries this into every
+        /// `{report:?}` assertion message. Without the `allow` the lanes that
+        /// actually see this crash (Windows ARM64, Windows x86_64, macOS arm64,
+        /// all built with `-D warnings`) fail to compile on a field that exists
+        /// to diagnose them.
+        #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+        attempts: u32,
+    }
+
+    /// Can this process query its own thread affinity at all?
+    ///
+    /// The parent's independent probe of the *same* capability the child's
+    /// cross-check depends on. Deliberately not a `/proc` read: the child asks
+    /// the kernel directly now, and excusing it on the strength of an unrelated
+    /// host fact would make the escape hatch a place for real failures to hide.
+    fn parent_cannot_query_its_own_affinity() -> bool {
+        crate::decode_affinity::observe_current_thread_cpus()
+            .cpus()
+            .is_none()
+    }
+
+    /// Encode a realized placement for the child's single marker line.
+    ///
+    /// Every blind spot gets its own code rather than a shared "unknown": the
+    /// parent has to be able to say *why* a child could not answer, and a code
+    /// that lumps "macOS has no affinity query" together with "the query failed
+    /// on Linux" would let the second hide behind the first's legitimate skip.
+    fn realized_placement_code(placement: &crate::decode_spmd::RealizedPlacement) -> &'static str {
+        use crate::decode_spmd::{PlacementBlindSpot, RealizedPlacement};
+        match placement {
+            RealizedPlacement::OneWorkerPerPhysicalCore => "one-per-core",
+            RealizedPlacement::SharedCore => "shared-core",
+            RealizedPlacement::Unpinned => "unpinned",
+            RealizedPlacement::Unobservable(PlacementBlindSpot::AffinityQueryUnsupported) => {
+                "no-affinity-query"
+            }
+            RealizedPlacement::Unobservable(PlacementBlindSpot::AffinityQueryFailed) => {
+                "affinity-query-failed"
+            }
+            RealizedPlacement::Unobservable(PlacementBlindSpot::TopologyUndetected) => {
+                "no-topology"
+            }
+        }
+    }
+
+    #[test]
+    fn every_realized_placement_has_its_own_wire_code() {
+        use crate::decode_spmd::{PlacementBlindSpot, RealizedPlacement};
+        let all = [
+            RealizedPlacement::OneWorkerPerPhysicalCore,
+            RealizedPlacement::SharedCore,
+            RealizedPlacement::Unpinned,
+            RealizedPlacement::Unobservable(PlacementBlindSpot::AffinityQueryUnsupported),
+            RealizedPlacement::Unobservable(PlacementBlindSpot::AffinityQueryFailed),
+            RealizedPlacement::Unobservable(PlacementBlindSpot::TopologyUndetected),
+        ];
+        let codes: std::collections::BTreeSet<&str> =
+            all.iter().map(realized_placement_code).collect();
+        // A collision would make two different facts indistinguishable on the
+        // wire, and the one that matters is a blind spot colliding with the
+        // success code -- exactly the failure this whole apparatus exists to
+        // prevent, reintroduced in the serializer.
+        assert_eq!(
+            codes.len(),
+            all.len(),
+            "two realized placements share a wire code: {codes:?}"
+        );
+        assert!(
+            !codes.contains("one-per-core")
+                || realized_placement_code(&RealizedPlacement::OneWorkerPerPhysicalCore)
+                    == "one-per-core"
+        );
+    }
+
+    /// Does the pool's reported placement match the placement in force?
+    ///
+    /// This is the **policy-neutral** half of the placement contract, and the
+    /// only half that stays true across a policy change. It asserts nothing
+    /// about *where* workers should run -- spread, compact, one per core, two
+    /// per core are all equally acceptable to it. It asserts only that
+    /// `worker_cpus()`, which is what a benchmark row's placement label is
+    /// derived from, is not a claim the process failed to carry out.
+    ///
+    /// That is the exact defect behind #1792: a runtime that reports
+    /// `realized=16 as_requested` and then runs on eight cores is not making a
+    /// trade-off, it is wrong -- and it is wrong regardless of which placement
+    /// policy is the right default.
+    ///
+    /// `None` when unanswerable: a partially pinned pool has no single
+    /// placement claim to check (a free worker is schedulable anywhere,
+    /// including onto a pinned worker's CPU), and a non-Linux or unreadable
+    /// `/proc` cannot answer at all.
+    fn placement_is_honest(pool: &crate::decode_spmd::SpmdDecodePools) -> Option<bool> {
+        let mut reported = pool.worker_cpus().to_vec();
+        // Fault injection, test-only by construction (this whole module is
+        // `cfg(test)`). Without it the end-to-end honesty assertion can only
+        // ever be observed passing: a real pool on a healthy host is honest,
+        // there is no way to ask it to lie, and an assertion never seen to fail
+        // is an assertion nobody has shown is connected to anything. This makes
+        // the child claim a CPU it is not on, which is exactly the #1792 shape.
+        if std::env::var_os(PLACEMENT_DISHONEST_ENV).is_some()
+            && let Some(slot) = reported.iter_mut().flatten().next()
+        {
+            *slot = slot.wrapping_add(1);
+        }
+        placement_verdict(&reported, pool_observed_affinities(pool))
+    }
+
+    /// The masks the pool's own workers read for themselves, in worker order.
+    ///
+    /// This replaced a `/proc/self/task` scan filtered on the `comm` prefix
+    /// `onnx-genai-spmd`, which could not be made correct: `comm` truncates at
+    /// 15 bytes and that prefix is exactly 15, so every worker of every pool in
+    /// the process was indistinguishable, and a second pool alive anywhere --
+    /// another test, a benchmark, a torn-down pool whose threads had not yet
+    /// exited -- silently joined the sample. Asking each worker to record its
+    /// own mask removes the ambiguity at the source.
+    ///
+    /// `None` when any worker could not read its own mask, which keeps
+    /// "unanswerable" distinct from "wrong".
+    fn pool_observed_affinities(
+        pool: &crate::decode_spmd::SpmdDecodePools,
+    ) -> Option<Vec<Vec<usize>>> {
+        let placements = pool.worker_placements();
+        if placements.is_empty() {
+            return None;
+        }
+        placements
+            .iter()
+            .map(|placement| placement.observed.cpus().map(<[usize]>::to_vec))
+            .collect()
+    }
+
+    /// The policy-neutral half of the placement contract, as a helper so the
+    /// sweep and the falsification test exercise the *same* assertion rather
+    /// than two similar-looking ones. A check the negative test does not go
+    /// through is a check the negative test does not cover.
+    fn assert_placement_is_honest(report: &RealizedWidth) {
+        if let Some(honest) = report.placement_honest {
+            assert!(
+                honest,
+                "requested width {} built a pool whose reported worker CPUs are not the CPUs \
+                 the kernel actually enforced, so any placement label derived from \
+                 `worker_cpus()` is a claim the process did not carry out ({report:?})",
+                report.requested
+            );
+        }
+    }
+    ///
+    /// Split out from the mask collection so the decision itself is testable
+    /// against synthetic inputs. The interesting cases -- a pin the kernel did
+    /// not apply, a reported CPU that is not the one in force -- cannot be
+    /// produced on demand by building a real pool, so a predicate that could
+    /// only ever be exercised through one would be a predicate nothing proves
+    /// can return `false`.
+    ///
+    /// `reported` is `worker_cpus()`: one slot per worker, `None` if unpinned.
+    /// `observed` is one CPU list per worker thread, in arbitrary order.
+    fn placement_verdict(
+        reported: &[Option<usize>],
+        observed: Option<Vec<Vec<usize>>>,
+    ) -> Option<bool> {
+        let mut reported: Vec<usize> = {
+            let pinned: Vec<usize> = reported.iter().flatten().copied().collect();
+            if pinned.len() != reported.len() || pinned.is_empty() {
+                return None;
+            }
+            pinned
+        };
+        let observed = observed?;
+        if observed.len() != reported.len() {
+            return None;
+        }
+        // A pinned thread is confined to exactly one CPU. Anything wider is a
+        // pin the kernel did not apply, which is precisely the dishonesty this
+        // predicate exists to catch -- so it is `Some(false)`, not `None`.
+        let mut actual = Vec::with_capacity(observed.len());
+        for list in observed {
+            match list.as_slice() {
+                [cpu] => actual.push(*cpu),
+                _ => return Some(false),
+            }
+        }
+        actual.sort_unstable();
+        reported.sort_unstable();
+        Some(actual == reported)
+    }
+
+    #[test]
+    fn placement_verdict_accepts_only_the_placement_actually_in_force() {
+        let pinned = [Some(2), Some(3)];
+
+        // Agreement, including when `/proc` enumerates threads in another
+        // order -- there is no thread-to-worker identity to preserve, because
+        // `comm` truncation makes the workers indistinguishable by name.
+        assert_eq!(
+            placement_verdict(&pinned, Some(vec![vec![2], vec![3]])),
+            Some(true)
+        );
+        assert_eq!(
+            placement_verdict(&pinned, Some(vec![vec![3], vec![2]])),
+            Some(true)
+        );
+
+        // The #1792 shape: the pool reports CPUs it is not on.
+        assert_eq!(
+            placement_verdict(&pinned, Some(vec![vec![2], vec![4]])),
+            Some(false)
+        );
+
+        // A pin that was reported but never applied: the thread is still free
+        // to run anywhere. `Some(false)`, not `None` -- the claim exists and is
+        // untrue.
+        assert_eq!(
+            placement_verdict(&pinned, Some(vec![vec![2], vec![0, 1, 2, 3]])),
+            Some(false)
+        );
+
+        // Unanswerable, and must not be scored: a partially pinned pool has no
+        // single claim (a free worker may sit on a pinned worker's CPU), a
+        // wholly unpinned pool makes no claim at all, and a thread count that
+        // does not line up means the read raced the pool.
+        assert_eq!(
+            placement_verdict(&[Some(2), None], Some(vec![vec![2], vec![3]])),
+            None
+        );
+        // The same case with the counts contrived to line up *after* the
+        // unpinned slot is dropped. Without this, discarding `None` slots and
+        // scoring the pinned subset is indistinguishable from rejecting the
+        // pool, because the length check masks it -- and the subset verdict is
+        // the dangerous one: it would let a pool with an entirely unplaced
+        // worker report an honest placement.
+        assert_eq!(
+            placement_verdict(&[Some(2), None], Some(vec![vec![2]])),
+            None
+        );
+        assert_eq!(placement_verdict(&[None, None], Some(vec![vec![2]])), None);
+        assert_eq!(placement_verdict(&[], Some(vec![])), None);
+        assert_eq!(placement_verdict(&pinned, Some(vec![vec![2]])), None);
+        assert_eq!(placement_verdict(&pinned, None), None);
+    }
+
+    /// Report the pool this process actually built. The width has to be
+    /// observed in a child because `pools()` is a process-wide `OnceLock`: the
+    /// first test to touch it fixes the width for every test after it, so a
+    /// width sweep is only measurable one process at a time.
+    #[test]
+    fn spmd_realized_width_subprocess() {
+        let _probe = lock_dispatch_probe();
+        let Ok(raw) = std::env::var(SPMD_WIDTH_CHILD_ENV) else {
+            return;
+        };
+        // `requested=0` marks the default-resolver arm in the report line: the
+        // parent did not ask for a width, so there is no requested value to
+        // echo and the only honest thing to print is "none".
+        let requested: usize = if raw == SPMD_WIDTH_CHILD_DEFAULT {
+            restrict_self_to_leader_cpus();
+            0
+        } else {
+            raw.parse().expect("the parent passes a decimal width")
+        };
+        let allowed = crate::decode_affinity::allowed_cpus().map_or(0, |cpus| cpus.len());
+        // Fails closed on a supported target: silently substituting the logical
+        // count for the physical one here would hand the parent an inflated
+        // `cores` and make its placement expectation trivially satisfiable.
+        let cores =
+            crate::core_topology::require_host_for_placement().map_or(allowed, |topology| {
+                crate::decode_affinity::allowed_cpus()
+                    .map_or(allowed, |cpus| topology.physical_cores_within(&cpus))
+            });
+        let (pool_built, workers, nodes, placement, honest, fully_pinned, realized, observed_ok) =
+            match crate::decode_spmd::pools() {
+                Some(pool) => {
+                    // Reported separately from `placement`, because
+                    // `planned_placement_is_one_worker_per_physical_core` answers
+                    // `Some(false)` for a *partially* pinned pool and so cannot
+                    // distinguish "every worker pinned, sharing cores" from
+                    // "some worker's pin failed". Only the latter makes the
+                    // `/proc` cross-check unanswerable, and the sweep's
+                    // anti-vacuity guard has to key off exactly that.
+                    let cpus = pool.worker_cpus();
+                    let fully_pinned = !cpus.is_empty() && cpus.iter().all(Option::is_some);
+                    (
+                        true,
+                        pool.total_workers(),
+                        pool.node_count(),
+                        pool.planned_placement_is_one_worker_per_physical_core(),
+                        placement_is_honest(pool),
+                        fully_pinned,
+                        realized_placement_code(&pool.realized_placement()),
+                        pool_observed_affinities(pool).is_some(),
+                    )
+                }
+                None => (false, 0, 0, None, None, false, "nopool", false),
+            };
+        let tri = |value: Option<bool>| match value {
+            Some(true) => "1",
+            Some(false) => "0",
+            None => "na",
+        };
+        println!(
+            "{SPMD_WIDTH_MARKER}requested={requested} available={} allowed={allowed} \
+             nodes={nodes} workers={workers} pool={} cores={cores} placement={} honest={} \
+             pinned={} proc={} realized={realized}",
+            available_parallelism(),
+            u8::from(pool_built),
+            tri(placement),
+            tri(honest),
+            u8::from(fully_pinned),
+            u8::from(observed_ok)
+        );
+        quiesce_pools_for_child_exit("spmd_realized_width");
+    }
+
+    /// Narrow this process to one CPU per physical core, in place.
+    ///
+    /// This is what `taskset -c 0,2,4,...` does to a benchmark run, and it is
+    /// the cpuset shape that #1780 got wrong: every allowed CPU is already a
+    /// distinct core, so a resolver that approximates cores as `available / 2`
+    /// silently halves the pool. Doing it from inside the child keeps the test
+    /// free of a `taskset` dependency and makes the mask an observable the
+    /// child reports (`allowed`/`cores`) rather than an assumption.
+    ///
+    /// Only Linux can do this. `set_current_thread_affinity` is a documented
+    /// no-op that returns `Err` everywhere else (see `decode_affinity.rs`), so
+    /// on those targets the leader-only cpuset cannot be constructed at all and
+    /// the caller must skip rather than assert. That is a different thing from
+    /// the restriction failing, which stays fatal on Linux.
+    fn restrict_self_to_leader_cpus() {
+        if !cfg!(target_os = "linux") {
+            return;
+        }
+        let Some(allowed) = crate::decode_affinity::allowed_cpus() else {
+            return;
+        };
+        let Ok(topology) = crate::core_topology::require_host_for_placement() else {
+            return;
+        };
+        let leaders = topology.leaders_within(&allowed);
+        if leaders.is_empty() {
+            return;
+        }
+        // A failure here is not silently tolerated: it would leave the child on
+        // the full cpuset, where `workers == cores` holds for the wrong reason
+        // and the assertion would pass without testing anything.
+        crate::decode_affinity::set_current_thread_affinity(&leaders)
+            .expect("restrict the child to leader CPUs");
+    }
+
+    fn realized_width_report(requested: usize) -> RealizedWidth {
+        realized_width_report_with(requested, false)
+    }
+
+    /// Spawn the child with **no** explicit width, on a leader-only cpuset, so
+    /// the default resolver is the thing under test.
+    fn realized_default_width_report() -> RealizedWidth {
+        realized_width_report_inner(SPMD_WIDTH_CHILD_DEFAULT, None, false)
+    }
+
+    fn realized_width_report_with(requested: usize, dishonest: bool) -> RealizedWidth {
+        let width = requested.to_string();
+        realized_width_report_inner(&width, Some(&width), dishonest)
+    }
+
+    fn realized_width_report_inner(
+        child_value: &str,
+        explicit_width: Option<&str>,
+        dishonest: bool,
+    ) -> RealizedWidth {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .arg("--exact")
+            .arg("kernels::matmul_nbits::tests::spmd_realized_width_subprocess")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env(SPMD_WIDTH_CHILD_ENV, child_value)
+            .env(crate::decode_spmd::PERSISTENT_POOL_ENV, "1")
+            .env_remove(crate::decode_affinity::DECODE_AFFINITY_ENV)
+            // The exact assertion assumes the `Fixed` schedule. Under `mlas` a
+            // work-stealing pool spawns a thread per shard with no inline
+            // dispatcher, so it never reclaims the reserved CPU and a fully
+            // subscribed request realizes `allowed - 1` lanes. Measured: with
+            // `--features mlas` and a steal schedule, width 32 builds 31. No
+            // lane runs this test that way today, so don't weaken the
+            // assertion for it -- just refuse to inherit the schedule, the
+            // same way this spawn refuses to inherit an affinity override.
+            .env_remove(crate::decode_spmd::DECODE_SCHEDULE_ENV)
+            .env_remove(SPMD_PARITY_CHILD_ENV);
+        // An explicit width bypasses the default resolver entirely, so the
+        // default arm has to remove both -- inheriting either one from the
+        // parent's own test environment would quietly turn the default arm
+        // into a second explicit-width arm that always passes.
+        match explicit_width {
+            Some(width) => {
+                command
+                    .env(DECODE_THREADS_ENV, width)
+                    .env("RAYON_NUM_THREADS", width);
+            }
+            None => {
+                command
+                    .env_remove(DECODE_THREADS_ENV)
+                    .env_remove("RAYON_NUM_THREADS");
+            }
+        }
+        // Never inherited: the sweep's honesty assertion would be meaningless
+        // if an ambient value could switch the injection on, and unfalsifiable
+        // if one could switch it off.
+        if dishonest {
+            command.env(PLACEMENT_DISHONEST_ENV, "1");
+        } else {
+            command.env_remove(PLACEMENT_DISHONEST_ENV);
+        }
+
+        // Bounded retry scoped to *exactly* the known environmental crash
+        // signature, for the same reason `run_affinity_defer_child` carries one:
+        // this child builds a pool of spinning workers, and on native Windows
+        // ARM64 that occasionally faults the whole process with
+        // `STATUS_ACCESS_VIOLATION` and empty stderr during pool build/teardown
+        // (see #1745). A real assertion failure prints a Rust panic and so still
+        // fails fast on the first attempt; on Linux this signature never occurs.
+        let mut stdout = String::new();
+        let mut attempts_used = 1;
+        for attempt in 1..=SPMD_WIDTH_CHILD_MAX_ATTEMPTS {
+            attempts_used = attempt;
+            let output = command
+                .output()
+                .expect("run the realized-width child process");
+            stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+
+            if is_environmental_access_violation_crash(
+                output.status.success(),
+                output.status.code(),
+                &stdout,
+                &stderr,
+                SPMD_WIDTH_MARKER,
+            ) && attempt < SPMD_WIDTH_CHILD_MAX_ATTEMPTS
+            {
+                record_environmental_retry(
+                    "spmd_realized_width",
+                    &format!("requested={child_value}"),
+                    attempt,
+                    SPMD_WIDTH_CHILD_MAX_ATTEMPTS,
+                );
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                continue;
+            }
+
+            assert!(
+                output.status.success(),
+                "realized-width child failed (requested={child_value}, status={}):\nstdout:\n{stdout}\n\
+                 stderr:\n{stderr}",
+                child_status_detail(&output.status)
+            );
+            break;
+        }
+
+        let report = stdout
+            .lines()
+            .find_map(|line| {
+                line.find(SPMD_WIDTH_MARKER)
+                    .map(|at| &line[at + SPMD_WIDTH_MARKER.len()..])
+            })
+            .unwrap_or_else(|| {
+                panic!("the child emitted no width report for child_value={child_value}:\n{stdout}")
+            });
+        let text = |key: &str| -> &str {
+            let needle = format!("{key}=");
+            report
+                .split_whitespace()
+                .find_map(|pair| pair.strip_prefix(&needle))
+                .unwrap_or_else(|| panic!("the width report is missing `{key}`: {report}"))
+        };
+        let field = |key: &str| -> usize {
+            text(key)
+                .parse()
+                .unwrap_or_else(|_| panic!("`{key}` is not a decimal count: {report}"))
+        };
+        let tri = |key: &str| -> Option<bool> {
+            match text(key) {
+                "1" => Some(true),
+                "0" => Some(false),
+                "na" => None,
+                other => panic!("`{key}` is not 1/0/na: {other}"),
+            }
+        };
+        let report = RealizedWidth {
+            requested: field("requested"),
+            available: field("available"),
+            allowed: field("allowed"),
+            nodes: field("nodes"),
+            workers: field("workers"),
+            pool_built: field("pool") == 1,
+            cores: field("cores"),
+            planned_distinct_cores: tri("placement"),
+            realized: text("realized").to_string(),
+            placement_honest: tri("honest"),
+            fully_pinned: field("pinned") == 1,
+            worker_masks_readable: field("proc") == 1,
+            attempts: attempts_used,
+        };
+
+        // A retry is only ever consumed for an exit code of exactly
+        // `STATUS_ACCESS_VIOLATION` (`0xC0000005`). A Linux exit status is
+        // `0..=255`, or absent when the child was signalled, so it cannot equal
+        // that NTSTATUS and the retry is structurally unreachable here. If this
+        // fires, either the signature widened or something genuinely new is
+        // crashing the child — both worth a red test rather than a silent
+        // retry, which is the failure mode #1745 is made of.
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            report.attempts, 1,
+            "a realized-width child consumed {} attempts on Linux, where the environmental \
+             STATUS_ACCESS_VIOLATION signature cannot occur ({report:?})",
+            report.attempts
+        );
+
+        report
+    }
+
+    /// A `t=N` label must mean N workers actually ran.
+    ///
+    /// The width a benchmark asks for is not the width it gets. An explicit
+    /// request is clamped to the host's logical CPUs by
+    /// `resolve_persistent_decode_threads_with_override`, and
+    /// `reserve_single_group_headroom` then frees a CPU for the inline
+    /// dispatcher whenever the request would occupy the whole allowed cpuset.
+    /// Neither reduction is visible to a harness that reports the number it
+    /// requested, and #1746 is what that costs: for a while every explicit
+    /// budget silently bought `N-1` compute lanes, and at `N=2` the single
+    /// remaining lane tripped the serial short-circuit and made the knob
+    /// indistinguishable from `=1`. Nothing failed; the numbers were just
+    /// answering a different question than their labels claimed.
+    ///
+    /// So assert the contract end to end, at the widths we actually publish,
+    /// against facts a child process observed about itself rather than against
+    /// a recomputation of the code under test.
+    ///
+    /// The assertion is exact at every width, including full subscription:
+    /// since #1748 the dispatcher owns the shard the reservation frees, so
+    /// `total_workers` counts compute lanes and equals the request. Verified
+    /// here under `taskset` at 1, 2, 4, 8 and 32 CPUs -- the fully-subscribed
+    /// case is the *common* one in production, because
+    /// `bound_process_to_decode_budget` confines the process to exactly the
+    /// budgeted CPUs at EP init.
+    /// A placement label the pool cannot back up must be *detected*, not just
+    /// computed.
+    ///
+    /// `every_benchmarked_decode_width_realizes_the_worker_count_it_requests`
+    /// asserts `honest`, but on a healthy host every pool is honest, so that
+    /// assertion is only ever observed passing and nothing shows it is wired to
+    /// anything. This drives one child with the reported placement deliberately
+    /// perturbed by a single CPU -- the minimum possible lie, and exactly the
+    /// #1792 shape of "reports one placement, runs another" -- and requires the
+    /// verdict to come back false.
+    ///
+    /// Linux-only for the harness, not for the property: the child is driven
+    /// through this crate's subprocess machinery. The *cross-check* itself is
+    /// per-thread `sched_getaffinity`/`GetThreadGroupAffinity` and is no longer
+    /// a `/proc` read, so the capability it actually needs is asserted below
+    /// rather than assumed from the target.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_pool_that_misreports_its_placement_is_caught_end_to_end() {
+        // The capability this test needs is the affinity *query*, not pinning
+        // and not `/proc`. Naming it here keeps the precondition attached to
+        // the mechanism: the previous version inherited its skip from the
+        // target triple, which was correct only while the cross-check read
+        // `/proc`.
+        if !crate::decode_affinity::affinity_observation_supported() {
+            eprintln!(
+                "skipping placement falsification: this target has no per-thread affinity \
+                 query, so a misreported placement is unobservable rather than false"
+            );
+            return;
+        }
+        let allowed = crate::decode_affinity::allowed_cpus().map_or(0, |cpus| cpus.len());
+        // Fails closed on the topology: this used to skip on
+        // `core_topology::host().is_none()`, so a detection regression turned
+        // the end-to-end falsification into a no-op that still reported green.
+        // A small cpuset is a legitimate skip (there is no second core to
+        // spread onto); an unanswerable topology on a supported target is not.
+        if let Err(reason) = crate::core_topology::require_host_for_placement() {
+            eprintln!("skipping placement falsification: {reason}");
+            return;
+        }
+        if allowed < 2 {
+            return;
+        }
+        let honest = realized_width_report_with(2, false);
+        let lying = realized_width_report_with(2, true);
+
+        // A pool that did not fully pin cannot be cross-checked at all, so the
+        // experiment below has no signal to read either way. Skip on the *host
+        // fact* rather than on the verdict: keying this off
+        // `placement_honest.is_none()` would let any defect that suppresses
+        // verdicts silence this test instead of failing it, which is the exact
+        // vacuity the sweep's guard exists to prevent. `fully_pinned` is
+        // reported independently of the verdict, so a suppressed verdict here
+        // is still a failure.
+        assert!(
+            honest.worker_masks_readable || parent_cannot_query_its_own_affinity(),
+            "this process can read its own thread affinity but the control child could \
+             not, so the cross-check is not running at all ({honest:?})"
+        );
+        if !honest.fully_pinned {
+            return;
+        }
+
+        // The control: the same width, same host, same code path, injection
+        // off. If this is not `Some(true)` the comparison below proves nothing,
+        // because a verdict that is never true cannot show that a false one
+        // means anything.
+        assert_eq!(
+            honest.placement_honest,
+            Some(true),
+            "the un-injected control did not produce an honest verdict, so the injected \
+             arm below is not a comparison ({honest:?})"
+        );
+        assert_eq!(
+            lying.placement_honest,
+            Some(false),
+            "a pool reporting a CPU it is not pinned to was not detected, so the honesty \
+             cross-check cannot see the defect it exists for ({lying:?})"
+        );
+
+        // And the assertion the sweep actually runs must reject it. Going
+        // through the same helper is the point: verifying the verdict alone
+        // would leave the sweep's own guard untested, which is how a check ends
+        // up computing the right answer and then not acting on it.
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let rejected = std::panic::catch_unwind(|| assert_placement_is_honest(&lying)).is_err();
+        std::panic::set_hook(previous);
+        assert!(
+            rejected,
+            "the sweep's placement-honesty assertion accepted a pool that misreports its \
+             own placement ({lying:?})"
+        );
+    }
+
+    /// A pinned run that does not name a width must still use every core it
+    /// was given.
+    ///
+    /// #1780: `taskset -c 0,2,4,...` hands the process a cpuset in which every
+    /// allowed CPU is already a distinct physical core. A resolver that
+    /// approximates the core count as `available / 2` then halves it, so the
+    /// pool builds on half the cores that were deliberately reserved for it.
+    /// #1794 fixed the resolver and covered
+    /// [`default_persistent_threads`] with unit tests over
+    /// `(available, allowed_physical_cores)`.
+    ///
+    /// Those unit tests cannot catch the regression that matters. They call the
+    /// pure function with the right second argument already in hand; the defect
+    /// was in what reached it. Plumb `None` into that call site and every one of
+    /// them still passes, because none of them builds a pool. This one does, on
+    /// a real leader-only cpuset, and asserts the property the benchmark record
+    /// actually depends on: **workers == cores**.
+    ///
+    /// It is the same shape as the rest of this sweep -- assert what the kernel
+    /// did, not what the resolver said about itself. The EP's own line was
+    /// `requested=8 realized=8 as_requested` throughout #1780: honest, agreed
+    /// with by every guard, and wrong, because the defect sat upstream of the
+    /// report in what "default" resolved to.
+    #[test]
+    fn a_default_width_pool_on_leader_cpus_uses_every_core_it_was_given() {
+        // Process-wide affinity masking is Linux-only, so on every other target
+        // the leader-only cpuset this test asserts about cannot be built. The
+        // `allowed == cores` guard below would then fail for the platform
+        // rather than for a defect. Skipping is loud rather than silent: an
+        // unexplained green here is exactly the vacuity the sweep exists to
+        // avoid, and the reason belongs in the log, not only in this comment.
+        if !cfg!(target_os = "linux") {
+            eprintln!(
+                "SKIP a_default_width_pool_on_leader_cpus_uses_every_core_it_was_given: \
+                 process-wide CPU affinity masking is implemented only on Linux, so a \
+                 leader-only cpuset cannot be constructed on this target"
+            );
+            return;
+        }
+
+        let report = realized_default_width_report();
+
+        if !report.pool_built {
+            // No persistent pool on this target: there is no placement to
+            // check, and inventing a pass here would be the vacuous case this
+            // sweep exists to avoid.
+            return;
+        }
+        if report.cores == 0 {
+            // Topology unreadable, so "one worker per core" is unanswerable.
+            return;
+        }
+
+        // The restriction has to have actually happened, or `workers == cores`
+        // below would hold for the wrong reason on the full cpuset.
+        assert_eq!(
+            report.allowed, report.cores,
+            "the child was asked to restrict itself to one CPU per physical \
+             core, so every allowed CPU must be a distinct core; allowed={} \
+             cores={} -- the restriction did not take, and the width assertion \
+             below would be testing nothing",
+            report.allowed, report.cores
+        );
+
+        assert_eq!(
+            report.workers,
+            report.cores,
+            "a default-width pool on a leader-only cpuset built {} workers on \
+             {} reserved cores. This is #1780: the run asked for no width, the \
+             resolver approximated the core count, and the pool silently used \
+             {} of the machine it was given. Every pinned benchmark that omits \
+             an explicit width measures this.",
+            report.workers,
+            report.cores,
+            if report.cores == 0 {
+                "part".to_string()
+            } else {
+                format!("{}/{}", report.workers, report.cores)
+            }
+        );
+
+        assert_eq!(
+            report.realized, "one-per-core",
+            "a default-width pool on a leader-only cpuset must realize one \
+             worker per physical core, got `{}`",
+            report.realized
+        );
+    }
+
+    #[test]
+    fn every_benchmarked_decode_width_realizes_the_worker_count_it_requests() {
+        // The published widths alone leave the interesting hole unprobed: on a
+        // host with more allowed CPUs than the largest of them, every case
+        // satisfies `effective < allowed`, so the dispatcher reservation is a
+        // no-op and full subscription -- the shape #1746 broke, and the shape
+        // production actually runs after `bound_process_to_decode_budget` --
+        // is never reached. Add one probe that asks for the whole cpuset.
+        let allowed_now = crate::decode_affinity::allowed_cpus().map_or(0, |cpus| cpus.len());
+        let mut widths: Vec<usize> = BENCHMARKED_DECODE_WIDTHS.to_vec();
+        if (2..=SPMD_WIDTH_FULL_SUBSCRIPTION_CAP).contains(&allowed_now)
+            && !widths.contains(&allowed_now)
+        {
+            widths.push(allowed_now);
+        }
+
+        let mut saw_full_subscription = false;
+        let mut saw_placement_check = false;
+        let mut saw_realized_placement_check = false;
+        for requested in widths {
+            let report = realized_width_report(requested);
+            assert_eq!(
+                report.requested, requested,
+                "the child echoed a width it was not asked for ({report:?})"
+            );
+
+            // A single-CPU cpuset leaves no core for the inline dispatcher
+            // alongside a spinning worker, so `build_from_env` documents a
+            // flat-path fallback rather than a self-starving pool.
+            if report.allowed == 1 {
+                assert!(
+                    !report.pool_built,
+                    "a single-CPU cpuset must fall back to the flat path, not build a \
+                     pool that starves its own dispatcher ({report:?})"
+                );
+                continue;
+            }
+            assert!(
+                report.pool_built,
+                "requested width {requested} built no persistent pool at all, so a decode \
+                 row labelled t={requested} never dispatched to one ({report:?})"
+            );
+
+            let effective = requested.min(report.available);
+
+            if report.nodes > 1 {
+                // `split_workers` + `reserve_split_headroom` rebalance per node,
+                // so only the bound is contractual on a NUMA host.
+                assert!(
+                    report.workers >= 1 && report.workers <= effective,
+                    "a NUMA-split pool realized {} workers, outside the contractual \
+                     1..={effective} ({report:?})",
+                    report.workers
+                );
+                continue;
+            }
+
+            saw_full_subscription |= report.allowed >= 2 && effective >= report.allowed;
+
+            // The placement half of the same label, in two parts that must not
+            // be confused with each other.
+            //
+            // (1) POLICY-NEUTRAL, always required: the placement the pool
+            // reports must be the placement actually in force. This is the
+            // #1792 defect -- the only user-facing placement control was inert,
+            // and a runtime that reports `realized=16 as_requested` while
+            // running somewhere else is wrong under *every* policy. Nothing
+            // here says where workers ought to run.
+            assert_placement_is_honest(&report);
+
+            // Anti-vacuity, per width rather than per sweep.
+            // `assert_placement_is_honest` is a no-op on `None`, so a verdict
+            // that stops being produced turns the check above into decoration
+            // that still passes.
+            //
+            // The condition is `fully_pinned && worker_masks_readable`, reported by the
+            // child, and deliberately *not* `distinct_cores.is_some()`. An
+            // earlier version used the latter and was wrong:
+            // `planned_placement_is_one_worker_per_physical_core` answers `Some(false)`
+            // for a partially pinned pool, while `placement_verdict` answers
+            // `None` for that same pool, so a single failed
+            // `sched_setaffinity` -- a CPU offlined or dropped from the cpuset
+            // between assignment and pin -- would have tripped this assertion
+            // on a legitimately configured host. A false failure here is worse
+            // than a missed detection, because the cheap way out of it is to
+            // weaken the guard back into decoration.
+            //
+            // `None` remains the correct answer for an unpinned or partially
+            // pinned pool, and demanding a verdict there would assert a pinning
+            // policy this half of the test is specifically not allowed to
+            // assert.
+            //
+            // An earlier version also accumulated `saw_honesty_check |= ...`
+            // across the sweep and asserted it once at the end. The mutation
+            // battery showed that guard was never load-bearing: its
+            // precondition was identical to the skip condition of
+            // `a_pool_that_misreports_its_placement_is_caught_end_to_end`,
+            // whose control arm already asserts `Some(true)` at width 2 -- a
+            // strictly stronger claim -- and one width contributing satisfied
+            // it for all five. The per-width form catches what neither did:
+            // verdicts disappearing for widths 4/8/16 while width 2 keeps
+            // working.
+            // Asserting mask readability rather than skipping on it is what
+            // keeps "the cross-check was disabled outright" a failure instead
+            // of a silent skip -- an earlier version tolerated it and the
+            // mutation battery immediately showed P4 escaping through it.
+            //
+            // The escape hatch is the *parent's own* probe of the *same
+            // mechanism*, not a tolerated `false`. It used to be a
+            // `read_dir("/proc/self/task")`, which was the right cross-signal
+            // while the child scanned `/proc` -- and became the wrong one the
+            // moment the child switched to `sched_getaffinity`. A container
+            // with `/proc` mounted normally and a seccomp policy denying
+            // `sched_getaffinity` would then have failed here for a legitimate
+            // host limitation. Probing the query the child actually uses keeps
+            // the escape hatch tied to the capability it is excusing, and it is
+            // still independent of whatever the child's cross-check does, so a
+            // broken cross-check on a healthy host still fails.
+            assert!(
+                report.worker_masks_readable || parent_cannot_query_its_own_affinity(),
+                "width {requested}: this process can read its own thread affinity but the \
+                 child could not, so the failure is in the cross-check rather than the host \
+                 -- the placement cross-check is not running ({report:?})"
+            );
+
+            assert!(
+                !(report.fully_pinned && report.worker_masks_readable)
+                    || report.placement_honest.is_some(),
+                "width {requested}: every worker is pinned and every mask was readable, so the \
+                 cross-check was answerable, yet no honesty verdict came back -- \
+                 `worker_cpus()` went unverified at this width and the #1792 class is \
+                 unguarded here ({report:?})"
+            );
+
+            // The other direction, so the guard above cannot be silenced by
+            // misreporting the host fact it keys off: a verdict is only
+            // producible from a fully pinned pool, so one that exists while
+            // `pinned=0` means the two disagree and one of them is lying.
+            assert!(
+                report.placement_honest.is_none()
+                    || (report.fully_pinned && report.worker_masks_readable),
+                "width {requested}: a placement verdict was produced while the child \
+                 reports it could not have produced one (pinned={}, proc={}), so the \
+                 honesty check and the host facts its guard keys off disagree about the \
+                 same pool ({report:?})",
+                report.fully_pinned,
+                report.worker_masks_readable
+            );
+
+            // (2) POLICY-DEPENDENT, and deliberately labelled as such: one
+            // worker per physical core is #1729's *spread* policy, not a law.
+            // It is measured better on a quiet host and measured ~26% worse
+            // with a single ~90% co-tenant, because a compact pool leaves half
+            // the box for the co-tenant to land on. The standing user direction
+            // (`.squad/decisions/inbox/copilot-cpu-shared-host-default-2026-08-23.md`,
+            // via #1729) is that a policy which wins only under exclusive
+            // quiet-host conditions is not a valid default, so this assertion
+            // may legitimately have to change.
+            //
+            // If it does, change it *deliberately* -- it is an assertion about
+            // the policy that is currently shipped, not about correctness. Do
+            // not "fix" it by loosening it to match whatever the pool did,
+            // which would delete the check; and do not read a failure here as a
+            // regression without first deciding which policy is intended. Part
+            // (1) above is the part that must survive that decision intact.
+            //
+            // Only assert where one-per-core is achievable: past the core
+            // budget the workers must double up, and demanding otherwise would
+            // fail the host, not the code.
+            if report.workers <= report.cores && report.planned_distinct_cores.is_some() {
+                assert_eq!(
+                    report.planned_distinct_cores,
+                    Some(true),
+                    "requested width {requested} realized {} workers that share physical \
+                     cores on a host with {} cores available, so a decode row labelled \
+                     t={requested} ran on fewer front ends than its label implies. This is \
+                     an assertion about the currently shipped spread policy ({report:?})",
+                    report.workers,
+                    report.cores
+                );
+            }
+            saw_placement_check |=
+                report.workers <= report.cores && report.planned_distinct_cores.is_some();
+
+            // (3) The same policy claim, asked of the kernel instead of the
+            // planner. (2) reads `worker_cpus()`, which is the assignment plus
+            // whatever the pin call *returned*, so it survives a build whose
+            // pinning does nothing and reports success. This one reads the mask
+            // each worker read for itself.
+            //
+            // Blind spots are named, and none of them is `one-per-core`: a
+            // child that could not answer fails the guard below rather than
+            // passing this one. Conditioned on the affinity query existing --
+            // `fully_pinned` reports the *pinning* capability, and a target
+            // that can pin without being able to read a mask back would fail
+            // this for a host limitation rather than a defect. The guard
+            // immediately after is what stops that condition from becoming an
+            // escape: where the query does exist, a child claiming it does not
+            // is a defect in the apparatus.
+            if crate::decode_affinity::affinity_observation_supported()
+                && report.fully_pinned
+                && report.workers <= report.cores
+            {
+                assert_eq!(
+                    report.realized, "one-per-core",
+                    "requested width {requested}: every worker reports an applied pin and the                      host has room, but the placement the workers actually observed for                      themselves is `{}` -- so the label t={requested} describes a placement                      the kernel did not enforce ({report:?})",
+                    report.realized
+                );
+            }
+            assert!(
+                !crate::decode_affinity::affinity_observation_supported()
+                    || report.realized != "no-affinity-query",
+                "width {requested}: this target has a per-thread affinity query, yet the                  child reported it had none -- the realized-placement observation is                  switched off, which is the exact shape of a check that cannot fail                  ({report:?})"
+            );
+            saw_realized_placement_check |=
+                crate::decode_affinity::affinity_observation_supported()
+                    && report.fully_pinned
+                    && report.workers <= report.cores;
+
+            assert_eq!(
+                report.workers, effective,
+                "requested width {requested} realized {} compute lanes, not the {effective} \
+                 it asked for ({report:?}) -- a decode benchmark row labelled t={requested} \
+                 would be reporting a width it never ran",
+                report.workers
+            );
+        }
+
+        // Say out loud when only the easy half ran. On a host with more allowed
+        // CPUs than the probe cap, no swept width reaches full subscription --
+        // so the dispatcher-shard path that #1746 broke goes unexercised and a
+        // green run here would mean less than it appears to. Derive this from
+        // what the children reported rather than from host assumptions, and
+        // only require it where the probe was actually capable of firing.
+        if (2..=SPMD_WIDTH_FULL_SUBSCRIPTION_CAP).contains(&allowed_now) {
+            assert!(
+                saw_full_subscription,
+                "no swept width reached full subscription on a {allowed_now}-CPU cpuset, so \
+                 the reservation path went untested and only the no-op half of the contract \
+                 was checked -- the full-subscription probe is not doing its job"
+            );
+        }
+
+        // Same reasoning for the placement half: if no swept width was pinned
+        // and inside the core budget, every placement assertion above was
+        // skipped and this test verified width only -- exactly the blind spot
+        // it was extended to close. An unpinned host is a legitimate reason,
+        // but it has to be stated rather than silently passed.
+        //
+        // The condition was `allowed_now >= 2 && core_topology::host().is_some()`
+        // and that second term made the guard self-defeating: it is predicated
+        // on the runtime success of the very call whose failure it exists to
+        // report, so a detection regression silenced the placement checks *and*
+        // this guard together, and the sweep still passed. It is now keyed on
+        // `DETECTION_SUPPORTED`, a compile-time property of the target, which
+        // cannot become false on a host that should have answered --
+        // `require_host_for_placement` panics there instead.
+        if crate::core_topology::DETECTION_SUPPORTED {
+            crate::core_topology::require_host_for_placement()
+                .expect("DETECTION_SUPPORTED targets must resolve a topology or panic");
+        }
+        if allowed_now >= 2 && crate::core_topology::DETECTION_SUPPORTED {
+            assert!(
+                saw_placement_check,
+                "no swept width produced a checkable *planned* placement on a \
+                 {allowed_now}-CPU cpuset, so the planner's core layout went unasserted \
+                 and only the worker count was verified"
+            );
+            // Separate counter from `saw_placement_check`, because the two can
+            // diverge in exactly the direction that matters: the planned check
+            // needs only a topology, while the realized one needs pins that
+            // actually took. A single flag would let the planner's assertions
+            // vouch for a realized check that never ran.
+            assert!(
+                saw_realized_placement_check
+                    || !crate::decode_affinity::pinning_supported()
+                    || !crate::decode_affinity::affinity_observation_supported(),
+                "no swept width produced a checkable *realized* placement on a \
+                 {allowed_now}-CPU cpuset that supports pinning and can read affinity \
+                 back, so every assertion about where the workers actually ran was \
+                 skipped and the sweep verified only what the planner intended"
+            );
+        }
     }
 
     #[test]
@@ -15861,7 +21124,8 @@ mod tests {
             .expect("run MLAS-shard parity child process");
         assert!(
             output.status.success(),
-            "MLAS-shard parity child failed (no_shard={no_shard}):\nstdout:\n{}\nstderr:\n{}",
+            "MLAS-shard parity child failed (no_shard={no_shard}, status={}):\nstdout:\n{}\nstderr:\n{}",
+            child_status_detail(&output.status),
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
@@ -16126,7 +21390,8 @@ mod tests {
             .expect("run MLAS prefill parity child process");
         assert!(
             output.status.success(),
-            "MLAS prefill parity child failed (serial={serial}):\nstdout:\n{}\nstderr:\n{}",
+            "MLAS prefill parity child failed (serial={serial}, status={}):\nstdout:\n{}\nstderr:\n{}",
+            child_status_detail(&output.status),
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
@@ -16418,60 +21683,21 @@ mod tests {
             }
             other => panic!("unknown affinity-defer scenario `{other}`"),
         }
-        // Deterministically stop and join the persistent pool's workers before
-        // this child process exits. The pool lives in a module-level `static`,
-        // which Rust never `Drop`s at exit, so without this join the forced
-        // scenario's hot worker threads would still be spinning/parked on
-        // `Arc<SharedState>` while the process tears down its runtime -- the
-        // race that intermittently faulted this child with an empty-stderr
-        // `STATUS_ACCESS_VIOLATION` (0xC0000005) on native Windows ARM64. It is a
-        // no-op for the auto scenarios (they build no pool).
-        crate::decode_spmd::shutdown_pools();
+        record_child_stage("affinity_defer", "body-complete");
+        // Through the shared helper so all three pool-building children have one
+        // teardown path rather than one that was fixed and two that were not --
+        // which is how #1745 came to be reported against the other two. The
+        // order here (teardown, then marker) is this child's existing one and is
+        // deliberately left alone; see `quiesce_pools_for_child_exit`.
+        quiesce_pools_for_child_exit("affinity_defer");
         println!("{AFFINITY_DEFER_MARKER}ok");
     }
-
-    /// The NTSTATUS code Windows reports for `STATUS_ACCESS_VIOLATION`
-    /// (`0xC0000005`) surfaced through `ExitStatus::code()` as a signed `i32`.
-    /// `ExitStatus::code()` is cross-platform, so this constant compiles on every
-    /// target; the crash it names only ever occurs on native Windows ARM64.
-    const STATUS_ACCESS_VIOLATION: i32 = -1_073_741_819;
 
     /// Total attempts allowed for a single affinity-defer child run before we give
     /// up and surface a failure. One nominal attempt plus two retries: the
     /// environmental crash is rare, so a small bound reliably rides through it
     /// without masking a persistent problem.
     const AFFINITY_DEFER_CHILD_MAX_ATTEMPTS: u32 = 3;
-
-    /// Classify an unsuccessful affinity-defer child exit as the *known
-    /// environmental* `STATUS_ACCESS_VIOLATION` crash (retryable) versus a real
-    /// test failure (not retryable). Extracted as a pure function so the exact
-    /// signature is unit-testable and the retry stays narrowly scoped.
-    ///
-    /// All four conditions must hold to treat the exit as the environmental flake:
-    ///   1. the child exited unsuccessfully (`success` is `false`), AND
-    ///   2. it emitted no success marker (`{AFFINITY_DEFER_MARKER}ok`), AND
-    ///   3. its stderr shows no Rust panic (no `panicked at` / `assertion`
-    ///      text) — a genuine assertion failure must fail fast, never retry, AND
-    ///   4. the exit code is exactly the Windows `STATUS_ACCESS_VIOLATION`
-    ///      NTSTATUS. Matching that specific code keeps the retry Windows-only in
-    ///      practice while the code stays portable.
-    fn is_environmental_access_violation_crash(
-        success: bool,
-        exit_code: Option<i32>,
-        stdout: &str,
-        stderr: &str,
-    ) -> bool {
-        if success {
-            return false;
-        }
-        if stdout.contains(&format!("{AFFINITY_DEFER_MARKER}ok")) {
-            return false;
-        }
-        if stderr.contains("panicked at") || stderr.contains("assertion") {
-            return false;
-        }
-        exit_code == Some(STATUS_ACCESS_VIOLATION)
-    }
 
     fn run_affinity_defer_child(scenario: &str, affinity: &str, forced: bool) {
         // Worker/Rayon thread count for the child. The `forced` scenario builds
@@ -16522,11 +21748,14 @@ mod tests {
                 output.status.code(),
                 &stdout,
                 &stderr,
+                &format!("{AFFINITY_DEFER_MARKER}ok"),
             ) && attempt < AFFINITY_DEFER_CHILD_MAX_ATTEMPTS
             {
-                eprintln!(
-                    "note: retrying affinity-defer child (scenario={scenario}) after \
-                     environmental STATUS_ACCESS_VIOLATION crash, attempt {attempt}"
+                record_environmental_retry(
+                    "affinity_defer",
+                    &format!("scenario={scenario}"),
+                    attempt,
+                    AFFINITY_DEFER_CHILD_MAX_ATTEMPTS,
                 );
                 std::thread::sleep(std::time::Duration::from_millis(100));
                 continue;
@@ -16538,8 +21767,9 @@ mod tests {
             // still surfaced with full scenario/stdout/stderr context.
             assert!(
                 output.status.success(),
-                "affinity-defer child failed (scenario={scenario}):\nstdout:\n{stdout}\n\
-                 stderr:\n{stderr}"
+                "affinity-defer child failed (scenario={scenario}, status={}):\nstdout:\n{stdout}\n\
+                 stderr:\n{stderr}",
+                child_status_detail(&output.status)
             );
             assert!(
                 stdout.contains(&format!("{AFFINITY_DEFER_MARKER}ok")),
@@ -16593,6 +21823,7 @@ mod tests {
             Some(STATUS_ACCESS_VIOLATION),
             "",
             "",
+            &marker_ok,
         ));
 
         // A successful run is never retryable, regardless of exit code.
@@ -16601,6 +21832,7 @@ mod tests {
             Some(STATUS_ACCESS_VIOLATION),
             &marker_ok,
             "",
+            &marker_ok,
         ));
 
         // A real assertion failure (Rust panic in stderr) must fail fast.
@@ -16609,6 +21841,7 @@ mod tests {
             Some(STATUS_ACCESS_VIOLATION),
             "",
             "thread 'main' panicked at src/foo.rs:1:1:\nassertion failed",
+            &marker_ok,
         ));
 
         // Any other non-success exit code is not the known signature.
@@ -16616,10 +21849,11 @@ mod tests {
             false,
             Some(1),
             "",
-            ""
+            "",
+            &marker_ok,
         ));
         assert!(!is_environmental_access_violation_crash(
-            false, None, "", ""
+            false, None, "", "", &marker_ok,
         ));
 
         // Even with the access-violation code, an emitted success marker means the
@@ -16629,6 +21863,27 @@ mod tests {
             Some(STATUS_ACCESS_VIOLATION),
             &marker_ok,
             "",
+            &marker_ok,
+        ));
+
+        // The marker is per-caller: the realized-width child emits a different
+        // token, and classifying it against the affinity marker would call a
+        // completed run environmental. Each caller's own marker must be the one
+        // that suppresses the retry.
+        let width_report = format!("{SPMD_WIDTH_MARKER}requested=2 workers=2");
+        assert!(!is_environmental_access_violation_crash(
+            false,
+            Some(STATUS_ACCESS_VIOLATION),
+            &width_report,
+            "",
+            SPMD_WIDTH_MARKER,
+        ));
+        assert!(is_environmental_access_violation_crash(
+            false,
+            Some(STATUS_ACCESS_VIOLATION),
+            &width_report,
+            "",
+            &marker_ok,
         ));
     }
 
@@ -16686,9 +21941,7 @@ mod tests {
         let below = at - 1;
 
         let _guard = backend_env_lock().lock().unwrap();
-        let previous = std::env::var("NXRT_CPU_GEMM_BACKEND").ok();
-        // SAFETY: the backend env lock serializes readers/writers of this var.
-        unsafe { std::env::set_var("NXRT_CPU_GEMM_BACKEND", "mlas") };
+        let _env = crate::test_support::EnvVarGuard::set("NXRT_CPU_GEMM_BACKEND", "mlas");
 
         let call = |m: usize| {
             let a = pseudo(m * k, 0.8);
@@ -16710,14 +21963,6 @@ mod tests {
 
         let decode = call(below);
         let prefill = call(at);
-
-        // SAFETY: still holding the backend env lock; restore prior value.
-        unsafe {
-            match &previous {
-                Some(value) => std::env::set_var("NXRT_CPU_GEMM_BACKEND", value),
-                None => std::env::remove_var("NXRT_CPU_GEMM_BACKEND"),
-            }
-        }
 
         if hand_int8_decode_has_native_dot() {
             assert_eq!(
@@ -16788,9 +22033,7 @@ mod tests {
         let kernel = accuracy4_kernel(k, n, block_size);
 
         let _guard = backend_env_lock().lock().unwrap();
-        let previous = std::env::var("NXRT_CPU_GEMM_BACKEND").ok();
-        // SAFETY: the backend env lock serializes readers/writers of this var.
-        unsafe { std::env::set_var("NXRT_CPU_GEMM_BACKEND", "mlas") };
+        let _env = crate::test_support::EnvVarGuard::set("NXRT_CPU_GEMM_BACKEND", "mlas");
 
         let a = pseudo(k, 0.8);
         let mut result = vec![0.0f32; n];
@@ -16807,14 +22050,6 @@ mod tests {
                 &mut result,
             )
             .unwrap();
-
-        // SAFETY: still holding the backend env lock; restore prior value.
-        unsafe {
-            match &previous {
-                Some(value) => std::env::set_var("NXRT_CPU_GEMM_BACKEND", value),
-                None => std::env::remove_var("NXRT_CPU_GEMM_BACKEND"),
-            }
-        }
 
         assert_eq!(
             routed, None,
@@ -16861,9 +22096,7 @@ mod tests {
         let scales_t = Owned::f32(&[n, k_blocks], &scales);
 
         let _guard = backend_env_lock().lock().unwrap();
-        let previous = std::env::var("NXRT_CPU_GEMM_BACKEND").ok();
-        // SAFETY: the backend env lock serializes readers/writers of this var.
-        unsafe { std::env::set_var("NXRT_CPU_GEMM_BACKEND", "mlas") };
+        let _env = crate::test_support::EnvVarGuard::set("NXRT_CPU_GEMM_BACKEND", "mlas");
 
         let a = pseudo(k, 0.8);
         let mut result = vec![0.0f32; n];
@@ -16880,14 +22113,6 @@ mod tests {
                 &mut result,
             )
             .unwrap();
-
-        // SAFETY: still holding the backend env lock; restore prior value.
-        unsafe {
-            match &previous {
-                Some(value) => std::env::set_var("NXRT_CPU_GEMM_BACKEND", value),
-                None => std::env::remove_var("NXRT_CPU_GEMM_BACKEND"),
-            }
-        }
 
         assert_eq!(
             served,
@@ -16942,12 +22167,10 @@ mod tests {
         let a = pseudo(k, 0.8);
 
         let _guard = backend_env_lock().lock().unwrap();
-        let previous = std::env::var("NXRT_CPU_GEMM_BACKEND").ok();
-        // SAFETY: the backend env lock serializes readers/writers of this var.
         // Force a non-MLAS backend to model the real-world default: MLAS SQNBit
         // routing for accuracy_level != 4 must not depend on the dense-GEMM
         // backend being MLAS.
-        unsafe { std::env::set_var("NXRT_CPU_GEMM_BACKEND", "generic") };
+        let _env = crate::test_support::EnvVarGuard::set("NXRT_CPU_GEMM_BACKEND", "generic");
         assert_ne!(
             crate::backend::CpuBackend::auto_detect(),
             crate::backend::CpuBackend::Mlas,
@@ -16974,14 +22197,6 @@ mod tests {
 
         let (acc0_served, acc0_result) = call(&test_kernel(k, n, block_size));
         let (acc4_served, _) = call(&accuracy4_kernel(k, n, block_size));
-
-        // SAFETY: still holding the backend env lock; restore prior value.
-        unsafe {
-            match &previous {
-                Some(value) => std::env::set_var("NXRT_CPU_GEMM_BACKEND", value),
-                None => std::env::remove_var("NXRT_CPU_GEMM_BACKEND"),
-            }
-        }
 
         assert_eq!(
             acc0_served,
@@ -17013,6 +22228,7 @@ mod tests {
     #[test]
     #[ignore = "perf probe; run explicitly with --ignored --nocapture"]
     fn matmulnbits_mlas_perf() {
+        let _probe = lock_dispatch_probe();
         use std::time::Instant;
 
         fn time<F: FnMut() + Send>(threads: usize, mut run: F) -> f64 {
@@ -17280,6 +22496,7 @@ mod tests {
     #[test]
     #[ignore = "perf probe; run explicitly with --ignored --nocapture"]
     fn int4_gemv_decode_microbench() {
+        let _probe = lock_dispatch_probe();
         use std::time::Instant;
 
         // Median-of-5 ns/call for one warm, L3-resident M=1 GEMV.
@@ -17399,6 +22616,7 @@ mod tests {
     #[test]
     #[ignore = "perf probe; run explicitly with --ignored --nocapture"]
     fn matmulnbits_mlas_decode_step() {
+        let _probe = lock_dispatch_probe();
         use std::time::Instant;
 
         // (K, N, count-per-token) for one Qwen2.5-Coder-7B decode step.
@@ -17773,6 +22991,70 @@ mod tests {
         assert_eq!(deferred_decode_width(), None);
     }
 
+    /// The SPMD decode pool is not a Rayon pool, so its fan-out grain must come
+    /// from its own worker count.
+    ///
+    /// `output_chunk_len` reads `rayon::current_num_threads()`, which describes
+    /// an executor the SPMD pool never dispatches to. When the ambient pool is
+    /// narrower than the SPMD pool the shared rule collapses to "run it all
+    /// serially", and `dispatch_output_rows` then hands the whole projection to
+    /// the dispatcher thread while every SPMD worker sits spinning --
+    /// `RAYON_NUM_THREADS=1` cost 14.2x on the `qwen` int4 decode loop.
+    /// `output_chunk_len_for` takes the width as an argument so the partition
+    /// matches the executor that will actually run it.
+    #[test]
+    fn the_spmd_grain_is_independent_of_the_ambient_rayon_width() {
+        let (n, k) = (4096usize, 1024usize);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("one-thread pool");
+
+        let (ambient, explicit) = pool.install(|| {
+            (
+                output_chunk_len(n, k),
+                output_chunk_len_for(rayon::current_num_threads().max(16), n, k),
+            )
+        });
+
+        assert_eq!(
+            ambient, n,
+            "a one-wide ambient pool must not split the output -- this is the \
+             value the SPMD pool used to read"
+        );
+        assert!(
+            explicit < n,
+            "a 16-wide SPMD pool must still split the output when the ambient \
+             Rayon pool is one thread (got {explicit} for n = {n})"
+        );
+    }
+
+    /// The width argument, not the ambient pool, is what moves the grain.
+    #[test]
+    fn output_chunk_len_for_matches_the_ambient_rule_at_the_ambient_width() {
+        let (n, k) = (6144usize, 4096usize);
+        assert_eq!(
+            output_chunk_len(n, k),
+            output_chunk_len_for(effective_fan_out_width(), n, k),
+            "the ambient wrapper must be exactly the width-taking rule applied \
+             to the ambient width"
+        );
+        assert_eq!(
+            output_chunk_len_for(1, n, k),
+            n,
+            "one worker cannot split the output"
+        );
+        assert_eq!(
+            output_chunk_len_for(0, n, k),
+            n,
+            "a zero width must degrade to serial, not divide by zero"
+        );
+        assert!(
+            output_chunk_len_for(16, n, k) <= output_chunk_len_for(2, n, k),
+            "more workers must not produce a coarser partition"
+        );
+    }
+
     /// The fallback half: work that genuinely routes to Rayon must still run,
     /// and correctly, with the decode pool built on demand underneath it. A
     /// deferred width below `MIN_ROUTED_FAN_OUT_WIDTH` is the `Wide` arm.
@@ -18009,6 +23291,7 @@ mod tests {
     /// guarantee as the task-runtime path.
     #[test]
     fn parallel_output_rows_repeated_covers_every_output_on_the_wide_path() {
+        let _probe = lock_dispatch_probe();
         use std::sync::atomic::{AtomicU32, Ordering};
 
         let (n, k) = (4096usize, 1024usize);
@@ -18035,6 +23318,111 @@ mod tests {
                 *value, index as f32,
                 "output {index} got the wrong `output_start`"
             );
+        }
+    }
+
+    #[test]
+    fn budget_within_physical_cores_is_not_worth_warning_about() {
+        assert_eq!(super::budget_beyond_physical_cores(16, Some(16)), None);
+        assert_eq!(super::budget_beyond_physical_cores(8, Some(16)), None);
+        assert_eq!(super::budget_beyond_physical_cores(1, Some(16)), None);
+    }
+
+    #[test]
+    fn budget_past_physical_cores_reports_the_core_count() {
+        assert_eq!(super::budget_beyond_physical_cores(32, Some(16)), Some(16));
+        assert_eq!(super::budget_beyond_physical_cores(17, Some(16)), Some(16));
+    }
+
+    /// An unknown topology is never an occasion to warn: the whole point of the
+    /// warning is that we know the request cannot pay for itself, and without a
+    /// core count we do not know that.
+    #[test]
+    fn unknown_topology_never_warns() {
+        assert_eq!(super::budget_beyond_physical_cores(1024, None), None);
+    }
+
+    /// A zero core count means detection returned something meaningless rather
+    /// than a real single-core host, so it is treated as unknown.
+    #[test]
+    fn zero_physical_cores_is_treated_as_unknown() {
+        assert_eq!(super::budget_beyond_physical_cores(32, Some(0)), None);
+    }
+
+    /// The int4 prefill GEBP crossover is size-aware: a weight that stays
+    /// L2-resident across rows keeps the column-blocked kernel ahead twice as
+    /// long, so it must not be handed the same row threshold as a weight that
+    /// streams from DRAM every row block.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn int4_prefill_gebp_crossover_is_size_aware() {
+        // qwen3-0.6B QKV: k=1024, n=2048+256+256 -> 1.0 MB packed.
+        let small = 1024 * 2560 / 2;
+        // llama3-8B QKV: k=4096, n=4096+1024+1024 -> 12.6 MB packed.
+        let large = 4096 * 6144 / 2;
+        assert!(small <= INT4_PREFILL_GEBP_L2_RESIDENT_BYTES);
+        assert!(large > INT4_PREFILL_GEBP_L2_RESIDENT_BYTES);
+
+        assert_eq!(
+            int4_prefill_gebp_min_rows(small, 32),
+            INT4_PREFILL_GEBP_MIN_ROWS_L2_RESIDENT,
+            "an L2-resident weight measured its crossover at m=6"
+        );
+        assert_eq!(
+            int4_prefill_gebp_min_rows(large, 32),
+            INT4_PREFILL_GEBP_MIN_ROWS,
+            "a DRAM-streaming weight measured its crossover at m=3"
+        );
+        // The resident threshold is the later one; swapping them would regress
+        // the small shape by 1.37x at m=4.
+        const {
+            assert!(INT4_PREFILL_GEBP_MIN_ROWS < INT4_PREFILL_GEBP_MIN_ROWS_L2_RESIDENT);
+        }
+    }
+
+    /// A 16-element block cannot enter either column-blocked kernel, so below
+    /// its crossover it falls to a scalar per-block dot on the narrow decode
+    /// pool rather than to a rival kernel. That is why its threshold is the
+    /// lowest of the three rather than, as the name once implied, a
+    /// conservative one.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn int4_prefill_gebp_crossover_holds_for_blocks_the_row_kernels_reject() {
+        let large = 4096 * 6144 / 2;
+        let small = 1024 * 2560 / 2;
+        for bytes in [small, large] {
+            assert_eq!(
+                int4_prefill_gebp_min_rows(bytes, 16),
+                INT4_PREFILL_GEBP_MIN_ROWS_UNBLOCKED,
+                "block_size=16 has no column-blocked kernel to hand off to"
+            );
+        }
+        // Every block size the retune applies to is one those kernels accept.
+        for block_size in [32usize, 64, 128, 256] {
+            assert!(block_size.is_multiple_of(32));
+            assert!(int4_prefill_gebp_min_rows(large, block_size) >= INT4_PREFILL_GEBP_MIN_ROWS);
+        }
+        // This gate is reachable at exactly one block size. `MatMulNBits`
+        // rejects block sizes that are not a power of two `>= 16`, and 16 is
+        // the only such size that is not a multiple of 32. If that validation
+        // ever widens, the decode-loop measurement behind the value below
+        // covers block 16 only and has to be re-run for whatever else arrives.
+        for block_size in [16usize, 32, 64, 128, 256, 512] {
+            let unblocked = int4_prefill_gebp_min_rows(large, block_size)
+                == INT4_PREFILL_GEBP_MIN_ROWS_UNBLOCKED
+                && !block_size.is_multiple_of(32);
+            assert_eq!(
+                unblocked,
+                block_size == 16,
+                "block_size={block_size}: the unblocked gate must name only 16"
+            );
+        }
+        // Decode is included deliberately: measured 3.2x-4.1x faster than the
+        // scalar per-block dot it replaces, growing with session count. Raising
+        // this back above 1 is a decode routing change and needs a decode-loop
+        // measurement (`int4_decode_loop_ab`), not the prefill sweep.
+        const {
+            assert!(INT4_PREFILL_GEBP_MIN_ROWS_UNBLOCKED == 1);
         }
     }
 }

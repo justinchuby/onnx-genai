@@ -1,0 +1,91 @@
+ir_version: 11
+graph {
+  node {
+    input: "key_cache"
+    input: "write_indices"
+    input: "new_key"
+    output: "updated_key_cache"
+    op_type: "ScatterND"
+  }
+  name: "fp8_kv_scatter"
+  input {
+    name: "key_cache"
+    type {
+      tensor_type {
+        elem_type: 17
+        shape {
+          dim {
+            dim_value: 2
+          }
+          dim {
+            dim_value: 4
+          }
+          dim {
+            dim_value: 8
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "write_indices"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 2
+          }
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_value: 2
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "new_key"
+    type {
+      tensor_type {
+        elem_type: 17
+        shape {
+          dim {
+            dim_value: 2
+          }
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_value: 8
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "updated_key_cache"
+    type {
+      tensor_type {
+        elem_type: 17
+        shape {
+          dim {
+            dim_value: 2
+          }
+          dim {
+            dim_value: 4
+          }
+          dim {
+            dim_value: 8
+          }
+        }
+      }
+    }
+  }
+}
+opset_import {
+  domain: ""
+  version: 24
+}

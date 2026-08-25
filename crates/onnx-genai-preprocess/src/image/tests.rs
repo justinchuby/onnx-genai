@@ -1213,6 +1213,39 @@ preprocessing:
 }
 
 #[test]
+fn dynamic_pixel_output_keeps_source_image_dimensions_unbound() {
+    const PROGRAM: &str = r#"
+preprocessing:
+  image:
+    transforms:
+      - op: decode_rgb
+      - op: resize
+        mode: pixel_area
+        min_pixels: 262144
+        max_pixels: 4194304
+        size_multiple: 32
+        interpolation: lanczos3
+      - op: rescale
+        scale: 0.00392156862745098
+      - op: normalize
+        mean: [0.485, 0.456, 0.406]
+        std: [0.229, 0.224, 0.225]
+    outputs:
+      - name: pixel_values
+        content: pixels
+        dtype: fp16
+"#;
+    let preprocessor = typed_preprocessor(&[1, 3, -1, -1], PROGRAM);
+    let image = DynamicImage::ImageRgb8(RgbImage::from_pixel(96, 64, Rgb([1, 2, 3])));
+    let bundle = preprocessor.preprocess(&[image]).unwrap();
+
+    assert_eq!(
+        bundle.tensor("pixel_values").unwrap().shape,
+        [1, 3, 448, 640]
+    );
+}
+
+#[test]
 fn pixel_area_rounding_matches_python_ties_to_even() {
     assert_eq!(round_to_multiple_ties_even(16, 32), 0);
     assert_eq!(round_to_multiple_ties_even(48, 32), 64);
@@ -1507,4 +1540,162 @@ preprocessing:
         format!("{error:#}").contains("temporal_order 'sideways'"),
         "unexpected error: {error:#}"
     );
+}
+
+#[test]
+fn patchify_patch_order_is_independent_of_merge_size() {
+    // A 4x4 image of 2x2 patches, each patch a distinct grey level, so a patch
+    // is identifiable from any single value it contributes.
+    const PROGRAM: &str = r#"
+preprocessing:
+  image:
+    transforms:
+      - op: decode_rgb
+      - op: resize
+        mode: pixel_area
+        min_pixels: 4
+        max_pixels: 65536
+        size_multiple: 4
+        interpolation: bicubic
+      - op: patchify
+        patch_size: 2
+        temporal_patch_size: 1
+        merge_size: 2
+        channel_order: channels_first
+        temporal_order: temporal_major
+{order}        flatten: true
+    outputs:
+      - name: pixel_values
+        content: pixels
+        dtype: fp32
+"#;
+    let mut image = RgbImage::new(4, 4);
+    for (patch_y, patch_x) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
+        let level = (patch_y * 2 + patch_x) as u8 * 10 + 10;
+        for y in 0..2 {
+            for x in 0..2 {
+                image.put_pixel(
+                    (patch_x * 2 + x) as u32,
+                    (patch_y * 2 + y) as u32,
+                    Rgb([level, level, level]),
+                );
+            }
+        }
+    }
+    let image = DynamicImage::ImageRgb8(image);
+    // First red value of each emitted patch identifies which patch came out where.
+    let patch_levels = |order: &str| {
+        let preprocessor = typed_preprocessor(&[-1, 12], &PROGRAM.replace("{order}", order));
+        let bundle = preprocessor
+            .preprocess(std::slice::from_ref(&image))
+            .unwrap();
+        let values = match &bundle.tensor("pixel_values").unwrap().data {
+            ImageTensorData::Fp32(values) => values.clone(),
+            other => panic!("expected fp32 pixels, got {other:?}"),
+        };
+        (
+            values
+                .as_chunks::<12>()
+                .0
+                .iter()
+                .map(|patch| patch[0])
+                .collect::<Vec<_>>(),
+            bundle.images[0].expansion_count,
+            bundle.images[0].spatial_merge_size,
+        )
+    };
+
+    // A 2x2 image of patches is a single merge group either way, so the emitted
+    // order matches; what must not change is the token accounting.
+    let (grouped, grouped_count, grouped_merge) = patch_levels("");
+    let (raster, raster_count, raster_merge) = patch_levels("        patch_order: raster\n");
+    assert_eq!(grouped, vec![10.0, 20.0, 30.0, 40.0]);
+    assert_eq!(raster, grouped);
+    assert_eq!(grouped_count, 4);
+    assert_eq!(
+        grouped_merge, 2,
+        "merge_size still collapses the four patches into one image token"
+    );
+    assert_eq!(
+        raster_count, grouped_count,
+        "patch_order must not disturb the placeholder count that merge_size sets"
+    );
+    assert_eq!(raster_merge, grouped_merge);
+}
+
+#[test]
+fn patchify_rejects_an_unknown_patch_order() {
+    const PROGRAM: &str = r#"
+preprocessing:
+  image:
+    transforms:
+      - op: decode_rgb
+      - op: patchify
+        patch_size: 2
+        temporal_patch_size: 1
+        merge_size: 1
+        patch_order: diagonal
+        flatten: true
+    outputs:
+      - name: pixel_values
+        content: pixels
+        dtype: fp32
+"#;
+    let document = serde_yaml::from_str::<MetadataDocument>(PROGRAM).unwrap();
+    let error = ImagePreprocessor::from_metadata_document(&[-1, 12], Some(document)).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("patch_order 'diagonal'"),
+        "unexpected error: {error:#}"
+    );
+}
+
+/// A summary for an image whose packed patch grid is `grid`.
+fn patched_summary(grid: [usize; 3], merge: usize) -> crate::image::ImageExpansionSummary {
+    crate::image::ImageExpansionSummary {
+        image_index: 0,
+        original_size: (64, 64),
+        tile_grid: TileGrid {
+            rows: 1,
+            columns: 1,
+        },
+        tile_count: 1,
+        expansion_count: grid[0] * grid[1] * grid[2],
+        patch_grid: Some(grid),
+        spatial_merge_size: merge,
+        tensor_offset: 0,
+        tensor_length: grid[0] * grid[1] * grid[2],
+    }
+}
+
+#[test]
+fn a_patch_grid_sizes_its_image_token_run() {
+    // Each merge_size x merge_size patch group becomes exactly one image token,
+    // which is what the prompt must reserve for the vision features.
+    let summary = patched_summary([1, 8, 12], 2);
+    assert_eq!(summary.image_token_count().expect("count"), Some(24));
+}
+
+#[test]
+fn an_unmerged_patch_grid_keeps_every_patch_as_a_token() {
+    let summary = patched_summary([1, 5, 7], 1);
+    assert_eq!(summary.image_token_count().expect("count"), Some(35));
+}
+
+#[test]
+fn a_patch_grid_that_does_not_divide_by_the_merge_edge_is_refused() {
+    let summary = patched_summary([1, 5, 6], 2);
+    let error = summary.image_token_count().expect_err("must refuse");
+    assert!(
+        format!("{error:#}").contains("not divisible by spatial_merge_size"),
+        "{error:#}"
+    );
+}
+
+#[test]
+fn a_tiled_image_reports_no_derivable_token_count() {
+    // tokens_per_tile is a package fact; preprocessing cannot invent it, so the
+    // caller is told to consult the package rather than given a wrong number.
+    let mut summary = patched_summary([1, 4, 4], 2);
+    summary.patch_grid = None;
+    assert_eq!(summary.image_token_count().expect("count"), None);
 }

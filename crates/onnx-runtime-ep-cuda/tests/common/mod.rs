@@ -17,9 +17,15 @@
 // per-item attributes.
 #![allow(dead_code)]
 
+use std::ptr::NonNull;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use cudarc::driver::CudaContext;
 use half::{bf16, f16};
 use onnx_runtime_ep_api::{
-    DeviceBuffer, DeviceId, DevicePtr, DevicePtrMut, ExecutionProvider, TensorMut, TensorView,
+    DeviceBuffer, DeviceId, DevicePtr, DevicePtrMut, ExecutionProvider, Kernel, TensorMetadata,
+    TensorMut, TensorView, WorkspaceAllocation, WorkspaceRequirement, WorkspaceView,
 };
 use onnx_runtime_ep_cpu::CpuExecutionProvider;
 use onnx_runtime_ep_cuda::CudaExecutionProvider;
@@ -28,13 +34,79 @@ use onnx_runtime_ir::{
     Attribute, DataType, Graph, Node, NodeId, compute_contiguous_strides, static_shape,
 };
 use onnx_runtime_loader::Model;
+use onnx_runtime_memory_governor::{DeviceAllocator, DeviceKey, MemoryError, Tier};
+
+/// Runtime-exact workspace bytes for one dispatch.
+pub fn runtime_workspace_requirement(
+    kernel: &dyn Kernel,
+    inputs: &[TensorView],
+) -> onnx_runtime_ep_api::Result<WorkspaceRequirement> {
+    let metadata = inputs
+        .iter()
+        .map(|input| TensorMetadata::new(input.dtype, input.shape, !input.is_absent()))
+        .collect::<Vec<_>>();
+    kernel.workspace_requirement_for_execution(inputs, &metadata)
+}
+
+/// Ensure `workspace` satisfies `requirement`, reusing or replacing it through
+/// the provider's governed workspace path.
+pub fn prepare_workspace(
+    ep: &CudaExecutionProvider,
+    requirement: WorkspaceRequirement,
+    workspace: &mut Option<WorkspaceAllocation>,
+) -> onnx_runtime_ep_api::Result<Option<WorkspaceView>> {
+    if requirement.bytes == 0 {
+        return Ok(None);
+    }
+    let required = usize::try_from(requirement.bytes).map_err(|_| {
+        onnx_runtime_ep_api::EpError::KernelFailed(format!(
+            "test workspace requirement {} does not fit usize",
+            requirement.bytes
+        ))
+    })?;
+    let needs_replacement = workspace
+        .as_ref()
+        .is_none_or(|buffer| buffer.len() < required || buffer.alignment() < requirement.alignment);
+    if needs_replacement {
+        let old = workspace.take();
+        *workspace =
+            Some(ep.replace_workspace(old, required, requirement.alignment, requirement.role)?);
+    }
+    let workspace = workspace
+        .as_mut()
+        .expect("a non-zero workspace requirement must prepare a buffer");
+    Ok(Some(WorkspaceView::new(
+        DevicePtrMut(workspace.as_mut_ptr()),
+        workspace.len(),
+    )))
+}
+
+/// Execute one kernel through the same prepared-workspace path the session
+/// executor uses.
+pub fn execute_kernel(
+    ep: &CudaExecutionProvider,
+    kernel: &dyn Kernel,
+    inputs: &[TensorView],
+    outputs: &mut [TensorMut],
+    workspace: &mut Option<WorkspaceAllocation>,
+) -> onnx_runtime_ep_api::Result<()> {
+    let requirement = runtime_workspace_requirement(kernel, inputs)?;
+    let workspace_view = prepare_workspace(ep, requirement, workspace)?;
+    kernel.execute_with_workspace(inputs, outputs, workspace_view)
+}
 
 /// A concrete input tensor: dtype, shape, and contiguous little-endian bytes.
+///
+/// An `absent` tensor models an omitted positional optional input: the harness
+/// materialises it as a null-backed [`TensorView::absent`] placeholder so a
+/// kernel's `is_absent()` checks and the EP's claim gate behave exactly as they
+/// do under ORT (which reports omitted optionals with an `Undefined` dtype).
 #[derive(Clone)]
 pub struct Tensor {
     pub dtype: DataType,
     pub shape: Vec<usize>,
     pub bytes: Vec<u8>,
+    pub absent: bool,
 }
 
 /// Reinterpret a slice of plain-old-data scalars as raw little-endian bytes.
@@ -51,6 +123,17 @@ pub fn input<T: Copy>(dtype: DataType, shape: &[usize], values: &[T]) -> Tensor 
         dtype,
         shape: shape.to_vec(),
         bytes: raw(values),
+        absent: false,
+    }
+}
+
+/// An omitted positional optional input (a null-backed placeholder).
+pub fn absent_input(dtype: DataType) -> Tensor {
+    Tensor {
+        dtype,
+        shape: Vec::new(),
+        bytes: Vec::new(),
+        absent: true,
     }
 }
 
@@ -77,6 +160,7 @@ pub fn float_input(dtype: DataType, shape: &[usize], values: &[f32]) -> Tensor {
         dtype,
         shape: shape.to_vec(),
         bytes: encode_floats(values, dtype),
+        absent: false,
     }
 }
 
@@ -131,13 +215,19 @@ pub fn build_graph(
         .iter()
         .enumerate()
         .map(|(index, tensor)| {
+            // An omitted optional is a `None` node input (no graph value), so
+            // positional arity is preserved and later present inputs are not
+            // misread as the omitted one.
+            if tensor.absent {
+                return None;
+            }
             let value = graph.create_named_value(
                 format!("input_{index}"),
                 tensor.dtype,
                 static_shape(tensor.shape.iter().copied()),
             );
             graph.add_input(value);
-            value
+            Some(value)
         })
         .collect::<Vec<_>>();
     let output_values = outputs
@@ -151,12 +241,7 @@ pub fn build_graph(
             )
         })
         .collect::<Vec<_>>();
-    let mut node = Node::new(
-        NodeId(0),
-        op,
-        input_values.into_iter().map(Some).collect(),
-        output_values.clone(),
-    );
+    let mut node = Node::new(NodeId(0), op, input_values, output_values.clone());
     node.domain = domain.to_string();
     for (name, value) in attrs {
         node.attributes.insert((*name).into(), value.clone());
@@ -191,7 +276,18 @@ pub fn run_cuda(
         .iter()
         .map(|tensor| static_shape(tensor.shape.iter().copied()))
         .collect::<Vec<_>>();
-    let claim_dtypes = inputs.iter().map(|tensor| tensor.dtype).collect::<Vec<_>>();
+    let claim_dtypes = inputs
+        .iter()
+        .map(|tensor| {
+            // ORT reports an omitted optional with an `Undefined` element type;
+            // mirror that so claim gates key off absence, not a stale dtype.
+            if tensor.absent {
+                DataType::Undefined
+            } else {
+                tensor.dtype
+            }
+        })
+        .collect::<Vec<_>>();
     let claim = ep.supports_op(
         model.graph.node(node_id),
         opset,
@@ -231,6 +327,9 @@ pub fn run_cuda(
         .zip(&input_buffers)
         .zip(&input_strides)
         .map(|((tensor, buffer), strides)| {
+            if tensor.absent {
+                return TensorView::absent(tensor.dtype);
+            }
             TensorView::new(
                 DevicePtr(buffer.as_ptr()),
                 tensor.dtype,
@@ -265,7 +364,15 @@ pub fn run_cuda(
             )
         })
         .collect::<Vec<_>>();
-    kernel.execute(&input_views, &mut output_views).unwrap();
+    let mut workspace = None;
+    execute_kernel(
+        ep,
+        kernel.as_ref(),
+        &input_views,
+        &mut output_views,
+        &mut workspace,
+    )
+    .unwrap();
 
     let result = outputs
         .iter()
@@ -287,6 +394,9 @@ pub fn run_cuda(
     }
     for buffer in output_buffers {
         ep.deallocate(buffer).unwrap();
+    }
+    if let Some(workspace) = workspace {
+        ep.deallocate_workspace(workspace).unwrap();
     }
     result
 }
@@ -319,6 +429,9 @@ pub fn run_cpu(
         .iter()
         .zip(&input_strides)
         .map(|(tensor, strides)| {
+            if tensor.absent {
+                return TensorView::absent(tensor.dtype);
+            }
             TensorView::new(
                 DevicePtr(tensor.bytes.as_ptr().cast()),
                 tensor.dtype,
@@ -367,6 +480,111 @@ pub fn require_cuda() -> CudaExecutionProvider {
             "CUDA test requires CUDA runtime libraries; CPU-only runs must leave this test ignored"
         ),
     }
+}
+
+/// Construct a raw CUDA context for the current visible device or panic.
+pub fn require_context(what: &str) -> Arc<CudaContext> {
+    match CudaContext::new(0) {
+        Ok(context) => context,
+        Err(error) => panic!(
+            "{what} requires the CUDA driver on the visible device, but creating a context failed: {error}"
+        ),
+    }
+}
+
+/// An injected eager `cuMemAlloc` allocator for tests that need to prove the
+/// provider routed a workspace through the selected `DeviceAllocator`.
+#[derive(Debug)]
+pub struct ExternalEagerAllocator {
+    context: Arc<CudaContext>,
+    device: DeviceKey,
+    cumemalloc_calls: AtomicU64,
+    frees: AtomicU64,
+}
+
+impl ExternalEagerAllocator {
+    pub fn new(context: Arc<CudaContext>) -> Self {
+        let ordinal = context.ordinal() as u32;
+        Self {
+            context,
+            device: DeviceKey::device(ordinal),
+            cumemalloc_calls: AtomicU64::new(0),
+            frees: AtomicU64::new(0),
+        }
+    }
+
+    pub fn cumemalloc_calls(&self) -> u64 {
+        self.cumemalloc_calls.load(Ordering::Relaxed)
+    }
+
+    pub fn frees(&self) -> u64 {
+        self.frees.load(Ordering::Relaxed)
+    }
+}
+
+impl DeviceAllocator for ExternalEagerAllocator {
+    fn allocate(&self, bytes: usize, align: usize) -> Result<NonNull<u8>, MemoryError> {
+        if align == 0 || !align.is_power_of_two() || align > 256 {
+            return Err(MemoryError::InvalidRequest {
+                tier: Tier::Device.name(),
+                requested: bytes as u64,
+                reason: "cuMemAlloc guarantees 256-byte alignment and this allocator does not \
+                         over-allocate to exceed it",
+            });
+        }
+        self.context
+            .bind_to_thread()
+            .map_err(|error| MemoryError::AllocationFailed {
+                tier: Tier::Device.name(),
+                requested: bytes as u64,
+                reason: format!("could not bind the CUDA context: {error}"),
+            })?;
+        // SAFETY: a fresh device allocation on the bound context, owned here and
+        // freed exactly once in `deallocate`.
+        let dptr =
+            unsafe { cudarc::driver::result::malloc_sync(bytes.max(1)) }.map_err(|error| {
+                MemoryError::AllocationFailed {
+                    tier: Tier::Device.name(),
+                    requested: bytes as u64,
+                    reason: format!("cuMemAlloc refused: {error}"),
+                }
+            })?;
+        NonNull::new(dptr as *mut u8)
+            .ok_or(MemoryError::AllocationFailed {
+                tier: Tier::Device.name(),
+                requested: bytes as u64,
+                reason: String::from("cuMemAlloc returned a null device pointer"),
+            })
+            .inspect(|_| {
+                self.cumemalloc_calls.fetch_add(1, Ordering::Relaxed);
+            })
+    }
+
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, _bytes: usize, _align: usize) {
+        let _ = self.context.bind_to_thread();
+        // SAFETY: the pointer came from `allocate` on this allocator and the
+        // caller's contract guarantees a single free.
+        let _ = unsafe {
+            cudarc::driver::result::free_sync(ptr.as_ptr() as cudarc::driver::sys::CUdeviceptr)
+        };
+        self.frees.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn device(&self) -> DeviceKey {
+        self.device
+    }
+}
+
+/// Wait until the provider's deferred release queue is idle so allocator-side
+/// free counters reflect every enqueued release.
+pub fn drain_releases(provider: &CudaExecutionProvider, what: &str) {
+    assert!(
+        provider
+            .release_queue()
+            .wait_until_idle(std::time::Duration::from_secs(30)),
+        "the deferred release queue must drain before {what} is asserted: {:?}",
+        provider.deferred_release_stats()
+    );
 }
 
 /// Assert two f32 value vectors agree element-wise within `tolerance`.

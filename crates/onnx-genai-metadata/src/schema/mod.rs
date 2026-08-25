@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use schemars::JsonSchema;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize};
 
 fn deserialize_non_empty_string<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
@@ -16,51 +16,66 @@ where
     Ok(value)
 }
 
-fn deserialize_optional_non_empty_string<'de, D>(
-    deserializer: D,
-) -> Result<Option<String>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    Option::<String>::deserialize(deserializer)?.map_or(Ok(None), |value| {
-        if value.is_empty() {
-            Err(serde::de::Error::custom("presence keys must not be empty"))
-        } else {
-            Ok(Some(value))
-        }
-    })
-}
-
+mod decoder_abi;
 mod generation;
 mod hardware;
-mod model_io;
+mod ir;
+mod package;
 mod pipeline;
-mod scheduler;
 
+pub use schema_vocabulary::{LENGTH_CONTENT_ROLES, PACK_OFFSETS_CONTENT, PACK_OWNER_CONTENT};
+
+pub use decoder_abi::*;
 pub use generation::*;
 pub use hardware::*;
-pub use model_io::*;
+pub use ir::*;
+pub use package::*;
 pub use pipeline::*;
-pub use scheduler::*;
 
 /// ONNX inference metadata consumed by runtimes and emitted by model builders.
 ///
-/// Every top-level section is optional for incremental adoption. Unknown fields
-/// are allowed and must be ignored by readers for forward compatibility.
+/// Every top-level section is optional for incremental adoption. The v1 surface
+/// is closed so removed scheduling and model-family fields fail fast.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 #[schemars(
+    deny_unknown_fields,
     title = "ONNX Inference Metadata",
-    description = "Portable, runtime-agnostic inference metadata for ONNX generative models. All top-level sections are optional, and unknown fields are permitted for forward-compatible schema evolution.",
+    description = "Portable, runtime-agnostic inference metadata for ONNX generative models. The v1 top-level surface is closed; executable composite packages use pipeline.workflow.",
     extend("$id" = "https://github.com/onnx/onnx/issues/8184"),
-    transform = schema_helpers::inference_metadata_aliases
+    transform = schema_helpers::inference_metadata_constraints
 )]
 pub struct InferenceMetadata {
-    /// Schema version of this inference-metadata document, e.g. `"v1"`.
+    /// Schema version of this inference-metadata document, e.g. `"v1.1"`.
     ///
-    /// Absent means the initial `"v1"` contract (readers default to `v1`).
-    /// Bump this only for breaking schema changes; additive fields keep the
-    /// same major version and rely on the forward-compatible "ignore unknown
-    /// fields" rule.
+    /// Canonically `"v<major>.<minor>"`, matching the `v1` that every writer in
+    /// this repository already stamps. Absence means the initial `v1.0`
+    /// contract, as do the spellings `"v1"`, `"1"`, `"1.0"` and `"v1.0"` that
+    /// predate a canonical form; readers normalize before comparing, so all of
+    /// them keep loading and `"1.1"` is an accepted synonym for `"v1.1"`. A
+    /// document that uses nothing new keeps stamping what it already stamped —
+    /// rewriting an existing spelling would change the package's semantic
+    /// identity to say something no reader distinguishes. Bump the major only
+    /// for breaking schema changes, and the minor whenever a document may carry
+    /// a field an older reader would not know.
+    ///
+    /// An additive field keeps the same major version, but note what that does
+    /// and does not buy: the v1 surface is closed — every structure here denies
+    /// unknown fields — so a reader built before a field was added rejects a
+    /// document that uses it rather than ignoring it. Compatibility with older
+    /// readers therefore comes from a new field being *absent by default*, not
+    /// from tolerance of unknown keys. A producer that emits one is declaring
+    /// that the package needs a reader which understands it, and a package that
+    /// does not emit it keeps loading everywhere it loaded before.
+    ///
+    /// That is a statement about *additive* fields, and it is not a promise that
+    /// this schema never reshapes one it already had. It does, while it is
+    /// pre-release: `token_packed` moved its `offsets` and `owner` into a
+    /// `levels` chain in v1.1, and a document written against the flat spelling
+    /// does not load at any version. A version says which fields a reader must
+    /// understand; it is not a compatibility guarantee spanning a reshape, and
+    /// nothing here silently reads an old spelling as a new one. See
+    /// `reject_flat_token_packed`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema_version: Option<String>,
 
@@ -76,10 +91,6 @@ pub struct InferenceMetadata {
     #[serde(default)]
     pub model: Option<ModelCapabilities>,
 
-    /// KV-cache storage, quantization tolerance, and operational semantics.
-    #[serde(default)]
-    pub kv_cache: Option<KvCacheSpec>,
-
     /// Model weight quantization intent, independent of the packed representation.
     #[serde(default)]
     pub quantization: Option<QuantizationIntent>,
@@ -88,49 +99,94 @@ pub struct InferenceMetadata {
     #[serde(default)]
     pub pipeline: Option<PipelineSpec>,
 
-    /// Generic inference strategy, including speculative decoding.
-    #[serde(default)]
-    pub strategy: Option<StrategySpec>,
-
-    /// Standalone speculative proposer declaration.
+    /// Runtime-managed LoRA adapters for bare or composite model packages.
     ///
-    /// This is the preferred native source for speculator discovery;
-    /// HuggingFace `config.json` is a compatibility fallback. The deprecated
-    /// `speculator_config` alias is accepted on input.
-    #[serde(default, alias = "speculator_config")]
-    pub speculative: Option<SpeculatorConfig>,
-
-    /// Structured-output formats and model training conventions.
-    #[serde(default)]
-    pub structured_output: Option<StructuredOutputSpec>,
+    /// This is the migrated `InferenceMetadata.adapters` contract from native
+    /// LoRA phases 1 and 2. Composite execution references workflow SSA inputs,
+    /// but artifact identity, target resolution, and lifecycle remain package
+    /// metadata rather than workflow control-flow nodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapters: Option<AdapterServiceContract>,
 
     /// Minimum and beneficial hardware capabilities used for distribution matching.
     #[serde(default)]
     pub hardware_requirements: Option<HardwareRequirements>,
 
-    /// Author-declared text-generation / search defaults.
-    ///
-    /// Populated from an onnxruntime-genai `genai_config.json` `search` block.
-    /// Every field is optional; readers treat an absent value as "use the
-    /// runtime default".
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub generation: Option<GenerationDefaults>,
-
-    /// Special / control token ids declared by the model author.
-    ///
-    /// Populated from the model-level token id fields of a `genai_config.json`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tokens: Option<SpecialTokens>,
-
     /// Declared, architecture-neutral input preprocessing programs.
     ///
-    /// Carries the typed multimodal preprocessing contract (currently the image
-    /// transform program and its named tensor outputs). Every operation and
-    /// output is generic, parameterized data — never a model family, vendor
-    /// string, or baked-in shape. Absent means the model declares no native
-    /// preprocessing program and a runtime must obtain it elsewhere or fail.
+    /// Carries the typed multimodal preprocessing contracts: the still-image,
+    /// video, and audio transform programs and their named tensor outputs.
+    /// Every operation and output is generic, parameterized data — never a
+    /// model family, vendor string, or baked-in shape. Absent means the model
+    /// declares no native preprocessing program and a runtime must obtain it
+    /// elsewhere or fail.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preprocessing: Option<PreprocessingSpec>,
+
+    /// Exact package facts needed to interpret request data correctly.
+    ///
+    /// Tokenizer artifacts, vocabulary size, special tokens, and the constraint
+    /// dialects the package's parser accepts. Grammars and JSON Schemas
+    /// themselves are request data, not package metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package: Option<PackageFacts>,
+
+    /// Authoritative generation defaults and the structural override surface.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<GenerationContract>,
+
+    /// Executable task profiles sharing this package's common facts.
+    ///
+    /// Every profile carries its own version and requirement class. A strict
+    /// reader may skip an `ignorable` profile it does not understand; unknown
+    /// core fields still fail.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub profiles: BTreeMap<String, TaskProfile>,
+
+    /// Portable speculative-decoding compatibility facts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speculative: Option<SpeculativeContract>,
+
+    /// Decode-step ABI recognized from the canonical workflow, resolved once on
+    /// first use.
+    ///
+    /// This is a cache of a pure function of `pipeline.workflow`, never part of
+    /// the document. Keeping it derived rather than serialized is what makes
+    /// the workflow the single authority: there is no second place a producer
+    /// could write an answer that disagrees.
+    #[serde(skip)]
+    #[schemars(skip)]
+    decoder_io: std::sync::OnceLock<Option<DecoderAbi>>,
+}
+
+impl InferenceMetadata {
+    /// The resolved decode-step graph ABI for this package's decoder.
+    ///
+    /// Derived from `pipeline.workflow` and nowhere else. There is no second
+    /// place a producer can state a different answer, because there is no
+    /// second place a producer can state one at all.
+    pub fn decoder_io(&self) -> Option<&DecoderAbi> {
+        self.decoder_io
+            .get_or_init(|| {
+                let workflow = &self.pipeline.as_ref()?.workflow;
+                let component = crate::graph_cardinality::sole_decoder_component(workflow)?;
+                crate::decoder_abi::decoder_abi(workflow, component)
+            })
+            .as_ref()
+    }
+
+    /// Install a decode ABI a loader recovered from the graph itself.
+    ///
+    /// A package imported from the foreign `genai_config.json` format carries no
+    /// workflow of ours, so its importer builds one and resolves the ABI from
+    /// it. That result is derived exactly like a recognized one, so it belongs
+    /// in the resolved slot.
+    ///
+    /// Replaces any previously resolved ABI, which is why it takes `&mut self`:
+    /// a loader derives an ABI before the package is shared.
+    pub fn set_derived_decoder_io(&mut self, io: DecoderAbi) {
+        self.decoder_io = std::sync::OnceLock::from(Some(io));
+    }
 }
 
 mod schema_vocabulary {
@@ -221,22 +277,6 @@ mod schema_vocabulary {
     );
 
     extensible_string!(
-        /// Quantization scaling-axis vocabulary.
-        QuantizationAxis,
-        quantization_axis,
-        QUANTIZATION_AXIS,
-        ["per_tensor", "per_channel", "per_token", "per_head"]
-    );
-
-    extensible_string!(
-        /// KV fork-precision policy vocabulary.
-        ForkPrecisionPolicy,
-        fork_precision_policy,
-        FORK_PRECISION_POLICY,
-        ["inherit", "highest", "independent"]
-    );
-
-    extensible_string!(
         /// Weight precision and quantization-recipe vocabulary.
         Precision,
         precision,
@@ -257,90 +297,20 @@ mod schema_vocabulary {
     );
 
     extensible_string!(
-        /// Pipeline component-role vocabulary.
-        PipelineRole,
-        pipeline_role,
-        PIPELINE_ROLE,
-        [
-            "encoder",
-            "vision_encoder",
-            "audio_encoder",
-            "decoder",
-            "draft",
-            "denoiser",
-            "scheduler",
-            "vocoder",
-            "speech_synthesis"
-        ]
-    );
-
-    extensible_string!(
-        /// Execution-device preference vocabulary.
-        DevicePreference,
-        device_preference,
-        DEVICE_PREFERENCE,
-        [
-            "auto", "cpu", "cuda", "rocm", "directml", "coreml", "webgpu", "npu"
-        ]
-    );
-
-    extensible_string!(
-        /// Generic inference-strategy vocabulary.
-        StrategyKind,
-        strategy_kind,
-        STRATEGY_KIND,
-        ["speculative"]
-    );
-
-    extensible_string!(
-        /// Speculative draft-producer vocabulary.
-        DraftProducer,
-        draft_producer,
-        DRAFT_PRODUCER,
-        ["draft_model", "self_speculative", "ngram", "extra_heads"]
-    );
-
-    extensible_string!(
-        /// Speculative verification-method vocabulary.
-        VerificationMethod,
-        verification_method,
-        VERIFICATION_METHOD,
-        ["single_forward"]
-    );
-
-    extensible_string!(
-        /// Speculative acceptance-rule vocabulary.
-        AcceptanceMethod,
-        acceptance_method,
-        ACCEPTANCE_METHOD,
-        ["rejection_sampling", "greedy", "typical"]
-    );
-
-    extensible_string!(
-        /// Speculative proposal-topology vocabulary.
-        ProposalTopology,
-        proposal_topology,
-        PROPOSAL_TOPOLOGY,
-        ["linear", "tree"]
-    );
-
-    extensible_string!(
-        /// Structured-output constraint-format vocabulary.
-        StructuredOutputFormat,
-        structured_output_format,
-        STRUCTURED_OUTPUT_FORMAT,
-        ["json_schema", "regex", "context_free_grammar", "choice"]
-    );
-
-    extensible_string!(
-        /// Generic image transform-operation vocabulary.
-        ImageTransformOp,
-        image_transform_op,
-        IMAGE_TRANSFORM_OP,
+        /// Generic pixel transform-operation vocabulary.
+        ///
+        /// One vocabulary spans stills and clips. A still-image program never
+        /// selects frames; a clip program samples and pads them and then does
+        /// the same spatial work. `sample_frames` and `pad_frames` are the two
+        /// operations a temporal axis adds, not a second program dialect.
+        VisionTransformOp,
+        vision_transform_op,
+        VISION_TRANSFORM_OP,
         [
             "decode",
             "decode_rgb",
             "convert_rgb",
+            "sample_frames",
             "resize",
             "rescale",
             "normalize",
@@ -348,6 +318,7 @@ mod schema_vocabulary {
             "flatten",
             "patchify",
             "pad",
+            "pad_frames",
             "emit_original_size",
             "emit_transformed_size",
             "emit_validity_mask",
@@ -357,35 +328,63 @@ mod schema_vocabulary {
     );
 
     extensible_string!(
-        /// Generic image-output content-role vocabulary.
-        ImageOutputContent,
-        image_output_content,
-        IMAGE_OUTPUT_CONTENT,
+        /// Generic pixel-output content-role vocabulary.
+        ///
+        /// A program that packs the media of several requests into one batch
+        /// emits the values that map packed entries back to request rows,
+        /// alongside the pixels themselves. Two roles cover every level:
+        /// `pack_offsets` and `pack_owner`. Which level a value serves is
+        /// stated by the ownership chain that references it, not by its role,
+        /// so a frames-to-clips pair and a clips-to-rows pair carry the same
+        /// two roles and a runtime resolves both the same way whatever the
+        /// medium calls its levels. `valid_lengths` says how much of a padded
+        /// dimension is real, and is shared with the audio vocabulary rather
+        /// than duplicated.
+        ///
+        /// They are content roles like any other: the runtime reads what a
+        /// tensor means from here, never from the name a producer chose. What
+        /// each value must structurally satisfy is stated by its tensor
+        /// contract — `batch_layout` and `padding` — which is what the
+        /// validator enforces.
+        VisionOutputContent,
+        vision_output_content,
+        VISION_OUTPUT_CONTENT,
         [
             "pixels",
             "patch_coordinates",
             "grid_dimensions",
             "original_size",
             "transformed_size",
-            "validity_mask"
+            "validity_mask",
+            "valid_lengths",
+            "pack_offsets",
+            "pack_owner"
         ]
     );
 
-    extensible_string!(
-        /// Image token-count source vocabulary.
-        ImageTokenCountSource,
-        image_token_count_source,
-        IMAGE_TOKEN_COUNT_SOURCE,
-        ["per_tile", "per_patch", "from_grid"]
-    );
+    /// Content roles that state how much of a padded dimension is real.
+    ///
+    /// `valid_lengths` is the medium-independent spelling, added because a
+    /// padded video, a padded image grid, and a padded text segment all need one
+    /// and none of them is audio. The two audio names that predate it say the
+    /// same thing about a particular unit and remain correct, so a program that
+    /// already emits `frame_lengths` points its `padding` entry at that value
+    /// rather than emitting a second copy under a new name.
+    ///
+    /// This list is *informative*: a `padding` entry names its length value by
+    /// name, and nothing dispatches on which of these spellings the value
+    /// carries. Deciding validity by role would refuse correct audio programs
+    /// and would put two statements where the reference already makes one.
+    /// `valid_frames` and `valid_samples` are deliberately absent — those are
+    /// counts a graph consumes as ordinary inputs, not statements about padding.
+    pub const LENGTH_CONTENT_ROLES: [&str; 3] =
+        ["valid_lengths", "sample_lengths", "frame_lengths"];
 
-    extensible_string!(
-        /// Prompt-placeholder to image correspondence vocabulary.
-        ImageCorrespondence,
-        image_correspondence,
-        IMAGE_CORRESPONDENCE,
-        ["prompt_order", "explicit_indices"]
-    );
+    /// Content role of the exclusive prefix offsets of an ownership level.
+    pub const PACK_OFFSETS_CONTENT: &str = "pack_offsets";
+
+    /// Content role of the owner map of an ownership level.
+    pub const PACK_OWNER_CONTENT: &str = "pack_owner";
 
     extensible_string!(
         /// Optional-thumbnail ordering vocabulary.
@@ -396,27 +395,88 @@ mod schema_vocabulary {
     );
 
     extensible_string!(
-        /// Position-value generation vocabulary.
-        PositionGeneration,
-        position_generation,
-        POSITION_GENERATION,
-        ["linear", "processor_coordinates"]
+        /// Generic audio transform-operation vocabulary.
+        ///
+        /// One vocabulary spans every declared audio program. A CTC acoustic
+        /// model normalizes raw samples and never builds a spectrogram; a
+        /// speech-to-text encoder pads to a fixed window and takes a log-mel.
+        /// Both are the same kind of declaration, so both draw their operation
+        /// names from here rather than from a per-family list.
+        AudioTransformOp,
+        audio_transform_op,
+        AUDIO_TRANSFORM_OP,
+        [
+            "decode",
+            "resample",
+            "downmix",
+            "rescale",
+            "zero_mean_unit_variance",
+            "normalize",
+            "pad",
+            "trim",
+            "frame",
+            "spectrogram",
+            "log_mel",
+            "log_mel_spectrogram",
+            "emit_valid_frames",
+            "emit_valid_samples",
+            "emit_sample_lengths",
+            "emit_validity_mask"
+        ]
     );
 
     extensible_string!(
-        /// Prefill→decode position-continuation vocabulary.
-        PositionContinuation,
-        position_continuation,
-        POSITION_CONTINUATION,
-        ["linear_increment", "carry_max", "from_grid"]
+        /// Generic audio-output content-role vocabulary.
+        ///
+        /// Audio arrived at lengths first and named them for what they count:
+        /// `sample_lengths` counts raw samples, `frame_lengths` counts frames
+        /// after framing, and `valid_frames`/`valid_samples` are the same fact
+        /// spelled as a count of the real entries. They stay, because a program
+        /// that already emits one keeps loading and because the finer name is
+        /// worth reading. `valid_lengths` joins them as the medium-independent
+        /// spelling, and all five are one role to the validator: the value a
+        /// `padding` entry names must carry one of them, whichever the producer
+        /// chose. See [`LENGTH_CONTENT_ROLES`].
+        AudioOutputContent,
+        audio_output_content,
+        AUDIO_OUTPUT_CONTENT,
+        [
+            "waveform",
+            "features",
+            "audio_features",
+            "valid_frames",
+            "valid_samples",
+            "sample_lengths",
+            "frame_lengths",
+            "valid_lengths",
+            "validity_mask",
+            "pack_offsets",
+            "pack_owner"
+        ]
     );
 
     extensible_string!(
-        /// Paired KV-cache update-semantics vocabulary.
-        KvUpdateKind,
-        kv_update_kind,
-        KV_UPDATE_KIND,
-        ["append", "shared_buffer"]
+        /// Frame-synchronous sequence-decoding algorithm vocabulary.
+        SequenceDecodingKind,
+        sequence_decoding_kind,
+        SEQUENCE_DECODING_KIND,
+        ["ctc", "greedy_argmax"]
+    );
+
+    extensible_string!(
+        /// Class-id -> string mapping source vocabulary.
+        DecodingVocabularySource,
+        decoding_vocabulary_source,
+        DECODING_VOCABULARY_SOURCE,
+        ["tokenizer", "inline"]
+    );
+
+    extensible_string!(
+        /// Dependence of a row's outputs on the rows batched with it.
+        BatchInvariance,
+        batch_invariance,
+        BATCH_INVARIANCE,
+        ["row_independent", "padding_sensitive"]
     );
 
     extensible_string!(
@@ -470,54 +530,38 @@ mod schema_vocabulary {
 
 mod schema_helpers {
     use schemars::Schema;
-    use serde_json::{Value, json};
+    use serde_json::json;
 
-    pub(super) fn inference_metadata_aliases(schema: &mut Schema) {
-        add_alias(
-            schema,
-            "speculative",
-            "speculator_config",
-            "Deprecated alias for `speculative`.",
-        );
-        forbid_both(schema, "speculative", "speculator_config");
-    }
-
-    pub(super) fn speculator_config_aliases(schema: &mut Schema) {
-        add_alias(
-            schema,
-            "proposal_type",
-            "method",
-            "Deprecated alias for `proposal_type`.",
-        );
-        add_alias(
-            schema,
-            "num_speculative_tokens",
-            "tokens_per_step",
-            "Deprecated alias for `num_speculative_tokens`.",
-        );
-
-        if let Some(required) = schema
+    /// Publish the retired `model.io` block's rejection in the JSON schema.
+    ///
+    /// `ModelCapabilities` does not deny unknown fields, so a validator working
+    /// from the schema alone would silently accept `model.io` and a producer
+    /// would not learn it had published an unloadable package until a runtime
+    /// refused it. The constraint therefore forbids the key outright — the same
+    /// rule `parser::reject_retired_model_io` enforces, so the published schema
+    /// and the loader cannot disagree about what is valid.
+    ///
+    /// An earlier revision forbade `model.io` only *beside* a `pipeline`, from
+    /// when the block was still an import-only source. It is not a source at
+    /// all now, so the narrower rule would accept exactly the documents the
+    /// loader rejects.
+    pub(super) fn inference_metadata_constraints(schema: &mut Schema) {
+        schema
             .ensure_object()
-            .get_mut("required")
-            .and_then(Value::as_array_mut)
-        {
-            required.retain(|name| name != "proposal_type");
-        }
-
-        schema.ensure_object().insert(
-            "oneOf".into(),
-            json!([
-                {
-                    "required": ["proposal_type"],
-                    "not": {"required": ["method"]}
-                },
-                {
-                    "required": ["method"],
-                    "not": {"required": ["proposal_type"]}
+            .entry("allOf")
+            .or_insert_with(|| json!([]))
+            .as_array_mut()
+            .expect("allOf inserted as an array")
+            .push(json!({
+                "not": {
+                    "required": ["model"],
+                    "properties": {
+                        "model": {
+                            "required": ["io"]
+                        }
+                    }
                 }
-            ]),
-        );
-        forbid_both(schema, "num_speculative_tokens", "tokens_per_step");
+            }));
     }
 
     pub(super) fn loop_state_pair(schema: &mut Schema) {
@@ -552,36 +596,6 @@ mod schema_helpers {
         );
     }
 
-    pub(super) fn phase_run_on(schema: &mut Schema) {
-        extensible_string_enum(
-            schema,
-            &[
-                "prompt_only",
-                "every_step",
-                "always",
-                "final_only",
-                "on_demand",
-            ],
-        );
-    }
-
-    pub(super) fn pipeline_strategy_kind(schema: &mut Schema) {
-        extensible_string_enum(
-            schema,
-            &[
-                "autoregressive",
-                "iterative",
-                "diffusion_steps",
-                "diffusion-steps",
-                "single_pass",
-                "single-pass",
-                "composite",
-                "nested_autoregressive",
-                "nested-autoregressive",
-            ],
-        );
-    }
-
     pub(super) fn attention_type(schema: &mut Schema) {
         extensible_string_enum(schema, super::schema_vocabulary::ATTENTION_TYPE);
     }
@@ -594,80 +608,40 @@ mod schema_helpers {
         extensible_string_enum(schema, super::schema_vocabulary::TENSOR_DTYPE);
     }
 
-    pub(super) fn quantization_axis(schema: &mut Schema) {
-        extensible_string_enum(schema, super::schema_vocabulary::QUANTIZATION_AXIS);
-    }
-
-    pub(super) fn fork_precision_policy(schema: &mut Schema) {
-        extensible_string_enum(schema, super::schema_vocabulary::FORK_PRECISION_POLICY);
-    }
-
     pub(super) fn precision(schema: &mut Schema) {
         extensible_string_enum(schema, super::schema_vocabulary::PRECISION);
     }
 
-    pub(super) fn pipeline_role(schema: &mut Schema) {
-        extensible_string_enum(schema, super::schema_vocabulary::PIPELINE_ROLE);
+    pub(super) fn vision_transform_op(schema: &mut Schema) {
+        extensible_string_enum(schema, super::schema_vocabulary::VISION_TRANSFORM_OP);
     }
 
-    pub(super) fn device_preference(schema: &mut Schema) {
-        extensible_string_enum(schema, super::schema_vocabulary::DEVICE_PREFERENCE);
+    pub(super) fn vision_output_content(schema: &mut Schema) {
+        extensible_string_enum(schema, super::schema_vocabulary::VISION_OUTPUT_CONTENT);
     }
 
-    pub(super) fn strategy_kind(schema: &mut Schema) {
-        extensible_string_enum(schema, super::schema_vocabulary::STRATEGY_KIND);
+    pub(super) fn audio_transform_op(schema: &mut Schema) {
+        extensible_string_enum(schema, super::schema_vocabulary::AUDIO_TRANSFORM_OP);
     }
 
-    pub(super) fn draft_producer(schema: &mut Schema) {
-        extensible_string_enum(schema, super::schema_vocabulary::DRAFT_PRODUCER);
-    }
-
-    pub(super) fn verification_method(schema: &mut Schema) {
-        extensible_string_enum(schema, super::schema_vocabulary::VERIFICATION_METHOD);
-    }
-
-    pub(super) fn acceptance_method(schema: &mut Schema) {
-        extensible_string_enum(schema, super::schema_vocabulary::ACCEPTANCE_METHOD);
-    }
-
-    pub(super) fn proposal_topology(schema: &mut Schema) {
-        extensible_string_enum(schema, super::schema_vocabulary::PROPOSAL_TOPOLOGY);
-    }
-
-    pub(super) fn structured_output_format(schema: &mut Schema) {
-        extensible_string_enum(schema, super::schema_vocabulary::STRUCTURED_OUTPUT_FORMAT);
-    }
-
-    pub(super) fn image_transform_op(schema: &mut Schema) {
-        extensible_string_enum(schema, super::schema_vocabulary::IMAGE_TRANSFORM_OP);
-    }
-
-    pub(super) fn image_output_content(schema: &mut Schema) {
-        extensible_string_enum(schema, super::schema_vocabulary::IMAGE_OUTPUT_CONTENT);
-    }
-
-    pub(super) fn image_token_count_source(schema: &mut Schema) {
-        extensible_string_enum(schema, super::schema_vocabulary::IMAGE_TOKEN_COUNT_SOURCE);
-    }
-
-    pub(super) fn image_correspondence(schema: &mut Schema) {
-        extensible_string_enum(schema, super::schema_vocabulary::IMAGE_CORRESPONDENCE);
+    pub(super) fn audio_output_content(schema: &mut Schema) {
+        extensible_string_enum(schema, super::schema_vocabulary::AUDIO_OUTPUT_CONTENT);
     }
 
     pub(super) fn thumbnail_order(schema: &mut Schema) {
         extensible_string_enum(schema, super::schema_vocabulary::THUMBNAIL_ORDER);
     }
 
-    pub(super) fn position_continuation(schema: &mut Schema) {
-        extensible_string_enum(schema, super::schema_vocabulary::POSITION_CONTINUATION);
+    pub(super) fn sequence_decoding_kind(schema: &mut Schema) {
+        extensible_string_enum(schema, super::schema_vocabulary::SEQUENCE_DECODING_KIND);
     }
 
-    pub(super) fn position_generation(schema: &mut Schema) {
-        extensible_string_enum(schema, super::schema_vocabulary::POSITION_GENERATION);
+    pub(super) fn decoding_vocabulary_source(schema: &mut Schema) {
+        extensible_string_enum(schema, super::schema_vocabulary::DECODING_VOCABULARY_SOURCE);
     }
 
-    pub(super) fn kv_update_kind(schema: &mut Schema) {
-        extensible_string_enum(schema, super::schema_vocabulary::KV_UPDATE_KIND);
+    pub(super) fn batch_invariance(schema: &mut Schema) {
+        extensible_string_enum(schema, super::schema_vocabulary::BATCH_INVARIANCE);
     }
 
     pub(super) fn state_init_kind(schema: &mut Schema) {
@@ -733,44 +707,6 @@ mod schema_helpers {
             ]),
         );
     }
-
-    fn add_alias(schema: &mut Schema, canonical: &str, alias: &str, description: &str) {
-        let object = schema.ensure_object();
-        let Some(canonical_schema) = object
-            .get("properties")
-            .and_then(Value::as_object)
-            .and_then(|properties| properties.get(canonical))
-            .cloned()
-        else {
-            return;
-        };
-
-        if let Some(properties) = object.get_mut("properties").and_then(Value::as_object_mut) {
-            properties.insert(
-                alias.to_owned(),
-                json!({
-                    "allOf": [canonical_schema],
-                    "deprecated": true,
-                    "description": description
-                }),
-            );
-        }
-    }
-
-    fn forbid_both(schema: &mut Schema, first: &str, second: &str) {
-        let constraint = json!({
-            "not": {
-                "required": [first, second]
-            }
-        });
-        let object = schema.ensure_object();
-        object
-            .entry("allOf")
-            .or_insert_with(|| json!([]))
-            .as_array_mut()
-            .expect("allOf inserted as an array")
-            .push(constraint);
-    }
 }
 
 #[cfg(test)]
@@ -779,8 +715,7 @@ mod tests {
 
     #[derive(Debug, Deserialize, Serialize)]
     struct OptionalModalityDocument {
-        io: ModelIoSpec,
-        phase: PhaseConfig,
+        io: DecoderAbi,
     }
 
     #[test]
@@ -788,13 +723,10 @@ mod tests {
         let old_yaml = r#"
 io:
   sequence_source: token_ids
-phase:
-  run_on: prompt_only
 "#;
         let old: OptionalModalityDocument =
             serde_yaml::from_str(old_yaml).expect("old metadata deserializes");
         assert!(old.io.optional_inputs.is_empty());
-        assert!(old.phase.when_present.is_none());
         assert_eq!(
             serde_yaml::to_value(&old).expect("old metadata serializes"),
             serde_yaml::from_str::<serde_yaml::Value>(old_yaml).expect("old YAML parses")
@@ -808,9 +740,6 @@ io:
       absent:
         kind: zeros
         shape: [0, sequence_len]
-phase:
-  run_on: prompt_only
-  when_present: audio
 "#;
         let new: OptionalModalityDocument =
             serde_yaml::from_str(new_yaml).expect("optional-modality metadata deserializes");
@@ -828,7 +757,6 @@ phase:
                 TensorDimension::Symbol("sequence_len".into())
             ]
         );
-        assert_eq!(new.phase.when_present.as_deref(), Some("audio"));
         assert_eq!(
             serde_yaml::to_value(&new).expect("optional-modality metadata serializes"),
             serde_yaml::from_str::<serde_yaml::Value>(new_yaml).expect("new YAML parses")

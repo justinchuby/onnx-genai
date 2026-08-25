@@ -1,30 +1,8 @@
-use std::collections::BTreeSet;
-use std::path::Path;
-
-use onnx_genai_metadata::{InferenceMetadata, SCHEMA_VERSION, capabilities};
-use onnx_genai_preprocess::image::ImagePreprocessor;
-use serde::Deserialize;
+use onnx_genai_metadata::{InferenceMetadata, SCHEMA_VERSION};
 use serde_json::{Map, Value, json};
+use std::collections::BTreeSet;
 
 use crate::*;
-
-#[derive(Debug, Default, Deserialize)]
-struct CompatibilityConfig {
-    #[serde(default)]
-    text_config: Option<CompatibilityTextConfig>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct CompatibilityTextConfig {
-    #[serde(default)]
-    rope_parameters: Option<CompatibilityRopeParameters>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct CompatibilityRopeParameters {
-    #[serde(default)]
-    mrope_section: Option<Vec<usize>>,
-}
 
 struct DecoderStateMetadata {
     kv_inputs: Vec<String>,
@@ -127,9 +105,8 @@ impl GenAiConfig {
     /// op. The Microsoft ONNX exporter maps attention onto the GQA op whenever
     /// key/value heads are declared and do not exceed the query heads — this
     /// includes full multi-head attention (`kv == attn`), which is just GQA with
-    /// group size 1. The GQA op supports `past_present_share_buffer` at any head
-    /// ratio, so this (not the strict GQA-vs-MHA ratio) is the correct gate for
-    /// the runtime-owned shared KV buffer path.
+    /// group size 1. This determines the semantic attention description only;
+    /// it does not select a KV storage or execution path.
     pub fn uses_group_query_attention_op(&self) -> bool {
         matches!(
             (
@@ -144,13 +121,6 @@ impl GenAiConfig {
     /// preferring the explicit `context_length` then `search.max_length`.
     pub fn max_sequence_length(&self) -> Option<usize> {
         self.model.context_length.or(self.search.max_length)
-    }
-
-    /// Whether this model advertises the runtime-owned shared KV buffer path.
-    pub fn shared_kv_buffer_supported(&self) -> bool {
-        self.search.past_present_share_buffer == Some(true)
-            && self.uses_group_query_attention_op()
-            && self.max_sequence_length().is_some()
     }
 
     pub(crate) fn shape(&self) -> ModelShape {
@@ -206,12 +176,9 @@ impl GenAiConfig {
 
     /// Convert into native [`InferenceMetadata`].
     ///
-    /// `kv_native_dtype` is the KV cache scalar dtype read from the ONNX graph by
-    /// the caller (e.g. `"float16"` / `"float32"`); it is not present in
-    /// `genai_config.json`. The runtime-owned shared KV buffer path is enabled —
-    /// by emitting `kv_cache.native_dtype` — only when the model declares
-    /// `search.past_present_share_buffer`, uses the GQA op, has a known max
-    /// sequence length, and a share-buffer-compatible KV dtype is provided.
+    /// `kv_native_dtype` is retained for API compatibility with callers that
+    /// inspect decoder graph state. It does not select inference execution or
+    /// emit KV storage metadata.
     ///
     /// NOTE: shapes/tensors the native spec cannot yet represent are intentionally
     /// skipped (loading never fails on them): VAD, Conformer NeMo
@@ -251,15 +218,16 @@ impl GenAiConfig {
 
     fn build_inference_metadata(
         &self,
-        kv_native_dtype: Option<&str>,
+        _kv_native_dtype: Option<&str>,
         decoder_graph: Option<&ModelGraphInfo>,
     ) -> Result<InferenceMetadata, GenAiConfigError> {
         let shape = self.shape();
 
-        // Decline the transducer family up front: it has no executable
-        // representation, so there is nothing honest to synthesize.
-        if shape == ModelShape::Transducer {
-            return Err(transducer_unsupported());
+        if shape != ModelShape::SingleDecoder {
+            return Err(incomplete(
+                "composite packages require native inference_metadata with pipeline.workflow; \
+                 legacy genai_config pipeline synthesis has been removed",
+            ));
         }
 
         let mut model = Map::new();
@@ -271,47 +239,103 @@ impl GenAiConfig {
         );
         insert_usize(&mut model, "vocab_size", self.model.vocab_size);
 
-        if shape == ModelShape::SingleDecoder {
-            let io = self.decoder_io_json(false, decoder_graph);
-            if !io.is_empty() {
-                model.insert("io".into(), Value::Object(io));
-            }
-        }
-
         let mut root = Map::new();
         root.insert("schema_version".into(), json!(SCHEMA_VERSION));
         root.insert("model".into(), Value::Object(model));
-
-        match shape {
-            ModelShape::SingleDecoder => {}
-            ModelShape::EncoderDecoder => {
-                root.insert("pipeline".into(), self.encoder_decoder_pipeline_json());
-            }
-            ModelShape::Multimodal => {
-                root.insert("pipeline".into(), self.multimodal_pipeline_json());
-            }
-            ModelShape::DecoderPipeline => {
-                root.insert("pipeline".into(), self.decoder_pipeline_json());
-            }
-            // Declined above; unreachable but kept explicit for exhaustiveness.
-            ModelShape::Transducer => return Err(transducer_unsupported()),
-        }
-
         if let Some(generation) = self.generation_json() {
             root.insert("generation".into(), generation);
         }
-        if let Some(tokens) = self.tokens_json() {
-            root.insert("tokens".into(), tokens);
-        }
 
-        if self.shared_kv_buffer_supported()
-            && let Some(dtype) = kv_native_dtype
-            && is_share_buffer_kv_dtype(dtype)
-        {
-            root.insert("kv_cache".into(), json!({ "native_dtype": dtype }));
+        // `genai_config.json` is a *foreign* producer's format, so importing it
+        // is a conversion, not a fallback: the result is stated in this project's
+        // one representation, `pipeline.workflow`. Emitting the retired
+        // `model.io` block here would reintroduce the second answer through the
+        // side door — the importer would be the only remaining producer of a
+        // shape nothing else can read.
+        let io = self.decoder_io_json(false, decoder_graph);
+        if !io.is_empty() {
+            let abi: onnx_genai_metadata::DecoderAbi = serde_json::from_value(Value::Object(io))?;
+            let workflow = onnx_genai_metadata::decoder_workflow::decoder_workflow(
+                &abi,
+                self.model
+                    .decoder
+                    .filename
+                    .as_deref()
+                    .unwrap_or("model.onnx"),
+                &onnx_genai_metadata::decoder_workflow::DecoderFacts {
+                    max_sequence_length: self.max_sequence_length(),
+                    // `genai_config.json` already normalizes a scalar or an
+                    // array here, so a model with several end tokens carries
+                    // all of them across instead of losing every id but the
+                    // first at the boundary.
+                    eos_token_ids: eos_token_ids(self),
+                    // When the caller supplied the decoder's graph, state the
+                    // ports it actually has. Guessing a state tensor's rank
+                    // produces a contract the session validator rejects for
+                    // whichever package happens to disagree.
+                    port_contracts: decoder_graph
+                        .map(port_contracts_from_graph)
+                        .unwrap_or_default(),
+                },
+            )
+            .map_err(|error| {
+                incomplete(format!(
+                    "this genai_config.json describes a decoder that cannot be stated as a \
+                 workflow: {error}"
+                ))
+            })?;
+            root.insert(
+                "pipeline".into(),
+                json!({ "workflow": serde_json::to_value(&workflow)? }),
+            );
         }
 
         Ok(serde_json::from_value(Value::Object(root))?)
+    }
+
+    /// Carry the legacy `search` block into `generation.defaults`.
+    ///
+    /// `search` is the author's declared generation policy, not deployment
+    /// policy: `do_sample`, `temperature`, `top_k`, `top_p` and the beam fields
+    /// decide what the package *means* when a caller supplies no overrides.
+    /// `GenerationDefaults` is field-for-field the same contract, so the
+    /// conversion is exact rather than approximate.
+    ///
+    /// `past_present_share_buffer` is deliberately absent here: it is a graph ABI
+    /// fact, not a generation default, and is carried by the workflow's
+    /// state-service group aliasing.
+    fn generation_json(&self) -> Option<Value> {
+        let search = &self.search;
+        let mut defaults = Map::new();
+        insert_some(&mut defaults, "do_sample", search.do_sample);
+        insert_some(&mut defaults, "temperature", search.temperature);
+        insert_some(&mut defaults, "top_k", search.top_k);
+        insert_some(&mut defaults, "top_p", search.top_p);
+        insert_some(
+            &mut defaults,
+            "repetition_penalty",
+            search.repetition_penalty,
+        );
+        insert_some(&mut defaults, "num_beams", search.num_beams);
+        insert_some(
+            &mut defaults,
+            "num_return_sequences",
+            search.num_return_sequences,
+        );
+        insert_some(&mut defaults, "min_length", search.min_length);
+        insert_some(&mut defaults, "max_length", search.max_length);
+        insert_some(&mut defaults, "length_penalty", search.length_penalty);
+        insert_some(
+            &mut defaults,
+            "no_repeat_ngram_size",
+            search.no_repeat_ngram_size,
+        );
+        insert_some(&mut defaults, "diversity_penalty", search.diversity_penalty);
+        insert_some(&mut defaults, "early_stopping", search.early_stopping);
+        if defaults.is_empty() {
+            return None;
+        }
+        Some(json!({ "defaults": Value::Object(defaults) }))
     }
 
     fn attention_json(&self) -> Value {
@@ -457,1079 +481,21 @@ impl GenAiConfig {
             }
         }
 
+        // Alias legality is a graph ABI fact, so it belongs to the state group, not to
+        // the generation defaults. Legacy `past_present_share_buffer: true` is
+        // exactly the author's statement that `present.*` may be written over
+        // `past_key_values.*` in one buffer; it is carried here so the runtime can
+        // still choose the shared-buffer decode path (and therefore continuous
+        // batching) for a legacy package. Silence stays `forbidden` by omission.
+        if self.search.past_present_share_buffer == Some(true) {
+            io.insert("aliasing".into(), json!("permitted"));
+        }
+
         io
-    }
-
-    fn multimodal_pipeline_json(&self) -> Value {
-        let mut models = Map::new();
-        let mut dataflow: Vec<Value> = Vec::new();
-        let mut phases = Map::new();
-        let mut prompt_encoder: Option<String> = None;
-
-        if let Some(vision) = &self.model.vision {
-            models.insert(
-                "vision_encoder".into(),
-                component_json(
-                    filename_or(&vision.filename, "vision.onnx"),
-                    "encoder",
-                    None,
-                ),
-            );
-            phases.insert("vision_encoder".into(), run_on("prompt_only"));
-            prompt_encoder.get_or_insert_with(|| "vision_encoder".into());
-            if self.model.embedding.is_some() {
-                let from = vision
-                    .outputs
-                    .image_features
-                    .as_deref()
-                    .unwrap_or("image_features");
-                let to = self
-                    .model
-                    .embedding
-                    .as_ref()
-                    .and_then(|e| e.inputs.image_features.as_deref())
-                    .unwrap_or("image_features");
-                dataflow.push(edge(
-                    &format!("vision_encoder.{from}"),
-                    &format!("embedding.{to}"),
-                ));
-            }
-        }
-
-        if let Some(speech) = &self.model.speech {
-            models.insert(
-                "audio_encoder".into(),
-                component_json(
-                    filename_or(&speech.filename, "speech.onnx"),
-                    "encoder",
-                    None,
-                ),
-            );
-            phases.insert("audio_encoder".into(), run_on("prompt_only"));
-            prompt_encoder.get_or_insert_with(|| "audio_encoder".into());
-            if self.model.embedding.is_some() {
-                let from = speech
-                    .outputs
-                    .audio_features
-                    .as_deref()
-                    .unwrap_or("audio_features");
-                let to = self
-                    .model
-                    .embedding
-                    .as_ref()
-                    .and_then(|e| e.inputs.audio_features.as_deref())
-                    .unwrap_or("audio_features");
-                dataflow.push(edge(
-                    &format!("audio_encoder.{from}"),
-                    &format!("embedding.{to}"),
-                ));
-            }
-        }
-
-        if let Some(embedding) = &self.model.embedding {
-            let mut io = Map::new();
-            if let Some(input_ids) = embedding.inputs.input_ids.as_deref() {
-                io.insert("token_input".into(), json!(input_ids));
-            }
-            let io = (!io.is_empty()).then_some(Value::Object(io));
-            models.insert(
-                "embedding".into(),
-                component_json(
-                    filename_or(&embedding.filename, "embedding.onnx"),
-                    "embedding",
-                    io,
-                ),
-            );
-            phases.insert("embedding".into(), run_on("every_step"));
-
-            let from = embedding
-                .outputs
-                .inputs_embeds
-                .as_deref()
-                .unwrap_or("inputs_embeds");
-            let to = self
-                .model
-                .decoder
-                .inputs
-                .inputs_embeds
-                .as_deref()
-                .unwrap_or("inputs_embeds");
-            dataflow.push(edge(&format!("embedding.{from}"), &format!("decoder.{to}")));
-        }
-
-        let decoder_io = self.decoder_io_json(false, None);
-        let decoder_io = (!decoder_io.is_empty()).then_some(Value::Object(decoder_io));
-        models.insert(
-            "decoder".into(),
-            component_json(
-                filename_or(&self.model.decoder.filename, "decoder.onnx"),
-                "decoder",
-                decoder_io,
-            ),
-        );
-        phases.insert("decoder".into(), run_on("every_step"));
-
-        let strategy = composite_encode_decode(prompt_encoder.as_deref(), "decoder");
-
-        let mut pipeline = Map::new();
-        pipeline.insert("models".into(), Value::Object(models));
-        pipeline.insert("dataflow".into(), Value::Array(dataflow));
-        pipeline.insert("strategy".into(), strategy);
-        pipeline.insert("phases".into(), Value::Object(phases));
-        if let Some(image_token_id) = self.model.image_token_id {
-            pipeline.insert(
-                "vision".into(),
-                json!({ "image_placeholder_token_id": image_token_id }),
-            );
-        }
-        Value::Object(pipeline)
-    }
-
-    fn encoder_decoder_pipeline_json(&self) -> Value {
-        let encoder = self.model.encoder.as_ref();
-        let mut models = Map::new();
-        models.insert(
-            "encoder".into(),
-            component_json(
-                filename_or(&encoder.and_then(|e| e.filename.clone()), "encoder.onnx"),
-                "encoder",
-                None,
-            ),
-        );
-        let decoder_io = self.decoder_io_json(true, None);
-        let decoder_io = (!decoder_io.is_empty()).then_some(Value::Object(decoder_io));
-        models.insert(
-            "decoder".into(),
-            component_json(
-                filename_or(&self.model.decoder.filename, "decoder.onnx"),
-                "decoder",
-                decoder_io,
-            ),
-        );
-
-        let enc_hidden = encoder
-            .and_then(|e| e.outputs.encoder_hidden_states.as_deref())
-            .unwrap_or(DEFAULT_ENCODER_HIDDEN_STATES);
-        let dec_hidden = self
-            .model
-            .decoder
-            .inputs
-            .encoder_hidden_states
-            .as_deref()
-            .unwrap_or(DEFAULT_ENCODER_HIDDEN_STATES);
-        let dataflow = vec![edge(
-            &format!("encoder.{enc_hidden}"),
-            &format!("decoder.{dec_hidden}"),
-        )];
-
-        let mut phases = Map::new();
-        phases.insert("encoder".into(), run_on("prompt_only"));
-        phases.insert("decoder".into(), run_on("every_step"));
-
-        let strategy = composite_encode_decode(Some("encoder"), "decoder");
-
-        let mut pipeline = Map::new();
-        pipeline.insert("models".into(), Value::Object(models));
-        pipeline.insert("dataflow".into(), Value::Array(dataflow));
-        pipeline.insert("strategy".into(), strategy);
-        pipeline.insert("phases".into(), Value::Object(phases));
-        Value::Object(pipeline)
-    }
-
-    fn decoder_pipeline_json(&self) -> Value {
-        // NOTE: the split decoder graphs are wired by raw graph tensor names,
-        // which contain dots (e.g. `past_key_values.0.key`) and cannot be
-        // expressed as `component.port` dataflow endpoints yet, so the dataflow
-        // is left empty; only the component list and ordering are captured.
-        let mut models = Map::new();
-        let mut last_stage: Option<String> = None;
-        for stage in &self.model.decoder.pipeline {
-            for (name, spec) in stage {
-                let role = pipeline_stage_role(name);
-                models.insert(
-                    name.clone(),
-                    component_json(
-                        filename_or(&spec.filename, &format!("{name}.onnx")),
-                        role,
-                        None,
-                    ),
-                );
-                last_stage = Some(name.clone());
-            }
-        }
-
-        let decoder = last_stage.unwrap_or_else(|| "decoder".into());
-        let strategy = json!({ "kind": "autoregressive", "decoder": decoder });
-
-        let mut pipeline = Map::new();
-        pipeline.insert("models".into(), Value::Object(models));
-        pipeline.insert("dataflow".into(), Value::Array(Vec::new()));
-        pipeline.insert("strategy".into(), strategy);
-        Value::Object(pipeline)
-    }
-
-    fn generation_json(&self) -> Option<Value> {
-        let s = &self.search;
-        let mut m = Map::new();
-        insert_bool(&mut m, "do_sample", s.do_sample);
-        insert_f32(&mut m, "temperature", s.temperature);
-        insert_usize(&mut m, "top_k", s.top_k);
-        insert_f32(&mut m, "top_p", s.top_p);
-        insert_f32(&mut m, "repetition_penalty", s.repetition_penalty);
-        insert_usize(&mut m, "num_beams", s.num_beams);
-        insert_usize(&mut m, "num_return_sequences", s.num_return_sequences);
-        insert_usize(&mut m, "min_length", s.min_length);
-        insert_usize(&mut m, "max_length", s.max_length);
-        insert_f32(&mut m, "length_penalty", s.length_penalty);
-        insert_usize(&mut m, "no_repeat_ngram_size", s.no_repeat_ngram_size);
-        insert_f32(&mut m, "diversity_penalty", s.diversity_penalty);
-        insert_bool(&mut m, "early_stopping", s.early_stopping);
-        (!m.is_empty()).then_some(Value::Object(m))
-    }
-
-    fn tokens_json(&self) -> Option<Value> {
-        let model = &self.model;
-        let mut m = Map::new();
-        insert_i64(&mut m, "pad_token_id", model.pad_token_id);
-        insert_i64(&mut m, "bos_token_id", model.bos_token_id);
-        if let Some(eos) = &model.eos_token_id {
-            m.insert("eos_token_id".into(), json!(eos.to_vec()));
-        }
-        insert_i64(&mut m, "sep_token_id", model.sep_token_id);
-        insert_i64(
-            &mut m,
-            "decoder_start_token_id",
-            model.decoder_start_token_id,
-        );
-        insert_i64(&mut m, "image_token_id", model.image_token_id);
-        insert_i64(&mut m, "video_token_id", model.video_token_id);
-        insert_i64(&mut m, "vision_start_token_id", model.vision_start_token_id);
-        (!m.is_empty()).then_some(Value::Object(m))
     }
 }
 
 impl GenAiConfig {
-    pub(crate) fn to_strict_pipeline_metadata(
-        &self,
-        model_dir: &Path,
-        graphs: &PipelineGraphInfo,
-    ) -> Result<InferenceMetadata, GenAiConfigError> {
-        let vision = required_ref(self.model.vision.as_ref(), "model.vision")?;
-        let embedding = required_ref(self.model.embedding.as_ref(), "model.embedding")?;
-        let vision_filename = required_str(vision.filename.as_deref(), "model.vision.filename")?;
-        let embedding_filename =
-            required_str(embedding.filename.as_deref(), "model.embedding.filename")?;
-        let decoder_filename = required_str(
-            self.model.decoder.filename.as_deref(),
-            "model.decoder.filename",
-        )?;
-        let processor_filename = required_str(
-            vision.config_filename.as_deref(),
-            "model.vision.config_filename",
-        )?;
-
-        let compatibility_config: CompatibilityConfig =
-            load_auxiliary_json(&model_dir.join("config.json"), "config.json")?;
-        let processor: ProcessorConfig = load_auxiliary_json(
-            &model_dir.join(processor_filename),
-            "processor config declared by model.vision.config_filename",
-        )?;
-
-        let vision_pixel = required_str(
-            vision.inputs.pixel_values.as_deref(),
-            "model.vision.inputs.pixel_values",
-        )?;
-        let vision_grid = required_str(
-            vision.inputs.image_grid_thw.as_deref(),
-            "model.vision.inputs.image_grid_thw",
-        )?;
-        let vision_features = required_str(
-            vision.outputs.image_features.as_deref(),
-            "model.vision.outputs.image_features",
-        )?;
-        let embedding_tokens = required_str(
-            embedding.inputs.input_ids.as_deref(),
-            "model.embedding.inputs.input_ids",
-        )?;
-        let embedding_image = required_str(
-            embedding.inputs.image_features.as_deref(),
-            "model.embedding.inputs.image_features",
-        )?;
-        let embedding_output = required_str(
-            embedding.outputs.inputs_embeds.as_deref(),
-            "model.embedding.outputs.inputs_embeds",
-        )?;
-        let decoder_embeds = required_str(
-            self.model.decoder.inputs.inputs_embeds.as_deref(),
-            "model.decoder.inputs.inputs_embeds",
-        )?;
-        let decoder_mask = required_str(
-            self.model.decoder.inputs.attention_mask.as_deref(),
-            "model.decoder.inputs.attention_mask",
-        )?;
-        let decoder_position = required_str(
-            self.model.decoder.inputs.position_ids.as_deref(),
-            "model.decoder.inputs.position_ids",
-        )?;
-        let decoder_logits = required_str(
-            self.model.decoder.outputs.logits.as_deref(),
-            "model.decoder.outputs.logits",
-        )?;
-        let image_token_id = required_copy(self.model.image_token_id, "model.image_token_id")?;
-        let past_present_share_buffer = required_copy(
-            self.search.past_present_share_buffer,
-            "search.past_present_share_buffer",
-        )?;
-        required_positive(vision.spatial_merge_size, "model.vision.spatial_merge_size")?;
-        required_positive(vision.patch_size, "model.vision.patch_size")?;
-
-        let vision_pixel_info = require_graph_input(&graphs.vision, vision_pixel, "vision")?;
-        let vision_grid_info = require_graph_input(&graphs.vision, vision_grid, "vision")?;
-        let vision_features_info = require_graph_output(&graphs.vision, vision_features, "vision")?;
-        require_graph_input(&graphs.embedding, embedding_tokens, "embedding")?;
-        let embedding_image_info =
-            require_graph_input(&graphs.embedding, embedding_image, "embedding")?;
-        let embedding_output_info =
-            require_graph_output(&graphs.embedding, embedding_output, "embedding")?;
-        let decoder_embeds_info = require_graph_input(&graphs.decoder, decoder_embeds, "decoder")?;
-        require_graph_input(&graphs.decoder, decoder_mask, "decoder")?;
-        let position_info = require_graph_input(&graphs.decoder, decoder_position, "decoder")?;
-        require_graph_output(&graphs.decoder, decoder_logits, "decoder")?;
-
-        require_same_dtype(
-            vision_features_info,
-            embedding_image_info,
-            "vision image-features dataflow",
-        )?;
-        require_same_dtype(
-            embedding_output_info,
-            decoder_embeds_info,
-            "embedding-to-decoder dataflow",
-        )?;
-
-        let sections = compatibility_config
-            .text_config
-            .and_then(|text| text.rope_parameters)
-            .and_then(|rope| rope.mrope_section);
-        if position_info.dimensions.len() != 3 {
-            return Err(incomplete(format!(
-                "decoder position input rank 3 required by the declared image_grid_thw processor summary (got rank {})",
-                position_info.dimensions.len()
-            )));
-        }
-        if sections.is_none() {
-            return Err(incomplete(
-                "config.json text_config.rope_parameters.mrope_section for the multi-axis position input",
-            ));
-        }
-        if let Some(sections) = &sections
-            && sections.len() != position_info.dimensions.len()
-        {
-            return Err(incomplete(format!(
-                "position section count ({}) does not match the ONNX position rank ({})",
-                sections.len(),
-                position_info.dimensions.len()
-            )));
-        }
-        if sections
-            .as_ref()
-            .is_some_and(|sections| sections.contains(&0))
-        {
-            return Err(incomplete(
-                "config.json text_config.rope_parameters.mrope_section entries must be greater than zero",
-            ));
-        }
-
-        let DecoderStateMetadata {
-            kv_inputs,
-            kv_outputs,
-            state_pairs,
-            kv_dtype,
-        } = self.strict_decoder_state(&graphs.decoder)?;
-        let has_state_pairs = !state_pairs.is_empty();
-        let preprocessing =
-            processor_program_json(&processor, vision, vision_pixel_info, vision_grid_info)?;
-
-        let mut decoder_io = Map::new();
-        // The split-VLM decoder is driven by `inputs_embeds` produced by the
-        // embedding component (the vision encoder raises image features into the
-        // same embedding stream); it declares no token-id input. Declare the
-        // sequence source explicitly so decode resolves the embeds input rather
-        // than defaulting to a (non-existent) token input. This mirrors the
-        // text-only fallback (`to_strict_text_only_pipeline_metadata`).
-        decoder_io.insert("sequence_source".into(), json!("inputs_embeds"));
-        if let Some(token) = self.model.decoder.inputs.input_ids.as_deref() {
-            require_graph_input(&graphs.decoder, token, "decoder")?;
-            decoder_io.insert("token_input".into(), json!(token));
-        }
-        decoder_io.insert("inputs_embeds_input".into(), json!(decoder_embeds));
-        decoder_io.insert("attention_mask_input".into(), json!(decoder_mask));
-        decoder_io.insert("position_ids_input".into(), json!(decoder_position));
-        decoder_io.insert("logits_output".into(), json!(decoder_logits));
-        decoder_io.insert("kv_inputs".into(), json!(kv_inputs));
-        decoder_io.insert("kv_outputs".into(), json!(kv_outputs));
-        decoder_io.insert(
-            "kv_update".into(),
-            json!(if past_present_share_buffer {
-                "shared_buffer"
-            } else {
-                "append"
-            }),
-        );
-        if has_state_pairs {
-            decoder_io.insert("state_pairs".into(), Value::Array(state_pairs));
-        }
-
-        let mut embedding_io = Map::new();
-        embedding_io.insert("token_input".into(), json!(embedding_tokens));
-
-        let mut models = Map::new();
-        models.insert(
-            "vision_encoder".into(),
-            component_json(vision_filename.to_owned(), "vision_encoder", None),
-        );
-        models.insert(
-            "embedding".into(),
-            component_json(
-                embedding_filename.to_owned(),
-                "embedding",
-                Some(Value::Object(embedding_io)),
-            ),
-        );
-        models.insert(
-            "decoder".into(),
-            component_json(
-                decoder_filename.to_owned(),
-                "decoder",
-                Some(Value::Object(decoder_io)),
-            ),
-        );
-
-        let dataflow = vec![
-            edge_with_dtype(
-                &format!("vision_encoder.{vision_features}"),
-                &format!("embedding.{embedding_image}"),
-                &vision_features_info.dtype,
-            ),
-            edge_with_dtype(
-                &format!("embedding.{embedding_output}"),
-                &format!("decoder.{decoder_embeds}"),
-                &embedding_output_info.dtype,
-            ),
-        ];
-        let mut phases = Map::new();
-        phases.insert("vision_encoder".into(), run_on("prompt_only"));
-        phases.insert("embedding".into(), run_on("every_step"));
-        phases.insert("decoder".into(), run_on("every_step"));
-
-        let strategy = json!({
-            "kind": "composite",
-            "stages": [
-                {
-                    "name": "encode_vision",
-                    "run_on": "prompt_only",
-                    "strategy": { "kind": "single_pass", "model": "vision_encoder" }
-                },
-                {
-                    "name": "embed_tokens",
-                    "run_on": "every_step",
-                    "strategy": { "kind": "single_pass", "model": "embedding" }
-                },
-                {
-                    "name": "decode",
-                    "run_on": "every_step",
-                    "strategy": { "kind": "autoregressive", "decoder": "decoder" }
-                }
-            ]
-        });
-
-        let positions = json!({
-            "input": decoder_position,
-            "rank": position_info.dimensions.len(),
-            "axes": ["temporal", "height", "width"],
-            "sections": sections,
-            "dtype": position_info.dtype,
-            "continuation": "from_grid",
-            "processor_summaries": [vision_grid]
-        });
-
-        let mut pipeline = Map::new();
-        pipeline.insert("models".into(), Value::Object(models));
-        pipeline.insert("dataflow".into(), Value::Array(dataflow));
-        pipeline.insert("strategy".into(), strategy);
-        pipeline.insert("phases".into(), Value::Object(phases));
-        pipeline.insert(
-            "vision".into(),
-            json!({
-                "image_placeholder_token_id": image_token_id,
-                "image_token_id": image_token_id,
-                "token_count_source": "from_grid",
-                "token_count_summary": vision_grid,
-                "placeholder_per_image": true
-            }),
-        );
-        pipeline.insert("positions".into(), positions);
-
-        let mut required_capabilities = vec![
-            capabilities::IMAGE_PREPROCESSING_PROGRAM,
-            capabilities::POSITION_PROGRAM,
-        ];
-        if preprocessing["image"]["outputs"]
-            .as_array()
-            .is_some_and(|outputs| outputs.len() > 1)
-        {
-            required_capabilities.push(capabilities::PACKED_IMAGE_OUTPUTS);
-        }
-        required_capabilities.push(capabilities::MULTI_AXIS_POSITIONS);
-        if has_state_pairs {
-            required_capabilities.push(capabilities::LOOP_CARRIED_STATE);
-        }
-
-        let mut model = Map::new();
-        model.insert("attention".into(), self.attention_json());
-        insert_usize(
-            &mut model,
-            "max_sequence_length",
-            self.max_sequence_length(),
-        );
-        insert_usize(&mut model, "vocab_size", self.model.vocab_size);
-
-        let mut root = Map::new();
-        root.insert("schema_version".into(), json!(SCHEMA_VERSION));
-        root.insert("required_capabilities".into(), json!(required_capabilities));
-        root.insert("model".into(), Value::Object(model));
-        root.insert("preprocessing".into(), preprocessing);
-        root.insert("pipeline".into(), Value::Object(pipeline));
-        if let Some(generation) = self.generation_json() {
-            root.insert("generation".into(), generation);
-        }
-        if let Some(tokens) = self.tokens_json() {
-            root.insert("tokens".into(), tokens);
-        }
-        if past_present_share_buffer && is_share_buffer_kv_dtype(&kv_dtype) {
-            root.insert("kv_cache".into(), json!({ "native_dtype": kv_dtype }));
-        }
-
-        let metadata: InferenceMetadata = serde_json::from_value(Value::Object(root))?;
-        let image_program = metadata
-            .preprocessing
-            .as_ref()
-            .and_then(|preprocessing| preprocessing.image.as_ref())
-            .ok_or_else(|| incomplete("synthesized typed image preprocessing program"))?;
-        let pixel_shape = vision_pixel_info
-            .dimensions
-            .iter()
-            .map(|dimension| match dimension {
-                Some(dimension) => i64::try_from(*dimension).map_err(|_| {
-                    incomplete(format!(
-                        "vision pixel input '{}' dimension {dimension} fits in i64",
-                        vision_pixel_info.name
-                    ))
-                }),
-                None => Ok(-1),
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        ImagePreprocessor::from_input_and_program(&pixel_shape, image_program).map_err(|error| {
-            incomplete(format!(
-                "synthesized image preprocessing program is not executable by ImagePreprocessor: {error}"
-            ))
-        })?;
-        Ok(metadata)
-    }
-
-    /// Strict **text-only** decode-pipeline synthesis for a multimodal
-    /// (embedding + decoder) compatibility package whose image path is unusable.
-    ///
-    /// A split VLM package pairs an `embedding` graph (token ids [+ optional
-    /// image features] → `inputs_embeds`) with an `inputs_embeds`-driven
-    /// `decoder`. When the package's declared image preprocessing is not
-    /// representable by the runtime (see
-    /// [`GenAiConfigError::UnrepresentablePreprocessing`]), the vision path
-    /// cannot be honored — but text decode never touches vision. This synthesis
-    /// produces the same embedding→decoder autoregressive pipeline with the
-    /// vision component, image preprocessing, image dataflow, and grid-derived
-    /// positions removed. It is driven purely by the package's declared modality
-    /// shape (a split embedding+decoder package that can accept token ids
-    /// without image features), never by a model name: any such package that is
-    /// image-unusable synthesizes text decode the same way.
-    ///
-    /// Positions are declared with `linear_increment` continuation instead of
-    /// the VLM `from_grid` program: for a pure-text sequence every multi-axis
-    /// (mrope) coordinate stream advances identically with the sequence
-    /// position, which `linear_increment` produces for any rank (`[t, t, …]`),
-    /// so no processor grid summary is required. All decoder KV / loop-carried
-    /// state facts are validated against the authoritative ONNX decoder graph
-    /// exactly as the multimodal path does.
-    pub(crate) fn to_strict_text_only_pipeline_metadata(
-        &self,
-        graphs: &PipelineGraphInfo,
-    ) -> Result<InferenceMetadata, GenAiConfigError> {
-        let embedding = required_ref(self.model.embedding.as_ref(), "model.embedding")?;
-        let embedding_filename =
-            required_str(embedding.filename.as_deref(), "model.embedding.filename")?;
-        let decoder_filename = required_str(
-            self.model.decoder.filename.as_deref(),
-            "model.decoder.filename",
-        )?;
-
-        let embedding_tokens = required_str(
-            embedding.inputs.input_ids.as_deref(),
-            "model.embedding.inputs.input_ids",
-        )?;
-        let embedding_output = required_str(
-            embedding.outputs.inputs_embeds.as_deref(),
-            "model.embedding.outputs.inputs_embeds",
-        )?;
-        let decoder_embeds = required_str(
-            self.model.decoder.inputs.inputs_embeds.as_deref(),
-            "model.decoder.inputs.inputs_embeds",
-        )?;
-        let decoder_mask = required_str(
-            self.model.decoder.inputs.attention_mask.as_deref(),
-            "model.decoder.inputs.attention_mask",
-        )?;
-        let decoder_position = required_str(
-            self.model.decoder.inputs.position_ids.as_deref(),
-            "model.decoder.inputs.position_ids",
-        )?;
-        let decoder_logits = required_str(
-            self.model.decoder.outputs.logits.as_deref(),
-            "model.decoder.outputs.logits",
-        )?;
-        let past_present_share_buffer = required_copy(
-            self.search.past_present_share_buffer,
-            "search.past_present_share_buffer",
-        )?;
-
-        require_graph_input(&graphs.embedding, embedding_tokens, "embedding")?;
-        let embedding_output_info =
-            require_graph_output(&graphs.embedding, embedding_output, "embedding")?;
-        let decoder_embeds_info = require_graph_input(&graphs.decoder, decoder_embeds, "decoder")?;
-        require_graph_input(&graphs.decoder, decoder_mask, "decoder")?;
-        let position_info = require_graph_input(&graphs.decoder, decoder_position, "decoder")?;
-        require_graph_output(&graphs.decoder, decoder_logits, "decoder")?;
-
-        require_same_dtype(
-            embedding_output_info,
-            decoder_embeds_info,
-            "embedding-to-decoder dataflow",
-        )?;
-
-        let position_rank = position_info.dimensions.len();
-        if position_rank == 0 {
-            return Err(incomplete(format!(
-                "decoder position input '{decoder_position}' declares a positive rank"
-            )));
-        }
-
-        let DecoderStateMetadata {
-            kv_inputs,
-            kv_outputs,
-            state_pairs,
-            kv_dtype,
-        } = self.strict_decoder_state(&graphs.decoder)?;
-        let has_state_pairs = !state_pairs.is_empty();
-        let multi_axis = position_rank > 1;
-
-        let mut decoder_io = Map::new();
-        // The decoder is driven by `inputs_embeds` produced by the embedding
-        // component (text.onnx declares no token-id input); declare the sequence
-        // source explicitly so decode resolves the embeds input rather than
-        // defaulting to a (non-existent) token input.
-        decoder_io.insert("sequence_source".into(), json!("inputs_embeds"));
-        if let Some(token) = self.model.decoder.inputs.input_ids.as_deref() {
-            require_graph_input(&graphs.decoder, token, "decoder")?;
-            decoder_io.insert("token_input".into(), json!(token));
-        }
-        decoder_io.insert("inputs_embeds_input".into(), json!(decoder_embeds));
-        decoder_io.insert("attention_mask_input".into(), json!(decoder_mask));
-        decoder_io.insert("position_ids_input".into(), json!(decoder_position));
-        decoder_io.insert("logits_output".into(), json!(decoder_logits));
-        decoder_io.insert("kv_inputs".into(), json!(kv_inputs));
-        decoder_io.insert("kv_outputs".into(), json!(kv_outputs));
-        decoder_io.insert(
-            "kv_update".into(),
-            json!(if past_present_share_buffer {
-                "shared_buffer"
-            } else {
-                "append"
-            }),
-        );
-        if has_state_pairs {
-            decoder_io.insert("state_pairs".into(), Value::Array(state_pairs));
-        }
-
-        // Text decode drives the embedding with token ids only. A split VLM
-        // embedding graph also declares an `image_features` input that the
-        // vision path would supply; with no vision component it has no dataflow
-        // edge, so it is declared as an optional input whose absent value is an
-        // empty (zero image-token) tensor. The image-token axis collapses to 0
-        // and any fixed feature width is preserved, so a pure-text prompt (no
-        // image placeholder tokens) never gathers from it.
-        let mut embedding_io = Map::new();
-        embedding_io.insert("token_input".into(), json!(embedding_tokens));
-        if let Some(image_features) = embedding.inputs.image_features.as_deref() {
-            let image_info = require_graph_input(&graphs.embedding, image_features, "embedding")?;
-            let absent_shape = image_info
-                .dimensions
-                .iter()
-                .map(|dimension| json!(dimension.unwrap_or(0)))
-                .collect::<Vec<_>>();
-            let mut optional_inputs = Map::new();
-            optional_inputs.insert(
-                image_features.to_owned(),
-                json!({
-                    "presence": "image_features",
-                    "absent": { "kind": "zeros", "shape": absent_shape }
-                }),
-            );
-            embedding_io.insert("optional_inputs".into(), Value::Object(optional_inputs));
-        }
-
-        let mut models = Map::new();
-        models.insert(
-            "embedding".into(),
-            component_json(
-                embedding_filename.to_owned(),
-                "embedding",
-                Some(Value::Object(embedding_io)),
-            ),
-        );
-        models.insert(
-            "decoder".into(),
-            component_json(
-                decoder_filename.to_owned(),
-                "decoder",
-                Some(Value::Object(decoder_io)),
-            ),
-        );
-
-        let dataflow = vec![edge_with_dtype(
-            &format!("embedding.{embedding_output}"),
-            &format!("decoder.{decoder_embeds}"),
-            &embedding_output_info.dtype,
-        )];
-        let mut phases = Map::new();
-        phases.insert("embedding".into(), run_on("every_step"));
-        phases.insert("decoder".into(), run_on("every_step"));
-
-        let strategy = json!({
-            "kind": "composite",
-            "stages": [
-                {
-                    "name": "embed_tokens",
-                    "run_on": "every_step",
-                    "strategy": { "kind": "single_pass", "model": "embedding" }
-                },
-                {
-                    "name": "decode",
-                    "run_on": "every_step",
-                    "strategy": { "kind": "autoregressive", "decoder": "decoder" }
-                }
-            ]
-        });
-
-        // Pure-text positions: every coordinate stream advances with the
-        // sequence position, which `linear_increment` yields for any rank. No
-        // processor grid summary is read, and no section widths are needed
-        // because there is no grid-derived coordinate program.
-        let mut positions = Map::new();
-        positions.insert("input".into(), json!(decoder_position));
-        positions.insert("rank".into(), json!(position_rank));
-        if multi_axis {
-            positions.insert(
-                "axes".into(),
-                json!(
-                    (0..position_rank)
-                        .map(|axis| format!("axis_{axis}"))
-                        .collect::<Vec<_>>()
-                ),
-            );
-        }
-        positions.insert("dtype".into(), json!(position_info.dtype));
-        positions.insert("continuation".into(), json!("linear_increment"));
-
-        let mut pipeline = Map::new();
-        pipeline.insert("models".into(), Value::Object(models));
-        pipeline.insert("dataflow".into(), Value::Array(dataflow));
-        pipeline.insert("strategy".into(), strategy);
-        pipeline.insert("phases".into(), Value::Object(phases));
-        pipeline.insert("positions".into(), Value::Object(positions));
-
-        let mut required_capabilities = vec![capabilities::POSITION_PROGRAM];
-        if multi_axis {
-            required_capabilities.push(capabilities::MULTI_AXIS_POSITIONS);
-        }
-        if has_state_pairs {
-            required_capabilities.push(capabilities::LOOP_CARRIED_STATE);
-        }
-
-        let mut model = Map::new();
-        model.insert("attention".into(), self.attention_json());
-        insert_usize(
-            &mut model,
-            "max_sequence_length",
-            self.max_sequence_length(),
-        );
-        insert_usize(&mut model, "vocab_size", self.model.vocab_size);
-
-        let mut root = Map::new();
-        root.insert("schema_version".into(), json!(SCHEMA_VERSION));
-        root.insert("required_capabilities".into(), json!(required_capabilities));
-        root.insert("model".into(), Value::Object(model));
-        root.insert("pipeline".into(), Value::Object(pipeline));
-        if let Some(generation) = self.generation_json() {
-            root.insert("generation".into(), generation);
-        }
-        if let Some(tokens) = self.tokens_json() {
-            root.insert("tokens".into(), tokens);
-        }
-        if past_present_share_buffer && is_share_buffer_kv_dtype(&kv_dtype) {
-            root.insert("kv_cache".into(), json!({ "native_dtype": kv_dtype }));
-        }
-
-        Ok(serde_json::from_value(Value::Object(root))?)
-    }
-
-    /// Strict encoder-decoder pipeline synth (audio/text sequence-to-sequence).
-    ///
-    /// Recognized purely from the encoder-decoder SHAPE of `genai_config.json`
-    /// (a declared `model.encoder` with cross-attention KV outputs feeding the
-    /// decoder's cross-attention KV inputs), never from `model.type` or a model
-    /// name, so any encoder-decoder family (Whisper audio, and other
-    /// sequence-to-sequence encoders) synthesizes the same way. Every port,
-    /// rank, and dtype fact is validated against the authoritative ONNX graphs.
-    pub(crate) fn to_strict_encoder_decoder_pipeline_metadata(
-        &self,
-        graphs: &EncoderDecoderGraphInfo,
-    ) -> Result<InferenceMetadata, GenAiConfigError> {
-        let encoder = required_ref(self.model.encoder.as_ref(), "model.encoder")?;
-        let decoder = &self.model.decoder;
-        let encoder_filename = required_str(encoder.filename.as_deref(), "model.encoder.filename")?;
-        let decoder_filename = required_str(decoder.filename.as_deref(), "model.decoder.filename")?;
-
-        // Encoder prompt input, keyed off the declared input SHAPE, not a model
-        // name: audio front-ends declare `audio_features`, text encoders declare
-        // `input_ids`. Exactly one must be present.
-        let (encoder_input_field, encoder_input, encoder_input_role) = match (
-            encoder.inputs.audio_features.as_deref(),
-            encoder.inputs.input_ids.as_deref(),
-        ) {
-            (Some(audio), None) => (
-                "model.encoder.inputs.audio_features",
-                audio,
-                "audio_features_input",
-            ),
-            (None, Some(ids)) => ("model.encoder.inputs.input_ids", ids, "token_input"),
-            (Some(_), Some(_)) => {
-                return Err(incomplete(
-                    "model.encoder declares both audio_features and input_ids; exactly one encoder prompt input is required",
-                ));
-            }
-            (None, None) => {
-                return Err(incomplete(
-                    "model.encoder.inputs.audio_features or model.encoder.inputs.input_ids",
-                ));
-            }
-        };
-        let encoder_input = required_str(Some(encoder_input), encoder_input_field)?;
-        require_graph_input(&graphs.encoder, encoder_input, "encoder")?;
-
-        let encoder_hidden = required_str(
-            encoder.outputs.encoder_hidden_states.as_deref(),
-            "model.encoder.outputs.encoder_hidden_states",
-        )?;
-        require_graph_output(&graphs.encoder, encoder_hidden, "encoder")?;
-
-        let token = required_str(
-            decoder.inputs.input_ids.as_deref(),
-            "model.decoder.inputs.input_ids",
-        )?;
-        require_graph_input(&graphs.decoder, token, "decoder")?;
-        let logits = required_str(
-            decoder.outputs.logits.as_deref(),
-            "model.decoder.outputs.logits",
-        )?;
-        require_graph_output(&graphs.decoder, logits, "decoder")?;
-
-        // Self-attention KV: the growing per-step cache. Matched by pattern
-        // against the decoder graph so only the ports the graph truly exposes are
-        // declared, paired positionally as `[key_i, value_i, ...]`.
-        let (self_input_indices, self_kv_inputs, self_input_dtype) = strict_indexed_kv(
-            &graphs.decoder.inputs,
-            required_str(
-                decoder.inputs.past_key_names.as_deref(),
-                "model.decoder.inputs.past_key_names",
-            )?,
-            required_str(
-                decoder.inputs.past_value_names.as_deref(),
-                "model.decoder.inputs.past_value_names",
-            )?,
-            "decoder self-attention past key/value",
-        )?;
-        let (self_output_indices, self_kv_outputs, self_output_dtype) = strict_indexed_kv(
-            &graphs.decoder.outputs,
-            required_str(
-                decoder.outputs.present_key_names.as_deref(),
-                "model.decoder.outputs.present_key_names",
-            )?,
-            required_str(
-                decoder.outputs.present_value_names.as_deref(),
-                "model.decoder.outputs.present_value_names",
-            )?,
-            "decoder self-attention present key/value",
-        )?;
-        if self_input_indices != self_output_indices {
-            return Err(incomplete(
-                "decoder self-attention past/present KV do not have identical layer indices",
-            ));
-        }
-        if self_input_dtype != self_output_dtype {
-            return Err(incomplete(format!(
-                "decoder self-attention past KV dtype {self_input_dtype} does not match present KV dtype {self_output_dtype}"
-            )));
-        }
-
-        // Cross-attention KV static routing. The encoder computes the cross KV
-        // ONCE from the audio/text prompt and emits `present_*_cross_%d`; those
-        // feed the decoder's `past_*_cross_%d` inputs and never grow or update
-        // across decode steps. This is why they are wired as pipeline dataflow
-        // edges from the encoder to the decoder (a prompt-time prologue result),
-        // distinct from the growing self-attention cache the decoder owns.
-        let (cross_input_indices, cross_kv_inputs, cross_input_dtype) = strict_indexed_kv(
-            &graphs.decoder.inputs,
-            required_str(
-                decoder.inputs.cross_past_key_names.as_deref(),
-                "model.decoder.inputs.cross_past_key_names",
-            )?,
-            required_str(
-                decoder.inputs.cross_past_value_names.as_deref(),
-                "model.decoder.inputs.cross_past_value_names",
-            )?,
-            "decoder cross-attention past key/value",
-        )?;
-        let (cross_output_indices, cross_kv_outputs, cross_output_dtype) = strict_indexed_kv(
-            &graphs.encoder.outputs,
-            required_str(
-                encoder.outputs.cross_present_key_names.as_deref(),
-                "model.encoder.outputs.cross_present_key_names",
-            )?,
-            required_str(
-                encoder.outputs.cross_present_value_names.as_deref(),
-                "model.encoder.outputs.cross_present_value_names",
-            )?,
-            "encoder cross-attention present key/value",
-        )?;
-        if cross_input_indices != cross_output_indices {
-            return Err(incomplete(
-                "encoder-produced and decoder-consumed cross-attention KV do not have identical layer indices",
-            ));
-        }
-        if cross_input_dtype != cross_output_dtype {
-            return Err(incomplete(format!(
-                "encoder cross-attention KV dtype {cross_output_dtype} does not match decoder cross-attention KV dtype {cross_input_dtype}"
-            )));
-        }
-        // Cross-attention KV static routing is declared through the decoder's
-        // paired `cross_kv_inputs` (the decoder's `past_*_cross_%d` ports) and
-        // `cross_kv_outputs` (the encoder's `present_*_cross_%d` ports), matched
-        // positionally per layer. The runtime binds these encoder-produced KV
-        // tensors as stateful decoder inputs computed ONCE at prompt time, so
-        // they are NOT wired as per-step dataflow edges (doing so would
-        // double-bind the port). `dataflow` carries only genuine per-invocation
-        // tensor edges, e.g. the encoder hidden-states edge below when present.
-        let mut dataflow: Vec<Value> = Vec::new();
-
-        let mut decoder_io = Map::new();
-        decoder_io.insert("token_input".into(), json!(token));
-        if let Some(mask) = decoder.inputs.attention_mask.as_deref() {
-            require_graph_input(&graphs.decoder, mask, "decoder")?;
-            decoder_io.insert("attention_mask_input".into(), json!(mask));
-        }
-        if let Some(position) = decoder.inputs.position_ids.as_deref() {
-            require_graph_input(&graphs.decoder, position, "decoder")?;
-            decoder_io.insert("position_ids_input".into(), json!(position));
-        }
-        // Some encoder-decoder decoders also consume the encoder hidden states
-        // directly (computing cross KV internally); route it only when declared
-        // AND actually present as a decoder graph input.
-        if let Some(decoder_hidden) = decoder.inputs.encoder_hidden_states.as_deref()
-            && require_graph_input(&graphs.decoder, decoder_hidden, "decoder").is_ok()
-        {
-            decoder_io.insert("encoder_hidden_states_input".into(), json!(decoder_hidden));
-            dataflow.push(edge_with_dtype(
-                &format!("encoder.{encoder_hidden}"),
-                &format!("decoder.{decoder_hidden}"),
-                &cross_output_dtype,
-            ));
-        }
-        decoder_io.insert("logits_output".into(), json!(logits));
-        decoder_io.insert("kv_inputs".into(), json!(self_kv_inputs));
-        decoder_io.insert("kv_outputs".into(), json!(self_kv_outputs));
-        decoder_io.insert("kv_update".into(), json!("append"));
-        decoder_io.insert("cross_kv_inputs".into(), json!(cross_kv_inputs));
-        decoder_io.insert("cross_kv_outputs".into(), json!(cross_kv_outputs));
-
-        let mut encoder_io = Map::new();
-        // The encoder prompt-input role (`audio_features_input` vs `token_input`)
-        // is taken directly from WHICH explicit genai-config field the exporter
-        // declared (`audio_features` vs `input_ids`), captured in the match
-        // above — never re-derived by string-matching the port name.
-        encoder_io.insert(encoder_input_role.into(), json!(encoder_input));
-
-        let mut models = Map::new();
-        models.insert(
-            "encoder".into(),
-            component_json(
-                encoder_filename.to_owned(),
-                "encoder",
-                Some(Value::Object(encoder_io)),
-            ),
-        );
-        models.insert(
-            "decoder".into(),
-            component_json(
-                decoder_filename.to_owned(),
-                "decoder",
-                Some(Value::Object(decoder_io)),
-            ),
-        );
-
-        let mut phases = Map::new();
-        phases.insert("encoder".into(), run_on("prompt_only"));
-        phases.insert("decoder".into(), run_on("every_step"));
-
-        let strategy = composite_encode_decode(Some("encoder"), "decoder");
-
-        let mut pipeline = Map::new();
-        pipeline.insert("models".into(), Value::Object(models));
-        pipeline.insert("dataflow".into(), Value::Array(dataflow));
-        pipeline.insert("strategy".into(), strategy);
-        pipeline.insert("phases".into(), Value::Object(phases));
-
-        let mut model = Map::new();
-        model.insert("attention".into(), self.attention_json());
-        insert_usize(
-            &mut model,
-            "max_sequence_length",
-            self.max_sequence_length(),
-        );
-        insert_usize(&mut model, "vocab_size", self.model.vocab_size);
-
-        let mut root = Map::new();
-        root.insert("schema_version".into(), json!(SCHEMA_VERSION));
-        root.insert("model".into(), Value::Object(model));
-        root.insert("pipeline".into(), Value::Object(pipeline));
-        if let Some(generation) = self.generation_json() {
-            root.insert("generation".into(), generation);
-        }
-        if let Some(tokens) = self.tokens_json() {
-            root.insert("tokens".into(), tokens);
-        }
-
-        Ok(serde_json::from_value(Value::Object(root))?)
-    }
-
     fn strict_decoder_state(
         &self,
         graph: &ModelGraphInfo,
@@ -1726,7 +692,7 @@ impl GenAiConfig {
         })
     }
 
-    /// Best-effort auto-derived [`ModelIoSpec`] for a stock decoder export whose
+    /// Best-effort auto-derived [`DecoderAbi`] for a stock decoder export whose
     /// sidecar declares no `io` block, built purely from an ONNX graph's port
     /// inventory.
     ///
@@ -1736,16 +702,16 @@ impl GenAiConfig {
     /// guarded [`derive_decoder_io_from_graph`](Self::derive_decoder_io_from_graph)
     /// classifier, applies the recurrent-hybrid safety gate (non-empty
     /// `state_pairs`), binds the conventional non-KV ports by name-presence in the
-    /// graph interface, and assembles the `ModelIoSpec`.
+    /// graph interface, and assembles the `DecoderAbi`.
     ///
     /// Returns `None` (leaving the caller's `io = None` shape-inference path
     /// untouched) unless the derivation yields at least one recurrent state pair —
     /// the exact case the shape-inference path cannot resolve. Pure-dense decoders
     /// (no state pairs) always return `None`.
-    pub fn derive_model_io_spec_from_graph(
+    pub fn derive_decoder_abi_from_graph(
         graph: &ModelGraphInfo,
-    ) -> Option<onnx_genai_metadata::ModelIoSpec> {
-        use onnx_genai_metadata::{LoopStatePair, ModelIoSpec};
+    ) -> Option<onnx_genai_metadata::DecoderAbi> {
+        use onnx_genai_metadata::{DecoderAbi, LoopStatePair};
 
         let derived = Self::derive_decoder_io_from_graph(graph)?;
         // Safety gate: derive only when the graph actually yielded KV ports.
@@ -1761,7 +727,7 @@ impl GenAiConfig {
         // fails the load with "per-layer KV page geometry is unknown".
         //
         // That is what blocks DeepSeek-V2 (MLA, #1012): its `genai_config.json`
-        // declares a single `decoder.head_size: 128` and no `model.io`, while its
+        // declares a single `decoder.head_size: 128` and no port ABI, while its
         // KV is asymmetric — key head_size 192 (qk_nope 128 + qk_rope 64), value
         // 128. A scalar cannot express that, but the graph shapes can, and
         // `kv_cache_bytes_for_tensors` already sums each tensor independently,
@@ -1792,7 +758,7 @@ impl GenAiConfig {
         // an empty list, so downstream cannot read "declared, and empty" as
         // different from "not applicable".
         let state_pairs = (!state_pairs.is_empty()).then_some(state_pairs);
-        Some(ModelIoSpec {
+        Some(DecoderAbi {
             sequence_source: None,
             kv_ownership: None,
             kv_layout: None,
@@ -1804,11 +770,16 @@ impl GenAiConfig {
             hidden_output: None,
             kv_inputs: (!derived.kv_inputs.is_empty()).then_some(derived.kv_inputs),
             kv_outputs: (!derived.kv_outputs.is_empty()).then_some(derived.kv_outputs),
+            // Alias legality is an author's statement about the graph ABI, not
+            // something the graph interface reveals: identically-shaped past and
+            // present tensors do not prove the graph tolerates them being the
+            // same buffer. This derivation sees only shapes, so it stays silent
+            // (= forbidden) and leaves the declaration to the config.
+            aliasing: None,
             encoder_hidden_states_input: None,
             audio_features_input: None,
             cross_kv_inputs: None,
             cross_kv_outputs: None,
-            kv_update: None,
             state_pairs,
             optional_inputs: std::collections::BTreeMap::new(),
             static_cache: None,
@@ -1850,36 +821,6 @@ pub(crate) fn incomplete(missing: impl Into<String>) -> GenAiConfigError {
     }
 }
 
-/// Honest decline for a multimodal package whose declared image preprocessing
-/// has no lossless runtime encoding (e.g. Qwen-style `smart_resize`). The image
-/// path is refused rather than approximated, but the caller may fall back to
-/// text-only decode via [`GenAiConfig::to_strict_text_only_pipeline_metadata`].
-pub(crate) fn unrepresentable_preprocessing(detail: impl Into<String>) -> GenAiConfigError {
-    GenAiConfigError::UnrepresentablePreprocessing {
-        detail: detail.into(),
-    }
-}
-
-/// Honest decline for an RNN-T transducer package. The transducer family
-/// (streaming Conformer encoder with cache state + LSTM prediction network +
-/// joint network + optional VAD, driven by a blank-symbol greedy transducer
-/// loop) has no representation in the current inference-metadata contract, so
-/// the loader declines with a descriptive reason instead of fabricating a
-/// Whisper-style cross-attention encoder-decoder spec that does not match the
-/// graphs.
-pub(crate) fn transducer_unsupported() -> GenAiConfigError {
-    GenAiConfigError::UnsupportedPipelineFamily {
-        family: "RNN-T transducer".into(),
-        reason: "the package declares a joint (joiner) network and/or an LSTM prediction \
-                 network (targets + lstm_hidden_state/lstm_cell_state, no attention KV), i.e. a \
-                 Conformer-Transducer topology. Executing it needs a joint-network greedy \
-                 transducer decode loop (blank_id / max_symbols_per_step), streaming encoder \
-                 cache state (cache_last_channel/cache_last_time), and VAD segmentation — none of \
-                 which the encoder-decoder cross-attention contract models"
-            .into(),
-    }
-}
-
 pub(crate) fn required_str<'a>(
     value: Option<&'a str>,
     field: &str,
@@ -1889,34 +830,37 @@ pub(crate) fn required_str<'a>(
         .ok_or_else(|| incomplete(field))
 }
 
-fn required_ref<'a, T>(value: Option<&'a T>, field: &str) -> Result<&'a T, GenAiConfigError> {
-    value.ok_or_else(|| incomplete(field))
+/// The dtype and rank of every port a decoder graph exposes.
+fn port_contracts_from_graph(
+    graph: &ModelGraphInfo,
+) -> std::collections::BTreeMap<String, onnx_genai_metadata::TensorContract> {
+    graph
+        .inputs
+        .iter()
+        .chain(graph.outputs.iter())
+        .map(|tensor| {
+            (
+                tensor.name.clone(),
+                onnx_genai_metadata::TensorContract {
+                    dtype: tensor.dtype.clone(),
+                    rank: tensor.dimensions.len(),
+                    // The graph's own shape is authoritative; restating it here
+                    // would be a second place it could drift.
+                    shape: None,
+                    optional: false,
+                    batch_layout: onnx_genai_metadata::BatchLayout::RequestAligned { axis: 0 },
+                    padding: Vec::new(),
+                },
+            )
+        })
+        .collect()
 }
 
-fn required_copy<T: Copy>(value: Option<T>, field: &str) -> Result<T, GenAiConfigError> {
-    value.ok_or_else(|| incomplete(field))
-}
-
-fn required_positive(value: Option<usize>, field: &str) -> Result<usize, GenAiConfigError> {
-    value
-        .filter(|value| *value > 0)
-        .ok_or_else(|| incomplete(format!("{field} must be greater than zero")))
-}
-
-fn load_auxiliary_json<T>(path: &Path, description: &str) -> Result<T, GenAiConfigError>
-where
-    T: serde::de::DeserializeOwned,
-{
-    let content = std::fs::read_to_string(path).map_err(|error| {
-        incomplete(format!(
-            "{description} at {} could not be read: {error}",
-            path.display()
-        ))
-    })?;
-    serde_json::from_str(&content).map_err(|error| {
-        incomplete(format!(
-            "{description} at {} is not valid for compatibility conversion: {error}",
-            path.display()
-        ))
-    })
+/// Every end-of-generation token id a `genai_config.json` declares.
+fn eos_token_ids(config: &GenAiConfig) -> Vec<i64> {
+    match config.model.eos_token_id.as_ref() {
+        Some(crate::wire_types::EosTokenId::Single(id)) => vec![*id],
+        Some(crate::wire_types::EosTokenId::Many(ids)) => ids.clone(),
+        None => Vec::new(),
+    }
 }

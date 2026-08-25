@@ -1,0 +1,8 @@
+ir_version: 11
+graph {
+  name: "identity"
+}
+opset_import {
+  domain: ""
+  version: 24
+}

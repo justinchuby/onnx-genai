@@ -200,16 +200,22 @@ Ordered by *decode-path impact × distance from parity*, which is also
    it, and `AttentionTranspose`, `MoE` and `GemmF32` cannot fully graduate until
    it does. Hardest: MLAS is a mature, hand-tuned, multi-ISA SGEMM.
 2. **Activations.** Already the closest — Tanh and Sigmoid *have* graduated. Erf
-   and exact Gelu remain (MLAS is 1.4–1.6× and 1.17× at 4 Mi).
+   and exact Gelu remain: on the `narrow` arm of the re-measurement below MLAS
+   is **1.34–1.56×** on Erf and **1.10–1.12×** on exact Gelu (`wide`:
+   **1.34–1.64×** and **1.12–1.18×**).
 3. **Normalization.** Already ours; listed so it stays measured, not to be
    absorbed.
 4. **Softmax.** *Largely closed.* This entry used to read "the widest measured
    gap and the easiest structural win", because the native route was a scalar
-   `f32::exp` loop ~9× off MLAS. `softmax_avx2` landed on `main` and the
-   re-measurement below puts native at 0.91–1.01 ns/element, ratio 0.66 — a
-   5.1–5.7× native improvement. What remains is the `exp` polynomial and the
-   two-pass row traversal, worth roughly 1.5×, on the decode critical path for
-   every token. Still short of the 1.05 graduation bar, but no longer the
+   `f32::exp` loop ~9× off MLAS. `softmax_avx2` (#1234) and then #1416 landed on
+   `main`, and the re-measurement below puts the ratio at **0.82–0.87** across
+   the three softmax cases on the `narrow` arm (**0.80–0.83** on `wide`). The
+   then-vs-now attribution is a separate, width-matched comparison: measured on
+   `wide` against the archived #1173 numbers, the MLAS control arm is stationary
+   to within **4.2%**, so **1.24–1.27× is attributable native work**, matching
+   what #1416 claimed for the row kernel. What remains is the
+   `exp` polynomial and the two-pass row traversal, on the decode critical path
+   for every token. Still short of the 1.05 graduation bar, but no longer the
    headline gap.
 5. **Attention transpose / KV layout.** Native except for the two inner GEMMs;
    graduates with (1).
@@ -240,7 +246,10 @@ Unpacked:
   `cargo bench -p onnx-runtime-ep-cpu --bench native_vs_mlas`, which runs both
   routes interleaved in one process and reports the median of 21 repetitions,
   then prints the verdict per case: `native-graduates` /
-  `native-faster-but-under-5%` / `keep-mlas`.
+  `native-faster-but-under-5%` / `keep-mlas`. **One invocation's verdict is not
+  a graduation.** That 21-rep median still moves between invocations by more
+  than 5% on most cases in the table below, so a single `native-graduates` line
+  is a sample rather than a result.
 - **On wall time, with CPU time beside it.** The two routes do not use the same
   number of threads — our `x86_sgemm` parallelises over column strips while MLAS
   declines to parallelise some shapes — so a CPU-time-only comparison would
@@ -249,9 +258,52 @@ Unpacked:
   real: a route that "wins" by recruiting the whole machine regresses every
   concurrent session on the box, and the bench labels that
   `native-graduates-but-costs-more-cpu` rather than passing it silently.
-- **Repeatable, outside noise.** Cross-worktree comparison on a shared runner
-  showed a uniform 0.70–0.82× offset on *byte-identical* kernels — larger than
-  most kernel wins. One binary, interleaved, or it does not count.
+- **Repeatable, outside noise — and the noise has to be measured, not assumed.**
+  Cross-worktree comparison on a shared runner showed a uniform 0.70–0.82×
+  offset on *byte-identical* kernels — larger than most kernel wins. One binary,
+  interleaved, or it does not count. But interleaving only equalises placement
+  *between the two arms*; it does not make the ratio robust, because the two
+  routes scale differently with width, so anything that changes the machine's
+  effective width moves them by different amounts. Two requirements follow.
+  1. **Report the ratio's spread across invocations, and graduate only when that
+     spread is smaller than the claimed win.** A 5% win inside a 30% spread is
+     not a win.
+  2. **Discard invocations that did not get the CPU.** Take
+     `(utime + stime) / wall` for the bench process from `os.wait4` rusage and
+     drop any invocation materially below the median of its siblings. A rep that
+     was descheduled is not a slow rep, it is an untrusted one — a distinction
+     owed to #1809, where adding this guard moved an A/A null from 52% to
+     0.04–0.56%. Note what it does and does not do here: **in-process
+     interleaving is what protects the ratio**; this guard only catches
+     *differential* descheduling between the arms. Contention that lands evenly
+     on both arms passes it wholesale. It is what lets you keep measuring on a
+     shared box instead of waiting for a quiet one that never arrives, not a
+     substitute for the interleaving.
+  3. **Better still, measure foreign CPU on your own core set.** #1814 landed
+     the measurement on `main` after this table was taken (now the
+     `onnx-runtime-hostmon` crate, and reported as `host_foreign` by
+     `bench_generic`).
+     It reads busy jiffies on the process's `Cpus_allowed_list` and subtracts
+     the process's own CPU, so the remainder is *foreign load on the cores you
+     were actually confined to*. That closes the hole in the guard above
+     directly: contention landing evenly on both arms is invisible to a
+     differential CPU-efficiency check but shows up here as a positive foreign
+     column. It also demonstrates why the host-level gates are insufficient —
+     one foreign thread on a 32-CPU box does not move `/proc/loadavg` field 4,
+     yet on a barrier-synchronised dispatch it cost a clean 2× at N=2. The
+     tables below predate it and were guarded by the weaker method; a
+     re-measurement should use it.
+- **At a stated width.** The verdict is a function of how many cores the process
+  is given, for the reason in the previous bullet: the two routes do not scale
+  alike. Measured directly, six idle physical cores in one L3 domain against all
+  32 logical CPUs, same binary, arms interleaved — `matmul_f32 16×512×512` reads
+  **1.581 narrow and 0.866 wide**, and `decode 1×2048×2048` reads **1.117 narrow
+  and 0.934 wide**. Both cross the 1.05 line on width alone. Record the width;
+  never compare rows taken at different ones; and **verify the width actually
+  held** — #1815 found a sibling harness whose two arms ran on different CPU
+  sets while reporting the same thread count, so read `Cpus_allowed_list` from
+  `/proc/<pid>/task/*/status` during the run rather than trusting the `taskset`
+  you typed.
 - **Across the supported range.** A win at one shape and a loss at another is
   not a graduation; it is a shape gate, and it belongs in the ledger's
   `shape_gate` column with both routes kept.
@@ -267,86 +319,257 @@ did not.
 ### Current gap, measured
 
 `cargo bench -p onnx-runtime-ep-cpu --bench native_vs_mlas`, Linux x86-64,
-AVX2+FMA, 32 cores, one binary, interleaved, median of 21 reps. Native route is
-`SimdX86` (the AVX2 `x86_sgemm` we ship, not the portable fallback) for GEMM.
-Times are per unit of work — per multiply-accumulate for GEMM, per element
+AVX2+FMA, one binary, interleaved, median of 21 reps per invocation. Native
+route is `SimdX86` (the AVX2 `x86_sgemm` we ship, not the portable fallback) for
+GEMM. Times are per unit of work — per multiply-accumulate for GEMM, per element
 otherwise. `ratio = mlas / native` in wall time; **above 1.0 means native is
 faster**.
 
-| family | case | native ns/unit | MLAS ns/unit | ratio | cpu_ratio | verdict |
-|---|---|---|---|---|---|---|
-| `matmul_f32` | decode 1×2048×2048 | 0.1309 | 0.0311 | 0.238 | 0.217 | keep-mlas |
-| `matmul_f32` | decode 1×4096×4096 | 0.1297 | 0.0660 | 0.509 | 0.480 | keep-mlas |
-| `matmul_f32` | 16×512×512 | 0.1396 | 0.0088 | 0.063 | 0.049 | keep-mlas |
-| `matmul_f32` | prefill 128×2048×2048 | 0.0103 | 0.0042 | 0.407 | 0.321 | keep-mlas |
-| `matmul_f32` | odd 37×1023×511 | 0.0476 | 0.0097 | 0.203 | 0.160 | keep-mlas |
-| `softmax` | decode 1×32000 | 0.9108 | 0.6038 | 0.663 | 0.653 | keep-mlas |
-| `softmax` | attn 32×512 | 1.0083 | 0.6636 | 0.658 | 0.650 | keep-mlas |
-| `softmax` | prefill 128×4096 | 0.9312 | 0.6368 | 0.684 | 0.697 | keep-mlas |
-| `activations` | erf 4 Ki | 1.2984 | 0.9108 | 0.701 | 0.703 | keep-mlas |
-| `activations` | erf 1 Mi | 0.4551 | 0.3565 | 0.783 | 0.773 | keep-mlas |
-| `activations` | gelu-exact 4 Ki | 1.6710 | 1.5655 | 0.937 | 0.944 | keep-mlas |
-| `activations` | gelu-exact 1 Mi | 0.4813 | 0.4010 | 0.833 | 0.844 | keep-mlas |
+Re-measured on `main` after the decode-placement corrections (#1729, #1794,
+#1811), which changed how many physical cores a process actually gets and so
+changed every absolute number in the previous revision of this table — that
+revision had been taken when the decode pool put 16 workers on 8 physical cores.
 
-This is the honest state of the programme: **no family measured here is ready to
-graduate** under the 1.05 rule, and the ratios say where the work is.
+Taken with `scripts/bench_native_vs_mlas_width.py`, **6 reps per arm,
+alternating which arm runs first**, on a host that was explicitly *not* quiet
+(~4–5 cores of unrelated load throughout). Two arms:
 
-**Softmax moved, and it moved because the native side was fixed.** An earlier
-revision of this table recorded softmax at 5.17 ns/element and a ratio near
-0.10 — "~9–10× off, the widest measured gap" — because the native route was a
-scalar `f32::exp` loop. `softmax_avx2` has since landed on `main`, and the row
-above is the re-measurement: **0.91–1.01 ns/element, a 5.1–5.7× native speedup,
-ratio 0.10 → 0.66**. That is exactly the predicted structural win, banked, and
-it is the cleanest evidence so far that the absorption thesis is sound: the gap
-was an unvectorised native kernel, not something intrinsic to MLAS. The
-remaining 1.5× is the `exp` polynomial and the two-pass row traversal, not a
-missing instruction set.
+- **narrow** — `taskset -c 16,20,22,26,28,30`: six distinct physical cores, one
+  sibling each, all inside a single L3 domain, all measured idle before the run.
+  **6/6 reps trusted.**
+- **wide** — `taskset -c 0-31`: every logical CPU, which is what the previous
+  revision used. **5/6 reps trusted**; one discarded at `cpu_per_wall` 13.14
+  against a median of 14.17.
 
-Activations are within 1.2–1.4× — reachable. f32 GEMM is 2–16× off depending on
-shape, and the spread is the finding: `SimdX86` is closest at the large shapes it
-was tuned for (0.41–0.51 at 4096-decode and 128-prefill) and furthest at small
-and awkwardly-shaped ones, where MLAS's packing and blocking amortise better.
-With softmax largely closed, **f32 GEMM is now unambiguously the widest gap and
-the top priority**.
+`spread` is `(max − min) / median` of the ratio across that arm's trusted reps.
 
-Two caveats a future agent should not have to rediscover. First, these numbers
-were taken on a **busy shared 32-core container**; repeat runs of the same
-binary moved the GEMM ratios by up to 2× (`prefill_128x2048x2048` read 0.338,
-0.561 and 0.662 across three consecutive runs) while softmax and activations
-were stable to ~2%. Treat the GEMM row as an order of magnitude, not a
-measurement, and re-run on a quiet pinned host before acting on it. Second, this
-bench calls `gemm_with_backend` directly, so **neither** route gets the
-prepacked constant weights that `matmul_dense` gives them in a real session.
-That is deliberate — it compares the kernels rather than the caching — but it
-means the bench understates both routes at inference time, and it is not the
-instrument for judging the prepack path.
+**Read the `ratio` column as a median of per-rep ratios, not as the quotient of
+the two columns beside it.** Each rep contributes its own `mlas / native`, and
+the median is taken over those; the `ns/unit` columns are independently the
+medians of their own times. Because a median does not distribute over division,
+the two disagree slightly — `decode 1×2048×2048` shows 0.0684 / 0.0617 = 1.109
+by column but 1.117 by rep. The per-rep form is the correct one to quote,
+because it pairs each MLAS invocation with the native invocation it was
+interleaved against, which is the whole point of interleaving; the quotient of
+medians silently pairs measurements that were never adjacent. The gap between
+the two is itself a smell — where it is large, the arm is unstable.
+
+**The mask was verified to hold, not assumed.** #1815 observed the neighbouring
+`bench_generic` harness spawning its ORT arm *outside* the affinity confinement
+it applied to the native arm, so the two arms ran on different CPU sets while
+reporting the same thread count. That hazard applies to any `taskset` claim,
+including this one, so it was checked rather than asserted: sampling
+`Cpus_allowed_list` from `/proc/<pid>/task/*/status` 40 times across a live
+narrow-arm run gives **478 thread-observations, every one of them
+`16,20,22,26,28,30`** — the five `mlas-sys-ws-N` work-stealing threads, the five
+`nxrt-task-N` workers and the bench's own threads alike. Both routes were
+confined identically. (The single `0-31` observation is the `taskset` process
+itself, before it execs.) A width comparison is only as good as the confinement
+it claims, and this one is checkable.
+
+**narrow arm — 6 physical cores, one L3, idle.** This is the arm to quote,
+because it is the one whose reps agree.
+
+| family | case | native ns/unit | MLAS ns/unit | ratio | spread | cpu_ratio | verdict |
+|---|---|---|---|---|---|---|---|
+| `matmul_f32` | decode 1×2048×2048 | 0.0617 | 0.0684 | **1.117** | 21% | 0.875 | native-graduates-but-costs-more-cpu |
+| `matmul_f32` | decode 1×4096×4096 | 0.1454 | 0.1161 | 0.800 | 20% | 0.742 | keep-mlas |
+| `matmul_f32` | 16×512×512 | 0.0282 | 0.0435 | 1.581 | 41% | 1.083 | **unstable** |
+| `matmul_f32` | prefill 128×2048×2048 | 0.0125 | 0.0090 | 0.687 | 42% | 0.566 | keep-mlas |
+| `matmul_f32` | odd 37×1023×511 | 0.0266 | 0.0133 | 0.523 | 82% | 0.434 | keep-mlas |
+| `softmax` | decode 1×32000 | 0.8092 | 0.6578 | 0.821 | 4% | 0.825 | keep-mlas |
+| `softmax` | attn 32×512 | 0.6264 | 0.5454 | 0.869 | 12% | 0.865 | keep-mlas |
+| `softmax` | prefill 128×4096 | 0.6192 | 0.5407 | 0.871 | 6% | 0.867 | keep-mlas |
+| `activations` | erf 4 Ki | 1.1148 | 0.8321 | 0.746 | 17% | 0.746 | keep-mlas |
+| `activations` | erf 1 Mi | 0.4263 | 0.2651 | 0.641 | 6% | 0.646 | keep-mlas |
+| `activations` | gelu-exact 4 Ki | 1.3832 | 1.2235 | 0.889 | 4% | 0.889 | keep-mlas |
+| `activations` | gelu-exact 1 Mi | 0.4751 | 0.4374 | 0.912 | 4% | 0.905 | keep-mlas |
+
+**wide arm — all 32 logical CPUs**, same binary, same session, interleaved with
+the rows above.
+
+| family | case | ratio | spread | verdict | vs narrow |
+|---|---|---|---|---|---|
+| `matmul_f32` | decode 1×2048×2048 | 0.934 | 13% | keep-mlas | **flips** |
+| `matmul_f32` | decode 1×4096×4096 | 0.515 | 74% | keep-mlas | |
+| `matmul_f32` | 16×512×512 | 0.866 | **134%** | **unstable** | **flips** |
+| `matmul_f32` | prefill 128×2048×2048 | 0.595 | 41% | keep-mlas | |
+| `matmul_f32` | odd 37×1023×511 | 0.168 | 55% | keep-mlas | |
+| `softmax` | decode 1×32000 | 0.826 | 22% | keep-mlas | |
+| `softmax` | attn 32×512 | 0.800 | 12% | keep-mlas | |
+| `softmax` | prefill 128×4096 | 0.832 | 10% | keep-mlas | |
+| `activations` | erf 4 Ki | 0.748 | 20% | keep-mlas | |
+| `activations` | erf 1 Mi | 0.611 | 8% | keep-mlas | |
+| `activations` | gelu-exact 4 Ki | 0.890 | 5% | keep-mlas | |
+| `activations` | gelu-exact 1 Mi | 0.846 | 6% | keep-mlas | |
+
+Three things fall out of putting the two arms side by side, and all three are
+about the *method*, not the kernels.
+
+**1. Two cases change verdict on width alone.** `decode 1×2048×2048` reads 1.117
+on six cores and 0.934 on thirty-two; `16×512×512` reads 1.581 and 0.866. Same
+binary, same machine, same half-hour — only the CPU mask differs. The mechanism
+is in the rule above: `x86_sgemm` parallelises over column strips and MLAS
+declines to parallelise some shapes, so the two arms do not scale alike, and
+interleaving the *routes* inside one process does nothing to protect against
+this because it changes both routes at once. **A graduation claim without a
+stated width is not checkable.**
+
+**2. `16×512×512` disagrees with itself on both arms.** Its per-rep verdict
+alternates between `keep-mlas` and `native-graduates` from a byte-identical
+binary — 134% spread wide, 41% narrow. It is marked unstable rather than given a
+verdict. This is the entire argument for the spread requirement: at a 5%
+threshold and a 134% spread, the bench will eventually hand you a
+`native-graduates` line, and nothing in that single invocation's output would
+tell you it was a coin flip. Had the previous revision of this table been run
+once more, it could have graduated a route on this row.
+
+**3. The narrow arm is the more trustworthy one overall, though not on every
+row.** Its spreads run **4–82%** against the wide arm's **5–134%**, and it lost
+no reps to the efficiency guard. Isolation beat parallelism: six idle cores in
+one L3 domain produce a more repeatable number than thirty-two logical CPUs
+shared with someone else's build. But the honest qualifier is that `odd
+37×1023×511` is an 82% coin flip on the narrow arm too — wider than eleven of
+the twelve wide-arm rows — so "narrow is tighter" is an aggregate statement, not
+a per-row guarantee. Prefer the arm whose reps agree **on the row you care
+about**, and say which one you used.
+
+Net: **`decode 1×2048×2048` is the first f32 GEMM case to show a real native
+win**, at 1.117 on the narrow arm — but it is `native-graduates-but-costs-more-cpu`
+(cpu_ratio 0.875, so native burns more CPU for that latency), it does not hold
+at 32 threads, and its 21% spread is wider than its 12% win. **Under the rule
+above that is not a graduation.** It is the strongest candidate on the board and
+the right next thing to re-measure properly. Everything else stays `keep-mlas`.
+
+**Before re-measuring that row, read #1827.** The explanation given above for
+why it does not hold at 32 threads — "the two routes do not scale alike" — is
+true but may be materially under-specified for this particular row. `m == 1`
+takes `sgemm_simd_m1`, whose strip decomposition carries a `.max(8)` floor that
+appears to cap it at `ceil(n / 256)` tasks *independently of pool width*: at
+`n = 2048` that is 8 tasks at both 6 and 32 threads, which would mean the wide
+arm added twenty-four spinning workers and no parallelism. If that holds, the
+wide number is not "native scaled worse", it is "native was capped while the
+pool spun", and this row is **better** than the table credits it for. That is
+derived from source and **not yet measured** — #1827 states the falsifiable
+prediction (native wall time flat from 8 threads upward at `n = 2048`, with the
+knee moving to `ceil(n / 256)` at other shapes). Settle it before spending a
+graduation argument on this row in either direction.
+
+**Softmax moved, and the MLAS column tells you how much of it was ours.** An
+earlier revision of this table recorded softmax at 5.17 ns/element and a ratio
+near 0.10 — "~9–10× off, the widest measured gap" — because the native route was
+a scalar `f32::exp` loop. `softmax_avx2` (#1234) and then #1416 have since
+landed on `main`.
+
+The trap in reading that as kernel progress is that the machine changed
+underneath *both* arms between the two measurements. What makes it decomposable
+is that **no vendored MLAS kernel has changed since #1173** — the only
+`mlas-sys` edits are the additive straggler handshake in `work_stealing_pool.rs`
+(#828, diagnosed in #1714). That provenance is a *prior*, not the proof: the
+"it only adds waiting" argument is one-directional, and in any case a control
+that silently got slower would inflate the ratio just as badly as one that got
+faster. The load-bearing evidence is the **direct then→now measurement of the
+MLAS column itself**, below — the control is shown to have held still rather
+than assumed to have. Compare **like width to like width**: the previous
+revision and the `wide` arm above were both taken on all 32 logical CPUs.
+
+| softmax case | MLAS then → now (control) | native then → now | ratio |
+|---|---|---|---|
+| decode 1×32000 | 0.6038 → 0.6015 (**−0.4%**) | 0.9108 → 0.7198 (**1.27×**) | 0.66 → 0.83 |
+| attn 32×512 | 0.6636 → 0.6357 (−4.2%) | 1.0083 → 0.7944 (1.27×) | 0.66 → 0.80 |
+| prefill 128×4096 | 0.6368 → 0.6265 (−1.6%) | 0.9312 → 0.7527 (1.24×) | 0.68 → 0.83 |
+
+(Ratios in this table are quotients of medians on both sides, since the archived
+revision recorded only medians; that is why the "now" column differs in the last
+digit from the median-of-ratios in the wide table above.)
+
+The control is stationary to within 4.2% across all three, so the native column
+is real work: **1.24–1.27×**, which is exactly what #1416 claimed for the row
+kernel. That is the cleanest attribution in this document, and it only exists
+because the comparison arm was left untouched. Prefer this decomposition over
+raw absolute columns whenever the table is re-measured across an infrastructure
+change.
+
+**One activation row wants a second look.** `erf 1 Mi` is the only case where
+the **native** arm went the wrong way at matched width: 0.4551 → 0.5167, 13.5%
+slower. The nearest scatter figure available is the `wide` arm's **8%** spread,
+but that is a spread of *ratios* and this is a move in a *native time*, so the
+two are not strictly commensurable — read it as "larger than the run-to-run
+scatter of anything else in this row", not as a significance test. And its MLAS
+control is *not* stationary here
+(0.3565 → 0.3174, 11% faster), so unlike softmax this cannot be attributed to
+our kernel from these numbers alone — a 25% relative swing with both arms moving
+is as consistent with a bandwidth or placement effect as with a regression.
+**Flagged, pinned re-measurement needed, not yet a finding.**
+
+The f32 GEMM rows carry **no attribution at all**, and it is worth being explicit
+about why rather than quietly presenting the improved ratios. `decode 1×2048×2048`
+went **0.238 → 0.885** at matched width (both computed as a quotient of medians,
+since the archived revision recorded only medians — hence 0.885 rather than the
+0.934 median-of-ratios in the wide table above), which looks like a large native
+win, and the native column did improve (0.1309 → 0.0715, 1.83×). But the control
+moved further: MLAS went 0.0311 → 0.0633, i.e. **2.0× slower with no kernel
+change**.
+When the control arm moves by more than the effect, the arms are no longer
+comparable across revisions, and the only defensible statement is the current
+ratio at a stated width with its spread attached. GEMM remains the widest gap
+(0.17–1.58 depending on shape and width) and **the top priority**, and the shape
+dependence is unchanged: `SimdX86` is closest at the large shapes it was tuned
+for and furthest at small and awkwardly-shaped ones, where MLAS's packing and
+blocking amortise better.
+
+One caveat a future agent should not have to rediscover: this bench calls
+`gemm_with_backend` directly, so **neither** route gets the prepacked constant
+weights that `matmul_dense` gives them in a real session. That is deliberate —
+it compares the kernels rather than the caching — but it means the bench
+understates both routes at inference time, and it is not the instrument for
+judging the prepack path.
 
 The comparison against #1116's dense-f32 work is not contradictory for this
 reason: that task measured the shipped path with prepacking on a quiet laptop
 and found parity at prefill, while this measures the raw kernels on a noisy
 shared box. Both are true of what they measured.
 
-### The one absorption already built but not switched on
+### The absorption that already shipped — and a table this document got wrong
 
-#1116 ported the mechanism behind MLAS's `SgemmKernelM1Avx` — stream B in place
-at M=1 rather than packing panels that are reused zero times — into
-`x86_sgemm::sgemm_simd`, but left it behind `ONNX_GENAI_CPU_MM_SIMD_M1_GEMV`,
-default **off**, pending a measurement. This bench is that instrument, so here
-is the measurement, same binary, same session, toggle the only difference:
+#1091 identified, and #1116 ported, the mechanism behind MLAS's
+`SgemmKernelM1Avx` — stream B in place at M=1 rather than packing panels that
+are reused zero times — into `x86_sgemm::sgemm_simd`. It landed behind
+`ONNX_GENAI_CPU_MM_SIMD_M1_GEMV`, default **off**, pending a measurement.
 
-| case | ratio, toggle off | ratio, toggle on | native time change |
-|---|---|---|---|
-| decode 1×2048×2048 | 0.146 | **0.337** | 0.194 → 0.0796 ns/MAC (**2.4× faster**) |
-| decode 1×4096×4096 | 0.625 | **0.843** | 0.127 → 0.104 ns/MAC (1.2× faster) |
-| prefill 128×2048×2048 | 0.662 | 0.566 | unchanged (toggle only affects M=1) |
+**That toggle no longer exists, and it had already been removed before the first
+revision of this document described it as live.** #1183 shipped the GEMV on by
+default. Today `sgemm_simd` calls `sgemm_simd_variant(a, b, c, m, k, n, true)`
+unconditionally; `use_m1_gemv` is a plain function parameter that only the
+in-process A/B harness ever passes as `false`. **No environment variable reaches
+that route**, and grepping the EP source for the variable finds only prose.
 
-The toggle is a **large, one-sided, mechanism-explained win on the shape that
-dominates decode**, and it moves nothing else — a native-over-native
-improvement that needs no reference at all. Turning it on by default is the
-obvious next slice and the shortest path to the first f32 GEMM graduation. It
-is not done here: flipping a kernel default is a kernel change that deserves its
-own before/after on a quiet pinned host, per the rule this document just wrote.
-This document ships only the ledger, the harness and the roadmap.
+**Retraction.** The first revision of this section carried a three-row table
+captioned "same binary, same session, toggle the only difference", reporting
+`decode 1×2048×2048` at 0.146 with the toggle off against 0.337 with it on, and
+called turning it on "the obvious next slice". Setting that variable cannot
+produce two different columns, because nothing reads it — an A/B run that way
+measures the same route twice. **The table is withdrawn.** It is exactly the
+failure this document's own graduation rule warns about — an arm that was not on
+the route it was labelled with — committed by the document that wrote the rule,
+and it survived review because a plausible number in a well-formed table is not
+self-evidently unmeasured. That is the argument for falsifying the *route* and
+not just reading the *result*: a poisoned-binary or control-arm check would have
+caught it immediately, and no amount of extra reps would have.
+
+The comparison is still worth making, and there is a correct instrument for it:
+`bench_f32_gemm_ab` in `kernels/matmul.rs` drives `sgemm_simd_variant` with the
+flag set both ways inside one process (`GEMM_AB_ARM=simd_packed` against
+`simd_gemv`, default `both` interleaves them), and carries a built-in control —
+the M≥2 rows, which an M==1-only route cannot move, so a run that shifts them is
+a run to discard. Anyone re-opening this question should use that harness, and
+should quote #1183's shipped end-to-end result (through an ORT session, `ours/ORT`
+p50 7.57 → 1.18 at 1×2048×2048 f32, with the M=128 prefill control unmoved at
+1.03) rather than the withdrawn table.
+
+The consequence for the roadmap is that the "obvious next slice" is **already
+done**. The f32 GEMM position stated above was measured with the GEMV in place,
+so it is the post-absorption gap, not the pre-absorption one.
 
 ## What linking the reference costs (research builds only)
 

@@ -18,7 +18,11 @@ use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, Ten
 use onnx_runtime_ir::{DataType, Node};
 
 use crate::error::driver_err;
+use crate::kernels::expert_route_telemetry::{
+    ArmedTelemetry, MARK_DEVICE_SRC, RouteTelemetryConfig, TelemetrySnapshot, TelemetryUnsupported,
+};
 use crate::kernels::{qmoe_gemm, qmoe_grouping};
+use crate::route_residency::RouteTelemetrySource;
 use crate::runtime::{CudaRuntime, cuptr};
 
 const MODULE: &str = "qmoe_affine_v1";
@@ -36,6 +40,11 @@ const GATE_UP_ACTIVATE_BF16_OCC_ENTRY: &str = "qmoe_gate_up_activate_bf16_occ";
 const COMBINE_F32_ENTRY: &str = "qmoe_combine_f32";
 const COMBINE_F16_ENTRY: &str = "qmoe_combine_f16";
 const COMBINE_BF16_ENTRY: &str = "qmoe_combine_bf16";
+// Element-wise widen of the T-typed float routing/scale/bias inputs to f32 so
+// the f32 routing and dequant kernels can be reused unchanged for fp16/bf16
+// graphs. See `FloatDtype::widen_entry`.
+const WIDEN_F16_ENTRY: &str = "qmoe_widen_f16_f32";
+const WIDEN_BF16_ENTRY: &str = "qmoe_widen_bf16_f32";
 const LINEAR_ONE_TASK_PER_BLOCK_MAX_ROUTES: usize = 16;
 
 const CUDA_SRC: &str = r#"
@@ -78,6 +87,35 @@ __device__ __forceinline__ int total_order_key(float value)
 // memory instead of re-issuing latency-bound global loads. At decode (rows=1)
 // this replaces a single active thread with the whole block, which was the
 // dominant decode cost.
+#if QMOE_HAS_HALF
+// Widen a contiguous fp16/bf16 buffer to f32 (grid-strided). Conversion is
+// exact: every fp16/bf16 value is representable in f32, so the reused f32
+// routing/dequant kernels see byte-for-byte the authored values.
+extern "C" __global__ void qmoe_widen_f16_f32(
+    const __half* src,
+    float* dst,
+    const unsigned long long count)
+{
+    for (unsigned long long i =
+             blockIdx.x * (unsigned long long)blockDim.x + threadIdx.x;
+         i < count; i += (unsigned long long)blockDim.x * gridDim.x) {
+        dst[i] = __half2float(src[i]);
+    }
+}
+
+extern "C" __global__ void qmoe_widen_bf16_f32(
+    const __nv_bfloat16* src,
+    float* dst,
+    const unsigned long long count)
+{
+    for (unsigned long long i =
+             blockIdx.x * (unsigned long long)blockDim.x + threadIdx.x;
+         i < count; i += (unsigned long long)blockDim.x * gridDim.x) {
+        dst[i] = __bfloat162float(src[i]);
+    }
+}
+#endif
+
 extern "C" __global__ void qmoe_route(
     const float* router_probs,
     const float* router_weights,
@@ -86,7 +124,9 @@ extern "C" __global__ void qmoe_route(
     const unsigned long long rows,
     const int experts,
     const int top_k,
-    const int normalize)
+    const int normalize,
+    unsigned int* route_telemetry_bitmap,
+    unsigned int* route_telemetry_header)
 {
     extern __shared__ unsigned char qmoe_route_smem[];
     float* shared_logits = (float*)qmoe_route_smem;
@@ -148,6 +188,13 @@ extern "C" __global__ void qmoe_route(
         }
 
         if (threadIdx.x == 0) {
+            // Fused, inert route telemetry (issue #1810 Slice 7A): thread 0 has
+            // finalized indices[0..top_k] for this row. Mark once per row; the
+            // helper is a no-op when telemetry pointers are null (disarmed), so
+            // the selection/weight outputs written below are byte-identical.
+            route_telemetry_mark_row(
+                route_telemetry_bitmap, route_telemetry_header,
+                indices, top_k, experts);
             if (router_weights) {
                 const float* aggregation =
                     router_weights + row * (unsigned long long)experts;
@@ -925,6 +972,17 @@ extern "C" __global__ void qmoe_combine_bf16(
 #endif
 "#;
 
+/// The QMoE affine device module (`MODULE`) with the shared route-telemetry
+/// `__device__` helpers prepended, so `qmoe_route`'s fused
+/// `route_telemetry_mark_row` call resolves. Assembled once and leaked to a
+/// `'static` string, matching the existing NVRTC source-cache lifetime. When a
+/// kernel is disarmed the route kernel receives null telemetry pointers and the
+/// helper is inert, so the emitted route outputs are byte-identical.
+fn qmoe_module_src() -> &'static str {
+    static SRC: OnceLock<&'static str> = OnceLock::new();
+    SRC.get_or_init(|| Box::leak(format!("{MARK_DEVICE_SRC}{CUDA_SRC}").into_boxed_str()))
+}
+
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 struct QuantLayout {
     bits: usize,
@@ -972,9 +1030,9 @@ fn linear_module_source(layout: QuantLayout) -> (&'static str, &'static str) {
     );
     let source = Box::leak(
         format!(
-            "#define QMOE_BITS {}\n#define QMOE_BLOCK_SIZE {}\n\
+            "{}#define QMOE_BITS {}\n#define QMOE_BLOCK_SIZE {}\n\
              #define QMOE_HAS_ZERO_POINTS {}\n{}",
-            layout.bits, layout.block_size, zero_points, CUDA_SRC
+            MARK_DEVICE_SRC, layout.bits, layout.block_size, zero_points, CUDA_SRC
         )
         .into_boxed_str(),
     );
@@ -1064,6 +1122,23 @@ impl MoeAttributes {
                 "swiglu_fusion is only valid when activation_type='swiglu'",
             ));
         }
+        let activation_alpha = float_attr(node, "activation_alpha", 1.0)?;
+        let activation_beta = float_attr(node, "activation_beta", 0.0)?;
+        let swiglu_limit = float_attr(node, "swiglu_limit", f32::INFINITY)?;
+        for (name, value) in [
+            ("activation_alpha", activation_alpha),
+            ("activation_beta", activation_beta),
+            ("swiglu_limit", swiglu_limit),
+        ] {
+            if value.is_nan() {
+                return Err(error(format!("attribute {name} must not be NaN")));
+            }
+        }
+        if swiglu_limit <= 0.0 {
+            return Err(error(format!(
+                "swiglu_limit must be positive, got {swiglu_limit}"
+            )));
+        }
         Ok(Self {
             k: usize::try_from(k).map_err(|_| error("k exceeds usize limits"))?,
             prefill_min_tokens: usize::try_from(prefill_min_tokens)
@@ -1071,9 +1146,9 @@ impl MoeAttributes {
             activation,
             normalize_routing_weights,
             swiglu_fusion: swiglu_fusion as usize,
-            activation_alpha: float_attr(node, "activation_alpha", 1.0)?,
-            activation_beta: float_attr(node, "activation_beta", 0.0)?,
-            swiglu_limit: float_attr(node, "swiglu_limit", f32::INFINITY)?,
+            activation_alpha,
+            activation_beta,
+            swiglu_limit,
         })
     }
 
@@ -1162,7 +1237,19 @@ pub struct QMoEFactory {
 }
 
 impl KernelFactory for QMoEFactory {
-    fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+    fn create(&self, node: &Node, input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+        Ok(Box::new(self.create_kernel(node, input_shapes)?))
+    }
+}
+
+impl QMoEFactory {
+    /// Build a concrete [`QMoEKernel`]. This is the body of [`create`], exposed
+    /// so route-telemetry tests (issue #1810 Slice 7A) can obtain the concrete
+    /// kernel and call its `#[doc(hidden)]` arming API — the trait object
+    /// returned by [`KernelFactory::create`] cannot expose it. Crate-internal /
+    /// test seam only.
+    #[doc(hidden)]
+    pub fn create_kernel(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<QMoEKernel> {
         let attributes = MoeAttributes::from_node(node)?;
         let bits = int_attr(node, "expert_weight_bits", 4)?;
         if !matches!(bits, 1 | 2 | 4 | 8) {
@@ -1190,14 +1277,15 @@ impl KernelFactory for QMoEFactory {
                  block-quantized MoE operator"
             )));
         }
-        Ok(Box::new(QMoEKernel {
+        Ok(QMoEKernel {
             runtime: self.runtime.clone(),
             attributes,
             bits: bits as usize,
             block_size: block_size as usize,
             scratch: Mutex::new(ScratchPool::default()),
             warmed: AtomicBool::new(false),
-        }))
+            telemetry: Mutex::new(None),
+        })
     }
 }
 
@@ -1264,6 +1352,129 @@ pub struct QMoEKernel {
     block_size: usize,
     scratch: Mutex<ScratchPool>,
     warmed: AtomicBool,
+    /// Inert, default-disabled route telemetry (issue #1810 Slice 7A). `None`
+    /// unless explicitly armed via [`QMoEKernel::arm_route_telemetry`]; while
+    /// `None` the route kernel receives null telemetry pointers and produces
+    /// byte-identical outputs.
+    telemetry: Mutex<Option<ArmedTelemetry>>,
+}
+
+impl QMoEKernel {
+    /// Arm inert route telemetry (issue #1810 Slice 7A). Allocates the
+    /// persistent stable-VA record through the existing runtime allocator, stamps
+    /// request/device identity, and opens the first accumulation window
+    /// (`epoch = 1`). Subsequent [`execute`](Self::execute) calls whose expert
+    /// count matches `config.num_experts` accumulate their routes into the
+    /// current window via the fused route-kernel marks; the window advances only
+    /// at [`reset_route_telemetry_boundary`](Self::reset_route_telemetry_boundary).
+    /// Returns a typed [`TelemetryUnsupported`] on a device mismatch or
+    /// unsupported property, in which case telemetry stays disabled and ordinary
+    /// inference is unaffected. Session/kernel-scoped and crate-internal/test
+    /// only — there is no public typed-config seam to wire this to yet, so it is
+    /// `#[doc(hidden)]` and default-off. Re-arming replaces any prior record.
+    ///
+    /// Caveat: re-arming (or [`disarm_route_telemetry`](Self::disarm_route_telemetry))
+    /// frees the previous record's device buffers. An instantiated CUDA graph
+    /// bakes those pointers into its route nodes, so the caller MUST tear down
+    /// any capture that referenced the old record (`reset_graph`) before
+    /// re-arming or disarming; otherwise a later `replay_graph` would touch
+    /// freed memory. Every current caller does so, and there is no production
+    /// caller.
+    #[doc(hidden)]
+    pub fn arm_route_telemetry(
+        &self,
+        config: RouteTelemetryConfig,
+    ) -> std::result::Result<(), TelemetryUnsupported> {
+        let armed = ArmedTelemetry::arm(&self.runtime, config)?;
+        let mut telemetry = self
+            .telemetry
+            .lock()
+            .expect("cuda_ep QMoE telemetry poisoned");
+        if let Some(previous) = telemetry.take() {
+            previous.free(&self.runtime);
+        }
+        *telemetry = Some(armed);
+        Ok(())
+    }
+
+    /// Disarm and release any armed route-telemetry record. Idempotent. The
+    /// caller must first `reset_graph` any capture that referenced the record
+    /// (its device pointers are baked into captured graph nodes) — see
+    /// [`arm_route_telemetry`](Self::arm_route_telemetry).
+    #[doc(hidden)]
+    pub fn disarm_route_telemetry(&self) {
+        let mut telemetry = self
+            .telemetry
+            .lock()
+            .expect("cuda_ep QMoE telemetry poisoned");
+        if let Some(previous) = telemetry.take() {
+            previous.free(&self.runtime);
+        }
+    }
+
+    /// Advance route telemetry to the next accumulation window at an explicit
+    /// **coarse safe boundary** (issue #1810 Slice 7A; design §2.3/§3). This is
+    /// the *only* place the epoch advances and the record is re-zeroed — nothing
+    /// on the [`execute`](Self::execute)/replay path resets it, so every eager
+    /// call and captured replay in a window accumulates the routed-expert union
+    /// and in-range count into the stable record with a fixed epoch. A window is
+    /// consumed (snapshot/validate) and then this is called before new work, so
+    /// the next window starts empty with no stale carryover.
+    ///
+    /// It reuses existing runtime authorities only: it is **rejected while the
+    /// EP stream is capturing/replaying** (returns `Err`; a drain is illegal
+    /// mid-capture), and otherwise drains prior stream work through
+    /// `drain_for_unmap` before re-stamping the header on the host. No-op (`Ok`)
+    /// when disarmed. Allocates nothing and moves no pointer. Crate-internal /
+    /// test-only; there is no production boundary-policy caller yet.
+    #[doc(hidden)]
+    pub fn reset_route_telemetry_boundary(&self) -> Result<()> {
+        let mut telemetry = self
+            .telemetry
+            .lock()
+            .expect("cuda_ep QMoE telemetry poisoned");
+        match telemetry.as_mut() {
+            Some(armed) => armed.reset_boundary(&self.runtime),
+            None => Ok(()),
+        }
+    }
+
+    /// Copy the current telemetry record to the host (test/observability only —
+    /// this is not the production CONSUME path and self-synchronizes). Returns
+    /// `None` when telemetry is not armed.
+    #[doc(hidden)]
+    pub fn route_telemetry_snapshot(&self) -> Result<Option<TelemetrySnapshot>> {
+        let telemetry = self
+            .telemetry
+            .lock()
+            .expect("cuda_ep QMoE telemetry poisoned");
+        match telemetry.as_ref() {
+            Some(armed) => Ok(Some(armed.snapshot(&self.runtime)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Total device bytes held by the armed telemetry record (teardown /
+    /// accounting tests); `0` when disarmed.
+    #[doc(hidden)]
+    pub fn route_telemetry_footprint_bytes(&self) -> usize {
+        self.telemetry
+            .lock()
+            .expect("cuda_ep QMoE telemetry poisoned")
+            .as_ref()
+            .map_or(0, ArmedTelemetry::footprint_bytes)
+    }
+
+    /// Stable device VA of the armed telemetry bitmap (capture/replay stable-
+    /// pointer tests); `None` when disarmed.
+    #[doc(hidden)]
+    pub fn route_telemetry_bitmap_addr(&self) -> Option<u64> {
+        self.telemetry
+            .lock()
+            .expect("cuda_ep QMoE telemetry poisoned")
+            .as_ref()
+            .map(ArmedTelemetry::bitmap_addr)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1272,6 +1483,12 @@ struct QuantizedExperts<'a> {
     scales: &'a TensorView<'a>,
     zero_points: Option<&'a TensorView<'a>>,
     bias: Option<&'a TensorView<'a>>,
+    /// f32 device buffer holding widened scales when the graph is fp16/bf16;
+    /// `None` for f32 (use `scales` directly). The dequant kernels always read
+    /// f32 scales, so fp16/bf16 scales are widened once per execute.
+    scales_override: Option<CUdeviceptr>,
+    /// f32 device buffer holding widened biases when the graph is fp16/bf16.
+    bias_override: Option<CUdeviceptr>,
     out_features: usize,
     in_features: usize,
     packed_in: usize,
@@ -1307,7 +1524,7 @@ impl<'a> QuantizedExperts<'a> {
             packed.dtype,
             DataType::Uint8,
         )?;
-        require_dtype(&format!("{name}_scales"), scales.dtype, DataType::Float32)?;
+        float_widen_entry(&format!("{name}_scales"), scales.dtype)?;
         let pack_size = 8 / bits;
         if !in_features.is_multiple_of(pack_size) {
             return Err(error(format!(
@@ -1349,11 +1566,7 @@ impl<'a> QuantizedExperts<'a> {
             )?;
         }
         if let Some(bias) = bias {
-            require_dtype(
-                &format!("{name}_experts_bias"),
-                bias.dtype,
-                DataType::Float32,
-            )?;
+            float_widen_entry(&format!("{name}_experts_bias"), bias.dtype)?;
             require_shape(
                 &format!("{name}_experts_bias"),
                 bias.shape,
@@ -1380,6 +1593,8 @@ impl<'a> QuantizedExperts<'a> {
             scales,
             zero_points,
             bias,
+            scales_override: None,
+            bias_override: None,
             out_features,
             in_features,
             packed_in,
@@ -1387,9 +1602,52 @@ impl<'a> QuantizedExperts<'a> {
             zero_point_bytes,
         })
     }
+
+    /// Device pointer to f32 scales: the widened buffer for fp16/bf16 graphs,
+    /// or the original f32 initializer.
+    fn scales_ptr(&self) -> CUdeviceptr {
+        self.scales_override
+            .unwrap_or_else(|| tensor_ptr(self.scales))
+    }
+
+    /// Device pointer to f32 biases (widened for fp16/bf16), or 0 when absent.
+    fn bias_ptr(&self) -> CUdeviceptr {
+        match (self.bias_override, self.bias) {
+            (Some(ptr), _) => ptr,
+            (None, Some(bias)) => tensor_ptr(bias),
+            (None, None) => 0,
+        }
+    }
 }
 
 impl Kernel for QMoEKernel {
+    /// Returning `Ok(())` does not, by itself, imply the launched kernels have
+    /// completed on the device: like the rest of the CUDA EP's single-in-order-
+    /// stream eager path, the trailing `self.runtime.synchronize()` call below
+    /// is a no-op by default (see `CudaRuntime::synchronize`'s doc comment on
+    /// `defer_eager_sync`). Kernel-to-kernel ordering is guaranteed by the
+    /// stream; any host-visible read (`dtoh`/`dtod`) self-synchronizes before
+    /// its copy. This call used to be relied on (accidentally, since it was
+    /// already inert under the default configuration) to protect two things
+    /// that are now handled explicitly instead:
+    ///
+    /// - scratch-growth-free safety: `ScratchPool::ensure` now drains the
+    ///   stream itself with `drain_for_unmap` (an unconditional barrier,
+    ///   unlike `synchronize`), only when a slot actually grows (see its doc
+    ///   comment) — the case this really guards against.
+    /// - teardown safety: `Drop for QMoEKernel` now performs its own
+    ///   best-effort `drain_for_unmap` before freeing scratch, since it can no
+    ///   longer assume a prior call already synced.
+    ///
+    /// The trailing `synchronize()` call itself is kept, not removed: it
+    /// establishes no correctness guarantee of its own in the default
+    /// configuration (that is now entirely the job of the two `drain_for_unmap`
+    /// call sites above), but keeping it means `ONNX_GENAI_DEFER_EAGER_SYNC=0`'s
+    /// debug escape hatch still forces this kernel to become fully synchronous
+    /// too, exactly like every other kernel in this EP (e.g.
+    /// `MatMulNBitsKernel::run`'s main GEMV path) — so a device-side error from
+    /// this call's kernels still surfaces synchronously from `execute` itself
+    /// under that debug flag, matching prior behavior.
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         if !(7..=21).contains(&inputs.len()) || outputs.len() != 1 {
             return Err(error(format!(
@@ -1430,7 +1688,7 @@ impl Kernel for QMoEKernel {
                 outputs[0].dtype, inputs[0].dtype
             )));
         }
-        require_dtype("router_probs", inputs[1].dtype, DataType::Float32)?;
+        float_widen_entry("router_probs", inputs[1].dtype)?;
         if dtype.needs_half_headers() {
             self.runtime.require_nvrtc_half_headers("QMoE")?;
         }
@@ -1482,7 +1740,7 @@ impl Kernel for QMoEKernel {
         }
         let fc1_size = self.attributes.fc1_size(inter)?;
 
-        let fc1 = QuantizedExperts::validate(
+        let mut fc1 = QuantizedExperts::validate(
             "fc1",
             &inputs[2],
             &inputs[3],
@@ -1494,7 +1752,7 @@ impl Kernel for QMoEKernel {
             self.bits,
             self.block_size,
         )?;
-        let fc2 = QuantizedExperts::validate(
+        let mut fc2 = QuantizedExperts::validate(
             "fc2",
             &inputs[5],
             &inputs[6],
@@ -1509,7 +1767,7 @@ impl Kernel for QMoEKernel {
 
         let has_fc3 = optional_input(inputs, 8).is_some();
         let uses_separate_gate = self.attributes.uses_separate_gate(has_fc3);
-        let fc3 = if uses_separate_gate {
+        let mut fc3 = if uses_separate_gate {
             Some(QuantizedExperts::validate(
                 "fc3",
                 optional_input(inputs, 8)
@@ -1541,7 +1799,7 @@ impl Kernel for QMoEKernel {
         };
 
         if let Some(router_weights) = optional_input(inputs, 14) {
-            require_dtype("router_weights", router_weights.dtype, DataType::Float32)?;
+            float_widen_entry("router_weights", router_weights.dtype)?;
             require_shape("router_weights", router_weights.shape, &[rows, experts])?;
         }
         for (name, tensor) in [("input", &inputs[0]), ("router_probs", &inputs[1])] {
@@ -1656,20 +1914,158 @@ impl Kernel for QMoEKernel {
             )
             .transpose()?;
 
+        // ORT binds input, router_probs, scales, biases and the optional
+        // aggregation weights to one type parameter T, so a valid fp16/bf16
+        // graph carries fp16/bf16 versions of these operands. The routing and
+        // dequant kernels read them as f32, so widen any non-f32 operand to f32
+        // scratch once per execute — an exact, lossless upcast — and reuse the
+        // identical f32 kernels. Each operand is classified independently: an
+        // f32 operand keeps its original pointer (so pure-f32 graphs and the
+        // pre-existing "fp16 activations + f32 scales" graphs are byte-for-byte
+        // unchanged), while an fp16/bf16 operand is upcast.
+        let router_elems = checked_product(&[rows, experts], "router element count")?;
+        let router_probs_ptr = match float_widen_entry("router_probs", inputs[1].dtype)? {
+            None => tensor_ptr(&inputs[1]),
+            Some(entry) => self.widen_to_f32(
+                &mut scratch,
+                11,
+                capturing,
+                entry,
+                tensor_ptr(&inputs[1]),
+                router_elems,
+            )?,
+        };
+        let router_weights_ptr = match optional_input(inputs, 14) {
+            None => 0,
+            Some(rw) => match float_widen_entry("router_weights", rw.dtype)? {
+                None => tensor_ptr(rw),
+                Some(entry) => self.widen_to_f32(
+                    &mut scratch,
+                    12,
+                    capturing,
+                    entry,
+                    tensor_ptr(rw),
+                    router_elems,
+                )?,
+            },
+        };
+        if let Some(entry) = float_widen_entry("fc1_scales", fc1.scales.dtype)? {
+            fc1.scales_override = Some(self.widen_to_f32(
+                &mut scratch,
+                13,
+                capturing,
+                entry,
+                tensor_ptr(fc1.scales),
+                checked_product(fc1.scales.shape, "fc1 scales element count")?,
+            )?);
+        }
+        if let Some(entry) = float_widen_entry("fc2_scales", fc2.scales.dtype)? {
+            fc2.scales_override = Some(self.widen_to_f32(
+                &mut scratch,
+                14,
+                capturing,
+                entry,
+                tensor_ptr(fc2.scales),
+                checked_product(fc2.scales.shape, "fc2 scales element count")?,
+            )?);
+        }
+        if let Some(fc3) = fc3.as_mut()
+            && let Some(entry) = float_widen_entry("fc3_scales", fc3.scales.dtype)?
+        {
+            fc3.scales_override = Some(self.widen_to_f32(
+                &mut scratch,
+                15,
+                capturing,
+                entry,
+                tensor_ptr(fc3.scales),
+                checked_product(fc3.scales.shape, "fc3 scales element count")?,
+            )?);
+        }
+        if let Some(bias) = fc1.bias
+            && let Some(entry) = float_widen_entry("fc1_experts_bias", bias.dtype)?
+        {
+            fc1.bias_override = Some(self.widen_to_f32(
+                &mut scratch,
+                16,
+                capturing,
+                entry,
+                tensor_ptr(bias),
+                checked_product(bias.shape, "fc1 bias element count")?,
+            )?);
+        }
+        if let Some(bias) = fc2.bias
+            && let Some(entry) = float_widen_entry("fc2_experts_bias", bias.dtype)?
+        {
+            fc2.bias_override = Some(self.widen_to_f32(
+                &mut scratch,
+                17,
+                capturing,
+                entry,
+                tensor_ptr(bias),
+                checked_product(bias.shape, "fc2 bias element count")?,
+            )?);
+        }
+        if let Some(fc3) = fc3.as_mut()
+            && let Some(bias) = fc3.bias
+            && let Some(entry) = float_widen_entry("fc3_experts_bias", bias.dtype)?
+        {
+            fc3.bias_override = Some(self.widen_to_f32(
+                &mut scratch,
+                18,
+                capturing,
+                entry,
+                tensor_ptr(bias),
+                checked_product(bias.shape, "fc3 bias element count")?,
+            )?);
+        }
+
+        // Inert route telemetry (issue #1810 Slice 7A). When armed for this
+        // expert count, hand the stable-VA record pointers to the fused route
+        // kernel so its `atomicOr`/`atomicAdd` marks accumulate this call's
+        // routes into the *current window* (union bitmap + saturating count).
+        // There is deliberately **no reset/epoch launch here** — the window and
+        // its epoch are advanced only by an explicit
+        // `reset_route_telemetry_boundary` at a coarse safe boundary (design
+        // §2.3/§3), so every eager call and captured replay accumulates rather
+        // than resetting per call. When disarmed — or armed for a different
+        // capacity — the pointers are null and the route kernel is
+        // byte-identical; a capacity mismatch leaves telemetry inert for this
+        // call and never fails inference.
+        let (telemetry_bitmap, telemetry_header) = {
+            let telemetry = self
+                .telemetry
+                .lock()
+                .expect("cuda_ep QMoE telemetry poisoned");
+            match telemetry.as_ref() {
+                Some(armed) if armed.matches_experts(experts) => {
+                    (armed.bitmap_ptr(), armed.header_ptr())
+                }
+                _ => (0u64, 0u64),
+            }
+        };
+
         self.launch_route(
-            &inputs[1],
-            optional_input(inputs, 14),
+            router_probs_ptr,
+            router_weights_ptr,
             route_indices,
             route_weights,
             rows,
             experts,
+            telemetry_bitmap,
+            telemetry_header,
         )?;
         // Investigation probe (default-OFF): dump the top-k expert SELECTION and
         // the router-logit margin per QMoE call so a CPU-vs-CUDA run can be
         // diffed to distinguish a benign borderline-argmax reassociation from a
         // real router top-k divergence. Safe only outside graph capture.
         if !capturing && std::env::var_os("ONNX_GENAI_QMOE_ROUTE_DUMP").is_some() {
-            self.dump_route_selection(&inputs[1], route_indices, rows, experts, self.attributes.k)?;
+            self.dump_route_selection(
+                router_probs_ptr,
+                route_indices,
+                rows,
+                experts,
+                self.attributes.k,
+            )?;
         }
         if let Some(grouping) = grouping {
             let fc1_output = fc1_output.expect("grouped QMoE keeps FC1 scratch");
@@ -1785,15 +2181,19 @@ impl Kernel for QMoEKernel {
             rows,
             hidden,
         )?;
-        let result = if capturing {
-            Ok(())
-        } else {
-            self.runtime.synchronize()
-        };
-        if result.is_ok() && !capturing {
+        // All kernels above are enqueued on the single in-order EP stream, so
+        // kernel-to-kernel ordering is already guaranteed without waiting here,
+        // and no host-visible read of their output happens in this function
+        // (see the doc comment on this impl). The `synchronize()` call below is
+        // a no-op by default (`defer_eager_sync`); it exists only so the
+        // `ONNX_GENAI_DEFER_EAGER_SYNC=0` debug escape hatch still applies to
+        // this kernel like every other one in the EP — see the doc comment on
+        // this impl.
+        if !capturing {
+            self.runtime.synchronize()?;
             self.warmed.store(true, Ordering::Relaxed);
         }
-        result
+        Ok(())
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
@@ -1821,7 +2221,7 @@ impl QMoEKernel {
     /// any token divergence is purely downstream (GEMV/argmax), not routing.
     fn dump_route_selection(
         &self,
-        router_probs: &TensorView,
+        router_probs: CUdeviceptr,
         route_indices: CUdeviceptr,
         rows: usize,
         experts: usize,
@@ -1847,7 +2247,7 @@ impl QMoEKernel {
                     rows * experts * std::mem::size_of::<f32>(),
                 )
             };
-            unsafe { self.runtime.dtoh(bytes, tensor_ptr(router_probs))? };
+            unsafe { self.runtime.dtoh(bytes, router_probs)? };
         }
         for row in 0..rows {
             let call = CALL.fetch_add(1, Ordering::Relaxed);
@@ -1878,18 +2278,55 @@ impl QMoEKernel {
         Ok(())
     }
 
+    /// Widen a contiguous fp16/bf16 device buffer (`entry` selects the kernel)
+    /// into f32 scratch slot `index`, returning the f32 pointer. Conversion is
+    /// exact, so the reused f32 routing/dequant kernels are numerically
+    /// unaffected. Only invoked for fp16/bf16 graphs; f32 never widens.
+    #[allow(clippy::too_many_arguments)]
+    fn widen_to_f32(
+        &self,
+        scratch: &mut ScratchPool,
+        index: usize,
+        capturing: bool,
+        entry: &str,
+        src: CUdeviceptr,
+        elements: usize,
+    ) -> Result<CUdeviceptr> {
+        let bytes = checked_bytes(elements, std::mem::size_of::<f32>(), "widened f32 scratch")?;
+        let dst = scratch.ensure(&self.runtime, index, bytes, capturing)?;
+        // The widen kernels use __half/__nv_bfloat16, so ensure NVRTC compiles
+        // the module with the fp16/bf16 headers available before it is resolved.
+        self.runtime.require_nvrtc_half_headers("QMoE widen")?;
+        let function = self
+            .runtime
+            .nvrtc_function(MODULE, qmoe_module_src(), entry)?;
+        let count = as_u64("widen element count", elements)?;
+        let config = self.pointwise_launch_config(count)?;
+        let mut builder = self.runtime.stream().launch_builder(&function);
+        builder.arg(&src).arg(&dst).arg(&count);
+        // SAFETY: `src` holds `elements` fp16/bf16 values and `dst` was sized for
+        // the same count of f32; the ABI matches `qmoe_widen_*_f32`.
+        unsafe { builder.launch(config) }
+            .map(|_| ())
+            .map_err(|err| driver_err("widen QMoE fp16 routing/scale input", err))?;
+        Ok(dst)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn launch_route(
         &self,
-        router_probs: &TensorView,
-        router_weights: Option<&TensorView>,
+        router_probs: CUdeviceptr,
+        router_weights: CUdeviceptr,
         route_indices: CUdeviceptr,
         route_weights: CUdeviceptr,
         rows: usize,
         experts: usize,
+        route_telemetry_bitmap: CUdeviceptr,
+        route_telemetry_header: CUdeviceptr,
     ) -> Result<()> {
-        let function = self.runtime.nvrtc_function(MODULE, CUDA_SRC, ROUTE_ENTRY)?;
-        let router_probs = tensor_ptr(router_probs);
-        let router_weights = router_weights.map(tensor_ptr).unwrap_or(0);
+        let function = self
+            .runtime
+            .nvrtc_function(MODULE, qmoe_module_src(), ROUTE_ENTRY)?;
         let rows = as_u64("row count", rows)?;
         let experts = as_i32("expert count", experts)?;
         let top_k = as_i32("top-k", self.attributes.k)?;
@@ -1904,9 +2341,12 @@ impl QMoEKernel {
             .arg(&rows)
             .arg(&experts)
             .arg(&top_k)
-            .arg(&normalize);
+            .arg(&normalize)
+            .arg(&route_telemetry_bitmap)
+            .arg(&route_telemetry_header);
         // SAFETY: tensor layouts and scratch sizes were validated, and the ABI
-        // matches `qmoe_route`.
+        // matches `qmoe_route`. Telemetry pointers are null when disarmed, which
+        // the kernel treats as inert.
         unsafe { builder.launch(config) }
             .map(|_| ())
             .map_err(|err| driver_err("launch QMoE routing", err))
@@ -2080,9 +2520,9 @@ impl QMoEKernel {
                 .ok_or_else(|| error("grouped GEMM shared-memory stride overflow"))?,
         )?;
         let packed = tensor_ptr(weights.packed);
-        let scales = tensor_ptr(weights.scales);
+        let scales = weights.scales_ptr();
         let zero_points = weights.zero_points.map(tensor_ptr).unwrap_or(0);
-        let bias = weights.bias.map(tensor_ptr).unwrap_or(0);
+        let bias = weights.bias_ptr();
         let routes = as_u64("route count", routes)?;
         let tasks = as_u64("grouped linear task count", tasks)?;
         let gemm_min_tokens = as_u64(
@@ -2149,9 +2589,9 @@ impl QMoEKernel {
             .nvrtc_function(module, source, dtype.linear_entry())?;
         let packed = tensor_ptr(weights.packed);
         let expert_counts = expert_counts.unwrap_or(0);
-        let scales = tensor_ptr(weights.scales);
+        let scales = weights.scales_ptr();
         let zero_points = weights.zero_points.map(tensor_ptr).unwrap_or(0);
-        let bias = weights.bias.map(tensor_ptr).unwrap_or(0);
+        let bias = weights.bias_ptr();
         let tasks = checked_product(&[routes, weights.out_features], "linear output task count")?;
         let grid_x = self.linear_reduction_grid(tasks, routes)?;
         let config = self.runtime.reduction_launch_config(
@@ -2255,17 +2695,15 @@ impl QMoEKernel {
             std::mem::size_of::<f32>() as u32,
         )?;
         let fc1_packed = tensor_ptr(fc1.packed);
-        let fc1_scales = tensor_ptr(fc1.scales);
+        let fc1_scales = fc1.scales_ptr();
         let fc1_zero_points = fc1.zero_points.map(tensor_ptr).unwrap_or(0);
-        let fc1_bias = fc1.bias.map(tensor_ptr).unwrap_or(0);
+        let fc1_bias = fc1.bias_ptr();
         let fc3_packed = fc3.map(|weights| tensor_ptr(weights.packed)).unwrap_or(0);
-        let fc3_scales = fc3.map(|weights| tensor_ptr(weights.scales)).unwrap_or(0);
+        let fc3_scales = fc3.map(|weights| weights.scales_ptr()).unwrap_or(0);
         let fc3_zero_points = fc3
             .and_then(|weights| weights.zero_points.map(tensor_ptr))
             .unwrap_or(0);
-        let fc3_bias = fc3
-            .and_then(|weights| weights.bias.map(tensor_ptr))
-            .unwrap_or(0);
+        let fc3_bias = fc3.map(|weights| weights.bias_ptr()).unwrap_or(0);
         let routes = as_u64("route count", routes)?;
         let top_k = as_i32("top-k", self.attributes.k)?;
         let inter = as_i32("intermediate feature count", inter)?;
@@ -2340,7 +2778,7 @@ impl QMoEKernel {
     ) -> Result<()> {
         let function = self
             .runtime
-            .nvrtc_function(MODULE, CUDA_SRC, ACTIVATE_ENTRY)?;
+            .nvrtc_function(MODULE, qmoe_module_src(), ACTIVATE_ENTRY)?;
         let total = checked_product(&[routes, inter], "activation element count")?;
         let config = self.pointwise_launch_config(as_u64("activation element count", total)?)?;
         let fc3 = fc3.unwrap_or(0);
@@ -2379,9 +2817,9 @@ impl QMoEKernel {
         rows: usize,
         hidden: usize,
     ) -> Result<()> {
-        let function = self
-            .runtime
-            .nvrtc_function(MODULE, CUDA_SRC, dtype.combine_entry())?;
+        let function =
+            self.runtime
+                .nvrtc_function(MODULE, qmoe_module_src(), dtype.combine_entry())?;
         let total = checked_product(&[rows, hidden], "combined output element count")?;
         let config = self.pointwise_launch_config(as_u64("output element count", total)?)?;
         let output_ptr = cuptr(output.data_ptr_mut::<u8>() as *const c_void);
@@ -2499,7 +2937,29 @@ impl QMoEKernel {
     }
 }
 
-const SCRATCH_SLOTS: usize = 11;
+const SCRATCH_SLOTS: usize = 19;
+
+/// Classifies a QMoE T-typed float operand (router_probs, scales, biases,
+/// aggregation weights) and returns the widen kernel that upcasts it to f32, or
+/// `None` when it is already f32 (used directly to keep the f32 path
+/// bit-identical). Errors for any non-float dtype.
+///
+/// ORT's `com.microsoft::QMoE` binds these operands to a single type parameter
+/// `T` = {float, float16, bfloat16}, so a valid fp16 graph carries fp16 scales
+/// and router probs. Because the native backend is the sole validator (it skips
+/// ORT's `Session::new` type check), we accept the stricter superset where each
+/// float operand is independently f32 or a half type: an all-fp16 graph runs,
+/// and a mixed graph (fp16 activations, f32 scales) keeps working unchanged.
+fn float_widen_entry(name: &str, dtype: DataType) -> Result<Option<&'static str>> {
+    match dtype {
+        DataType::Float32 => Ok(None),
+        DataType::Float16 => Ok(Some(WIDEN_F16_ENTRY)),
+        DataType::BFloat16 => Ok(Some(WIDEN_BF16_ENTRY)),
+        other => Err(error(format!(
+            "{name} requires Float32, Float16, or BFloat16, got {other:?}"
+        ))),
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 struct ScratchSlot {
@@ -2521,6 +2981,14 @@ impl Default for ScratchPool {
 }
 
 impl ScratchPool {
+    /// Returns a device pointer with capacity for at least `bytes`, growing
+    /// the slot (freeing any smaller previous allocation) on demand.
+    ///
+    /// Growth is the one place in `QMoEKernel::execute` that still needs an
+    /// unconditional device drain (see the call to `drain_for_unmap` below):
+    /// `execute` itself is otherwise fully asynchronous, so a launch from the
+    /// *previous* call may still be reading the old, undersized pointer when
+    /// this call wants to free it.
     fn ensure(
         &mut self,
         runtime: &CudaRuntime,
@@ -2539,10 +3007,28 @@ impl ScratchPool {
                 slot.capacity
             )));
         }
+        if slot.ptr != 0 {
+            // `free_raw` returns to a shared, size-classed pool rather than the
+            // driver in the common case, so a stale pointer can be handed to an
+            // unrelated caller almost immediately — there is no synchronization
+            // inside `alloc_raw`/`free_raw` to rely on. A prior `execute()` call
+            // may still have in-flight kernels reading this slot (the trailing
+            // per-op sync that used to force this ordering was removed; see
+            // `QMoEKernel::execute`), so this growth path is now the only place
+            // that needs an unconditional barrier before freeing the old
+            // pointer. Drain *before* allocating the replacement (mirroring
+            // `BroadcastMetadataCache::prepare` in `elementwise.rs`): if the
+            // drain fails, nothing new has been allocated yet, so there is
+            // nothing to leak on this error path. Growth is rare (first time a
+            // kernel instance sees a shape larger than any previous call), so
+            // this cost is not paid on the steady-state path.
+            runtime.drain_for_unmap()?;
+        }
         let fresh = runtime.alloc_raw(bytes)?;
         if slot.ptr != 0 {
-            // SAFETY: the previous pointer came from this runtime and is replaced
-            // only after the new allocation succeeds.
+            // SAFETY: the previous pointer came from this runtime, every prior
+            // kernel that could read it has retired (drained above), and it is
+            // replaced only after the new allocation succeeds.
             unsafe {
                 let _ = runtime.free_raw(slot.ptr);
             }
@@ -2559,14 +3045,31 @@ impl Drop for QMoEKernel {
             .scratch
             .get_mut()
             .expect("cuda_ep QMoE scratch pool poisoned");
+        if scratch.slots.iter().any(|slot| slot.ptr != 0) {
+            // `execute()` no longer syncs after every call, so a launch from
+            // the last call may still be in flight and reading these scratch
+            // buffers. `Drop` can't propagate a `Result`, so this is a
+            // best-effort barrier: on error (e.g. a poisoned/lost device) we
+            // still proceed to free, matching the pre-existing "errors are
+            // swallowed at teardown" behavior of the `free_raw` calls below.
+            let _ = self.runtime.drain_for_unmap();
+        }
         for slot in scratch.slots.iter_mut().rev() {
             if slot.ptr != 0 {
-                // SAFETY: every non-zero pointer came from this runtime and is
-                // freed exactly once when the kernel is dropped.
+                // SAFETY: every non-zero pointer came from this runtime, the
+                // drain above (best-effort) has retired prior in-flight
+                // kernels, and each pointer is freed exactly once here.
                 let _ = unsafe { self.runtime.free_raw(slot.ptr) };
                 slot.ptr = 0;
                 slot.capacity = 0;
             }
+        }
+        // Release any armed route-telemetry record (issue #1810 Slice 7A).
+        // `free` drains in-flight launches before returning the buffers.
+        if let Ok(telemetry) = self.telemetry.get_mut()
+            && let Some(armed) = telemetry.take()
+        {
+            armed.free(&self.runtime);
         }
     }
 }
@@ -2708,6 +3211,21 @@ fn as_u64(name: &str, value: usize) -> Result<u64> {
 
 fn error(message: impl Into<String>) -> EpError {
     EpError::KernelFailed(format!("cuda_ep com.microsoft::QMoE: {}", message.into()))
+}
+
+/// The armed `QMoEKernel` is the production [`RouteTelemetrySource`]: the
+/// boundary consumer drives a live kernel through exactly the two existing,
+/// already-tested window primitives (snapshot self-synchronizes; reset is
+/// rejected under capture). No new mechanism — this only names the ordered pair
+/// for the Slice-7C boundary caller.
+impl RouteTelemetrySource for QMoEKernel {
+    fn route_telemetry_snapshot(&self) -> Result<Option<TelemetrySnapshot>> {
+        QMoEKernel::route_telemetry_snapshot(self)
+    }
+
+    fn reset_route_telemetry_boundary(&self) -> Result<()> {
+        QMoEKernel::reset_route_telemetry_boundary(self)
+    }
 }
 
 #[cfg(test)]

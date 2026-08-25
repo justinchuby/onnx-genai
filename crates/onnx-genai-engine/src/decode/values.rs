@@ -211,7 +211,10 @@ pub(crate) fn clone_value(value: &Value) -> anyhow::Result<Value> {
 }
 
 /// The single axis of `shape` whose extent is `extent`, or `None` when no axis
-/// or more than one axis matches.
+/// or more than one axis matches. Only reachable from
+/// [`DecodeState::truncate_past`](super::state::DecodeState::truncate_past),
+/// which has no production caller while rollback is unwired.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn sole_axis_with_extent(shape: &[i64], extent: usize) -> Option<usize> {
     let extent = i64::try_from(extent).ok()?;
     let mut found = None;

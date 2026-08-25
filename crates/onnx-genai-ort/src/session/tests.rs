@@ -191,6 +191,7 @@ fn rejects_unrecognized_ep_names_without_conservative_append() {
         std::ptr::null_mut(),
         &resolved,
         false,
+        false,
         &CudaAttentionMode::Auto,
         &["CPUExecutionProvider".to_string()],
     )
@@ -231,6 +232,7 @@ fn invalid_plugin_requests_are_preserved_as_session_creation_errors() {
         std::ptr::null_mut(),
         &resolved,
         false,
+        false,
         &CudaAttentionMode::Auto,
         &["CPUExecutionProvider".to_string()],
     )
@@ -249,6 +251,7 @@ fn invalid_plugin_requests_are_preserved_as_session_creation_errors() {
         &Environment::new("empty-inline-plugin-test").expect("environment"),
         std::ptr::null_mut(),
         &resolved,
+        false,
         false,
         &CudaAttentionMode::Auto,
         &["CPUExecutionProvider".to_string()],
@@ -339,6 +342,7 @@ fn unavailable_named_provider_errors_instead_of_falling_back() {
         &Environment::new("webgpu-unavailable-test").expect("environment"),
         std::ptr::null_mut(),
         &resolved,
+        false,
         false,
         &CudaAttentionMode::Auto,
         &["CPUExecutionProvider".to_string()],
@@ -608,7 +612,7 @@ fn cpu_ort_auto_default_is_disabled_off_windows_arm64() {
 #[test]
 fn unfused_cuda_attention_uses_math_provider_option() {
     assert_eq!(
-        cuda_provider_options("3".to_string(), true, &CudaAttentionMode::Unfused),
+        cuda_provider_options("3".to_string(), true, false, &CudaAttentionMode::Unfused),
         vec![
             ("device_id".to_string(), "3".to_string()),
             ("enable_cuda_graph".to_string(), "1".to_string()),
@@ -616,12 +620,24 @@ fn unfused_cuda_attention_uses_math_provider_option() {
         ]
     );
     assert_eq!(
-        cuda_provider_options("0".to_string(), false, &CudaAttentionMode::Auto),
+        cuda_provider_options("0".to_string(), false, false, &CudaAttentionMode::Auto),
         vec![("device_id".to_string(), "0".to_string())]
     );
     assert_eq!(
-        cuda_provider_options("0".to_string(), false, &CudaAttentionMode::Fused),
+        cuda_provider_options("0".to_string(), false, false, &CudaAttentionMode::Fused),
         vec![("device_id".to_string(), "0".to_string())]
+    );
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn managed_cuda_allocator_forces_a_unified_cuda_stream() {
+    assert_eq!(
+        cuda_provider_options("0".to_string(), false, true, &CudaAttentionMode::Auto),
+        vec![
+            ("device_id".to_string(), "0".to_string()),
+            ("use_ep_level_unified_stream".to_string(), "1".to_string()),
+        ]
     );
 }
 
@@ -653,6 +669,7 @@ fn cuda_request_requires_compile_time_feature() {
         std::ptr::null_mut(),
         &resolved,
         false,
+        false,
         &CudaAttentionMode::Auto,
         &[],
     )
@@ -661,5 +678,62 @@ fn cuda_request_requires_compile_time_feature() {
         error
             .to_string()
             .contains("CUDA support not compiled in; rebuild with --features cuda")
+    );
+}
+
+#[test]
+fn graph_capture_withdraws_concurrent_run_regardless_of_provider() {
+    // Capture/replay is per-session state keyed by gpu_graph_id, so it is the
+    // session - not the provider - that stops being concurrently runnable. CUDA
+    // otherwise declares the capability, which is what makes this worth
+    // asserting: the provider says yes and the session still has to say no.
+    let cuda = resolve_execution_provider(&ep_selection("cuda"));
+    assert_eq!(
+        concurrent_run_support(std::slice::from_ref(&cuda), false),
+        ConcurrentRunSupport::Supported
+    );
+    let captured = concurrent_run_support(&[cuda], true);
+    let reason = captured
+        .reason()
+        .expect("a capturing session must refuse concurrent runs");
+    assert!(
+        reason.contains("gpu_graph_id"),
+        "must name the mechanism: {reason}"
+    );
+    assert!(
+        reason.contains("its own session"),
+        "must say what to do instead: {reason}"
+    );
+}
+
+#[test]
+fn a_provider_without_the_capability_withdraws_it_for_the_whole_session() {
+    for name in ["webgpu", "coreml", "qnn"] {
+        let resolved = resolve_execution_provider(&ep_selection(name));
+        let support = concurrent_run_support(std::slice::from_ref(&resolved), false);
+        let reason = support.reason().unwrap_or_else(|| {
+            panic!("'{name}' does not declare concurrent Run and must refuse it")
+        });
+        assert!(reason.contains(name), "must name the provider: {reason}");
+    }
+    // A session that resolved nothing has nothing declaring the guarantee, so
+    // it fails closed rather than defaulting to permissive.
+    assert!(concurrent_run_support(&[], false).reason().is_some());
+}
+
+#[test]
+fn a_mixed_provider_set_is_only_as_concurrent_as_its_least_capable_member() {
+    let providers = [
+        resolve_execution_provider(&ep_selection("cuda")),
+        resolve_execution_provider(&ep_selection("webgpu")),
+        resolve_execution_provider(&ep_selection("cpu")),
+    ];
+    let reason = concurrent_run_support(&providers, false)
+        .reason()
+        .expect("one non-concurrent provider must withdraw it for the session")
+        .to_string();
+    assert!(
+        reason.contains("webgpu"),
+        "must name the offender: {reason}"
     );
 }

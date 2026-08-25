@@ -131,14 +131,36 @@ impl MoeAttributes {
                 "swiglu_fusion is only valid when activation_type='swiglu'",
             ));
         }
+        let activation_alpha = float_attr(node, "activation_alpha", 1.0)?;
+        let activation_beta = float_attr(node, "activation_beta", 0.0)?;
+        let swiglu_limit = float_attr(node, "swiglu_limit", f32::INFINITY)?;
+        // These three feed directly into the clipped-SwiGLU formula
+        // (`min/max/clamp` then a sigmoid and a multiply). A NaN silently
+        // poisons every routed token's output instead of failing at the one
+        // point - node creation - where the offending attribute name is
+        // still available to report.
+        for (name, value) in [
+            ("activation_alpha", activation_alpha),
+            ("activation_beta", activation_beta),
+            ("swiglu_limit", swiglu_limit),
+        ] {
+            if value.is_nan() {
+                return Err(error(format!("attribute {name} must not be NaN")));
+            }
+        }
+        if swiglu_limit <= 0.0 {
+            return Err(error(format!(
+                "swiglu_limit must be positive, got {swiglu_limit}"
+            )));
+        }
         Ok(Self {
             k: k as usize,
             activation,
             normalize_routing_weights: normalize,
             swiglu_fusion: swiglu_fusion as usize,
-            activation_alpha: float_attr(node, "activation_alpha", 1.0)?,
-            activation_beta: float_attr(node, "activation_beta", 0.0)?,
-            swiglu_limit: float_attr(node, "swiglu_limit", f32::INFINITY)?,
+            activation_alpha,
+            activation_beta,
+            swiglu_limit,
         })
     }
 
@@ -951,7 +973,7 @@ pub(super) fn run_expert(
             } else if attributes.swiglu_fusion == 1 {
                 let mut gate = Vec::with_capacity(inter);
                 let mut linear = Vec::with_capacity(inter);
-                for pair in fc1_out.chunks_exact(2) {
+                for pair in fc1_out.as_chunks::<2>().0 {
                     gate.push(pair[0]);
                     linear.push(pair[1]);
                 }
@@ -1014,11 +1036,8 @@ pub(super) fn run_expert_grouped(
     let mut fc1_out = linear_grouped(input, rows, fc1_weights, fc1_bias, fc1_size, hidden)?;
     let activated = match attributes.activation {
         Activation::Swiglu => {
-            let linear_part;
-            let gate_part;
-            if attributes.swiglu_fusion == 0 {
-                gate_part = fc1_out;
-                linear_part = linear_grouped(
+            let (gate_part, linear_part) = if attributes.swiglu_fusion == 0 {
+                let linear = linear_grouped(
                     input,
                     rows,
                     fc3_weights.expect("validated unfused swiglu FC3"),
@@ -1026,12 +1045,13 @@ pub(super) fn run_expert_grouped(
                     inter,
                     hidden,
                 )?;
+                (fc1_out, linear)
             } else {
                 let mut gate = Vec::with_capacity(rows * inter);
                 let mut linear = Vec::with_capacity(rows * inter);
                 for row in fc1_out.chunks_exact(fc1_size) {
                     if attributes.swiglu_fusion == 1 {
-                        for pair in row.chunks_exact(2) {
+                        for pair in row.as_chunks::<2>().0 {
                             gate.push(pair[0]);
                             linear.push(pair[1]);
                         }
@@ -1040,9 +1060,8 @@ pub(super) fn run_expert_grouped(
                         linear.extend_from_slice(&row[inter..]);
                     }
                 }
-                gate_part = gate;
-                linear_part = linear;
-            }
+                (gate, linear)
+            };
             gate_part
                 .into_iter()
                 .zip(linear_part)

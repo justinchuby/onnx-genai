@@ -46,7 +46,8 @@ fn logits_output_by_exclusion(
     })?;
     if non_cache.next().is_some() {
         return Err(OrtError::InvalidArgument(
-            "static-cache model exposes multiple non-cache outputs; declare model.io.logits_output"
+            "static-cache model exposes multiple non-cache outputs, so logits_output is \
+             ambiguous; give the port the logits role in pipeline.workflow.components.<component>.ports.roles"
                 .into(),
         ));
     }
@@ -60,7 +61,7 @@ fn logits_output_by_exclusion(
 /// write hint, not the source of truth for cache ownership.
 pub struct StaticCacheDecodeSession<'a> {
     session: &'a Session,
-    binding: IoBinding,
+    binding: IoBinding<'a>,
     signature: StaticCacheSignature,
     batch_size: i64,
     current_len: usize,
@@ -79,7 +80,7 @@ pub struct StaticCacheDecodeSession<'a> {
 /// and avoid running model compute for inactive rows.
 pub struct BatchedStaticCacheDecodeSession<'a> {
     session: &'a Session,
-    binding: IoBinding,
+    binding: IoBinding<'a>,
     signature: StaticCacheSignature,
     batch_size: usize,
     row_lens: Vec<usize>,
@@ -96,7 +97,7 @@ impl<'a> StaticCacheDecodeSession<'a> {
     /// Detect a STATIC-CACHE/TensorScatter signature from ONNX graph I/O.
     pub fn detect(
         session: &Session,
-        io: Option<&onnx_genai_metadata::ModelIoSpec>,
+        io: Option<&onnx_genai_metadata::DecoderAbi>,
     ) -> Result<Option<StaticCacheSignature>> {
         Ok(detect_static_cache(session, io)?.map(|(signature, ..)| signature))
     }
@@ -105,7 +106,7 @@ impl<'a> StaticCacheDecodeSession<'a> {
     pub fn new(
         session: &'a Session,
         options: StaticCacheDecodeOptions,
-        io: Option<&onnx_genai_metadata::ModelIoSpec>,
+        io: Option<&onnx_genai_metadata::DecoderAbi>,
     ) -> Result<Self> {
         let (signature, pairs, abi) = detect_static_cache(session, io)?.ok_or_else(|| {
             OrtError::InvalidArgument(
@@ -383,7 +384,7 @@ impl<'a> BatchedStaticCacheDecodeSession<'a> {
     /// Detect a STATIC-CACHE/TensorScatter signature from ONNX graph I/O.
     pub fn detect(
         session: &Session,
-        io: Option<&onnx_genai_metadata::ModelIoSpec>,
+        io: Option<&onnx_genai_metadata::DecoderAbi>,
     ) -> Result<Option<StaticCacheSignature>> {
         StaticCacheDecodeSession::detect(session, io)
     }
@@ -393,7 +394,7 @@ impl<'a> BatchedStaticCacheDecodeSession<'a> {
     pub fn new(
         session: &'a Session,
         options: StaticCacheDecodeOptions,
-        io: Option<&onnx_genai_metadata::ModelIoSpec>,
+        io: Option<&onnx_genai_metadata::DecoderAbi>,
     ) -> Result<Self> {
         let (signature, pairs, abi) = detect_static_cache(session, io)?.ok_or_else(|| {
             OrtError::InvalidArgument(
@@ -1344,9 +1345,6 @@ mod tests {
         let outputs = names(&["scores", "hidden", "updated_key_cache.0"]);
         let cache: HashSet<&str> = ["updated_key_cache.0"].into_iter().collect();
         let error = logits_output_by_exclusion(&outputs, &cache).unwrap_err();
-        assert!(
-            format!("{error:?}").contains("model.io.logits_output"),
-            "{error:?}"
-        );
+        assert!(format!("{error:?}").contains("logits_output"), "{error:?}");
     }
 }

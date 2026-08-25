@@ -37,7 +37,7 @@ classifiers = [
 ]
 # CUDA 13 runtime NVIDIA libraries (mirrors crates/onnx-runtime-python's [cuda]
 # set). REQUIRED deps (not an extra): `pip install nxrt-ep-cuda` must pull them
-# so the EP's dlopen'd libs (libcudart / libcublas(+Lt) / libnvrtc / libcupti,
+# so the EP's dlopen'd libs (libcudart / libcublas(+Lt) / libcufft / libnvrtc / libcupti,
 # which auditwheel excludes from the wheel) resolve at runtime. The CUDA driver
 # (libcuda.so.1) remains a host prerequisite. These wheels target Linux/Windows.
 #
@@ -50,6 +50,8 @@ classifiers = [
 dependencies = [
     "nvidia-cuda-runtime>=13,<14",
     "nvidia-cublas>=13,<14",       # libcublas + libcublasLt (cuBLASLt MatMul)
+    "nvidia-cufft>=12,<13",        # cuFFT 12.x shipped with the CUDA 13 line
+    "nvidia-nvjitlink>=13,<14",    # cuFFT JIT dependency
     "nvidia-cuda-nvrtc>=13,<14",   # runtime NVRTC compilation of fused/pointwise kernels
     "nvidia-cuda-cupti>=13,<14",   # GPU kernel tracing
 ]

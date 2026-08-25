@@ -11,17 +11,13 @@ use axum::{
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response, Sse, sse::Event},
 };
-use base64::Engine as _;
-use onnx_genai::text_to_audio::TextToAudioRequest;
-use onnx_genai::text_to_image::TextToImageRequest;
 use onnx_genai::{
-    FinishReason, GenerateOptions, GeneratePrompt, GenerateRequest, GenerateResult, SessionId,
-    StopSequence,
+    FinishReason, GenerateOptions, GeneratePrompt, GenerateRequest, GenerateResult, StopSequence,
 };
 use onnx_genai_engine::{
     DryConfig, EmbeddingOptions, EngineGovernorError, GenerateConstraint, GovernorSnapshot,
-    MirostatConfig, MirostatVersion, ResourceLimit, SamplingOverrides, TokenLogprob, XtcConfig,
-    parse_resource_limit,
+    MirostatConfig, MirostatVersion, PackageCapabilityError, ResourceLimit, SamplingOverrides,
+    TokenLogprob, XtcConfig, parse_resource_limit,
 };
 use onnx_genai_metadata::GenerationDefaults;
 use onnx_genai_ort::{ChatMessage as TemplateChatMessage, ChatTemplate, Tokenizer};
@@ -48,17 +44,18 @@ use crate::{
         ChatLogprobs, ChatMessage, ChatMessageContent, ChatMessageToolCall,
         ChatMessageToolCallFunction, ChatTokenLogprob, ChatTool, ChatTopLogprob, CompletionChoice,
         CompletionLogprobs, CompletionRequest, CompletionResponse, EmbeddingData, EmbeddingInput,
-        EmbeddingRequest, EmbeddingResponse, EmbeddingUsage, EmbeddingVector, ImageData,
-        ImageGenerationRequest, ImageGenerationResponse, ImageResponseFormat, InputAudio,
-        ReasoningEffort, ResponseFormat, SpeechRequest, SpeechResponseFormat, StopInput,
-        ToolChoice, ToolChoiceMode, Usage,
+        EmbeddingRequest, EmbeddingResponse, EmbeddingUsage, EmbeddingVector, InputAudio,
+        ReasoningEffort, ResponseFormat, StopInput, ToolChoice, ToolChoiceMode, Usage,
     },
+    worker::SessionPlacement,
 };
 
 mod admin;
 mod completions;
+mod images;
 mod multimodal;
 mod sessions;
+mod speech;
 
 #[cfg(feature = "metrics")]
 pub(crate) use admin::prometheus_metrics;
@@ -67,6 +64,8 @@ pub(crate) use admin::{
     admin_warmup_model, debug_config, debug_kv, debug_profile, debug_sessions, debug_trace,
     debug_trace_perfetto, health, models, resources, status,
 };
+#[cfg(test)]
+pub(crate) use completions::prepare_completion;
 pub use completions::{
     ParsedAssistantOutput, build_generate_request, build_prompt, parse_assistant_output,
     parse_tool_calls,
@@ -74,10 +73,12 @@ pub use completions::{
 pub(crate) use completions::{
     chat_completions, collect_generation_result, completions, embeddings,
 };
-#[cfg(test)]
-pub(crate) use completions::{image_placeholder_text, prepare_completion};
-pub(crate) use multimodal::{audio_speech, audio_transcriptions, image_generations};
+pub(crate) use images::{
+    a1111_img2img, a1111_models, a1111_options, a1111_samplers, a1111_txt2img, openai_images,
+};
+pub(crate) use multimodal::audio_transcriptions;
 pub(crate) use sessions::{create_session, delete_session};
+pub(crate) use speech::audio_speech;
 
 const SESSION_ID_HEADER: &str = "x-session-id";
 const MAX_SESSION_ID_LEN: usize = 128;
@@ -149,7 +150,19 @@ pub(crate) struct SessionStatus {
 #[derive(Debug, Serialize)]
 pub(crate) struct DebugConfigResponse {
     model_id: String,
-    pipeline: bool,
+    /// How many components the package's serialized `pipeline.workflow`
+    /// declares.
+    ///
+    /// Every loaded package serializes one, so this is a fact about the file on
+    /// disk rather than a report of which executor the runtime chose. An
+    /// operator debugging a package wants to know what it *says*; what runs it
+    /// is visible in the execution-provider and island diagnostics beside it.
+    workflow_components: usize,
+    /// How many of those components name an ONNX graph, as opposed to a step
+    /// the runtime implements.
+    workflow_graph_components: usize,
+    /// Whether that workflow declares a generation loop.
+    workflow_declares_generation_loop: bool,
     max_output_tokens: usize,
     max_sessions: usize,
     max_queue_depth: usize,
@@ -376,9 +389,9 @@ struct ErrorBody {
 
 #[derive(Debug)]
 pub(crate) struct ApiError {
-    status: StatusCode,
-    message: String,
-    kind: &'static str,
+    pub(crate) status: StatusCode,
+    pub(crate) message: String,
+    pub(crate) kind: &'static str,
     retry_after_secs: Option<u64>,
 }
 
@@ -400,12 +413,32 @@ pub(crate) enum CompletionGeneration {
         options: GenerateOptions,
     },
 }
+/// `error.type` for a request that conflicts with the state or the capability of
+/// what is loaded.
+///
+/// A 409 is never a fault: nothing broke, and the caller can act on it. Reporting
+/// one as `server_error` told a client to retry a crash.
+pub(crate) const CONFLICT_ERROR_KIND: &str = "conflict_error";
+
+/// `error.type` for a request the loaded package cannot serve as asked.
+pub(crate) const INVALID_REQUEST_ERROR_KIND: &str = "invalid_request_error";
+
 impl ApiError {
     fn bad_request(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
             message: message.into(),
             kind: "server_error",
+            retry_after_secs: None,
+        }
+    }
+
+    /// A request the loaded package cannot serve, and no retry will change.
+    fn invalid_request(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            message: message.into(),
+            kind: INVALID_REQUEST_ERROR_KIND,
             retry_after_secs: None,
         }
     }
@@ -437,11 +470,13 @@ impl ApiError {
         }
     }
 
+    /// The request conflicts with the state or the capability of what is
+    /// loaded.
     fn conflict(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::CONFLICT,
             message: message.into(),
-            kind: "server_error",
+            kind: CONFLICT_ERROR_KIND,
             retry_after_secs: None,
         }
     }
@@ -454,9 +489,44 @@ impl ApiError {
             retry_after_secs: Some(OVERLOAD_RETRY_AFTER_SECS),
         }
     }
+
+    fn payload_too_large(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            message: message.into(),
+            kind: "invalid_request_error",
+            retry_after_secs: None,
+        }
+    }
 }
 
-fn generation_failure(error: DriverFailure) -> ApiError {
+/// Turn a session-creation failure into the status it actually is.
+///
+/// A package that declares no conversation is not a server fault and not a
+/// malformed request: the caller asked this package for something it does not
+/// support, which is what 409 says. Reporting it as a 500 told a client to retry
+/// something that will never succeed, and hid a package defect behind an
+/// operational one.
+pub(crate) fn session_create_failure(error: anyhow::Error) -> ApiError {
+    match onnx_genai_engine::package_capability_error(&error) {
+        Some(capability) => package_capability_failure(capability),
+        None => ApiError::internal(format!("session create failed: {error}")),
+    }
+}
+
+fn package_capability_failure(capability: PackageCapabilityError) -> ApiError {
+    match capability {
+        PackageCapabilityError::NoSessionState => ApiError::conflict(capability.to_string()),
+        PackageCapabilityError::ConversationOverBound { .. } => {
+            ApiError::invalid_request(capability.to_string())
+        }
+        PackageCapabilityError::ExclusiveLeaseConflict { .. } => {
+            ApiError::conflict(capability.to_string())
+        }
+    }
+}
+
+pub(crate) fn generation_failure(error: DriverFailure) -> ApiError {
     match error.kind {
         DriverFailureKind::MemoryOverload => {
             tracing::warn!(
@@ -465,6 +535,12 @@ fn generation_failure(error: DriverFailure) -> ApiError {
             );
             ApiError::too_many_requests(MEMORY_OVERLOAD_MESSAGE)
         }
+        // The caller asked this package for something it cannot serve as asked.
+        // A conversation past its declared bound is a request that is too large
+        // and the caller can shorten; a busy session is a conflict that the same
+        // request succeeds at once the turn in flight finishes. Both are read
+        // off the engine's own type, so neither status depends on wording.
+        DriverFailureKind::PackageCapability(capability) => package_capability_failure(capability),
         DriverFailureKind::Internal => {
             ApiError::internal(format!("generation failed: {}", error.message))
         }
@@ -490,6 +566,9 @@ where
     async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
         match Json::<T>::from_request(request, state).await {
             Ok(Json(value)) => Ok(Self(value)),
+            Err(rejection) if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE => {
+                Err(ApiError::payload_too_large(rejection.body_text()))
+            }
             Err(rejection) => Err(ApiError::bad_request(describe_json_rejection(&rejection))),
         }
     }
@@ -557,6 +636,7 @@ fn map_generate_submit_error(err: GenerateSubmitError) -> ApiError {
             "generation capacity exceeded; retry after the server finishes queued work",
         ),
         GenerateSubmitError::DriverStopped => ApiError::internal("engine driver stopped"),
+        GenerateSubmitError::Failed(error) => generation_failure(error),
     }
 }
 
@@ -614,7 +694,7 @@ fn audio_decoder_prompt(
 
 async fn close_evicted_session(
     engine: &EngineDriver,
-    evicted: Option<SessionId>,
+    evicted: Option<SessionPlacement>,
 ) -> Result<(), ApiError> {
     if let Some(evicted) = evicted {
         engine
@@ -663,6 +743,7 @@ mod overload_tests {
             available: 0,
             role: onnx_runtime_memory_governor::MemoryRole::KvCache,
             detail: "mapped holder could not reach its tentative reclaim target".into(),
+            source: None,
         }
         .into();
         let response = generation_failure(DriverFailure::from_engine_error(&error)).into_response();

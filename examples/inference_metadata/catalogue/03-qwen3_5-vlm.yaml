@@ -1,0 +1,179 @@
+# Qwen3.5 VLM: vision encoder, embedding/projector, then text decoder.
+schema_version: v1
+pipeline:
+  workflow:
+    manifest:
+      capabilities:
+      - workflow_ssa
+      - typed_emit
+    inputs:
+      request.pixel_values:
+        contract:
+          dtype: float32
+          rank: 4
+          shape:
+          - batch
+          - 3
+          - height
+          - width
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: runtime
+          version: '1.0'
+          role: media
+        source:
+          kind: request
+        required: true
+      request.input_ids:
+        contract:
+          dtype: int64
+          rank: 2
+          shape:
+          - batch
+          - sequence
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: runtime
+          version: '1.0'
+          role: prompt_tokens
+        source:
+          kind: request
+        required: true
+    outputs:
+      logits:
+        contract:
+          dtype: float16
+          rank: 3
+          shape:
+          - batch
+          - sequence
+          - vocab
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role: tensor
+        stage: pre_adapter
+    components:
+      vision_encoder:
+        implementation:
+          kind: onnx
+          artifact: qwen3_5_vlm/vision_encoder.onnx.textproto
+        ports:
+          inputs:
+            pixel_values:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - 3
+              - height
+              - width
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            image_features:
+              dtype: float16
+              rank: 3
+              shape:
+              - batch
+              - patches
+              - vision_hidden
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+      embedding_projector:
+        implementation:
+          kind: onnx
+          artifact: qwen3_5_vlm/embedding_projector.onnx.textproto
+        ports:
+          inputs:
+            input_ids:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - sequence
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            image_features:
+              dtype: float16
+              rank: 3
+              shape:
+              - batch
+              - patches
+              - vision_hidden
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            inputs_embeds:
+              dtype: float16
+              rank: 3
+              shape:
+              - batch
+              - sequence
+              - hidden
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+      decoder:
+        implementation:
+          kind: onnx
+          artifact: qwen3_5_vlm/decoder.onnx.textproto
+        ports:
+          inputs:
+            inputs_embeds:
+              dtype: float16
+              rank: 3
+              shape:
+              - batch
+              - sequence
+              - hidden
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            logits:
+              dtype: float16
+              rank: 3
+              shape:
+              - batch
+              - sequence
+              - vocab
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          roles:
+            inputs_embeds: inputs_embeds
+            logits: logits
+    state: {}
+    steps:
+    - kind: invoke
+      component: vision_encoder
+      inputs:
+        pixel_values: request.pixel_values
+      outputs:
+        image_features: vision.features
+    - kind: invoke
+      component: embedding_projector
+      inputs:
+        input_ids: request.input_ids
+        image_features: vision.features
+      outputs:
+        inputs_embeds: multimodal.embeds
+    - kind: invoke
+      component: decoder
+      inputs:
+        inputs_embeds: multimodal.embeds
+      outputs:
+        logits: decoder.logits
+    - kind: emit
+      value: decoder.logits
+      output: logits
+      mode: replace

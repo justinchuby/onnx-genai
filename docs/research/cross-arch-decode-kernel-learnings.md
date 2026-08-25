@@ -237,10 +237,17 @@ tiles must be re-derived, not shared.
 ### 7.2 RTX-specific levers (from known optimizations)
 
 1. **Interleave dequant (already merged, `ONNX_GENAI_INTERLEAVE_DEQUANT`) helps RTX
-   more, not less.** RTX GDDR bandwidth is far below HBM (e.g. ~1 TB/s class vs
-   4.8 TB/s), but M=1 int4 decode is still issue/latency-bound; cutting dequant
-   instruction count (§1, ~9 vs ~14 instrs/8 values) is arch-independent and pays
-   off on every RTX generation. Validate the opt-in flag on RTX when hardware lands.
+   more per instruction, but costs RTX the most in memory.** RTX GDDR bandwidth is
+   far below HBM (e.g. ~1 TB/s class vs 4.8 TB/s), but M=1 int4 decode is still
+   issue/latency-bound; cutting dequant instruction count (§1, ~9 vs ~14 instrs/8
+   values) is arch-independent and pays off on every RTX generation.
+   **Caveat that blocks a default-on:** `ensure_interleaved` allocates a second
+   copy of every routed weight and never frees the ORT-owned original, so routed
+   int4 weights are resident twice for the process lifetime. A 20 GB int4 model
+   needs ~20 GB extra VRAM — an instant OOM on the 24 GB cards this lever is
+   supposed to help. Making it default-on requires interleaving in place, or
+   dropping the original, first. Validate the opt-in flag on RTX when hardware
+   lands, and measure VRAM as well as tok/s.
 2. **Ada (sm_89) oversized L2 → L2-residency is the standout consumer lever.** A
    4090's ~72 MB L2 can hold a large fraction of an int4 model's hot weights,
    cutting *effective* DRAM traffic dramatically — exactly the regime where a

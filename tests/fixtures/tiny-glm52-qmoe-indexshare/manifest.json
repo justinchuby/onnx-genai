@@ -1,8 +1,9 @@
 {
   "generator": "tests/fixtures/tiny-glm52-qmoe-indexshare/generate.py",
-  "mobius_commit": "791773b",
+  "mobius_commit": "d33c33b347bac987cbeff52dca6c1d595ac7780f",
   "seed": 0,
   "architecture": "glm_moe_dsa",
+  "use_dsa": true,
   "emission": [
     "pkg.nxrt::IndexShare",
     "com.microsoft::QMoE"
@@ -10,24 +11,9 @@
   "prompt_ids": [
     123
   ],
-  "expected_tokens": [
-    62,
-    164,
-    59,
-    205,
-    48,
-    166,
-    27,
-    9,
-    221,
-    190,
-    123,
-    108
-  ],
   "files": {
-    "model.onnx": 185662,
-    "model.onnx.data": 187648,
-    "inference_metadata.yaml": 189,
+    "model.onnx.textproto": 850675,
+    "inference_metadata.yaml": 37460,
     "tokenizer.json": 4680
   }
 }

@@ -1,2835 +1,0 @@
-mobius0.1.0:Ç™
-Ê
-model.embed_tokens.weight
-	input_idsv_model.embed_tokens.Gather_0 model/embed_tokens/Gather_node_0"GatherJW
-	namespaceJ: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/embed_tokens: EmbeddingJ_
-pkg.onnxscript.class_hierarchy=['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'Embedding']J;
-pkg.onnxscript.name_scopes['', 'model', 'embed_tokens']
-Ê
-model.rotary_emb.cos_cache
-position_idsv_model.rotary_emb.Gather_1model/rotary_emb/Gather_node_1"GatherJW
-	namespaceJ: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/rotary_emb: DefaultRopeJa
-pkg.onnxscript.class_hierarchy?['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'DefaultRope']J9
-pkg.onnxscript.name_scopes['', 'model', 'rotary_emb']
-Ê
-model.rotary_emb.sin_cache
-position_idsv_model.rotary_emb.Gather_2model/rotary_emb/Gather_node_2"GatherJW
-	namespaceJ: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/rotary_emb: DefaultRopeJa
-pkg.onnxscript.class_hierarchy?['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'DefaultRope']J9
-pkg.onnxscript.name_scopes['', 'model', 'rotary_emb']
-é
-attention_mask
-const_1_i64v_model.CumSum_3model/CumSum_node_3"CumSumJ?
-	namespace2: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModelJR
-pkg.onnxscript.class_hierarchy0['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel']J+
-pkg.onnxscript.name_scopes['', 'model']
-ò
-v_model.CumSum_3
-
-const_1d_1v_model.Unsqueeze_4model/Unsqueeze_node_4"	UnsqueezeJ?
-	namespace2: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModelJR
-pkg.onnxscript.class_hierarchy0['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel']J+
-pkg.onnxscript.name_scopes['', 'model']
-ì
-	input_idsv_model.Shape_5model/Shape_node_5"Shape*
-
-end†*
-start†J?
-	namespace2: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModelJR
-pkg.onnxscript.class_hierarchy0['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel']J+
-pkg.onnxscript.name_scopes['', 'model']
-ò
-attention_maskv_model.Shape_6model/Shape_node_6"Shape*
-
-end†*
-start†J?
-	namespace2: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModelJR
-pkg.onnxscript.class_hierarchy0['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel']J+
-pkg.onnxscript.name_scopes['', 'model']
-ä
-v_model.Shape_6
-v_model.Shape_5v_model.Sub_7model/Sub_node_7"SubJ?
-	namespace2: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModelJR
-pkg.onnxscript.class_hierarchy0['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel']J+
-pkg.onnxscript.name_scopes['', 'model']
-¨
-v_model.CumSum_3
-v_model.Sub_7
-v_model.Shape_6
-
-const_1d_1v_model.Slice_8model/Slice_node_8"SliceJ?
-	namespace2: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModelJR
-pkg.onnxscript.class_hierarchy0['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel']J+
-pkg.onnxscript.name_scopes['', 'model']
-ó
-v_model.Slice_8
-
-const_1d_2v_model.Unsqueeze_9model/Unsqueeze_node_9"	UnsqueezeJ?
-	namespace2: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModelJR
-pkg.onnxscript.class_hierarchy0['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel']J+
-pkg.onnxscript.name_scopes['', 'model']
-µ
-v_model.Unsqueeze_9
-v_model.Unsqueeze_4v_model.GreaterOrEqual_10model/GreaterOrEqual_node_10"GreaterOrEqualJ?
-	namespace2: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModelJR
-pkg.onnxscript.class_hierarchy0['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel']J+
-pkg.onnxscript.name_scopes['', 'model']
-ò
-attention_mask
-
-const_1d_1v_model.Unsqueeze_11model/Unsqueeze_node_11"	UnsqueezeJ?
-	namespace2: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModelJR
-pkg.onnxscript.class_hierarchy0['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel']J+
-pkg.onnxscript.name_scopes['', 'model']
-é
-v_model.Unsqueeze_11v_model.Cast_12model/Cast_node_12"Cast*	
-to	†J?
-	namespace2: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModelJR
-pkg.onnxscript.class_hierarchy0['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel']J+
-pkg.onnxscript.name_scopes['', 'model']
-ñ
-v_model.Cast_12
-v_model.GreaterOrEqual_10v_model.And_13model/And_node_13"AndJ?
-	namespace2: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModelJR
-pkg.onnxscript.class_hierarchy0['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel']J+
-pkg.onnxscript.name_scopes['', 'model']
-≤
-v_model.And_13
-const_0.0_f32
-!const_-3.4028234663852886e+38_f32v_model.Where_14model/Where_node_14"WhereJ?
-	namespace2: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModelJR
-pkg.onnxscript.class_hierarchy0['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel']J+
-pkg.onnxscript.name_scopes['', 'model']
-ä
-v_model.Where_14v_model.Cast_15model/Cast_node_15"Cast*	
-to†J?
-	namespace2: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModelJR
-pkg.onnxscript.class_hierarchy0['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel']J+
-pkg.onnxscript.name_scopes['', 'model']
-ô
-v_model.Cast_15
-
-const_1d_1v_model.Unsqueeze_16model/Unsqueeze_node_16"	UnsqueezeJ?
-	namespace2: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModelJR
-pkg.onnxscript.class_hierarchy0['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel']J+
-pkg.onnxscript.name_scopes['', 'model']
-Æ
-v_model.embed_tokens.Gather_0
-%model.layers.0.input_layernorm.weight4v_model.layers.0.input_layernorm.RMSNormalization_177model/layers.0/input_layernorm/RMSNormalization_node_17"RMSNormalization*
-epsilonΩ7Ü5†*
-axisˇˇˇˇˇˇˇˇˇ†Jx
-	namespacek: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/input_layernorm: RMSNormJv
-pkg.onnxscript.class_hierarchyT['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'RMSNorm']JJ
-pkg.onnxscript.name_scopes,['', 'model', 'layers.0', 'input_layernorm']
-¬
-4v_model.layers.0.input_layernorm.RMSNormalization_17
-(model.layers.0.self_attn.q_a_proj.weight
-(model.layers.0.self_attn.q_a_proj.scales2v_model.layers.0.self_attn.q_a_proj.MatMulNBits_185model/layers.0/self_attn/q_a_proj/MatMulNBits_node_18"MatMulNBits*
-K@†*
-N †*
-bits†*
-
-block_size †:com.microsoftJò
-	namespaceä: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/q_a_proj: QuantizedLinearJî
-pkg.onnxscript.class_hierarchyr['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'QuantizedLinear']JP
-pkg.onnxscript.name_scopes2['', 'model', 'layers.0', 'self_attn', 'q_a_proj']Jw
-$pkg.onnxscript.shape_inference_errorONo schema registered for 'MatMulNBits' version '24' and domain 'com.microsoft'!
-·
-2v_model.layers.0.self_attn.q_a_proj.MatMulNBits_18
--model.layers.0.self_attn.q_a_layernorm.weight<v_model.layers.0.self_attn.q_a_layernorm.RMSNormalization_19?model/layers.0/self_attn/q_a_layernorm/RMSNormalization_node_19"RMSNormalization*
-epsilonΩ7Ü5†*
-axisˇˇˇˇˇˇˇˇˇ†Jï
-	namespaceá: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/q_a_layernorm: RMSNormJå
-pkg.onnxscript.class_hierarchyj['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'RMSNorm']JU
-pkg.onnxscript.name_scopes7['', 'model', 'layers.0', 'self_attn', 'q_a_layernorm']J√
-$pkg.onnxscript.shape_inference_erroröType of input 0 value v_model.layers.0.self_attn.q_a_proj.MatMulNBits_18 of node model/layers.0/self_attn/q_a_layernorm/RMSNormalization_node_19 not known
-ó
-<v_model.layers.0.self_attn.q_a_layernorm.RMSNormalization_19
-(model.layers.0.self_attn.q_b_proj.weight
-(model.layers.0.self_attn.q_b_proj.scales2v_model.layers.0.self_attn.q_b_proj.MatMulNBits_205model/layers.0/self_attn/q_b_proj/MatMulNBits_node_20"MatMulNBits*
-K †*
-N`†*
-bits†*
-
-block_size †:com.microsoftJò
-	namespaceä: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/q_b_proj: QuantizedLinearJî
-pkg.onnxscript.class_hierarchyr['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'QuantizedLinear']JP
-pkg.onnxscript.name_scopes2['', 'model', 'layers.0', 'self_attn', 'q_b_proj']J√
-$pkg.onnxscript.shape_inference_erroröType of input 0 value v_model.layers.0.self_attn.q_a_layernorm.RMSNormalization_19 of node model/layers.0/self_attn/q_b_proj/MatMulNBits_node_20 not known
-í
-2v_model.layers.0.self_attn.q_b_proj.MatMulNBits_20
-
-const_1d_5%v_model.layers.0.self_attn.Reshape_21(model/layers.0/self_attn/Reshape_node_21"ReshapeJ}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.0', 'self_attn']J¨
-$pkg.onnxscript.shape_inference_errorÉType of input 0 value v_model.layers.0.self_attn.q_b_proj.MatMulNBits_20 of node model/layers.0/self_attn/Reshape_node_21 not known
-Æ
-%v_model.layers.0.self_attn.Reshape_21
-
-const_1d_6%v_model.layers.0.self_attn.Split_22_0%v_model.layers.0.self_attn.Split_22_1&model/layers.0/self_attn/Split_node_22"Split*
-axisˇˇˇˇˇˇˇˇˇ†J}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.0', 'self_attn']Jú
-$pkg.onnxscript.shape_inference_errortType of input 0 value v_model.layers.0.self_attn.Reshape_21 of node model/layers.0/self_attn/Split_node_22 not known
-˜
-%v_model.layers.0.self_attn.Split_22_1
-
-const_1d_7%v_model.layers.0.self_attn.Reshape_23(model/layers.0/self_attn/Reshape_node_23"ReshapeJ}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.0', 'self_attn']Jû
-$pkg.onnxscript.shape_inference_errorvType of input 0 value v_model.layers.0.self_attn.Split_22_1 of node model/layers.0/self_attn/Reshape_node_23 not known
-à
-%v_model.layers.0.self_attn.Reshape_23
-v_model.rotary_emb.Gather_1
-v_model.rotary_emb.Gather_2-v_model.layers.0.self_attn.RotaryEmbedding_240model/layers.0/self_attn/RotaryEmbedding_node_24"RotaryEmbedding*
-	num_heads†*
-rotary_embedding_dim †*
-interleaved†J}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.0', 'self_attn']J¶
-$pkg.onnxscript.shape_inference_error~Type of input 0 value v_model.layers.0.self_attn.Reshape_23 of node model/layers.0/self_attn/RotaryEmbedding_node_24 not known
-˜
-%v_model.layers.0.self_attn.Split_22_0
-
-const_1d_8%v_model.layers.0.self_attn.Reshape_25(model/layers.0/self_attn/Reshape_node_25"ReshapeJ}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.0', 'self_attn']Jû
-$pkg.onnxscript.shape_inference_errorvType of input 0 value v_model.layers.0.self_attn.Split_22_0 of node model/layers.0/self_attn/Reshape_node_25 not known
-á
--v_model.layers.0.self_attn.RotaryEmbedding_24
-
-const_1d_9%v_model.layers.0.self_attn.Reshape_26(model/layers.0/self_attn/Reshape_node_26"ReshapeJ}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.0', 'self_attn']J¶
-$pkg.onnxscript.shape_inference_error~Type of input 0 value v_model.layers.0.self_attn.RotaryEmbedding_24 of node model/layers.0/self_attn/Reshape_node_26 not known
-§
-%v_model.layers.0.self_attn.Reshape_25
-%v_model.layers.0.self_attn.Reshape_26$v_model.layers.0.self_attn.Concat_27'model/layers.0/self_attn/Concat_node_27"Concat*
-axisˇˇˇˇˇˇˇˇˇ†J}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.0', 'self_attn']Jù
-$pkg.onnxscript.shape_inference_erroruType of input 0 value v_model.layers.0.self_attn.Reshape_25 of node model/layers.0/self_attn/Concat_node_27 not known
-ˆ
-$v_model.layers.0.self_attn.Concat_27
-const_1d_10%v_model.layers.0.self_attn.Reshape_28(model/layers.0/self_attn/Reshape_node_28"ReshapeJ}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.0', 'self_attn']Jù
-$pkg.onnxscript.shape_inference_erroruType of input 0 value v_model.layers.0.self_attn.Concat_27 of node model/layers.0/self_attn/Reshape_node_28 not known
-˛
-4v_model.layers.0.input_layernorm.RMSNormalization_17
-2model.layers.0.self_attn.kv_a_proj_with_mqa.weight
-2model.layers.0.self_attn.kv_a_proj_with_mqa.scales<v_model.layers.0.self_attn.kv_a_proj_with_mqa.MatMulNBits_29?model/layers.0/self_attn/kv_a_proj_with_mqa/MatMulNBits_node_29"MatMulNBits*
-K@†*
-N†*
-bits†*
-
-block_size †:com.microsoftJ¢
-	namespaceî: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/kv_a_proj_with_mqa: QuantizedLinearJî
-pkg.onnxscript.class_hierarchyr['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'QuantizedLinear']JZ
-pkg.onnxscript.name_scopes<['', 'model', 'layers.0', 'self_attn', 'kv_a_proj_with_mqa']Jw
-$pkg.onnxscript.shape_inference_errorONo schema registered for 'MatMulNBits' version '24' and domain 'com.microsoft'!
-›
-<v_model.layers.0.self_attn.kv_a_proj_with_mqa.MatMulNBits_29
-
-const_1d_6%v_model.layers.0.self_attn.Split_30_0%v_model.layers.0.self_attn.Split_30_1&model/layers.0/self_attn/Split_node_30"Split*
-axisˇˇˇˇˇˇˇˇˇ†J}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.0', 'self_attn']J¥
-$pkg.onnxscript.shape_inference_errorãType of input 0 value v_model.layers.0.self_attn.kv_a_proj_with_mqa.MatMulNBits_29 of node model/layers.0/self_attn/Split_node_30 not known
-Õ
-%v_model.layers.0.self_attn.Split_30_0
-.model.layers.0.self_attn.kv_a_layernorm.weight=v_model.layers.0.self_attn.kv_a_layernorm.RMSNormalization_31@model/layers.0/self_attn/kv_a_layernorm/RMSNormalization_node_31"RMSNormalization*
-epsilonΩ7Ü5†*
-axisˇˇˇˇˇˇˇˇˇ†Jñ
-	namespaceà: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/kv_a_layernorm: RMSNormJå
-pkg.onnxscript.class_hierarchyj['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'RMSNorm']JV
-pkg.onnxscript.name_scopes8['', 'model', 'layers.0', 'self_attn', 'kv_a_layernorm']J∑
-$pkg.onnxscript.shape_inference_erroréType of input 0 value v_model.layers.0.self_attn.Split_30_0 of node model/layers.0/self_attn/kv_a_layernorm/RMSNormalization_node_31 not known
-°
-=v_model.layers.0.self_attn.kv_a_layernorm.RMSNormalization_31
-)model.layers.0.self_attn.kv_b_proj.weight
-)model.layers.0.self_attn.kv_b_proj.scales3v_model.layers.0.self_attn.kv_b_proj.MatMulNBits_326model/layers.0/self_attn/kv_b_proj/MatMulNBits_node_32"MatMulNBits*
-K†*	
-NÄ†*
-bits†*
-
-block_size †:com.microsoftJô
-	namespaceã: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/kv_b_proj: QuantizedLinearJî
-pkg.onnxscript.class_hierarchyr['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'QuantizedLinear']JQ
-pkg.onnxscript.name_scopes3['', 'model', 'layers.0', 'self_attn', 'kv_b_proj']J≈
-$pkg.onnxscript.shape_inference_errorúType of input 0 value v_model.layers.0.self_attn.kv_a_layernorm.RMSNormalization_31 of node model/layers.0/self_attn/kv_b_proj/MatMulNBits_node_32 not known
-ï
-3v_model.layers.0.self_attn.kv_b_proj.MatMulNBits_32
-const_1d_11%v_model.layers.0.self_attn.Reshape_33(model/layers.0/self_attn/Reshape_node_33"ReshapeJ}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.0', 'self_attn']J≠
-$pkg.onnxscript.shape_inference_errorÑType of input 0 value v_model.layers.0.self_attn.kv_b_proj.MatMulNBits_32 of node model/layers.0/self_attn/Reshape_node_33 not known
-Ø
-%v_model.layers.0.self_attn.Reshape_33
-const_1d_12%v_model.layers.0.self_attn.Split_34_0%v_model.layers.0.self_attn.Split_34_1&model/layers.0/self_attn/Split_node_34"Split*
-axisˇˇˇˇˇˇˇˇˇ†J}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.0', 'self_attn']Jú
-$pkg.onnxscript.shape_inference_errortType of input 0 value v_model.layers.0.self_attn.Reshape_33 of node model/layers.0/self_attn/Split_node_34 not known
-˜
-%v_model.layers.0.self_attn.Split_34_1
-
-const_1d_7%v_model.layers.0.self_attn.Reshape_35(model/layers.0/self_attn/Reshape_node_35"ReshapeJ}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.0', 'self_attn']Jû
-$pkg.onnxscript.shape_inference_errorvType of input 0 value v_model.layers.0.self_attn.Split_34_1 of node model/layers.0/self_attn/Reshape_node_35 not known
-à
-%v_model.layers.0.self_attn.Split_30_1
-v_model.rotary_emb.Gather_1
-v_model.rotary_emb.Gather_2-v_model.layers.0.self_attn.RotaryEmbedding_360model/layers.0/self_attn/RotaryEmbedding_node_36"RotaryEmbedding*
-	num_heads†*
-rotary_embedding_dim †*
-interleaved†J}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.0', 'self_attn']J¶
-$pkg.onnxscript.shape_inference_error~Type of input 0 value v_model.layers.0.self_attn.Split_30_1 of node model/layers.0/self_attn/RotaryEmbedding_node_36 not known
-¸
--v_model.layers.0.self_attn.RotaryEmbedding_36
-const_1d_13"v_model.layers.0.self_attn.Tile_37%model/layers.0/self_attn/Tile_node_37"TileJ}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.0', 'self_attn']J£
-$pkg.onnxscript.shape_inference_error{Type of input 0 value v_model.layers.0.self_attn.RotaryEmbedding_36 of node model/layers.0/self_attn/Tile_node_37 not known
-˜
-%v_model.layers.0.self_attn.Split_34_0
-
-const_1d_8%v_model.layers.0.self_attn.Reshape_38(model/layers.0/self_attn/Reshape_node_38"ReshapeJ}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.0', 'self_attn']Jû
-$pkg.onnxscript.shape_inference_errorvType of input 0 value v_model.layers.0.self_attn.Split_34_0 of node model/layers.0/self_attn/Reshape_node_38 not known
-Ò
-"v_model.layers.0.self_attn.Tile_37
-
-const_1d_9%v_model.layers.0.self_attn.Reshape_39(model/layers.0/self_attn/Reshape_node_39"ReshapeJ}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.0', 'self_attn']Jõ
-$pkg.onnxscript.shape_inference_errorsType of input 0 value v_model.layers.0.self_attn.Tile_37 of node model/layers.0/self_attn/Reshape_node_39 not known
-§
-%v_model.layers.0.self_attn.Reshape_38
-%v_model.layers.0.self_attn.Reshape_39$v_model.layers.0.self_attn.Concat_40'model/layers.0/self_attn/Concat_node_40"Concat*
-axisˇˇˇˇˇˇˇˇˇ†J}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.0', 'self_attn']Jù
-$pkg.onnxscript.shape_inference_erroruType of input 0 value v_model.layers.0.self_attn.Reshape_38 of node model/layers.0/self_attn/Concat_node_40 not known
-ˆ
-$v_model.layers.0.self_attn.Concat_40
-const_1d_10%v_model.layers.0.self_attn.Reshape_41(model/layers.0/self_attn/Reshape_node_41"ReshapeJ}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.0', 'self_attn']Jù
-$pkg.onnxscript.shape_inference_erroruType of input 0 value v_model.layers.0.self_attn.Concat_40 of node model/layers.0/self_attn/Reshape_node_41 not known
-∆
-past_key_values.0.key
-
-const_1d_1%v_model.layers.0.self_attn.Squeeze_42(model/layers.0/self_attn/Squeeze_node_42"SqueezeJ}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.0', 'self_attn']
-Í
-%v_model.layers.0.self_attn.Squeeze_42
-const_1d_14
-const_1d_15
-
-const_1d_2#v_model.layers.0.self_attn.Slice_43&model/layers.0/self_attn/Slice_node_43"SliceJ}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.0', 'self_attn']
-‘
-#v_model.layers.0.self_attn.Slice_43
-
-const_1d_5%v_model.layers.0.self_attn.Reshape_44(model/layers.0/self_attn/Reshape_node_44"ReshapeJ}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.0', 'self_attn']
-„
-%v_model.layers.0.self_attn.Reshape_44'v_model.layers.0.self_attn.Transpose_45*model/layers.0/self_attn/Transpose_node_45"	Transpose*
-perm@ @@@†J}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.0', 'self_attn']
-»
-past_key_values.0.value
-
-const_1d_1%v_model.layers.0.self_attn.Squeeze_46(model/layers.0/self_attn/Squeeze_node_46"SqueezeJ}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.0', 'self_attn']
-÷
-%v_model.layers.0.self_attn.Squeeze_46
-
-const_1d_8%v_model.layers.0.self_attn.Reshape_47(model/layers.0/self_attn/Reshape_node_47"ReshapeJ}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.0', 'self_attn']
-„
-%v_model.layers.0.self_attn.Reshape_47'v_model.layers.0.self_attn.Transpose_48*model/layers.0/self_attn/Transpose_node_48"	Transpose*
-perm@ @@@†J}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.0', 'self_attn']
-Í
-%v_model.layers.0.self_attn.Squeeze_42
-const_1d_15
-const_1d_16
-
-const_1d_2#v_model.layers.0.self_attn.Slice_49&model/layers.0/self_attn/Slice_node_49"SliceJ}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.0', 'self_attn']
-¯
-4v_model.layers.0.input_layernorm.RMSNormalization_17
-*model.layers.0.self_attn.indexer.wk.weight
-*model.layers.0.self_attn.indexer.wk.scales4v_model.layers.0.self_attn.indexer.wk.MatMulNBits_507model/layers.0/self_attn/indexer/wk/MatMulNBits_node_50"MatMulNBits*
-K@†*
-N†*
-bits†*
-
-block_size †:com.microsoftJ¨
-	namespaceû: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/indexer: GlmMoeDsaIndexer/wk: QuantizedLinearJ©
-pkg.onnxscript.class_hierarchyÜ['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'GlmMoeDsaIndexer', 'QuantizedLinear']JU
-pkg.onnxscript.name_scopes7['', 'model', 'layers.0', 'self_attn', 'indexer', 'wk']Jw
-$pkg.onnxscript.shape_inference_errorONo schema registered for 'MatMulNBits' version '24' and domain 'com.microsoft'!
-œ
-4v_model.layers.0.self_attn.indexer.wk.MatMulNBits_50
-.model.layers.0.self_attn.indexer.k_norm.weight
-,model.layers.0.self_attn.indexer.k_norm.bias?v_model.layers.0.self_attn.indexer.k_norm.LayerNormalization_51Bmodel/layers.0/self_attn/indexer/k_norm/LayerNormalization_node_51"LayerNormalization*
-epsilonΩ7Ü5†*
-axisˇˇˇˇˇˇˇˇˇ†J™
-	namespaceú: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/indexer: GlmMoeDsaIndexer/k_norm: LayerNormJ£
-pkg.onnxscript.class_hierarchyÄ['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'GlmMoeDsaIndexer', 'LayerNorm']JY
-pkg.onnxscript.name_scopes;['', 'model', 'layers.0', 'self_attn', 'indexer', 'k_norm']J»
-$pkg.onnxscript.shape_inference_errorüType of input 0 value v_model.layers.0.self_attn.indexer.wk.MatMulNBits_50 of node model/layers.0/self_attn/indexer/k_norm/LayerNormalization_node_51 not known
-ê
-?v_model.layers.0.self_attn.indexer.k_norm.LayerNormalization_51
-v_model.rotary_emb.Gather_1
-v_model.rotary_emb.Gather_25v_model.layers.0.self_attn.indexer.RotaryEmbedding_528model/layers.0/self_attn/indexer/RotaryEmbedding_node_52"RotaryEmbedding*
-	num_heads†*
-rotary_embedding_dim †*
-interleaved†Jò
-	namespaceä: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/indexer: GlmMoeDsaIndexerJï
-pkg.onnxscript.class_hierarchys['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'GlmMoeDsaIndexer']JO
-pkg.onnxscript.name_scopes1['', 'model', 'layers.0', 'self_attn', 'indexer']J…
-$pkg.onnxscript.shape_inference_error†Type of input 0 value v_model.layers.0.self_attn.indexer.k_norm.LayerNormalization_51 of node model/layers.0/self_attn/indexer/RotaryEmbedding_node_52 not known
-ç
-#v_model.layers.0.self_attn.Slice_49
-5v_model.layers.0.self_attn.indexer.RotaryEmbedding_52,v_model.layers.0.self_attn.indexer.Concat_53/model/layers.0/self_attn/indexer/Concat_node_53"Concat*
-axis†Jò
-	namespaceä: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/indexer: GlmMoeDsaIndexerJï
-pkg.onnxscript.class_hierarchys['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'GlmMoeDsaIndexer']JO
-pkg.onnxscript.name_scopes1['', 'model', 'layers.0', 'self_attn', 'indexer']J∂
-$pkg.onnxscript.shape_inference_errorçType of input 1 value v_model.layers.0.self_attn.indexer.RotaryEmbedding_52 of node model/layers.0/self_attn/indexer/Concat_node_53 not known
-›
-<v_model.layers.0.self_attn.q_a_layernorm.RMSNormalization_19
-,model.layers.0.self_attn.indexer.wq_b.weight
-,model.layers.0.self_attn.indexer.wq_b.scales6v_model.layers.0.self_attn.indexer.wq_b.MatMulNBits_549model/layers.0/self_attn/indexer/wq_b/MatMulNBits_node_54"MatMulNBits*
-K †*
-N†*
-bits†*
-
-block_size †:com.microsoftJÆ
-	namespace†: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/indexer: GlmMoeDsaIndexer/wq_b: QuantizedLinearJ©
-pkg.onnxscript.class_hierarchyÜ['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'GlmMoeDsaIndexer', 'QuantizedLinear']JW
-pkg.onnxscript.name_scopes9['', 'model', 'layers.0', 'self_attn', 'indexer', 'wq_b']J«
-$pkg.onnxscript.shape_inference_errorûType of input 0 value v_model.layers.0.self_attn.q_a_layernorm.RMSNormalization_19 of node model/layers.0/self_attn/indexer/wq_b/MatMulNBits_node_54 not known
-Ó
-6v_model.layers.0.self_attn.indexer.wq_b.MatMulNBits_54
-const_1d_17-v_model.layers.0.self_attn.indexer.Reshape_550model/layers.0/self_attn/indexer/Reshape_node_55"ReshapeJò
-	namespaceä: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/indexer: GlmMoeDsaIndexerJï
-pkg.onnxscript.class_hierarchys['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'GlmMoeDsaIndexer']JO
-pkg.onnxscript.name_scopes1['', 'model', 'layers.0', 'self_attn', 'indexer']J∏
-$pkg.onnxscript.shape_inference_errorèType of input 0 value v_model.layers.0.self_attn.indexer.wq_b.MatMulNBits_54 of node model/layers.0/self_attn/indexer/Reshape_node_55 not known
-Œ
--v_model.layers.0.self_attn.indexer.Reshape_55*v_model.layers.0.self_attn.indexer.Cast_56-model/layers.0/self_attn/indexer/Cast_node_56"Cast*	
-to†Jò
-	namespaceä: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/indexer: GlmMoeDsaIndexerJï
-pkg.onnxscript.class_hierarchys['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'GlmMoeDsaIndexer']JO
-pkg.onnxscript.name_scopes1['', 'model', 'layers.0', 'self_attn', 'indexer']J¨
-$pkg.onnxscript.shape_inference_errorÉType of input 0 value v_model.layers.0.self_attn.indexer.Reshape_55 of node model/layers.0/self_attn/indexer/Cast_node_56 not known
-Ã
-,v_model.layers.0.self_attn.indexer.Concat_53*v_model.layers.0.self_attn.indexer.Cast_57-model/layers.0/self_attn/indexer/Cast_node_57"Cast*	
-to†Jò
-	namespaceä: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/indexer: GlmMoeDsaIndexerJï
-pkg.onnxscript.class_hierarchys['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'GlmMoeDsaIndexer']JO
-pkg.onnxscript.name_scopes1['', 'model', 'layers.0', 'self_attn', 'indexer']J´
-$pkg.onnxscript.shape_inference_errorÇType of input 0 value v_model.layers.0.self_attn.indexer.Concat_53 of node model/layers.0/self_attn/indexer/Cast_node_57 not known
-‚
-*v_model.layers.0.self_attn.indexer.Cast_57/v_model.layers.0.self_attn.indexer.Transpose_582model/layers.0/self_attn/indexer/Transpose_node_58"	Transpose*
-perm@ @@†Jò
-	namespaceä: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/indexer: GlmMoeDsaIndexerJï
-pkg.onnxscript.class_hierarchys['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'GlmMoeDsaIndexer']JO
-pkg.onnxscript.name_scopes1['', 'model', 'layers.0', 'self_attn', 'indexer']JÆ
-$pkg.onnxscript.shape_inference_errorÖType of input 0 value v_model.layers.0.self_attn.indexer.Cast_57 of node model/layers.0/self_attn/indexer/Transpose_node_58 not known
-ˆ
-*v_model.layers.0.self_attn.indexer.Cast_56
-/v_model.layers.0.self_attn.indexer.Transpose_58,v_model.layers.0.self_attn.indexer.MatMul_59/model/layers.0/self_attn/indexer/MatMul_node_59"MatMulJò
-	namespaceä: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/indexer: GlmMoeDsaIndexerJï
-pkg.onnxscript.class_hierarchys['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'GlmMoeDsaIndexer']JO
-pkg.onnxscript.name_scopes1['', 'model', 'layers.0', 'self_attn', 'indexer']J´
-$pkg.onnxscript.shape_inference_errorÇType of input 0 value v_model.layers.0.self_attn.indexer.Cast_56 of node model/layers.0/self_attn/indexer/MatMul_node_59 not known
-¡
-,v_model.layers.0.self_attn.indexer.MatMul_59*v_model.layers.0.self_attn.indexer.Relu_60-model/layers.0/self_attn/indexer/Relu_node_60"ReluJò
-	namespaceä: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/indexer: GlmMoeDsaIndexerJï
-pkg.onnxscript.class_hierarchys['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'GlmMoeDsaIndexer']JO
-pkg.onnxscript.name_scopes1['', 'model', 'layers.0', 'self_attn', 'indexer']J´
-$pkg.onnxscript.shape_inference_errorÇType of input 0 value v_model.layers.0.self_attn.indexer.MatMul_59 of node model/layers.0/self_attn/indexer/Relu_node_60 not known
-¥
-4v_model.layers.0.input_layernorm.RMSNormalization_17
-4model.layers.0.self_attn.indexer.weights_proj.weight
-4model.layers.0.self_attn.indexer.weights_proj.scales>v_model.layers.0.self_attn.indexer.weights_proj.MatMulNBits_61Amodel/layers.0/self_attn/indexer/weights_proj/MatMulNBits_node_61"MatMulNBits*
-K@†*
-N†*
-bits†*
-
-block_size †:com.microsoftJ∂
-	namespace®: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/indexer: GlmMoeDsaIndexer/weights_proj: QuantizedLinearJ©
-pkg.onnxscript.class_hierarchyÜ['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'GlmMoeDsaIndexer', 'QuantizedLinear']J_
-pkg.onnxscript.name_scopesA['', 'model', 'layers.0', 'self_attn', 'indexer', 'weights_proj']Jw
-$pkg.onnxscript.shape_inference_errorONo schema registered for 'MatMulNBits' version '24' and domain 'com.microsoft'!
-
->v_model.layers.0.self_attn.indexer.weights_proj.MatMulNBits_61*v_model.layers.0.self_attn.indexer.Cast_62-model/layers.0/self_attn/indexer/Cast_node_62"Cast*	
-to†Jò
-	namespaceä: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/indexer: GlmMoeDsaIndexerJï
-pkg.onnxscript.class_hierarchys['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'GlmMoeDsaIndexer']JO
-pkg.onnxscript.name_scopes1['', 'model', 'layers.0', 'self_attn', 'indexer']JΩ
-$pkg.onnxscript.shape_inference_errorîType of input 0 value v_model.layers.0.self_attn.indexer.weights_proj.MatMulNBits_61 of node model/layers.0/self_attn/indexer/Cast_node_62 not known
-Î
-const_0.7071067811865476_f32
-*v_model.layers.0.self_attn.indexer.Cast_62.v_model.layers.0.self_attn.indexer.CastLike_631model/layers.0/self_attn/indexer/CastLike_node_63"CastLikeJò
-	namespaceä: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/indexer: GlmMoeDsaIndexerJï
-pkg.onnxscript.class_hierarchys['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'GlmMoeDsaIndexer']JO
-pkg.onnxscript.name_scopes1['', 'model', 'layers.0', 'self_attn', 'indexer']J≠
-$pkg.onnxscript.shape_inference_errorÑType of input 1 value v_model.layers.0.self_attn.indexer.Cast_62 of node model/layers.0/self_attn/indexer/CastLike_node_63 not known
-Ë
-*v_model.layers.0.self_attn.indexer.Cast_62
-.v_model.layers.0.self_attn.indexer.CastLike_63)v_model.layers.0.self_attn.indexer.Mul_64,model/layers.0/self_attn/indexer/Mul_node_64"MulJò
-	namespaceä: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/indexer: GlmMoeDsaIndexerJï
-pkg.onnxscript.class_hierarchys['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'GlmMoeDsaIndexer']JO
-pkg.onnxscript.name_scopes1['', 'model', 'layers.0', 'self_attn', 'indexer']Jß
-$pkg.onnxscript.shape_inference_errorType of input 0 value v_model.layers.0.self_attn.indexer.Cast_62 of node model/layers.0/self_attn/indexer/Mul_node_64 not known
-‹
-)v_model.layers.0.self_attn.indexer.Mul_64
-const_1d_19/v_model.layers.0.self_attn.indexer.Unsqueeze_652model/layers.0/self_attn/indexer/Unsqueeze_node_65"	UnsqueezeJò
-	namespaceä: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/indexer: GlmMoeDsaIndexerJï
-pkg.onnxscript.class_hierarchys['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'GlmMoeDsaIndexer']JO
-pkg.onnxscript.name_scopes1['', 'model', 'layers.0', 'self_attn', 'indexer']J≠
-$pkg.onnxscript.shape_inference_errorÑType of input 0 value v_model.layers.0.self_attn.indexer.Mul_64 of node model/layers.0/self_attn/indexer/Unsqueeze_node_65 not known
-È
-*v_model.layers.0.self_attn.indexer.Relu_60
-/v_model.layers.0.self_attn.indexer.Unsqueeze_65)v_model.layers.0.self_attn.indexer.Mul_66,model/layers.0/self_attn/indexer/Mul_node_66"MulJò
-	namespaceä: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/indexer: GlmMoeDsaIndexerJï
-pkg.onnxscript.class_hierarchys['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'GlmMoeDsaIndexer']JO
-pkg.onnxscript.name_scopes1['', 'model', 'layers.0', 'self_attn', 'indexer']Jß
-$pkg.onnxscript.shape_inference_errorType of input 0 value v_model.layers.0.self_attn.indexer.Relu_60 of node model/layers.0/self_attn/indexer/Mul_node_66 not known
-Ï
-)v_model.layers.0.self_attn.indexer.Mul_66
-
-const_1d_2/v_model.layers.0.self_attn.indexer.ReduceSum_672model/layers.0/self_attn/indexer/ReduceSum_node_67"	ReduceSum*
-keepdims †Jò
-	namespaceä: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/indexer: GlmMoeDsaIndexerJï
-pkg.onnxscript.class_hierarchys['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'GlmMoeDsaIndexer']JO
-pkg.onnxscript.name_scopes1['', 'model', 'layers.0', 'self_attn', 'indexer']J≠
-$pkg.onnxscript.shape_inference_errorÑType of input 0 value v_model.layers.0.self_attn.indexer.Mul_66 of node model/layers.0/self_attn/indexer/ReduceSum_node_67 not known
-Â
-/v_model.layers.0.self_attn.indexer.ReduceSum_67+v_model.layers.0.self_attn.indexer.Shape_68.model/layers.0/self_attn/indexer/Shape_node_68"Shape*
-
-end†*
-start†Jò
-	namespaceä: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/indexer: GlmMoeDsaIndexerJï
-pkg.onnxscript.class_hierarchys['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'GlmMoeDsaIndexer']JO
-pkg.onnxscript.name_scopes1['', 'model', 'layers.0', 'self_attn', 'indexer']JØ
-$pkg.onnxscript.shape_inference_errorÜType of input 0 value v_model.layers.0.self_attn.indexer.ReduceSum_67 of node model/layers.0/self_attn/indexer/Shape_node_68 not known
-ê
-v_model.Unsqueeze_16
-
-const_1d_1-v_model.layers.0.self_attn.indexer.Squeeze_690model/layers.0/self_attn/indexer/Squeeze_node_69"SqueezeJò
-	namespaceä: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/indexer: GlmMoeDsaIndexerJï
-pkg.onnxscript.class_hierarchys['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'GlmMoeDsaIndexer']JO
-pkg.onnxscript.name_scopes1['', 'model', 'layers.0', 'self_attn', 'indexer']
-Ñ.v_model.layers.0.self_attn.indexer.Constant_701model/layers.0/self_attn/indexer/Constant_node_70"Constant*
-
-value_ints@ †Jò
-	namespaceä: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/indexer: GlmMoeDsaIndexerJï
-pkg.onnxscript.class_hierarchys['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'GlmMoeDsaIndexer']JO
-pkg.onnxscript.name_scopes1['', 'model', 'layers.0', 'self_attn', 'indexer']
-Ñ.v_model.layers.0.self_attn.indexer.Constant_711model/layers.0/self_attn/indexer/Constant_node_71"Constant*
-
-value_ints@†Jò
-	namespaceä: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/indexer: GlmMoeDsaIndexerJï
-pkg.onnxscript.class_hierarchys['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'GlmMoeDsaIndexer']JO
-pkg.onnxscript.name_scopes1['', 'model', 'layers.0', 'self_attn', 'indexer']
-“
--v_model.layers.0.self_attn.indexer.Squeeze_69
-.v_model.layers.0.self_attn.indexer.Constant_70
-+v_model.layers.0.self_attn.indexer.Shape_68
-.v_model.layers.0.self_attn.indexer.Constant_71+v_model.layers.0.self_attn.indexer.Slice_72.model/layers.0/self_attn/indexer/Slice_node_72"SliceJò
-	namespaceä: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/indexer: GlmMoeDsaIndexerJï
-pkg.onnxscript.class_hierarchys['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'GlmMoeDsaIndexer']JO
-pkg.onnxscript.name_scopes1['', 'model', 'layers.0', 'self_attn', 'indexer']J´
-$pkg.onnxscript.shape_inference_errorÇType of input 2 value v_model.layers.0.self_attn.indexer.Shape_68 of node model/layers.0/self_attn/indexer/Slice_node_72 not known
- 
-+v_model.layers.0.self_attn.indexer.Slice_72*v_model.layers.0.self_attn.indexer.Cast_73-model/layers.0/self_attn/indexer/Cast_node_73"Cast*	
-to†Jò
-	namespaceä: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/indexer: GlmMoeDsaIndexerJï
-pkg.onnxscript.class_hierarchys['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'GlmMoeDsaIndexer']JO
-pkg.onnxscript.name_scopes1['', 'model', 'layers.0', 'self_attn', 'indexer']J™
-$pkg.onnxscript.shape_inference_errorÅType of input 0 value v_model.layers.0.self_attn.indexer.Slice_72 of node model/layers.0/self_attn/indexer/Cast_node_73 not known
-Ô
-/v_model.layers.0.self_attn.indexer.ReduceSum_67
-*v_model.layers.0.self_attn.indexer.Cast_73)v_model.layers.0.self_attn.indexer.Add_74,model/layers.0/self_attn/indexer/Add_node_74"AddJò
-	namespaceä: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/indexer: GlmMoeDsaIndexerJï
-pkg.onnxscript.class_hierarchys['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'GlmMoeDsaIndexer']JO
-pkg.onnxscript.name_scopes1['', 'model', 'layers.0', 'self_attn', 'indexer']J≠
-$pkg.onnxscript.shape_inference_errorÑType of input 0 value v_model.layers.0.self_attn.indexer.ReduceSum_67 of node model/layers.0/self_attn/indexer/Add_node_74 not known
-Ñ.v_model.layers.0.self_attn.indexer.Constant_751model/layers.0/self_attn/indexer/Constant_node_75"Constant*
-
-value_ints@†Jò
-	namespaceä: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/indexer: GlmMoeDsaIndexerJï
-pkg.onnxscript.class_hierarchys['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'GlmMoeDsaIndexer']JO
-pkg.onnxscript.name_scopes1['', 'model', 'layers.0', 'self_attn', 'indexer']
-Î
-+v_model.layers.0.self_attn.indexer.Shape_68
-.v_model.layers.0.self_attn.indexer.Constant_75)v_model.layers.0.self_attn.indexer.Min_76,model/layers.0/self_attn/indexer/Min_node_76"MinJò
-	namespaceä: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/indexer: GlmMoeDsaIndexerJï
-pkg.onnxscript.class_hierarchys['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'GlmMoeDsaIndexer']JO
-pkg.onnxscript.name_scopes1['', 'model', 'layers.0', 'self_attn', 'indexer']J©
-$pkg.onnxscript.shape_inference_errorÄType of input 0 value v_model.layers.0.self_attn.indexer.Shape_68 of node model/layers.0/self_attn/indexer/Min_node_76 not known
- 
-)v_model.layers.0.self_attn.indexer.Add_74
-)v_model.layers.0.self_attn.indexer.Min_76,v_model.layers.0.self_attn.indexer.TopK_77_0,v_model.layers.0.self_attn.indexer.TopK_77_1-model/layers.0/self_attn/indexer/TopK_node_77"TopK*
-sorted †*
-largest†*
-axisˇˇˇˇˇˇˇˇˇ†Jò
-	namespaceä: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/indexer: GlmMoeDsaIndexerJï
-pkg.onnxscript.class_hierarchys['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'GlmMoeDsaIndexer']JO
-pkg.onnxscript.name_scopes1['', 'model', 'layers.0', 'self_attn', 'indexer']Jß
-$pkg.onnxscript.shape_inference_errorType of input 0 value v_model.layers.0.self_attn.indexer.Add_74 of node model/layers.0/self_attn/indexer/TopK_node_77 not known
-Ã
-,v_model.layers.0.self_attn.indexer.TopK_77_1*v_model.layers.0.self_attn.indexer.Cast_78-model/layers.0/self_attn/indexer/Cast_node_78"Cast*	
-to†Jò
-	namespaceä: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/indexer: GlmMoeDsaIndexerJï
-pkg.onnxscript.class_hierarchys['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'GlmMoeDsaIndexer']JO
-pkg.onnxscript.name_scopes1['', 'model', 'layers.0', 'self_attn', 'indexer']J´
-$pkg.onnxscript.shape_inference_errorÇType of input 0 value v_model.layers.0.self_attn.indexer.TopK_77_1 of node model/layers.0/self_attn/indexer/Cast_node_78 not known
-Õ
-*v_model.layers.0.self_attn.indexer.Cast_78
-)v_model.layers.0.self_attn.indexer.Min_76,v_model.layers.0.self_attn.indexer.TopK_79_0,v_model.layers.0.self_attn.indexer.TopK_79_1-model/layers.0/self_attn/indexer/TopK_node_79"TopK*
-sorted†*
-largest †*
-axisˇˇˇˇˇˇˇˇˇ†Jò
-	namespaceä: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/indexer: GlmMoeDsaIndexerJï
-pkg.onnxscript.class_hierarchys['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'GlmMoeDsaIndexer']JO
-pkg.onnxscript.name_scopes1['', 'model', 'layers.0', 'self_attn', 'indexer']J©
-$pkg.onnxscript.shape_inference_errorÄType of input 0 value v_model.layers.0.self_attn.indexer.Cast_78 of node model/layers.0/self_attn/indexer/TopK_node_79 not known
-Ã
-,v_model.layers.0.self_attn.indexer.TopK_79_0*v_model.layers.0.self_attn.indexer.Cast_80-model/layers.0/self_attn/indexer/Cast_node_80"Cast*	
-to†Jò
-	namespaceä: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/indexer: GlmMoeDsaIndexerJï
-pkg.onnxscript.class_hierarchys['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'GlmMoeDsaIndexer']JO
-pkg.onnxscript.name_scopes1['', 'model', 'layers.0', 'self_attn', 'indexer']J´
-$pkg.onnxscript.shape_inference_errorÇType of input 0 value v_model.layers.0.self_attn.indexer.TopK_79_0 of node model/layers.0/self_attn/indexer/Cast_node_80 not known
-˜
-%v_model.layers.0.self_attn.Reshape_28
-
-const_1d_5%v_model.layers.0.self_attn.Reshape_81(model/layers.0/self_attn/Reshape_node_81"ReshapeJ}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.0', 'self_attn']Jû
-$pkg.onnxscript.shape_inference_errorvType of input 0 value v_model.layers.0.self_attn.Reshape_28 of node model/layers.0/self_attn/Reshape_node_81 not known
-Ü
-%v_model.layers.0.self_attn.Reshape_81'v_model.layers.0.self_attn.Transpose_82*model/layers.0/self_attn/Transpose_node_82"	Transpose*
-perm@ @@@†J}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.0', 'self_attn']J†
-$pkg.onnxscript.shape_inference_errorxType of input 0 value v_model.layers.0.self_attn.Reshape_81 of node model/layers.0/self_attn/Transpose_node_82 not known
-˜
-%v_model.layers.0.self_attn.Reshape_41
-
-const_1d_5%v_model.layers.0.self_attn.Reshape_83(model/layers.0/self_attn/Reshape_node_83"ReshapeJ}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.0', 'self_attn']Jû
-$pkg.onnxscript.shape_inference_errorvType of input 0 value v_model.layers.0.self_attn.Reshape_41 of node model/layers.0/self_attn/Reshape_node_83 not known
-Ü
-%v_model.layers.0.self_attn.Reshape_83'v_model.layers.0.self_attn.Transpose_84*model/layers.0/self_attn/Transpose_node_84"	Transpose*
-perm@ @@@†J}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.0', 'self_attn']J†
-$pkg.onnxscript.shape_inference_errorxType of input 0 value v_model.layers.0.self_attn.Reshape_83 of node model/layers.0/self_attn/Transpose_node_84 not known
-˜
-%v_model.layers.0.self_attn.Reshape_35
-
-const_1d_8%v_model.layers.0.self_attn.Reshape_85(model/layers.0/self_attn/Reshape_node_85"ReshapeJ}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.0', 'self_attn']Jû
-$pkg.onnxscript.shape_inference_errorvType of input 0 value v_model.layers.0.self_attn.Reshape_35 of node model/layers.0/self_attn/Reshape_node_85 not known
-Ü
-%v_model.layers.0.self_attn.Reshape_85'v_model.layers.0.self_attn.Transpose_86*model/layers.0/self_attn/Transpose_node_86"	Transpose*
-perm@ @@@†J}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.0', 'self_attn']J†
-$pkg.onnxscript.shape_inference_errorxType of input 0 value v_model.layers.0.self_attn.Reshape_85 of node model/layers.0/self_attn/Transpose_node_86 not known
-°
-'v_model.layers.0.self_attn.Transpose_45
-'v_model.layers.0.self_attn.Transpose_84$v_model.layers.0.self_attn.Concat_87'model/layers.0/self_attn/Concat_node_87"Concat*
-axis†J}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.0', 'self_attn']Jü
-$pkg.onnxscript.shape_inference_errorwType of input 1 value v_model.layers.0.self_attn.Transpose_84 of node model/layers.0/self_attn/Concat_node_87 not known
-°
-'v_model.layers.0.self_attn.Transpose_48
-'v_model.layers.0.self_attn.Transpose_86$v_model.layers.0.self_attn.Concat_88'model/layers.0/self_attn/Concat_node_88"Concat*
-axis†J}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.0', 'self_attn']Jü
-$pkg.onnxscript.shape_inference_errorwType of input 1 value v_model.layers.0.self_attn.Transpose_86 of node model/layers.0/self_attn/Concat_node_88 not known
-˚
-$v_model.layers.0.self_attn.Concat_88#v_model.layers.0.self_attn.Shape_89&model/layers.0/self_attn/Shape_node_89"Shape*
-
-end†*
-start †J}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.0', 'self_attn']Jõ
-$pkg.onnxscript.shape_inference_errorsType of input 0 value v_model.layers.0.self_attn.Concat_88 of node model/layers.0/self_attn/Shape_node_89 not known
-π&v_model.layers.0.self_attn.Constant_90)model/layers.0/self_attn/Constant_node_90"Constant*
-
-value_ints@†J}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.0', 'self_attn']
-ò
-#v_model.layers.0.self_attn.Shape_89
-&v_model.layers.0.self_attn.Constant_90$v_model.layers.0.self_attn.Concat_91'model/layers.0/self_attn/Concat_node_91"Concat*
-axis †J}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.0', 'self_attn']Jõ
-$pkg.onnxscript.shape_inference_errorsType of input 0 value v_model.layers.0.self_attn.Shape_89 of node model/layers.0/self_attn/Concat_node_91 not known
-Ω&v_model.layers.0.self_attn.Constant_92)model/layers.0/self_attn/Constant_node_92"Constant*
-value_float    †J}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.0', 'self_attn']
-Õ
-&v_model.layers.0.self_attn.Constant_92"v_model.layers.0.self_attn.Cast_93%model/layers.0/self_attn/Cast_node_93"Cast*	
-to†J}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.0', 'self_attn']
-â
-"v_model.layers.0.self_attn.Cast_93
-$v_model.layers.0.self_attn.Concat_91$v_model.layers.0.self_attn.Expand_94'model/layers.0/self_attn/Expand_node_94"ExpandJ}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.0', 'self_attn']Jú
-$pkg.onnxscript.shape_inference_errortType of input 1 value v_model.layers.0.self_attn.Concat_91 of node model/layers.0/self_attn/Expand_node_94 not known
-ò
-$v_model.layers.0.self_attn.Concat_88
-$v_model.layers.0.self_attn.Expand_94$v_model.layers.0.self_attn.Concat_95'model/layers.0/self_attn/Concat_node_95"Concat*
-axis†J}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.0', 'self_attn']Jú
-$pkg.onnxscript.shape_inference_errortType of input 0 value v_model.layers.0.self_attn.Concat_88 of node model/layers.0/self_attn/Concat_node_95 not known
-â
-*v_model.layers.0.self_attn.indexer.Cast_80
-
-const_1d_1'v_model.layers.0.self_attn.Unsqueeze_96*model/layers.0/self_attn/Unsqueeze_node_96"	UnsqueezeJ}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.0', 'self_attn']J•
-$pkg.onnxscript.shape_inference_error}Type of input 0 value v_model.layers.0.self_attn.indexer.Cast_80 of node model/layers.0/self_attn/Unsqueeze_node_96 not known
-∂
-'v_model.layers.0.self_attn.Transpose_82
-$v_model.layers.0.self_attn.Concat_87
-$v_model.layers.0.self_attn.Concat_95
- 
- 
-'v_model.layers.0.self_attn.Unsqueeze_96(v_model.layers.0.self_attn.IndexShare_97+model/layers.0/self_attn/IndexShare_node_97"
-IndexShare*
-	num_heads†*
-kv_num_heads†*
-scaleÏQ>†:pkg.nxrtJ}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.0', 'self_attn']J£
-$pkg.onnxscript.shape_inference_error{Type of input 0 value v_model.layers.0.self_attn.Transpose_82 of node model/layers.0/self_attn/IndexShare_node_97 not known
-ê
-(v_model.layers.0.self_attn.IndexShare_97
-const_1d_14
-const_1d_20
-const_1d_19#v_model.layers.0.self_attn.Slice_98&model/layers.0/self_attn/Slice_node_98"SliceJ}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.0', 'self_attn']Jü
-$pkg.onnxscript.shape_inference_errorwType of input 0 value v_model.layers.0.self_attn.IndexShare_97 of node model/layers.0/self_attn/Slice_node_98 not known
-Ç
-#v_model.layers.0.self_attn.Slice_98'v_model.layers.0.self_attn.Transpose_99*model/layers.0/self_attn/Transpose_node_99"	Transpose*
-perm@ @@@†J}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.0', 'self_attn']Jû
-$pkg.onnxscript.shape_inference_errorvType of input 0 value v_model.layers.0.self_attn.Slice_98 of node model/layers.0/self_attn/Transpose_node_99 not known
-ˇ
-'v_model.layers.0.self_attn.Transpose_99
-const_1d_21&v_model.layers.0.self_attn.Reshape_100)model/layers.0/self_attn/Reshape_node_100"ReshapeJ}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.0', 'self_attn']J°
-$pkg.onnxscript.shape_inference_erroryType of input 0 value v_model.layers.0.self_attn.Transpose_99 of node model/layers.0/self_attn/Reshape_node_100 not known
-‡
-&v_model.layers.0.self_attn.Reshape_100
-&model.layers.0.self_attn.o_proj.weight
-&model.layers.0.self_attn.o_proj.scales1v_model.layers.0.self_attn.o_proj.MatMulNBits_1014model/layers.0/self_attn/o_proj/MatMulNBits_node_101"MatMulNBits*
-K@†*
-N@†*
-bits†*
-
-block_size †:com.microsoftJñ
-	namespaceà: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/o_proj: QuantizedLinearJî
-pkg.onnxscript.class_hierarchyr['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'QuantizedLinear']JN
-pkg.onnxscript.name_scopes0['', 'model', 'layers.0', 'self_attn', 'o_proj']J¨
-$pkg.onnxscript.shape_inference_errorÉType of input 0 value v_model.layers.0.self_attn.Reshape_100 of node model/layers.0/self_attn/o_proj/MatMulNBits_node_101 not known
-á
-$v_model.layers.0.self_attn.Concat_87(v_model.layers.0.self_attn.Transpose_102+model/layers.0/self_attn/Transpose_node_102"	Transpose*
-perm@ @@@†J}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.0', 'self_attn']J†
-$pkg.onnxscript.shape_inference_errorxType of input 0 value v_model.layers.0.self_attn.Concat_87 of node model/layers.0/self_attn/Transpose_node_102 not known
-Å
-(v_model.layers.0.self_attn.Transpose_102
-const_1d_10&v_model.layers.0.self_attn.Reshape_103)model/layers.0/self_attn/Reshape_node_103"ReshapeJ}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.0', 'self_attn']J¢
-$pkg.onnxscript.shape_inference_errorzType of input 0 value v_model.layers.0.self_attn.Transpose_102 of node model/layers.0/self_attn/Reshape_node_103 not known
-∞
-&v_model.layers.0.self_attn.Reshape_103
-,v_model.layers.0.self_attn.indexer.Concat_53%v_model.layers.0.self_attn.Concat_104(model/layers.0/self_attn/Concat_node_104"Concat*
-axisˇˇˇˇˇˇˇˇˇ†J}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.0', 'self_attn']Jü
-$pkg.onnxscript.shape_inference_errorwType of input 0 value v_model.layers.0.self_attn.Reshape_103 of node model/layers.0/self_attn/Concat_node_104 not known
-á
-$v_model.layers.0.self_attn.Concat_88(v_model.layers.0.self_attn.Transpose_105+model/layers.0/self_attn/Transpose_node_105"	Transpose*
-perm@ @@@†J}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.0', 'self_attn']J†
-$pkg.onnxscript.shape_inference_errorxType of input 0 value v_model.layers.0.self_attn.Concat_88 of node model/layers.0/self_attn/Transpose_node_105 not known
-Å
-(v_model.layers.0.self_attn.Transpose_105
-const_1d_21&v_model.layers.0.self_attn.Reshape_106)model/layers.0/self_attn/Reshape_node_106"ReshapeJ}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.0', 'self_attn']J¢
-$pkg.onnxscript.shape_inference_errorzType of input 0 value v_model.layers.0.self_attn.Transpose_105 of node model/layers.0/self_attn/Reshape_node_106 not known
-Á
-%v_model.layers.0.self_attn.Concat_104
-
-const_1d_1present.0.key+model/layers.0/self_attn/Unsqueeze_node_107"	UnsqueezeJ}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.0', 'self_attn']J°
-$pkg.onnxscript.shape_inference_erroryType of input 0 value v_model.layers.0.self_attn.Concat_104 of node model/layers.0/self_attn/Unsqueeze_node_107 not known
-Î
-&v_model.layers.0.self_attn.Reshape_106
-
-const_1d_1present.0.value+model/layers.0/self_attn/Unsqueeze_node_108"	UnsqueezeJ}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.0', 'self_attn']J¢
-$pkg.onnxscript.shape_inference_errorzType of input 0 value v_model.layers.0.self_attn.Reshape_106 of node model/layers.0/self_attn/Unsqueeze_node_108 not known
-µ
-v_model.embed_tokens.Gather_0
-1v_model.layers.0.self_attn.o_proj.MatMulNBits_101v_model.layers.0.Add_109model/layers.0/Add_node_109"AddJ_
-	namespaceR: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayerJk
-pkg.onnxscript.class_hierarchyI['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer']J7
-pkg.onnxscript.name_scopes['', 'model', 'layers.0']Jù
-$pkg.onnxscript.shape_inference_erroruType of input 1 value v_model.layers.0.self_attn.o_proj.MatMulNBits_101 of node model/layers.0/Add_node_109 not known
-á
-v_model.layers.0.Add_109
-.model.layers.0.post_attention_layernorm.weight>v_model.layers.0.post_attention_layernorm.RMSNormalization_110Amodel/layers.0/post_attention_layernorm/RMSNormalization_node_110"RMSNormalization*
-epsilonΩ7Ü5†*
-axisˇˇˇˇˇˇˇˇˇ†JÅ
-	namespacet: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/post_attention_layernorm: RMSNormJv
-pkg.onnxscript.class_hierarchyT['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'RMSNorm']JS
-pkg.onnxscript.name_scopes5['', 'model', 'layers.0', 'post_attention_layernorm']J´
-$pkg.onnxscript.shape_inference_errorÇType of input 0 value v_model.layers.0.Add_109 of node model/layers.0/post_attention_layernorm/RMSNormalization_node_110 not known
-›
->v_model.layers.0.post_attention_layernorm.RMSNormalization_110
-#model.layers.0.mlp.gate_proj.weight
-#model.layers.0.mlp.gate_proj.scales.v_model.layers.0.mlp.gate_proj.MatMulNBits_1111model/layers.0/mlp/gate_proj/MatMulNBits_node_111"MatMulNBits*
-K@†*	
-NÄ†*
-bits†*
-
-block_size †:com.microsoftJÉ
-	namespacev: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/mlp: MLP/gate_proj: QuantizedLinearJÖ
-pkg.onnxscript.class_hierarchyc['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'MLP', 'QuantizedLinear']JK
-pkg.onnxscript.name_scopes-['', 'model', 'layers.0', 'mlp', 'gate_proj']J¡
-$pkg.onnxscript.shape_inference_erroròType of input 0 value v_model.layers.0.post_attention_layernorm.RMSNormalization_110 of node model/layers.0/mlp/gate_proj/MatMulNBits_node_111 not known
-√
-.v_model.layers.0.mlp.gate_proj.MatMulNBits_111 v_model.layers.0.mlp.Sigmoid_112#model/layers.0/mlp/Sigmoid_node_112"SigmoidJh
-	namespace[: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/mlp: MLPJr
-pkg.onnxscript.class_hierarchyP['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'MLP']J>
-pkg.onnxscript.name_scopes ['', 'model', 'layers.0', 'mlp']J¢
-$pkg.onnxscript.shape_inference_errorzType of input 0 value v_model.layers.0.mlp.gate_proj.MatMulNBits_111 of node model/layers.0/mlp/Sigmoid_node_112 not known
-’
-.v_model.layers.0.mlp.gate_proj.MatMulNBits_111
- v_model.layers.0.mlp.Sigmoid_112v_model.layers.0.mlp.Mul_113model/layers.0/mlp/Mul_node_113"MulJh
-	namespace[: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/mlp: MLPJr
-pkg.onnxscript.class_hierarchyP['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'MLP']J>
-pkg.onnxscript.name_scopes ['', 'model', 'layers.0', 'mlp']Jû
-$pkg.onnxscript.shape_inference_errorvType of input 0 value v_model.layers.0.mlp.gate_proj.MatMulNBits_111 of node model/layers.0/mlp/Mul_node_113 not known
-œ
->v_model.layers.0.post_attention_layernorm.RMSNormalization_110
-!model.layers.0.mlp.up_proj.weight
-!model.layers.0.mlp.up_proj.scales,v_model.layers.0.mlp.up_proj.MatMulNBits_114/model/layers.0/mlp/up_proj/MatMulNBits_node_114"MatMulNBits*
-K@†*	
-NÄ†*
-bits†*
-
-block_size †:com.microsoftJÅ
-	namespacet: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/mlp: MLP/up_proj: QuantizedLinearJÖ
-pkg.onnxscript.class_hierarchyc['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'MLP', 'QuantizedLinear']JI
-pkg.onnxscript.name_scopes+['', 'model', 'layers.0', 'mlp', 'up_proj']Jø
-$pkg.onnxscript.shape_inference_errorñType of input 0 value v_model.layers.0.post_attention_layernorm.RMSNormalization_110 of node model/layers.0/mlp/up_proj/MatMulNBits_node_114 not known
-Ω
-v_model.layers.0.mlp.Mul_113
-,v_model.layers.0.mlp.up_proj.MatMulNBits_114v_model.layers.0.mlp.Mul_115model/layers.0/mlp/Mul_node_115"MulJh
-	namespace[: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/mlp: MLPJr
-pkg.onnxscript.class_hierarchyP['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'MLP']J>
-pkg.onnxscript.name_scopes ['', 'model', 'layers.0', 'mlp']Jå
-$pkg.onnxscript.shape_inference_errordType of input 0 value v_model.layers.0.mlp.Mul_113 of node model/layers.0/mlp/Mul_node_115 not known
-ò
-v_model.layers.0.mlp.Mul_115
-#model.layers.0.mlp.down_proj.weight
-#model.layers.0.mlp.down_proj.scales.v_model.layers.0.mlp.down_proj.MatMulNBits_1161model/layers.0/mlp/down_proj/MatMulNBits_node_116"MatMulNBits*	
-KÄ†*
-N@†*
-bits†*
-
-block_size †:com.microsoftJÉ
-	namespacev: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/mlp: MLP/down_proj: QuantizedLinearJÖ
-pkg.onnxscript.class_hierarchyc['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'MLP', 'QuantizedLinear']JK
-pkg.onnxscript.name_scopes-['', 'model', 'layers.0', 'mlp', 'down_proj']Jû
-$pkg.onnxscript.shape_inference_errorvType of input 0 value v_model.layers.0.mlp.Mul_115 of node model/layers.0/mlp/down_proj/MatMulNBits_node_116 not known
-î
-v_model.layers.0.Add_109
-.v_model.layers.0.mlp.down_proj.MatMulNBits_116v_model.layers.0.Add_117model/layers.0/Add_node_117"AddJ_
-	namespaceR: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayerJk
-pkg.onnxscript.class_hierarchyI['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer']J7
-pkg.onnxscript.name_scopes['', 'model', 'layers.0']JÑ
-$pkg.onnxscript.shape_inference_error\Type of input 0 value v_model.layers.0.Add_109 of node model/layers.0/Add_node_117 not known
-œ
-v_model.layers.0.Add_117
-%model.layers.1.input_layernorm.weight5v_model.layers.1.input_layernorm.RMSNormalization_1188model/layers.1/input_layernorm/RMSNormalization_node_118"RMSNormalization*
-epsilonΩ7Ü5†*
-axisˇˇˇˇˇˇˇˇˇ†Jx
-	namespacek: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/input_layernorm: RMSNormJv
-pkg.onnxscript.class_hierarchyT['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'RMSNorm']JJ
-pkg.onnxscript.name_scopes,['', 'model', 'layers.1', 'input_layernorm']J°
-$pkg.onnxscript.shape_inference_erroryType of input 0 value v_model.layers.0.Add_117 of node model/layers.1/input_layernorm/RMSNormalization_node_118 not known
-å
-5v_model.layers.1.input_layernorm.RMSNormalization_118
-(model.layers.1.self_attn.q_a_proj.weight
-(model.layers.1.self_attn.q_a_proj.scales3v_model.layers.1.self_attn.q_a_proj.MatMulNBits_1196model/layers.1/self_attn/q_a_proj/MatMulNBits_node_119"MatMulNBits*
-K@†*
-N †*
-bits†*
-
-block_size †:com.microsoftJò
-	namespaceä: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/q_a_proj: QuantizedLinearJî
-pkg.onnxscript.class_hierarchyr['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'QuantizedLinear']JP
-pkg.onnxscript.name_scopes2['', 'model', 'layers.1', 'self_attn', 'q_a_proj']JΩ
-$pkg.onnxscript.shape_inference_errorîType of input 0 value v_model.layers.1.input_layernorm.RMSNormalization_118 of node model/layers.1/self_attn/q_a_proj/MatMulNBits_node_119 not known
-Ê
-3v_model.layers.1.self_attn.q_a_proj.MatMulNBits_119
--model.layers.1.self_attn.q_a_layernorm.weight=v_model.layers.1.self_attn.q_a_layernorm.RMSNormalization_120@model/layers.1/self_attn/q_a_layernorm/RMSNormalization_node_120"RMSNormalization*
-epsilonΩ7Ü5†*
-axisˇˇˇˇˇˇˇˇˇ†Jï
-	namespaceá: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/q_a_layernorm: RMSNormJå
-pkg.onnxscript.class_hierarchyj['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'RMSNorm']JU
-pkg.onnxscript.name_scopes7['', 'model', 'layers.1', 'self_attn', 'q_a_layernorm']J≈
-$pkg.onnxscript.shape_inference_errorúType of input 0 value v_model.layers.1.self_attn.q_a_proj.MatMulNBits_119 of node model/layers.1/self_attn/q_a_layernorm/RMSNormalization_node_120 not known
-ú
-=v_model.layers.1.self_attn.q_a_layernorm.RMSNormalization_120
-(model.layers.1.self_attn.q_b_proj.weight
-(model.layers.1.self_attn.q_b_proj.scales3v_model.layers.1.self_attn.q_b_proj.MatMulNBits_1216model/layers.1/self_attn/q_b_proj/MatMulNBits_node_121"MatMulNBits*
-K †*
-N`†*
-bits†*
-
-block_size †:com.microsoftJò
-	namespaceä: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/q_b_proj: QuantizedLinearJî
-pkg.onnxscript.class_hierarchyr['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'QuantizedLinear']JP
-pkg.onnxscript.name_scopes2['', 'model', 'layers.1', 'self_attn', 'q_b_proj']J≈
-$pkg.onnxscript.shape_inference_errorúType of input 0 value v_model.layers.1.self_attn.q_a_layernorm.RMSNormalization_120 of node model/layers.1/self_attn/q_b_proj/MatMulNBits_node_121 not known
-ó
-3v_model.layers.1.self_attn.q_b_proj.MatMulNBits_121
-
-const_1d_5&v_model.layers.1.self_attn.Reshape_122)model/layers.1/self_attn/Reshape_node_122"ReshapeJ}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.1', 'self_attn']JÆ
-$pkg.onnxscript.shape_inference_errorÖType of input 0 value v_model.layers.1.self_attn.q_b_proj.MatMulNBits_121 of node model/layers.1/self_attn/Reshape_node_122 not known
-¥
-&v_model.layers.1.self_attn.Reshape_122
-
-const_1d_6&v_model.layers.1.self_attn.Split_123_0&v_model.layers.1.self_attn.Split_123_1'model/layers.1/self_attn/Split_node_123"Split*
-axisˇˇˇˇˇˇˇˇˇ†J}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.1', 'self_attn']Jû
-$pkg.onnxscript.shape_inference_errorvType of input 0 value v_model.layers.1.self_attn.Reshape_122 of node model/layers.1/self_attn/Split_node_123 not known
-¸
-&v_model.layers.1.self_attn.Split_123_1
-
-const_1d_7&v_model.layers.1.self_attn.Reshape_124)model/layers.1/self_attn/Reshape_node_124"ReshapeJ}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.1', 'self_attn']J†
-$pkg.onnxscript.shape_inference_errorxType of input 0 value v_model.layers.1.self_attn.Split_123_1 of node model/layers.1/self_attn/Reshape_node_124 not known
-é
-&v_model.layers.1.self_attn.Reshape_124
-v_model.rotary_emb.Gather_1
-v_model.rotary_emb.Gather_2.v_model.layers.1.self_attn.RotaryEmbedding_1251model/layers.1/self_attn/RotaryEmbedding_node_125"RotaryEmbedding*
-	num_heads†*
-rotary_embedding_dim †*
-interleaved†J}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.1', 'self_attn']J©
-$pkg.onnxscript.shape_inference_errorÄType of input 0 value v_model.layers.1.self_attn.Reshape_124 of node model/layers.1/self_attn/RotaryEmbedding_node_125 not known
-¸
-&v_model.layers.1.self_attn.Split_123_0
-
-const_1d_8&v_model.layers.1.self_attn.Reshape_126)model/layers.1/self_attn/Reshape_node_126"ReshapeJ}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.1', 'self_attn']J†
-$pkg.onnxscript.shape_inference_errorxType of input 0 value v_model.layers.1.self_attn.Split_123_0 of node model/layers.1/self_attn/Reshape_node_126 not known
-ç
-.v_model.layers.1.self_attn.RotaryEmbedding_125
-
-const_1d_9&v_model.layers.1.self_attn.Reshape_127)model/layers.1/self_attn/Reshape_node_127"ReshapeJ}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.1', 'self_attn']J©
-$pkg.onnxscript.shape_inference_errorÄType of input 0 value v_model.layers.1.self_attn.RotaryEmbedding_125 of node model/layers.1/self_attn/Reshape_node_127 not known
-™
-&v_model.layers.1.self_attn.Reshape_126
-&v_model.layers.1.self_attn.Reshape_127%v_model.layers.1.self_attn.Concat_128(model/layers.1/self_attn/Concat_node_128"Concat*
-axisˇˇˇˇˇˇˇˇˇ†J}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.1', 'self_attn']Jü
-$pkg.onnxscript.shape_inference_errorwType of input 0 value v_model.layers.1.self_attn.Reshape_126 of node model/layers.1/self_attn/Concat_node_128 not known
-˚
-%v_model.layers.1.self_attn.Concat_128
-const_1d_10&v_model.layers.1.self_attn.Reshape_129)model/layers.1/self_attn/Reshape_node_129"ReshapeJ}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.1', 'self_attn']Jü
-$pkg.onnxscript.shape_inference_errorwType of input 0 value v_model.layers.1.self_attn.Concat_128 of node model/layers.1/self_attn/Reshape_node_129 not known
-“
-5v_model.layers.1.input_layernorm.RMSNormalization_118
-2model.layers.1.self_attn.kv_a_proj_with_mqa.weight
-2model.layers.1.self_attn.kv_a_proj_with_mqa.scales=v_model.layers.1.self_attn.kv_a_proj_with_mqa.MatMulNBits_130@model/layers.1/self_attn/kv_a_proj_with_mqa/MatMulNBits_node_130"MatMulNBits*
-K@†*
-N†*
-bits†*
-
-block_size †:com.microsoftJ¢
-	namespaceî: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/kv_a_proj_with_mqa: QuantizedLinearJî
-pkg.onnxscript.class_hierarchyr['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'QuantizedLinear']JZ
-pkg.onnxscript.name_scopes<['', 'model', 'layers.1', 'self_attn', 'kv_a_proj_with_mqa']J«
-$pkg.onnxscript.shape_inference_errorûType of input 0 value v_model.layers.1.input_layernorm.RMSNormalization_118 of node model/layers.1/self_attn/kv_a_proj_with_mqa/MatMulNBits_node_130 not known
-„
-=v_model.layers.1.self_attn.kv_a_proj_with_mqa.MatMulNBits_130
-
-const_1d_6&v_model.layers.1.self_attn.Split_131_0&v_model.layers.1.self_attn.Split_131_1'model/layers.1/self_attn/Split_node_131"Split*
-axisˇˇˇˇˇˇˇˇˇ†J}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.1', 'self_attn']J∂
-$pkg.onnxscript.shape_inference_errorçType of input 0 value v_model.layers.1.self_attn.kv_a_proj_with_mqa.MatMulNBits_130 of node model/layers.1/self_attn/Split_node_131 not known
-“
-&v_model.layers.1.self_attn.Split_131_0
-.model.layers.1.self_attn.kv_a_layernorm.weight>v_model.layers.1.self_attn.kv_a_layernorm.RMSNormalization_132Amodel/layers.1/self_attn/kv_a_layernorm/RMSNormalization_node_132"RMSNormalization*
-epsilonΩ7Ü5†*
-axisˇˇˇˇˇˇˇˇˇ†Jñ
-	namespaceà: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/kv_a_layernorm: RMSNormJå
-pkg.onnxscript.class_hierarchyj['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'RMSNorm']JV
-pkg.onnxscript.name_scopes8['', 'model', 'layers.1', 'self_attn', 'kv_a_layernorm']Jπ
-$pkg.onnxscript.shape_inference_errorêType of input 0 value v_model.layers.1.self_attn.Split_131_0 of node model/layers.1/self_attn/kv_a_layernorm/RMSNormalization_node_132 not known
-¶
->v_model.layers.1.self_attn.kv_a_layernorm.RMSNormalization_132
-)model.layers.1.self_attn.kv_b_proj.weight
-)model.layers.1.self_attn.kv_b_proj.scales4v_model.layers.1.self_attn.kv_b_proj.MatMulNBits_1337model/layers.1/self_attn/kv_b_proj/MatMulNBits_node_133"MatMulNBits*
-K†*	
-NÄ†*
-bits†*
-
-block_size †:com.microsoftJô
-	namespaceã: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/kv_b_proj: QuantizedLinearJî
-pkg.onnxscript.class_hierarchyr['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'QuantizedLinear']JQ
-pkg.onnxscript.name_scopes3['', 'model', 'layers.1', 'self_attn', 'kv_b_proj']J«
-$pkg.onnxscript.shape_inference_errorûType of input 0 value v_model.layers.1.self_attn.kv_a_layernorm.RMSNormalization_132 of node model/layers.1/self_attn/kv_b_proj/MatMulNBits_node_133 not known
-ö
-4v_model.layers.1.self_attn.kv_b_proj.MatMulNBits_133
-const_1d_11&v_model.layers.1.self_attn.Reshape_134)model/layers.1/self_attn/Reshape_node_134"ReshapeJ}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.1', 'self_attn']JØ
-$pkg.onnxscript.shape_inference_errorÜType of input 0 value v_model.layers.1.self_attn.kv_b_proj.MatMulNBits_133 of node model/layers.1/self_attn/Reshape_node_134 not known
-µ
-&v_model.layers.1.self_attn.Reshape_134
-const_1d_12&v_model.layers.1.self_attn.Split_135_0&v_model.layers.1.self_attn.Split_135_1'model/layers.1/self_attn/Split_node_135"Split*
-axisˇˇˇˇˇˇˇˇˇ†J}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.1', 'self_attn']Jû
-$pkg.onnxscript.shape_inference_errorvType of input 0 value v_model.layers.1.self_attn.Reshape_134 of node model/layers.1/self_attn/Split_node_135 not known
-¸
-&v_model.layers.1.self_attn.Split_135_1
-
-const_1d_7&v_model.layers.1.self_attn.Reshape_136)model/layers.1/self_attn/Reshape_node_136"ReshapeJ}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.1', 'self_attn']J†
-$pkg.onnxscript.shape_inference_errorxType of input 0 value v_model.layers.1.self_attn.Split_135_1 of node model/layers.1/self_attn/Reshape_node_136 not known
-é
-&v_model.layers.1.self_attn.Split_131_1
-v_model.rotary_emb.Gather_1
-v_model.rotary_emb.Gather_2.v_model.layers.1.self_attn.RotaryEmbedding_1371model/layers.1/self_attn/RotaryEmbedding_node_137"RotaryEmbedding*
-	num_heads†*
-rotary_embedding_dim †*
-interleaved†J}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.1', 'self_attn']J©
-$pkg.onnxscript.shape_inference_errorÄType of input 0 value v_model.layers.1.self_attn.Split_131_1 of node model/layers.1/self_attn/RotaryEmbedding_node_137 not known
-Å
-.v_model.layers.1.self_attn.RotaryEmbedding_137
-const_1d_13#v_model.layers.1.self_attn.Tile_138&model/layers.1/self_attn/Tile_node_138"TileJ}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.1', 'self_attn']J•
-$pkg.onnxscript.shape_inference_error}Type of input 0 value v_model.layers.1.self_attn.RotaryEmbedding_137 of node model/layers.1/self_attn/Tile_node_138 not known
-¸
-&v_model.layers.1.self_attn.Split_135_0
-
-const_1d_8&v_model.layers.1.self_attn.Reshape_139)model/layers.1/self_attn/Reshape_node_139"ReshapeJ}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.1', 'self_attn']J†
-$pkg.onnxscript.shape_inference_errorxType of input 0 value v_model.layers.1.self_attn.Split_135_0 of node model/layers.1/self_attn/Reshape_node_139 not known
-ˆ
-#v_model.layers.1.self_attn.Tile_138
-
-const_1d_9&v_model.layers.1.self_attn.Reshape_140)model/layers.1/self_attn/Reshape_node_140"ReshapeJ}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.1', 'self_attn']Jù
-$pkg.onnxscript.shape_inference_erroruType of input 0 value v_model.layers.1.self_attn.Tile_138 of node model/layers.1/self_attn/Reshape_node_140 not known
-™
-&v_model.layers.1.self_attn.Reshape_139
-&v_model.layers.1.self_attn.Reshape_140%v_model.layers.1.self_attn.Concat_141(model/layers.1/self_attn/Concat_node_141"Concat*
-axisˇˇˇˇˇˇˇˇˇ†J}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.1', 'self_attn']Jü
-$pkg.onnxscript.shape_inference_errorwType of input 0 value v_model.layers.1.self_attn.Reshape_139 of node model/layers.1/self_attn/Concat_node_141 not known
-˚
-%v_model.layers.1.self_attn.Concat_141
-const_1d_10&v_model.layers.1.self_attn.Reshape_142)model/layers.1/self_attn/Reshape_node_142"ReshapeJ}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.1', 'self_attn']Jü
-$pkg.onnxscript.shape_inference_errorwType of input 0 value v_model.layers.1.self_attn.Concat_141 of node model/layers.1/self_attn/Reshape_node_142 not known
-»
-past_key_values.1.key
-
-const_1d_1&v_model.layers.1.self_attn.Squeeze_143)model/layers.1/self_attn/Squeeze_node_143"SqueezeJ}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.1', 'self_attn']
-Ì
-&v_model.layers.1.self_attn.Squeeze_143
-const_1d_14
-const_1d_15
-
-const_1d_2$v_model.layers.1.self_attn.Slice_144'model/layers.1/self_attn/Slice_node_144"SliceJ}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.1', 'self_attn']
-◊
-$v_model.layers.1.self_attn.Slice_144
-
-const_1d_5&v_model.layers.1.self_attn.Reshape_145)model/layers.1/self_attn/Reshape_node_145"ReshapeJ}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.1', 'self_attn']
-Ê
-&v_model.layers.1.self_attn.Reshape_145(v_model.layers.1.self_attn.Transpose_146+model/layers.1/self_attn/Transpose_node_146"	Transpose*
-perm@ @@@†J}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.1', 'self_attn']
- 
-past_key_values.1.value
-
-const_1d_1&v_model.layers.1.self_attn.Squeeze_147)model/layers.1/self_attn/Squeeze_node_147"SqueezeJ}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.1', 'self_attn']
-Ÿ
-&v_model.layers.1.self_attn.Squeeze_147
-
-const_1d_8&v_model.layers.1.self_attn.Reshape_148)model/layers.1/self_attn/Reshape_node_148"ReshapeJ}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.1', 'self_attn']
-Ê
-&v_model.layers.1.self_attn.Reshape_148(v_model.layers.1.self_attn.Transpose_149+model/layers.1/self_attn/Transpose_node_149"	Transpose*
-perm@ @@@†J}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.1', 'self_attn']
-Ì
-&v_model.layers.1.self_attn.Squeeze_143
-const_1d_15
-const_1d_16
-
-const_1d_2$v_model.layers.1.self_attn.Slice_150'model/layers.1/self_attn/Slice_node_150"SliceJ}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.1', 'self_attn']
-ƒ
-5v_model.layers.1.input_layernorm.RMSNormalization_118
-*model.layers.1.self_attn.indexer.wk.weight
-*model.layers.1.self_attn.indexer.wk.scales5v_model.layers.1.self_attn.indexer.wk.MatMulNBits_1518model/layers.1/self_attn/indexer/wk/MatMulNBits_node_151"MatMulNBits*
-K@†*
-N†*
-bits†*
-
-block_size †:com.microsoftJ¨
-	namespaceû: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/indexer: GlmMoeDsaIndexer/wk: QuantizedLinearJ©
-pkg.onnxscript.class_hierarchyÜ['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'GlmMoeDsaIndexer', 'QuantizedLinear']JU
-pkg.onnxscript.name_scopes7['', 'model', 'layers.1', 'self_attn', 'indexer', 'wk']Jø
-$pkg.onnxscript.shape_inference_errorñType of input 0 value v_model.layers.1.input_layernorm.RMSNormalization_118 of node model/layers.1/self_attn/indexer/wk/MatMulNBits_node_151 not known
-‘
-5v_model.layers.1.self_attn.indexer.wk.MatMulNBits_151
-.model.layers.1.self_attn.indexer.k_norm.weight
-,model.layers.1.self_attn.indexer.k_norm.bias@v_model.layers.1.self_attn.indexer.k_norm.LayerNormalization_152Cmodel/layers.1/self_attn/indexer/k_norm/LayerNormalization_node_152"LayerNormalization*
-epsilonΩ7Ü5†*
-axisˇˇˇˇˇˇˇˇˇ†J™
-	namespaceú: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/indexer: GlmMoeDsaIndexer/k_norm: LayerNormJ£
-pkg.onnxscript.class_hierarchyÄ['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'GlmMoeDsaIndexer', 'LayerNorm']JY
-pkg.onnxscript.name_scopes;['', 'model', 'layers.1', 'self_attn', 'indexer', 'k_norm']J 
-$pkg.onnxscript.shape_inference_error°Type of input 0 value v_model.layers.1.self_attn.indexer.wk.MatMulNBits_151 of node model/layers.1/self_attn/indexer/k_norm/LayerNormalization_node_152 not known
-ï
-@v_model.layers.1.self_attn.indexer.k_norm.LayerNormalization_152
-v_model.rotary_emb.Gather_1
-v_model.rotary_emb.Gather_26v_model.layers.1.self_attn.indexer.RotaryEmbedding_1539model/layers.1/self_attn/indexer/RotaryEmbedding_node_153"RotaryEmbedding*
-	num_heads†*
-rotary_embedding_dim †*
-interleaved†Jò
-	namespaceä: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/indexer: GlmMoeDsaIndexerJï
-pkg.onnxscript.class_hierarchys['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'GlmMoeDsaIndexer']JO
-pkg.onnxscript.name_scopes1['', 'model', 'layers.1', 'self_attn', 'indexer']JÀ
-$pkg.onnxscript.shape_inference_error¢Type of input 0 value v_model.layers.1.self_attn.indexer.k_norm.LayerNormalization_152 of node model/layers.1/self_attn/indexer/RotaryEmbedding_node_153 not known
-ì
-$v_model.layers.1.self_attn.Slice_150
-6v_model.layers.1.self_attn.indexer.RotaryEmbedding_153-v_model.layers.1.self_attn.indexer.Concat_1540model/layers.1/self_attn/indexer/Concat_node_154"Concat*
-axis†Jò
-	namespaceä: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/indexer: GlmMoeDsaIndexerJï
-pkg.onnxscript.class_hierarchys['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'GlmMoeDsaIndexer']JO
-pkg.onnxscript.name_scopes1['', 'model', 'layers.1', 'self_attn', 'indexer']J∏
-$pkg.onnxscript.shape_inference_errorèType of input 1 value v_model.layers.1.self_attn.indexer.RotaryEmbedding_153 of node model/layers.1/self_attn/indexer/Concat_node_154 not known
-‚
-=v_model.layers.1.self_attn.q_a_layernorm.RMSNormalization_120
-,model.layers.1.self_attn.indexer.wq_b.weight
-,model.layers.1.self_attn.indexer.wq_b.scales7v_model.layers.1.self_attn.indexer.wq_b.MatMulNBits_155:model/layers.1/self_attn/indexer/wq_b/MatMulNBits_node_155"MatMulNBits*
-K †*
-N†*
-bits†*
-
-block_size †:com.microsoftJÆ
-	namespace†: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/indexer: GlmMoeDsaIndexer/wq_b: QuantizedLinearJ©
-pkg.onnxscript.class_hierarchyÜ['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'GlmMoeDsaIndexer', 'QuantizedLinear']JW
-pkg.onnxscript.name_scopes9['', 'model', 'layers.1', 'self_attn', 'indexer', 'wq_b']J…
-$pkg.onnxscript.shape_inference_error†Type of input 0 value v_model.layers.1.self_attn.q_a_layernorm.RMSNormalization_120 of node model/layers.1/self_attn/indexer/wq_b/MatMulNBits_node_155 not known
-Û
-7v_model.layers.1.self_attn.indexer.wq_b.MatMulNBits_155
-const_1d_17.v_model.layers.1.self_attn.indexer.Reshape_1561model/layers.1/self_attn/indexer/Reshape_node_156"ReshapeJò
-	namespaceä: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/indexer: GlmMoeDsaIndexerJï
-pkg.onnxscript.class_hierarchys['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'GlmMoeDsaIndexer']JO
-pkg.onnxscript.name_scopes1['', 'model', 'layers.1', 'self_attn', 'indexer']J∫
-$pkg.onnxscript.shape_inference_errorëType of input 0 value v_model.layers.1.self_attn.indexer.wq_b.MatMulNBits_155 of node model/layers.1/self_attn/indexer/Reshape_node_156 not known
-”
-.v_model.layers.1.self_attn.indexer.Reshape_156+v_model.layers.1.self_attn.indexer.Cast_157.model/layers.1/self_attn/indexer/Cast_node_157"Cast*	
-to†Jò
-	namespaceä: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/indexer: GlmMoeDsaIndexerJï
-pkg.onnxscript.class_hierarchys['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'GlmMoeDsaIndexer']JO
-pkg.onnxscript.name_scopes1['', 'model', 'layers.1', 'self_attn', 'indexer']JÆ
-$pkg.onnxscript.shape_inference_errorÖType of input 0 value v_model.layers.1.self_attn.indexer.Reshape_156 of node model/layers.1/self_attn/indexer/Cast_node_157 not known
-—
--v_model.layers.1.self_attn.indexer.Concat_154+v_model.layers.1.self_attn.indexer.Cast_158.model/layers.1/self_attn/indexer/Cast_node_158"Cast*	
-to†Jò
-	namespaceä: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/indexer: GlmMoeDsaIndexerJï
-pkg.onnxscript.class_hierarchys['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'GlmMoeDsaIndexer']JO
-pkg.onnxscript.name_scopes1['', 'model', 'layers.1', 'self_attn', 'indexer']J≠
-$pkg.onnxscript.shape_inference_errorÑType of input 0 value v_model.layers.1.self_attn.indexer.Concat_154 of node model/layers.1/self_attn/indexer/Cast_node_158 not known
-Á
-+v_model.layers.1.self_attn.indexer.Cast_1580v_model.layers.1.self_attn.indexer.Transpose_1593model/layers.1/self_attn/indexer/Transpose_node_159"	Transpose*
-perm@ @@†Jò
-	namespaceä: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/indexer: GlmMoeDsaIndexerJï
-pkg.onnxscript.class_hierarchys['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'GlmMoeDsaIndexer']JO
-pkg.onnxscript.name_scopes1['', 'model', 'layers.1', 'self_attn', 'indexer']J∞
-$pkg.onnxscript.shape_inference_erroráType of input 0 value v_model.layers.1.self_attn.indexer.Cast_158 of node model/layers.1/self_attn/indexer/Transpose_node_159 not known
-¸
-+v_model.layers.1.self_attn.indexer.Cast_157
-0v_model.layers.1.self_attn.indexer.Transpose_159-v_model.layers.1.self_attn.indexer.MatMul_1600model/layers.1/self_attn/indexer/MatMul_node_160"MatMulJò
-	namespaceä: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/indexer: GlmMoeDsaIndexerJï
-pkg.onnxscript.class_hierarchys['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'GlmMoeDsaIndexer']JO
-pkg.onnxscript.name_scopes1['', 'model', 'layers.1', 'self_attn', 'indexer']J≠
-$pkg.onnxscript.shape_inference_errorÑType of input 0 value v_model.layers.1.self_attn.indexer.Cast_157 of node model/layers.1/self_attn/indexer/MatMul_node_160 not known
-∆
--v_model.layers.1.self_attn.indexer.MatMul_160+v_model.layers.1.self_attn.indexer.Relu_161.model/layers.1/self_attn/indexer/Relu_node_161"ReluJò
-	namespaceä: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/indexer: GlmMoeDsaIndexerJï
-pkg.onnxscript.class_hierarchys['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'GlmMoeDsaIndexer']JO
-pkg.onnxscript.name_scopes1['', 'model', 'layers.1', 'self_attn', 'indexer']J≠
-$pkg.onnxscript.shape_inference_errorÑType of input 0 value v_model.layers.1.self_attn.indexer.MatMul_160 of node model/layers.1/self_attn/indexer/Relu_node_161 not known
-ä
-5v_model.layers.1.input_layernorm.RMSNormalization_118
-4model.layers.1.self_attn.indexer.weights_proj.weight
-4model.layers.1.self_attn.indexer.weights_proj.scales?v_model.layers.1.self_attn.indexer.weights_proj.MatMulNBits_162Bmodel/layers.1/self_attn/indexer/weights_proj/MatMulNBits_node_162"MatMulNBits*
-K@†*
-N†*
-bits†*
-
-block_size †:com.microsoftJ∂
-	namespace®: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/indexer: GlmMoeDsaIndexer/weights_proj: QuantizedLinearJ©
-pkg.onnxscript.class_hierarchyÜ['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'GlmMoeDsaIndexer', 'QuantizedLinear']J_
-pkg.onnxscript.name_scopesA['', 'model', 'layers.1', 'self_attn', 'indexer', 'weights_proj']J…
-$pkg.onnxscript.shape_inference_error†Type of input 0 value v_model.layers.1.input_layernorm.RMSNormalization_118 of node model/layers.1/self_attn/indexer/weights_proj/MatMulNBits_node_162 not known
-ı
-?v_model.layers.1.self_attn.indexer.weights_proj.MatMulNBits_162+v_model.layers.1.self_attn.indexer.Cast_163.model/layers.1/self_attn/indexer/Cast_node_163"Cast*	
-to†Jò
-	namespaceä: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/indexer: GlmMoeDsaIndexerJï
-pkg.onnxscript.class_hierarchys['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'GlmMoeDsaIndexer']JO
-pkg.onnxscript.name_scopes1['', 'model', 'layers.1', 'self_attn', 'indexer']Jø
-$pkg.onnxscript.shape_inference_errorñType of input 0 value v_model.layers.1.self_attn.indexer.weights_proj.MatMulNBits_162 of node model/layers.1/self_attn/indexer/Cast_node_163 not known
-
-const_0.7071067811865476_f32
-+v_model.layers.1.self_attn.indexer.Cast_163/v_model.layers.1.self_attn.indexer.CastLike_1642model/layers.1/self_attn/indexer/CastLike_node_164"CastLikeJò
-	namespaceä: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/indexer: GlmMoeDsaIndexerJï
-pkg.onnxscript.class_hierarchys['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'GlmMoeDsaIndexer']JO
-pkg.onnxscript.name_scopes1['', 'model', 'layers.1', 'self_attn', 'indexer']JØ
-$pkg.onnxscript.shape_inference_errorÜType of input 1 value v_model.layers.1.self_attn.indexer.Cast_163 of node model/layers.1/self_attn/indexer/CastLike_node_164 not known
-Ô
-+v_model.layers.1.self_attn.indexer.Cast_163
-/v_model.layers.1.self_attn.indexer.CastLike_164*v_model.layers.1.self_attn.indexer.Mul_165-model/layers.1/self_attn/indexer/Mul_node_165"MulJò
-	namespaceä: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/indexer: GlmMoeDsaIndexerJï
-pkg.onnxscript.class_hierarchys['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'GlmMoeDsaIndexer']JO
-pkg.onnxscript.name_scopes1['', 'model', 'layers.1', 'self_attn', 'indexer']J™
-$pkg.onnxscript.shape_inference_errorÅType of input 0 value v_model.layers.1.self_attn.indexer.Cast_163 of node model/layers.1/self_attn/indexer/Mul_node_165 not known
-·
-*v_model.layers.1.self_attn.indexer.Mul_165
-const_1d_190v_model.layers.1.self_attn.indexer.Unsqueeze_1663model/layers.1/self_attn/indexer/Unsqueeze_node_166"	UnsqueezeJò
-	namespaceä: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/indexer: GlmMoeDsaIndexerJï
-pkg.onnxscript.class_hierarchys['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'GlmMoeDsaIndexer']JO
-pkg.onnxscript.name_scopes1['', 'model', 'layers.1', 'self_attn', 'indexer']JØ
-$pkg.onnxscript.shape_inference_errorÜType of input 0 value v_model.layers.1.self_attn.indexer.Mul_165 of node model/layers.1/self_attn/indexer/Unsqueeze_node_166 not known
-
-+v_model.layers.1.self_attn.indexer.Relu_161
-0v_model.layers.1.self_attn.indexer.Unsqueeze_166*v_model.layers.1.self_attn.indexer.Mul_167-model/layers.1/self_attn/indexer/Mul_node_167"MulJò
-	namespaceä: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/indexer: GlmMoeDsaIndexerJï
-pkg.onnxscript.class_hierarchys['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'GlmMoeDsaIndexer']JO
-pkg.onnxscript.name_scopes1['', 'model', 'layers.1', 'self_attn', 'indexer']J™
-$pkg.onnxscript.shape_inference_errorÅType of input 0 value v_model.layers.1.self_attn.indexer.Relu_161 of node model/layers.1/self_attn/indexer/Mul_node_167 not known
-Ò
-*v_model.layers.1.self_attn.indexer.Mul_167
-
-const_1d_20v_model.layers.1.self_attn.indexer.ReduceSum_1683model/layers.1/self_attn/indexer/ReduceSum_node_168"	ReduceSum*
-keepdims †Jò
-	namespaceä: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/indexer: GlmMoeDsaIndexerJï
-pkg.onnxscript.class_hierarchys['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'GlmMoeDsaIndexer']JO
-pkg.onnxscript.name_scopes1['', 'model', 'layers.1', 'self_attn', 'indexer']JØ
-$pkg.onnxscript.shape_inference_errorÜType of input 0 value v_model.layers.1.self_attn.indexer.Mul_167 of node model/layers.1/self_attn/indexer/ReduceSum_node_168 not known
-Í
-0v_model.layers.1.self_attn.indexer.ReduceSum_168,v_model.layers.1.self_attn.indexer.Shape_169/model/layers.1/self_attn/indexer/Shape_node_169"Shape*
-
-end†*
-start†Jò
-	namespaceä: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/indexer: GlmMoeDsaIndexerJï
-pkg.onnxscript.class_hierarchys['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'GlmMoeDsaIndexer']JO
-pkg.onnxscript.name_scopes1['', 'model', 'layers.1', 'self_attn', 'indexer']J±
-$pkg.onnxscript.shape_inference_erroràType of input 0 value v_model.layers.1.self_attn.indexer.ReduceSum_168 of node model/layers.1/self_attn/indexer/Shape_node_169 not known
-í
-v_model.Unsqueeze_16
-
-const_1d_1.v_model.layers.1.self_attn.indexer.Squeeze_1701model/layers.1/self_attn/indexer/Squeeze_node_170"SqueezeJò
-	namespaceä: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/indexer: GlmMoeDsaIndexerJï
-pkg.onnxscript.class_hierarchys['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'GlmMoeDsaIndexer']JO
-pkg.onnxscript.name_scopes1['', 'model', 'layers.1', 'self_attn', 'indexer']
-Ü/v_model.layers.1.self_attn.indexer.Constant_1712model/layers.1/self_attn/indexer/Constant_node_171"Constant*
-
-value_ints@ †Jò
-	namespaceä: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/indexer: GlmMoeDsaIndexerJï
-pkg.onnxscript.class_hierarchys['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'GlmMoeDsaIndexer']JO
-pkg.onnxscript.name_scopes1['', 'model', 'layers.1', 'self_attn', 'indexer']
-Ü/v_model.layers.1.self_attn.indexer.Constant_1722model/layers.1/self_attn/indexer/Constant_node_172"Constant*
-
-value_ints@†Jò
-	namespaceä: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/indexer: GlmMoeDsaIndexerJï
-pkg.onnxscript.class_hierarchys['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'GlmMoeDsaIndexer']JO
-pkg.onnxscript.name_scopes1['', 'model', 'layers.1', 'self_attn', 'indexer']
-⁄
-.v_model.layers.1.self_attn.indexer.Squeeze_170
-/v_model.layers.1.self_attn.indexer.Constant_171
-,v_model.layers.1.self_attn.indexer.Shape_169
-/v_model.layers.1.self_attn.indexer.Constant_172,v_model.layers.1.self_attn.indexer.Slice_173/model/layers.1/self_attn/indexer/Slice_node_173"SliceJò
-	namespaceä: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/indexer: GlmMoeDsaIndexerJï
-pkg.onnxscript.class_hierarchys['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'GlmMoeDsaIndexer']JO
-pkg.onnxscript.name_scopes1['', 'model', 'layers.1', 'self_attn', 'indexer']J≠
-$pkg.onnxscript.shape_inference_errorÑType of input 2 value v_model.layers.1.self_attn.indexer.Shape_169 of node model/layers.1/self_attn/indexer/Slice_node_173 not known
-œ
-,v_model.layers.1.self_attn.indexer.Slice_173+v_model.layers.1.self_attn.indexer.Cast_174.model/layers.1/self_attn/indexer/Cast_node_174"Cast*	
-to†Jò
-	namespaceä: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/indexer: GlmMoeDsaIndexerJï
-pkg.onnxscript.class_hierarchys['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'GlmMoeDsaIndexer']JO
-pkg.onnxscript.name_scopes1['', 'model', 'layers.1', 'self_attn', 'indexer']J¨
-$pkg.onnxscript.shape_inference_errorÉType of input 0 value v_model.layers.1.self_attn.indexer.Slice_173 of node model/layers.1/self_attn/indexer/Cast_node_174 not known
-ı
-0v_model.layers.1.self_attn.indexer.ReduceSum_168
-+v_model.layers.1.self_attn.indexer.Cast_174*v_model.layers.1.self_attn.indexer.Add_175-model/layers.1/self_attn/indexer/Add_node_175"AddJò
-	namespaceä: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/indexer: GlmMoeDsaIndexerJï
-pkg.onnxscript.class_hierarchys['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'GlmMoeDsaIndexer']JO
-pkg.onnxscript.name_scopes1['', 'model', 'layers.1', 'self_attn', 'indexer']JØ
-$pkg.onnxscript.shape_inference_errorÜType of input 0 value v_model.layers.1.self_attn.indexer.ReduceSum_168 of node model/layers.1/self_attn/indexer/Add_node_175 not known
-Ü/v_model.layers.1.self_attn.indexer.Constant_1762model/layers.1/self_attn/indexer/Constant_node_176"Constant*
-
-value_ints@†Jò
-	namespaceä: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/indexer: GlmMoeDsaIndexerJï
-pkg.onnxscript.class_hierarchys['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'GlmMoeDsaIndexer']JO
-pkg.onnxscript.name_scopes1['', 'model', 'layers.1', 'self_attn', 'indexer']
-Ò
-,v_model.layers.1.self_attn.indexer.Shape_169
-/v_model.layers.1.self_attn.indexer.Constant_176*v_model.layers.1.self_attn.indexer.Min_177-model/layers.1/self_attn/indexer/Min_node_177"MinJò
-	namespaceä: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/indexer: GlmMoeDsaIndexerJï
-pkg.onnxscript.class_hierarchys['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'GlmMoeDsaIndexer']JO
-pkg.onnxscript.name_scopes1['', 'model', 'layers.1', 'self_attn', 'indexer']J´
-$pkg.onnxscript.shape_inference_errorÇType of input 0 value v_model.layers.1.self_attn.indexer.Shape_169 of node model/layers.1/self_attn/indexer/Min_node_177 not known
-“
-*v_model.layers.1.self_attn.indexer.Add_175
-*v_model.layers.1.self_attn.indexer.Min_177-v_model.layers.1.self_attn.indexer.TopK_178_0-v_model.layers.1.self_attn.indexer.TopK_178_1.model/layers.1/self_attn/indexer/TopK_node_178"TopK*
-sorted †*
-largest†*
-axisˇˇˇˇˇˇˇˇˇ†Jò
-	namespaceä: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/indexer: GlmMoeDsaIndexerJï
-pkg.onnxscript.class_hierarchys['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'GlmMoeDsaIndexer']JO
-pkg.onnxscript.name_scopes1['', 'model', 'layers.1', 'self_attn', 'indexer']J™
-$pkg.onnxscript.shape_inference_errorÅType of input 0 value v_model.layers.1.self_attn.indexer.Add_175 of node model/layers.1/self_attn/indexer/TopK_node_178 not known
-—
--v_model.layers.1.self_attn.indexer.TopK_178_1+v_model.layers.1.self_attn.indexer.Cast_179.model/layers.1/self_attn/indexer/Cast_node_179"Cast*	
-to†Jò
-	namespaceä: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/indexer: GlmMoeDsaIndexerJï
-pkg.onnxscript.class_hierarchys['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'GlmMoeDsaIndexer']JO
-pkg.onnxscript.name_scopes1['', 'model', 'layers.1', 'self_attn', 'indexer']J≠
-$pkg.onnxscript.shape_inference_errorÑType of input 0 value v_model.layers.1.self_attn.indexer.TopK_178_1 of node model/layers.1/self_attn/indexer/Cast_node_179 not known
-‘
-+v_model.layers.1.self_attn.indexer.Cast_179
-*v_model.layers.1.self_attn.indexer.Min_177-v_model.layers.1.self_attn.indexer.TopK_180_0-v_model.layers.1.self_attn.indexer.TopK_180_1.model/layers.1/self_attn/indexer/TopK_node_180"TopK*
-sorted†*
-largest †*
-axisˇˇˇˇˇˇˇˇˇ†Jò
-	namespaceä: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/indexer: GlmMoeDsaIndexerJï
-pkg.onnxscript.class_hierarchys['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'GlmMoeDsaIndexer']JO
-pkg.onnxscript.name_scopes1['', 'model', 'layers.1', 'self_attn', 'indexer']J´
-$pkg.onnxscript.shape_inference_errorÇType of input 0 value v_model.layers.1.self_attn.indexer.Cast_179 of node model/layers.1/self_attn/indexer/TopK_node_180 not known
-—
--v_model.layers.1.self_attn.indexer.TopK_180_0+v_model.layers.1.self_attn.indexer.Cast_181.model/layers.1/self_attn/indexer/Cast_node_181"Cast*	
-to†Jò
-	namespaceä: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/indexer: GlmMoeDsaIndexerJï
-pkg.onnxscript.class_hierarchys['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'GlmMoeDsaIndexer']JO
-pkg.onnxscript.name_scopes1['', 'model', 'layers.1', 'self_attn', 'indexer']J≠
-$pkg.onnxscript.shape_inference_errorÑType of input 0 value v_model.layers.1.self_attn.indexer.TopK_180_0 of node model/layers.1/self_attn/indexer/Cast_node_181 not known
-¸
-&v_model.layers.1.self_attn.Reshape_129
-
-const_1d_5&v_model.layers.1.self_attn.Reshape_182)model/layers.1/self_attn/Reshape_node_182"ReshapeJ}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.1', 'self_attn']J†
-$pkg.onnxscript.shape_inference_errorxType of input 0 value v_model.layers.1.self_attn.Reshape_129 of node model/layers.1/self_attn/Reshape_node_182 not known
-ã
-&v_model.layers.1.self_attn.Reshape_182(v_model.layers.1.self_attn.Transpose_183+model/layers.1/self_attn/Transpose_node_183"	Transpose*
-perm@ @@@†J}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.1', 'self_attn']J¢
-$pkg.onnxscript.shape_inference_errorzType of input 0 value v_model.layers.1.self_attn.Reshape_182 of node model/layers.1/self_attn/Transpose_node_183 not known
-¸
-&v_model.layers.1.self_attn.Reshape_142
-
-const_1d_5&v_model.layers.1.self_attn.Reshape_184)model/layers.1/self_attn/Reshape_node_184"ReshapeJ}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.1', 'self_attn']J†
-$pkg.onnxscript.shape_inference_errorxType of input 0 value v_model.layers.1.self_attn.Reshape_142 of node model/layers.1/self_attn/Reshape_node_184 not known
-ã
-&v_model.layers.1.self_attn.Reshape_184(v_model.layers.1.self_attn.Transpose_185+model/layers.1/self_attn/Transpose_node_185"	Transpose*
-perm@ @@@†J}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.1', 'self_attn']J¢
-$pkg.onnxscript.shape_inference_errorzType of input 0 value v_model.layers.1.self_attn.Reshape_184 of node model/layers.1/self_attn/Transpose_node_185 not known
-¸
-&v_model.layers.1.self_attn.Reshape_136
-
-const_1d_8&v_model.layers.1.self_attn.Reshape_186)model/layers.1/self_attn/Reshape_node_186"ReshapeJ}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.1', 'self_attn']J†
-$pkg.onnxscript.shape_inference_errorxType of input 0 value v_model.layers.1.self_attn.Reshape_136 of node model/layers.1/self_attn/Reshape_node_186 not known
-ã
-&v_model.layers.1.self_attn.Reshape_186(v_model.layers.1.self_attn.Transpose_187+model/layers.1/self_attn/Transpose_node_187"	Transpose*
-perm@ @@@†J}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.1', 'self_attn']J¢
-$pkg.onnxscript.shape_inference_errorzType of input 0 value v_model.layers.1.self_attn.Reshape_186 of node model/layers.1/self_attn/Transpose_node_187 not known
-ß
-(v_model.layers.1.self_attn.Transpose_146
-(v_model.layers.1.self_attn.Transpose_185%v_model.layers.1.self_attn.Concat_188(model/layers.1/self_attn/Concat_node_188"Concat*
-axis†J}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.1', 'self_attn']J°
-$pkg.onnxscript.shape_inference_erroryType of input 1 value v_model.layers.1.self_attn.Transpose_185 of node model/layers.1/self_attn/Concat_node_188 not known
-ß
-(v_model.layers.1.self_attn.Transpose_149
-(v_model.layers.1.self_attn.Transpose_187%v_model.layers.1.self_attn.Concat_189(model/layers.1/self_attn/Concat_node_189"Concat*
-axis†J}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.1', 'self_attn']J°
-$pkg.onnxscript.shape_inference_erroryType of input 1 value v_model.layers.1.self_attn.Transpose_187 of node model/layers.1/self_attn/Concat_node_189 not known
-Ä
-%v_model.layers.1.self_attn.Concat_189$v_model.layers.1.self_attn.Shape_190'model/layers.1/self_attn/Shape_node_190"Shape*
-
-end†*
-start †J}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.1', 'self_attn']Jù
-$pkg.onnxscript.shape_inference_erroruType of input 0 value v_model.layers.1.self_attn.Concat_189 of node model/layers.1/self_attn/Shape_node_190 not known
-ª'v_model.layers.1.self_attn.Constant_191*model/layers.1/self_attn/Constant_node_191"Constant*
-
-value_ints@†J}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.1', 'self_attn']
-û
-$v_model.layers.1.self_attn.Shape_190
-'v_model.layers.1.self_attn.Constant_191%v_model.layers.1.self_attn.Concat_192(model/layers.1/self_attn/Concat_node_192"Concat*
-axis †J}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.1', 'self_attn']Jù
-$pkg.onnxscript.shape_inference_erroruType of input 0 value v_model.layers.1.self_attn.Shape_190 of node model/layers.1/self_attn/Concat_node_192 not known
-ø'v_model.layers.1.self_attn.Constant_193*model/layers.1/self_attn/Constant_node_193"Constant*
-value_float    †J}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.1', 'self_attn']
-–
-'v_model.layers.1.self_attn.Constant_193#v_model.layers.1.self_attn.Cast_194&model/layers.1/self_attn/Cast_node_194"Cast*	
-to†J}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.1', 'self_attn']
-è
-#v_model.layers.1.self_attn.Cast_194
-%v_model.layers.1.self_attn.Concat_192%v_model.layers.1.self_attn.Expand_195(model/layers.1/self_attn/Expand_node_195"ExpandJ}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.1', 'self_attn']Jû
-$pkg.onnxscript.shape_inference_errorvType of input 1 value v_model.layers.1.self_attn.Concat_192 of node model/layers.1/self_attn/Expand_node_195 not known
-û
-%v_model.layers.1.self_attn.Concat_189
-%v_model.layers.1.self_attn.Expand_195%v_model.layers.1.self_attn.Concat_196(model/layers.1/self_attn/Concat_node_196"Concat*
-axis†J}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.1', 'self_attn']Jû
-$pkg.onnxscript.shape_inference_errorvType of input 0 value v_model.layers.1.self_attn.Concat_189 of node model/layers.1/self_attn/Concat_node_196 not known
-é
-+v_model.layers.1.self_attn.indexer.Cast_181
-
-const_1d_1(v_model.layers.1.self_attn.Unsqueeze_197+model/layers.1/self_attn/Unsqueeze_node_197"	UnsqueezeJ}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.1', 'self_attn']Jß
-$pkg.onnxscript.shape_inference_errorType of input 0 value v_model.layers.1.self_attn.indexer.Cast_181 of node model/layers.1/self_attn/Unsqueeze_node_197 not known
-æ
-(v_model.layers.1.self_attn.Transpose_183
-%v_model.layers.1.self_attn.Concat_188
-%v_model.layers.1.self_attn.Concat_196
- 
- 
-(v_model.layers.1.self_attn.Unsqueeze_197)v_model.layers.1.self_attn.IndexShare_198,model/layers.1/self_attn/IndexShare_node_198"
-IndexShare*
-	num_heads†*
-kv_num_heads†*
-scaleÏQ>†:pkg.nxrtJ}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.1', 'self_attn']J•
-$pkg.onnxscript.shape_inference_error}Type of input 0 value v_model.layers.1.self_attn.Transpose_183 of node model/layers.1/self_attn/IndexShare_node_198 not known
-ï
-)v_model.layers.1.self_attn.IndexShare_198
-const_1d_14
-const_1d_20
-const_1d_19$v_model.layers.1.self_attn.Slice_199'model/layers.1/self_attn/Slice_node_199"SliceJ}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.1', 'self_attn']J°
-$pkg.onnxscript.shape_inference_erroryType of input 0 value v_model.layers.1.self_attn.IndexShare_198 of node model/layers.1/self_attn/Slice_node_199 not known
-á
-$v_model.layers.1.self_attn.Slice_199(v_model.layers.1.self_attn.Transpose_200+model/layers.1/self_attn/Transpose_node_200"	Transpose*
-perm@ @@@†J}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.1', 'self_attn']J†
-$pkg.onnxscript.shape_inference_errorxType of input 0 value v_model.layers.1.self_attn.Slice_199 of node model/layers.1/self_attn/Transpose_node_200 not known
-Å
-(v_model.layers.1.self_attn.Transpose_200
-const_1d_21&v_model.layers.1.self_attn.Reshape_201)model/layers.1/self_attn/Reshape_node_201"ReshapeJ}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.1', 'self_attn']J¢
-$pkg.onnxscript.shape_inference_errorzType of input 0 value v_model.layers.1.self_attn.Transpose_200 of node model/layers.1/self_attn/Reshape_node_201 not known
-‡
-&v_model.layers.1.self_attn.Reshape_201
-&model.layers.1.self_attn.o_proj.weight
-&model.layers.1.self_attn.o_proj.scales1v_model.layers.1.self_attn.o_proj.MatMulNBits_2024model/layers.1/self_attn/o_proj/MatMulNBits_node_202"MatMulNBits*
-K@†*
-N@†*
-bits†*
-
-block_size †:com.microsoftJñ
-	namespaceà: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention/o_proj: QuantizedLinearJî
-pkg.onnxscript.class_hierarchyr['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention', 'QuantizedLinear']JN
-pkg.onnxscript.name_scopes0['', 'model', 'layers.1', 'self_attn', 'o_proj']J¨
-$pkg.onnxscript.shape_inference_errorÉType of input 0 value v_model.layers.1.self_attn.Reshape_201 of node model/layers.1/self_attn/o_proj/MatMulNBits_node_202 not known
-â
-%v_model.layers.1.self_attn.Concat_188(v_model.layers.1.self_attn.Transpose_203+model/layers.1/self_attn/Transpose_node_203"	Transpose*
-perm@ @@@†J}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.1', 'self_attn']J°
-$pkg.onnxscript.shape_inference_erroryType of input 0 value v_model.layers.1.self_attn.Concat_188 of node model/layers.1/self_attn/Transpose_node_203 not known
-Å
-(v_model.layers.1.self_attn.Transpose_203
-const_1d_10&v_model.layers.1.self_attn.Reshape_204)model/layers.1/self_attn/Reshape_node_204"ReshapeJ}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.1', 'self_attn']J¢
-$pkg.onnxscript.shape_inference_errorzType of input 0 value v_model.layers.1.self_attn.Transpose_203 of node model/layers.1/self_attn/Reshape_node_204 not known
-±
-&v_model.layers.1.self_attn.Reshape_204
--v_model.layers.1.self_attn.indexer.Concat_154%v_model.layers.1.self_attn.Concat_205(model/layers.1/self_attn/Concat_node_205"Concat*
-axisˇˇˇˇˇˇˇˇˇ†J}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.1', 'self_attn']Jü
-$pkg.onnxscript.shape_inference_errorwType of input 0 value v_model.layers.1.self_attn.Reshape_204 of node model/layers.1/self_attn/Concat_node_205 not known
-â
-%v_model.layers.1.self_attn.Concat_189(v_model.layers.1.self_attn.Transpose_206+model/layers.1/self_attn/Transpose_node_206"	Transpose*
-perm@ @@@†J}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.1', 'self_attn']J°
-$pkg.onnxscript.shape_inference_erroryType of input 0 value v_model.layers.1.self_attn.Concat_189 of node model/layers.1/self_attn/Transpose_node_206 not known
-Å
-(v_model.layers.1.self_attn.Transpose_206
-const_1d_21&v_model.layers.1.self_attn.Reshape_207)model/layers.1/self_attn/Reshape_node_207"ReshapeJ}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.1', 'self_attn']J¢
-$pkg.onnxscript.shape_inference_errorzType of input 0 value v_model.layers.1.self_attn.Transpose_206 of node model/layers.1/self_attn/Reshape_node_207 not known
-Á
-%v_model.layers.1.self_attn.Concat_205
-
-const_1d_1present.1.key+model/layers.1/self_attn/Unsqueeze_node_208"	UnsqueezeJ}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.1', 'self_attn']J°
-$pkg.onnxscript.shape_inference_erroryType of input 0 value v_model.layers.1.self_attn.Concat_205 of node model/layers.1/self_attn/Unsqueeze_node_208 not known
-Î
-&v_model.layers.1.self_attn.Reshape_207
-
-const_1d_1present.1.value+model/layers.1/self_attn/Unsqueeze_node_209"	UnsqueezeJ}
-	namespacep: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttentionJÅ
-pkg.onnxscript.class_hierarchy_['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'GlmMoeDsaAttention']JD
-pkg.onnxscript.name_scopes&['', 'model', 'layers.1', 'self_attn']J¢
-$pkg.onnxscript.shape_inference_errorzType of input 0 value v_model.layers.1.self_attn.Reshape_207 of node model/layers.1/self_attn/Unsqueeze_node_209 not known
-ó
-v_model.layers.0.Add_117
-1v_model.layers.1.self_attn.o_proj.MatMulNBits_202v_model.layers.1.Add_210model/layers.1/Add_node_210"AddJ_
-	namespaceR: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayerJk
-pkg.onnxscript.class_hierarchyI['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer']J7
-pkg.onnxscript.name_scopes['', 'model', 'layers.1']JÑ
-$pkg.onnxscript.shape_inference_error\Type of input 0 value v_model.layers.0.Add_117 of node model/layers.1/Add_node_210 not known
-á
-v_model.layers.1.Add_210
-.model.layers.1.post_attention_layernorm.weight>v_model.layers.1.post_attention_layernorm.RMSNormalization_211Amodel/layers.1/post_attention_layernorm/RMSNormalization_node_211"RMSNormalization*
-epsilonΩ7Ü5†*
-axisˇˇˇˇˇˇˇˇˇ†JÅ
-	namespacet: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/post_attention_layernorm: RMSNormJv
-pkg.onnxscript.class_hierarchyT['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', 'RMSNorm']JS
-pkg.onnxscript.name_scopes5['', 'model', 'layers.1', 'post_attention_layernorm']J´
-$pkg.onnxscript.shape_inference_errorÇType of input 0 value v_model.layers.1.Add_210 of node model/layers.1/post_attention_layernorm/RMSNormalization_node_211 not known
-µ
->v_model.layers.1.post_attention_layernorm.RMSNormalization_211"v_model.layers.1.mlp.moe.Shape_212%model/layers.1/mlp/moe/Shape_node_212"ShapeJã
-	namespace~: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/mlp: _DeepSeekMoEFFN/moe: FusedQuantizedMoEJì
-pkg.onnxscript.class_hierarchyq['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', '_DeepSeekMoEFFN', 'FusedQuantizedMoE']JE
-pkg.onnxscript.name_scopes'['', 'model', 'layers.1', 'mlp', 'moe']Jµ
-$pkg.onnxscript.shape_inference_erroråType of input 0 value v_model.layers.1.post_attention_layernorm.RMSNormalization_211 of node model/layers.1/mlp/moe/Shape_node_212 not known
-‰%v_model.layers.1.mlp.moe.Constant_213(model/layers.1/mlp/moe/Constant_node_213"Constant*
-
-value_ints@ˇˇˇˇˇˇˇˇˇ@@†Jã
-	namespace~: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/mlp: _DeepSeekMoEFFN/moe: FusedQuantizedMoEJì
-pkg.onnxscript.class_hierarchyq['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', '_DeepSeekMoEFFN', 'FusedQuantizedMoE']JE
-pkg.onnxscript.name_scopes'['', 'model', 'layers.1', 'mlp', 'moe']
-‰
->v_model.layers.1.post_attention_layernorm.RMSNormalization_211
-%v_model.layers.1.mlp.moe.Constant_213$v_model.layers.1.mlp.moe.Reshape_214'model/layers.1/mlp/moe/Reshape_node_214"ReshapeJã
-	namespace~: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/mlp: _DeepSeekMoEFFN/moe: FusedQuantizedMoEJì
-pkg.onnxscript.class_hierarchyq['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', '_DeepSeekMoEFFN', 'FusedQuantizedMoE']JE
-pkg.onnxscript.name_scopes'['', 'model', 'layers.1', 'mlp', 'moe']J∑
-$pkg.onnxscript.shape_inference_erroréType of input 0 value v_model.layers.1.post_attention_layernorm.RMSNormalization_211 of node model/layers.1/mlp/moe/Reshape_node_214 not known
-á
-$v_model.layers.1.mlp.moe.Reshape_214!v_model.layers.1.mlp.moe.Cast_215$model/layers.1/mlp/moe/Cast_node_215"Cast*	
-to†Jã
-	namespace~: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/mlp: _DeepSeekMoEFFN/moe: FusedQuantizedMoEJì
-pkg.onnxscript.class_hierarchyq['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', '_DeepSeekMoEFFN', 'FusedQuantizedMoE']JE
-pkg.onnxscript.name_scopes'['', 'model', 'layers.1', 'mlp', 'moe']Jô
-$pkg.onnxscript.shape_inference_errorqType of input 0 value v_model.layers.1.mlp.moe.Reshape_214 of node model/layers.1/mlp/moe/Cast_node_215 not known
-π
-"model.layers.1.mlp.moe.gate.weight+v_model.layers.1.mlp.moe.gate.Transpose_216.model/layers.1/mlp/moe/gate/Transpose_node_216"	Transpose*
-perm@@ †J¢
-	namespaceî: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/mlp: _DeepSeekMoEFFN/moe: FusedQuantizedMoE/gate: DeepSeekMoEGateJß
-pkg.onnxscript.class_hierarchyÑ['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', '_DeepSeekMoEFFN', 'FusedQuantizedMoE', 'DeepSeekMoEGate']JM
-pkg.onnxscript.name_scopes/['', 'model', 'layers.1', 'mlp', 'moe', 'gate']
-√
-!v_model.layers.1.mlp.moe.Cast_215&v_model.layers.1.mlp.moe.gate.Cast_217)model/layers.1/mlp/moe/gate/Cast_node_217"Cast*	
-to†J¢
-	namespaceî: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/mlp: _DeepSeekMoEFFN/moe: FusedQuantizedMoE/gate: DeepSeekMoEGateJß
-pkg.onnxscript.class_hierarchyÑ['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', '_DeepSeekMoEFFN', 'FusedQuantizedMoE', 'DeepSeekMoEGate']JM
-pkg.onnxscript.name_scopes/['', 'model', 'layers.1', 'mlp', 'moe', 'gate']Jõ
-$pkg.onnxscript.shape_inference_errorsType of input 0 value v_model.layers.1.mlp.moe.Cast_215 of node model/layers.1/mlp/moe/gate/Cast_node_217 not known
-˜
-&v_model.layers.1.mlp.moe.gate.Cast_217
-+v_model.layers.1.mlp.moe.gate.Transpose_216(v_model.layers.1.mlp.moe.gate.MatMul_218+model/layers.1/mlp/moe/gate/MatMul_node_218"MatMulJ¢
-	namespaceî: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/mlp: _DeepSeekMoEFFN/moe: FusedQuantizedMoE/gate: DeepSeekMoEGateJß
-pkg.onnxscript.class_hierarchyÑ['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', '_DeepSeekMoEFFN', 'FusedQuantizedMoE', 'DeepSeekMoEGate']JM
-pkg.onnxscript.name_scopes/['', 'model', 'layers.1', 'mlp', 'moe', 'gate']J¢
-$pkg.onnxscript.shape_inference_errorzType of input 0 value v_model.layers.1.mlp.moe.gate.Cast_217 of node model/layers.1/mlp/moe/gate/MatMul_node_218 not known
-“
-(v_model.layers.1.mlp.moe.gate.MatMul_218)v_model.layers.1.mlp.moe.gate.Sigmoid_219,model/layers.1/mlp/moe/gate/Sigmoid_node_219"SigmoidJ¢
-	namespaceî: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/mlp: _DeepSeekMoEFFN/moe: FusedQuantizedMoE/gate: DeepSeekMoEGateJß
-pkg.onnxscript.class_hierarchyÑ['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', '_DeepSeekMoEFFN', 'FusedQuantizedMoE', 'DeepSeekMoEGate']JM
-pkg.onnxscript.name_scopes/['', 'model', 'layers.1', 'mlp', 'moe', 'gate']J•
-$pkg.onnxscript.shape_inference_error}Type of input 0 value v_model.layers.1.mlp.moe.gate.MatMul_218 of node model/layers.1/mlp/moe/gate/Sigmoid_node_219 not known
-˘
-)v_model.layers.1.mlp.moe.gate.Sigmoid_219
-3model.layers.1.mlp.moe.gate.e_score_correction_bias%v_model.layers.1.mlp.moe.gate.Add_220(model/layers.1/mlp/moe/gate/Add_node_220"AddJ¢
-	namespaceî: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/mlp: _DeepSeekMoEFFN/moe: FusedQuantizedMoE/gate: DeepSeekMoEGateJß
-pkg.onnxscript.class_hierarchyÑ['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', '_DeepSeekMoEFFN', 'FusedQuantizedMoE', 'DeepSeekMoEGate']JM
-pkg.onnxscript.name_scopes/['', 'model', 'layers.1', 'mlp', 'moe', 'gate']J¢
-$pkg.onnxscript.shape_inference_errorzType of input 0 value v_model.layers.1.mlp.moe.gate.Sigmoid_219 of node model/layers.1/mlp/moe/gate/Add_node_220 not known
-ñ*v_model.layers.1.mlp.moe.gate.Constant_221-model/layers.1/mlp/moe/gate/Constant_node_221"Constant*
-
-value_ints@†J¢
-	namespaceî: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/mlp: _DeepSeekMoEFFN/moe: FusedQuantizedMoE/gate: DeepSeekMoEGateJß
-pkg.onnxscript.class_hierarchyÑ['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', '_DeepSeekMoEFFN', 'FusedQuantizedMoE', 'DeepSeekMoEGate']JM
-pkg.onnxscript.name_scopes/['', 'model', 'layers.1', 'mlp', 'moe', 'gate']
-Æ
-%v_model.layers.1.mlp.moe.gate.Add_220
-*v_model.layers.1.mlp.moe.gate.Constant_221(v_model.layers.1.mlp.moe.gate.TopK_222_0(v_model.layers.1.mlp.moe.gate.TopK_222_1)model/layers.1/mlp/moe/gate/TopK_node_222"TopK*
-axisˇˇˇˇˇˇˇˇˇ†J¢
-	namespaceî: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/mlp: _DeepSeekMoEFFN/moe: FusedQuantizedMoE/gate: DeepSeekMoEGateJß
-pkg.onnxscript.class_hierarchyÑ['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', '_DeepSeekMoEFFN', 'FusedQuantizedMoE', 'DeepSeekMoEGate']JM
-pkg.onnxscript.name_scopes/['', 'model', 'layers.1', 'mlp', 'moe', 'gate']Jü
-$pkg.onnxscript.shape_inference_errorwType of input 0 value v_model.layers.1.mlp.moe.gate.Add_220 of node model/layers.1/mlp/moe/gate/TopK_node_222 not known
-±
-)v_model.layers.1.mlp.moe.gate.Sigmoid_219
-(v_model.layers.1.mlp.moe.gate.TopK_222_10v_model.layers.1.mlp.moe.gate.GatherElements_2233model/layers.1/mlp/moe/gate/GatherElements_node_223"GatherElements*
-axisˇˇˇˇˇˇˇˇˇ†J¢
-	namespaceî: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/mlp: _DeepSeekMoEFFN/moe: FusedQuantizedMoE/gate: DeepSeekMoEGateJß
-pkg.onnxscript.class_hierarchyÑ['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', '_DeepSeekMoEFFN', 'FusedQuantizedMoE', 'DeepSeekMoEGate']JM
-pkg.onnxscript.name_scopes/['', 'model', 'layers.1', 'mlp', 'moe', 'gate']JÆ
-$pkg.onnxscript.shape_inference_errorÖType of input 0 value v_model.layers.1.mlp.moe.gate.Sigmoid_219 of node model/layers.1/mlp/moe/gate/GatherElements_node_223 not known
-â
-0v_model.layers.1.mlp.moe.gate.GatherElements_223
-const_1d_22+v_model.layers.1.mlp.moe.gate.ReduceSum_224.model/layers.1/mlp/moe/gate/ReduceSum_node_224"	ReduceSum*
-keepdims†J¢
-	namespaceî: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/mlp: _DeepSeekMoEFFN/moe: FusedQuantizedMoE/gate: DeepSeekMoEGateJß
-pkg.onnxscript.class_hierarchyÑ['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', '_DeepSeekMoEFFN', 'FusedQuantizedMoE', 'DeepSeekMoEGate']JM
-pkg.onnxscript.name_scopes/['', 'model', 'layers.1', 'mlp', 'moe', 'gate']J∞
-$pkg.onnxscript.shape_inference_erroráType of input 0 value v_model.layers.1.mlp.moe.gate.GatherElements_223 of node model/layers.1/mlp/moe/gate/ReduceSum_node_224 not known
-Ó
-const_1e-20_f32
-+v_model.layers.1.mlp.moe.gate.ReduceSum_224*v_model.layers.1.mlp.moe.gate.CastLike_225-model/layers.1/mlp/moe/gate/CastLike_node_225"CastLikeJ¢
-	namespaceî: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/mlp: _DeepSeekMoEFFN/moe: FusedQuantizedMoE/gate: DeepSeekMoEGateJß
-pkg.onnxscript.class_hierarchyÑ['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', '_DeepSeekMoEFFN', 'FusedQuantizedMoE', 'DeepSeekMoEGate']JM
-pkg.onnxscript.name_scopes/['', 'model', 'layers.1', 'mlp', 'moe', 'gate']J™
-$pkg.onnxscript.shape_inference_errorÅType of input 1 value v_model.layers.1.mlp.moe.gate.ReduceSum_224 of node model/layers.1/mlp/moe/gate/CastLike_node_225 not known
-Ù
-+v_model.layers.1.mlp.moe.gate.ReduceSum_224
-*v_model.layers.1.mlp.moe.gate.CastLike_225%v_model.layers.1.mlp.moe.gate.Add_226(model/layers.1/mlp/moe/gate/Add_node_226"AddJ¢
-	namespaceî: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/mlp: _DeepSeekMoEFFN/moe: FusedQuantizedMoE/gate: DeepSeekMoEGateJß
-pkg.onnxscript.class_hierarchyÑ['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', '_DeepSeekMoEFFN', 'FusedQuantizedMoE', 'DeepSeekMoEGate']JM
-pkg.onnxscript.name_scopes/['', 'model', 'layers.1', 'mlp', 'moe', 'gate']J§
-$pkg.onnxscript.shape_inference_error|Type of input 0 value v_model.layers.1.mlp.moe.gate.ReduceSum_224 of node model/layers.1/mlp/moe/gate/Add_node_226 not known
-˙
-0v_model.layers.1.mlp.moe.gate.GatherElements_223
-%v_model.layers.1.mlp.moe.gate.Add_226%v_model.layers.1.mlp.moe.gate.Div_227(model/layers.1/mlp/moe/gate/Div_node_227"DivJ¢
-	namespaceî: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/mlp: _DeepSeekMoEFFN/moe: FusedQuantizedMoE/gate: DeepSeekMoEGateJß
-pkg.onnxscript.class_hierarchyÑ['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', '_DeepSeekMoEFFN', 'FusedQuantizedMoE', 'DeepSeekMoEGate']JM
-pkg.onnxscript.name_scopes/['', 'model', 'layers.1', 'mlp', 'moe', 'gate']J™
-$pkg.onnxscript.shape_inference_errorÅType of input 0 value v_model.layers.1.mlp.moe.gate.GatherElements_223 of node model/layers.1/mlp/moe/gate/Div_node_227 not known
-ﬂ
-const_2.5_f32
-%v_model.layers.1.mlp.moe.gate.Div_227*v_model.layers.1.mlp.moe.gate.CastLike_228-model/layers.1/mlp/moe/gate/CastLike_node_228"CastLikeJ¢
-	namespaceî: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/mlp: _DeepSeekMoEFFN/moe: FusedQuantizedMoE/gate: DeepSeekMoEGateJß
-pkg.onnxscript.class_hierarchyÑ['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', '_DeepSeekMoEFFN', 'FusedQuantizedMoE', 'DeepSeekMoEGate']JM
-pkg.onnxscript.name_scopes/['', 'model', 'layers.1', 'mlp', 'moe', 'gate']J£
-$pkg.onnxscript.shape_inference_error{Type of input 1 value v_model.layers.1.mlp.moe.gate.Div_227 of node model/layers.1/mlp/moe/gate/CastLike_node_228 not known
-Ë
-%v_model.layers.1.mlp.moe.gate.Div_227
-*v_model.layers.1.mlp.moe.gate.CastLike_228%v_model.layers.1.mlp.moe.gate.Mul_229(model/layers.1/mlp/moe/gate/Mul_node_229"MulJ¢
-	namespaceî: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/mlp: _DeepSeekMoEFFN/moe: FusedQuantizedMoE/gate: DeepSeekMoEGateJß
-pkg.onnxscript.class_hierarchyÑ['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', '_DeepSeekMoEFFN', 'FusedQuantizedMoE', 'DeepSeekMoEGate']JM
-pkg.onnxscript.name_scopes/['', 'model', 'layers.1', 'mlp', 'moe', 'gate']Jû
-$pkg.onnxscript.shape_inference_errorvType of input 0 value v_model.layers.1.mlp.moe.gate.Div_227 of node model/layers.1/mlp/moe/gate/Mul_node_229 not known
-ù
-const_0.0_f32
-%v_model.layers.1.mlp.moe.gate.Add_220%v_model.layers.1.mlp.moe.CastLike_230(model/layers.1/mlp/moe/CastLike_node_230"CastLikeJã
-	namespace~: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/mlp: _DeepSeekMoEFFN/moe: FusedQuantizedMoEJì
-pkg.onnxscript.class_hierarchyq['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', '_DeepSeekMoEFFN', 'FusedQuantizedMoE']JE
-pkg.onnxscript.name_scopes'['', 'model', 'layers.1', 'mlp', 'moe']Jû
-$pkg.onnxscript.shape_inference_errorvType of input 1 value v_model.layers.1.mlp.moe.gate.Add_220 of node model/layers.1/mlp/moe/CastLike_node_230 not known
-°
-%v_model.layers.1.mlp.moe.gate.Add_220
-%v_model.layers.1.mlp.moe.CastLike_230 v_model.layers.1.mlp.moe.Mul_231#model/layers.1/mlp/moe/Mul_node_231"MulJã
-	namespace~: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/mlp: _DeepSeekMoEFFN/moe: FusedQuantizedMoEJì
-pkg.onnxscript.class_hierarchyq['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', '_DeepSeekMoEFFN', 'FusedQuantizedMoE']JE
-pkg.onnxscript.name_scopes'['', 'model', 'layers.1', 'mlp', 'moe']Jô
-$pkg.onnxscript.shape_inference_errorqType of input 0 value v_model.layers.1.mlp.moe.gate.Add_220 of node model/layers.1/mlp/moe/Mul_node_231 not known
-á
- v_model.layers.1.mlp.moe.Mul_231
-(v_model.layers.1.mlp.moe.gate.TopK_222_1
-%v_model.layers.1.mlp.moe.gate.Mul_229,v_model.layers.1.mlp.moe.ScatterElements_232/model/layers.1/mlp/moe/ScatterElements_node_232"ScatterElements*
-axisˇˇˇˇˇˇˇˇˇ†Jã
-	namespace~: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/mlp: _DeepSeekMoEFFN/moe: FusedQuantizedMoEJì
-pkg.onnxscript.class_hierarchyq['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', '_DeepSeekMoEFFN', 'FusedQuantizedMoE']JE
-pkg.onnxscript.name_scopes'['', 'model', 'layers.1', 'mlp', 'moe']J†
-$pkg.onnxscript.shape_inference_errorxType of input 0 value v_model.layers.1.mlp.moe.Mul_231 of node model/layers.1/mlp/moe/ScatterElements_node_232 not known
-¨
-!v_model.layers.1.mlp.moe.Cast_215
-%v_model.layers.1.mlp.moe.gate.Add_220
-*model.layers.1.mlp.moe.fc1_experts_weights
-!model.layers.1.mlp.moe.fc1_scales
- 
-*model.layers.1.mlp.moe.fc2_experts_weights
-!model.layers.1.mlp.moe.fc2_scales
- 
- 
- 
- 
- 
- 
- 
-,v_model.layers.1.mlp.moe.ScatterElements_232!v_model.layers.1.mlp.moe.QMoE_233$model/layers.1/mlp/moe/QMoE_node_233"QMoE*
-activation_type"swiglu†*
-k†* 
-normalize_routing_weights †*
-swiglu_fusion†*
-expert_weight_bits†*
-
-block_size †*
-
-quant_type"int†:com.microsoftJã
-	namespace~: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/mlp: _DeepSeekMoEFFN/moe: FusedQuantizedMoEJì
-pkg.onnxscript.class_hierarchyq['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', '_DeepSeekMoEFFN', 'FusedQuantizedMoE']JE
-pkg.onnxscript.name_scopes'['', 'model', 'layers.1', 'mlp', 'moe']Jñ
-$pkg.onnxscript.shape_inference_errornType of input 0 value v_model.layers.1.mlp.moe.Cast_215 of node model/layers.1/mlp/moe/QMoE_node_233 not known
-∆
-!v_model.layers.1.mlp.moe.QMoE_233
->v_model.layers.1.post_attention_layernorm.RMSNormalization_211%v_model.layers.1.mlp.moe.CastLike_234(model/layers.1/mlp/moe/CastLike_node_234"CastLikeJã
-	namespace~: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/mlp: _DeepSeekMoEFFN/moe: FusedQuantizedMoEJì
-pkg.onnxscript.class_hierarchyq['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', '_DeepSeekMoEFFN', 'FusedQuantizedMoE']JE
-pkg.onnxscript.name_scopes'['', 'model', 'layers.1', 'mlp', 'moe']Jö
-$pkg.onnxscript.shape_inference_errorrType of input 0 value v_model.layers.1.mlp.moe.QMoE_233 of node model/layers.1/mlp/moe/CastLike_node_234 not known
-Æ
-%v_model.layers.1.mlp.moe.CastLike_234
-"v_model.layers.1.mlp.moe.Shape_212$v_model.layers.1.mlp.moe.Reshape_235'model/layers.1/mlp/moe/Reshape_node_235"ReshapeJã
-	namespace~: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/mlp: _DeepSeekMoEFFN/moe: FusedQuantizedMoEJì
-pkg.onnxscript.class_hierarchyq['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', '_DeepSeekMoEFFN', 'FusedQuantizedMoE']JE
-pkg.onnxscript.name_scopes'['', 'model', 'layers.1', 'mlp', 'moe']Jù
-$pkg.onnxscript.shape_inference_erroruType of input 0 value v_model.layers.1.mlp.moe.CastLike_234 of node model/layers.1/mlp/moe/Reshape_node_235 not known
-à
->v_model.layers.1.post_attention_layernorm.RMSNormalization_211
-2model.layers.1.mlp.shared_experts.gate_proj.weight
-2model.layers.1.mlp.shared_experts.gate_proj.scales=v_model.layers.1.mlp.shared_experts.gate_proj.MatMulNBits_236@model/layers.1/mlp/shared_experts/gate_proj/MatMulNBits_node_236"MatMulNBits*
-K@†*
-N †*
-bits†*
-
-block_size †:com.microsoftJ±
-	namespace£: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/mlp: _DeepSeekMoEFFN/shared_experts: _SharedExpertMLP/gate_proj: QuantizedLinearJ¶
-pkg.onnxscript.class_hierarchyÉ['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', '_DeepSeekMoEFFN', '_SharedExpertMLP', 'QuantizedLinear']J]
-pkg.onnxscript.name_scopes?['', 'model', 'layers.1', 'mlp', 'shared_experts', 'gate_proj']J–
-$pkg.onnxscript.shape_inference_errorßType of input 0 value v_model.layers.1.post_attention_layernorm.RMSNormalization_211 of node model/layers.1/mlp/shared_experts/gate_proj/MatMulNBits_node_236 not known
-Ò
-=v_model.layers.1.mlp.shared_experts.gate_proj.MatMulNBits_236/v_model.layers.1.mlp.shared_experts.Sigmoid_2372model/layers.1/mlp/shared_experts/Sigmoid_node_237"SigmoidJñ
-	namespaceà: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/mlp: _DeepSeekMoEFFN/shared_experts: _SharedExpertMLPJí
-pkg.onnxscript.class_hierarchyp['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', '_DeepSeekMoEFFN', '_SharedExpertMLP']JP
-pkg.onnxscript.name_scopes2['', 'model', 'layers.1', 'mlp', 'shared_experts']J¡
-$pkg.onnxscript.shape_inference_erroròType of input 0 value v_model.layers.1.mlp.shared_experts.gate_proj.MatMulNBits_236 of node model/layers.1/mlp/shared_experts/Sigmoid_node_237 not known
-í
-=v_model.layers.1.mlp.shared_experts.gate_proj.MatMulNBits_236
-/v_model.layers.1.mlp.shared_experts.Sigmoid_237+v_model.layers.1.mlp.shared_experts.Mul_238.model/layers.1/mlp/shared_experts/Mul_node_238"MulJñ
-	namespaceà: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/mlp: _DeepSeekMoEFFN/shared_experts: _SharedExpertMLPJí
-pkg.onnxscript.class_hierarchyp['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', '_DeepSeekMoEFFN', '_SharedExpertMLP']JP
-pkg.onnxscript.name_scopes2['', 'model', 'layers.1', 'mlp', 'shared_experts']JΩ
-$pkg.onnxscript.shape_inference_errorîType of input 0 value v_model.layers.1.mlp.shared_experts.gate_proj.MatMulNBits_236 of node model/layers.1/mlp/shared_experts/Mul_node_238 not known
-˙
->v_model.layers.1.post_attention_layernorm.RMSNormalization_211
-0model.layers.1.mlp.shared_experts.up_proj.weight
-0model.layers.1.mlp.shared_experts.up_proj.scales;v_model.layers.1.mlp.shared_experts.up_proj.MatMulNBits_239>model/layers.1/mlp/shared_experts/up_proj/MatMulNBits_node_239"MatMulNBits*
-K@†*
-N †*
-bits†*
-
-block_size †:com.microsoftJØ
-	namespace°: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/mlp: _DeepSeekMoEFFN/shared_experts: _SharedExpertMLP/up_proj: QuantizedLinearJ¶
-pkg.onnxscript.class_hierarchyÉ['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', '_DeepSeekMoEFFN', '_SharedExpertMLP', 'QuantizedLinear']J[
-pkg.onnxscript.name_scopes=['', 'model', 'layers.1', 'mlp', 'shared_experts', 'up_proj']JŒ
-$pkg.onnxscript.shape_inference_error•Type of input 0 value v_model.layers.1.post_attention_layernorm.RMSNormalization_211 of node model/layers.1/mlp/shared_experts/up_proj/MatMulNBits_node_239 not known
-˙
-+v_model.layers.1.mlp.shared_experts.Mul_238
-;v_model.layers.1.mlp.shared_experts.up_proj.MatMulNBits_239+v_model.layers.1.mlp.shared_experts.Mul_240.model/layers.1/mlp/shared_experts/Mul_node_240"MulJñ
-	namespaceà: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/mlp: _DeepSeekMoEFFN/shared_experts: _SharedExpertMLPJí
-pkg.onnxscript.class_hierarchyp['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', '_DeepSeekMoEFFN', '_SharedExpertMLP']JP
-pkg.onnxscript.name_scopes2['', 'model', 'layers.1', 'mlp', 'shared_experts']J´
-$pkg.onnxscript.shape_inference_errorÇType of input 0 value v_model.layers.1.mlp.shared_experts.Mul_238 of node model/layers.1/mlp/shared_experts/Mul_node_240 not known
-‚
-+v_model.layers.1.mlp.shared_experts.Mul_240
-2model.layers.1.mlp.shared_experts.down_proj.weight
-2model.layers.1.mlp.shared_experts.down_proj.scales=v_model.layers.1.mlp.shared_experts.down_proj.MatMulNBits_241@model/layers.1/mlp/shared_experts/down_proj/MatMulNBits_node_241"MatMulNBits*
-K †*
-N@†*
-bits†*
-
-block_size †:com.microsoftJ±
-	namespace£: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/mlp: _DeepSeekMoEFFN/shared_experts: _SharedExpertMLP/down_proj: QuantizedLinearJ¶
-pkg.onnxscript.class_hierarchyÉ['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', '_DeepSeekMoEFFN', '_SharedExpertMLP', 'QuantizedLinear']J]
-pkg.onnxscript.name_scopes?['', 'model', 'layers.1', 'mlp', 'shared_experts', 'down_proj']JΩ
-$pkg.onnxscript.shape_inference_errorîType of input 0 value v_model.layers.1.mlp.shared_experts.Mul_240 of node model/layers.1/mlp/shared_experts/down_proj/MatMulNBits_node_241 not known
-ˆ
-$v_model.layers.1.mlp.moe.Reshape_235
-=v_model.layers.1.mlp.shared_experts.down_proj.MatMulNBits_241v_model.layers.1.mlp.Add_242model/layers.1/mlp/Add_node_242"AddJt
-	namespaceg: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/mlp: _DeepSeekMoEFFNJ~
-pkg.onnxscript.class_hierarchy\['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer', '_DeepSeekMoEFFN']J>
-pkg.onnxscript.name_scopes ['', 'model', 'layers.1', 'mlp']Jî
-$pkg.onnxscript.shape_inference_errorlType of input 0 value v_model.layers.1.mlp.moe.Reshape_235 of node model/layers.1/mlp/Add_node_242 not known
-Ç
-v_model.layers.1.Add_210
-v_model.layers.1.mlp.Add_242v_model.layers.1.Add_243model/layers.1/Add_node_243"AddJ_
-	namespaceR: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayerJk
-pkg.onnxscript.class_hierarchyI['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'GlmMoeDsaDecoderLayer']J7
-pkg.onnxscript.name_scopes['', 'model', 'layers.1']JÑ
-$pkg.onnxscript.shape_inference_error\Type of input 0 value v_model.layers.1.Add_210 of node model/layers.1/Add_node_243 not known
-§
-v_model.layers.1.Add_243
-model.norm.weight!v_model.norm.RMSNormalization_244$model/norm/RMSNormalization_node_244"RMSNormalization*
-epsilonΩ7Ü5†*
-axisˇˇˇˇˇˇˇˇˇ†JM
-	namespace@: GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/norm: RMSNormJ]
-pkg.onnxscript.class_hierarchy;['GlmMoeDsaCausalLMModel', 'GlmMoeDsaTextModel', 'RMSNorm']J3
-pkg.onnxscript.name_scopes['', 'model', 'norm']Jç
-$pkg.onnxscript.shape_inference_erroreType of input 0 value v_model.layers.1.Add_243 of node model/norm/RMSNormalization_node_244 not known
-ç
-lm_head.weightv_lm_head.Transpose_245lm_head/Transpose_node_245"	Transpose*
-perm@@ †J5
-	namespace(: GlmMoeDsaCausalLMModel/lm_head: LinearJF
-pkg.onnxscript.class_hierarchy$['GlmMoeDsaCausalLMModel', 'Linear']J-
-pkg.onnxscript.name_scopes['', 'lm_head']
-ü
-!v_model.norm.RMSNormalization_244
-v_lm_head.Transpose_245logitslm_head/MatMul_node_246"MatMulJ5
-	namespace(: GlmMoeDsaCausalLMModel/lm_head: LinearJF
-pkg.onnxscript.class_hierarchy$['GlmMoeDsaCausalLMModel', 'Linear']J-
-pkg.onnxscript.name_scopes['', 'lm_head']Jâ
-$pkg.onnxscript.shape_inference_erroraType of input 0 value v_model.norm.RMSNormalization_244 of node lm_head/MatMul_node_246 not knownglm_moe_dsa*cÄ@Bmodel.embed_tokens.weightj
-locationmodel.onnx.dataj
-offset56576j
-length65536p*cÄBmodel.rotary_emb.cos_cachej
-locationmodel.onnx.dataj
-offset17664j
-length2048p*cÄBmodel.rotary_emb.sin_cachej
-locationmodel.onnx.dataj
-offset19712j
-length2048p*Bconst_1_i64J       *B
-const_1d_1J       *B
-const_1d_2J       *Bconst_0.0_f32J    *+B!const_-3.4028234663852886e+38_f32Jˇˇˇ*Æ@B%model.layers.0.input_layernorm.weightJÄ"ø<T™:›∏iºÚÃÉªÔºí,º≥.lº«≤ç<¥	‘<⁄*Ω´ç!ºm∑;º)⁄œ<vôªÂ0îº˚n∞º.∑¶ºÉº>Ú≠ºÔÒ:œπ9íÒXºÙ,<˘VÇº˜÷VººæÊº—ÂÅ<ıB9ùÅ<Fâµ<û∆ºé∑;ÓC{ºf‰ÛªO=º¯çÌ<≥«ª◊“ºôÚÁ;E[=∑DÁ:Ω·<ÿ3ﬂºMâ<√ﬂq=◊ô;ä«Ìº+ˆ;ﬂ&àº∑Ò:rÚF<{ºóõª≈èº	‡P<F+≤∫Å‰Ÿ<‘HΩ∞zo;Èëëºbä·π[‰ı</’Ï<êGï;*q B(model.layers.0.self_attn.q_a_proj.weightj
-locationmodel.onnx.dataj
-offset4352j
-length1024p*≥ B(model.layers.0.self_attn.q_a_proj.scalesJÄfQ4;‡ÌöªÜG<˚ÇB<∏V¨<SO8<}SΩ$…èª«XΩºË_É<!wÕª ¢ªÎ5";Ωı±∫ˆ<âà;º≤'BºÖKNΩ?îéº~Â∫ŒË∂;ãÂÉºYe‡;amÁ<x≥›<h%<S•˝∫¯CÌª´>0ºvJ)<"Bº|Rº”‡£;≥ÃºP%∏â};/ª≥∏¶ºoGM9‹ÿ”<‹Ìªÿ˘ººˆÌ9¢˙<çjßºaHT<ﬂÂºB»]<öº}=¡ºÄπˆª!	{;[ªπ@"ªçÇº"√6<ñ<åâº.ÙÁπRñª
-Öíºw∆;ØØ◊ªîb„<*∂ B-model.layers.0.self_attn.q_a_layernorm.weightJÄrß<!</hFº1“<…˚< ?ºûâ!ªÇµO<çßπ;\ﬁ;Gh6ºÀ∏2ªèÇ<^™ê<]QπªË*=09ΩfÌÃ<a≠0ª∏ï|;N;rıº∏ƒ< Û =˘ç=Br)ºˆ	ã<û[∏<ô0@Ω-Uµª≥ZÛ;óå<*r`B(model.layers.0.self_attn.q_b_proj.weightj
-locationmodel.onnx.dataj
-offset14592j
-length1536p*k`B(model.layers.0.self_attn.q_b_proj.scalesj
-locationmodel.onnx.dataj
-offset0j
-length384p*2B
-const_1d_5J                               *"B
-const_1d_6J              **B
-const_1d_7J                ˇˇˇˇˇˇˇˇ*2B
-const_1d_8J                               *2B
-const_1d_9J                               *+Bconst_1d_10J                `       *zB2model.layers.0.self_attn.kv_a_proj_with_mqa.weightj
-locationmodel.onnx.dataj
-offset2816j
-length768p*˝B2model.layers.0.self_attn.kv_a_proj_with_mqa.scalesJ¿áÕ<Â%ºYP<≈#±ºñj£<æTÛªA›¸;À
-Ê:j˝mºK¨á<ÿ/=Ù_º 1P=Ó`<ê‹}=&√Yº†: ºP°“<ëw<>ÖØº˚ <∑ºL‘p<{=ºÛ*cºõ!<w≥fºr"ªIœ:F^¶<ÎÎâº¿ú#ΩŸG}º2¬!<µº;<˜Í¶ª“≠ä<∞ÒÙºO¬><§K›<x˙,º&E¡<4'=PØ=¨›<Ü<çG=*vB.model.layers.0.self_attn.kv_a_layernorm.weightJ@_YΩ¢-Ç<ízª∞D+<D5<Q]ºœR∫ºú=Wªbe<  ºOÛ˝ºIŒΩ<[‡∏;µ˜¬π3ÏB<*tÄB)model.layers.0.self_attn.kv_b_proj.weightj
-locationmodel.onnx.dataj
-offset21760j
-length2048p*oÄB)model.layers.0.self_attn.kv_b_proj.scalesj
-locationmodel.onnx.dataj
-offset768j
-length512p*3Bconst_1d_11J                                *#Bconst_1d_12J              *+Bconst_1d_13J                     *Bconst_1d_14J        *Bconst_1d_15J`       *Bconst_1d_16Jh       *∑B*model.layers.0.self_attn.indexer.wk.weightJÄ√\u»Ì}>õR©%ﬁi≠	“–“[±Ô·@Iÿ∞≈\¢®¸ó¬∂˛|Ñ ‚Ô§têBR`Ñ9πÚ4ãúk}£-B[™ ùLhƒπÊ¨+Ï∏Ö‰¡ ·‘U<° ◊eV‘¿^(5^Æi}ÿ8ﬂWLJÏˇÑà^b–ƒÿõ-g8H¬IõPX†‰ß¥⁄¢<Okmô¨˘øÓ±ï1õ
-ß««¨gùﬂLœ ,·érV‹-ˆxp1V‰«``∫x+î#)∆‹ æ°"KáÍgFz/"D‘^∑]*»Hv¿íêc{D=B¡ìá∆˙F∫ƒÄ“ã®EI+a∫@£v¶ÿ∫KÕπf“\.Ñ/*tB*model.layers.0.self_attn.indexer.wk.scalesJ@R°∆< eΩX·Œ<4L©<π¡<p%7Ωe„•<·è<á0<˘…TΩë.°;‡9Kº|“ºáMÆ∫wÓÅ<¥∑Ÿª*VB.model.layers.0.self_attn.indexer.k_norm.weightJ °Æ(ºu:µªêô}ºbÇÁºBÏ0ªTE	Ω
-"†<42º*TB,model.layers.0.self_attn.indexer.k_norm.biasJ vÉ,ºµ†π]S;=¬1<Gê™º‘&Oºùb≤ºEâ<*πB,model.layers.0.self_attn.indexer.wq_b.weightJÄÇß*ª’îÇë’&R‡=˙dFzam®uñÊºr}ã‚Ä†pL_e©ÿUØ®Œâ≥§qO9ﬂVÊÂIDQÀ5ÕÉ5ió“i∂Ø∏©ú¶x7ã€È‹g˛ë\wzCΩE)%Åd}â®,m!ç‘Æ[±ùØ:«=˚ CƒvÑ~ ∂Öj~@≤ù∞Ì%L8
-Z”nÆÔE˛Ìç¬≤∆ﬁBmÇb2cI»ÃΩ√ûıõjÖåS Ï)*èK3Brk¶R>ú™“û*ﬁïåBßEGõc]ŸÅ¿79˛»ˆnï}∫…
-˚??±Ë˝≠ƒ4èµœRÍráYgß≥Tëh≠£_äÿ*vB,model.layers.0.self_attn.indexer.wq_b.scalesJ@ÆS^<ˆ¡∞ºKÄ=tÁO<˚⁄≤:ù>;h¸ºAg>=˚}‘ºŸe≈ª>∆t<"!Ωf2?<"0TªÍ
-L<ÈÜë;*3Bconst_1d_17J                               *ÄB4model.layers.0.self_attn.indexer.weights_proj.weightJ@^Ô?âDñÉPÜt8√éŸπ’ˆAY=uÓu¸°æ`Ñ\ƒ∫KÍÁ0“/T∂ò`µ=˛÷Äjò£3°Rïõ√ü›:*NB4model.layers.0.self_attn.indexer.weights_proj.scalesJ¶7™ª!7a<Ñ5Ω⁄1 Ω*&Bconst_0.7071067811865476_f32JÛ5?*Bconst_1d_19J       *Bconst_1d_20J       *+Bconst_1d_21J                @       *p@B&model.layers.0.self_attn.o_proj.weightj
-locationmodel.onnx.dataj
-offset23808j
-length2048p*l@B&model.layers.0.self_attn.o_proj.scalesj
-locationmodel.onnx.dataj
-offset1280j
-length512p*∑@B.model.layers.0.post_attention_layernorm.weightJÄr‰<˜_.<!áÜ<´»›;Ä∞ªÆ´ºù≥ø:&Z≈º”4R;9Mûº3Ç∏<Ω`º‰Ê)ªJ&ƒ<t·*ºôÈ·<n≈ºF-Iª õª>,<-©ºjBˆºi¡ëº.5=4øãºæ–Ãº&¬≤<Y.dºπˆ;Àì]ªëáªñ’ª’ÚNºÿá<Mœ.<¥çäºb{
-Ω°¡+;ù_;ö;ô∫v∂ºzÇ<r∂Ì;&4˜ºTÂªª$≈ª7‡ºŸ⁄⁄;Ø`<ˆ®;}∞ôº¿ØA<Ôƒ∂ºüH= <%4);@¶ªú4<j?;ºã{’ª…πΩ;'V;Ÿ˚ëª=*nÄB#model.layers.0.mlp.gate_proj.weightj
-locationmodel.onnx.dataj
-offset32000j
-length4096p*kÄB#model.layers.0.mlp.gate_proj.scalesj
-locationmodel.onnx.dataj
-offset5376j
-length1024p*lÄB!model.layers.0.mlp.up_proj.weightj
-locationmodel.onnx.dataj
-offset36096j
-length4096p*iÄB!model.layers.0.mlp.up_proj.scalesj
-locationmodel.onnx.dataj
-offset6400j
-length1024p*m@B#model.layers.0.mlp.down_proj.weightj
-locationmodel.onnx.dataj
-offset40192j
-length4096p*j@B#model.layers.0.mlp.down_proj.scalesj
-locationmodel.onnx.dataj
-offset7424j
-length1024p*Æ@B%model.layers.1.input_layernorm.weightJÄ”ØŸº–òºÁVg;∞.ÜºG4Mªs˚8Œjø:ºó: 2&º‰N3º.•Yºµ*<ºÚ0=∏˛ª:ûU;úë=G>!<uú<∂C;¢m5<fœ<ÁU<˜M=ãÎ&;&nVºî:ÅªKô<|ÍB<Úx=ô¥‚ºO7;Ω–<ãÉ∫C:ºaU¶<F&w<Õi;œ©Mª÷¢Ç<@;ùº_ßºõåsº&H<E|±º⁄y ªî)ë;Aë+<3àiºYx;©‘;„q¯<ì@ºÛ∆ÿ<A˜ÈªŸ~u={ª´ºT a;ù`«∫‡tºÁb<ÂPø;SÖº*€<≥ˆª*q B(model.layers.1.self_attn.q_a_proj.weightj
-locationmodel.onnx.dataj
-offset8448j
-length1024p*≥ B(model.layers.1.self_attn.q_a_proj.scalesJÄ÷ô®º‹Ë∆ªÇã<2.Ñ<pPˇ<ücª+t3;¿¬ºKé£º<AÅª∆Xéª∏Pµº›mﬁ<>Öı<‘ÌÀº¸=L;Úzíº/©=+Ew<:πìª&®Ω∆º%Ω˛§¢<ÅOÄ<r9èª¯YS<“WÅ<…Õeº$=ﬂª°≠⁄;6K=g,†<â7¥n-Ω¯H;Ωy˜‰º˛»<∑(f=4,=¶õÿºÑ4∑<6!ÆºE7Î;=àºî«Ä;°ïx<¡ÛºÓcûπ∂Ù;!Äp<‘X<Æ]á<òüºUãÍ∫;TË;ÄëÅ<¶‰Åº- ;<ÈUâ<>Nå<Ø€<WzÌº◊«:y˛∞º*∂ B-model.layers.1.self_attn.q_a_layernorm.weightJÄÛµåº≠p∫ó£<„[˛ºÉ=7áú;£Yë<Óì<~èôª;"ä<ù‘9jø;›$ûº9ãøº/[<<Ëˆº”wÕºÑVñ<PD!=íéz<ß@Ω¡":I6F<7öç<IP+ºÄ«Åºgúª∆ÑÜ<ág¬<µ•m∫…‘èº·˚<º*r`B(model.layers.1.self_attn.q_b_proj.weightj
-locationmodel.onnx.dataj
-offset16128j
-length1536p*m`B(model.layers.1.self_attn.q_b_proj.scalesj
-locationmodel.onnx.dataj
-offset384j
-length384p*zB2model.layers.1.self_attn.kv_a_proj_with_mqa.weightj
-locationmodel.onnx.dataj
-offset3584j
-length768p*˝B2model.layers.1.self_attn.kv_a_proj_with_mqa.scalesJ¿‡ºãÖÈª -≈;inº–Ê4ºfñºt˘Á;@J£ªsn=uÂ÷ª–F3º3VÑ<¶m-={Å®;≈∑;t˝=RÔqºä‰é<\î-ºãÅ'<a°AªØ“˙;o5ºúºí≠π<^∆ºE“πº!|≈;*5u<ﬁ(Ω -yºIj‡º˝√»;”Û≤<\–ºDx ;ÄH=¶2	;TØ‡ªPóÃ;Ø±j;Aä1º"ó8ºœ—é;æR…<> «º€|f∫0Ω*vB.model.layers.1.self_attn.kv_a_layernorm.weightJ@råºñ…éº9Æ8ºöEñª)@,º^Rï<RbâªRø_ºnSVº‚ﬁ⁄º‰úÄªÙAº[ÆΩè<êœ;,⁄ú;*tÄB)model.layers.1.self_attn.kv_b_proj.weightj
-locationmodel.onnx.dataj
-offset25856j
-length2048p*pÄB)model.layers.1.self_attn.kv_b_proj.scalesj
-locationmodel.onnx.dataj
-offset1792j
-length512p*∑B*model.layers.1.self_attn.indexer.wk.weightJÄo=^ó¸m'3-ﬁ‹ j=ÌYÛ(˜ïäF9¶ÙC]ÅÁ‹x¨à	W!Q„Ÿ÷¢∞˘ï¬ò£∫9n◊òQÍ-ó3"ZAäVÓCcú∆-Îç[IÍˆ¿r´‹B?§$D J#T∑ Ö¡N√~ÜÊÕfp´‹=)g∏á˛Qå;˘\î†~≤ÏÖ˘Jgãú®@3Tk=∂tÎ„6ˆwzIåÚ—G≥ÁØ˜ü†Wz`û‡0Ωr]u§–©o“/U >˜e€:®{ª@ m@∏-˘T¥≤π≥uE≥„âÅîı'Xô<\5T¥~Ïà}>—¶…ƒ ÂÙFLc|MtT*tB*model.layers.1.self_attn.indexer.wk.scalesJ@Ôk<ßÕ<ÅR	=b⁄≥ºèÇΩ+˙Õ;ÙªF@pªp*Eºˇ%"ª|©ªÿ)Û∫-Tª<ßè∑º¥>Ω‡≥É:*VB.model.layers.1.self_attn.indexer.k_norm.weightJ É}º&Ã∑<ì ªûôÁº¨É<À„≥<-π¶;%iÃª*TB,model.layers.1.self_attn.indexer.k_norm.biasJ ÙÙªWŒb<•6¸<m7ê<…≠6=(Ú=…œ%ΩmôΩ*πB,model.layers.1.self_attn.indexer.wq_b.weightJÄ˚."£î 	õ	…ÌWÕı™óë(áW‚e#Iõßèƒ≈9r÷ﬂØA#H#E†GIH≥¢^vü2ë{&Ω=¯€†¿'qnÓ´ˆÉ.@¡F˚içíVËmï2x¥*Ω+0õ:S¬ƒ‚õ‹«ÑhƒQ‡ã#•.{ñT„tÅŒ#É·zÙÂsw¶h`˜ã4oÈ√≤9fÏ˚≠{Æaîf˛8 8]:r≥ú∑i8‰‹=ÌÁº‡q≥ja?ÚTHôÛ/›©dó|«†”O_Ò÷SGÊ˝»p1\ÊlÍ8·˛›ÛmHî€S⁄ìÃfÔÜF:A™ßZí∂‹è\ÓØ⁄t∏ìqUÑo≤*vB,model.layers.1.self_attn.indexer.wq_b.scalesJ@|ﬂãº≥t ∫>ôº“§\: õ<º?»ª¯.6ºk„‡<‚œLª¸î8=u;ÏªÌ<†·b<o/£;ú¶;=•üºπ*ÄB4model.layers.1.self_attn.indexer.weights_proj.weightJ@ ›‘ì‘÷cÉ£,o†í>Ä(äE}æ/V(ÆcÒø]¨§ù{õ°Tî 3œ:ôETM0Ãy∂2nÒ≠MFˇ*NB4model.layers.1.self_attn.indexer.weights_proj.scalesJø1ΩÂ ÄºdÆªvlôº*p@B&model.layers.1.self_attn.o_proj.weightj
-locationmodel.onnx.dataj
-offset27904j
-length2048p*l@B&model.layers.1.self_attn.o_proj.scalesj
-locationmodel.onnx.dataj
-offset2304j
-length512p*∑@B.model.layers.1.post_attention_layernorm.weightJÄ|Œ9*Œºnûò;bkC<Å"2=Tzcº≤…Ã<Ê÷ò<®eï<ÕjI<X∆ª<‘LG9¿ïˆ;âπà<ócàºìù€<ıÊ<†ùLº@È=©¿ºá7∫Í‘Û<˚<Éº¿ÌΩ<Æk;Âaª{Î#=]∑§;n8Ÿ<LËŒ;a©_ºÕîºÂíb;Ê√ª¥lªπH	<¢¡¿ªÙ÷í;¿.=A.'=ïv;ú.Yº>X6<È(Z=È∑òºé0ÁºRÂAº‡Äæ;*≈c;wd≤ªyçº=j©<ôÁà<û’ºm#Æºtô=O(ŒºΩ∫ºéΩ)=#==¢R¢ª™‚J:∂Ä+ªÉjv;*t@ B*model.layers.1.mlp.moe.fc1_experts_weightsj
-locationmodel.onnx.dataj
-offset48384j
-length8192p*k@B!model.layers.1.mlp.moe.fc1_scalesj
-locationmodel.onnx.dataj
-offset29952j
-length2048p*t@B*model.layers.1.mlp.moe.fc2_experts_weightsj
-locationmodel.onnx.dataj
-offset44288j
-length4096p*j@B!model.layers.1.mlp.moe.fc2_scalesj
-locationmodel.onnx.dataj
-offset9472j
-length1024p*j@B"model.layers.1.mlp.moe.gate.weightj
-locationmodel.onnx.dataj
-offset10496j
-length1024p*KB3model.layers.1.mlp.moe.gate.e_score_correction_biasJh1áºkr—ªÕÕ∞<∆¶∫*Bconst_1d_22Jˇˇˇˇˇˇˇˇ*Bconst_1e-20_f32JÂ<*Bconst_2.5_f32J   @*| B2model.layers.1.mlp.shared_experts.gate_proj.weightj
-locationmodel.onnx.dataj
-offset11520j
-length1024p*Ω B2model.layers.1.mlp.shared_experts.gate_proj.scalesJÄ®o¢<ı|><Y‹<FXºﬁ¥{ªú^º˝±˘ªØWR=Nå=¸G:∫5 ¯;‘T÷;ÅV©ªz±º;÷\ªÑ%º°‹âº`©¸<á*µ<õX=Ò≤É<≥÷<;Ö≤<œ<<ÈÍ;«Yºn<◊5©;¢Qé<		=±Ω∆Ú™ª&/Õ<Ö”xº¢,∏;F•S:È8;Xå%º#Ç#=äé(<€2ΩØ7T=Ã/Ω…Dº•±{ºDx=òpBΩ™vH∑óÈlªç_=º˝Wì<0‹	<ÙeΩ‡4ª∫†ùº}Éºÿëm<«.õºyCÛ;©†∫ºôP†ºSÒû∫À¶Êº¡‰
-º*z B0model.layers.1.mlp.shared_experts.up_proj.weightj
-locationmodel.onnx.dataj
-offset12544j
-length1024p*ª B0model.layers.1.mlp.shared_experts.up_proj.scalesJÄè{“ªPylº<,ºyk˜∫Æ<:Êº≤îo=Ω<x£«ºñ$ö<˘Dï<TÄä;>¡º˛ù”<≥Æª=T< Ω(ó;Ω‰º C;B÷º≤t+<›1€;"Öæ;P"‹;f[π¡0á<Læﬁ<ØÖºõ0º9DºyÛº.6;yÎÊ;G£:éÙ;íl"=)»Nº‘—πºá”<{Bº>“<bäe<Ø√<=˛“<-|Øª·ú©ª/Hº…AºÍêË<Ÿ:õ9Ñ…<ŸΩƒºúÜ2ºX(πºOê<«8Ì<œˇº™©b<ê|∑ºxB|<˘≈¥;≈3„;◊á<*|@B2model.layers.1.mlp.shared_experts.down_proj.weightj
-locationmodel.onnx.dataj
-offset13568j
-length1024p*Ω@B2model.layers.1.mlp.shared_experts.down_proj.scalesJÄ∞πFº˘7ò<cT°º~ÀºwΩÊΩ~ºôñÆ;ê}=ìnÜªT6<h	!Ω"õ°ºÈ/ìºÇπ¿ºn‰ø;µo;S = 
-è<+ëÒ;‹è√ºåPü<E[Èº'Î=Ô,S<ä€Ωº{lÈªSz√:´	Ñª!öÊ;tÛ∞ªfΩ)Qä<¡∂Úª$]ñ<‡Ö	Ω∞<6ΩI£º7-M=∆C2;D¡<[Æ™º=`3=L≤¸<˚¥‹º=)ºLˇ˘∫,÷”93Ω¬Äæ<<¯IºâT#<sq•<xºΩéºﬁG¸ª¶ÀÕ;=»µº0Fé<^eçºsÑ ;≥õ≠ª√„qºã %;jœ<*ö@Bmodel.norm.weightJÄ^›=*~bºÂöΩ§C+º¸íπùyh<høªE∑oªÕAêªT ≈º;[mºGﬂ	<¸†ª%EUªªÄxf=…=7Áf<·˘º9'%<`6Ë; >⁄:-«<yG<‚ÆÄº∑ÆΩ<y#å;$Ø<¶iºÂı5<(¢ºp±Ã9éïvº8c¡<T\àº∆"=ÓI¥<ƒ÷<∫Ò°<∑•-<rÇµº˚<TZm<cM;GÃ·<Iö'ºñ˜ÆºePZºÅƒW;∑G˙ªWãº7\0ªu?’ºF·≤<ÿ˛eºcò:˚`≤ªçºπ|%ºû†Jº_Œº†å<y)Çº4öπ*YÄ@Blm_head.weightj
-locationmodel.onnx.dataj
-offset122112j
-length65536pZ4
-	input_ids'
-%!
-
-batch_size
-sequence_lengthZ?
-attention_mask-
-+'
-
-batch_size
-total_sequence_lengthZ7
-position_ids'
-%!
-
-batch_size
-sequence_lengthZM
-past_key_values.0.key4
-2.
-
-batch_size
-
-past_sequence_length
-hZO
-past_key_values.0.value4
-2.
-
-batch_size
-
-past_sequence_length
-@ZM
-past_key_values.1.key4
-2.
-
-batch_size
-
-past_sequence_length
-hZO
-past_key_values.1.value4
-2.
-
-batch_size
-
-past_sequence_length
-@b
-logitsb
-present.0.keyb
-present.0.valueb
-present.1.keyb
-present.1.valuej,
-model.embed_tokens.weight
-	
-Ä
-@j-
-model.rotary_emb.cos_cache
-	
-Ä
-j-
-model.rotary_emb.sin_cache
-	
-Ä
-j
-const_1_i64
- j
-
-const_1d_1
-
-
-j
-
-const_1d_2
-
-
-j
-const_0.0_f32
- j+
-!const_-3.4028234663852886e+38_f32
- j3
-%model.layers.0.input_layernorm.weight
-
-
-@j>
-(model.layers.0.self_attn.q_a_proj.weight
-
- 
-
-j:
-(model.layers.0.self_attn.q_a_proj.scales
-
- 
-j;
--model.layers.0.self_attn.q_a_layernorm.weight
-
-
- j>
-(model.layers.0.self_attn.q_b_proj.weight
-
-`
-
-j:
-(model.layers.0.self_attn.q_b_proj.scales
-
-`
-j
-
-const_1d_5
-
-
-j
-
-const_1d_6
-
-
-j
-
-const_1d_7
-
-
-j
-
-const_1d_8
-
-
-j
-
-const_1d_9
-
-
-j
-const_1d_10
-
-
-jH
-2model.layers.0.self_attn.kv_a_proj_with_mqa.weight
-
-
-
-jD
-2model.layers.0.self_attn.kv_a_proj_with_mqa.scales
-
-
-j<
-.model.layers.0.self_attn.kv_a_layernorm.weight
-
-
-j@
-)model.layers.0.self_attn.kv_b_proj.weight
-
-Ä
-
-j<
-)model.layers.0.self_attn.kv_b_proj.scales
-	
-Ä
-j
-const_1d_11
-
-
-j
-const_1d_12
-
-
-j
-const_1d_13
-
-
-j
-const_1d_14
-
-
-j
-const_1d_15
-
-
-j
-const_1d_16
-
-
-j@
-*model.layers.0.self_attn.indexer.wk.weight
-
-
-
-j<
-*model.layers.0.self_attn.indexer.wk.scales
-
-
-j<
-.model.layers.0.self_attn.indexer.k_norm.weight
-
-
-j:
-,model.layers.0.self_attn.indexer.k_norm.bias
-
-
-jB
-,model.layers.0.self_attn.indexer.wq_b.weight
-
-
-
-j>
-,model.layers.0.self_attn.indexer.wq_b.scales
-
-
-j
-const_1d_17
-
-
-jJ
-4model.layers.0.self_attn.indexer.weights_proj.weight
-
-
-
-jF
-4model.layers.0.self_attn.indexer.weights_proj.scales
-
-
-j&
-const_0.7071067811865476_f32
- j
-const_1d_19
-
-
-j
-const_1d_20
-
-
-j
-const_1d_21
-
-
-j<
-&model.layers.0.self_attn.o_proj.weight
-
-@
-
-j8
-&model.layers.0.self_attn.o_proj.scales
-
-@
-j<
-.model.layers.0.post_attention_layernorm.weight
-
-
-@j:
-#model.layers.0.mlp.gate_proj.weight
-
-Ä
-
-j6
-#model.layers.0.mlp.gate_proj.scales
-	
-Ä
-j8
-!model.layers.0.mlp.up_proj.weight
-
-Ä
-
-j4
-!model.layers.0.mlp.up_proj.scales
-	
-Ä
-j9
-#model.layers.0.mlp.down_proj.weight
-
-@
-
-j5
-#model.layers.0.mlp.down_proj.scales
-
-@
-j3
-%model.layers.1.input_layernorm.weight
-
-
-@j>
-(model.layers.1.self_attn.q_a_proj.weight
-
- 
-
-j:
-(model.layers.1.self_attn.q_a_proj.scales
-
- 
-j;
--model.layers.1.self_attn.q_a_layernorm.weight
-
-
- j>
-(model.layers.1.self_attn.q_b_proj.weight
-
-`
-
-j:
-(model.layers.1.self_attn.q_b_proj.scales
-
-`
-jH
-2model.layers.1.self_attn.kv_a_proj_with_mqa.weight
-
-
-
-jD
-2model.layers.1.self_attn.kv_a_proj_with_mqa.scales
-
-
-j<
-.model.layers.1.self_attn.kv_a_layernorm.weight
-
-
-j@
-)model.layers.1.self_attn.kv_b_proj.weight
-
-Ä
-
-j<
-)model.layers.1.self_attn.kv_b_proj.scales
-	
-Ä
-j@
-*model.layers.1.self_attn.indexer.wk.weight
-
-
-
-j<
-*model.layers.1.self_attn.indexer.wk.scales
-
-
-j<
-.model.layers.1.self_attn.indexer.k_norm.weight
-
-
-j:
-,model.layers.1.self_attn.indexer.k_norm.bias
-
-
-jB
-,model.layers.1.self_attn.indexer.wq_b.weight
-
-
-
-j>
-,model.layers.1.self_attn.indexer.wq_b.scales
-
-
-jJ
-4model.layers.1.self_attn.indexer.weights_proj.weight
-
-
-
-jF
-4model.layers.1.self_attn.indexer.weights_proj.scales
-
-
-j<
-&model.layers.1.self_attn.o_proj.weight
-
-@
-
-j8
-&model.layers.1.self_attn.o_proj.scales
-
-@
-j<
-.model.layers.1.post_attention_layernorm.weight
-
-
-@j@
-*model.layers.1.mlp.moe.fc1_experts_weights
-
-
-@
- j7
-!model.layers.1.mlp.moe.fc1_scales
-
-
-@
-j@
-*model.layers.1.mlp.moe.fc2_experts_weights
-
-
-@
-j7
-!model.layers.1.mlp.moe.fc2_scales
-
-
-@
-j4
-"model.layers.1.mlp.moe.gate.weight
-
-
-@jA
-3model.layers.1.mlp.moe.gate.e_score_correction_bias
-
-
-j
-const_1d_22
-
-
-j
-const_1e-20_f32
- j
-const_2.5_f32
- jH
-2model.layers.1.mlp.shared_experts.gate_proj.weight
-
- 
-
-jD
-2model.layers.1.mlp.shared_experts.gate_proj.scales
-
- 
-jF
-0model.layers.1.mlp.shared_experts.up_proj.weight
-
- 
-
-jB
-0model.layers.1.mlp.shared_experts.up_proj.scales
-
- 
-jH
-2model.layers.1.mlp.shared_experts.down_proj.weight
-
-@
-
-jD
-2model.layers.1.mlp.shared_experts.down_proj.scales
-
-@
-j
-model.norm.weight
-
-
-@j!
-lm_head.weight
-	
-Ä
-@jL
-v_model.embed_tokens.Gather_0+
-)%
-
-batch_size
-sequence_length
-@jJ
-v_model.rotary_emb.Gather_1+
-)%
-
-batch_size
-sequence_length
-jJ
-v_model.rotary_emb.Gather_2+
-)%
-
-batch_size
-sequence_length
-jA
-v_model.CumSum_3-
-+'
-
-batch_size
-total_sequence_lengthjH
-v_model.Unsqueeze_41
-/+
-
-batch_size
-
-total_sequence_lengthj
-v_model.Shape_5
-
-
-j
-v_model.Shape_6
-
-
-j
-v_model.Sub_7
-
-
-j
-v_model.Slice_8
-
-
- 
- j%
-v_model.Unsqueeze_9
-
- 
- 
-j@
-v_model.GreaterOrEqual_10#
-!	
- 
- 
-total_sequence_lengthjI
-v_model.Unsqueeze_111
-/+
-
-batch_size
-
-total_sequence_lengthjD
-v_model.Cast_121
-/	+
-
-batch_size
-
-total_sequence_lengthj5
-v_model.And_13#
-!	
- 
- 
-total_sequence_lengthj7
-v_model.Where_14#
-!
- 
- 
-total_sequence_lengthj6
-v_model.Cast_15#
-!
- 
- 
-total_sequence_lengthj?
-v_model.Unsqueeze_16'
-%!
- 
-
- 
-total_sequence_lengthjc
-4v_model.layers.0.input_layernorm.RMSNormalization_17+
-)%
-
-batch_size
-sequence_length
-@jY
-%v_model.layers.0.self_attn.Squeeze_420
-.*
-
-batch_size
-past_sequence_length
-hjW
-#v_model.layers.0.self_attn.Slice_430
-.*
-
-batch_size
-past_sequence_length
-`j]
-%v_model.layers.0.self_attn.Reshape_444
-2.
-
-batch_size
-past_sequence_length
-
-j_
-'v_model.layers.0.self_attn.Transpose_454
-2.
-
-batch_size
-
-past_sequence_length
-jY
-%v_model.layers.0.self_attn.Squeeze_460
-.*
-
-batch_size
-past_sequence_length
-@j]
-%v_model.layers.0.self_attn.Reshape_474
-2.
-
-batch_size
-past_sequence_length
-
-j_
-'v_model.layers.0.self_attn.Transpose_484
-2.
-
-batch_size
-
-past_sequence_length
-jW
-#v_model.layers.0.self_attn.Slice_490
-.*
-
-batch_size
-past_sequence_length
-jT
--v_model.layers.0.self_attn.indexer.Squeeze_69#
-!
- 
- 
-total_sequence_lengthj<
-.v_model.layers.0.self_attn.indexer.Constant_70
-
-
-j<
-.v_model.layers.0.self_attn.indexer.Constant_71
-
-
-j<
-.v_model.layers.0.self_attn.indexer.Constant_75
-
-
-j4
-&v_model.layers.0.self_attn.Constant_90
-
-
-j0
-&v_model.layers.0.self_attn.Constant_92
- j,
-"v_model.layers.0.self_attn.Cast_93
- jZ
-&v_model.layers.1.self_attn.Squeeze_1430
-.*
-
-batch_size
-past_sequence_length
-hjX
-$v_model.layers.1.self_attn.Slice_1440
-.*
-
-batch_size
-past_sequence_length
-`j^
-&v_model.layers.1.self_attn.Reshape_1454
-2.
-
-batch_size
-past_sequence_length
-
-j`
-(v_model.layers.1.self_attn.Transpose_1464
-2.
-
-batch_size
-
-past_sequence_length
-jZ
-&v_model.layers.1.self_attn.Squeeze_1470
-.*
-
-batch_size
-past_sequence_length
-@j^
-&v_model.layers.1.self_attn.Reshape_1484
-2.
-
-batch_size
-past_sequence_length
-
-j`
-(v_model.layers.1.self_attn.Transpose_1494
-2.
-
-batch_size
-
-past_sequence_length
-jX
-$v_model.layers.1.self_attn.Slice_1500
-.*
-
-batch_size
-past_sequence_length
-jU
-.v_model.layers.1.self_attn.indexer.Squeeze_170#
-!
- 
- 
-total_sequence_lengthj=
-/v_model.layers.1.self_attn.indexer.Constant_171
-
-
-j=
-/v_model.layers.1.self_attn.indexer.Constant_172
-
-
-j=
-/v_model.layers.1.self_attn.indexer.Constant_176
-
-
-j5
-'v_model.layers.1.self_attn.Constant_191
-
-
-j1
-'v_model.layers.1.self_attn.Constant_193
- j-
-#v_model.layers.1.self_attn.Cast_194
- j3
-%v_model.layers.1.mlp.moe.Constant_213
-
-
-j=
-+v_model.layers.1.mlp.moe.gate.Transpose_216
-
-@
-j8
-*v_model.layers.1.mlp.moe.gate.Constant_221
-
-
-j*
-v_lm_head.Transpose_245
-	
-@
-ÄB
- B
-com.microsoftB
-pkg.nxrt

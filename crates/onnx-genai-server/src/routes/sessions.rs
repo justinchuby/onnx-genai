@@ -8,24 +8,19 @@ pub(crate) async fn create_session(
         .resolve("")
         .map_err(map_registry_error)?
         .ok_or_else(|| ApiError::internal("no model loaded"))?;
-    if handle.pipeline {
-        return Err(ApiError::bad_request(
-            "sessions are not supported by pipeline models",
-        ));
-    }
     let client_id = state
         .sessions
         .next_client_id()
         .map_err(|err| ApiError::internal(format!("session id generation failed: {err}")))?;
-    let engine_session_id = handle
+    let placement = handle
         .engine
         .create_session()
         .await
-        .map_err(|err| ApiError::internal(format!("session create failed: {err}")))?;
+        .map_err(session_create_failure)?;
 
     let evicted = state
         .sessions
-        .insert(client_id.clone(), engine_session_id)
+        .insert(client_id.clone(), placement)
         .map_err(|err| ApiError::internal(format!("session registry failed: {err}")))?;
     close_evicted_session(&handle.engine, evicted).await?;
 
@@ -44,7 +39,7 @@ pub(crate) async fn delete_session(
         .resolve("")
         .map_err(map_registry_error)?
         .ok_or_else(|| ApiError::internal("no model loaded"))?;
-    let engine_session_id = state
+    let placement = state
         .sessions
         .remove(&client_id)
         .map_err(|err| ApiError::internal(format!("session registry failed: {err}")))?
@@ -52,7 +47,7 @@ pub(crate) async fn delete_session(
 
     handle
         .engine
-        .close_session(engine_session_id)
+        .close_session(placement)
         .await
         .map_err(|err| ApiError::internal(format!("session close failed: {err}")))?;
 

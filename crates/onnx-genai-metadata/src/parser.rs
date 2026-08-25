@@ -1,15 +1,13 @@
 //! Load inference metadata from YAML or JSON files.
 
 use crate::schema::{
-    InferenceMetadata, MtpHiddenLayout, MtpKvMode, PipelineSpec, ProposalType, SharedKvGroup,
-    SpeculatorConfig,
+    InferenceMetadata, MtpHiddenLayout, MtpKvMode, PipelineSpec, ProposalType, SpeculatorConfig,
 };
 use std::path::{Path, PathBuf};
 
 /// Source used to discover a speculator declaration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpeculatorConfigSource {
-    InferenceMetadata,
     HuggingFaceConfig,
 }
 
@@ -20,34 +18,6 @@ pub enum SpeculatorProposerKind {
     PEagle,
     Mtp,
     DFlash,
-}
-
-/// Resolved shared-KV proposer descriptor.
-///
-/// Every field is resolved from the `speculative` metadata section, with
-/// output-name defaults applied. `model` is resolved relative to the model
-/// directory.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SharedKvProposerSpec {
-    /// Absolute path to the assistant ONNX model.
-    pub model: PathBuf,
-    /// Number of speculative tokens proposed after the guaranteed target token.
-    pub num_speculative_tokens: usize,
-    /// Target backbone hidden size `H`.
-    pub backbone_hidden_size: usize,
-    /// Vocabulary size of the assistant's own `logits` output.
-    pub vocab_size: usize,
-    /// Name of the assistant output threaded forward between steps.
-    pub projected_state_output: String,
-    /// Name of the assistant's draft-distribution output.
-    pub logits_output: String,
-    /// Absolute path to the target model's raw input-token embedding table
-    /// (`[vocab_size, backbone_hidden_size]` little-endian f32).
-    pub input_embedding: PathBuf,
-    /// Shared-KV binding groups consumed by the assistant.
-    pub shared_kv: Vec<SharedKvGroup>,
-    /// Fully resolved proposer execution contract.
-    pub io: crate::schema::ModelIoSpec,
 }
 
 /// Resolved Mobius MTP sidecar descriptor.
@@ -67,8 +37,9 @@ pub struct MtpProposerSpec {
     pub hc_mult: usize,
     /// Sidecar output consumed by the shared target LM head.
     pub mtp_hidden_output: String,
-    /// Sidecar recurrent HC-state output.
-    pub mtp_state_output: String,
+    /// Sidecar recurrent HC-state output, if the head threads one. A
+    /// pure-attention (proposal-local) head declares none.
+    pub mtp_state_output: Option<String>,
     /// Sidecar KV lifetime.
     pub kv_mode: MtpKvMode,
     /// Exact target embedding initializer name.
@@ -80,8 +51,6 @@ pub struct MtpProposerSpec {
 /// Current construction status for the engine-facing proposer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpeculatorProposerStatus {
-    /// A fully resolved shared-KV proposer.
-    SharedKv(Box<SharedKvProposerSpec>),
     /// A fully resolved Mobius MTP sidecar.
     Mtp(MtpProposerSpec),
     NotYetSupported(SpeculatorProposerKind),
@@ -116,7 +85,18 @@ impl SpeculatorDescriptor {
             ProposalType::DFlash => {
                 SpeculatorProposerStatus::NotYetSupported(SpeculatorProposerKind::DFlash)
             }
-            ProposalType::SharedKv => resolve_shared_kv(model_dir, &config),
+            // A legacy `shared_kv` speculator no longer selects a runtime path.
+            // Borrowed-KV drafting is declared by the package's
+            // `speculative.proposal_execution: {kind: chained}` contract and
+            // driven by the workflow interpreter, so a descriptor that only says
+            // `shared_kv` names no executable proposer — say so instead of
+            // resolving one nothing can run.
+            ProposalType::SharedKv => SpeculatorProposerStatus::Unknown(
+                "shared_kv speculators are declared by the package's \
+                 `speculative.proposal_execution: {kind: chained}` workflow contract, not by a \
+                 `proposal_type: shared_kv` block"
+                    .into(),
+            ),
             ProposalType::Unknown(value) => SpeculatorProposerStatus::Unknown(value.clone()),
         };
 
@@ -179,148 +159,12 @@ impl SpeculatorDescriptor {
                 .mtp_hidden_output
                 .clone()
                 .unwrap_or_else(|| "mtp_hidden".into()),
-            mtp_state_output: config
-                .mtp_state_output
-                .clone()
-                .unwrap_or_else(|| "mtp_state".into()),
+            mtp_state_output: config.mtp_state_output.clone(),
             kv_mode: config.kv_mode.unwrap_or(MtpKvMode::ProposalLocal),
             embedding_initializer: embedding.name.clone(),
             lm_head_initializer: lm_head.name.clone(),
         })
     }
-}
-
-/// Resolve a parsed speculative declaration without re-reading metadata.
-pub fn resolve_speculator_config(
-    model_dir: &Path,
-    config: SpeculatorConfig,
-) -> SpeculatorDescriptor {
-    SpeculatorDescriptor::from_config(model_dir, config, SpeculatorConfigSource::InferenceMetadata)
-}
-
-/// Resolve a `shared_kv` speculator into a supported proposer status.
-///
-/// Missing or malformed required fields — `model`, `backbone_hidden_size`,
-/// `vocab_size`, an empty `shared_kv` list, or any group with empty
-/// `target_layers` — degrade to [`SpeculatorProposerStatus::Unknown`] so a
-/// malformed descriptor never aborts model loading; the engine treats such
-/// descriptors as absent.
-fn resolve_shared_kv(model_dir: &Path, config: &SpeculatorConfig) -> SpeculatorProposerStatus {
-    let Some(model) = config.model.as_ref() else {
-        return SpeculatorProposerStatus::Unknown("shared_kv metadata is missing `model`".into());
-    };
-    let Some(backbone_hidden_size) = config.backbone_hidden_size else {
-        return SpeculatorProposerStatus::Unknown(
-            "shared_kv metadata is missing `backbone_hidden_size`".into(),
-        );
-    };
-    let Some(vocab_size) = config.vocab_size else {
-        return SpeculatorProposerStatus::Unknown(
-            "shared_kv metadata is missing `vocab_size`".into(),
-        );
-    };
-    let Some(input_embedding) = config.input_embedding.as_ref() else {
-        return SpeculatorProposerStatus::Unknown(
-            "shared_kv metadata is missing `input_embedding` (target input-token \
-             embedding table required to build the assistant's inputs_embeds)"
-                .into(),
-        );
-    };
-    if config.shared_kv.is_empty() {
-        return SpeculatorProposerStatus::Unknown(
-            "shared_kv metadata declares no `shared_kv` binding groups".into(),
-        );
-    }
-    if let Some(group) = config
-        .shared_kv
-        .iter()
-        .find(|group| group.target_layers.is_empty())
-    {
-        return SpeculatorProposerStatus::Unknown(format!(
-            "shared_kv group '{}' lists no `target_layers`",
-            group.name
-        ));
-    }
-    let io = config
-        .io
-        .clone()
-        .unwrap_or_else(|| crate::schema::ModelIoSpec {
-            sequence_source: Some(crate::schema::SequenceInputKind::InputsEmbeds),
-            kv_ownership: Some(crate::schema::KvOwnership::Shared),
-            kv_layout: None,
-            token_input: None,
-            inputs_embeds_input: Some("inputs_embeds".into()),
-            attention_mask_input: Some("attention_mask".into()),
-            position_ids_input: Some("position_ids".into()),
-            logits_output: Some(
-                config
-                    .logits_output
-                    .clone()
-                    .unwrap_or_else(|| "logits".into()),
-            ),
-            hidden_output: Some(
-                config
-                    .projected_state_output
-                    .clone()
-                    .unwrap_or_else(|| "projected_state".into()),
-            ),
-            kv_inputs: None,
-            kv_outputs: None,
-            encoder_hidden_states_input: None,
-            audio_features_input: None,
-            cross_kv_inputs: None,
-            cross_kv_outputs: None,
-            kv_update: None,
-            state_pairs: None,
-            optional_inputs: std::collections::BTreeMap::new(),
-            static_cache: None,
-        });
-    if io
-        .sequence_source
-        .unwrap_or(crate::schema::SequenceInputKind::TokenIds)
-        != crate::schema::SequenceInputKind::InputsEmbeds
-    {
-        return SpeculatorProposerStatus::Unknown(
-            "shared_kv metadata `io.sequence_source` must be `inputs_embeds`".into(),
-        );
-    }
-    if io.kv_ownership.unwrap_or(crate::schema::KvOwnership::Owned)
-        != crate::schema::KvOwnership::Shared
-    {
-        return SpeculatorProposerStatus::Unknown(
-            "shared_kv metadata `io.kv_ownership` must be `shared`".into(),
-        );
-    }
-    if io.inputs_embeds_input.as_deref().is_none_or(str::is_empty) {
-        return SpeculatorProposerStatus::Unknown(
-            "shared_kv metadata is missing `io.inputs_embeds_input`".into(),
-        );
-    }
-    if io.logits_output.as_deref().is_none_or(str::is_empty)
-        && io.hidden_output.as_deref().is_none_or(str::is_empty)
-    {
-        return SpeculatorProposerStatus::Unknown(
-            "shared_kv metadata must declare at least one output role: `io.logits_output` or `io.hidden_output`"
-                .into(),
-        );
-    }
-    SpeculatorProposerStatus::SharedKv(Box::new(SharedKvProposerSpec {
-        model: model_dir.join(model),
-        num_speculative_tokens: config.num_speculative_tokens,
-        backbone_hidden_size,
-        vocab_size,
-        projected_state_output: config
-            .projected_state_output
-            .clone()
-            .unwrap_or_else(|| "projected_state".to_string()),
-        logits_output: config
-            .logits_output
-            .clone()
-            .unwrap_or_else(|| "logits".to_string()),
-        input_embedding: model_dir.join(input_embedding),
-        shared_kv: config.shared_kv.clone(),
-        io,
-    }))
 }
 
 /// The inference-metadata sidecar in `model_dir`, if the package ships one.
@@ -361,59 +205,382 @@ const METADATA_FILE_NAMES: [&str; 3] = [
 /// Load inference metadata from a file (YAML or JSON based on extension).
 pub fn load_metadata(path: &Path) -> Result<InferenceMetadata, crate::MetadataError> {
     let content = std::fs::read_to_string(path).map_err(crate::MetadataError::Io)?;
+    parse_metadata(&content, path.extension().and_then(|e| e.to_str()))
+}
 
-    let metadata: InferenceMetadata = match path.extension().and_then(|e| e.to_str()) {
-        Some("yaml" | "yml") => serde_yaml::from_str(&content)
-            .map_err(|e| crate::MetadataError::Parse(e.to_string()))?,
-        Some("json") => serde_json::from_str(&content)
-            .map_err(|e| crate::MetadataError::Parse(e.to_string()))?,
+/// The one way a document becomes an [`InferenceMetadata`].
+///
+/// Every loader goes through here rather than calling `serde` itself, because
+/// two things have to happen before a typed reader sees the bytes. The retired
+/// `model.io` block has to be recognized so a package that still declares one
+/// gets told how to convert it instead of failing later with a puzzled "declares
+/// no workflow". And the schema version has to be compared, because every
+/// structure in this schema denies unknown fields: a document from a newer
+/// runtime is not malformed, and reporting the first field this build happens
+/// not to know would send a reader hunting for a typo that is not there.
+///
+/// `extension` is a hint, not a requirement — `None` tries YAML and then JSON,
+/// which is what a document with no filename gets.
+pub fn parse_metadata(
+    content: &str,
+    extension: Option<&str>,
+) -> Result<InferenceMetadata, crate::MetadataError> {
+    preparse(content)?;
+    match extension {
+        Some("yaml" | "yml") => {
+            serde_yaml::from_str(content).map_err(|e| crate::MetadataError::Parse(e.to_string()))
+        }
+        Some("json") => {
+            serde_json::from_str(content).map_err(|e| crate::MetadataError::Parse(e.to_string()))
+        }
         _ => {
-            // Try YAML first, then JSON
-            if let Ok(m) = serde_yaml::from_str::<InferenceMetadata>(&content) {
-                m
+            // YAML is a superset of JSON, but its error for a JSON document that
+            // is wrong in a JSON way is worse, so fall back rather than insist.
+            if let Ok(metadata) = serde_yaml::from_str::<InferenceMetadata>(content) {
+                Ok(metadata)
             } else {
-                serde_json::from_str::<InferenceMetadata>(&content)
-                    .map_err(|e| crate::MetadataError::Parse(e.to_string()))?
+                serde_json::from_str::<InferenceMetadata>(content)
+                    .map_err(|e| crate::MetadataError::Parse(e.to_string()))
             }
         }
-    };
+    }
+}
 
+/// Like [`parse_metadata`], for a document a caller already holds as JSON.
+///
+/// A lowering that builds a document in memory gets the same two checks a file
+/// gets. It would otherwise be the one path on which a package could declare a
+/// version nothing verified.
+pub fn parse_metadata_json(
+    document: &serde_json::Value,
+) -> Result<InferenceMetadata, crate::MetadataError> {
+    let value = serde_yaml::to_value(document)
+        .map_err(|error| crate::MetadataError::Parse(error.to_string()))?;
+    gate_document(&value)?;
+    serde_json::from_value(document.clone())
+        .map_err(|error| crate::MetadataError::Parse(error.to_string()))
+}
+
+/// Checks that read a document as a tree, before anything reads it as a type.
+fn preparse(content: &str) -> Result<(), crate::MetadataError> {
+    let Ok(document) = serde_yaml::from_str::<serde_yaml::Value>(content) else {
+        // Not parseable as a tree at all; the typed reader reports why.
+        return Ok(());
+    };
+    gate_document(&document)
+}
+
+fn gate_document(document: &serde_yaml::Value) -> Result<(), crate::MetadataError> {
+    reject_retired_model_io(document)?;
+    let declared = crate::version::declared_in(document).map_err(crate::MetadataError::Parse)?;
+    crate::version::gate(declared)
+        .map(|_| ())
+        .map_err(crate::MetadataError::Parse)?;
+    // After the version, deliberately. The flat packed spelling is a reshape
+    // within the v1 line, so refusing it presumes the document belongs to that
+    // line. A document from a version this build does not support is refused for
+    // being from that version, and this crate does not tell its author what a
+    // spelling it has never read is supposed to mean.
+    //
+    // It also cannot become part of the gate, which is the tempting
+    // simplification to reach for later. A stale document here is well-formed
+    // and declares a version this reader supports; both spellings belong to the
+    // same line, so no comparison of version numbers can tell them apart. A
+    // retired spelling is only ever found by recognizing its shape.
+    reject_flat_token_packed(document, String::new())
+}
+
+/// Refuse a document that still declares the retired `model.io` block.
+///
+/// The schema has no field for it, so `serde` would simply drop the key and the
+/// package would fail later with a puzzled "declares no workflow". Recognizing
+/// the retired shape here — and *only* to explain it — turns that into an
+/// actionable error naming the conversion. This is the one place the old spelling
+/// appears, and it never produces a value: it produces a refusal.
+fn reject_retired_model_io(document: &serde_yaml::Value) -> Result<(), crate::MetadataError> {
+    let declares_retired_io = document
+        .get("model")
+        .and_then(|model| model.get("io"))
+        .is_some_and(|io| !io.is_null());
+    if !declares_retired_io {
+        return Ok(());
+    }
+    Err(crate::MetadataError::Parse(
+        "this package declares the retired `model.io` block, which is no longer a way to state \
+         a graph ABI. A single decoder is declared exactly like every other pipeline: a \
+         `pipeline.workflow` with one ONNX component whose ports carry roles, a state_service \
+         group owning its KV cache, and a generation loop. Convert the package once, offline, \
+         with `migrate_model_io <package-dir>`."
+            .to_string(),
+    ))
+}
+
+/// Refuse a document that still spells `token_packed` as one flat pair.
+///
+/// The layout used to carry `offsets` and `owner` directly on the batch layout,
+/// which could say only that a packed axis had exactly one level of ownership.
+/// It now carries `levels`, because an item can itself be a group -- frames in
+/// clips in rows -- and a single pair cannot say that.
+///
+/// A one-level chain is exactly what the old spelling meant, so a shim would be
+/// expressible. It is refused rather than translated because this schema is
+/// pre-release and [rule 3](../../../RULES.md) is to reshape it completely
+/// rather than keep a second spelling alive: no in-tree package uses
+/// `token_packed`, so nothing is being broken except a document written against
+/// an unreleased shape, and the alternative is two ways to say one thing for as
+/// long as the crate exists.
+///
+/// What that costs is a good error, which is why this is here. `serde` reports
+/// the old shape as an unknown field, and an unknown field reads like a typo --
+/// a reader goes looking for a misspelling rather than for a migration. Like
+/// `model.io`, this recognizer never produces a value; it produces a refusal
+/// that names the change.
+fn reject_flat_token_packed(
+    document: &serde_yaml::Value,
+    path: String,
+) -> Result<(), crate::MetadataError> {
+    match document {
+        serde_yaml::Value::Mapping(mapping) => {
+            let is_packed = mapping
+                .get(serde_yaml::Value::from("kind"))
+                .and_then(serde_yaml::Value::as_str)
+                == Some("token_packed");
+            let retired = ["offsets", "owner"]
+                .into_iter()
+                .filter(|field| mapping.contains_key(serde_yaml::Value::from(*field)))
+                .collect::<Vec<_>>();
+            if is_packed && !retired.is_empty() {
+                let at = if path.is_empty() {
+                    String::new()
+                } else {
+                    format!(" at `{path}`")
+                };
+                return Err(crate::MetadataError::Parse(format!(
+                    "the `token_packed` batch layout{at} declares `{}` directly, which is the \
+                     retired flat spelling of ownership. A packed axis now declares `levels`, an \
+                     ownership chain innermost first, because an item can itself be a group. The \
+                     flat pair is the one-level case: replace `offsets: <o>, owner: <w>` with \
+                     `levels: [{{ offsets: <o>, owner: <w> }}]`, and add an outer entry if the \
+                     items are themselves grouped. An emitted level also states `extent`. This \
+                     spelling is not read, and no document is converted for you.",
+                    retired.join("` and `")
+                )));
+            }
+            for (key, value) in mapping {
+                let segment = key.as_str().unwrap_or("?");
+                let child = if path.is_empty() {
+                    segment.to_string()
+                } else {
+                    format!("{path}.{segment}")
+                };
+                reject_flat_token_packed(value, child)?;
+            }
+            Ok(())
+        }
+        serde_yaml::Value::Sequence(items) => {
+            for (index, item) in items.iter().enumerate() {
+                reject_flat_token_packed(item, format!("{path}[{index}]"))?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Load inference metadata together with its canonical semantic identity.
+///
+/// The identity binds disposable artifacts -- compiled plans, memory plans,
+/// state checkpoints -- to the metadata semantics they were produced against.
+/// It is not integrity, not provenance, and not a trust decision.
+pub fn load_metadata_with_identity(
+    path: &Path,
+) -> Result<(InferenceMetadata, String), crate::MetadataError> {
+    let content = std::fs::read_to_string(path).map_err(crate::MetadataError::Io)?;
+    let identity = crate::identity::semantic_identity_of_str(&content)?;
+    Ok((load_metadata(path)?, identity))
+}
+
+/// Load and semantically validate a metadata document or package directory.
+///
+/// Package-relative artifact references are checked for existence and may not
+/// escape the package root. ONNX signature admission remains the runtime's
+/// responsibility because it depends on the selected execution provider.
+pub fn load_metadata_package(path: &Path) -> Result<InferenceMetadata, crate::MetadataError> {
+    let metadata_path = if path.is_dir() {
+        [
+            "inference_metadata.yaml",
+            "inference_metadata.yml",
+            "inference_metadata.json",
+        ]
+        .into_iter()
+        .map(|name| path.join(name))
+        .find(|candidate| candidate.is_file())
+        .ok_or_else(|| {
+            crate::MetadataError::Parse(format!(
+                "package '{}' has no inference_metadata.yaml, .yml, or .json",
+                path.display()
+            ))
+        })?
+    } else {
+        path.to_path_buf()
+    };
+    let metadata = load_metadata(&metadata_path)?;
+    let Some(pipeline) = &metadata.pipeline else {
+        return Err(crate::MetadataError::Parse(
+            "metadata has no pipeline section".to_string(),
+        ));
+    };
+    crate::validation::validate_pipeline_spec(
+        pipeline,
+        crate::version::normalize(metadata.schema_version.as_deref())
+            .unwrap_or(crate::version::INITIAL_SCHEMA_VERSION),
+    )
+    .map_err(|error| crate::MetadataError::Parse(error.to_string()))?;
+    // Document-level invariants are not pipeline-scoped, so `validate_pipeline_spec`
+    // cannot see them. Without this call they hold only for callers who reach for
+    // `validate_metadata` directly — which is nobody loading a package from disk,
+    // including the `validate_metadata` binary. A guarantee that a producer's own
+    // validation run cannot observe is not a guarantee.
+    crate::validation::validate_metadata(&metadata)
+        .map_err(|errors| crate::MetadataError::Parse(errors.join("; ")))?;
+    validate_package_artifacts(
+        &pipeline.workflow,
+        metadata_path.parent().unwrap_or_else(|| Path::new(".")),
+    )?;
+    if let Some(adapters) = &metadata.adapters {
+        validate_adapter_artifacts(
+            adapters,
+            metadata_path.parent().unwrap_or_else(|| Path::new(".")),
+        )?;
+    }
     Ok(metadata)
+}
+
+fn validate_adapter_artifacts(
+    service: &crate::schema::AdapterServiceContract,
+    root: &Path,
+) -> Result<(), crate::MetadataError> {
+    for (alias, artifact) in &service.artifacts {
+        for (index, source) in artifact.weights.iter().enumerate() {
+            let mut files = vec![("weights", source.location.as_str())];
+            if let Some(location) = &source.config_location {
+                files.push(("config", location.as_str()));
+            }
+            for (kind, location) in files {
+                resolve_package_artifact(
+                    root,
+                    location,
+                    &format!("adapter '{alias}' source {index} {kind}"),
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Resolve one package-relative file.
+///
+/// Canonicalizing both paths rejects symlink and `..` escapes. Callers receive
+/// the canonical file path so they load the exact confined file admitted here.
+pub fn resolve_package_artifact(
+    root: &Path,
+    location: &str,
+    description: &str,
+) -> Result<PathBuf, crate::MetadataError> {
+    let root = root.canonicalize().map_err(crate::MetadataError::Io)?;
+    let candidate = root.join(location);
+    let resolved = candidate.canonicalize().map_err(|error| {
+        crate::MetadataError::Parse(format!(
+            "{description} artifact '{}' cannot be opened: {error}",
+            candidate.display()
+        ))
+    })?;
+    if !resolved.starts_with(&root) {
+        return Err(crate::MetadataError::Parse(format!(
+            "{description} artifact '{location}' escapes package root '{}'",
+            root.display()
+        )));
+    }
+    if !resolved.is_file() {
+        return Err(crate::MetadataError::Parse(format!(
+            "{description} artifact '{}' is not a file",
+            resolved.display()
+        )));
+    }
+    Ok(resolved)
+}
+
+fn validate_package_artifacts(
+    workflow: &crate::schema::WorkflowSpec,
+    root: &Path,
+) -> Result<(), crate::MetadataError> {
+    let root = root.canonicalize().map_err(crate::MetadataError::Io)?;
+    let mut artifacts = Vec::new();
+    for (component, declaration) in &workflow.components {
+        match &declaration.implementation {
+            crate::schema::ComponentImplementation::Onnx { artifact } => {
+                artifacts.push((format!("component '{component}'"), artifact.as_str()));
+            }
+            crate::schema::ComponentImplementation::Adapter {
+                artifact: Some(artifact),
+                ..
+            } => {
+                artifacts.push((
+                    format!("adapter component '{component}'"),
+                    artifact.as_str(),
+                ));
+            }
+            crate::schema::ComponentImplementation::Adapter { artifact: None, .. }
+            | crate::schema::ComponentImplementation::Binding => {}
+        }
+    }
+    for (name, input) in &workflow.inputs {
+        if let crate::schema::WorkflowInputSource::Artifact { path } = &input.source {
+            artifacts.push((format!("workflow input '{name}'"), path.as_str()));
+        }
+    }
+    for (owner, artifact) in artifacts {
+        let candidate = root.join(artifact);
+        let resolved = candidate.canonicalize().map_err(|error| {
+            crate::MetadataError::Parse(format!(
+                "{owner} artifact '{}' cannot be opened: {error}",
+                candidate.display()
+            ))
+        })?;
+        if !resolved.starts_with(&root) {
+            return Err(crate::MetadataError::Parse(format!(
+                "{owner} artifact '{artifact}' escapes package root '{}'",
+                root.display()
+            )));
+        }
+        if !resolved.is_file() {
+            return Err(crate::MetadataError::Parse(format!(
+                "{owner} artifact '{}' is not a file",
+                resolved.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Load and validate a metadata file's `pipeline` section.
 pub fn load_pipeline_spec(path: &Path) -> Result<PipelineSpec, crate::MetadataError> {
     let metadata = load_metadata(path)?;
+    let version = crate::version::normalize(metadata.schema_version.as_deref())
+        .unwrap_or(crate::version::INITIAL_SCHEMA_VERSION);
     let spec = metadata
         .pipeline
         .ok_or_else(|| crate::MetadataError::Parse("metadata has no pipeline section".into()))?;
-    crate::validation::validate_pipeline_spec(&spec)
+    crate::validation::validate_pipeline_spec(&spec, version)
         .map_err(|err| crate::MetadataError::Parse(err.to_string()))?;
     Ok(spec)
 }
 
-/// Detect a speculator package, preferring native inference metadata over the
-/// HuggingFace `config.json` compatibility format.
+/// Detect a legacy HuggingFace speculator package from `config.json`.
 ///
 /// Detection is best-effort so malformed or unrelated external configuration
 /// does not change normal model-directory loading behavior.
 pub fn detect_speculator(model_dir: &Path) -> Option<SpeculatorDescriptor> {
-    for name in METADATA_FILE_NAMES {
-        let path = model_dir.join(name);
-        if !path.is_file() {
-            continue;
-        }
-        if let Ok(metadata) = load_metadata(&path)
-            && let Some(config) = metadata.speculative
-        {
-            return Some(SpeculatorDescriptor::from_config(
-                model_dir,
-                config,
-                SpeculatorConfigSource::InferenceMetadata,
-            ));
-        }
-    }
-
     let config_path = model_dir.join("config.json");
     let content = std::fs::read_to_string(config_path).ok()?;
     let config = serde_json::from_str::<HuggingFaceModelConfig>(&content)
@@ -435,7 +602,17 @@ struct HuggingFaceModelConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::InferenceMetadata;
+
+    #[derive(serde::Deserialize)]
+    struct LegacySpeculatorDocument {
+        speculative: SpeculatorConfig,
+    }
+
+    fn parse_legacy_speculator(document: &str) -> SpeculatorConfig {
+        serde_yaml::from_str::<LegacySpeculatorDocument>(document)
+            .expect("legacy speculator config parses")
+            .speculative
+    }
 
     /// A directory of this test's own, so parallel tests cannot see each
     /// other's sidecars.
@@ -510,43 +687,31 @@ speculative:
       target_layers: [1]
 ";
 
+    /// A legacy `proposal_type: shared_kv` block still parses — third-party
+    /// configs in the wild carry it — but it no longer resolves to a runnable
+    /// proposer, because borrowed-KV drafting is declared by the package's
+    /// `speculative.proposal_execution: {kind: chained}` workflow contract and
+    /// driven by the interpreter. The diagnostic has to say so, or a package
+    /// author reading "unknown" would try to fix the wrong block.
     #[test]
-    fn shared_kv_metadata_round_trips_into_supported_descriptor() {
-        let metadata: InferenceMetadata =
-            serde_yaml::from_str(SHARED_KV_YAML).expect("shared_kv metadata parses");
-        let config = metadata.speculative.expect("speculative section present");
+    fn legacy_shared_kv_speculator_degrades_to_unknown_naming_the_workflow_contract() {
+        let config = parse_legacy_speculator(SHARED_KV_YAML);
         assert_eq!(config.proposal_type, ProposalType::SharedKv);
         assert_eq!(config.num_speculative_tokens, 3);
-        assert_eq!(config.backbone_hidden_size, Some(16));
-        assert_eq!(config.vocab_size, Some(32));
         assert_eq!(config.shared_kv.len(), 2);
-        assert_eq!(config.shared_kv[0].name, "sliding_attention");
-        assert_eq!(config.shared_kv[0].target_layers, vec![0]);
-        assert_eq!(config.shared_kv[1].name, "full_attention");
-        assert_eq!(config.shared_kv[1].target_layers, vec![1]);
 
         let descriptor = SpeculatorDescriptor::from_config(
             Path::new("/models/shared-kv"),
             config,
-            SpeculatorConfigSource::InferenceMetadata,
+            SpeculatorConfigSource::HuggingFaceConfig,
         );
-        let SpeculatorProposerStatus::SharedKv(spec) = descriptor.proposer else {
-            panic!("expected a supported shared_kv proposer");
+        let SpeculatorProposerStatus::Unknown(reason) = descriptor.proposer else {
+            panic!("a legacy shared_kv descriptor must not resolve to a runnable proposer");
         };
-        assert_eq!(
-            spec.model,
-            Path::new("/models/shared-kv/assistant/model.onnx")
+        assert!(
+            reason.contains("proposal_execution") && reason.contains("chained"),
+            "the diagnostic must point at the workflow contract: {reason}"
         );
-        assert_eq!(spec.num_speculative_tokens, 3);
-        assert_eq!(spec.backbone_hidden_size, 16);
-        assert_eq!(spec.vocab_size, 32);
-        assert_eq!(spec.projected_state_output, "projected_state");
-        assert_eq!(spec.logits_output, "logits");
-        assert_eq!(
-            spec.input_embedding,
-            Path::new("/models/shared-kv/input_embedding.f32")
-        );
-        assert_eq!(spec.shared_kv.len(), 2);
     }
 
     /// A legacy `gemma4_assistant` proposal_type (pre-generalization name) no
@@ -568,8 +733,7 @@ speculative:
       target_layers: [0]
 "
             );
-            let metadata: InferenceMetadata = serde_yaml::from_str(&yaml).expect("metadata parses");
-            let config = metadata.speculative.expect("speculative section present");
+            let config = parse_legacy_speculator(&yaml);
             assert!(
                 matches!(config.proposal_type, ProposalType::Unknown(_)),
                 "expected Unknown for legacy value '{legacy}', got {:?}",
@@ -578,195 +742,12 @@ speculative:
             let descriptor = SpeculatorDescriptor::from_config(
                 Path::new("/models/shared-kv"),
                 config,
-                SpeculatorConfigSource::InferenceMetadata,
+                SpeculatorConfigSource::HuggingFaceConfig,
             );
             assert!(
                 matches!(descriptor.proposer, SpeculatorProposerStatus::Unknown(_)),
                 "expected proposer Unknown for legacy value '{legacy}'"
             );
         }
-    }
-
-    #[test]
-    fn shared_kv_defaults_output_names() {
-        let metadata: InferenceMetadata = serde_yaml::from_str(
-            "\
-speculative:
-  proposal_type: shared-kv
-  model: assistant/model.onnx
-  backbone_hidden_size: 8
-  vocab_size: 16
-  input_embedding: input_embedding.f32
-  shared_kv:
-    - name: sliding_attention
-      target_layers: [0]
-",
-        )
-        .expect("shared_kv metadata parses");
-        let config = metadata.speculative.expect("speculative section present");
-        let descriptor = SpeculatorDescriptor::from_config(
-            Path::new("/models/shared-kv"),
-            config,
-            SpeculatorConfigSource::InferenceMetadata,
-        );
-        let SpeculatorProposerStatus::SharedKv(spec) = descriptor.proposer else {
-            panic!("expected a supported shared_kv proposer");
-        };
-        assert_eq!(spec.projected_state_output, "projected_state");
-        assert_eq!(spec.logits_output, "logits");
-        assert_eq!(
-            spec.input_embedding,
-            Path::new("/models/shared-kv/input_embedding.f32")
-        );
-        assert_eq!(spec.num_speculative_tokens, 4);
-        assert_eq!(spec.shared_kv.len(), 1);
-        assert_eq!(
-            spec.io.sequence_source,
-            Some(crate::schema::SequenceInputKind::InputsEmbeds)
-        );
-        assert_eq!(
-            spec.io.kv_ownership,
-            Some(crate::schema::KvOwnership::Shared)
-        );
-        assert_eq!(
-            spec.io.inputs_embeds_input.as_deref(),
-            Some("inputs_embeds")
-        );
-        assert_eq!(spec.io.logits_output.as_deref(), Some("logits"));
-        assert_eq!(spec.io.hidden_output.as_deref(), Some("projected_state"));
-    }
-
-    #[test]
-    fn shared_kv_explicit_execution_contract_and_ports_are_preserved() {
-        let metadata: InferenceMetadata = serde_yaml::from_str(
-            "\
-speculative:
-  proposal_type: shared_kv
-  model: proposer.onnx
-  backbone_hidden_size: 6
-  vocab_size: 10
-  input_embedding: embedding.f32
-  io:
-    sequence_source: inputs_embeds
-    kv_ownership: shared
-    inputs_embeds_input: proposer_embeddings
-    logits_output: draft_scores
-    hidden_output: recurrent_projection
-  shared_kv:
-    - name: local
-      target_layers: [0]
-      key_input: proposer_cache_key
-      value_input: proposer_cache_value
-      target_key_input: target_cache_key
-      target_value_input: target_cache_value
-",
-        )
-        .expect("explicit proposer metadata parses");
-        let descriptor = SpeculatorDescriptor::from_config(
-            Path::new("/models/explicit"),
-            metadata.speculative.expect("speculative section"),
-            SpeculatorConfigSource::InferenceMetadata,
-        );
-        let SpeculatorProposerStatus::SharedKv(spec) = descriptor.proposer else {
-            panic!("expected shared-KV proposer");
-        };
-        assert_eq!(
-            spec.io.sequence_source,
-            Some(crate::schema::SequenceInputKind::InputsEmbeds)
-        );
-        assert_eq!(
-            spec.io.kv_ownership,
-            Some(crate::schema::KvOwnership::Shared)
-        );
-        assert_eq!(
-            spec.io.inputs_embeds_input.as_deref(),
-            Some("proposer_embeddings")
-        );
-        assert_eq!(spec.io.logits_output.as_deref(), Some("draft_scores"));
-        assert_eq!(
-            spec.io.hidden_output.as_deref(),
-            Some("recurrent_projection")
-        );
-        assert_eq!(
-            spec.shared_kv[0].target_key_input.as_deref(),
-            Some("target_cache_key")
-        );
-    }
-
-    #[test]
-    fn shared_kv_missing_required_field_is_unknown() {
-        let metadata: InferenceMetadata = serde_yaml::from_str(
-            "\
-speculative:
-  proposal_type: shared_kv
-  model: assistant/model.onnx
-",
-        )
-        .expect("shared_kv metadata parses");
-        let config = metadata.speculative.expect("speculative section present");
-        let descriptor = SpeculatorDescriptor::from_config(
-            Path::new("/models/shared-kv"),
-            config,
-            SpeculatorConfigSource::InferenceMetadata,
-        );
-        assert!(matches!(
-            descriptor.proposer,
-            SpeculatorProposerStatus::Unknown(_)
-        ));
-    }
-
-    /// A malformed shared-KV block (empty `shared_kv`, or a group with empty
-    /// `target_layers`) must degrade to `Unknown` rather than resolve, so it
-    /// never aborts model loading — the engine treats it as absent.
-    #[test]
-    fn shared_kv_empty_binding_groups_degrade_to_unknown() {
-        let metadata: InferenceMetadata = serde_yaml::from_str(
-            "\
-speculative:
-  proposal_type: shared_kv
-  model: assistant/model.onnx
-  backbone_hidden_size: 8
-  vocab_size: 16
-",
-        )
-        .expect("shared_kv metadata parses");
-        let config = metadata.speculative.expect("speculative section present");
-        assert!(config.shared_kv.is_empty());
-        let descriptor = SpeculatorDescriptor::from_config(
-            Path::new("/models/shared-kv"),
-            config,
-            SpeculatorConfigSource::InferenceMetadata,
-        );
-        assert!(matches!(
-            descriptor.proposer,
-            SpeculatorProposerStatus::Unknown(_)
-        ));
-    }
-
-    #[test]
-    fn shared_kv_empty_target_layers_degrade_to_unknown() {
-        let metadata: InferenceMetadata = serde_yaml::from_str(
-            "\
-speculative:
-  proposal_type: shared_kv
-  model: assistant/model.onnx
-  backbone_hidden_size: 8
-  vocab_size: 16
-  shared_kv:
-    - name: sliding_attention
-",
-        )
-        .expect("shared_kv metadata parses");
-        let config = metadata.speculative.expect("speculative section present");
-        assert!(config.shared_kv[0].target_layers.is_empty());
-        let descriptor = SpeculatorDescriptor::from_config(
-            Path::new("/models/shared-kv"),
-            config,
-            SpeculatorConfigSource::InferenceMetadata,
-        );
-        assert!(matches!(
-            descriptor.proposer,
-            SpeculatorProposerStatus::Unknown(_)
-        ));
     }
 }

@@ -25,6 +25,8 @@ pub enum OrtError {
     Cuda(String),
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+    #[error(transparent)]
+    ThreadAffinity(#[from] crate::thread_affinity::ThreadAffinityError),
 }
 
 pub type Result<T> = std::result::Result<T, OrtError>;
@@ -56,12 +58,12 @@ pub(crate) fn api() -> Result<&'static onnx_genai_ort_sys::OrtApi> {
             return Err(OrtError::ApiVersionMismatch(format!(
                 "ONNX Runtime API version mismatch: loaded {loaded_path} ({reason}), \
                  ORT version {loaded_version}, API {loaded_api}; onnx-genai was built \
-                 against API {} (ORT 1.28.x).\n\
-                 Fix: set ONNX_GENAI_ORT_LIB to the full path of the ORT 1.28 library \
+                 against API {} (ORT 1.29.x).\n\
+                 Fix: set ONNX_GENAI_ORT_LIB to the full path of the ORT 1.29 library \
                  (for example a conda env's onnxruntime.dll), set ONNX_GENAI_ORT_LIB_DIR \
                  to its containing directory, activate that conda env and put its library \
                  directory first on PATH/LD_LIBRARY_PATH/DYLD_LIBRARY_PATH, or rebuild so \
-                 ort-sys downloads ORT 1.28.0.",
+                 ort-sys downloads ORT 1.29.0.",
                 onnx_genai_ort_sys::ORT_API_VERSION
             )));
         }

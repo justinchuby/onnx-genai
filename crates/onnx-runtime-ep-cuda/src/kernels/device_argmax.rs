@@ -32,6 +32,10 @@ pub(crate) fn scratch_words(elements: usize, batch: usize) -> usize {
 
 const SOURCE: &str = r#"
 #include <cuda_fp16.h>
+#if __has_include(<cuda_bf16.h>)
+#define NXRT_HAS_CUDA_BF16 1
+#include <cuda_bf16.h>
+#endif
 
 template <typename T>
 __device__ __forceinline__ float argmax_load(T value);
@@ -45,6 +49,13 @@ template <>
 __device__ __forceinline__ float argmax_load<__half>(__half value) {
   return __half2float(value);
 }
+
+#ifdef NXRT_HAS_CUDA_BF16
+template <>
+__device__ __forceinline__ float argmax_load<__nv_bfloat16>(__nv_bfloat16 value) {
+  return __bfloat162float(value);
+}
+#endif
 
 __device__ __forceinline__ void argmax_update(
     float candidate,
@@ -158,6 +169,18 @@ extern "C" __global__ void greedy_argmax_partials_f16(
       logits, elements, partial_values, partial_indices, select_last);
 }
 
+#ifdef NXRT_HAS_CUDA_BF16
+extern "C" __global__ void greedy_argmax_partials_bf16(
+    const __nv_bfloat16* logits,
+    unsigned long long elements,
+    float* partial_values,
+    unsigned int* partial_indices,
+    unsigned int select_last) {
+  greedy_argmax_partials_impl<__nv_bfloat16>(
+      logits, elements, partial_values, partial_indices, select_last);
+}
+#endif
+
 extern "C" __global__ void greedy_argmax_finalize(
     const float* partial_values,
     const unsigned int* partial_indices,
@@ -238,9 +261,10 @@ pub(crate) fn launch(
     let (entry, elem_size) = match dtype {
         DataType::Float32 => ("greedy_argmax_partials_f32", std::mem::size_of::<f32>()),
         DataType::Float16 => ("greedy_argmax_partials_f16", std::mem::size_of::<u16>()),
+        DataType::BFloat16 => ("greedy_argmax_partials_bf16", std::mem::size_of::<u16>()),
         other => {
             return Err(EpError::KernelFailed(format!(
-                "cuda_ep device argmax: unsupported logits dtype {other:?}; expected Float32 or Float16"
+                "cuda_ep device argmax: unsupported logits dtype {other:?}; expected Float32, Float16 or BFloat16"
             )));
         }
     };
@@ -282,7 +306,7 @@ pub(crate) fn launch(
         ));
     }
 
-    if dtype == DataType::Float16 {
+    if dtype == DataType::Float16 || dtype == DataType::BFloat16 {
         runtime.require_nvrtc_half_headers("device argmax")?;
     }
     let partial_function = runtime.nvrtc_function("native_device_argmax", SOURCE, entry)?;
@@ -542,6 +566,143 @@ mod tests {
         out
     }
 
+    fn run_case_bf16(
+        ep: &CudaExecutionProvider,
+        logits: &[f32],
+        tie_break: ArgmaxTieBreak,
+    ) -> [u32; 2] {
+        let bytes = logits
+            .iter()
+            .flat_map(|&value| half::bf16::from_f32(value).to_bits().to_ne_bytes())
+            .collect::<Vec<_>>();
+        let mut input = ep.allocate(bytes.len(), 256).unwrap();
+        let mut output = ep.allocate(result_bytes(logits.len(), 1), 256).unwrap();
+        ep.copy_from_host(&bytes, &mut input).unwrap();
+        ensure_input_coherent(ep, &input, bytes.len());
+        ep.device_argmax(
+            &input,
+            logits.len(),
+            1,
+            DataType::BFloat16,
+            &mut output,
+            tie_break,
+        )
+        .unwrap();
+        let mut result = [0_u8; RESULT_BYTES];
+        ep.copy_to_host(&output, &mut result).unwrap();
+        let values = [
+            u32::from_ne_bytes(result[..4].try_into().unwrap()),
+            u32::from_ne_bytes(result[4..].try_into().unwrap()),
+        ];
+        ep.deallocate(input).unwrap();
+        ep.deallocate(output).unwrap();
+        values
+    }
+
+    /// Batched bf16 sibling of [`run_batch_case`]: rounds every row to bf16, runs
+    /// the whole `batch` in one launch, and reads back the per-row header.
+    fn run_batch_case_bf16(
+        ep: &CudaExecutionProvider,
+        rows: &[Vec<f32>],
+        tie_break: ArgmaxTieBreak,
+    ) -> Vec<[u32; 2]> {
+        let batch = rows.len();
+        let vocab = rows[0].len();
+        assert!(rows.iter().all(|row| row.len() == vocab));
+        let bytes = rows
+            .iter()
+            .flatten()
+            .flat_map(|&value| half::bf16::from_f32(value).to_bits().to_ne_bytes())
+            .collect::<Vec<_>>();
+        let mut input = ep.allocate(bytes.len(), 256).unwrap();
+        let mut output = ep.allocate(result_bytes(vocab, batch), 256).unwrap();
+        ep.copy_from_host(&bytes, &mut input).unwrap();
+        ensure_input_coherent(ep, &input, bytes.len());
+        ep.device_argmax(
+            &input,
+            vocab,
+            batch,
+            DataType::BFloat16,
+            &mut output,
+            tie_break,
+        )
+        .unwrap();
+        let mut header = vec![0_u8; batch * RESULT_BYTES];
+        ep.copy_to_host(&output, &mut header).unwrap();
+        let out = (0..batch)
+            .map(|s| {
+                let base = s * RESULT_BYTES;
+                [
+                    u32::from_ne_bytes(header[base..base + 4].try_into().unwrap()),
+                    u32::from_ne_bytes(header[base + 4..base + 8].try_into().unwrap()),
+                ]
+            })
+            .collect();
+        ep.deallocate(input).unwrap();
+        ep.deallocate(output).unwrap();
+        out
+    }
+
+    #[test]
+    fn device_argmax_bf16_matches_host_for_248320_ties_and_nan() {
+        let Some(ep) = gpu() else { return };
+        // A realistic hybrid-model vocab (Qwen3.8-27B lm_head emits bf16 logits
+        // over 248320 tokens); the kernel must be vocab-size agnostic.
+        let mut logits = (0..248_320)
+            .map(|i| ((i % 41) as f32 - 20.0) * 0.125)
+            .collect::<Vec<_>>();
+        logits[4242] = 9.5;
+        logits[200_001] = 9.5;
+        logits[77] = f32::NAN;
+        // Reference argmax over the bf16-rounded values, matching kernel input.
+        let rounded = logits
+            .iter()
+            .map(|&value| half::bf16::from_f32(value).to_f32())
+            .collect::<Vec<_>>();
+        let result = run_case_bf16(&ep, &logits, ArgmaxTieBreak::LowestIndex);
+        assert_eq!(result, [host_argmax(&rounded), 0]);
+
+        let all_non_finite = [f32::NAN, f32::NEG_INFINITY, f32::NAN];
+        let result = run_case_bf16(&ep, &all_non_finite, ArgmaxTieBreak::LowestIndex);
+        assert_eq!(result, [host_argmax(&all_non_finite), 0]);
+    }
+
+    #[test]
+    fn device_argmax_bf16_agrees_with_f32_oracle_and_tie_break() {
+        let Some(ep) = gpu() else { return };
+        // Cross-validate bf16 argmax against an f32 argmax oracle computed over
+        // the *same* bf16-rounded values, across batch shapes and both tie-break
+        // policies. bf16 has fewer mantissa bits than f16, so ties are frequent;
+        // the device kernel must pick the identical index the host reference does.
+        for &m in &[1usize, 4, 6, 8] {
+            let mut rows = Vec::with_capacity(m);
+            for r in 0..m {
+                let mut seed = 0x9E37_79B9_u32 ^ (r as u32).wrapping_mul(2_654_435_761);
+                let row = (0..4096)
+                    .map(|_| {
+                        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                        // Round to bf16 so the f32 oracle and the bf16 kernel see
+                        // bit-identical values and every tie is genuine.
+                        half::bf16::from_f32((seed as i32 as f32 / i32::MAX as f32) * 4.0).to_f32()
+                    })
+                    .collect::<Vec<f32>>();
+                rows.push(row);
+            }
+            for &tie in &[ArgmaxTieBreak::LowestIndex, ArgmaxTieBreak::HighestIndex] {
+                let select_last = tie.select_last_index();
+                let bf16 = run_batch_case_bf16(&ep, &rows, tie);
+                let f32_oracle = run_batch_case(&ep, &rows, tie);
+                for (row, (got, want)) in bf16.iter().zip(f32_oracle.iter()).enumerate() {
+                    assert_eq!(
+                        got[0], want[0],
+                        "M={m} row {row} tie={select_last}: bf16 device argmax {} != f32 oracle {}",
+                        got[0], want[0]
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn device_argmax_matches_host_for_151936_random_ties_and_nan() {
         let Some(ep) = gpu() else { return };
@@ -672,7 +833,7 @@ mod tests {
                 .map(|row| {
                     let mut seed = 0x9E37_79B9_u32
                         .wrapping_mul(row as u32 + 1)
-                        .wrapping_add(0x1234_5);
+                        .wrapping_add(0x0001_2345);
                     (0..VOCAB)
                         .map(|_| {
                             seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
@@ -754,7 +915,7 @@ mod tests {
             // Wallace's exact {3, 76032, 152063} case at vocab 152064 (→ 3). The
             // lowest global index must win in every case. One config per row
             // (cycled) so each batch exercises several boundary layouts.
-            const STRIDE: usize = 256 * ((VOCAB + 1023) / 1024); // 38_144 for 152_064
+            const STRIDE: usize = 256 * VOCAB.div_ceil(1024); // 38_144 for 152_064
             let boundary_configs: [[usize; 3]; 6] = [
                 [3, VOCAB / 2, VOCAB - 1],        // Wallace's exact {3, 76032, 152063} → 3
                 [STRIDE - 1, STRIDE, STRIDE + 1], // straddles the first seam → STRIDE-1

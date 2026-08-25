@@ -3442,6 +3442,16 @@ has no `m > 1` fan-out at all — it loops over activation rows and calls
 `parallel_output_rows` **once per row**. An 8-token prefill is eight
 fork-joins; a 512-token prefill is five hundred and twelve.
 
+> **Resolved 2026-08-19 (#1435).** This section was right that the path was
+> dead, and the default is now on. It was wrong about the cost, though, and so
+> was I when I acted on it: replacing the `m` fork-joins with one is worth
+> 6.897 -> 6.874 ms on `llama3_8b_qkv_t8`, i.e. nothing. The eight barriers were
+> never the problem. What was: the kernel spends >80% of its instruction stream
+> decoding nibbles and re-did all of it for every activation row, which is why
+> that cell's time was exactly linear in `m`. Decoding once per row *tile*
+> instead is worth 3.03x there and 2.53-5.22x across every int4 prefill cell.
+> See [`2026-08-19-int4-prefill-row-blocking.md`](2026-08-19-int4-prefill-row-blocking.md).
+
 `parallel_output_rows` is the single flat fan-out shared by eight call sites
 (`int4_matmul_m1`, `packed_nbits_output_row`, `borrowed_affine_int4_matmul`,
 `borrowed_affine_int4_matmul_nblock`, `int8_row`, `gemv_nk`, `gemv_nk_u8`,
@@ -4197,381 +4207,991 @@ For assertions specifically: a test that encodes a *contract* rather than a
 *result* should say so, so that the next reader can tell a stale expectation from
 a real regression. The distinction matters — updating a stale assertion is
 correct, and weakening a live one to get green is how a real bug ships.
+## 42. Phase 20: the answer to §39.4 was the wrong loop (#1402), and softmax's cost was not where its code shape suggests (#1416)
 
-## 42. Phase 21: a decode-shaped harness, and the three pools it found
+§39.4 left one experiment open and one method to run it with. This phase runs it,
+gets a negative answer, and then finds the win one level up. It then does the
+same thing to softmax: profile it by phase instead of as a whole, and the
+optimisation that follows is not the one the code shape implies.
 
-Phase 20 closed the t=16→t=32 "drift" by showing it was pool construction
-rather than inference, and ended on an admission: neither of the harness
-shapes this campaign had was honest about decode. Seven runs sits inside the
-warm-up transient. Four hundred runs in a tight loop leaves the transient but
-enters the one regime real decode never occupies — no gap between parallel
-regions, so the pool's workers never park and every dispatch lands on a
-spinning core.
+### 42.1 Sharing one packed panel across row blocks loses, and loses harder the wider the pool
 
-This phase builds the missing harness and reports what it found. There is no
-kernel change here. The deliverable is a measuring instrument plus the first
-set of numbers that instrument makes it possible to state.
+The experiment §39.4 proposed was literal: pack a column panel once, then let the
+pool sweep the row bands under it, so `t` threads share one immutable pack
+instead of packing `t` times. It was built, and it is worse than the unpacked
+driver it replaces at every panel width tried:
 
-### 41.1 What the harness is
+| panel width | t=2 | t=4 | t=8 | t=16 | t=32 |
+|---|---|---|---|---|---|
+| 128 KB | 0.83 | 0.56 | 0.35 | 0.20 | 0.40 |
+| 256 KB | 0.94 | 0.70 | 0.52 | 0.33 | 0.55 |
+| 512 KB | 1.04 | 0.84 | 0.76 | 0.61 | 0.77 |
+| 1 MB | 1.02 | 0.80 | 0.71 | 0.55 | 0.75 |
+| 4 MB | 1.00 | 0.74 | 0.64 | 0.49 | 0.72 |
 
-`bench_decode_gap` (`crates/onnx-genai-bench/src/bin/`) runs any ONNX model in
-a loop with a **configurable gap** between iterations, and reports the
-steady-state distribution together with the counters that say which scheduling
-regime produced it. The reusable pieces live in
-`crates/onnx-genai-bench/src/decode_gap.rs` behind unit tests.
+Geomean against the unpacked driver over `{phi35, qwen3, mixtral} × {96, 148,
+256, 365} rows`, higher is better. The 512 KB and 4 MB rows are *after* a second
+fix described below; the first attempt was worse still.
 
-Four things it does that the previous harnesses did not:
+Two costs, and the shape of the table names both. There is a fork-join per
+column panel, which is why every column degrades as `t` grows rather than
+degrading uniformly. And the pack itself becomes a serial term: it is O(n·k)
+work that the first version split only over `nc/PNR` micro-panels, so for
+phi35's `k=6400` — where a 512 KB panel holds exactly one micro-panel — the
+pack ran on one thread while the other 31 waited on the barrier. Splitting the
+pack over `k` as well as over micro-panels recovered a large part of it (0.61 →
+0.79 at 16 threads) and never enough. Amdahl is not negotiable: a barrier per
+panel plus a partly serial pack cannot beat a driver with neither.
 
-* **The gap is a distribution, not a constant.** `--gap-us` sets a mean,
-  `--gap-jitter` a uniform spread, `--gap-kind` chooses busy-spin (host-side
-  compute), sleep (blocking on a tokenizer), or an alternation of the two. A
-  *fixed* gap can sit permanently just inside or just outside the pool's spin
-  window and report a clean number for a bimodal reality; jitter reports the
-  mixture.
-* **Warm-up is detected, not guessed.** Every iteration is recorded from the
-  first, and the reported window begins where the series stops trending
-  (`steady_state_start`). A run whose series never settles says so instead of
-  quietly reporting its own transient. This matters because warm-up length is
-  a function of pool width — one `--warmups` constant cannot be right for both
-  a 4-wide and a 32-wide pool, and choosing it per-arm by hand is how an A/B
-  ends up comparing a warm arm against a cold one.
-* **Park/wake is counted, not inferred.** Voluntary context switches and the
-  task pool's own `parks`/`spin_hits` counters are reported per iteration.
-* **The ORT session is dropped before timing.** §38 established that a
-  co-resident ORT pool spin-waits long after its last op and depresses a
-  native arm measured beside it by up to 4.8x. Here parity is judged once,
-  against ORT, and then the ORT session goes out of scope — so the timed
-  window is solo *by construction* rather than by remembering a flag.
+### 42.2 Distributing whole panels wins, because it is the serial algorithm with its outer loop given away
 
-### 41.2 Two measurement bugs, found by the harness in itself
+The version that works keeps the same packed microkernel and moves the
+parallelism out one level: each lane takes whole column panels, packs each one
+exactly once itself, and sweeps the entire row extent against it. No barrier
+inside a panel, no shared buffer, a fully parallel pack, and the panel stays in
+the owning core's private L2 for the whole sweep. Total pack work is exactly
+`n16·k` element moves no matter how many threads run — the same total as the
+single-threaded path, which is the property §39.4 was actually asking for. It
+just is not obtained by sharing.
 
-Recorded because both would have produced confident, wrong, publishable
-numbers, and neither is obvious.
+Kernel grid, gated (below), against the unpacked driver:
 
-**CPU time is not in `/proc/self/status`.** The first working version reported
-`0.000 cpu-s` for every run. `status` carries RSS, thread count and context
-switches but no CPU accounting at all; CPU has to come from `/proc/self/stat`.
-A harness that reads one file and assumes it has everything reports a
-confident zero.
+| | t=2 | t=4 | t=8 | t=16 | t=32 |
+|---|---|---|---|---|---|
+| geomean | **1.178** | **1.208** | **1.268** | **1.237** | **1.014** |
 
-**Context-switch counters in `/proc/self/status` describe only the leader
-thread.** This one is worse, because the number it produces is plausible. With
-the process file, park/wake came out at ~1.2 per iteration at *every* gap from
-0 to 20 ms — which would mean the pool's behaviour is independent of how long
-it sits idle, i.e. that the adaptive spin window does nothing. Summing
-`/proc/self/task/*/status` instead gives the real picture below. A pool of
-sixteen workers parking on every dispatch moves the *leader's* counter by
-approximately nothing.
+By model: phi35 **1.377**, qwen3 **1.077**, mixtral **1.101**; worst single cell
+0.80; best cells 2.49–2.54 (phi35 at `m=96`, `t=16`).
 
-Both are covered by regression tests, the second by parking a spawned thread
-deliberately and asserting the sampler sees it (sampled while the thread is
-still alive — an exited thread takes its counters with it).
+End to end at `t=512`, median native/ort ratio, negative = faster, both arms
+proved pure-native and every invocation carrying a §39 control arm:
 
-The steady-state detector also went through three formulations before it was
-right, and the first two are worth naming because both are natural and both
-are wrong. Comparing each window against *the final window* lets a
-monotonically rising series be declared steady at the very end, because the
-final window always matches itself. Requiring *every overlapping* window to
-match makes the verdict hostage to a single blip anywhere in the run, since
-one outlier appears in `window` consecutive windows — on this host that
-reported "never settled" for series that plainly settled. The shipped version
-compares non-overlapping blocks against the median of the whole tail.
+| model | t=2 | t=4 | t=8 | t=16 | t=32 |
+|---|---|---|---|---|---|
+| phi35moe | −21.6% | −11.3% | −25.2% | −35.0% | −12.9% |
+| qwen3moe | −27.6% | −19.3% | −13.3% | −6.6% | +0.8% ¹ |
 
-### 41.3 Where the pool stops spinning
+¹ inside that cell's floor.
 
-`gemm_nbits_qwen3_0p6b_qkv_t8`, budget 16, 400 iterations, steady window
-detected, sleep gaps so the main thread contributes no CPU of its own:
+**Mixtral could not be read on the ratio at all**, and this is the §39.3 rule
+doing its job rather than an inconvenience: its control arm moved up to **+66%**
+in one invocation, which is larger than any effect being claimed, so those
+invocations are discarded. Re-run at 5 trials and read on native time against
+the control, mixtral is −2.4 / +1.7 / −5.3 / −6.3 / −3.6% at 2/4/8/16/32 —
+parity to a small win, which is what §42.3 predicts for a model with only one of
+its two GEMM shapes above the gate.
 
-| gap | p50 (ms) | cpu-s per wall-s | parks/iter | spin-hits/iter |
+### 42.3 The gate, and why `k` is in it
+
+Two conditions, both measured on the grid above rather than derived:
+
+1. **A band for every thread** (`m/PMR >= threads`). The unpacked driver slices
+   `m` into `MR`-row blocks and fills a wide pool better than a `PMR`-row band
+   sweep can when `m` is short, so packing there trades a certain loss for a
+   speculative win.
+2. **`k >= 2048`.** Below it the per-panel costs stop amortising and the
+   unpacked kernel's strided `b` reads are already cache-resident. Measured:
+   mixtral's `k=1024` shapes 0.90–1.02, qwen3's `k=768` 0.59–1.09, every
+   `k >= 2048` shape a win.
+
+`k >= 1024` scored marginally better on raw grid geomean (1.194 vs 1.177) and
+was **rejected**, because it turned mixtral's first GEMM into a consistent small
+loss. A geomean that improves while a production shape regresses is the geomean
+answering a question nobody asked.
+
+The threshold is quoted in the source as `PANEL_BYTES / (PNR * 16)` — the `k` at
+which one micro-panel reaches a quarter of the panel budget. That is a
+mnemonic that happens to land on the measured cliff on this host, not a
+derivation, and it is written down that way so a future L2 change is not
+mistaken for a proof.
+
+### 42.4 Softmax: pass 2 is 73% of the row, and it is throughput-bound
+
+Softmax sat at 1.10–1.32 ours/ORT after #1245's pure-Horner `exp8`. Timing the
+row kernel as a whole says only that. Timing it **by phase** says where to look
+(per element, `d=1024`, this host):
+
+| phase | ps/element | share |
+|---|---|---|
+| pass 1, row max | 67 | 11% |
+| pass 2, exp + sum | 446 | 73% |
+| pass 3, normalize | 58 | 10% |
+| whole row | 608 | |
+
+The two passes that matter are limited by *different* things, and that is the
+whole result:
+
+- **Pass 1 is latency-bound.** One `vmaxps` chain retires 8 floats per ~4 cycles
+  while the load ports could feed 16. Four independent chains: 67 → 37
+  ps/element, **1.8x**.
+- **Pass 2 is throughput-bound**, on ports 0/1, at 16 such ops per 8 lanes ≈ the
+  8 cycles/iteration measured. So the same trick fails: four independent *sum*
+  chains measured 446 → **458** ps/element, slower. The fix has to remove ops,
+  not reorder them.
+
+Three of those 16 ops existed only to patch `exp8`'s non-finite lanes — a
+`max_ps` clamp, an unordered compare and a `blendv`. All three are unnecessary,
+because `-inf` is caught by the underflow mask that already exists (bitwise
+`andnot`, so poisoned arithmetic underneath does not matter) and `NaN`
+propagates through the polynomial and the exponent build on its own
+(`cvtps_epi32` maps it to the integer indefinite, whose low nine bits build
+`2^0 = 1.0`). Removing them: 446 → 370 ps/element, **1.20x**.
+
+Whole row 608 → 481 ps/element: **1.16x at d=64 rising to 1.26x at d>=256**.
+End to end over all seven softmax fixtures × 1/2/4/8 threads, 25 of 28 cells
+show the old kernel slower by more than that cell's floor (+2.0% to +51.8%),
+with no cell regressing; the three inside their floors were re-run at 41 trials
+and all three then favour the new kernel.
+
+**Not taken:** folding the `mul` and `round` into one FMA with a magic-number
+constant removes a fourth port-0/1 op, and is worth 3% (370 → 356 ps/element).
+It moves `k` for arguments on a rounding boundary, so it forfeits bit-identity
+and would require re-establishing the 1-ULP bound from scratch. 3% does not buy
+that.
+
+### 42.5 Two lessons about evidence
+
+**Exhaustive beats representative when the domain is 2^32.** The `exp8` change
+is not argued and not sampled: an offline harness evaluates the old and new
+forms over **every f32 bit pattern** and reports 0 non-NaN inputs differing in
+any bit and 0 NaN inputs where either side is not NaN. The 1-ULP bound, the
+exact zero below the underflow threshold and the NaN contract then transfer by
+construction rather than by re-measurement — and the check runs in 0.6 seconds.
+A control that deletes the underflow mask reports 1,020,022,810 mismatches,
+first at `-87.33654`, which is what makes the zero meaningful.
+
+**A test that cannot fail is worse than no test, and invariance hides them.**
+Softmax is invariant to the value subtracted: exponentials and sum shift by the
+same factor and cancel. So a row maximum that misses part of the row is
+*numerically silent* — deleting one of the four new accumulator chains passed
+every existing test in the file. It only surfaces as overflow. The test that now
+guards it puts a 3e38 logit at every position of seven different `d` values and
+requires the row to stay finite. The same shape of hole appeared in #1402: no
+test shape produced a short final column panel, because the panel width is
+derived from `n16` and the thread count and the natural shapes divide evenly.
+Both were found by mutation, not by reading.
+
+## 43. The fourth instance §40 predicted, and it was the unit rather than the value (#1484)
+
+§40 was written so that "the fourth instance is recognised rather than
+re-derived". This is that instance, found six days later, and it is recorded
+here because it arrived with a variant §40 did not cover.
+
+### 43.1 The finding
+
+`parallel_rows_per_task` in the softmax kernel refused to fan out below
+`MIN_PARALLEL_SOFTMAX_ROWS = 64` rows. Decode attention softmax is
+`n = heads` by `d = kv_len`, so a 32-head model sat below that floor at **every**
+key length and **every** pool width. Measured on a pure-native default build, our
+native p50 was flat from one thread to eight while ORT parallelised:
+
+| fixture | t=1 | t=2 | t=4 | t=8 |
 | --- | --- | --- | --- | --- |
-| 0 us | 0.916 | 13.68 | 1.7 | 111.6 |
-| 100 us | 0.863 | 13.41 | 3.8 | 129.7 |
-| 500 us | 1.011 | 10.71 | 16.9 | 97.9 |
-| 2000 us | 0.811 | 5.94 | 16.1 | 92.5 |
-| 20000 us | 1.086 | 0.90 | 16.9 | 82.9 |
+| `sm_decode_h32_kv1024` | 0.031 ms | 0.031 ms | 0.031 ms | 0.031 ms |
+| `sm_decode_h32_kv8192` | 0.208 ms | 0.209 ms | 0.210 ms | 0.211 ms |
 
-The transition is between **200 us and 500 us**, and `parks/iter` saturates at
-~17 — one per worker plus the dispatcher. That is exactly `MAX_SPIN`, the
-task runtime's adaptive spin ceiling (`pool.rs`: `MIN_SPIN` 20 us doubling to
-`MAX_SPIN` 500 us on a hit, halving on a park). The policy behaves as
-documented, which had never been confirmed at the model level.
+That flatness *was* the multi-thread `ours/ORT` gap on these fixtures. Removing
+the row floor and keeping the adjacent element floor moved native time down
+29.9%-43.6% wherever the fan-out engages, and the ratio with it: −53.9% at
+kv4096 t=8, −44.1% at kv2048 t=8, −39.9% at kv8192 t=8, −23.2% at kv1024 t=2.
 
-**Cross-validation against the micro-benchmark.** The CPU EP's
-`task_runtime_latency` integration test sweeps the same gaps against a bare
-fan-out. Independently, at 16 workers, it reports dispatch p50 of 5.5 us at a
-0 us gap, 5.4 us at 20 us, 5.6 us at 100 us, then **10.2 us at 500 us** and
-38.5 us at 2000 us. Two harnesses, two levels, same threshold.
+### 43.2 The variant: the constant was calibrated in the right regime, in the wrong unit
 
-### 41.4 The cost of spinning, and the cost of not
+§40.2 says the three earlier instances were all "correct when set, and became
+wrong because a different regime started using the same path". This one is not
+quite that. A row floor is never right, in any regime, because **a row is not a
+unit of work** — `n` prices work only if `d` is held fixed, and `d` is the key
+length, which is the one thing that varies most in attention. The floor was a
+proxy for "enough work to amortise the pool wake-up", and the predicate it sat in
+*already contained the honest form of that question* one line below, as
+`MIN_PARALLEL_SOFTMAX_ELEMENTS`. Two thresholds for one question, one of them
+dimensionally wrong, and the wrong one bound first.
 
-Converting the table above to CPU per iteration (`cpu-per-wall` x iteration
-wall, sleep gaps, so all of it is the pool):
+So §40.3's practice — record the regime next to the constant — would not have
+prevented this. The regime was fine. The check to add is narrower and cheaper:
+**a threshold should be expressed in the unit of the thing it is protecting.**
+Wake-up cost is amortised by work, so the gate is priced in elements. When two
+thresholds guard one decision, ask whether the weaker one is a proxy for the
+stronger, and if it is, delete it rather than tuning it.
 
-| gap | CPU-ms per iteration | over the 0-gap baseline |
+The widening is safe for a reason worth stating in the same unit: chunks are
+sized by `ROW_TILE_BYTES`, not by pool width, so the newly-admitted `32 x 8192`
+yields 32 chunks of 8192 elements — exactly what the already-admitted `64 x 256`
+yields. The smallest total work admitted is unchanged at 16384 elements and the
+smallest per-chunk work is unchanged at 4097. Nothing new is admitted *per
+worker*; only the row-shaped refusal is gone.
+
+### 43.3 A gate whose effect is numerically invisible needs its wiring tested
+
+The more transferable lesson is a testing one, and it repeats §42's "a test that
+cannot fail is worse than no test" in a new form.
+
+Softmax rows are independent, so **the output is bit-identical whether or not the
+fan-out happens**. Every correctness test in the file is therefore blind to the
+gate by construction. Review demonstrated the consequence: inverting the caller's
+use of the predicate — which pins every large softmax back to a single thread and
+undoes the entire change — left all 1448 tests passing. The new unit test did not
+catch it either, because it exercised the predicate in isolation rather than
+through its caller.
+
+A performance gate has no numerical signature, so it must be asserted directly:
+the test now pins `parallel_rows_per_task`'s `Some`/`None` decision, not just the
+predicate's boolean. Its refusals hold at any pool width and run everywhere; the
+fan-out half returns early below two lanes, matching the existing
+`parallel_output_rows_dispatches_to_the_task_runtime`.
+
+Two further mutations were needed to pin the floor honestly. Asserting the
+boundary at `MIN` and `MIN-2` let a floor relaxed to `MIN-1` survive; `3 x 5461`
+is one element short and now straddles it exactly. And `saturating_mul` is
+load-bearing rather than defensive: it clamps *upward*, so an unrepresentable
+element count reads as "plenty of work" and fans out, where a wrapping multiply
+reads as "none" and would silently pin the largest tensors in the system to one
+thread. The first draft of that assertion had the sign backwards, and the test
+caught its own author.
+
+### 43.4 Reporting note
+
+The benchmark host was heavily contended during this run — A/A null controls
+reached 61% on some cells, against ≤2.5% for most cells in the §42 run, and
+absolute times inflated ~35%. Per §39.3 the control is the arbiter, and the
+honest read here came from structure rather than from the grid: only four of the
+seven softmax fixtures change gate decision at all. `sm_bert_b8_s128` (n=12288),
+`sm_prefill_h32_s512` (n=16384) and `sm_whisper_cross` (n=30000) cleared the old
+row floor already, so the predicate returns the same value before and after and
+their code path cannot change. Their scatter — up to +31.1% at prefill t=8,
+against a 31.41% A/A floor — is a calibration of the host, not a result, and is
+reported as such. When a host is too noisy to measure, knowing which cells
+*cannot* have moved is worth more than more trials.
+
+## 44. Two identical symptoms, opposite verdicts: why a self-consistent A/B cannot adjudicate correctness (#1491, #1421)
+
+On the same day, two changes produced the *same* symptom: a reordered
+floating-point reduction flipped the greedy `argmax` at a near-tie, changing the
+decoded token stream. The obvious reading — "output changed, therefore
+regression" — would have been wrong for one of them, and the equally obvious
+reading — "the A/B agrees with itself, therefore fine" — would have shipped a
+silent corruption in the other.
+
+| | #1491 (causal capture) | #1421 (RMSNorm fold) |
+|---|---|---|
+| Mechanism | split-KV chunked online softmax reorders the fp32 key reduction vs the monolithic `attention_row` serial reduction | folding the standalone norm into the following GEMV reorders the fp16 reduction |
+| Margin at the flip | 0.047 nats (`6086` vs `30879`) | 0.0156 nats (`448` vs `304`) |
+| Independent oracle picked | the **parent** — the change was wrong | the **changed** side — the change was *more* accurate |
+| Disposition | fix (gate causal back onto the monolithic path) | accept, and correct the docs |
+
+### 44.1 The trap: a comparison that passes because both sides moved together
+
+#1491 was first validated by comparing eager decode against captured decode:
+300/300 tokens identical. That comparison is *necessary* but proves only that the
+two paths agree **with each other**. Enabling `dev_length_eligible` for the causal
+form routed *both* eager and capture onto the split-KV kernel, so both moved, and
+the check passed while the output was wrong.
+
+The failure was maximally quiet: no crash, no NaN, no garbage — a *plausible*
+alternative token (the runner-up), appearing only past a capacity boundary and
+only at a near-tie. A downstream reader would have seen fluent text.
+
+**Rule.** Byte-identity between two paths you changed together is not evidence of
+correctness. At least one arm of a correctness comparison must be something the
+change provably cannot reach.
+
+### 44.2 The instrument: a teacher-forced dense-prefill oracle
+
+What settled both cases was cheap and reusable. Take the shared prefix both sides
+agree on (prompt + generated tokens up to the divergence), then run it as a
+**fresh full prefill** — one dense causal attention pass that touches no KV-ring,
+no fixed-capacity decode, no `dev_len` logic — and dump the top-k next-token
+logprobs:
+
+```
+profile_native --model <dir> --ep cpu \
+  --dump-logprobs <abs-out.json> --prompt-ids <abs-prefix.json>
+```
+
+Note `--prompt-ids` takes a **file path**, not inline JSON (inline yields a
+misleading `os error 123`). Run it on the **CPU EP**: a different implementation
+at different precision, which a CUDA kernel change cannot influence. Keep the
+prefix under the KV capacity so the oracle stays on the dense path.
+
+This gives the *ranking and the margin*, not just a winner — and the margin is
+what tells you whether you are looking at a bug or at rounding. Both cases here
+were sub-0.05-nat ties, i.e. positions where any legitimate reassociation may
+flip the choice.
+
+### 44.3 The corollary: a "byte-identical" claim in a comment is a hypothesis
+
+The RMSNorm fold was documented in-code as *byte-identical*. It is not: it changes
+reduction order, and one prompt in six flipped a token at qwen0.5B/896. The claim
+had apparently never been tested — and because it was written as settled fact, it
+was reused as a premise. The comment now states what is actually true (reduction
+order changes; greedy tokens can flip at near-ties) with the oracle verdict
+attached.
+
+**Rule.** Treat an unverified numerical-equivalence claim in a comment as an
+untested hypothesis, especially when it is load-bearing for a decision. Verifying
+one is usually a single measurement.
+
+### 44.4 Reporting note
+
+Neither investigation reported throughput: the box was shared, and a token-stream
+comparison is immune to contention while a timing number is not. Both conclusions
+rest on exact token ids and logprob margins, which are contention-independent.
+
+## 45. The route with a known defect was the route with no A/B (#1685)
+
+#1685 reported an SDPA fast-path failure under `--features mlas`: ~3% of runs on
+`main` left an 8-row hole of exact `0.0` in the output, or died with a SIGSEGV,
+tripping `identity specialization diverged`. The investigation found the bug
+**already fixed** — incidentally, by an unrelated PR, with nothing guarding it —
+and then found the more interesting thing: *why nobody had noticed either the
+break or the fix*.
+
+### 45.1 The defect: a straggler from a retired epoch
+
+`WorkStealingThreadPool::parallel_for` publishes one job into a single shared
+slot under `dispatch_lock`. `wait_for_completion` returns when `remaining`
+reaches zero — when the last **block** has run. A worker is not finished then:
+it is still inside `run_job`, holding a by-value copy of the old `Job` and
+looping in `claim_iterations` against the *shared* counters.
+
+Before `0f40538b2` (PR #828, which added the 12 lines as a side effect of an
+unrelated IR redesign) the dispatcher returned and released the lock at that
+moment. MLAS fans out under rayon in `sdpa_f32_fast`, so the next dispatch came
+from a different rayon worker, republished the loop bounds and bumped the epoch
+while the straggler was still live. The straggler then claimed a block of the
+**new** range and did two things at once:
+
+1. decremented the new job's `remaining` without running the new closure, so
+   `wait_for_completion` returned early and a partition **never executed** — a
+   `beta = 0` SGEMM left those rows of `C` untouched (the 8-row hole, `8 · dv`
+   contiguous zeros at a tile boundary: MLAS had split the 128-row `probs·V`
+   GEMM 16 ways); and
+2. invoked the **old** closure with an index from the **new** range, writing
+   through raw pointers past the end of the previous GEMM's `C` — the SIGSEGV.
+
+`wait_for_workers` closes both by making the dispatcher wait for
+`observed == worker_count` before clearing the `Job`.
+
+### 45.2 Why it would not reproduce, and what finally did
+
+Direct reproduction failed completely: 80 runs of the exact test, 40 runs at
+`--test-threads 8`, pool widths 4/8/16/32, 3000 iterations of a nested
+rayon×`sgemm` stress with NaN-prefilled `C`, and 6000 `sdpa_f32` invocations at
+the reported shape — **zero** holes.
+
+The reason is that the race needs two dispatches to *overlap*, and concurrent
+`parallel_for` calls are serialised by `dispatch_lock`. The window is only the
+gap between the last block finishing and the straggler leaving `run_job`, which
+is why the issue reports ~3% **per process** rather than per invocation.
+
+What settled it was a falsifier rather than a reproducer: remove
+`wait_for_workers` from current `main` and run four dispatcher threads against
+one 8-thread pool. The guard test passes in 0.12 s on `main` and fails in
+milliseconds without it — `range start index 16 out of range for slice of
+length 0`, i.e. a retired-epoch straggler running the old closure against the
+new range, which is #1685's SIGSEGV in safe-Rust form.
+
+**Rule.** When a race will not reproduce, stop trying to trigger it and try to
+*break the fix instead*. A falsifier that fails in milliseconds is a better
+regression guard than a reproducer that fires 3% of the time, and it is the one
+you can leave running in CI.
+
+### 45.3 The actual finding: the audit, not the kernel
+
+The kernel needed no fix. The coverage did:
+
+| Instrument | State before #1685 |
+|---|---|
+| `backend_ab.rs` `AB_COVERED` | `AttentionTranspose` **absent**, while its `PLAN` entry claimed `Graduation::Partial` — and the graduation rule *reads* `AB_COVERED` |
+| `tests/native_vs_mlas_differential.rs` | no attention row at all |
+| `benches/native_vs_mlas.rs` | no attention row at all |
+| `identity_hook_specialization_matches_the_general_epilogue` | compared two **zero-prefilled** buffers |
+| `scripts/ort_ab/gen_mha.py` | 7 cells, all bidirectional encoder shapes; `unidirectional` supported but never set; no `q_seq = 1`; no past-KV |
+| `mha_parity/cases.rs` | 12 goldens; the only past-KV case has `q_seq = 1`, so `causal = unidirectional && q_seq > 1` is **false** |
+
+The zero-prefill point is not theoretical. Dropping 8 rows per tile from the
+`probs·V` GEMM — 6144 of 98304 elements, #1685's exact signature — leaves the
+pre-existing test **passing**, because an unwritten element is indistinguishable
+from a legitimate `0.0` and a hole that lands identically in both compared runs
+cancels out. The same falsifier against the NaN-prefilled version reports
+`left 6144 of 98304 output elements unwritten; first at index 7680 =
+(tile 0, row 120, column 0)`.
+
+**Rule.** A buffer prefilled with the identity of the operation cannot
+distinguish "computed" from "skipped". Prefill with a value the kernel can never
+legitimately produce.
+
+### 45.4 An undefined benchmark cell is not a slow benchmark cell
+
+Adding causal and decode rows to `gen_mha.py` immediately produced 24/384
+parity failures on one cell: `q_seq = 8`, `kv_seq = 1024`, `unidirectional = 1`,
+no past-KV — chunked prefill expressed as one fused long K/V.
+
+That looked like a kernel bug and was not one. Sweeping a NumPy oracle over
+*every* causal offset in `0..=kv_seq` matched ORT at **none** of them, while the
+same oracle matches ORT to 1.2e-7 with `unidirectional = 0`, and matches to
+2.4e-7 at offset `past_seq` once a real past-KV cache is supplied. ORT's
+`unidirectional` is simply undefined when `q_seq != kv_seq` with no past input.
+
+So the cell was invalid: neither runtime was computing a defined answer, and any
+timing from it is meaningless. It is replaced by past-KV cells
+(`llama_decode_past1023`, `llama_chunk8_past1016`, `llama_chunk32_past992`),
+which is how the runtime actually emits chunked prefill, and `build_mha` now
+raises on the invalid combination rather than emitting a graph that will fail
+parity later.
+
+**Rule.** Before treating a parity failure as a kernel bug, check that the graph
+has a defined answer. An oracle sweep over the plausible conventions costs
+minutes and distinguishes "we are wrong" from "the question is malformed".
+
+### 45.5 The offset nothing was checking
+
+The same exercise exposed a second hole. `past_seq` is load-bearing only when
+`q_seq > 1` **and** the cache is non-empty; every self-attention golden has
+`past == 0` and the one past-KV golden has `q_seq == 1`. So the causal offset
+was verified by nothing.
+
+Hard-coding `past_seq = 0` leaves **all 12 pre-existing goldens passing**. The
+new `past_kv_chunked_prefill_causal` case (`S = 3`, `past = 6`,
+`unidirectional = 1`) is the only one that fails, at `max abs diff 2.22`. Our
+convention was already correct; it is now pinned.
+
+### 45.6 The kernel gap the new coverage did find
+
+With past-KV cells finally in the matrix, `llama_decode_past1023` measured
+**27.2x** ORT. `concat_cache` was the cause, and it was a pure layout mistake:
+
+```rust
+for d in 0..dim {            // head dim OUTSIDE
+    for j in 0..past.seq {   // sequence INSIDE
+        data[((b * heads + h) * total + j) * dim + d] = past.at(b, h, j, d);
+```
+
+`Bnsh` is contiguous `[b][h][s][d]`, so consecutive stores were `dim` floats —
+512 B at Llama's head size — apart. Every store touched a fresh cache line and
+the whole tensor was traversed `dim` times: a column-major walk of a row-major
+buffer, ~4.2 M near-certain misses per tensor, ~20 ms of a ~28 ms node. The
+operator spent most of a decode step copying its own cache.
+
+For a fixed `(b, h)` plane both sources are already laid out as the destination
+needs them, so the concat is two `copy_from_slice` calls, fanned across planes
+on the same `MIN_PARALLEL_TRANSPOSE_ELEMENTS` threshold the sibling transforms
+use. The two neighbouring functions document this exact rule in their doc
+comments; `concat_cache` was the one place that broke it, and no benchmark row
+supplied a past-KV cache, so nothing measured it.
+
+| cell (t=8) | before | after |
+|---|---|---|
+| `llama_decode_past1023` | 27.2x | 13.8x |
+| `llama_chunk8_past1016` | 24.8x | 13.1x |
+| `llama_chunk32_past992` | 27.7x | 18.5x |
+
+**Rule.** A convention documented in two of three sibling functions is not
+enforced anywhere. The third one is where the cost is.
+
+### 45.7 Complete results, production default build, 18 cells x 4 thread counts
+
+Default (MLAS-free) `bench_generic`: `nm`, `nm -D`, `strings` and `ldd` all
+report **0** MLAS symbols and no `libstdc++`. The same probes on a
+`--features mlas` build of the same crate report **842** symbols, 105 strings
+and a `libstdc++` link, so the probe is known to be able to see MLAS when it is
+there. `MultiHeadAttention` executes natively at 99.97% of node time, one call,
+no ORT fallback. 432/432 trials parity `PASS` (the 24 failures were the
+undefined cell, now removed).
+
+**Measurement conditions -- what the absolute milliseconds are and are not.**
+This grid was taken on a shared 16-physical/32-logical host on which other
+agents run benchmarks and full test suites. Roy has since measured the *same*
+cell at 197.2 and 22.8 tok/s in two windows -- an 8.6x swing from contention
+alone -- with intra-run spreads as tight as 6% in the corrupted samples. A
+tight spread only says contention was *steady* during the run; it does not say
+the host was quiet. I did not record host occupancy for this window, so I
+cannot certify it was.
+
+What survives that, and why:
+
+- **Ratios, but only against a *symmetric* tax.** The arms are interleaved, so
+  an occupancy tax that falls on both equally cancels in `native/ort`. It does
+  **not** cancel when the tax falls on one arm only, which is the case here --
+  see 45.10. The `concat_cache` before/after figures in 45.6 are native-vs-native
+  and keep their footing; the native-vs-ORT ratios do not.
+- **The scaling shape in 45.8** rests on the code, not on the timings:
+  `sdpa_f32_simd` contains no fan-out at all, so the native arm cannot scale
+  with thread count whatever the host is doing. **The timing-based version of
+  this argument, which appeared here and claimed ORT was a positive control for
+  core availability, was wrong and is retracted in 45.10.**
+
+What does not survive: the **absolute** millisecond columns below. A steady
+occupancy tax is invisible in the spread *and* invisible in the ratio, and it
+is real. Treat them as shape, not as throughput numbers, and do not quote them
+as a baseline without re-measuring on a recorded quiet window. In particular
+the mild regression at `t = 16` (9.2 -> 14.4 ms) is small enough to be a
+contention artifact; nothing in 45.8 depends on it.
+
+**Rule.** A benchmark on a shared host must record host occupancy alongside the
+numbers, gating on the instantaneous runnable count
+(`cut -d' ' -f4 /proc/loadavg | cut -d/ -f1`) rather than the 1-minute load
+average, which is an EMA and misleads in both directions -- it stays high for a
+minute after a heavy run ends and reads low while a burst is still in flight.
+An unrecorded window cannot be defended later; it can only be re-run.
+
+`native/ort`, p50, lower is better; `(…)` is the same-invocation A/A null
+control arm:
+
+| cell | t=1 | t=4 | t=8 | t=16 | native ms t=1 → t=16 |
+|---|---|---|---|---|---|
+| `bert_base_b8_s128` | 5.36 (5.31) | 13.01 (8.97) | 15.50 (14.46) | 19.93 (20.97) | 38.2 → 42.3 |
+| `bert_base_decode_kv1024` | 1.51 (1.54) | 0.78 (0.76) | **0.55** (0.46) | 0.62 (0.58) | 1.2 → 1.3 |
+| `bert_base_s128` | 5.71 (5.73) | 9.99 (8.56) | 11.63 (10.64) | 11.65 (12.29) | 4.8 → 7.8 |
+| `bert_base_s384` | 7.04 (7.14) | 22.89 (15.69) | 23.36 (23.78) | 28.18 (32.36) | 52.7 → 59.7 |
+| `bert_large_s128` | 5.65 (5.67) | 11.29 (8.89) | 12.75 (14.01) | 15.75 (15.92) | 6.3 → 11.0 |
+| `clip_l14_s257` | 5.79 (5.74) | 14.00 (13.25) | 24.49 (25.95) | 24.83 (24.52) | 25.0 → 38.1 |
+| `llama_chunk32_past992` | 4.11 (4.18) | 11.69 (12.31) | 17.93 (17.64) | 24.29 (23.75) | 42.4 → 42.9 |
+| `llama_chunk8_past1016` | 3.41 (3.59) | 8.10 (7.59) | 11.77 (11.99) | 17.16 (17.15) | 17.6 → 21.9 |
+| `llama_decode_b8_kv1024` | 1.50 (1.50) | 1.44 (1.45) | 1.55 (1.53) | 1.53 (1.55) | 79.9 → 51.4 |
+| `llama_decode_kv1024` | 1.93 (1.88) | 1.14 (1.46) | 1.33 (1.22) | 1.24 (1.68) | 13.1 → 8.8 |
+| `llama_decode_kv128` | 1.50 (1.49) | 0.69 (0.75) | **0.63** (0.65) | 0.72 (0.63) | 0.6 → 0.8 |
+| `llama_decode_kv4096` | 1.59 (1.59) | 1.32 (1.35) | 1.40 (1.39) | 1.40 (1.68) | 42.2 → 31.8 |
+| `llama_decode_past1023` | 3.48 (3.49) | 8.21 (8.00) | 11.00 (9.65) | 15.03 (13.60) | 10.5 → 13.8 |
+| `llama_prefill_s128_causal` | 3.31 (3.35) | 5.67 (6.86) | 6.74 (7.67) | 9.96 (8.04) | 15.5 → 22.5 |
+| `llama_prefill_s512_causal` | 3.75 (3.73) | 12.34 (12.49) | 19.34 (19.30) | 21.86 (21.60) | 237.8 → 232.5 |
+| `phi35_prefill_s256_causal` | 4.02 (3.99) | 11.11 (10.67) | 15.20 (15.04) | 18.18 (17.25) | 51.8 → 52.8 |
+| `vit_b16_s197` | 5.64 (5.66) | 11.60 (11.33) | 11.37 (11.54) | 12.09 (16.70) | 10.9 → 11.3 |
+| `whisper_cross_s1500` | 6.16 (6.16) | 20.42 (21.55) | 31.52 (31.68) | 40.29 (40.46) | 182.6 → 181.3 |
+
+The null arm tracks the native arm within a few percent on every cell, so the
+ratios are the measurement and not the instrument.
+
+### 45.8 What the table actually says: the production SDPA route is single-threaded
+
+Read the last column. `native ms` is **flat** from 1 to 16 threads on every
+cell — 182.6 → 181.3 for whisper, 237.8 → 232.5 for `llama_prefill_s512`,
+42.4 → 42.9 for `chunk32`. The ratio degrades with thread count purely because
+ORT scales and we do not (`llama_decode_past1023`: ORT 3.05 ms → 1.06 ms across
+the same sweep).
+
+The code agrees with the measurement: `sdpa_f32_simd`, the route a **default**
+build takes on x86 and aarch64, is a plain `for b { for n { … } }` with no rayon
+fan-out at all. `sdpa_f32_fast` — the MLAS *research* route — does use
+`par_chunks_mut`. The shipped route is the serial one.
+
+That inverts how these ratios should be read. At `t = 1` the grid is 1.5–7.0x,
+which is a per-core efficiency gap. Everything above that is unclaimed
+parallelism, not kernel quality, and it is worth roughly the thread count. The
+decode cells that already win (`bert_base_decode_kv1024` 0.55x,
+`llama_decode_kv128` 0.63x) are the ones small enough that one core is enough.
+
+This is a separate workstream from #1685 and is filed as such rather than folded
+into a coverage PR; it also touches pool ownership, which is Sebastian's lane.
+Filed as **#1718**, carrying the flat `native_p50` column, the
+`llama_decode_past1023` thread-scaling control above, and the code observation.
+
+**Rule.** When a native/ORT ratio degrades monotonically with thread count while
+the native absolute time stays flat, stop optimising the kernel. The number is
+reporting the other runtime's scaling, not this one's arithmetic.
+
+### 45.9 Resolution, and one over-claim in 45.8 corrected
+
+#1718 is fixed: `sdpa_f32_simd` now fans out over flattened `(batch, head, query)`
+rows on the task runtime, above a measured 4 Mi-MAC floor. Full results, the
+threshold derivation and the falsifiers are in
+[`2026-08-22-sdpa-fanout.md`](2026-08-22-sdpa-fanout.md). The prefill and encoder
+cells above move -48% to -83% at t >= 4; `llama_prefill_s512_causal` — profiled at
+~73% SDPA on the critical path — goes **233.6 ms -> 30.7 ms (7.6x)** at t=16 with
+process CPU rising 137% -> 956%. That 7.6x is a 2-repeat focused A/B; the
+best-replicated win is `bert_base_s384` at -83.4% (6.0x, median of 3, 0.2% null
+arm).
+
+**But 45.8's "it is worth roughly the thread count" is wrong for the decode cells,
+and the correction matters more than the win.** Profiling
+`llama_decode_past1023` at t=16 — the exact cell 45.8 quotes as its
+thread-scaling control — shows it is **51% `__memmove_avx_unaligned_erms`**, under
+`concat_cache` and `load_bnsh`. `sdpa_f32_simd` is ~5.5% of samples, roughly 23%
+of wall. Amdahl therefore bounds *any* SDPA fix on that shape at about **1.3x**,
+not 16x, and the best-replicated measurement of that cell (**-21.7% at t=8**,
+11 trials, null arm +6.0%) sits essentially at that ceiling.
+
+The flat `native_p50` column was real and the code observation was correct. What
+did not follow is the sizing: a flat native column tells you parallelism is
+unclaimed, but not *how much* of the wall clock is available to claim. That
+requires attribution, and on decode-with-past shapes the attribution says the KV
+concat is the larger term. `concat_cache` also still reaches **global Rayon** in
+a pure-native build, which is a separate open lane.
+
+**Amended rule.** A flat native absolute time across thread counts identifies
+unclaimed parallelism, but it does not size the prize. Profile the cell before
+quoting a headroom multiple — otherwise you are asserting that the kernel you
+happened to be reading is the whole critical path.
+
+### 45.10 Retraction: ORT was not a positive control, it was the tax
+
+The caveat in 45.7 argued that the native-vs-ORT ratios survived host
+contention because the arms are interleaved and because ORT scaling 2.9x in the
+same window proved cores were available to both. **That argument is wrong.** It
+assumed the two arms faced the same host. They did not, in two ways that both
+push the same direction and both grow with thread count.
+
+**1. The ORT arm's thread pool is the thing taxing the native arm.** In a paired
+run `bench_generic` builds `ort_session` once and keeps it alive for the whole
+measurement loop, alternating `measure_native()` and `measure_ort()` inside it.
+ORT's intra-op pool spin-waits between its runs, so it is burning cores *during*
+the native timing. This is not a new discovery -- `ab.py`'s own docstring says
+so, and puts it at "up to 6x depression on long cells", which is why
+`--native-only` exists. I used the paired mode, correctly, because the
+comparison is native-vs-ORT; I then reasoned about the result as though the
+paired-mode tax were not there.
+
+The part that matters for 45.8: `ab.py` passes the same width to both arms,
+`--native-threads T` **and** `--ort-intra-threads T`. So at `T = 16` there are
+~16 ORT threads spinning while the native sample is taken, and at `T = 1` there
+is ~1. **The tax is one-directional and grows with `T`** -- exactly the shape
+45.8 reported as a native scaling failure. A ratio cancels a symmetric tax; this
+one is asymmetric by construction.
+
+**2. The arms may not even have had the same cores.** *(This leg named the
+wrong mechanism. The one it names is excluded below; a different one, and a
+larger asymmetry, is what the rest of this section establishes.)* Sebastian has
+since shown
+(#1729, from `/proc/<pid>/task/*/status`, no timing involved) that the EP's
+default 16-wide pool pins its workers to cpus 0-15, which on this host is 8
+physical cores with two workers per core, and one of the two L3 domains. cpu0
+additionally carries a permanent external competitor -- a pinned scalar probe
+gets 0.503 of the throughput there that it gets on any other CPU. ORT's pool is
+not pinned and roams all 32 logical CPUs.
+
+**Half resolved, and the other half is worse than the version I retracted.**
+This leg was left as "not yet verified", pending a `/proc` read against a live
+bench process. The *first* mechanism did not need one -- it is answerable from
+the routing code, with no timing at all, and the answer is no:
+
+* The production SDPA route forks on `decode_pool_active()` (`sdpa.rs:1287`).
+  Only the true arm reaches `decode_parallel_output_row_blocks`, i.e. the SPMD
+  pool that `decode_affinity` places. The false arm goes to
+  `task_runtime::chunk_runs_mut`.
+* `decode_pool_active()` is `spmd_decode_active() || numa_decode_active()`
+  (`matmul_nbits.rs:4918`). Both halves are gated on a **thread-local**:
+  `IN_SPMD_SCOPE` (`:4901`) and `IN_NUMA_SCOPE` (`:4891`), each set only inside
+  `with_decode_pool_scope`. Neither is a process-global, so no other thread's
+  decode loop can turn this on for the benchmark's engine thread.
+* The only production callers of that scope are under
+  `onnx-genai-engine/src/native_decode/` -- the generation loop in `cpu.rs`
+  (445, 578, 584) and the speculative proposer (`proposer.rs:325`).
+  `bench_generic` never mentions `native_decode`; it drives graphs through
+  `onnx-runtime-session`.
+
+So on a single-node SDPA/MHA graph the flag is false and **the SPMD pool is
+never entered**, which means the per-worker cpus 0-15 assignment `#1729` fixed
+could not have reached these rows.
+
+**That is not the same as "placement did not reach these rows", and I published
+the stronger claim.** A review of the draft caught it. There is a *second*,
+independent mechanism that confines CPUs, it is keyed on the same
+`ONNX_GENAI_CPU_DECODE_THREADS` value, and it **did** apply here:
+
+* `CpuExecutionProvider::initialize` (`provider.rs:340`) calls
+  `bound_process_to_decode_budget()` (`matmul_nbits.rs:4354`). With a budget
+  set and no explicit `ONNX_GENAI_CPU_DECODE_AFFINITY`, it calls
+  `set_current_thread_affinity` -- a real `sched_setaffinity` on the calling
+  thread. Its own doc comment states the reach: "threads spawned afterwards
+  ... inherit the mask".
+* `bench_generic` reaches it. `InferenceSession::load` selects the CPU EP via
+  `executor/platform.rs:8`, which calls `ep.initialize(...)`. And
+  `bench_generic` sets `ONNX_GENAI_CPU_DECODE_THREADS` from `--native-threads`
+  before any session is built (`:670-673`), so on every row where `ab.py`
+  passed a width, **the benchmark process confined itself**.
+
+This is documented in-tree, by Sebastian, in the `#1746` addendum to
+`2026-08-22-decode-width-scaling.md` -- including the observation that his
+`int4_decode_loop_ab` bench is *unaffected* because it never calls
+`initialize()` and enters the decode scope directly. Mine is the opposite case:
+it goes through the production session-load path, so it gets the mask. I read
+that addendum as being about his harness and did not check mine against it.
+
+**The mask's value, now observed rather than reasoned about.** Read from
+`/proc/<pid>/task/*/status` on live `bench_generic` runs on this host, with no
+outer `taskset`, so the process saw all 32 logical CPUs before confining
+itself:
+
+| `--native-threads` | mask the process gave itself |
+|---|---|
+| 2 | `[0, 2]` |
+| 4 | `[0, 2, 4, 6]` |
+| 16 | `[0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30]` |
+
+`scatter_across_cores` (`decode_affinity.rs:560`) ranks physical-core leaders
+ahead of SMT siblings, and that is what it does here: at `T = 16` the mask is
+16 *distinct physical cores* spanning both L3 domains, not the compact
+`cpus 0-15` set. **So the `#1729` pathology -- two spinning workers per core --
+is excluded on both mechanisms.**
+
+That is not the same as calling the spread mask good, and 26.2 of this document
+is the reason to be careful: it measured exactly this `0,2,...,30` layout as
+**worse** (0.133 ms vs 0.079 ms) for a pinned multi-worker decode pool, because
+straddling two CCXs costs more than SMT sharing when the working set fits in one
+CCX's L3. Both can be true, and here they are: that penalty is paid by a *pool*,
+through cross-CCX barrier and shared-data traffic, and these rows never build
+one -- the SPMD pool is never entered and 45.8 shows the SDPA route has no
+fan-out at all. So the spread is harmless *for these rows specifically*, and
+anyone quoting this paragraph for a pool workload should read 26.2 instead.
+
+**And a third asymmetry, which is the real find, and it is confirmed.**
+Affinity is inherited at thread creation, and the two arms are built on
+opposite sides of the mask: `bench_generic` constructs `ort_session` at `:691`
+and *then* `InferenceSession::load` at `:703`, and it is that load which
+applies the confinement. So ORT's intra-op pool is spawned **before** the
+process is confined and the native EP's threads **after** it.
+
+That is exactly what `/proc` shows. Same runs, threads grouped by name and
+mask:
+
+| `T` | confined to the budget mask | **unconfined, `0-31`** |
+|---|---|---|
+| 2 | 3 x `bench_generic`, 1 x `nxrt-task-0` | **1** |
+| 4 | 5 x `bench_generic`, 3 x `nxrt-task-N` | **3** |
+
+Every `nxrt-task-N` worker -- the native task runtime -- carries the budget
+mask. The unconfined threads are unnamed, so they inherit the process name,
+and there are exactly `T - 1` of them: ORT's intra-op pool, spawned at session
+construction, before the mask existed.
+
+At `T = 16` the mask is measured but the thread census is not: the
+`--native-only` launch that read it has no ORT arm. Carrying the `T - 1` rule
+across gives **a native arm confined to 16 physical cores while ~15 ORT workers
+roam all 32 logical CPUs** -- inferred from two points, not counted at 16 --
+including the SMT siblings of
+the very cores the native arm cannot leave. This does not replace reason 1, it
+sharpens it: the spin tax is not merely concurrent with the native sample, it
+is free to land on the sibling of every core the native arm is pinned to,
+while the native arm has nowhere else to go. And like reason 1 it grows with
+`T`, which is the shape 45.8 read as a native scaling failure.
+
+`--ort-intra-threads T` does **not** equalise this. It equalises the thread
+*counts*; the CPU *sets* differ by construction.
+
+**Mitigation, verified.** Setting `ONNX_GENAI_CPU_DECODE_AFFINITY=off` makes
+`explicit_decode_affinity_requested()` true, so `bound_process_to_decode_budget`
+stands its auto-mask down:
+
+```
+onnx-genai: CPU decode budget 16 bounds the prefill/MLAS Rayon pool; process
+CPU affinity is left to the explicit ONNX_GENAI_CPU_DECODE_AFFINITY setting
+```
+
+Re-probed at `T = 4`, all 11 threads then read `Cpus_allowed_list: 0-31` --
+both arms unconfined, symmetric. **Any re-measurement of these rows should set
+it**, together with `--native-only` or `--ort-intra-threads 1` for reason 1.
+
+Worth carrying to `#1792`, which reports this knob as *inert* on the default
+SPMD path: it is not inert here. It is the only switch that disables the
+process self-confinement. The same environment variable is dead in one
+mechanism and load-bearing in the other, which is a worse story for a user
+than either finding alone.
+
+**On the cost of these probes.** They are `/proc` reads, not timings, so host
+contention cannot corrupt them -- which is why they were taken on a busy host
+(runnable 33) rather than queued behind it. The widest arm was a single
+`--runs 1` native-only launch. Nothing here is a benchmark and nothing here
+claims a millisecond.
+
+**Consequence for the re-measurement queue.** Decode rows taken before
+`6e8c31ebd` were on 8 physical cores and do need re-taking. For the single-node
+SDPA/MHA rows in 45.7-45.10, both placement mechanisms are now settled and they
+land on opposite sides: the `#1729` per-worker mask never reached these rows,
+and the process budget mask that *did* reach them spreads one thread per
+physical core, which for these rows is harmless (see the 26.2 caveat above).
+**The rows are still not clean, but the reason is no longer placement -- it is
+that the ORT arm escaped the mask entirely.** They need re-taking for that and for reason 1;
+re-take with `ONNX_GENAI_CPU_DECODE_AFFINITY=off` and a `--native-only` or
+`--ort-intra-threads 1` arm, which removes both.
+
+**Rule.** Disproving one mechanism is not disproving the class. I traced the
+knob to the pool I already suspected, found it did not reach me, and wrote
+"placement did not reach these rows" -- when what I had shown was "*that* pool
+did not reach these rows". The second mechanism was one `grep` for
+`sched_setaffinity` away, in a file I had already opened, described in a
+teammate's document I had already read.
+
+**Rule.** A confound is a claim like any other and needs the same standard of
+proof in both directions. "It shares a knob with something that was broken" is
+a reason to check, not a finding -- and neither is "I checked the obvious place
+and it was clean". The direction that says *your data is fine* is the one that
+propagates: an over-stated confound costs a re-measurement, an under-stated one
+ships a wrong number under somebody else's name.
+
+**What still stands.** The finding of 45.8 -- the shipped SDPA route claims no
+parallelism -- is a statement about code: `sdpa_f32_simd` is a plain
+`for b { for n { ... } }` with no fan-out, while `sdpa_f32_fast` beside it uses
+`par_chunks_mut`. Native cannot scale with `T` whatever the host does. That leg
+never depended on a timing and is unaffected.
+
+**What does not.** The size of the gap at high `T`, the 13.6x figure at
+`t = 16`, and the mild regression from 9.2 to 14.4 ms between `t = 8` and
+`t = 16`. That regression now has a mechanism pointing at the instrument rather
+than the kernel: it is where ORT's spinning pool is widest. Re-measure with
+`--native-only` arms against a fixed reference, or with `--ort-intra-threads`
+held at 1 while `--native-threads` sweeps, before quoting any of it.
+
+**Rule.** An A/B is only a controlled experiment if the *harness* treats the
+arms symmetrically. Interleaving controls for drift over time; it does nothing
+about a tax that one arm imposes on the other, and a spin-waiting pool in the
+comparison arm is exactly that. Check what the other arm's runtime is doing
+while your arm is being timed -- and check it before, not after, you publish a
+scaling curve.
+
+**Rule.** Process-wide state applied *during* setup makes construction order
+part of the experiment design. Affinity is inherited at thread creation, so
+"which arm was built first" silently decided which arm got the whole machine.
+Nothing in the harness expresses that ordering as a decision; it is just the
+order two `let` bindings happen to appear in. When a runtime mutates the
+process, every thread that already exists is outside the change and every
+thread created later is inside it -- so audit setup order, not just the
+measured region.
+
+**Rule.** "The control scaled, so cores were available" is only valid when the
+control is independent of the treatment. Here the control *was* the competitor.
+A positive control has to be something that cannot be causing the effect it is
+being used to rule out.
+
+## 46. The residual was never steady state (a diagnostic, not a kernel)
+
+§38.7 closed with "the native-alone t=16→t=32 drift on the small shapes (roughly
+1.7×) survives everything above and has no explanation yet. It is the real
+remaining scheduler residual." It had an explanation. It is not a steady-state
+loss at all, and chasing it as one would have been wasted work.
+
+### 46.1 The drift reproduces, and then dissolves
+
+On latest `main`, native-only, arms interleaved, 9 reps, median ms — the drift is
+real at the harness's run count:
+
+| cell | t=16 | t=32 | drift |
+| --- | --- | --- | --- |
+| `qwen3_0p6b_qkv_t8` | 3.345 | 6.286 | 1.88× |
+| `qwen3_0p6b_qkv_t1` | 0.520 | 0.692 | 1.33× |
+| `qwen3_0p6b_mlp_t8` | 5.029 | 5.596 | 1.11× |
+
+Raising `--runs` from 7 to 40 removes it. Three reps at each width, same binary,
+same shapes:
+
+| t | native p50 (40 runs) | user CPU |
 | --- | --- | --- |
-| 0 us | 12.53 | — |
-| 100 us | 12.92 | +0.4 |
-| 500 us | 16.18 | +3.7 |
-| 2000 us | 16.70 | +4.2 |
-| 20000 us | 18.98 | +6.5 |
+| 16 | 1.325 / 1.735 / 1.051 ms | 2.33 / 2.23 / 2.13 s |
+| 32 | 1.223 / 1.724 / 1.039 ms | **4.39 / 4.43 / 4.38 s** |
 
-Idle spin costs roughly **`workers` x `spin window`** of CPU per idle period,
-saturating near 6.5 CPU-ms — 16 workers holding cores for up to 500 us before
-parking. At a *decode-shaped* gap of 100 us it costs +0.4 CPU-ms, which is
-0.4% of the ~10 ms this cell already spends. The spin window is cheap where
-decode actually lives and expensive only where decode does not.
+The wall times are the same to within noise. The CPU is not: t=32 burns almost
+exactly twice as much of it to produce the same answer in the same time.
 
-That is the argument against reflexively shortening it, and it is worth
-stating plainly because the opposite conclusion looks obvious from the
-saturated number alone.
+### 46.2 Splitting fixed from marginal
 
-### 41.5 The thread census: three pools, and the unnamed ones are ours
+Sweeping `--runs` and fitting CPU = fixed + marginal × runs separates the two
+terms cleanly. `gemm_nbits_qwen3_0p6b_qkv_t8`, native-only:
 
-The long-standing open item was a thread count that ran to roughly twice the
-configured budget, with the excess unnamed and unattributed. Bracketing each
-construction step with a census delta settles it:
+| budget | fixed (CPU-s) | marginal (CPU-ms/inference) | steady-state wall |
+| --- | --- | --- | --- |
+| 2 | 0.13 | 8.19 | 4.531 ms |
+| 4 | 0.31 | 8.61 | 3.271 ms |
+| 8 | 0.63 | 8.05 | 1.588 ms |
+| 16 | 1.55 | 13.99 | 0.921 ms |
+| 32 | **3.67** | 15.17 | 0.934 ms |
 
-| configuration | threads | composition |
-| --- | --- | --- |
-| default (no budget set) | 22 | 1 main + 6 decode + 15 task-runtime |
-| `--native-threads 16` | 48 | 1 + **16 global Rayon** + 16 decode + 15 task-runtime |
-| `--native-threads 32` | 80 | 1 + **32 global Rayon** + 32 decode + 15 task-runtime |
+Two things fall out. The marginal cost per inference at t=16 and t=32 is
+essentially the same (13.99 vs 15.17), and so is the steady-state wall (0.921 vs
+0.934 — t=32 is very slightly *worse*). **There is no steady-state t=16→t=32
+drift.** What there is, is a fixed cost that grows faster than the budget does:
+roughly 2.4× per doubling against 2× the threads.
 
-The unnamed threads are **ours**: the global Rayon pool, built eagerly by
-`bound_process_to_decode_budget` so that prefill and MLAS inherit the budget.
-They are anonymous only because `rayon::ThreadPoolBuilder::build_global` is
-not given a `thread_name`, and a thread nobody names inherits the *process*
-name — which is why a flat census makes them look like the benchmark binary's
-own threads rather than a pool.
+That fixed cost is pool construction and warm-up, and it is entirely
+pre-existing. Measured against the phase-16 base binary it is identical — 0.64 /
+1.67 / 3.54 CPU-s at budgets 8 / 16 / 32, against 0.63 / 1.59 / 3.73 for current
+`main`. Phase 16 neither caused it nor fixed it.
 
-Three consequences worth recording:
+### 46.3 What the fixed cost is
 
-1. **Setting an explicit budget more than doubles the thread count**, because
-   it creates a global Rayon pool of `budget` workers *in addition to* raising
-   the decode pool to `budget`. In a decode-only workload that Rayon pool does
-   essentially no work. This is a component of the fixed construction cost
-   phase 20 measured, and it is the specific reason an explicit budget is so
-   much more expensive than the default.
-2. **No duplicate ORT pool is created by our EP.** The census delta across
-   building the ORT session with `intra_op_num_threads=1` is exactly zero
-   threads. Whatever else is going on, we are not double-provisioning against
-   ORT.
-3. **The default decode pool is 6 workers on this 32-logical host**, not 16.
-   The default is far more frugal than any explicitly budgeted configuration.
+A single inference with no warmups, on a 512² dense model small enough that the
+arithmetic is irrelevant:
 
-### 41.6 The budget matrix
-
-Same cell, 100 us busy gap, 400 iterations, steady window detected, native
-alone, production build (`build=native` — no MLAS, no ORT CPU fallback):
-
-| budget | p50 (ms) | p90 (ms) | cpu-s per wall-s | threads |
-| --- | --- | --- | --- | --- |
-| default | 1.435 | 1.672 | 5.19 | 22 |
-| 1 | 7.011 | 7.113 | 1.00 | 3 |
-| 2 | 3.585 | 3.652 | 1.95 | 6 |
-| 4 | 1.858 | 1.972 | 3.78 | 12 |
-| 8 | 1.738 | 1.929 | 6.38 | 24 |
-| 16 | 0.910 | 0.981 | 13.85 | 48 |
-| 32 | 0.934 | 0.953 | 14.83 | 80 |
-
-Scaling is near-ideal from 1 to 4 (1.96x, then 1.93x), appears to **stall from
-4 to 8** (1.07x for twice the threads and 1.7x the CPU), recovers 1.91x from 8
-to 16, and is flat to negative from 16 to 32 — the last of which is phase 20's
-finding reproduced by an independent harness.
-
-**The 4-to-8 stall is an artifact, and §41.7 explains it.** It is retained in
-the table above exactly as first measured, because the way it dissolves is
-more useful than the table would have been if it had been quietly corrected.
-
-The matched ORT arm on the same cell is **0.1196 ms** at `intra_op=16`, so
-native is **7.6x behind** at its best budget. That is consistent with the
-7.7x measured for this cell by the entirely separate `bench_generic` solo-arm
-path, and it is a kernel gap, not a scheduling one.
-
-### 41.7 An explicit budget cannot migrate away from a noisy neighbour
-
-The 4→8 stall did not reproduce. Chasing it produced a better finding than
-the one it retracted.
-
-Re-measuring budget 4 with the identical binary and flags, in two sessions a
-few hours apart:
-
-| session | p50 samples (ms) |
-| --- | --- |
-| A | 1.858, 1.847, 1.861, 1.871 |
-| B | 2.766, 2.761, 2.756, 3.992 |
-
-Within each session the reading is tight — four samples inside 1%, which is
-*better* than the null control's band. Across sessions it moves **1.48x**.
-This is not noise in the ordinary sense; it is a stable measurement of two
-different things.
-
-The mechanism is the budget's own affinity confinement. An explicit budget of
-N calls `select_budget_cpus(N)`, which is **deterministic**: budget 4 always
-confines the process to CPUs `[0, 2, 4, 6]`, budget 16 always to
-`[0, 2, ..., 30]`. Sampling `/proc/stat` during session B, CPUs 0/2/4/6 were
-22-34% busy with co-tenant work at a host load average of 8-21.
-
-So a budgeted process **cannot migrate away from a busy core**. That is the
-feature working as designed — the docstring's promise is that prefill, MLAS
-and decode "stay off the rest of the machine" — but it has three
-consequences that were not previously written down:
-
-1. **A small budget concentrates the exposure.** Budget 4 gives up 28 of 32
-   logical CPUs and keeps 4 it must share; the scheduler's usual remedy,
-   migration, has been removed. Budget 16 spans more cores and averages over
-   them, so it moved far less between the same two sessions (0.910 → 0.889).
-   The *narrower* the budget, the *more* volatile the result on a shared host
-   — the opposite of the intuition that fewer threads means less interference.
-2. **Budgeted processes collide deterministically.** Because the selection is
-   always the same low-numbered physical cores, N budgeted processes on one
-   host all land on the same cores instead of spreading across the machine.
-   Single-tenant this is correct and intended; multi-tenant it is close to
-   worst-case, and this campaign's own benchmark host is multi-tenant.
-3. **Low-budget cells in any matrix on a shared host carry co-tenant load as
-   signal.** The original 4→8 comparison put a session-A reading of budget 4
-   against a session-B reading of budget 8 and read the difference as
-   parallel-decomposition behaviour. Measured within one session, 4→8 is
-   1.57x — sublinear, unremarkable, and not a stall.
-
-An attempt to isolate this by pinning to apparently-idle CPUs
-(`taskset -c 11,17,20,31` with the auto-mask stood down) produced 1.866 then
-3.296 — worse and more variable, because 11, 17 and 31 are **SMT siblings** of
-busy physical cores 10, 16 and 30. Picking logical CPUs without regard to SMT
-pairing hands you cores you do not actually own, which is the same lesson
-#1232 encoded in `select_budget_cpus` and which I promptly re-learned by
-hand.
-
-**Protocol consequence, and it is stronger than the one in §41.9:** a budget
-sweep is only interpretable if **every cell is measured in the same session**,
-interleaved, on an otherwise-quiet host. Comparing cells across sessions
-compares co-tenant weather. The steady-state detector does not save you here,
-because each individual reading is genuinely steady — it is steady at the
-wrong value.
-
-
-### 41.8 Concurrency: the median is fine, the tail is not
-
-1, 2 and 4 concurrent sessions sharing one process-wide pool, budget 16,
-100 us gap, 300 iterations each:
-
-| sessions | p50 (ms) | p90 (ms) | spread | throughput | parks/iter |
+| budget | user CPU | first-inference wall | threads created | futex calls | sched_yield |
 | --- | --- | --- | --- | --- | --- |
-| 1 | 0.931 | 1.009 | 1.08x | 1.00x | 2.15 |
-| 2 | 1.146 | 1.814 | 1.58x | 1.62x | 0.55 |
-| 4 | 1.756 | 4.611 | 2.63x | 2.12x | 0.17 |
+| 8 | 0.23 s | 2.198 ms | 15 | 150 | 643 |
+| 32 | **2.24 s** | **27.895 ms** | 63 | 1611 | 3346 |
 
-Median latency degrades 1.9x for 4x the offered load and aggregate throughput
-improves 2.1x, which is respectable for a pool that one session already
-saturates. **p90 degrades 4.6x**, which is not. `slot_exhausted` is zero
-throughout, so this is not the dispatch path declining work — it is
-contention for workers, and it lands on the tail.
+Two CPU-seconds and 28 ms of first-inference latency, to compute a 512×512
+matrix product. It is model-independent, so it is not the kernel. Forcing
+`ONNX_GENAI_CPU_TASK_THREADS=1` does not reduce it (2.53 s vs 2.00 s on the int4
+cell — it gets slightly *worse*), so it is not the task runtime either. It is the
+Rayon pools coming up: futex and yield-spin churn while twice as many workers
+race to their loops.
 
-The methodological point is sharper than the result. The micro-benchmark's
-own concurrency probe reports dispatch p50 moving only 5.2 us → 6.7 us from 1
-to 8 sessions, i.e. **"concurrency is fine"**. At the model level it is not.
-Dispatch latency was never the constraint; time-to-worker under contention
-is. A harness that only measures the dispatch path cannot see this, which is
-precisely why the model-level one had to exist.
+### 46.4 Past the physical core count, nothing is bought
 
-### 41.9 The noise band, and an order effect
+The obvious question is whether the extra workers earn their construction back on
+larger work. They do not. Steady-state wall, native-only, 25 runs after 10
+warmups, median of 3:
 
-Three A/A null controls (the same binary twice in one process, budget 16,
-100 us gap, 400 iterations) returned **0.941x, 0.923x, 0.809x**.
-
-Two readings. The band is **tighter than the 7-run harness's 0.72x–1.20x**,
-so steady-state detection genuinely improves precision. But all three land
-*below* 1.0, which is a systematic within-process order effect of roughly
--8% favouring the second arm — warm allocator and warm caches, not noise.
-
-The consequence is a protocol rule: **A/B arms must be separate processes.**
-The `null` arm's value is as a bias detector, not as a way to run two arms
-cheaply. Any within-process A/B on this codebase carries an ~8% tailwind for
-whichever arm runs second, which is larger than most effects worth chasing.
-
-### 41.10 What this leaves open
-
-* **Retracted:** the 4→8 budget scaling stall. It was co-tenant load on the
-  four cores an explicit budget of 4 confines itself to (§41.7). Measured
-  within a single session, 4→8 is 1.57x. Nothing to explain.
-* **Whether `select_budget_cpus` should stagger its selection.** Its
-  determinism is correct for the single-tenant case it was designed for and
-  close to worst-case for a shared host, where every budgeted process picks
-  the same low-numbered cores. Not a defect; an unexamined trade.
-* **p90 under concurrency.** The tail is the real oversubscription cost and
-  nothing here addresses it; `slot_exhausted` being zero rules out the
-  obvious explanation.
-* **The eagerly-built global Rayon pool.** It is `budget` threads that a
-  decode-only process never uses. Making it lazy means guaranteeing every
-  global-Rayon entry point in the default build routes through a guard first,
-  and getting that wrong silently un-bounds prefill parallelism — so it is
-  named here as a measured cost with a known shape, not attempted as a
-  drive-by.
-* **Retracted:** a claimed regression of "111 of 915 dispatches declined" in
-  `nested_dispatch_slot_pressure`. That was a misreading — the test issues
-  ~25-30 dispatches in total, so 915 was never a number it could produce.
-  Re-measured across four runs it declines 0, 1, 2 and 6 of ~25-30, every
-  decline occurring in the 16-dispatcher row and none below it. #1377's zero
-  sits inside that range. The count tracks host load, for the same reason
-  §41.7 gives: when co-tenants hold cores, workers free their slots later and
-  more nested dispatches fall back to inline execution. The fallback is the
-  designed behaviour, so this is the mechanism working, not a regression.
-
-### 41.11 The adaptive spin window is structurally pinned — and it does not matter
-
-Reading `worker_loop` against §41.4's numbers turns up a real defect. The
-window has **two** doubling sites and **one** halving site:
-
-* `ran > 0` after a drain doubles it (line ~367);
-* a spin hit doubles it (~397);
-* a park halves it (~408).
-
-The sequence after any park is: halve (500 → 250 us), then the futex wake
-returns *because work arrived*, the worker drains it, `ran > 0`, double
-(250 → 500 us). Net zero, every time. **The halving can never win**, so in any
-workload that does work at all the window sits permanently at `MAX_SPIN`.
-The comment at the halving site — "shrink it so a mostly-idle process
-converges on parking rather than on burning a core" — describes an intent
-the very next statement undoes. That also explains why §41.4's idle CPU
-saturates at ~6.5 CPU-ms ≈ 16 workers x `MAX_SPIN`.
-
-Running work is not evidence that a *spin window* was well-sized; only a spin
-hit is. So the `ran > 0` doubling is the wrong one, and removing it should let
-a large-gap workload converge to `MIN_SPIN` within five iterations.
-
-**It does not.** A/B with the two binaries interleaved in one session
-(§41.7's rule), sleep gaps, budget 16, 250 iterations:
-
-| gap | arm | p50 (ms) | cpu-s per wall-s | parks/iter |
-| --- | --- | --- | --- | --- |
-| 100 us | base | 0.844 / 0.846 | 12.61 / 12.84 | 4.16 / 2.04 |
-| 100 us | fix | 0.877 / 0.899 | 12.91 / 12.68 | 3.41 / 7.19 |
-| 2000 us | base | 0.974 / 1.050 | 5.78 / 5.45 | 16.92 / 19.04 |
-| 2000 us | fix | 0.942 / 0.911 | 5.60 / 5.06 | 17.16 / 19.11 |
-
-5% slower at 100 us, 7% faster at 2000 us — both inside the 0.81x-1.24x null
-band, and **CPU moves ~3% where the model predicted ~44%**. The prediction
-failed for a checkable reason: `parks/iter` is ~17 in *both* arms at a 2 ms
-gap. The workers park either way. The window governs how long they spin
-before parking, and empirically that is worth ~0.4 CPU-ms per iteration, not
-the ~8 ms that `16 x MAX_SPIN` implies — the spin loop exits early on the
-epoch check far more often than it runs to the window's end.
-
-So the defect is real, the reasoning from it was wrong, and the change is
-**not shipped**. Recorded because "the adaptive window is not actually
-adaptive" is worth knowing before someone tunes `MIN_SPIN`/`MAX_SPIN` and
-expects the adaptation to respond, and because the measurement bounds what
-fixing it could ever be worth.
-
-One thing the attempt did establish, from the per-thread census at a 2 ms
-gap: idle CPU is **not** spread evenly across our pools.
-
-| pool | threads | total CPU over the run |
+| cell | budget 16 | budget 32 |
 | --- | --- | --- |
-| task runtime (`nxrt-task-*`) | 15 | ~3.45 s |
-| decode SPMD (`onnx-genai-deco`) | 16 | 0.28 s |
-| prefill Rayon (`nxgn-prefill-*`) + main | 17 | 0.05 s |
+| `llama3_8b_mlp_t512` | **969 ms** | 1537 ms |
+| `llama3_8b_qkv_t128` | **106.4 ms** | 109.5 ms |
+| `qwen3_0p6b_mlp_t512` | **109.2 ms** | 112.5 ms |
+| `qwen3_0p6b_qkv_t8` | **0.921 ms** | 0.934 ms |
 
-The task runtime is **12x** the decode pool. Any future work on idle CPU
-belongs there, and the prefill pool — the one that looked alarming in §41.5
-because it was anonymous and 16 threads wide — is 1.5% of the total.
+On this 16-physical-core / 32-logical host a 32-thread budget is never faster
+than a 16-thread one, in decode or in prefill, and on the largest prefill shape
+it is 1.6× slower. This is the same fact `cap_spinning_workers` already encodes
+for the task runtime's lanes, showing up one level out: past one worker per
+physical core, the surplus workers are SMT siblings of workers that already
+exist, and they contend instead of adding throughput.
+
+### 46.5 The default was already right
+
+The important control, and the one that decides what this phase should change:
+
+| configuration | CPU for 60 runs | native |
+| --- | --- | --- |
+| default (no thread env set) | **0.54 s** | 1.371 ms |
+| `--native-threads 32` | 4.72 s | 0.933 ms |
+
+The shipping default — a flat decode pool capped at eight workers and SMT-capped
+task lanes — costs 0.54 CPU-seconds. Asking explicitly for 32 costs 8.7× that to
+run 1.47× faster. **The runtime's default configuration is the efficient one.**
+Nothing in the production path is misconfigured; the benchmark harness is what
+asks for 32, and the runtime faithfully honours it.
+
+So the residual is not a runtime defect to fix. It is a request that cannot pay
+for itself, which the runtime accepted silently.
+
+### 46.6 What this phase changes
+
+Two things, both small.
+
+The first is a diagnostic. `bound_process_to_decode_budget` now warns once when
+an explicit budget exceeds the physical cores the process may use, naming the
+core count and pointing at `ONNX_GENAI_CPU_DECODE_THREADS`. It does not override
+the request — an explicit budget stays explicit — it just stops a configuration
+that doubles CPU for no wall gain from being invisible. `budget_beyond_physical_cores`
+is a pure function so the policy is testable without a host, and an unknown
+topology deliberately never warns.
+
+The second is this document. Every `--threads 32` figure in this ledger was taken
+on a configuration that §46.4 shows is strictly worse than `--threads 16` on this
+host, and §46.1 shows was additionally measured inside a warm-up transient that
+the 7-run harness never leaves. Combined with §38's finding that the paired
+harness depresses the native arm 2.7–4.8× on long cells, the wide-thread rows of
+this campaign have now had two independent instrument errors found in them.
+
+### 46.7 One caveat, and what is genuinely left
+
+The steady-state numbers above are a *tight loop*: back-to-back inferences with
+no serial work between them. That is the one regime in which Rayon's parking cost
+disappears, because its workers never get the chance to park. It flatters the
+pre-phase-16 base — which reaches 0.858 ms at budget 32 over 400 runs, against
+the 50 ms the 7-run harness reported for the same binary and cell. Real decode is
+the opposite shape: single-digit microseconds of serial work between parallel
+regions, which is exactly the gap `task_runtime_latency.rs` models with
+`busy_gap` and exactly why the task runtime exists. Neither 7 runs nor 400 is the
+honest number for decode; a gap-aware harness is, and this campaign does not have
+one at the model level.
+
+That is the real open item now, and it is a methodology item rather than a
+kernel one. The scheduler residual that §36.8 and §38.7 were chasing does not
+exist.

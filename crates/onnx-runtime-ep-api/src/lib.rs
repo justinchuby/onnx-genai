@@ -55,18 +55,25 @@ pub use kernel::{
 };
 pub use onnx_runtime_optimizer::OptimizationPass as OptimizerPass;
 pub use provider::{
-    ArgmaxTieBreak, CaptureRegionShapeStatus, DeviceBuffer, EpConfig, EpId, ExecutionProvider,
-    Fence, HostToDeviceCopier, StructuralCaptureDecline,
+    ArgmaxTieBreak, BoundBufferOwnership, CaptureRegionShapeStatus, DeviceBuffer, DeviceGraphSlot,
+    EpConfig, EpId, ExecutionProvider, Fence, HostToDeviceCopier, RawDeviceAllocationSiteStats,
+    StructuralCaptureDecline, WorkspaceAllocation,
 };
 pub use registry::{EpRegistry, KernelFactory, OpKey, OpRegistry};
 pub use tensor::{
     DevicePtr, DevicePtrMut, ExternalMmapRegion, TensorBacking, TensorMut, TensorView,
 };
 pub use weight::{
-    ExecutionProviderCapabilities, LazyDeviceWeightBinder, LazyWeight, LazyWeightBoundary,
-    LazyWeightCandidate, MmapRegionSource, NXRT_WEIGHT_PAGING_CAPABILITY, NegotiatedWeight,
-    PagedWeight, Phase3aHostOnlyBinder, ResidentWeight, ResidentWeightMaterializer, WeightHandle,
-    WeightHandleError, lazy_weight_candidates,
+    AdmissionPolicyInput, EvictionClass, ExecutionProviderCapabilities, ExpertWeightGroup,
+    LazyDeviceWeightBinder, LazyWeight, LazyWeightBoundary, LazyWeightCandidate, MmapRegionSource,
+    NXRT_WEIGHT_PAGING_CAPABILITY, NegotiatedWeight, PagedWeight, Phase3aHostOnlyBinder,
+    ResidencyDecision, ResidencyDegradationReason, ResidencyPlan, ResidencyPolicy,
+    ResidencyPolicyInput, ResidencyResizeOutcome, ResidencyResizePlan, ResidencyResizeRequest,
+    ResidentWeight, ResidentWeightMaterializer, ResizeDirection, ResizeRejection, ResizeSafePoint,
+    RoutedResidencyCoverage, RoutedResidencyGuardHandle, RoutedResidencyProof,
+    RoutedResidencyRequirement, StaticProfileResidencyPolicy, WeightHandle, WeightHandleError,
+    WholeBankReason, WholeBankResidentPolicy, expert_weight_groups, lazy_weight_candidates,
+    plan_residency, plan_resize, prove_routed_residency,
 };
 
 // Re-export the device vocabulary from the IR so EP authors have one import.

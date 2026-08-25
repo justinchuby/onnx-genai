@@ -15,6 +15,8 @@ use crate::{DataType, IoBinding, MemoryInfo, OrtError, Result, Session, TensorIn
 /// Introspected EAGLE-3 draft-head graph signature.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Eagle3HeadSignature {
+    /// Element type shared by embeddings, target context, recurrence, and outputs.
+    pub activation_dtype: DataType,
     /// Token embedding and recycled-hidden width.
     pub hidden_size: usize,
     /// Width of the concatenated target hidden-state input.
@@ -78,7 +80,7 @@ struct Eagle3KvPair {
 /// Stateful runner for one EAGLE-3 draft-head forward at a time.
 pub struct Eagle3DecodeSession<'a> {
     session: &'a Session,
-    binding: IoBinding,
+    binding: IoBinding<'a>,
     signature: Eagle3HeadSignature,
     mode: Eagle3DraftKvMode,
     batch_size: i64,
@@ -224,18 +226,25 @@ impl<'a> Eagle3DecodeSession<'a> {
 
         let seq_i64 = i64::try_from(seq_len)
             .map_err(|_| OrtError::InvalidArgument("seq_len exceeds i64".into()))?;
-        let embeds =
-            Value::from_slice_f32(inputs_embeds, &[self.batch_size, seq_i64, hidden as i64])?;
-        let fused = Value::from_slice_f32(
+        let embeds = Value::from_f32_slice_as(
+            inputs_embeds,
+            &[self.batch_size, seq_i64, hidden as i64],
+            self.signature.activation_dtype,
+        )?;
+        let fused = Value::from_f32_slice_as(
             fused_hidden,
             &[
                 self.batch_size,
                 seq_i64,
                 self.signature.fused_hidden_size as i64,
             ],
+            self.signature.activation_dtype,
         )?;
-        let recycled =
-            Value::from_slice_f32(recycled_hidden, &[self.batch_size, seq_i64, hidden as i64])?;
+        let recycled = Value::from_f32_slice_as(
+            recycled_hidden,
+            &[self.batch_size, seq_i64, hidden as i64],
+            self.signature.activation_dtype,
+        )?;
 
         let past = if self.mode == Eagle3DraftKvMode::GrowCache {
             self.kv_len
@@ -363,11 +372,21 @@ fn detect_eagle3_head(
     ) else {
         return Ok(None);
     };
+    let activation_dtype = embeds.dtype;
     for info in [embeds, fused, recycled, logits, hidden] {
-        if info.dtype != DataType::Float32 {
+        if !matches!(
+            info.dtype,
+            DataType::Float32 | DataType::Float16 | DataType::BFloat16
+        ) {
             return Err(OrtError::InvalidArgument(format!(
-                "EAGLE-3 tensor '{}' must be Float32, got {:?}",
+                "chained proposer tensor '{}' must be Float32, Float16, or BFloat16, got {:?}",
                 info.name, info.dtype
+            )));
+        }
+        if info.dtype != activation_dtype {
+            return Err(OrtError::InvalidArgument(format!(
+                "chained proposer activation tensors must share one dtype; '{}' is {:?}, expected {:?}",
+                info.name, info.dtype, activation_dtype
             )));
         }
     }
@@ -399,6 +418,7 @@ fn detect_eagle3_head(
         (0, 0, DataType::Float32)
     };
     let signature = Eagle3HeadSignature {
+        activation_dtype,
         hidden_size,
         fused_hidden_size,
         draft_vocab_size,
@@ -482,7 +502,7 @@ fn empty_past_value(info: &TensorInfo) -> Result<Value> {
 }
 
 fn last_row_f32(value: &Value, width: usize) -> Result<Vec<f32>> {
-    let data = value.to_vec_f32()?;
+    let data = value.to_vec_f32_lossy()?;
     if data.len() < width || !data.len().is_multiple_of(width) {
         return Err(OrtError::InvalidArgument(format!(
             "EAGLE-3 output length {} is not a positive multiple of width {width}",

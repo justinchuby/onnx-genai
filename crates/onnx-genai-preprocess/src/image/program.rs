@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, path::Path};
 use anyhow::Context;
 use image::DynamicImage;
 use onnx_genai_metadata::{
-    ImageOutputBinding, ImagePreprocessingProgram, ImageSizeSpec, ImageTransform,
+    VisionOutputBinding, VisionPreprocessingProgram, VisionSizeSpec, VisionTransform,
 };
 use serde::Deserialize;
 
@@ -104,6 +104,7 @@ struct ImageTransformMetadata {
     merge_size: Option<usize>,
     channel_order: Option<String>,
     temporal_order: Option<String>,
+    patch_order: Option<String>,
     coordinate_order: Option<String>,
     flatten: Option<bool>,
     pad_value: Option<f64>,
@@ -145,7 +146,22 @@ pub(super) struct PatchifySpec {
     pub(super) merge_size: usize,
     pub(super) channel_order: PatchChannelOrder,
     pub(super) temporal_order: PatchTemporalOrder,
+    pub(super) patch_order: PatchOrder,
     pub(super) coordinate_order: CoordinateOrder,
+}
+
+/// The order patches are emitted in, which is independent of `merge_size`.
+///
+/// Qwen2-VL packs each `merge_size x merge_size` spatial group contiguously, so
+/// the model's merge reshape sees a whole group per row. Some exports instead
+/// expect plain row-major patch order and do the grouping inside the graph.
+/// `merge_size` still governs how many patches collapse into one image token,
+/// so the two knobs cannot be folded together: emitting raster order by setting
+/// `merge_size: 1` would also quadruple the placeholder count.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum PatchOrder {
+    MergeGroups,
+    Raster,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -206,7 +222,7 @@ impl ImagePreprocessor {
     /// Resolves preprocessing directly from a typed metadata program.
     pub fn from_input_and_program(
         shape: &[i64],
-        program: &ImagePreprocessingProgram,
+        program: &VisionPreprocessingProgram,
     ) -> anyhow::Result<Self> {
         Self::from_metadata_document(
             shape,
@@ -235,7 +251,7 @@ impl ImagePreprocessor {
         Self::from_metadata_document(shape, document)
     }
 
-    fn image_metadata_from_program(program: &ImagePreprocessingProgram) -> ImageMetadata {
+    fn image_metadata_from_program(program: &VisionPreprocessingProgram) -> ImageMetadata {
         ImageMetadata {
             resize: None,
             tiling: None,
@@ -253,14 +269,14 @@ impl ImagePreprocessor {
         }
     }
 
-    fn image_transform_metadata(transform: &ImageTransform) -> ImageTransformMetadata {
+    fn image_transform_metadata(transform: &VisionTransform) -> ImageTransformMetadata {
         ImageTransformMetadata {
             op: transform.op.clone(),
             inputs: transform.inputs.clone(),
             outputs: transform.outputs.clone(),
             size: transform.size.as_ref().map(|size| match size {
-                ImageSizeSpec::Square(edge) => ImageSize::Square(*edge),
-                ImageSizeSpec::Dimensions { width, height } => ImageSize::Dimensions {
+                VisionSizeSpec::Square(edge) => ImageSize::Square(*edge),
+                VisionSizeSpec::Dimensions { width, height } => ImageSize::Dimensions {
                     width: *width,
                     height: *height,
                 },
@@ -287,6 +303,7 @@ impl ImagePreprocessor {
             merge_size: transform.merge_size,
             channel_order: transform.channel_order.clone(),
             temporal_order: transform.temporal_order.clone(),
+            patch_order: transform.patch_order.clone(),
             coordinate_order: transform.coordinate_order.clone(),
             flatten: transform.flatten,
             pad_value: transform.pad_value,
@@ -294,9 +311,9 @@ impl ImagePreprocessor {
         }
     }
 
-    fn image_output_metadata(output: &ImageOutputBinding) -> ImageOutputMetadata {
+    fn image_output_metadata(output: &VisionOutputBinding) -> ImageOutputMetadata {
         ImageOutputMetadata {
-            source: output.source.clone(),
+            source: Some(output.source.clone()),
             name: output.name.clone(),
             content: output.content.clone(),
             dtype: output.dtype.clone(),
@@ -360,12 +377,20 @@ impl ImagePreprocessor {
         if resolved_shape.len() == 4 {
             match layout {
                 ImageLayout::Nchw => {
-                    resolved_shape[2] = i64::from(config.height);
-                    resolved_shape[3] = i64::from(config.width);
+                    if resolved_shape[2] != -1 || program.dynamic_resize.is_none() {
+                        resolved_shape[2] = i64::from(config.height);
+                    }
+                    if resolved_shape[3] != -1 || program.dynamic_resize.is_none() {
+                        resolved_shape[3] = i64::from(config.width);
+                    }
                 }
                 ImageLayout::Nhwc => {
-                    resolved_shape[1] = i64::from(config.height);
-                    resolved_shape[2] = i64::from(config.width);
+                    if resolved_shape[1] != -1 || program.dynamic_resize.is_none() {
+                        resolved_shape[1] = i64::from(config.height);
+                    }
+                    if resolved_shape[2] != -1 || program.dynamic_resize.is_none() {
+                        resolved_shape[2] = i64::from(config.width);
+                    }
                 }
             }
         }
@@ -904,6 +929,13 @@ fn typed_program_from_metadata(
                         "unsupported image patchify temporal_order '{other}'; expected channel_major or temporal_major"
                     ),
                 };
+                let patch_order = match transform.patch_order.as_deref().unwrap_or("merge_groups") {
+                    "merge_groups" | "merge_blocks" => PatchOrder::MergeGroups,
+                    "raster" | "row_major" => PatchOrder::Raster,
+                    other => anyhow::bail!(
+                        "unsupported image patchify patch_order '{other}'; expected merge_groups or raster"
+                    ),
+                };
                 let coordinate_order = match transform.coordinate_order.as_deref().unwrap_or("yx") {
                     "yx" => CoordinateOrder::Yx,
                     "xy" => CoordinateOrder::Xy,
@@ -917,6 +949,7 @@ fn typed_program_from_metadata(
                     merge_size,
                     channel_order,
                     temporal_order,
+                    patch_order,
                     coordinate_order,
                 });
                 patchified = true;

@@ -2,15 +2,9 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 
-use onnx_genai_genai_config::{
-    EncoderDecoderGraphInfo, GraphTensorInfo, ModelGraphInfo, PipelineGraphInfo,
-    pipeline_inference_metadata_from_dir,
-};
-use onnx_genai_metadata::{
-    InferenceMetadata, PipelineSpec, PreprocessingSpec, SpeculatorDescriptor, detect_speculator,
-    load_metadata, load_pipeline_spec,
-};
+use onnx_genai_metadata::{InferenceMetadata, PipelineSpec, PreprocessingSpec, load_metadata};
 use onnx_model_package::{ModelPackage, SelectionRequest, is_model_package_directory};
 
 use crate::{
@@ -39,8 +33,6 @@ pub struct ModelDirectory {
     pub metadata_path: Option<PathBuf>,
     /// Resolved compatibility configuration path, including package references.
     pub genai_config_path: Option<PathBuf>,
-    /// Detected standalone speculator declaration, if present.
-    pub speculator: Option<SpeculatorDescriptor>,
 }
 
 impl ModelDirectory {
@@ -83,7 +75,6 @@ impl ModelDirectory {
 
         let model_path = resolve_model_path(root)?;
         let metadata_path = find_metadata_path(root);
-        let speculator = detect_speculator(root);
         let genai_config_path = onnx_genai_genai_config::find_in_dir(root);
 
         Ok(Self {
@@ -92,7 +83,6 @@ impl ModelDirectory {
             tokenizer_path,
             metadata_path,
             genai_config_path,
-            speculator,
         })
     }
 
@@ -140,14 +130,12 @@ impl ModelDirectory {
         let genai_config_path = selected
             .genai_config_path
             .or_else(|| onnx_genai_genai_config::find_in_dir(&selected.variant_directory));
-        let speculator = detect_speculator(&selected.variant_directory);
         Ok(Self {
             root: selected.variant_directory,
             model_path: selected.model_path,
             tokenizer_path,
             metadata_path,
             genai_config_path,
-            speculator,
         })
     }
 }
@@ -266,7 +254,9 @@ pub struct PipelineModelDirectory {
     /// leave this unset rather than mislabeling `genai_config.json` as native metadata.
     pub metadata_path: Option<PathBuf>,
     pub spec: PipelineSpec,
-    /// The package's parsed inference metadata, when it ships one.
+    /// Package-level adapter catalog and request-selection ABI.
+    pub adapters: Option<onnx_genai_metadata::AdapterServiceContract>,
+    /// The package's parsed inference metadata.
     ///
     /// Resolving the directory already reads and validates this file, so every
     /// setting it declares -- context length, chunked prefill, EOS ids,
@@ -327,52 +317,98 @@ impl PipelineModelDirectory {
             return Err(model_dir_missing_err(root));
         }
 
-        let native_metadata_path = find_metadata_path(root);
-        let (metadata_path, spec, metadata, preprocessing) =
-            if let Some(metadata_path) = native_metadata_path {
-                let spec = load_pipeline_spec(&metadata_path)
-                    .map_err(|err| OrtError::InvalidArgument(err.to_string()))?;
-                let metadata = load_metadata(&metadata_path)
-                    .map_err(|err| OrtError::InvalidArgument(err.to_string()))?;
-                let preprocessing = metadata.preprocessing.clone();
-                (Some(metadata_path), spec, Some(metadata), preprocessing)
-            } else {
-                let (metadata_path, spec, preprocessing) = load_compatibility_pipeline(root)?;
-                (metadata_path, spec, None, preprocessing)
-            };
+        let metadata_path = find_metadata_path(root).ok_or_else(|| {
+            OrtError::InvalidArgument(format!(
+                "pipeline package '{}' must contain inference_metadata.yaml or \
+                 inference_metadata.json with pipeline.workflow",
+                root.display()
+            ))
+        })?;
+        let metadata = load_metadata(&metadata_path)
+            .map_err(|err| OrtError::InvalidArgument(err.to_string()))?;
+        let spec = metadata.pipeline.clone().ok_or_else(|| {
+            OrtError::InvalidArgument("metadata has no pipeline section".to_string())
+        })?;
+        onnx_genai_metadata::validate_metadata(&metadata)
+            .map_err(|errors| OrtError::InvalidArgument(errors.join("; ")))?;
+        let preprocessing = metadata.preprocessing.clone();
+        let adapters = metadata.adapters.clone();
 
         let mut model_paths = BTreeMap::new();
-        let mut per_component_tokenizers = BTreeMap::new();
-        for (name, component) in &spec.models {
-            model_paths.insert(
-                name.clone(),
-                resolve_relative_file(root, &component.filename, "pipeline model")?,
-            );
-            if let Some(tokenizer) = &component.tokenizer {
-                per_component_tokenizers.insert(
-                    name.clone(),
-                    resolve_relative_file(root, tokenizer, "component tokenizer")?,
-                );
+        for (name, component) in &spec.workflow.components {
+            match &component.implementation {
+                onnx_genai_metadata::ComponentImplementation::Onnx { artifact } => {
+                    model_paths.insert(
+                        name.clone(),
+                        resolve_relative_file(root, artifact, "workflow ONNX component")?,
+                    );
+                }
+                onnx_genai_metadata::ComponentImplementation::Adapter {
+                    artifact: Some(artifact),
+                    ..
+                } => {
+                    let _ = resolve_relative_file(root, artifact, "workflow adapter artifact")?;
+                }
+                onnx_genai_metadata::ComponentImplementation::Adapter {
+                    artifact: None, ..
+                }
+                | onnx_genai_metadata::ComponentImplementation::Binding => {}
             }
         }
 
-        let shared_tokenizer = root.join("tokenizer.json");
+        let declared_tokenizer = metadata
+            .package
+            .as_ref()
+            .and_then(|package| package.tokenizer.as_ref())
+            .filter(|tokenizer| !tokenizer.artifacts.is_empty());
+        let shared_tokenizer = if let Some(tokenizer) = declared_tokenizer {
+            let mut resolved = Vec::with_capacity(tokenizer.artifacts.len());
+            for artifact in &tokenizer.artifacts {
+                resolved.push(
+                    onnx_genai_metadata::resolve_package_artifact(
+                        root,
+                        &artifact.location,
+                        "package tokenizer",
+                    )
+                    .map_err(|error| OrtError::InvalidArgument(error.to_string()))?,
+                );
+            }
+            let canonical = resolved
+                .iter()
+                .find(|path| {
+                    path.file_name()
+                        .is_some_and(|name| name == "tokenizer.json")
+                })
+                .or_else(|| (resolved.len() == 1).then(|| &resolved[0]))
+                .ok_or_else(|| {
+                    OrtError::InvalidArgument(
+                        "package.tokenizer.artifacts must identify one canonical tokenizer.json \
+                         artifact when multiple tokenizer files are declared"
+                            .to_string(),
+                    )
+                })?;
+            Some(canonical.clone())
+        } else {
+            let legacy = root.join("tokenizer.json");
+            legacy.is_file().then_some(legacy)
+        };
         let tokenizer_paths = PipelineTokenizerPaths {
-            shared: shared_tokenizer.is_file().then_some(shared_tokenizer),
-            per_component: per_component_tokenizers,
+            shared: shared_tokenizer,
+            per_component: BTreeMap::new(),
         };
 
         crate::pipeline_admission::validate_pipeline_admission(
             &spec,
-            preprocessing.as_ref(),
             &model_paths,
+            metadata.speculative.as_ref(),
         )?;
 
         Ok(Self {
             root: root.to_path_buf(),
-            metadata_path,
+            metadata_path: Some(metadata_path),
             spec,
-            metadata,
+            adapters,
+            metadata: Some(metadata),
             preprocessing,
             model_paths,
             tokenizer_paths,
@@ -380,9 +416,23 @@ impl PipelineModelDirectory {
     }
 }
 
+/// The one ORT environment a pipeline's sessions share, created on first use.
+fn lazy_environment(cell: &OnceLock<Arc<Environment>>) -> Result<&Arc<Environment>> {
+    if let Some(environment) = cell.get() {
+        return Ok(environment);
+    }
+    let created = Arc::new(Environment::new("onnx-genai-pipeline")?);
+    Ok(cell.get_or_init(|| created))
+}
+
 /// Loaded ORT sessions and tokenizer assets for a pipeline model directory.
 pub struct PipelineModels {
-    pub sessions: BTreeMap<String, Session>,
+    /// Component sessions, co-ownable so that anything ORT derives from a
+    /// session (an `IoBinding`, a `CreateAllocator` allocator) can hold the
+    /// session alive for as long as it needs it. ORT frees that derived state
+    /// through the session, so `ReleaseSession` has to come last; an `Arc` makes
+    /// that a refcount fact rather than a field-order convention.
+    pub sessions: BTreeMap<String, Arc<Session>>,
     /// Declared graph I/O for components whose ORT [`Session`] was intentionally
     /// not built because the pipeline executes them on the native backend (an
     /// ORT session for such a component would be redundant, and a native-only
@@ -391,7 +441,11 @@ pub struct PipelineModels {
     pub tokenizers: BTreeMap<String, Tokenizer>,
     pub shared_tokenizer: Option<Tokenizer>,
     pub directory: PipelineModelDirectory,
-    _environment: Option<Environment>,
+    session_options: SessionOptions,
+    /// Created on first use so a package inspected without ORT sessions never
+    /// initializes the ORT runtime, while generated execution islands can still
+    /// obtain the one environment their sessions share.
+    environment: OnceLock<Arc<Environment>>,
 }
 
 impl PipelineModels {
@@ -403,6 +457,16 @@ impl PipelineModels {
     /// Resolve and load all pipeline ONNX models using caller-provided session options.
     pub fn load_with_options(root: impl AsRef<Path>, options: SessionOptions) -> Result<Self> {
         Self::load_with_ort_session_filter(root, options, |_| true)
+    }
+
+    /// Load component sessions with `component_options` while retaining
+    /// `generated_options` for execution-island sessions built from those components.
+    pub fn load_with_component_options(
+        root: impl AsRef<Path>,
+        component_options: SessionOptions,
+        generated_options: SessionOptions,
+    ) -> Result<Self> {
+        Self::load_with_options_and_filter(root, component_options, generated_options, |_| true)
     }
 
     /// Resolve and load pipeline assets, building an ORT [`Session`] only for the
@@ -420,20 +484,29 @@ impl PipelineModels {
         options: SessionOptions,
         build_ort_session: impl Fn(&str) -> bool,
     ) -> Result<Self> {
+        Self::load_with_options_and_filter(root, options.clone(), options, build_ort_session)
+    }
+
+    fn load_with_options_and_filter(
+        root: impl AsRef<Path>,
+        component_options: SessionOptions,
+        generated_options: SessionOptions,
+        build_ort_session: impl Fn(&str) -> bool,
+    ) -> Result<Self> {
         let directory = PipelineModelDirectory::load(root)?;
 
         let mut sessions = BTreeMap::new();
         let mut graph_io_metadata = BTreeMap::new();
-        let mut environment = None;
+        let environment = OnceLock::new();
         for (name, path) in &directory.model_paths {
             if build_ort_session(name) {
-                let environment = match environment.as_ref() {
-                    Some(environment) => environment,
-                    None => environment.insert(Environment::new("onnx-genai-pipeline")?),
-                };
                 sessions.insert(
                     name.clone(),
-                    Session::new(environment, path, options.clone())?,
+                    Arc::new(Session::new(
+                        lazy_environment(&environment)?.as_ref(),
+                        path,
+                        component_options.clone(),
+                    )?),
                 );
             } else {
                 graph_io_metadata.insert(name.clone(), graph_io_from_model_path(path)?);
@@ -459,8 +532,38 @@ impl PipelineModels {
             tokenizers,
             shared_tokenizer,
             directory,
-            _environment: environment,
+            session_options: generated_options,
+            environment,
         })
+    }
+
+    /// A component set for a workflow whose graphs the caller executes itself.
+    ///
+    /// Some workflows name a component that this process already runs through a
+    /// different executor — a decoder driven by a fused decode session that owns
+    /// its paged KV, above all. Building a second ORT session for that graph
+    /// would load the same weights twice and give the package two answers about
+    /// what its decoder is. The caller supplies the resolved directory and the
+    /// tokenizer it already opened; no ONNX file is read and no ORT environment
+    /// is created.
+    ///
+    /// The declared graph I/O of every component is still exposed, so decode
+    /// resolution and diagnostics see the same contracts a loaded package would
+    /// present.
+    pub fn hosted(
+        directory: PipelineModelDirectory,
+        session_options: SessionOptions,
+        shared_tokenizer: Option<Tokenizer>,
+    ) -> Self {
+        Self {
+            sessions: BTreeMap::new(),
+            graph_io_metadata: BTreeMap::new(),
+            tokenizers: BTreeMap::new(),
+            shared_tokenizer,
+            directory,
+            session_options,
+            environment: OnceLock::new(),
+        }
     }
 
     /// Return a component-specific tokenizer, falling back to the shared tokenizer.
@@ -472,7 +575,16 @@ impl PipelineModels {
 
     /// Return a loaded session by component name.
     pub fn session(&self, component: &str) -> Option<&Session> {
-        self.sessions.get(component)
+        self.sessions.get(component).map(Arc::as_ref)
+    }
+
+    /// Return a co-ownable handle to a loaded session.
+    ///
+    /// Callers that build an `IoBinding` or a session-derived `Allocator` and
+    /// store it alongside (or outliving) their borrow of `PipelineModels` take
+    /// the session this way, so the session cannot be released first.
+    pub fn shared_session(&self, component: &str) -> Option<Arc<Session>> {
+        self.sessions.get(component).map(Arc::clone)
     }
 
     /// Return a component's declared graph I/O through the backend-neutral
@@ -483,11 +595,31 @@ impl PipelineModels {
     /// runs the component.
     pub fn graph_io(&self, component: &str) -> Option<&dyn GraphIo> {
         if let Some(session) = self.sessions.get(component) {
-            return Some(session as &dyn GraphIo);
+            return Some(session.as_ref() as &dyn GraphIo);
         }
         self.graph_io_metadata
             .get(component)
             .map(|graph| graph as &dyn GraphIo)
+    }
+
+    /// Environment shared by package sessions and generated execution islands,
+    /// created on first use.
+    ///
+    /// A package whose components all run on the native backend never builds an
+    /// ORT session, so the environment stays uncreated until an execution island
+    /// actually needs one.
+    pub fn environment(&self) -> Result<&Environment> {
+        lazy_environment(&self.environment).map(Arc::as_ref)
+    }
+
+    #[doc(hidden)]
+    pub fn environment_handle(&self) -> Option<Arc<Environment>> {
+        self.environment.get().cloned()
+    }
+
+    /// Session options used to load package components.
+    pub fn session_options(&self) -> SessionOptions {
+        self.session_options.clone()
     }
 }
 
@@ -787,7 +919,10 @@ mod model_package_tests {
             ..Default::default()
         };
         let directory = ModelDirectory::load_with_package_selection(&root, &selection).unwrap();
-        assert_eq!(directory.model_path, root.join("cpu-fp32/model.onnx"));
+        assert_eq!(
+            directory.model_path,
+            root.join("cpu-fp32/model.onnx.textproto")
+        );
         assert_eq!(
             directory.tokenizer_path,
             root.join(format!(
@@ -802,13 +937,7 @@ mod model_package_tests {
         let root =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm-scatter");
         let directory = ModelDirectory::load(&root).unwrap();
-        // The fixture carries both `model.onnx` and `model.onnx.textproto`.
-        // `prefer_binary_onnx_twins` resolves that pair to the binary, so this
-        // expects the binary. It expected the textproto until now: the loader
-        // changed deliberately and this assertion was never updated, because
-        // this crate's tests do not run in CI. That is fixed in the same change
-        // as this line.
-        assert_eq!(directory.model_path, root.join("model.onnx"));
+        assert_eq!(directory.model_path, root.join("model.onnx.textproto"));
         assert_eq!(directory.tokenizer_path, root.join("tokenizer.json"));
     }
 }
@@ -817,217 +946,6 @@ mod model_package_tests {
 /// so every loader in the workspace agrees on what counts as one.
 fn find_metadata_path(root: &Path) -> Option<PathBuf> {
     onnx_genai_metadata::find_metadata_path(root)
-}
-
-fn load_compatibility_pipeline(
-    root: &Path,
-) -> Result<(Option<PathBuf>, PipelineSpec, Option<PreprocessingSpec>)> {
-    let genai_path = onnx_genai_genai_config::find_in_dir(root).ok_or_else(|| {
-        OrtError::Io(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!(
-                "pipeline metadata not found in {}; expected inference_metadata.{{yaml,yml,json}} \
-                 or a complete genai_config.json compatibility package",
-                root.display()
-            ),
-        ))
-    })?;
-    let config = onnx_genai_genai_config::load(&genai_path)
-        .map_err(|error| OrtError::InvalidArgument(error.to_string()))?;
-    // Decline the RNN-T transducer family explicitly. It declares `model.encoder`
-    // but is structurally distinct from a cross-attention encoder-decoder; the
-    // genai-config synthesis returns an UnsupportedPipelineFamily error rather
-    // than fabricating a spec, and surfacing it here gives a precise message
-    // instead of the misleading "model.vision missing" fall-through below.
-    if config.is_transducer() {
-        let reason = config
-            .to_inference_metadata(None)
-            .err()
-            .map(|error| error.to_string())
-            .unwrap_or_else(|| "unsupported RNN-T transducer package".to_owned());
-        return Err(OrtError::InvalidArgument(reason));
-    }
-    if config.model.encoder.is_some() {
-        return load_encoder_decoder_compatibility_pipeline(root, &config);
-    }
-    let vision =
-        config.model.vision.as_ref().ok_or_else(|| {
-            incomplete_compatibility_error(root, "model.vision in genai_config.json")
-        })?;
-    let embedding = config.model.embedding.as_ref().ok_or_else(|| {
-        incomplete_compatibility_error(root, "model.embedding in genai_config.json")
-    })?;
-    let vision_filename =
-        compatibility_filename(root, vision.filename.as_deref(), "model.vision.filename")?;
-    let embedding_filename = compatibility_filename(
-        root,
-        embedding.filename.as_deref(),
-        "model.embedding.filename",
-    )?;
-    let decoder_filename = compatibility_filename(
-        root,
-        config.model.decoder.filename.as_deref(),
-        "model.decoder.filename",
-    )?;
-    let graphs = PipelineGraphInfo {
-        vision: inspect_model_graph(&vision_filename, "vision")?,
-        embedding: inspect_model_graph(&embedding_filename, "embedding")?,
-        decoder: inspect_model_graph(&decoder_filename, "decoder")?,
-    };
-    let metadata = pipeline_inference_metadata_from_dir(root, &graphs)
-        .map_err(|error| OrtError::InvalidArgument(error.to_string()))?
-        .ok_or_else(|| {
-            incomplete_compatibility_error(
-                root,
-                "a multimodal genai_config.json with vision, embedding, and decoder components",
-            )
-        })?;
-    let preprocessing = metadata.preprocessing;
-    let spec = metadata
-        .pipeline
-        .ok_or_else(|| incomplete_compatibility_error(root, "the synthesized metadata pipeline"))?;
-    onnx_genai_metadata::validate_pipeline_spec(&spec)
-        .map_err(|error| OrtError::InvalidArgument(error.to_string()))?;
-    Ok((None, spec, preprocessing))
-}
-
-/// Synthesize an encoder-decoder (audio/text sequence-to-sequence, e.g. Whisper)
-/// compatibility pipeline from a genai_config package that declares
-/// `model.encoder` + `model.decoder` but no vision/embedding front-end.
-fn load_encoder_decoder_compatibility_pipeline(
-    root: &Path,
-    config: &onnx_genai_genai_config::GenAiConfig,
-) -> Result<(Option<PathBuf>, PipelineSpec, Option<PreprocessingSpec>)> {
-    let encoder = config.model.encoder.as_ref().ok_or_else(|| {
-        incomplete_compatibility_error(root, "model.encoder in genai_config.json")
-    })?;
-    let encoder_filename =
-        compatibility_filename(root, encoder.filename.as_deref(), "model.encoder.filename")?;
-    let decoder_filename = compatibility_filename(
-        root,
-        config.model.decoder.filename.as_deref(),
-        "model.decoder.filename",
-    )?;
-    let graphs = EncoderDecoderGraphInfo {
-        encoder: inspect_model_graph(&encoder_filename, "encoder")?,
-        decoder: inspect_model_graph(&decoder_filename, "decoder")?,
-    };
-    let metadata = onnx_genai_genai_config::encoder_decoder_pipeline_inference_metadata_from_dir(
-        root, &graphs,
-    )
-    .map_err(|error| OrtError::InvalidArgument(error.to_string()))?
-    .ok_or_else(|| {
-        incomplete_compatibility_error(
-            root,
-            "an encoder-decoder genai_config.json with encoder and decoder components",
-        )
-    })?;
-    let preprocessing = metadata.preprocessing;
-    let spec = metadata
-        .pipeline
-        .ok_or_else(|| incomplete_compatibility_error(root, "the synthesized metadata pipeline"))?;
-    onnx_genai_metadata::validate_pipeline_spec(&spec)
-        .map_err(|error| OrtError::InvalidArgument(error.to_string()))?;
-    Ok((None, spec, preprocessing))
-}
-
-fn compatibility_filename(root: &Path, value: Option<&str>, field: &str) -> Result<PathBuf> {
-    let filename = value
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| incomplete_compatibility_error(root, field))?;
-    resolve_relative_file(root, filename, field)
-}
-
-fn incomplete_compatibility_error(root: &Path, missing: &str) -> OrtError {
-    OrtError::InvalidArgument(format!(
-        "cannot synthesize compatibility pipeline metadata for {}: missing required semantics: \
-         {missing}. Why: compatibility loading uses only explicit genai_config.json, config.json, \
-         processor-config, and ONNX graph facts; it never guesses from model.type or a model name. \
-         How to fix: regenerate the package with native inference_metadata.json (preferred), or \
-         export a complete compatibility package that declares the missing facts",
-        root.display()
-    ))
-}
-
-fn inspect_model_graph(path: &Path, component: &str) -> Result<ModelGraphInfo> {
-    let model = onnx_std::load_model(path).map_err(|error| {
-        OrtError::InvalidArgument(format!(
-            "failed to inspect {component} ONNX graph at {} while synthesizing compatibility \
-             pipeline metadata: {error}",
-            path.display()
-        ))
-    })?;
-    let graph = &model.graph;
-    let inputs = graph
-        .inputs
-        .iter()
-        .map(|id| graph_tensor_info(graph.value(*id), component, "input"))
-        .collect::<Result<Vec<_>>>()?;
-    let outputs = graph
-        .outputs
-        .iter()
-        .map(|id| graph_tensor_info(graph.value(*id), component, "output"))
-        .collect::<Result<Vec<_>>>()?;
-    Ok(ModelGraphInfo { inputs, outputs })
-}
-
-fn graph_tensor_info(
-    value: &onnx_std::ir::Value,
-    component: &str,
-    direction: &str,
-) -> Result<GraphTensorInfo> {
-    let name = value.name.clone().ok_or_else(|| {
-        OrtError::InvalidArgument(format!(
-            "{component} ONNX graph has an unnamed {direction}; compatibility loading requires \
-             explicit graph-port names"
-        ))
-    })?;
-    let dimensions = value
-        .shape
-        .iter()
-        .map(|dimension| match dimension {
-            onnx_std::ir::Dim::Static(value) => Some(*value),
-            onnx_std::ir::Dim::Symbolic(_) => None,
-        })
-        .collect();
-    Ok(GraphTensorInfo {
-        name,
-        dtype: graph_dtype_name(value.dtype).to_owned(),
-        dimensions,
-    })
-}
-
-fn graph_dtype_name(dtype: onnx_std::ir::DataType) -> &'static str {
-    use onnx_std::ir::DataType;
-    match dtype {
-        DataType::Undefined => "undefined",
-        DataType::Float32 => "float32",
-        DataType::Uint8 => "uint8",
-        DataType::Int8 => "int8",
-        DataType::Uint16 => "uint16",
-        DataType::Int16 => "int16",
-        DataType::Int32 => "int32",
-        DataType::Int64 => "int64",
-        DataType::String => "string",
-        DataType::Bool => "bool",
-        DataType::Float16 => "float16",
-        DataType::Float64 => "float64",
-        DataType::Uint32 => "uint32",
-        DataType::Uint64 => "uint64",
-        DataType::Complex64 => "complex64",
-        DataType::Complex128 => "complex128",
-        DataType::BFloat16 => "bfloat16",
-        DataType::Float8E4M3FN => "float8_e4m3fn",
-        DataType::Float8E4M3FNUZ => "float8_e4m3fnuz",
-        DataType::Float8E5M2 => "float8_e5m2",
-        DataType::Float8E5M2FNUZ => "float8_e5m2fnuz",
-        DataType::Uint4 => "uint4",
-        DataType::Int4 => "int4",
-        DataType::Float4E2M1 => "float4_e2m1",
-        DataType::Float8E8M0 => "float8_e8m0",
-        DataType::Uint2 => "uint2",
-        DataType::Int2 => "int2",
-    }
 }
 
 fn resolve_relative_file(root: &Path, relative: &str, description: &str) -> Result<PathBuf> {
@@ -1056,6 +974,175 @@ fn resolve_relative_file(root: &Path, relative: &str, description: &str) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+
+    const TOKENIZER_BYTES: &[u8] = b"{}";
+
+    fn copy_directory(source: &Path, destination: &Path) {
+        fs::create_dir_all(destination).unwrap();
+        for entry in fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            let source_path = entry.path();
+            let destination_path = destination.join(entry.file_name());
+            if source_path.is_dir() {
+                copy_directory(&source_path, &destination_path);
+            } else {
+                fs::copy(source_path, destination_path).unwrap();
+            }
+        }
+    }
+
+    fn staged_pipeline(name: &str, location: &str) -> PathBuf {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/onnx_genai_workflows/static_cache");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join("pipeline-tokenizer-artifacts")
+            .join(name);
+        let _ = fs::remove_dir_all(&root);
+        copy_directory(&source, &root);
+        let mut metadata = fs::read_to_string(source.join("inference_metadata.yaml"))
+            .unwrap()
+            .replace("\r\n", "\n");
+        let artifact = format!("    artifacts:\n    - location: {location}\n");
+        const TOKENIZER_NEEDLE: &str = "    byte_level: true\n";
+        assert!(
+            metadata.contains(TOKENIZER_NEEDLE),
+            "tokenizer fixture must contain the insertion point"
+        );
+        metadata = metadata.replacen(
+            TOKENIZER_NEEDLE,
+            &format!("    byte_level: true\n{artifact}"),
+            1,
+        );
+        fs::write(root.join("inference_metadata.yaml"), metadata).unwrap();
+        root
+    }
+
+    fn staged_legacy_pipeline(name: &str) -> PathBuf {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/onnx_genai_workflows/static_cache");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join("pipeline-tokenizer-artifacts")
+            .join(name);
+        let _ = fs::remove_dir_all(&root);
+        copy_directory(&source, &root);
+        root
+    }
+
+    fn write_tokenizer(root: &Path, location: &str, bytes: &[u8]) {
+        let path = root.join(location);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn pipeline_resolves_nested_declared_tokenizer_artifact() {
+        let root = staged_pipeline("nested", "assets/tokenizers/tokenizer.json");
+        write_tokenizer(&root, "assets/tokenizers/tokenizer.json", TOKENIZER_BYTES);
+
+        let directory = PipelineModelDirectory::load(&root).unwrap();
+        let expected = root
+            .join("assets/tokenizers/tokenizer.json")
+            .canonicalize()
+            .unwrap();
+        assert_eq!(
+            directory.tokenizer_paths.shared.as_deref(),
+            Some(expected.as_path())
+        );
+    }
+
+    #[test]
+    fn pipeline_allows_declared_tokenizer_bytes_to_be_replaced() {
+        let root = staged_pipeline("replaceable", "tokenizer.json");
+        write_tokenizer(&root, "tokenizer.json", TOKENIZER_BYTES);
+        PipelineModelDirectory::load(&root).unwrap();
+
+        fs::write(root.join("tokenizer.json"), b"{\"replacement\":true}").unwrap();
+        let directory = PipelineModelDirectory::load(&root).unwrap();
+        assert_eq!(
+            directory.tokenizer_paths.shared,
+            Some(root.join("tokenizer.json").canonicalize().unwrap())
+        );
+    }
+
+    #[test]
+    fn pipeline_rejects_retired_tokenizer_hash_field() {
+        let root = staged_pipeline("retired-hash", "tokenizer.json");
+        write_tokenizer(&root, "tokenizer.json", TOKENIZER_BYTES);
+        let metadata_path = root.join("inference_metadata.yaml");
+        let metadata = fs::read_to_string(&metadata_path).unwrap().replace(
+            "    - location: tokenizer.json\n",
+            "    - location: tokenizer.json\n      sha256: retired\n",
+        );
+        fs::write(metadata_path, metadata).unwrap();
+
+        let error = PipelineModelDirectory::load(&root).unwrap_err().to_string();
+        assert!(error.contains("unknown field `sha256`"), "{error}");
+    }
+
+    #[test]
+    fn pipeline_rejects_missing_declared_tokenizer_file() {
+        let root = staged_pipeline("missing-file", "nested/tokenizer.json");
+
+        let error = PipelineModelDirectory::load(&root)
+            .unwrap_err()
+            .to_string()
+            .replace('\\', "/");
+        assert!(error.contains("cannot be opened"), "{error}");
+        assert!(
+            error.contains("nested") && error.contains("tokenizer.json"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn pipeline_rejects_declared_tokenizer_directory() {
+        let root = staged_pipeline("not-a-file", "nested/tokenizer.json");
+        fs::create_dir_all(root.join("nested/tokenizer.json")).unwrap();
+
+        let error = PipelineModelDirectory::load(&root).unwrap_err().to_string();
+        assert!(error.contains("is not a file"), "{error}");
+    }
+
+    #[test]
+    fn pipeline_rejects_tokenizer_path_escape() {
+        let root = staged_pipeline("escape", "../escaped-tokenizer.json");
+        fs::write(
+            root.parent().unwrap().join("escaped-tokenizer.json"),
+            TOKENIZER_BYTES,
+        )
+        .unwrap();
+
+        let error = PipelineModelDirectory::load(&root).unwrap_err().to_string();
+        assert!(error.contains("escapes package root"), "{error}");
+    }
+
+    #[test]
+    fn declared_tokenizer_is_not_overridden_by_unrelated_root_file() {
+        let root = staged_pipeline("explicit-beats-root", "nested/tokenizer.json");
+        write_tokenizer(&root, "nested/tokenizer.json", TOKENIZER_BYTES);
+        fs::write(root.join("tokenizer.json"), b"unrelated").unwrap();
+
+        let directory = PipelineModelDirectory::load(&root).unwrap();
+        assert_eq!(
+            directory.tokenizer_paths.shared,
+            Some(root.join("nested/tokenizer.json").canonicalize().unwrap())
+        );
+    }
+
+    #[test]
+    fn legacy_pipeline_without_artifacts_uses_root_tokenizer() {
+        let root = staged_legacy_pipeline("legacy-root");
+        write_tokenizer(&root, "tokenizer.json", TOKENIZER_BYTES);
+
+        let directory = PipelineModelDirectory::load(&root).unwrap();
+        assert_eq!(
+            directory.tokenizer_paths.shared,
+            Some(root.join("tokenizer.json"))
+        );
+    }
 
     #[test]
     fn same_stem_binary_and_textproto_are_one_logical_model() {
@@ -1068,13 +1155,42 @@ mod tests {
         assert_eq!(paths, vec![binary]);
     }
 
+    /// A fixture that exists only to carry a non-dense graph output.
+    ///
+    /// These tests used to point at `tiny-glm52-qmoe-indexshare`, a real
+    /// end-to-end model fixture. #1832 regenerated it and `logits` became an
+    /// ordinary dense tensor, which deleted the premise both tests rest on
+    /// without either test mentioning the fixture's shape. A dedicated fixture
+    /// cannot be regenerated out from under them by unrelated model work.
     fn non_dense_logits_fixture() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/fixtures/tiny-glm52-qmoe-indexshare/model.onnx")
+            .join("../../tests/fixtures/non-dense-graph-io/model.onnx.textproto")
+    }
+
+    /// Guards the premise of the two tests below: if this fails, they are
+    /// vacuous rather than wrong, and the fixture is what needs fixing.
+    fn assert_fixture_logits_is_non_dense() {
+        let error = graph_io_from_model_path_for_names(
+            &non_dense_logits_fixture(),
+            &[],
+            &["logits".to_string()],
+        )
+        .expect_err("the fixture's `logits` must not be a dense tensor")
+        .to_string();
+
+        assert!(
+            error.contains("not a dense tensor type"),
+            "fixture no longer declares a non-dense `logits`, so this test is vacuous: {error}"
+        );
     }
 
     #[test]
     fn selected_dense_kv_ignores_unrelated_non_dense_logits() {
+        // Without this the test passes just as happily against a fixture with no
+        // non-dense output at all, which is exactly how it went vacuous after
+        // #1832 while its sibling failed loudly.
+        assert_fixture_logits_is_non_dense();
+
         let inputs = vec![
             "past_key_values.0.key".to_string(),
             "past_key_values.0.value".to_string(),

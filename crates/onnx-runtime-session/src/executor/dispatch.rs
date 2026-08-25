@@ -169,6 +169,7 @@ impl Executor {
                 entry.0 += elapsed;
                 entry.1 += 1;
                 result?;
+                self.release_dead_values(pi, external);
             }
             print_op_profile(run_start.elapsed(), timings);
         } else {
@@ -178,9 +179,74 @@ impl Executor {
                 }
                 self.prefetch_lazy_weights_after(pi)?;
                 self.exec_plan_node(pi, resolved, outer_scope, external, OpCaptureTrace::Eager)?;
+                self.release_dead_values(pi, external);
             }
         }
         Ok(())
+    }
+
+    /// Release the buffers of values whose last consumer was plan node `pi`.
+    ///
+    /// The guards mirror the in-place-overwrite path: anything the caller owns,
+    /// anything aliased by a view, and anything a sequence or shared buffer still
+    /// refers to is left alone. A value that fails a guard simply stays resident,
+    /// which is the pre-existing behaviour for every value.
+    /// Free the buffers of values whose last consumer was node `pi`.
+    ///
+    /// The guard list is deliberately the same one `inplace_input` applies,
+    /// because both are asking the same question: may this buffer be taken away
+    /// from the value that currently holds it? Any guard added there belongs
+    /// here too.
+    ///
+    /// A value that is aliased -- by a view, by a sequence's shared storage --
+    /// is never released, even after every alias has died. `pinned` records
+    /// that a value was ever an alias source and is only cleared between runs,
+    /// so it is a deliberately conservative over-approximation. Releasing on
+    /// the exact liveness test (`views` no longer names it as a source) would
+    /// be wrong for the decode memo, which restores a step's view table from
+    /// `retained_views` on the *next* run and expects the source buffer to
+    /// still be resident. Measured cost of the conservative choice on the
+    /// vision encoder is 36 MiB out of ~12 GB reclaimed, which does not buy an
+    /// aliasing analysis that has to be right across runs.
+    fn release_dead_values(&mut self, pi: usize, external: &ExternalBindings) {
+        if !self.release_dead_values_enabled {
+            return;
+        }
+        let dead = std::mem::take(&mut self.plan[pi].dead_after);
+        for &vid in &dead {
+            if external.inputs.contains_key(&vid)
+                || external.outputs.contains_key(&vid)
+                || self.pinned.contains(&vid)
+                || self.shared_buffers.contains_key(&vid)
+                || self.seq_elem_values.contains_key(&vid)
+                || self.views.contains_key(&vid)
+            {
+                continue;
+            }
+            // A memoized loop-invariant `If` skips its branch on later runs and
+            // serves the outputs straight from the buffers the first run left
+            // resident (see `exec_if`), and the memo outlives an eager run.
+            // Freeing one of those outputs turns the next skip into a missing
+            // buffer. `try_move_host_output` declines for the same reason.
+            if let Some(producer) = self.graph.try_value(vid).and_then(|value| value.producer)
+                && self.if_last_predicate.contains_key(&producer)
+            {
+                continue;
+            }
+            // A borrowed buffer aliases memory this session does not own.
+            if self.buffers.get(&vid).is_some_and(|b| b.is_borrowed()) {
+                continue;
+            }
+            // `DeviceBuffer` is a bare handle with no `Drop`: dropping it
+            // strands the allocation, so the owning EP has to free it.
+            if let Some(buffer) = self.buffers.remove(&vid) {
+                // The reuse fast path treats a surviving shape entry as proof
+                // the allocation is still there, so it has to go with it.
+                self.buffer_shapes.remove(&vid);
+                let _ = self.ep.deallocate(buffer);
+            }
+        }
+        self.plan[pi].dead_after = dead;
     }
 
     fn prefetch_lazy_weights_after(&self, pi: usize) -> Result<()> {
@@ -261,7 +327,7 @@ impl Executor {
                     RunMode::Capture => {
                         {
                             let kernels = self.collect_segment_kernels(seg, resolved)?;
-                            ep.begin_device_graph_capture(&kernels)?;
+                            ep.begin_device_graph_capture_in(self.graph_slot, &kernels)?;
                         }
                         // Any early return (`?`) while recording this segment
                         // must end the stream capture before it propagates —
@@ -270,7 +336,8 @@ impl Executor {
                         // is rejected while capturing). The guard aborts the
                         // capture on drop; `disarm()` hands off to the normal
                         // `end_device_graph_capture()` on the success path.
-                        let mut capture_guard = SegmentCaptureGuard::arm(ep.as_ref());
+                        let mut capture_guard =
+                            SegmentCaptureGuard::arm(ep.as_ref(), self.graph_slot);
                         for pi in seg.start..seg.end {
                             let node_id = self.plan[pi].node_id;
                             if let Err(error) = self.exec_plan_node(
@@ -289,11 +356,17 @@ impl Executor {
                             }
                         }
                         capture_guard.disarm();
-                        ep.end_device_graph_capture()?;
-                        ep.replay_device_graph_segment(seg.graph_index)?;
+                        ep.end_device_graph_capture_in(self.graph_slot)?;
+                        // Capture is closed: syncs are legal again. Free any
+                        // view-owner buffers that `install_view_outputs` parked
+                        // while recording (freeing mid-capture is rejected).
+                        for old in self.capture_deferred_frees.drain(..) {
+                            ep.deallocate(old)?;
+                        }
+                        ep.replay_device_graph_segment_in(self.graph_slot, seg.graph_index)?;
                     }
                     RunMode::Replay => {
-                        ep.replay_device_graph_segment(seg.graph_index)?;
+                        ep.replay_device_graph_segment_in(self.graph_slot, seg.graph_index)?;
                     }
                     RunMode::Eager => {
                         unreachable!("eager runs never build a segment schedule")
@@ -442,11 +515,14 @@ impl Executor {
             ep: &ep,
             graph: &self.graph,
             weight_handles: &self.weight_handles,
+            expert_region_candidates: &self.expert_region_candidates,
             buffers: &mut self.buffers,
             buffer_shapes: &mut self.buffer_shapes,
             shared_buffers: &mut self.shared_buffers,
             views_meta: &mut self.views,
             pinned: &mut self.pinned,
+            capture_deferred_frees: &mut self.capture_deferred_frees,
+            capturing: matches!(capture, OpCaptureTrace::Captured),
             persistent_workspace: &mut self.persistent_workspace,
             step_workspace: &mut self.step_workspace,
             inherited_workspace: self
@@ -547,7 +623,9 @@ impl Executor {
         // Ask the kernel whether its outputs are strided views over its inputs
         // (a layout/movement op such as Slice). If so, record view metadata
         // aliasing the source buffer and skip compute + allocation entirely.
-        if !has_lazy_inputs && let Some(specs) = kernel.view_outputs(&views, outputs.len()) {
+        if !has_lazy_inputs
+            && let Some(specs) = kernel.view_outputs(&views, &output_shapes, outputs.len())
+        {
             if outputs
                 .iter()
                 .any(|output| external.outputs.contains_key(output))
@@ -813,16 +891,19 @@ impl Executor {
         }
         let mut output_shapes: Vec<Vec<usize>> =
             outputs.iter().map(|v| resolved[v].clone()).collect();
-        // Fixed-capacity KV for the default-domain Attention op. Its present
-        // K/V outputs (slots 1..) are consumer-less graph outputs bound to a
-        // growing device cache. Expose them to the kernel at the binding's
-        // physical capacity so the kernel can append the new token into a fixed
-        // per-head slot (constant stride, no per-step restride) instead of
-        // repacking the whole cache densely. The valid attended length is still
-        // derived from the logical past+current extent, so this only widens the
-        // *storage* stride and never changes what the kernel attends over. Only
-        // present slots that are bound sub-shape (logical != physical) capacity
-        // buffers are widened; a dense/unbound present keeps its inferred shape.
+        // Fixed-capacity KV for the default-domain Attention op, and for a
+        // decomposed attention's plain-`Concat` KV-cache append (see
+        // `geometry::is_kv_cache_growth_concat`). Both present outputs are
+        // consumer-less graph outputs bound to a growing device cache; the two
+        // branches below correct for that binding, but via different targets
+        // (`output_shapes` for `Attention`, `resolved` for the `Concat` case —
+        // see the `Concat` branch's comment for why) since only `Attention`'s
+        // own kernel needs the widened shape to place the new token correctly.
+        // Either way, the valid attended length is still derived from the
+        // logical past+current extent, so this only widens the *storage*
+        // stride/tracked shape and never changes what is attended over. Only
+        // present values bound sub-shape (logical != physical) capacity buffers
+        // are corrected; a dense/unbound present keeps its inferred shape.
         {
             let node = self.graph.node(node_id);
             if node.is_default_domain() && node.op_type == "Attention" {
@@ -859,6 +940,58 @@ impl Executor {
                                 .is_some_and(|(&physical, &logical)| physical >= logical))
                     {
                         output_shapes[oi] = value.shape.clone();
+                    }
+                }
+            } else if is_kv_cache_growth_concat(&self.graph, node)
+                && let Some(axis) = node.attr("axis").and_then(Attribute::as_int)
+            {
+                // Decomposed attention grows its KV cache with a plain `Concat`
+                // (`present.* = Concat(past.*, current, axis)`) instead of an
+                // in-op cache. `is_kv_cache_growth_concat` recognizes this by
+                // input/output role alone (see its doc comment) — the same
+                // predicate `geometry::classify_mask_consumer` uses to decide
+                // whether a mask combined with a value derived from this append
+                // can also be frozen to physical width; the two are two sides
+                // of one invariant.
+                //
+                // Unlike `Attention`, whose kernel is *designed* to receive a
+                // physical-capacity output shape (it derives the true attended
+                // length from the mask/cache extent instead, so widening tells
+                // it where to place the new token without repacking), a plain
+                // `Concat` kernel independently validates that its declared
+                // output shape equals `past.shape[axis] + current.shape[axis]`
+                // and correctly writes only that (small) delta — relying on the
+                // present==past device aliasing for the append to land in
+                // place. Widening `output_shapes` here would make the node's
+                // *own* dispatch shape lie about that arithmetic and the kernel
+                // would (rightly) reject it. So only `resolved` is corrected —
+                // it is what a same-step downstream consumer (a decomposed
+                // attention's `Shape(present.*)` / `Unsqueeze` chain) reads via
+                // `refill_input_shapes`, and it is what was stale before this
+                // fix (the original crash). This node's own `output_shapes`
+                // stays the naive, arithmetically-correct value below.
+                let rank = output_shapes[0].len();
+                let axis = if axis < 0 { axis + rank as i64 } else { axis };
+                if let Ok(axis) = usize::try_from(axis)
+                    && axis < rank
+                {
+                    let ovid = outputs[0];
+                    if let Some(value) = external.outputs.get(&ovid)
+                        && value.accepts_subshape
+                        && value.shape.len() == output_shapes[0].len()
+                        && value
+                            .shape
+                            .iter()
+                            .zip(&output_shapes[0])
+                            .enumerate()
+                            .all(|(a, (&physical, &logical))| a == axis || physical == logical)
+                        && value
+                            .shape
+                            .get(axis)
+                            .zip(output_shapes[0].get(axis))
+                            .is_some_and(|(&physical, &logical)| physical >= logical)
+                    {
+                        resolved.insert(ovid, value.shape.clone());
                     }
                 }
             }
@@ -1245,11 +1378,20 @@ struct KernelDispatchContext<'a> {
     ep: &'a Arc<dyn ExecutionProvider>,
     graph: &'a Graph,
     weight_handles: &'a HashMap<ValueId, WeightHandle>,
+    expert_region_candidates: &'a HashMap<ValueId, onnx_runtime_loader::WeightRegionCatalog>,
     buffers: &'a mut HashMap<ValueId, DeviceBuffer>,
     buffer_shapes: &'a mut HashMap<ValueId, Vec<usize>>,
     shared_buffers: &'a mut HashMap<ValueId, Arc<SharedTensorBuffer>>,
     views_meta: &'a mut HashMap<ValueId, ValueView>,
     pinned: &'a mut HashSet<ValueId>,
+    /// Stale view-owner buffers parked here instead of freed while a captured
+    /// segment is being recorded (freeing synchronizes, which stream capture
+    /// forbids). Flushed by the caller once capture closes. See
+    /// [`super::state`]`::capture_deferred_frees`.
+    capture_deferred_frees: &'a mut Vec<DeviceBuffer>,
+    /// True while this node is recorded into a device graph
+    /// ([`OpCaptureTrace::Captured`]): buffer frees must be deferred, not issued.
+    capturing: bool,
     persistent_workspace: &'a mut Option<PreparedWorkspace>,
     step_workspace: &'a mut Option<PreparedWorkspace>,
     inherited_workspace: Option<WorkspaceView>,
@@ -1349,7 +1491,15 @@ impl KernelDispatchContext<'_> {
                 ovid.0
             );
             if let Some(old) = self.buffers.remove(&ovid) {
-                self.ep.deallocate(old)?;
+                // Freeing synchronizes the copy stream (pooled unmap), which is
+                // illegal while a device graph is recording. During capture we
+                // park the now-orphaned buffer and let the caller free it once
+                // capture closes; outside capture we free immediately.
+                if self.capturing {
+                    self.capture_deferred_frees.push(old);
+                } else {
+                    self.ep.deallocate(old)?;
+                }
             }
             self.shared_buffers.remove(&ovid);
             self.buffer_shapes.remove(&ovid);
@@ -1522,13 +1672,50 @@ impl KernelDispatchContext<'_> {
                 })
                 .collect::<Vec<_>>()
         });
+
+        // Acquire a routed-residency guard for QMoE-family boundary nodes
+        // (issue #82 slice 5). This is the one dispatch-time authority: no
+        // parallel ad-hoc residency check exists elsewhere. Fused-routing
+        // kernels cannot name their routed set host-side before launch, so
+        // `FusedRoutingUnknown` is the only requirement this call site can
+        // construct today; `acquire_routed_residency`'s CUDA impl always
+        // proves `WholeBank` in response (see its doc comment). The guard is
+        // held exactly as long as `kernel_inputs`/the paged weight pins are
+        // held below, and dropped at the same point, so the resize seam
+        // cannot observe a safe point mid-dispatch. Capture: this call
+        // itself does not gate on capture state; the guard's presence is
+        // what makes `resize_safe_point` fail closed, and captured nodes
+        // never call this residency's resize path while replaying, so a
+        // guard acquired during capture recording remains valid for the
+        // node's normal (non-captured) re-dispatch semantics without needing
+        // separate capture-lifetime bookkeeping here.
+        let _routed_residency_guard = if LazyWeightBoundary::QMoe
+            .matches(&node.domain, &node.op_type)
+            || LazyWeightBoundary::BlockQuantizedMoe.matches(&node.domain, &node.op_type)
+        {
+            inputs.iter().find_map(|value| {
+                let value = (*value)?;
+                let catalog = self.expert_region_candidates.get(&value)?;
+                self.ep
+                    .acquire_routed_residency(
+                        value.0 as u64,
+                        onnx_runtime_ep_api::RoutedResidencyRequirement::FusedRoutingUnknown,
+                        catalog,
+                    )
+                    .ok()
+                    .flatten()
+            })
+        } else {
+            None
+        };
+
         let execution = {
             let _s = phase_span!("exec_kernel.compute");
             let metadata = views
                 .iter()
                 .map(|view| TensorMetadata::new(view.dtype, view.shape, !view.is_absent()))
                 .collect::<Vec<_>>();
-            let requirement = kernel.workspace_requirement(&metadata)?;
+            let requirement = kernel.workspace_requirement_for_execution(views, &metadata)?;
             let prepared = match requirement.lifetime {
                 WorkspaceLifetime::SessionPersistent => &mut *self.persistent_workspace,
                 WorkspaceLifetime::StepScoped => &mut *self.step_workspace,
@@ -1583,36 +1770,15 @@ impl KernelDispatchContext<'_> {
                     // before retiring the old disposable workspace. Release it
                     // before acquiring the replacement to avoid charging both.
                     self.ep.sync()?;
-                    if let Some(old) = prepared.take() {
-                        self.ep.deallocate(old.buffer)?;
-                    }
-                    let target_mapped = self
-                        .ep
-                        .mapped_bytes_for_allocation(required, requirement.alignment)?;
-                    let mut grant = self
-                        .ep
-                        .prepare_mapped_growth(target_mapped, requirement.role)?;
-                    let lease = match self
-                        .ep
-                        .reserve_workspace(requirement.bytes, requirement.role)
-                    {
-                        Ok(lease) => lease,
-                        Err(error) => {
-                            drop(grant);
-                            return Err(error.into());
-                        }
-                    };
-                    let buffer = match grant.take() {
-                        Some(grant) => self.ep.allocate_with_mapped_growth(
-                            required,
-                            requirement.alignment,
-                            grant,
-                        )?,
-                        None => self.ep.allocate(required, requirement.alignment)?,
-                    };
+                    let old = prepared.take().map(|workspace| workspace.buffer);
+                    let buffer = self.ep.replace_workspace(
+                        old,
+                        required,
+                        requirement.alignment,
+                        requirement.role,
+                    )?;
                     *prepared = Some(PreparedWorkspace {
                         buffer,
-                        _lease: lease,
                         bytes: required,
                         alignment: requirement.alignment,
                     });
@@ -1682,6 +1848,7 @@ impl KernelDispatchContext<'_> {
             })?;
 
         drop(kernel_inputs);
+        drop(_routed_residency_guard);
         for backing in out_bufs {
             if let Some(buf) = backing.internal {
                 self.buffers.insert(backing.vid, buf);

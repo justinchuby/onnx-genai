@@ -11,12 +11,9 @@ devices. The no-model suite needs no ONNX Runtime model or GPU:
 
 Model scenarios are gated by `bench-ort` and use the committed tiny fixtures:
 
-- end-to-end generation tokens/second (`tiny-llm-scatter`)
-- prefill latency by context length (`tiny-llm-scatter`)
-- static batch throughput by batch size (`tiny-llm-scatter`)
-- scheduler-driven continuous-batch versus sequential throughput at 1/2/4/8
-  concurrent rows, with Criterion latency distributions (`tiny-llm-scatter`)
-- prefix-cache prefill speedup: cold versus warm (prefix-primed) prefill (`tiny-llm-scatter`)
+- end-to-end generation tokens/second (`tiny-llm`)
+- prefill latency by context length (`tiny-llm`)
+- prefix-cache prefill speedup: cold versus warm (prefix-primed) prefill (`tiny-llm`)
 
 Run the comparable suite:
 
@@ -52,7 +49,7 @@ The opt-in profiling binaries measure different layers:
   native nxrt decoder-with-past adapter and the same engine decode loop as ORT,
   with forward passes through `onnx-runtime-session::InferenceSession::run`.
   For an identical steady-window native-vs-ORT comparison, build with
-  `--features bench-native,bench-ort,cuda` and run the same command with
+  `--features native-cuda,ort-cuda` and run the same command with
   `--backend native` and `--backend ort`.
 
 The `--steady` path is directly comparable head-to-head: both backends use the
@@ -64,7 +61,7 @@ bytes so an over-budget run cannot be mistaken for a full-resident one.
 
 ```bash
 cargo run --release -p onnx-genai-bench \
-  --features bench-native,bench-ort,cuda \
+  --features native-cuda,ort-cuda \
   --bin profile_native -- \
   --model /path/to/model --ep cuda --backend ort --steady \
   --tokens 128 --warmups 1 --runs 3 --decode-skip 8

@@ -1,0 +1,136 @@
+name: Host lock
+
+# `scripts/hostlock.sh` is the advisory benchmark-host lock (#1803, #1806) and
+# `scripts/hostlock_test.sh` is its conformance suite, covering mutual
+# exclusion, atomic publish, stale-holder reaping, fail-closed admission and
+# the CPU-efficiency verdict. Until this workflow existed, **nothing ran it.**
+# It was run by hand, by me, on the box it locks -- which is the same
+# "assigned, never executed" shape the suite itself exists to prevent, one
+# level up. A suite nobody runs is a suite that is green because it is stale.
+#
+# Deliberately no assertion count here. The first version of this comment said
+# "252 assertions (249 before #1910)", which was a projection: 249 was the
+# total on the branch, +3 for a PR that had not landed. Neither number was
+# ever the total on main, which went 249 -> 258 (#1908) -> 265 (#1869) while
+# #1912 was in review, and moves again when #1910 lands. The suite pins its
+# own total in its last assertion -- `every assertion in this file ran` --
+# which is the only copy of that number that cannot drift, because it fails
+# the run rather than misinforming a reader.
+#
+# It has already earned its place more than once. Three of the defects it
+# caught were introduced by the fix for the previous one:
+#
+#   * an acquire that `mkdir`ed and then wrote its metadata handed the host to
+#     THREE simultaneous winners, because a competitor reading in the window
+#     between the two steps sees a lock with no anchor pid and reaps it;
+#   * the reaper's own mutex could be orphaned by a SIGKILL between `mkdir`
+#     and `rmdir`, after which no stale lock could ever be reaped again;
+#   * `reaper_release` compared only `$$`, so on a box cycling ~1.5M pids in
+#     four days it could delete a live successor's guard.
+#
+# Path-filtered on purpose. The suite spends about ten core-seconds on real
+# load -- six spinners for the occupancy reading, three ~1.5s single-cpu cells
+# for the efficiency verdict -- which is cheap but not free, and it is
+# irrelevant to a PR that does not touch the lock. So it runs only when
+# `scripts/hostlock*.sh` or this file changes, on PRs and on pushes to main.
+# It is deliberately NOT one of the required checks, and it must never become
+# one. The required set is `Fast (Linux x86_64)` and `Rust quality`, and
+# adding a three-and-a-half-minute shell job to every PR's critical path buys
+# nothing for the PRs that never touch these two files. But there is a harder
+# reason than cost: with `pull_request: paths:`, a PR that does not touch
+# these files does not get a SKIPPED job, it gets no job at all -- so a
+# required check by this name would sit "Expected -- waiting for status" on
+# every unrelated PR, forever. `ci.yml` solves the same problem the other way
+# round, and the distinction is worth getting right because it is the whole
+# reason that workflow is shaped as it is: its two required jobs carry a
+# JOB-level `if: needs.changes.outputs.docs_only != 'true'`, and a job skipped
+# by a conditional reports a conclusion, which satisfies a required check. The
+# `changes` job they read has no `if:` at all -- deliberately, and its own
+# comment records that gating it once skipped the entire workflow, because a
+# job whose `needs` dependency is skipped is skipped whatever its own `if:`
+# says. Workflow-level `paths:` cannot be rescued that way: there is no job to
+# skip, so there is no conclusion to report.
+#
+# Linux-only by construction, matching the tool: `hostlock.sh` reads
+# `/proc/<pid>/stat` for pid start times, relies on `mv -T` for its atomic
+# publish, and uses `stat -c`. Its PORTABILITY block says so.
+#
+# Timing, measured rather than assumed. The suite contains fixed sleeps and
+# several bounded waits, so its wall time is dominated by waiting, not by
+# work. Under `taskset -c 30,31` on the development host -- two cores, the
+# shape of a GitHub-hosted runner -- it passed 252/252 in 210s while consuming
+# 53% of a single core averaged over that window, i.e. it is mostly waiting.
+# (252 was the total at the time of that measurement; the assertions added
+# since are string-validation cells that add no wall time worth counting.)
+# The first real run of this job on a GitHub-hosted runner then took 3m17s,
+# which is the number to trust, and it is why the emulation above is recorded
+# rather than deleted: it predicted the real one. The 20-minute timeout is ~6x
+# that, which leaves room for a slower runner without letting a genuinely hung
+# wait sit for the six-hour default.
+#
+# The suite is required to pass on a co-tenanted host (#1802): every cell that
+# needs to know what a run achieved measures this host and derives its
+# threshold, rather than asserting a number only an idle box can produce. That
+# is what makes it safe to run on shared CI infrastructure at all, and the
+# two-core run above is the evidence for it rather than the claim.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - "scripts/hostlock.sh"
+      - "scripts/hostlock_test.sh"
+      # The whole directory, not the drivers we happen to know about: the
+      # conformance check below exists to catch a *new* harness, and a path
+      # filter listing today's files would skip the job for exactly the file
+      # it was written to catch.
+      - "scripts/ort_ab/**"
+      - ".github/workflows/hostlock.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "scripts/hostlock.sh"
+      - "scripts/hostlock_test.sh"
+      # The whole directory, not the drivers we happen to know about: the
+      # conformance check below exists to catch a *new* harness, and a path
+      # filter listing today's files would skip the job for exactly the file
+      # it was written to catch.
+      - "scripts/ort_ab/**"
+      - ".github/workflows/hostlock.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  conformance:
+    name: Host lock conformance
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: shellcheck
+        run: shellcheck scripts/hostlock.sh scripts/hostlock_test.sh
+
+      # The suite pins its own total (`every assertion in this file ran`), so a
+      # refactor that silently drops assertions fails here rather than passing
+      # with fewer of them. That assertion is the reason this job can be
+      # trusted to mean what its name says.
+      - name: Conformance suite
+        run: bash scripts/hostlock_test.sh
+
+      # The admission gate in the A/B driver is lock conformance one layer up:
+      # it is what makes the outer harness hold the lock across every arm
+      # rather than each benchmark child holding it between them. Its cells
+      # drive the real `hostlock.sh` against a stub arm that prints a result
+      # line and exits, so they cost no measurable CPU and need no quiet host.
+      - name: A/B driver admission
+        run: python3 scripts/ort_ab/test_ab_lock.py
+
+      # "Mandatory for saturating runs" has meant "somebody remembered": the
+      # #2043 audit found one driver of fourteen taking the lock. This step
+      # makes every file in the directory declare what it is, and fails when a
+      # driver neither gates nor records why not.
+      - name: Driver gate conformance
+        run: python3 scripts/ort_ab/test_gate_conformance.py

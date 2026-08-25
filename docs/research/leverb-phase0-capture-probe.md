@@ -29,11 +29,11 @@ source /home/justinchu/onnx-genai/.cudaenv.sh
 # ALWAYS re-check idle + pin a high-index idle GPU before every run:
 nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory --format=csv,noheader
 
-cargo test -p onnx-genai-engine --features cuda,native-backend --release --no-run
+cargo test -p onnx-genai-engine --features native-cuda --release --no-run
 
 CUDA_VISIBLE_DEVICES=7 ONNX_GENAI_RUN_CUDA_SMOKE=1 \
   ONNX_GENAI_LEVERB_MODEL=/home/justinchu/glm-e2e-artifacts/glm-4-9b-int4-cuda \
-  cargo test -p onnx-genai-engine --features cuda,native-backend --release \
+  cargo test -p onnx-genai-engine --features native-cuda --release \
   --lib leverb_phase0_capture_probe -- --ignored --nocapture
 ```
 

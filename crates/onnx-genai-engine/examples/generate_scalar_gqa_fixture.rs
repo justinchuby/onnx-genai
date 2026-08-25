@@ -53,7 +53,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&root)?;
 
     let mut graph = Graph::new();
-    graph.opset_imports.insert(String::new(), 11);
+    graph.opset_imports.insert(String::new(), 24);
     graph.opset_imports.insert("com.microsoft".into(), 1);
     let batch = graph.intern_symbol("batch");
     let sequence = graph.intern_symbol("sequence");
@@ -145,16 +145,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let total_i64 = graph.create_named_value("total_i64", DataType::Int64, vec![]);
+    // ReduceSum moved `axes` from an attribute to an input in opset 13, so the
+    // reduced axes are supplied as an int64 tensor input (opset-24 schema).
+    let reduce_axes = graph.create_named_value("reduce_axes", DataType::Int64, vec![2.into()]);
+    insert_node(
+        &mut graph,
+        "",
+        "Constant",
+        vec![],
+        vec![reduce_axes],
+        &[("value", Attribute::Tensor(tensor_i64(vec![2], &[0, 1])))],
+    );
     insert_node(
         &mut graph,
         "",
         "ReduceSum",
-        vec![attention_mask],
+        vec![attention_mask, reduce_axes],
         vec![total_i64],
-        &[
-            ("axes", Attribute::Ints(vec![0, 1])),
-            ("keepdims", Attribute::Int(0)),
-        ],
+        &[("keepdims", Attribute::Int(0))],
     );
     let one = graph.create_named_value("one", DataType::Int64, vec![]);
     insert_node(
@@ -232,6 +240,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for output in [logits, present_key, present_value] {
         graph.add_output(output);
     }
+    // `Model::new` stamps `DEFAULT_IR_VERSION` (11), which matches the
+    // maintained-fixture floor, so no explicit ir_version override is needed.
     onnx_std::save_model(&Model::new(graph), root.join("model.onnx"))?;
     Ok(())
 }

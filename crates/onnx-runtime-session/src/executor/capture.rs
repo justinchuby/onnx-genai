@@ -365,12 +365,17 @@ impl OpCaptureTrace<'_> {
 /// [`disarm`]: SegmentCaptureGuard::disarm
 pub(super) struct SegmentCaptureGuard<'a> {
     pub(super) ep: &'a dyn ExecutionProvider,
+    pub(super) slot: DeviceGraphSlot,
     pub(super) armed: bool,
 }
 
 impl<'a> SegmentCaptureGuard<'a> {
-    pub(super) fn arm(ep: &'a dyn ExecutionProvider) -> Self {
-        Self { ep, armed: true }
+    pub(super) fn arm(ep: &'a dyn ExecutionProvider, slot: DeviceGraphSlot) -> Self {
+        Self {
+            ep,
+            slot,
+            armed: true,
+        }
     }
 
     pub(super) fn disarm(&mut self) {
@@ -383,7 +388,7 @@ impl Drop for SegmentCaptureGuard<'_> {
         if self.armed {
             // Best-effort: the abort itself may fail, but the caller is already
             // unwinding a capture failure and will reset the lifecycle next.
-            let _ = self.ep.abort_device_graph_capture();
+            let _ = self.ep.abort_device_graph_capture_in(self.slot);
         }
     }
 }
@@ -472,7 +477,16 @@ impl Executor {
     /// binding-signature mismatch on replay is independently caught, so a pinned
     /// symbol is never replayed against a stale grid.
     pub(crate) fn pin_fixed_capacity_kv_capture_symbols(&mut self) -> usize {
-        let pinned = collect_capacity_pinned_kv_symbols(&self.graph);
+        let mut pinned = collect_capacity_pinned_kv_symbols(&self.graph);
+        // Also pin the decode-freeze-safe attention-mask length symbol(s): the
+        // mask/causal-bias axis is a fixed-capacity constant on the single-token
+        // decode path (the frozen-width mask saturates to the true valid length),
+        // exactly like a pinned KV seq axis. Without this the mask-builder cone
+        // AND every capacity-form `Attention` consuming the bias stay eager seams
+        // (an MLA / HF-causal model captures with dozens of interleaved seams that
+        // replay incoherently); pinning admits them into capture. See
+        // [`collect_freeze_safe_mask_symbols`].
+        pinned.extend(collect_freeze_safe_mask_symbols(&self.graph));
         if pinned.is_empty() {
             return 0;
         }
@@ -484,7 +498,7 @@ impl Executor {
         self.capacity_pinned_kv_symbols = pinned;
         if std::env::var("ONNX_GENAI_LOG_GROWING_SYMBOLS").is_ok() {
             eprintln!(
-                "[onnx-genai-capture] pinned {} fixed-capacity KV seq symbol(s): {:?}; \
+                "[onnx-genai-capture] pinned {} fixed-capacity KV seq / freeze-safe mask symbol(s): {:?}; \
                  disqualifying set now {} symbol(s)",
                 count,
                 self.capacity_pinned_kv_symbols,
@@ -554,10 +568,10 @@ impl Executor {
         resolved: &mut HashMap<ValueId, Vec<usize>>,
         external: &ExternalBindings,
     ) {
-        self.capture_warm_seeded.clear();
+        self.cap_mut().capture_warm_seeded.clear();
         // Trust the warm just-in-time shapes only for the exact signature they
         // were derived under; otherwise leave values unresolved (eager seams).
-        if self.capture_warm_signature.as_ref() != Some(&external.capture_signature()) {
+        if self.cap().capture_warm_signature.as_ref() != Some(&external.capture_signature()) {
             return;
         }
         let external_values: HashSet<ValueId> = external
@@ -567,6 +581,7 @@ impl Executor {
             .copied()
             .collect();
         let warm: Vec<(ValueId, Vec<usize>)> = self
+            .cap()
             .capture_warm_shapes
             .iter()
             .map(|(&vid, shape)| (vid, shape.clone()))
@@ -579,7 +594,9 @@ impl Executor {
             {
                 continue;
             }
-            self.capture_warm_seeded.insert(vid, shape.clone());
+            self.cap_mut()
+                .capture_warm_seeded
+                .insert(vid, shape.clone());
             resolved.insert(vid, shape);
         }
     }
@@ -599,7 +616,7 @@ impl Executor {
             return false;
         }
         self.plan[pi].outputs.iter().any(|out| {
-            match (self.capture_cf_shapes.get(out), resolved.get(out)) {
+            match (self.cap().capture_cf_shapes.get(out), resolved.get(out)) {
                 (Some(captured), Some(current)) => captured != current,
                 (Some(_), None) => true,
                 _ => false,
@@ -618,6 +635,7 @@ impl Executor {
         // to an eager seam so warm-decode shape seeding can still fold the rest of
         // the graph instead of one mislabeled kernel aborting the whole capture.
         if self
+            .cap()
             .capture_quarantine_ops
             .contains(&(canonical_domain(node), node.op_type.clone()))
         {

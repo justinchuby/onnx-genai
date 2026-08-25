@@ -110,8 +110,13 @@ impl Kernel for CausalConvWithStateKernel {
         }
         let pad = kernel_size - 1;
 
-        let has_bias = inputs.len() >= 3;
-        let has_state = inputs.len() >= 4;
+        // Optional inputs arrive positionally: an omitted one is a null-backed
+        // placeholder in its own slot, not a shortened list. Testing arity
+        // alone would read the placeholder for an omitted `bias` as the bias
+        // whenever `past_state` follows it — which is exactly the standard
+        // opset-27 decode form `(input, weight, "", past_state)`.
+        let has_bias = inputs.len() >= 3 && !inputs[2].is_absent();
+        let has_state = inputs.len() >= 4 && !inputs[3].is_absent();
 
         let x = to_dense_f32_widen("CausalConvWithState", &inputs[0])?;
         let weight = to_dense_f32_widen("CausalConvWithState", &inputs[1])?;

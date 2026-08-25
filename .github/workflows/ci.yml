@@ -4,15 +4,17 @@
 # coverage signal duplicates x64/macOS while owning the critical path.
 #
 # `changes` classifies whether a pull_request/push touched anything other than
-# docs/wiki/site content. When it did not, every Rust job below is skipped
+# docs/wiki content. When it did not, every Rust job below is skipped
 # rather than run. GitHub reports a skipped job with conclusion "skipped",
 # which counts as passing for required status checks (unlike a workflow that
 # never triggers at all, which would leave a required check pending forever)
 # -- see https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/troubleshooting-required-status-checks
 # So "Fast (Linux x86_64)" and "Rust quality" -- the two required checks --
 # still report a conclusion on every PR, just without doing the expensive
-# work when nothing but docs changed. Schedule and workflow_dispatch runs are
-# unaffected: `changes` doesn't run for them, so docs_only stays unset/false.
+# work when nothing but docs changed. Schedule and workflow_dispatch runs get
+# full CI: `changes` runs for them too and leaves docs_only=false, because it
+# only diffs for pull_request and push. (It must run for them -- see the note
+# on the job itself.)
 name: CI
 
 on:
@@ -39,11 +41,19 @@ jobs:
   changes:
     name: Detect change scope
     runs-on: ubuntu-latest
-    # Only classify pull_request/push diffs. schedule and workflow_dispatch
-    # runs skip this job entirely, so `needs.changes.outputs.docs_only` is
-    # empty for them and every `if: needs.changes.outputs.docs_only != 'true'`
-    # below evaluates true -- full CI, unchanged.
-    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    # This job must run for *every* event. It used to be gated on
+    # `github.event_name == 'pull_request' || github.event_name == 'push'`,
+    # with a comment claiming schedule and workflow_dispatch runs would skip
+    # only this job and still get full CI. That was wrong: every job below is
+    # `needs: changes` with a plain `if:` (no `always()`/`!cancelled()`), and
+    # GitHub skips a job whose `needs` dependency was skipped, whatever its
+    # own `if:` says. So gating this job skipped the entire workflow -- which
+    # silently made both the nightly `schedule` and `workflow_dispatch` no-ops
+    # that reported success without running a single check.
+    #
+    # There is nothing to gate on anyway: the classify step below only diffs
+    # for pull_request and push, and leaves docs_only=false for every other
+    # event, so schedule and workflow_dispatch get full CI by construction.
     outputs:
       docs_only: ${{ steps.filter.outputs.docs_only }}
     steps:
@@ -67,7 +77,7 @@ jobs:
 
           is_docs_path() {
             case "$1" in
-              docs/*|wiki/*|site/*|*.md|*.mdx|*.markdown|LICENSE|NOTICE)
+              docs/*|wiki/*|*.md|*.mdx|*.markdown|LICENSE|NOTICE)
                 return 0 ;;
               *)
                 return 1 ;;
@@ -114,17 +124,25 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       RUSTFLAGS: "-D warnings"
+      # This lane runs `onnx-runtime-ep-cpu`'s placement falsifiers, so the
+      # absence of what they need -- two physical cores, and a kernel that
+      # accepts `sched_setaffinity` -- is a defect here rather than a fact about
+      # somebody's laptop. Same shape as `NXRT_REQUIRE_ORT_TESTS` on `cli-ort`.
+      # Deliberately unset elsewhere, so a contributor inside a 1-core container
+      # still gets a stated skip instead of a red suite.
+      NXRT_REQUIRE_PLACEMENT_TESTS: "1"
 
     steps:
       - uses: actions/checkout@v5
         with:
           submodules: recursive
-      - name: Install Rust stable toolchain
+      - name: Install the pinned Rust toolchain
         id: rust-toolchain
         shell: bash
         run: |
-          rustup toolchain install stable --profile minimal --component clippy,rustfmt
-          rustup default stable
+          # The toolchain, and its components, come from rust-toolchain.toml so CI
+          # and contributors resolve the same rustc. See that file for why.
+          rustup toolchain install
           echo "version=$(rustc -Vv | sed -n 's/^release: //p')" >> "$GITHUB_OUTPUT"
       - name: Resolve cargo cache target
         id: cache-target
@@ -160,6 +178,15 @@ jobs:
         run: python scripts/benchmark_muse_native_local.py --self-test --require-numpy
       - name: Check formatting
         run: cargo fmt --all -- --check
+      # This lane builds a subset of the workspace, so only that subset's
+      # packages land in the registry cache. The MLAS-free merge gate in
+      # onnx-runtime-ep-cpu-plugin asks `cargo metadata --offline` for the
+      # *whole* workspace resolve, and fails loud rather than skipping when it
+      # cannot read one — so a package no built crate happens to need (via
+      # tokenizers, say) turns that gate red for a reason unrelated to MLAS.
+      # Fetching the locked graph first keeps the gate hermetic and honest.
+      - name: Fetch the locked dependency graph
+        run: cargo fetch --locked
       - name: Build Linux offline crates
         run: >-
           cargo build --locked
@@ -183,13 +210,24 @@ jobs:
           -p onnx-genai-preprocess
           -p onnx-std
           -p onnx-genai-router
-          -p onnx-runtime-memory -p onnx-runtime-virtual-memory -p onnx-runtime-memory-governor -p onnx-runtime-cuda-memory
+          -p onnx-runtime-memory -p onnx-runtime-virtual-memory -p onnx-runtime-memory-api -p onnx-runtime-memory-governor -p onnx-runtime-cuda-memory
           -p onnx-runtime-cpuinfo
           -p onnx-runtime-eager
           -p onnx-runtime-capi
           -p onnx-runtime-dlpack
           -p onnx-runtime-comm
           -p onnx-std-python
+      # `profile_native` is the tool every decode benchmark in docs/benchmarks
+      # is produced with, and nothing else in CI compiles it: the `-p` list
+      # above does not reach a bin that needs `--features bench-native`, and
+      # `benchmark.yml` only runs `--bench no_model` / `--bench model`. So an
+      # engine API change breaks it silently and it is discovered by hand, which
+      # is exactly what happened in #1878. Building (not running) it is cheap
+      # and closes that gap.
+      - name: Build the native profiling bin
+        run: >-
+          cargo build --locked
+          -p onnx-genai-bench --features bench-native --bin profile_native
       - name: Test Linux offline crates
         run: >-
           cargo test --locked
@@ -217,7 +255,7 @@ jobs:
           -p onnx-genai-preprocess
           -p onnx-std
           -p onnx-genai-router
-          -p onnx-runtime-memory -p onnx-runtime-virtual-memory -p onnx-runtime-memory-governor -p onnx-runtime-cuda-memory
+          -p onnx-runtime-memory -p onnx-runtime-virtual-memory -p onnx-runtime-memory-api -p onnx-runtime-memory-governor -p onnx-runtime-cuda-memory
           -p onnx-runtime-cpuinfo
           -p onnx-runtime-eager
           -p onnx-runtime-capi
@@ -238,14 +276,17 @@ jobs:
       - uses: actions/checkout@v5
         with:
           submodules: recursive
-      # Keep CI on Rust stable deliberately: this follows Rust's stability promise
-      # without freezing security fixes; the cache key records the resolved rustc release.
-      - name: Install Rust stable toolchain
+      # The Rust toolchain is pinned in rust-toolchain.toml so a runner image
+      # rolling forward cannot turn `-D warnings` red with no commit to blame,
+      # and so a contributor sees the same lints CI does. The cache key still
+      # records the resolved rustc release. See rust-toolchain.toml for why.
+      - name: Install the pinned Rust toolchain
         id: rust-toolchain
         shell: bash
         run: |
-          rustup toolchain install stable --profile minimal --component clippy,rustfmt
-          rustup default stable
+          # The toolchain, and its components, come from rust-toolchain.toml so CI
+          # and contributors resolve the same rustc. See that file for why.
+          rustup toolchain install
           echo "version=$(rustc -Vv | sed -n 's/^release: //p')" >> "$GITHUB_OUTPUT"
       # actions/cache is GitHub-owned, so it is acceptable where personally-owned
       # cargo cache actions are not. Include OS, runner arch, actual target triple,
@@ -300,6 +341,15 @@ jobs:
       - name: Check dispatch manifest claims have proving counters
         run: python3 scripts/check_dispatch_manifest.py
 
+      # Commands written into scripts and runbooks are never executed, so a
+      # renamed feature or a deleted binary rots there indefinitely and only
+      # surfaces when someone copies the line and blames their environment.
+      - name: Check documented command lint can still detect (self-test)
+        run: python3 scripts/check_documented_commands.py --self-test
+
+      - name: Check documented cargo commands still resolve
+        run: python3 scripts/check_documented_commands.py
+
       - name: Check feature-gated fast paths have fallback coverage
         run: python3 scripts/check_feature_gate_coverage.py
 
@@ -308,6 +358,30 @@ jobs:
       # went months that way (#678). This makes the gap a CI failure.
       - name: Check documented environment variables are implemented
         run: python3 .github/scripts/verify_documented_env_vars.py
+
+      # A `#[test]` added to a CUDA target without an ignore runs on every
+      # machine that has no GPU. The authoritative check for this is
+      # verify_cuda_test_honesty.py, but it needs two full CUDA test builds and
+      # so runs only on the CUDA lane -- which means an author learns about it
+      # after merge, and only if that lane is green enough to be believed. It
+      # was not: five such tests landed in three days (#1875, #1881, #1911,
+      # #1909), each one reported by a lane already red for another reason.
+      # This is the same rule read off the source in under a second, with no
+      # CUDA toolchain, so every pull request gets the signal. It supplements
+      # the inventory check and does not replace it -- it cannot see
+      # macro-expanded tests, nor inventory parity between feature configs.
+      #
+      # The scan covers both halves of the class. The half above is loud: the
+      # test runs and the lane reds. The other half is silent -- a `cfg` on
+      # `gpu-tests` (on the test, on its `mod`, on the whole target, or as
+      # manifest `required-features`) deletes the test from the base-config
+      # inventory, so the lane is green because the tests are not there. #1927
+      # lost thirteen that way and nothing reported it.
+      - name: Check CUDA test source scan can still detect (self-test)
+        run: python3 .github/scripts/verify_cuda_test_honesty.py --self-test
+
+      - name: Check CUDA tests are ignored, not deleted by a cfg
+        run: python3 .github/scripts/verify_cuda_test_honesty.py --source-scan
 
       # Rust warnings are errors: clippy is blocking for every pure/offline crate.
       # To add a crate, first confirm its normal+dev dependency tree contains no
@@ -337,7 +411,7 @@ jobs:
           -p onnx-genai-preprocess
           -p onnx-std
           -p onnx-genai-router
-          -p onnx-runtime-memory -p onnx-runtime-virtual-memory -p onnx-runtime-memory-governor -p onnx-runtime-cuda-memory
+          -p onnx-runtime-memory -p onnx-runtime-virtual-memory -p onnx-runtime-memory-api -p onnx-runtime-memory-governor -p onnx-runtime-cuda-memory
           -p onnx-runtime-cpuinfo
           -p onnx-runtime-eager
           -p onnx-runtime-capi
@@ -346,13 +420,20 @@ jobs:
           -p onnx-std-python
           -- -D warnings
 
+      # Wrapped in `run_test_step` because the selector is a bare test NAME,
+      # which libtest does not police: an exact-name filter that matches nothing
+      # prints `ok. 0 passed` and exits 0. This step selects exactly one test,
+      # so a rename retires it silently. #2055.
       - name: Check CPU EP MLAS-only feature configuration
-        run: >-
-          cargo test --locked
-          -p onnx-runtime-ep-cpu
-          --no-default-features
-          --features mlas
-          optimization_registry_excludes_nchwc_without_cnn_ops
+        run: |
+          # shellcheck source=scripts/test_step.sh
+          . ./scripts/test_step.sh
+          run_test_step "MLAS-only feature configuration" \
+            cargo test --locked \
+            -p onnx-runtime-ep-cpu \
+            --no-default-features \
+            --features mlas \
+            optimization_registry_excludes_nchwc_without_cnn_ops
 
       # The MoE grouped driver hands several `*mut f32` out of one `&mut [f32]`
       # to `MlasGemmBatch`, and its bit-exactness falsifiers are the only thing
@@ -360,26 +441,38 @@ jobs:
       # the default feature set those tests compile the non-MLAS fallback, so
       # the path that actually ships was going untested.  This runs them against
       # the real MLAS batched GEMM.
+      # Guarded for the same reason (#2055), and this one matters most: the
+      # filter is a MODULE PATH, so moving or renaming the module -- not just a
+      # test -- empties it. Measured on this repo, `kernels::moe_renamed::`
+      # reports `ok. 0 passed` and exits 0.
       - name: CPU EP MoE tests against real MLAS
-        run: >-
-          cargo test --locked
-          -p onnx-runtime-ep-cpu
-          --no-default-features
-          --features mlas
-          kernels::moe::
+        run: |
+          # shellcheck source=scripts/test_step.sh
+          . ./scripts/test_step.sh
+          run_test_step "CPU EP MoE against real MLAS" \
+            cargo test --locked \
+            -p onnx-runtime-ep-cpu \
+            --no-default-features \
+            --features mlas \
+            kernels::moe::
 
       # QLinearMatMul requantizes inside MLAS through the same output processor
       # ORT uses, and the tests that pin that fused path bit-for-bit against the
       # scalar loop only exist under `--features mlas`.  Nothing else in the
       # pipeline runs them: the coverage lane builds this crate without MLAS and
       # the ORT lane tests the plugin crate, not these unit tests.
+      # Guarded for the same reason (#2055): module-path filter, and this is
+      # the only place the fused MLAS requantize path is tested at all.
       - name: CPU EP QLinearMatMul tests against real MLAS
-        run: >-
-          cargo test --locked
-          -p onnx-runtime-ep-cpu
-          --no-default-features
-          --features mlas
-          kernels::qlinear_matmul::
+        run: |
+          # shellcheck source=scripts/test_step.sh
+          . ./scripts/test_step.sh
+          run_test_step "CPU EP QLinearMatMul against real MLAS" \
+            cargo test --locked \
+            -p onnx-runtime-ep-cpu \
+            --no-default-features \
+            --features mlas \
+            kernels::qlinear_matmul::
 
       # x86_64-apple-darwin changes target_arch but leaves target_os="macos",
       # so cfg(target_os) errors are invisible.  This step uses a genuine Linux
@@ -397,17 +490,83 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+      # The gate's submodule precondition, tested against fixture repository
+      # roots with cargo/rustup shimmed -- about a second, and it is the only
+      # thing that proves the check refuses BEFORE spending a clippy run rather
+      # than after one. One of its cells runs the gate against this checkout,
+      # so a precondition that started rejecting correct trees fails here
+      # instead of on every developer's box. #1816.
+      - name: Cross-compile gate preconditions (self-test)
+        run: |
+          shellcheck scripts/check_cross_compile.sh scripts/check_cross_compile_test.sh
+          bash scripts/check_cross_compile_test.sh
       - name: Cross-target compile check (catches os- and arch-gating errors)
         run: bash scripts/check_cross_compile.sh
+
+      # The merge gate is the one script whose failure mode is a green report:
+      # if it ever treats an absent required check as a passing one, nothing
+      # downstream notices, because the evidence it was supposed to collect is
+      # exactly what is missing. Its suite is hermetic (`gh` is shimmed), so it
+      # costs a second here and refuses to merge anything. #1966.
+      - name: Merge gate can still refuse (self-test)
+        run: |
+          shellcheck scripts/merge_when_green.sh scripts/merge_when_green_test.sh
+          bash scripts/merge_when_green_test.sh
+
+      # The Miri lane and the three MLAS steps above select tests by name, and
+      # libtest exits 0 on a filter that matches nothing -- so a renamed test
+      # turns its step into a no-op that reports `ok`. `run_miri` and
+      # `run_test_step` refuse that, and this suite is what proves they still
+      # refuse, including a negative control that reproduces the pre-guard
+      # behaviour. Hermetic (no cargo, no Miri), well under a second. Runs here
+      # rather than in miri.yml so it is covered by a required lane instead of
+      # by the lane it guards.
+      - name: Test step wrapper still refuses an empty filter (self-test)
+        run: |
+          shellcheck scripts/test_step.sh scripts/test_step_test.sh
+          bash scripts/test_step_test.sh
 
       # onnx-genai-engine's native decode path only compiles when this feature
       # is on. Without this step a refactor can leave it uncompilable while
       # every other job still passes -- which is exactly what happened when
       # native_decode.rs and engine.rs were split into module trees.
+      #
+      # onnx-genai-server was added after the same thing happened to it: a
+      # `#[cfg(feature = "native-backend")]` test in `onnx-genai-server/src/tests.rs`
+      # called `EngineDriver::generate` with the arity it had before a third
+      # parameter was added, and `main` sat uncompilable under this feature while
+      # Fast, Rust quality and every coverage lane stayed green (#1944). This
+      # step covered only the engine crate, so the one place that would have
+      # noticed did not look. The only job that did compile it is `CLI ORT`,
+      # which is slow and has been red for unrelated reasons.
       - name: Check the native backend compiles
         run: >-
           cargo clippy --locked --all-targets
-          -p onnx-genai-engine --features native-backend
+          -p onnx-genai-engine -p onnx-genai-server
+          --features onnx-genai-engine/native-backend,onnx-genai-server/native-backend
+          -- -D warnings
+
+      # The mirror image of the step above, and the other half of the same hole.
+      # That one turns the feature *on*, and it is the only `-D warnings` gate in
+      # this file that names these crates -- `Run clippy on all offline crates`
+      # cannot list them because they pull in `ort-sys`, and `CLI ORT`'s clippy
+      # steps name `onnx-genai-cli`, so `-D warnings` does not reach a dependency
+      # and dependencies do not build test targets anyway.
+      #
+      # So the *default* configuration of both crates was compiled by
+      # `Test ORT-backed workspace crates` and linted by nothing. Measured, not
+      # assumed: #1964 merged with `warning: function `test_session_decoder_runtime`
+      # is never used` in a green `CLI ORT` log. That warning was harmless; a real
+      # unused-code defect at default features has exactly the same signature and
+      # the same fate, in a log only read once something else has already failed.
+      #
+      # Most of this is cache-warm from the step above, which shares the whole
+      # dependency graph minus the feature. Both configurations are checked
+      # separately rather than as a union, because default is what ships.
+      - name: Check the default features compile clean
+        run: >-
+          cargo clippy --locked --all-targets
+          -p onnx-genai-engine -p onnx-genai-server
           -- -D warnings
 
       # No shipped artifact links MLAS: the wheel builds it only when someone
@@ -429,25 +588,34 @@ jobs:
         include:
           - name: Linux x86_64
             os: ubuntu-latest
+            require_placement: "1"
           - name: Windows x86_64
             os: windows-latest
+            require_placement: "1"
           - name: macOS arm64
             os: macos-latest
+            # macOS has no thread-to-core affinity API, so placement is
+            # unanswerable there by construction. Requiring it could only ever
+            # produce a false failure, which is why the guard asserts the
+            # affinity backend exists before asserting anything about cores.
+            require_placement: ""
     runs-on: ${{ matrix.os }}
     env:
       CARGO_TERM_COLOR: always
       RUSTFLAGS: "-D warnings"
+      NXRT_REQUIRE_PLACEMENT_TESTS: ${{ matrix.require_placement }}
 
     steps:
       - uses: actions/checkout@v5
         with:
           submodules: recursive
-      - name: Install Rust stable toolchain
+      - name: Install the pinned Rust toolchain
         id: rust-toolchain
         shell: bash
         run: |
-          rustup toolchain install stable --profile minimal --component clippy,rustfmt,llvm-tools-preview
-          rustup default stable
+          # The toolchain, and its components, come from rust-toolchain.toml so CI
+          # and contributors resolve the same rustc. See that file for why.
+          rustup toolchain install
           echo "version=$(rustc -Vv | sed -n 's/^release: //p')" >> "$GITHUB_OUTPUT"
       - name: Resolve cargo cache target
         id: cache-target
@@ -486,6 +654,11 @@ jobs:
           else
             cargo install cargo-llvm-cov --version "$CARGO_LLVM_COV_VERSION" --locked --force
           fi
+      # Same reason as the fast-linux lane: the MLAS-free gate reads the whole
+      # workspace resolve with `cargo metadata --offline`, so every package in
+      # the lockfile has to be present before the subset build starts.
+      - name: Fetch the locked dependency graph
+        run: cargo fetch --locked
       # Never replace these explicit packages with bare `cargo test` or
       # `--workspace`: that selects onnx-genai-ort-sys, whose build script
       # downloads a native ONNX Runtime distribution. The package list is
@@ -539,17 +712,21 @@ jobs:
       CARGO_TERM_COLOR: always
       RUSTFLAGS: "-D warnings"
       CMAKE_GENERATOR: "Visual Studio 17 2022"
+      # ARM64 Windows has the affinity backend, so the placement falsifiers are
+      # answerable here and their silence would be a defect, not a platform fact.
+      NXRT_REQUIRE_PLACEMENT_TESTS: "1"
 
     steps:
       - uses: actions/checkout@v5
         with:
           submodules: recursive
-      - name: Install Rust stable toolchain
+      - name: Install the pinned Rust toolchain
         id: rust-toolchain
         shell: bash
         run: |
-          rustup toolchain install stable --profile minimal --component clippy,rustfmt
-          rustup default stable
+          # The toolchain, and its components, come from rust-toolchain.toml so CI
+          # and contributors resolve the same rustc. See that file for why.
+          rustup toolchain install
           echo "version=$(rustc -Vv | sed -n 's/^release: //p')" >> "$GITHUB_OUTPUT"
       - name: Resolve cargo cache target
         id: cache-target
@@ -614,7 +791,7 @@ jobs:
           -p onnx-genai-preprocess
           -p onnx-std
           -p onnx-genai-router
-          -p onnx-runtime-memory -p onnx-runtime-virtual-memory -p onnx-runtime-memory-governor -p onnx-runtime-cuda-memory
+          -p onnx-runtime-memory -p onnx-runtime-virtual-memory -p onnx-runtime-memory-api -p onnx-runtime-memory-governor -p onnx-runtime-cuda-memory
           -p onnx-runtime-cpuinfo
           -p onnx-runtime-eager
           -p onnx-runtime-capi
@@ -636,12 +813,13 @@ jobs:
       - uses: actions/checkout@v5
         with:
           submodules: recursive
-      - name: Install Rust stable toolchain
+      - name: Install the pinned Rust toolchain
         id: rust-toolchain
         shell: bash
         run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
+          # The toolchain, and its components, come from rust-toolchain.toml so CI
+          # and contributors resolve the same rustc. See that file for why.
+          rustup toolchain install
           echo "version=$(rustc -Vv | sed -n 's/^release: //p')" >> "$GITHUB_OUTPUT"
       - name: Resolve cargo cache target
         id: cache-target
@@ -713,14 +891,17 @@ jobs:
       - uses: actions/checkout@v5
         with:
           submodules: recursive
-      # Keep CI on Rust stable deliberately: this follows Rust's stability promise
-      # without freezing security fixes; the cache key records the resolved rustc release.
-      - name: Install Rust stable toolchain
+      # The Rust toolchain is pinned in rust-toolchain.toml so a runner image
+      # rolling forward cannot turn `-D warnings` red with no commit to blame,
+      # and so a contributor sees the same lints CI does. The cache key still
+      # records the resolved rustc release. See rust-toolchain.toml for why.
+      - name: Install the pinned Rust toolchain
         id: rust-toolchain
         shell: bash
         run: |
-          rustup toolchain install stable --profile minimal --component clippy,rustfmt,llvm-tools-preview
-          rustup default stable
+          # The toolchain, and its components, come from rust-toolchain.toml so CI
+          # and contributors resolve the same rustc. See that file for why.
+          rustup toolchain install
           echo "version=$(rustc -Vv | sed -n 's/^release: //p')" >> "$GITHUB_OUTPUT"
       # actions/cache is GitHub-owned, so it is acceptable where personally-owned
       # cargo cache actions are not. Include OS, runner arch, actual target triple,
@@ -795,15 +976,28 @@ jobs:
       # These crates depend on the downloaded ONNX Runtime distribution above.
       # The set is still derived from the workspace inventory, not hand-copied
       # here; adding a new ORT-backed crate means classifying it in the script.
+      # Serialize because several integration tests temporarily select sessions
+      # through process-wide environment variables.
       - name: Test ORT-backed workspace crates
         run: >-
           cargo test --locked
           $(python .github/scripts/workspace_test_packages.py cargo-args ort-backed)
+          -- --test-threads=1
+      - name: Execute checked-in Mobius workflow packages
+        env:
+          MOBIUS_WORKFLOW_CONFORMANCE_DIR: ${{ github.workspace }}/tests/fixtures/onnx_genai_workflows
+        run: >-
+          cargo test --locked -p onnx-genai-engine
+          --test onnx_genai_workflow_conformance
       # `native-backend` is CPU-runnable: it selects the native CPU EP/session
       # crates, while CUDA-only engine integration tests are behind
-      # required-features = ["cuda", "native-backend"] and are not selected here.
+      # required-features = ["native-cuda"] and are not selected here.
+      # Serialize these tests because native session selection uses process-wide
+      # environment overrides; parallel execution can interfere across tests.
       - name: Test onnx-genai-engine native backend
-        run: cargo test --locked -p onnx-genai-engine --features native-backend
+        run: >-
+          cargo test --locked -p onnx-genai-engine --features native-backend
+          -- --test-threads=1
       # `!cancelled()` rather than the implicit `success()`: this is the only
       # job that sets `NXRT_REQUIRE_ORT_TESTS=1` with ORT present, so it is the
       # only place the EP-assignment falsifiers run fail-closed rather than
@@ -842,6 +1036,27 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
       - name: Clippy onnx-genai-cli
         run: cargo clippy --locked -p onnx-genai-cli --all-targets -- -D warnings
+      # The step above builds these crates with their *default* features, under
+      # which every `#[cfg(feature = "native-cuda")]` block evaluates to false
+      # and is therefore never parsed as code -- it cannot be type-checked or
+      # linted, so a defect there is invisible rather than red. #1632 closed
+      # that hole for `onnx-genai-engine` on the CUDA job; these two crates
+      # could not go there because both link the downloaded ONNX Runtime, which
+      # that job deliberately excludes. This is their home instead.
+      #
+      # A separate step rather than adding the feature to the one above: the
+      # default configuration is what ships, so it must keep being checked on
+      # its own rather than being replaced by a union of both.
+      #
+      # `onnx-genai-cli/native-cuda` pulls in `onnx-genai-server/native-cuda`
+      # transitively, but `-D warnings` is only enforced for packages named
+      # with `-p`, so the server is listed explicitly.
+      - name: Clippy onnx-genai-cli and onnx-genai-server with native CUDA
+        run: >-
+          cargo clippy --locked
+          -p onnx-genai-cli -p onnx-genai-server
+          --features onnx-genai-cli/native-cuda,onnx-genai-server/native-cuda
+          --all-targets -- -D warnings
 
   cuda-compile-linux:
     name: CUDA compile (Linux x86_64)
@@ -855,14 +1070,17 @@ jobs:
       - uses: actions/checkout@v5
         with:
           submodules: recursive
-      # Keep CI on Rust stable deliberately: this follows Rust's stability promise
-      # without freezing security fixes; the cache key records the resolved rustc release.
-      - name: Install Rust stable toolchain
+      # The Rust toolchain is pinned in rust-toolchain.toml so a runner image
+      # rolling forward cannot turn `-D warnings` red with no commit to blame,
+      # and so a contributor sees the same lints CI does. The cache key still
+      # records the resolved rustc release. See rust-toolchain.toml for why.
+      - name: Install the pinned Rust toolchain
         id: rust-toolchain
         shell: bash
         run: |
-          rustup toolchain install stable --profile minimal --component clippy,rustfmt
-          rustup default stable
+          # The toolchain, and its components, come from rust-toolchain.toml so CI
+          # and contributors resolve the same rustc. See that file for why.
+          rustup toolchain install
           echo "version=$(rustc -Vv | sed -n 's/^release: //p')" >> "$GITHUB_OUTPUT"
       # actions/cache is GitHub-owned, so it is acceptable where personally-owned
       # cargo cache actions are not. Include OS, runner arch, actual target triple,
@@ -917,8 +1135,58 @@ jobs:
       - name: Verify int4 MatMulNBits numerics oracle
         run: cargo test --locked -p onnx-runtime-ep-cuda --features cuda --test matmul_nbits_marlin_oracle
 
+      # The safe-point rejection rules are pure predicate logic over
+      # ResizeSafePoint (no device). Same situation as the two targets above:
+      # the honesty checker deliberately does not police a non-_gpu target, and
+      # workspace_test_packages.py deny-lists this crate from every offline
+      # lane, so without this step the target would be compiled and never run
+      # (#1875).
+      - name: Verify granule transition safe-point rules
+        run: cargo test --locked -p onnx-runtime-ep-cuda --features cuda --test content_preserving_transition
+
+      # Non-`_gpu` targets in this crate run in no other lane: the honesty
+      # script skips them and workspace_test_packages.py deny-lists the crate
+      # from the offline lanes. Without this step the relocated CPU-only tests
+      # would compile and never execute, which is the failure they were moved
+      # out of `_gpu` targets to avoid.
+      - name: Verify expert route telemetry CPU oracle
+        run: cargo test --locked -p onnx-runtime-ep-cuda --features cuda --test expert_route_telemetry_probe
+
+      # `--all-targets` and `gpu-tests` are both load-bearing. Without them
+      # clippy sees only the library's non-test code: every `#[cfg(test)]`
+      # module and all 58 `*_gpu.rs` targets go unlinted, and a lint error can
+      # sit on `main` indefinitely because no job ever parses those blocks. One
+      # did -- an `approx_constant` error in `optimizer.rs`'s test module,
+      # invisible to this step for as long as it omitted the flags.
+      #
+      # This costs an extra pass: clippy-driver caches separately from `cargo
+      # test`, so the honesty check's `cuda,gpu-tests` build above is not
+      # reused for this crate (its dependency builds are). The Windows CUDA
+      # lane deliberately keeps the narrower invocation -- it does not build
+      # the gpu-tests binaries at all, so the same change there would be a
+      # full extra build for lints this Linux step already covers.
       - name: Clippy CUDA execution provider
-        run: cargo clippy -p onnx-runtime-ep-cuda --features cuda -- -D warnings
+        run: >-
+          cargo clippy -p onnx-runtime-ep-cuda
+          --all-targets --features cuda,gpu-tests -- -D warnings
+      # (it appeared in ci.yml only inside a comment). That left ~167 cfg sites
+      # -- native_decode/{mod,load,cuda,tensor}.rs, memory_authority.rs,
+      # pipeline/* -- never type-checked, linted, or tested, so a change could
+      # break or orphan any of them with every check still green. `main` in fact
+      # already carried a `-D dead-code` violation there, found only by running
+      # this command by hand (#1631).
+      #
+      # Check-only, like the step above: CUDA is dynamically loaded, so no GPU
+      # and no CUDA toolkit are required. `--all-targets` matters -- the defect
+      # this caught is invisible to `--lib` alone, because the accessor's only
+      # caller lives in a `#[cfg(test)]` module.
+      - name: Clippy engine native-CUDA integration
+        run: >-
+          cargo clippy --locked
+          -p onnx-genai-engine
+          --features native-cuda
+          --all-targets
+          -- -D warnings
 
   cuda-compile-windows:
     name: CUDA compile (Windows x86_64)
@@ -932,14 +1200,17 @@ jobs:
       - uses: actions/checkout@v5
         with:
           submodules: recursive
-      # Keep CI on Rust stable deliberately: this follows Rust's stability promise
-      # without freezing security fixes; the cache key records the resolved rustc release.
-      - name: Install Rust stable toolchain
+      # The Rust toolchain is pinned in rust-toolchain.toml so a runner image
+      # rolling forward cannot turn `-D warnings` red with no commit to blame,
+      # and so a contributor sees the same lints CI does. The cache key still
+      # records the resolved rustc release. See rust-toolchain.toml for why.
+      - name: Install the pinned Rust toolchain
         id: rust-toolchain
         shell: bash
         run: |
-          rustup toolchain install stable --profile minimal --component clippy,rustfmt
-          rustup default stable
+          # The toolchain, and its components, come from rust-toolchain.toml so CI
+          # and contributors resolve the same rustc. See that file for why.
+          rustup toolchain install
           echo "version=$(rustc -Vv | sed -n 's/^release: //p')" >> "$GITHUB_OUTPUT"
       # actions/cache is GitHub-owned, so it is acceptable where personally-owned
       # cargo cache actions are not. Include OS, runner arch, actual target triple,

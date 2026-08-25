@@ -35,31 +35,32 @@ compile_error!(
 pub mod allocator;
 pub mod binding;
 pub mod chat_template;
-pub mod component;
 #[cfg(feature = "cuda")]
 pub mod cuda_rt;
 pub mod decode;
 pub mod decode_contract;
 #[cfg(feature = "cuda")]
-pub(crate) mod device_sampler;
+pub mod device_sampler;
 pub mod eagle3;
 pub mod env;
 pub mod error;
 pub mod governed_allocator;
 pub mod io_roles;
 pub mod loader;
+#[cfg(feature = "cuda")]
+mod managed_cuda_allocator;
 pub mod mtp;
 mod pipeline_admission;
 pub mod profile;
+pub mod runtime_capability;
 pub mod session;
-pub mod shared_kv_proposer;
+pub mod thread_affinity;
 pub mod tokenizer;
 pub mod value;
 
 pub use allocator::{Allocator, AllocatorType, MemoryInfo, MemoryType};
 pub use binding::IoBinding;
 pub use chat_template::{ChatMessage, ChatRole, ChatTemplate};
-pub use component::{OrtComponentSession, OrtComponentSessionRef};
 pub use decode::{
     BatchStepLogits, BatchedDecodeSession, BatchedSharedBufferDecodeSession,
     BatchedStaticCacheDecodeSession, DecodeKvMode, DecodeSession, DecodeSessionOptions,
@@ -78,11 +79,10 @@ pub use loader::{
     graph_io_from_model_path, graph_io_from_model_path_for_kv_pairs,
     graph_io_from_model_path_for_names, model_weight_bytes,
 };
+#[cfg(feature = "cuda")]
+pub use managed_cuda_allocator::{ManagedCudaAllocatorConfig, ManagedCudaAllocatorStats};
 pub use mtp::{
     MtpDecodeOptions, MtpDecodeSession, MtpDraftKvMode, MtpHeadSignature, MtpStepOutput,
-};
-pub use onnx_genai_metadata::{
-    ComponentDataType, ComponentError, ComponentIo, ComponentSession, ComponentTensor,
 };
 pub use onnx_genai_metadata::{
     ProposalType, SpeculatorConfig, SpeculatorConfigSource, SpeculatorDescriptor,
@@ -91,15 +91,12 @@ pub use onnx_genai_metadata::{
 pub use onnx_genai_runtime_config::EpSelection;
 pub use onnx_model_package::SelectionRequest as ModelPackageSelection;
 pub use session::{
-    CudaAttentionMode, EpCapabilities, ExecutionProviderStatus, GraphIo, GraphIoMetadata,
-    HardwareKind, ResolvedEp, RunPhaseError, Session, SessionOptions, SkippedExecutionProvider,
-    TensorInfo, USE_ENV_ALLOCATORS, available_execution_providers, capability, ep_selection,
-    resolve_execution_provider, selectable_execution_providers,
+    ConcurrentRunSupport, CudaAttentionMode, EpCapabilities, ExecutionProviderStatus, GraphIo,
+    GraphIoMetadata, HardwareKind, ResolvedEp, RunPhaseError, Session, SessionOptions,
+    SkippedExecutionProvider, TensorInfo, USE_ENV_ALLOCATORS, available_execution_providers,
+    capability, ep_selection, resolve_execution_provider, selectable_execution_providers,
 };
-pub use shared_kv_proposer::{
-    SharedKvInput, SharedKvProposerSession, SharedKvProposerSignature, SharedKvProposerStepOutput,
-    SharedKvSpec,
-};
+pub use thread_affinity::{OwnerThread, ThreadAccess, ThreadAffinity, ThreadAffinityError};
 pub use tokenizer::Tokenizer;
 pub use value::{DataType, Value};
 

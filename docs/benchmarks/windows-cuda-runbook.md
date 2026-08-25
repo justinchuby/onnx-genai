@@ -114,7 +114,7 @@ Build the native profiler once (the `cuda` feature enables the CUDA EP; the
 default `cuda-13000` API-version feature is already on):
 
 ```powershell
-cargo build --release -p onnx-genai-bench --features bench-native,cuda --bin profile_native
+cargo build --release -p onnx-genai-bench --features native-cuda --bin profile_native
 ```
 
 Then, in the **same shell** as the §1 block, run one short decode. Validated
@@ -308,9 +308,65 @@ provider DLLs beside it) reachable via `ONNX_GENAI_ORT_LIB_DIR`, those provider
 DLLs + the CUDA/cuDNN wheels on `PATH`, and `ONNX_GENAI_EP_FALLBACK=1` if you
 want a visible CPU retry instead of a hard failure.
 
-> **Unverified:** an end-to-end ORT-CUDA run was **not** performed here (no
-> CUDA-enabled ORT is installed on this box). The claims above are code- and
-> artifact-verified; the actual ORT-CUDA execution is not.
+### 4b. The CUDA-enabled ORT on this box: the conda `onnxruntime-gpu` wheel
+
+**This machine already has one** — `onnxruntime_gpu-1.28.0`, the same version
+this repo pins — installed next to the CUDA wheels:
+
+```
+…\anaconda3\Lib\site-packages\onnxruntime\capi\
+    onnxruntime.dll                     (16.6 MB)
+    onnxruntime_providers_cuda.dll     (252.9 MB)
+    onnxruntime_providers_shared.dll
+    onnxruntime_providers_tensorrt.dll
+```
+
+Point `ONNX_GENAI_ORT_LIB_DIR` at that directory (and put it on `PATH` so the
+provider DLLs resolve). Measured, end to end:
+
+```powershell
+$sp = 'C:\Users\justinchu\AppData\Local\anaconda3\Lib\site-packages\nvidia'
+$cu = "$sp\cu13"
+$ortdir = 'C:\Users\justinchu\AppData\Local\anaconda3\Lib\site-packages\onnxruntime\capi'
+$env:CUDA_PATH = $cu; $env:CUDA_HOME = $cu
+$env:ONNX_GENAI_ORT_LIB_DIR = $ortdir
+$env:ONNX_GENAI_EP_FALLBACK = '1'
+$env:PATH = "$ortdir;$cu\bin\x86_64;$sp\cudnn\bin;" + $env:PATH
+
+profile_native --model <model-dir> --ep cuda --backend ort --steady `
+  --tokens 32 --warmups 0 --runs 1
+```
+
+```
+ort_available_execution_providers: ["TensorrtExecutionProvider", "CUDAExecutionProvider", "CPUExecutionProvider"]
+generated_text: ", I am a beginner in Python programming and I have a question about the `print` function. …"
+```
+
+**Both env vars are required, and they fail at different stages** — worth
+knowing, because the second failure looks like a model problem rather than a
+configuration one:
+
+1. Without `ONNX_GENAI_ORT_LIB_DIR`, `ort-sys` loads the CPU-only ORT it
+   downloaded into `target\` and the provider list is
+   `["AzureExecutionProvider", "CPUExecutionProvider"]` — no CUDA EP.
+2. With the lib dir set but **without** `ONNX_GENAI_EP_FALLBACK=1`, the CUDA EP
+   *is* present but session creation fails:
+   `This session contains graph nodes that are assigned to the default CPU EP,
+   but fallback to CPU EP has been explicitly disabled by the user.` Some nodes
+   legitimately have no CUDA kernel, so the fallback has to be allowed.
+
+> **Correction (measured).** An earlier revision of this runbook said an
+> end-to-end ORT-CUDA run was "not performed here (no CUDA-enabled ORT is
+> installed on this box)". That was wrong — the conda `onnxruntime-gpu` wheel
+> above was already present and works. The claim came from searching only
+> `target\` and the repo tree. The lesson is narrow but recurring: *"not
+> installed" concluded from a search that never covered the place it would
+> live is not a measurement.*
+
+This unblocks native-vs-ORT A/B on CUDA. Measured on `qwen05b-fresh`, 32 greedy
+tokens, the native CUDA arm and the ORT CUDA arm produce **identical token ids**
+(and both match the ORT CPU arm) — so a divergence in such an A/B is a real
+signal, not a harness artifact.
 
 ---
 
@@ -333,6 +389,48 @@ returned nothing after each). If a run hangs, stop it by its specific PID
 
 ---
 
+## 6b. Host memory: `WorkingSet64` is the wrong metric (measured)
+
+Weights are `mmap`ed from the external-data file (`weights.rs`), and on Windows
+**mapped file pages that have been touched count toward the process working
+set**. Every weight byte is touched once to upload it to the device, so the
+whole external-data file shows up in `WorkingSet64` — even though it is OS file
+cache, is reclaimable under pressure, and was never allocated by us.
+
+Comparing backends on `WorkingSet64` therefore produces a large, entirely
+artificial difference. Measured on HY-MT1.5-1.8B (3480 MB `model.onnx.data`),
+sampling both counters **in the same sample set** so the two describe the same
+instant:
+
+| backend | working set | working set — private | mapped file pages |
+| --- | --- | --- | --- |
+| native | 4681 MB | **1028 MB** | 3654 MB |
+| ort | 1243 MB | **1147 MB** | 96 MB |
+
+On `WorkingSet64` native looks like it uses 3.4 GB more host memory. On private
+working set — the memory the process actually allocated — native is **119 MB
+lower** than ORT. The difference is the `mmap`, and nothing else.
+
+Use the private counter when comparing host memory:
+
+```powershell
+$s = (Get-Counter -Counter @(
+        '\Process(profile_native)\Working Set',
+        '\Process(profile_native)\Working Set - Private')).CounterSamples
+```
+
+Two traps inside this trap:
+
+- **`PrivateMemorySize64` is not the answer.** It reports committed private
+  *virtual* memory including non-resident pages, so it can exceed the working
+  set (measured here: 13524 MB for ORT against a 1243 MB working set).
+  Subtracting it from the working set is meaningless.
+- **Take both counters in one `Get-Counter` call.** Tracking each metric's peak
+  independently pairs values from different instants and can yield a negative
+  "mapped" figure — which is how this was first mis-measured.
+
+---
+
 ## 7. Measured vs. inferred
 
 | Claim | Status |
@@ -352,4 +450,9 @@ returned nothing after each). If a run hangs, stop it by its specific PID
 | `--tokens` must exceed `--decode-skip` | **measured** (both fail and pass cases) |
 | Discovery snippet (`import nvidia …`) locates the DLLs/headers | **measured** (passed) |
 | `ort-prebuilt` ORT is CPU-only; `ort-sys` loads by absolute path | **measured** (artifact + code) |
+| conda `onnxruntime-gpu` 1.28.0 provides a working CUDA EP end to end (§4b) | **measured** (passed) |
+| ORT-CUDA needs *both* `ONNX_GENAI_ORT_LIB_DIR` and `ONNX_GENAI_EP_FALLBACK=1` | **measured** (each omission reproduced) |
+| `WorkingSet64` counts touched `mmap` weight pages; private working set is the metric for host memory (§6b) | **measured** (paired-instant counters, both backends) |
+| Native private working set is *lower* than ORT's on HY-MT1.5 (1028 vs 1147 MB) | **measured** (§6b) |
+| native-CUDA and ORT-CUDA agree token-for-token on `qwen05b-fresh` (32 greedy tokens) | **measured** (passed) |
 | End-to-end ORT-CUDA run | **not verified** (no CUDA-enabled ORT installed) |

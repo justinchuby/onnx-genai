@@ -1,1101 +1,388 @@
-//! Compatibility layer that converts a **ComfyUI API-format workflow JSON** into
-//! the native onnx-genai [`InferenceMetadata`] spec.
+//! One-way importer that lowers a **ComfyUI API-format workflow JSON** into the
+//! canonical onnx-genai `pipeline.workflow` inference metadata.
+//!
+//! # What this is
 //!
 //! ComfyUI is a node-graph UI for diffusion. Its *"Save (API Format)"* export is
 //! a flat map `{node_id: {"class_type": str, "inputs": {port: value | link}}}`
-//! where a value of the form `[src_id, slot]` is a *link* to another node's
-//! output.
+//! where a value of the form `[src_id, slot]` links to another node's output.
 //!
-//! This crate is the ComfyUI analog of [`onnx-genai-genai-config`]: it parses an
-//! external config and produces native [`InferenceMetadata`], carrying only the
-//! pipeline *topology + run parameters* — never weights. When the referenced
-//! model components already exist as ONNX graphs (`denoiser.onnx`, `vae.onnx`,
-//! `text_encoder.onnx`), the onnx-genai iterative pipeline can run the ComfyUI
-//! workflow directly, with no Python translation step. In other words the same
-//! config runs both in ComfyUI and here, as long as the model itself is ONNX.
+//! This crate is the ComfyUI analogue of [`onnx-genai-genai-config`]: it reads an
+//! external config and produces native [`InferenceMetadata`]. Import is
+//! **one-way**. There is no export direction and no runtime that consults the
+//! ComfyUI document again: once conversion succeeds, the emitted
+//! `pipeline.workflow` is the sole source of execution truth, exactly as it is
+//! for a package Mobius exported natively. A ComfyUI class name never reaches
+//! the runtime, and no execution path branches on one.
 //!
-//! The canonical text-to-image graph is *KSampler-centric* and maps directly
-//! onto onnx-genai's composite iterative pipeline:
+//! # What it emits
 //!
-//! ```text
-//! EmptyLatentImage ─► KSampler ─► VAEDecode ─► SaveImage
-//! CLIPTextEncode(+/-) ─┘  (positive / negative → CFG cond / uncond)
-//! CheckpointLoaderSimple ─► model / clip / vae
-//! ```
+//! The same canonical IR the checked Mobius diffusion packages carry
+//! (`tests/fixtures/onnx_genai_workflows/diffusion`,
+//! `.../diffusion_guided`): typed SSA inputs, components with explicit ports and
+//! versioned contracts, invocation state cells, and a `loop`/`invoke`/`emit`
+//! step tree. Guidance is two text-encoder invocations plus an
+//! `onnx-genai.guidance-combine` component; the solver is
+//! `onnx-genai.solver-step`; the seeded latent draw is `onnx-genai.counter-rng`.
+//! Nothing about the emitted document is ComfyUI-shaped.
 //!
-//! Only the core txt2img subset is modeled today; unsupported samplers or a
-//! missing sampler node raise a clear [`ComfyUiConfigError`] rather than
-//! silently producing wrong dynamics. This mirrors the reference Python
-//! translator in `mobius.integrations.onnx_genai.comfyui`.
+//! # Fail-closed conversion
+//!
+//! Conversion is structural. It walks backwards from the workflow's single image
+//! sink and must understand every node that can reach it. A class the importer
+//! does not model is [`ComfyUiConfigError::UnknownNode`], naming the node id, the
+//! class, and the remedy. Nodes that provably cannot reach the sink are reported
+//! in [`ConversionReport::ignored_nodes`] and skipped, which is the only case
+//! where skipping is sound.
+//!
+//! Nothing that changes the produced image is dropped quietly: a scheduler with
+//! no canonical contract, a chained ControlNet, a step-windowed ControlNet, a
+//! merged conditioning, a truncated CLIP, a patched denoiser, and a LoRA with no
+//! declared adapter contract are all errors with a specific remedy.
+//!
+//! # Weights
+//!
+//! Like the ComfyUI document itself, this crate carries topology and run
+//! parameters only. The ONNX components the emitted workflow invokes come from
+//! the package (Mobius's diffusion exporter writes exactly the layout in
+//! [`ComponentLayout`]); the importer names them and never creates them.
+
+mod graph;
+mod layout;
+mod lower;
+mod plan;
+mod recognize;
+
+#[cfg(test)]
+mod tests;
 
 use std::path::Path;
 
 use onnx_genai_metadata::InferenceMetadata;
-use serde_json::{Map, Value, json};
+use serde_json::Value;
 
-/// Default ONNX component filenames the emitted pipeline references.
-const DENOISER_FILENAME: &str = "denoiser.onnx";
-const VAE_FILENAME: &str = "vae.onnx";
-const TEXT_ENCODER_FILENAME: &str = "text_encoder.onnx";
+pub use graph::{ComfyGraph, Link, Node};
+pub use layout::ComponentLayout;
+pub use plan::{
+    Conditioning, ControlNet, Guidance, LatentSource, Lora, Prediction, Solver, Spacing,
+    WorkflowPlan, strength_to_start_step,
+};
+pub use recognize::recognize;
 
-/// Default denoiser I/O port names (match the Mobius exporter contract).
-const DENOISER_SAMPLE_INPUT: &str = "sample";
-const DENOISER_TIMESTEP_INPUT: &str = "timestep";
-const DENOISER_CONDITIONING_INPUT: &str = "encoder_hidden_states";
-const DENOISER_OUTPUT: &str = "noise_pred";
-const VAE_LATENT_INPUT: &str = "latent";
-const TEXT_ENCODER_OUTPUT: &str = "last_hidden_state";
-
-const MAX_TRACE_DEPTH: usize = 16;
-
-/// ComfyUI node `class_type`s the translator recognizes.
-const SAMPLER_NODES: &[&str] = &["KSampler", "KSamplerAdvanced"];
-const VAE_DECODE_NODES: &[&str] = &["VAEDecode", "VAEDecodeTiled"];
-const VAE_ENCODE_NODES: &[&str] = &["VAEEncode", "VAEEncodeTiled"];
-const INPAINT_NODES: &[&str] = &["VAEEncodeForInpaint", "InpaintModelConditioning"];
-const TEXT_ENCODE_NODES: &[&str] = &["CLIPTextEncode"];
-const LATENT_NODES: &[&str] = &["EmptyLatentImage", "EmptySD3LatentImage"];
-
-/// ComfyUI sigma spacings onnx-genai reproduces. `normal`/`simple`/`ddim_uniform`
-/// map to linspace; `karras`/`exponential` enable their schedules.
-const SUPPORTED_SPACINGS: &[&str] = &["normal", "simple", "ddim_uniform", "karras", "exponential"];
-
-/// Errors produced while parsing a ComfyUI workflow.
+/// Errors produced while reading or lowering a ComfyUI workflow.
+///
+/// Every variant that refuses a workflow names the node and how to fix it,
+/// because a converter that says only "unsupported" leaves the author guessing
+/// which of forty nodes was the problem.
 #[derive(Debug, thiserror::Error)]
 pub enum ComfyUiConfigError {
     /// The file could not be read.
     #[error("failed to read ComfyUI workflow: {0}")]
     Io(#[from] std::io::Error),
+
     /// The file was not valid JSON.
     #[error("failed to parse ComfyUI workflow JSON: {0}")]
     Parse(#[from] serde_json::Error),
-    /// The graph was structurally valid JSON but not a supported workflow.
-    #[error("unsupported ComfyUI workflow: {0}")]
-    Unsupported(String),
+
+    /// The document is not a ComfyUI API-format workflow at all.
+    #[error(
+        "not a ComfyUI API-format workflow: {detail}. \
+         How to fix: export the graph with ComfyUI's 'Save (API Format)' command; the UI's \
+         plain 'Save' writes a different document that carries layout instead of a node map"
+    )]
+    NotAWorkflow {
+        /// What was structurally wrong.
+        detail: String,
+    },
+
+    /// A link referenced a node that does not exist.
+    #[error(
+        "ComfyUI workflow links to node '{node}', which the document does not define. \
+         Why: a dangling link means the export is truncated or hand-edited, and the importer \
+         will not guess what the missing node computed. \
+         How to fix: re-export the workflow from ComfyUI"
+    )]
+    DanglingLink {
+        /// The referenced node id.
+        node: String,
+    },
+
+    /// No node consumes an image, so there is no output path to convert.
+    #[error(
+        "ComfyUI workflow has no image output node ({expected}). \
+         Why: conversion walks backwards from the saved image, because that is the only part \
+         of the graph that provably decides the result. \
+         How to fix: connect the VAE decode to a SaveImage node and re-export"
+    )]
+    NoOutputPath {
+        /// Sink classes that were looked for.
+        expected: String,
+    },
+
+    /// The topology admits more than one reading.
+    #[error("ambiguous ComfyUI topology: {detail}. How to fix: {remedy}")]
+    AmbiguousTopology {
+        /// What was ambiguous.
+        detail: String,
+        /// How to make the workflow unambiguous.
+        remedy: String,
+    },
+
+    /// A node on the output path carries a fact the canonical IR cannot state.
+    #[error("ComfyUI node {node} ({class}) cannot be represented: {detail}. How to fix: {remedy}")]
+    Unrepresentable {
+        /// Node id in the workflow document.
+        node: String,
+        /// ComfyUI `class_type`.
+        class: String,
+        /// What could not be represented.
+        detail: String,
+        /// How to change the workflow so it can be.
+        remedy: String,
+    },
+
+    /// A node class on the output path is not modeled by this importer.
+    #[error(
+        "ComfyUI node {node} has unsupported class '{class}'. \
+         Why: {remedy}. \
+         How to fix: conversion is fail-closed, so a node whose semantics the importer cannot \
+         state is refused rather than dropped. Replace it with a modeled class, remove it from \
+         the path that produces the saved image, or add support for it before importing"
+    )]
+    UnknownNode {
+        /// Node id in the workflow document.
+        node: String,
+        /// ComfyUI `class_type`.
+        class: String,
+        /// Why the node matters to the produced image.
+        remedy: String,
+    },
+
+    /// A recognized feature has no canonical representation yet.
+    #[error(
+        "ComfyUI workflow uses {feature}, which the canonical workflow contract does not carry: \
+         {detail}. How to fix: {remedy}"
+    )]
+    UnsupportedFeature {
+        /// Human-readable feature name.
+        feature: String,
+        /// Why it cannot be represented.
+        detail: String,
+        /// How to change the workflow or the package.
+        remedy: String,
+    },
+
+    /// The emitted document did not satisfy the metadata contract.
+    ///
+    /// This is an importer bug, not a user error, and it is surfaced rather than
+    /// swallowed so a malformed conversion can never reach a package directory.
+    #[error(
+        "the converted workflow is not valid inference metadata: {0}. \
+         Why: the importer validates everything it emits, so an invalid document is a defect \
+         in the converter rather than something a package should carry"
+    )]
+    InvalidMetadata(String),
 }
 
-/// Map a ComfyUI `sampler_name` to an onnx-genai scheduler `kind`.
-///
-/// Only samplers with an onnx-genai implementation are mapped; others are
-/// rejected until onnx-genai grows an equivalent scheduler.
-fn sampler_kind(sampler_name: &str) -> Result<&'static str, ComfyUiConfigError> {
-    Ok(match sampler_name {
-        "euler" => "euler",
-        "euler_ancestral" => "euler_ancestral",
-        "ddim" => "ddim",
-        "dpmpp_2m" | "dpm_2m" => "dpmpp_2m",
-        other => {
-            return Err(ComfyUiConfigError::Unsupported(format!(
-                "ComfyUI sampler {other:?} has no onnx-genai equivalent yet; supported: \
-                 ddim, dpmpp_2m, euler, euler_ancestral"
-            )));
-        }
-    })
+/// How strict a conversion should be, and what package facts it may rely on.
+#[derive(Debug, Clone, Default)]
+pub struct ConvertOptions {
+    /// Artifact layout of the package the emitted workflow will run against.
+    pub layout: ComponentLayout,
+    /// The package's own `adapters` block, required when the workflow selects
+    /// LoRAs.
+    ///
+    /// Adapter identity, target bindings, and base-model fingerprints live in
+    /// the ONNX package, not in a ComfyUI graph. The importer routes the
+    /// workflow's LoRA *selection* through the canonical adapter inputs and
+    /// checks it against this contract; it never fabricates a target manifest.
+    pub adapters: Option<Value>,
 }
 
-/// Diffusion noise-schedule parameters for an onnx-genai scheduler.
-///
-/// Mirrors `SchedulerConfig` in the reference Python translator. Defaults are
-/// the Stable Diffusion values.
+/// What a conversion recovered, for a caller that wants to report it.
 #[derive(Debug, Clone, PartialEq)]
-pub struct SchedulerConfig {
-    /// Scheduler algorithm (`ddpm`, `ddim`, `euler`, `euler_ancestral`,
-    /// `dpmpp_2m`, or `flow_matching`).
-    pub kind: String,
-    /// Training timesteps the schedule was defined over.
-    pub num_train_timesteps: usize,
-    /// Linear beta-schedule start.
-    pub beta_start: f64,
-    /// Linear beta-schedule end.
-    pub beta_end: f64,
-    /// Beta schedule shape (`scaled_linear` for Stable Diffusion).
-    pub beta_schedule: String,
-    /// Model output parameterization.
-    pub prediction_type: String,
-    /// Use the Karras sigma spacing.
-    pub use_karras_sigmas: bool,
-    /// Use the exponential sigma spacing.
-    pub use_exponential_sigmas: bool,
+pub struct ConversionReport {
+    /// The normalized, Comfy-free plan the metadata was lowered from.
+    pub plan: WorkflowPlan,
+    /// Nodes that cannot reach the image sink and were therefore not converted.
+    pub ignored_nodes: Vec<String>,
+    /// LoRA identities routed through the package's adapter contract.
+    pub adapters: Vec<String>,
 }
 
-impl SchedulerConfig {
-    /// Build a config for `kind` with Stable Diffusion schedule defaults.
-    pub fn new(kind: impl Into<String>) -> Self {
-        Self {
-            kind: kind.into(),
-            num_train_timesteps: 1000,
-            beta_start: 0.00085,
-            beta_end: 0.012,
-            beta_schedule: "scaled_linear".into(),
-            prediction_type: "epsilon".into(),
-            use_karras_sigmas: false,
-            use_exponential_sigmas: false,
-        }
-    }
-
-    fn to_metadata_value(&self) -> Value {
-        let mut meta = Map::new();
-        meta.insert("kind".into(), json!(self.kind));
-        meta.insert(
-            "num_train_timesteps".into(),
-            json!(self.num_train_timesteps),
-        );
-        meta.insert("beta_start".into(), json!(self.beta_start));
-        meta.insert("beta_end".into(), json!(self.beta_end));
-        meta.insert("beta_schedule".into(), json!(self.beta_schedule));
-        meta.insert("prediction_type".into(), json!(self.prediction_type));
-        if self.use_karras_sigmas {
-            meta.insert("use_karras_sigmas".into(), json!(true));
-        }
-        if self.use_exponential_sigmas {
-            meta.insert("use_exponential_sigmas".into(), json!(true));
-        }
-        Value::Object(meta)
-    }
-}
-
-/// Everything needed to run a translated ComfyUI txt2img workflow.
+/// Convert a parsed ComfyUI workflow document into canonical metadata.
 ///
-/// `metadata` is the native onnx-genai pipeline document (topology + scheduler +
-/// guidance). The remaining fields are the per-run inputs recovered from the
-/// graph so a caller (native runner or Python driver) can actually drive it.
-#[derive(Debug, Clone)]
-pub struct ComfyUiWorkflow {
-    /// Native pipeline metadata (topology + scheduler + guidance).
-    pub metadata: InferenceMetadata,
-    /// The same native pipeline metadata as raw JSON (`{"pipeline": {...}}`),
-    /// convenient for display/serialization since [`InferenceMetadata`] is
-    /// deserialize-only.
-    pub metadata_json: serde_json::Value,
-    /// Positive-conditioning prompt text, if recoverable.
-    pub prompt: Option<String>,
-    /// Negative-conditioning prompt text, if recoverable.
-    pub negative_prompt: Option<String>,
-    /// Latent width in pixels.
-    pub width: u32,
-    /// Latent height in pixels.
-    pub height: u32,
-    /// Number of images to generate.
-    pub batch_size: u32,
-    /// RNG seed.
-    pub seed: i64,
-    /// Number of denoise steps.
-    pub steps: u32,
-    /// Classifier-free guidance scale (1.0 disables CFG).
-    pub cfg: f64,
-    /// The raw ComfyUI `sampler_name`.
-    pub sampler_name: String,
-    /// The mapped onnx-genai scheduler kind.
-    pub scheduler_kind: String,
-    /// The raw ComfyUI `scheduler` spacing.
-    pub scheduler_spacing: String,
-    /// Referenced checkpoint / UNet filename, if recoverable.
-    pub checkpoint: Option<String>,
-    /// KSampler `denoise` strength (< 1.0 => partial img2img loop).
-    pub denoise: f64,
-    /// First step index for a partial denoise loop.
-    pub start_step: u32,
-    /// LoRA `(name, strength)` pairs along the model chain, in application order.
-    pub loras: Vec<(String, f64)>,
-    /// First ControlNet `(name, strength)`, retained for compatibility.
-    pub controlnet: Option<(String, f64)>,
-    /// ControlNets reachable from the sampler conditioning graph.
-    pub controlnets: Vec<ControlNet>,
-    /// Source image referenced by the sampler's VAE-encode path.
-    pub source_image: Option<String>,
-    /// Inpainting mask referenced by the sampler's latent path.
-    pub mask_image: Option<String>,
-}
+/// Returns the typed [`InferenceMetadata`], the JSON document it was parsed from
+/// (metadata itself is deserialize-only), and a [`ConversionReport`].
+pub fn convert(
+    workflow: &Value,
+    options: &ConvertOptions,
+) -> Result<(InferenceMetadata, Value, ConversionReport), ComfyUiConfigError> {
+    let graph = ComfyGraph::from_value(workflow)?;
+    let plan = recognize(&graph)?;
+    lower::supported_prediction(plan.prediction, plan.solver)?;
 
-/// One ControlNet application recovered from the conditioning graph.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ControlNet {
-    /// ControlNet checkpoint name from the loader node.
-    pub name: String,
-    /// Conditioning strength from the apply node. This is metadata only: mobius
-    /// fuses ControlNet strength at export (`checkpoint_export(controlnet=...)`),
-    /// so it is not fed as a runtime denoiser input.
-    pub strength: f64,
-    /// Hint image referenced by the apply node, when directly recoverable.
-    pub image: Option<String>,
-}
-
-/// Return the flat node map, tolerating a `{"prompt": {...}}` wrapper.
-fn nodes_of(workflow: &Value) -> Option<&Map<String, Value>> {
-    let obj = workflow.as_object()?;
-    if let Some(Value::Object(inner)) = obj.get("prompt") {
-        return Some(inner);
+    let adapters = resolve_adapters(&plan, options)?;
+    let mut lowering = lower::Lowering::new(&plan, &options.layout);
+    if let Some((_, max_adapters)) = adapters.as_ref() {
+        lowering.declare_adapter_selection(*max_adapters);
     }
-    Some(obj)
-}
+    let document = lowering.build(adapters.as_ref().map(|(value, _)| value))?;
 
-/// A `[src_id, slot]` link references another node's output.
-fn as_link(value: &Value) -> Option<&str> {
-    let arr = value.as_array()?;
-    if arr.len() == 2 && arr[0].is_string() && arr[1].is_i64() {
-        arr[0].as_str()
-    } else {
-        None
-    }
-}
+    // Through the shared entry point, not `serde` directly: a lowering that
+    // built its own document is exactly as capable of stamping a version it does
+    // not mean as a file on disk is.
+    let metadata: InferenceMetadata = onnx_genai_metadata::parse_metadata_json(&document)
+        .map_err(|error| ComfyUiConfigError::InvalidMetadata(error.to_string()))?;
+    onnx_genai_metadata::validate_metadata(&metadata)
+        .map_err(|errors| ComfyUiConfigError::InvalidMetadata(errors.join("; ")))?;
 
-/// Follow a `[src_id, slot]` link to the referenced node object.
-fn resolve<'a>(nodes: &'a Map<String, Value>, reference: Option<&Value>) -> Option<&'a Value> {
-    let src = as_link(reference?)?;
-    nodes.get(src).filter(|n| n.is_object())
-}
-
-fn node_class(node: &Value) -> Option<&str> {
-    node.get("class_type").and_then(Value::as_str)
-}
-
-fn node_inputs(node: &Value) -> Option<&Map<String, Value>> {
-    node.get("inputs").and_then(Value::as_object)
-}
-
-fn input<'a>(node: &'a Value, key: &str) -> Option<&'a Value> {
-    node_inputs(node)?.get(key)
-}
-
-fn link_slot(value: &Value) -> Option<usize> {
-    value
-        .as_array()
-        .filter(|link| link.len() == 2)?
-        .get(1)?
-        .as_u64()
-        .map(|slot| slot as usize)
-}
-
-fn load_image_name(nodes: &Map<String, Value>, reference: Option<&Value>) -> Option<String> {
-    let node = resolve(nodes, reference)?;
-    match node_class(node)? {
-        "LoadImage" | "LoadImageMask" => input(node, "image")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
-        _ => None,
-    }
-}
-
-fn follow_image_inputs(
-    nodes: &Map<String, Value>,
-    reference: Option<&Value>,
-) -> (Option<String>, Option<String>) {
-    let Some(node) = resolve(nodes, reference) else {
-        return (None, None);
+    let report = ConversionReport {
+        ignored_nodes: plan.ignored_nodes.clone(),
+        adapters: plan.loras.iter().map(|lora| lora.name.clone()).collect(),
+        plan,
     };
-    let class = node_class(node).unwrap_or_default();
-    if VAE_ENCODE_NODES.contains(&class) {
-        return (load_image_name(nodes, input(node, "pixels")), None);
+    Ok((metadata, document, report))
+}
+
+/// Convert a ComfyUI workflow from a JSON string.
+pub fn convert_str(
+    json: &str,
+    options: &ConvertOptions,
+) -> Result<(InferenceMetadata, Value, ConversionReport), ComfyUiConfigError> {
+    let workflow: Value = serde_json::from_str(json)?;
+    convert(&workflow, options)
+}
+
+/// Convert a ComfyUI workflow JSON file.
+pub fn convert_file(
+    path: impl AsRef<Path>,
+    options: &ConvertOptions,
+) -> Result<(InferenceMetadata, Value, ConversionReport), ComfyUiConfigError> {
+    let text = std::fs::read_to_string(path)?;
+    convert_str(&text, options)
+}
+
+/// Serialize a converted metadata document as the YAML a package carries.
+///
+/// Conversion is deterministic, so the same workflow and options always produce
+/// byte-identical YAML. That is what makes a checked-in golden document a real
+/// regression test rather than a snapshot that drifts.
+pub fn to_yaml(document: &Value) -> Result<String, ComfyUiConfigError> {
+    serde_yaml::to_string(document)
+        .map_err(|error| ComfyUiConfigError::InvalidMetadata(error.to_string()))
+}
+
+/// Resolve the workflow's LoRA selection against the package adapter contract.
+///
+/// Returns the adapter block to embed and the fixed selection width, or `None`
+/// when the workflow selects no LoRA at all.
+fn resolve_adapters(
+    plan: &WorkflowPlan,
+    options: &ConvertOptions,
+) -> Result<Option<(Value, usize)>, ComfyUiConfigError> {
+    if plan.loras.is_empty() {
+        return Ok(None);
     }
-    if INPAINT_NODES.contains(&class) {
-        let pixels = input(node, "pixels").or_else(|| input(node, "image"));
-        let mask = input(node, "mask");
-        return (
-            load_image_name(nodes, pixels),
-            load_image_name(nodes, mask).or_else(|| {
-                let source = pixels?;
-                (link_slot(mask?) == Some(1))
-                    .then(|| load_image_name(nodes, Some(source)))
-                    .flatten()
+    let Some(adapters) = options.adapters.as_ref() else {
+        return Err(ComfyUiConfigError::UnsupportedFeature {
+            feature: format!(
+                "{} LoRA selection(s) ({})",
+                plan.loras.len(),
+                plan.loras
+                    .iter()
+                    .map(|lora| lora.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            detail: "a ComfyUI graph names a LoRA file, but canonical adapter metadata needs the \
+                     artifact identity, its base-model fingerprint, and the exact ONNX \
+                     initializer each factor binds to. None of that exists in the workflow \
+                     document, and inventing it would produce a package that claims bindings it \
+                     cannot honor"
+                .to_owned(),
+            remedy: "pass the package's own `adapters` contract (the block its exporter wrote) \
+                     so the importer can route this selection through it, or remove the LoRA \
+                     loaders from the workflow"
+                .to_owned(),
+        });
+    };
+
+    let declared: Vec<String> = adapters
+        .get("artifacts")
+        .and_then(Value::as_object)
+        .map(|artifacts| artifacts.keys().cloned().collect())
+        .unwrap_or_default();
+    let mut missing = Vec::new();
+    for lora in &plan.loras {
+        if !declared
+            .iter()
+            .any(|name| adapter_matches(name, &lora.name))
+        {
+            missing.push(lora.name.clone());
+        }
+    }
+    if !missing.is_empty() {
+        return Err(ComfyUiConfigError::UnsupportedFeature {
+            feature: format!("LoRA selection of {}", missing.join(", ")),
+            detail: format!(
+                "the supplied adapter contract declares {}, so the workflow selects an adapter \
+                 the package cannot apply",
+                if declared.is_empty() {
+                    "no artifacts".to_owned()
+                } else {
+                    declared.join(", ")
+                }
+            ),
+            remedy: "declare the missing adapter in the package's `adapters.artifacts` block, or \
+                     remove the LoRA loader from the workflow"
+                .to_owned(),
+        });
+    }
+
+    let max_adapters = adapters
+        .get("selection")
+        .and_then(|selection| selection.get("max_adapters"))
+        .and_then(Value::as_u64)
+        .map(|value| value as usize)
+        .unwrap_or(plan.loras.len())
+        .max(plan.loras.len());
+
+    // The selection inputs are the canonical request-scoped adapter ABI, so the
+    // emitted contract must name the SSA values this importer declares.
+    let mut adapters = adapters.clone();
+    if let Some(object) = adapters.as_object_mut() {
+        object.insert(
+            "selection".to_owned(),
+            serde_json::json!({
+                "segments": "request.adapter_segments",
+                "adapter_counts": "request.adapter_counts",
+                "scales": "request.adapter_scales",
+                "max_adapters": max_adapters,
             }),
         );
+        object
+            .entry("application_capability")
+            .or_insert_with(|| Value::String("onnx-genai.adapters@1".to_owned()));
     }
-    (None, None)
+    Ok(Some((adapters, max_adapters)))
 }
 
-/// Find the single node of one of `class_types`; error if absent or ambiguous.
-fn find_single<'a>(
-    nodes: &'a Map<String, Value>,
-    class_types: &[&str],
-    what: &str,
-) -> Result<&'a Value, ComfyUiConfigError> {
-    let mut hits = nodes
-        .values()
-        .filter(|n| node_class(n).is_some_and(|c| class_types.contains(&c)));
-    let first = hits.next().ok_or_else(|| {
-        ComfyUiConfigError::Unsupported(format!(
-            "ComfyUI workflow has no {what} node ({}); this translator supports the core \
-             text-to-image (KSampler) graph",
-            class_types.join(" / ")
-        ))
-    })?;
-    if hits.next().is_some() {
-        return Err(ComfyUiConfigError::Unsupported(format!(
-            "ComfyUI workflow has multiple {what} nodes; only one is supported"
-        )));
-    }
-    Ok(first)
-}
-
-/// Resolve a KSampler conditioning link to its CLIPTextEncode prompt text.
-fn follow_prompt_text(
-    nodes: &Map<String, Value>,
-    reference: Option<&Value>,
-    depth: usize,
-) -> Option<String> {
-    if depth == 0 {
-        return None;
-    }
-    let slot = reference.and_then(link_slot).unwrap_or(0);
-    let node = resolve(nodes, reference)?;
-    if node_class(node).is_some_and(|c| TEXT_ENCODE_NODES.contains(&c)) {
-        return input(node, "text")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-    }
-    // Conditioning wrappers and ControlNetApply nodes preserve the prompt edge.
-    for key in if slot == 1 {
-        ["negative", "conditioning", "positive"]
-    } else {
-        ["positive", "conditioning", "negative"]
-    } {
-        let Some(inner) = input(node, key) else {
-            continue;
-        };
-        if as_link(inner).is_some()
-            && let Some(prompt) = follow_prompt_text(nodes, Some(inner), depth - 1)
-        {
-            return Some(prompt);
-        }
-    }
-    None
-}
-
-/// Resolve a KSampler latent link to `(width, height, batch_size)`.
-fn follow_dims(nodes: &Map<String, Value>, reference: Option<&Value>) -> (u32, u32, u32) {
-    if let Some(node) = resolve(nodes, reference)
-        && node_class(node).is_some_and(|c| LATENT_NODES.contains(&c))
-    {
-        let width = input(node, "width").and_then(Value::as_u64).unwrap_or(512) as u32;
-        let height = input(node, "height").and_then(Value::as_u64).unwrap_or(512) as u32;
-        let batch = input(node, "batch_size")
-            .and_then(Value::as_u64)
-            .unwrap_or(1)
-            .max(1) as u32;
-        return (width, height, batch);
-    }
-    (512, 512, 1)
-}
-
-/// Trace a KSampler.model link back to a checkpoint/UNet filename.
-fn trace_checkpoint(nodes: &Map<String, Value>, reference: Option<&Value>) -> Option<String> {
-    let mut reference = reference;
-    for _ in 0..MAX_TRACE_DEPTH {
-        let node = resolve(nodes, reference)?;
-        for key in ["ckpt_name", "unet_name", "model_name"] {
-            if let Some(name) = input(node, key).and_then(Value::as_str) {
-                return Some(name.to_owned());
-            }
-        }
-        reference = input(node, "model");
-        as_link(reference?)?;
-    }
-    None
-}
-
-/// Collect LoraLoader nodes along a KSampler.model chain, in application order.
-fn trace_loras(nodes: &Map<String, Value>, reference: Option<&Value>) -> Vec<(String, f64)> {
-    let mut loras = Vec::new();
-    let mut reference = reference;
-    for _ in 0..MAX_TRACE_DEPTH {
-        let Some(node) = resolve(nodes, reference) else {
-            break;
-        };
-        if node_class(node).is_some_and(|c| matches!(c, "LoraLoader" | "LoraLoaderModelOnly"))
-            && let Some(name) = input(node, "lora_name").and_then(Value::as_str)
-        {
-            let strength = input(node, "strength_model")
-                .or_else(|| input(node, "strength"))
-                .and_then(Value::as_f64)
-                .unwrap_or(1.0);
-            loras.push((name.to_owned(), strength));
-        }
-        reference = input(node, "model");
-        if reference.and_then(as_link).is_none() {
-            break;
-        }
-    }
-    loras.reverse(); // base checkpoint applies first
-    loras
-}
-
-fn trace_image_name(
-    nodes: &Map<String, Value>,
-    reference: Option<&Value>,
-    depth: usize,
-) -> Option<String> {
-    if depth == 0 {
-        return None;
-    }
-    let node = resolve(nodes, reference)?;
-    if let Some(name) = load_image_name(nodes, reference) {
-        return Some(name);
-    }
-    node_inputs(node)?
-        .values()
-        .find_map(|value| trace_image_name(nodes, Some(value), depth - 1))
-}
-
-fn trace_controlnets_from(
-    nodes: &Map<String, Value>,
-    reference: Option<&Value>,
-    depth: usize,
-    seen: &mut std::collections::HashSet<String>,
-    controlnets: &mut Vec<ControlNet>,
-) {
-    if depth == 0 {
-        return;
-    }
-    let Some(node_id) = reference.and_then(as_link) else {
-        return;
-    };
-    if !seen.insert(node_id.to_owned()) {
-        return;
-    }
-    let Some(node) = nodes.get(node_id) else {
-        return;
-    };
-    let class = node_class(node).unwrap_or_default();
-    if matches!(class, "ControlNetApply" | "ControlNetApplyAdvanced") {
-        for key in ["conditioning", "positive", "negative"] {
-            trace_controlnets_from(nodes, input(node, key), depth - 1, seen, controlnets);
-        }
-        let strength = input(node, "strength")
-            .and_then(Value::as_f64)
-            .unwrap_or(1.0);
-        let loader = resolve(nodes, input(node, "control_net"));
-        if let Some(loader) = loader
-            && node_class(loader)
-                .is_some_and(|c| matches!(c, "ControlNetLoader" | "DiffControlNetLoader"))
-            && let Some(name) = input(loader, "control_net_name").and_then(Value::as_str)
-        {
-            controlnets.push(ControlNet {
-                name: name.to_owned(),
-                strength,
-                image: trace_image_name(nodes, input(node, "image"), MAX_TRACE_DEPTH),
-            });
-        }
-        return;
-    }
-    if let Some(inputs) = node_inputs(node) {
-        for value in inputs.values().filter(|value| as_link(value).is_some()) {
-            trace_controlnets_from(nodes, Some(value), depth - 1, seen, controlnets);
-        }
-    }
-}
-
-fn trace_controlnets(
-    nodes: &Map<String, Value>,
-    positive: Option<&Value>,
-    negative: Option<&Value>,
-) -> Vec<ControlNet> {
-    let mut seen = std::collections::HashSet::new();
-    let mut controlnets = Vec::new();
-    trace_controlnets_from(
-        nodes,
-        positive,
-        MAX_TRACE_DEPTH,
-        &mut seen,
-        &mut controlnets,
-    );
-    trace_controlnets_from(
-        nodes,
-        negative,
-        MAX_TRACE_DEPTH,
-        &mut seen,
-        &mut controlnets,
-    );
-    controlnets
-}
-
-/// Build the native pipeline metadata document for a diffusion workflow.
+/// Whether a declared artifact key names the LoRA the workflow selected.
 ///
-/// Mirrors `build_diffusion_pipeline_metadata` in the reference Python module:
-/// the denoiser runs an iterative loop (`noise_pred -> sample` self-edge), the
-/// per-step timestep is injected into `timestep`, an optional text encoder runs
-/// `prompt_only` feeding conditioning, and an optional VAE runs `final_only`.
-#[allow(clippy::too_many_arguments)]
-fn build_pipeline_metadata(
-    num_steps: u32,
-    scheduler: &SchedulerConfig,
-    guidance_scale: Option<f64>,
-    start_step: Option<u32>,
-    has_text_encoder: bool,
-    has_vae: bool,
-) -> Result<Value, ComfyUiConfigError> {
-    if num_steps < 1 {
-        return Err(ComfyUiConfigError::Unsupported(
-            "num_steps must be >= 1".into(),
-        ));
-    }
-
-    let mut models = Map::new();
-    models.insert(
-        "denoiser".into(),
-        json!({ "filename": DENOISER_FILENAME, "type": "denoiser" }),
-    );
-
-    let mut dataflow = vec![json!({
-        "from": format!("denoiser.{DENOISER_OUTPUT}"),
-        "to": format!("denoiser.{DENOISER_SAMPLE_INPUT}"),
-    })];
-    let mut phases = Map::new();
-
-    if has_text_encoder {
-        models.insert(
-            "text_encoder".into(),
-            json!({ "filename": TEXT_ENCODER_FILENAME, "type": "encoder" }),
-        );
-        dataflow.push(json!({
-            "from": format!("text_encoder.{TEXT_ENCODER_OUTPUT}"),
-            "to": format!("denoiser.{DENOISER_CONDITIONING_INPUT}"),
-        }));
-        phases.insert("text_encoder".into(), json!({ "run_on": "prompt_only" }));
-    }
-
-    if has_vae {
-        models.insert(
-            "vae".into(),
-            json!({ "filename": VAE_FILENAME, "type": "vae" }),
-        );
-        dataflow.push(json!({
-            "from": format!("denoiser.{DENOISER_SAMPLE_INPUT}"),
-            "to": format!("vae.{VAE_LATENT_INPUT}"),
-        }));
-        phases.insert("vae".into(), json!({ "run_on": "final_only" }));
-    }
-
-    let mut strategy = Map::new();
-    strategy.insert("kind".into(), json!("iterative"));
-    strategy.insert("denoiser".into(), json!("denoiser"));
-    strategy.insert("num_steps".into(), json!(num_steps));
-    strategy.insert("timestep_input".into(), json!(DENOISER_TIMESTEP_INPUT));
-    strategy.insert("scheduler_config".into(), scheduler.to_metadata_value());
-    if let Some(scale) = guidance_scale {
-        strategy.insert("guidance_scale".into(), json!(scale));
-        if scale != 1.0 {
-            strategy.insert(
-                "cfg_conditioning_input".into(),
-                json!(DENOISER_CONDITIONING_INPUT),
-            );
-        }
-    }
-    if let Some(start) = start_step {
-        if start == 0 || start > num_steps {
-            return Err(ComfyUiConfigError::Unsupported(format!(
-                "start_step ({start}) must be in 1..={num_steps}"
-            )));
-        }
-        strategy.insert("start_step".into(), json!(start));
-    }
-
-    let mut pipeline = Map::new();
-    pipeline.insert("models".into(), Value::Object(models));
-    pipeline.insert("dataflow".into(), Value::Array(dataflow));
-    pipeline.insert("strategy".into(), Value::Object(strategy));
-    if !phases.is_empty() {
-        pipeline.insert("phases".into(), Value::Object(phases));
-    }
-
-    let root = json!({ "pipeline": Value::Object(pipeline) });
-    Ok(root)
-}
-
-/// Parse a ComfyUI API-format workflow (`serde_json::Value`) into a structured
-/// [`ComfyUiWorkflow`] carrying native metadata + run parameters.
-pub fn parse_workflow(workflow: &Value) -> Result<ComfyUiWorkflow, ComfyUiConfigError> {
-    let nodes = nodes_of(workflow).ok_or_else(|| {
-        ComfyUiConfigError::Unsupported("workflow is not a JSON object of nodes".into())
-    })?;
-
-    let sampler = find_single(nodes, SAMPLER_NODES, "sampler")?;
-
-    let steps = input(sampler, "steps")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| {
-            ComfyUiConfigError::Unsupported("ComfyUI sampler node is missing 'steps'".into())
-        })? as u32;
-    let cfg = input(sampler, "cfg").and_then(Value::as_f64).unwrap_or(1.0);
-    let sampler_name = input(sampler, "sampler_name")
-        .and_then(Value::as_str)
-        .unwrap_or("euler")
-        .to_owned();
-    let spacing = input(sampler, "scheduler")
-        .and_then(Value::as_str)
-        .unwrap_or("normal")
-        .to_owned();
-    let seed = input(sampler, "seed")
-        .or_else(|| input(sampler, "noise_seed"))
-        .and_then(Value::as_i64)
-        .unwrap_or(0);
-    let denoise = input(sampler, "denoise")
-        .and_then(Value::as_f64)
-        .unwrap_or(1.0);
-
-    let kind = sampler_kind(&sampler_name)?;
-    let known_spacing = SUPPORTED_SPACINGS.contains(&spacing.as_str());
-
-    let start_step = strength_to_start_step(denoise, steps);
-
-    let prompt = follow_prompt_text(nodes, input(sampler, "positive"), MAX_TRACE_DEPTH);
-    let negative_prompt = follow_prompt_text(nodes, input(sampler, "negative"), MAX_TRACE_DEPTH);
-    let (width, height, batch_size) = follow_dims(nodes, input(sampler, "latent_image"));
-    let checkpoint = trace_checkpoint(nodes, input(sampler, "model"));
-    let loras = trace_loras(nodes, input(sampler, "model"));
-    let controlnets = trace_controlnets(
-        nodes,
-        input(sampler, "positive"),
-        input(sampler, "negative"),
-    );
-    let controlnet = controlnets
-        .first()
-        .map(|controlnet| (controlnet.name.clone(), controlnet.strength));
-    let (source_image, mask_image) = follow_image_inputs(nodes, input(sampler, "latent_image"));
-
-    let has_text_encoder = nodes
-        .values()
-        .any(|n| node_class(n).is_some_and(|c| TEXT_ENCODE_NODES.contains(&c)));
-    let has_vae = nodes
-        .values()
-        .any(|n| node_class(n).is_some_and(|c| VAE_DECODE_NODES.contains(&c)));
-    let guidance = if cfg != 1.0 { Some(cfg) } else { None };
-
-    let scheduler = SchedulerConfig {
-        use_karras_sigmas: spacing == "karras",
-        use_exponential_sigmas: spacing == "exponential",
-        ..SchedulerConfig::new(kind)
+/// ComfyUI names a file (`detail.safetensors`); a package names an identity
+/// (`detail`). Matching the stem keeps both spellings working without letting an
+/// unrelated adapter match.
+fn adapter_matches(declared: &str, selected: &str) -> bool {
+    let stem = |value: &str| {
+        value
+            .rsplit('/')
+            .next()
+            .unwrap_or(value)
+            .trim_end_matches(".safetensors")
+            .trim_end_matches(".ckpt")
+            .trim_end_matches(".pt")
+            .to_owned()
     };
-    // Unknown spacings still parse; the runtime falls back to linspace. We keep
-    // the flag off so behavior is well-defined (parity with the Python warning).
-    let _ = known_spacing;
-
-    let metadata_json = build_pipeline_metadata(
-        steps,
-        &scheduler,
-        guidance,
-        if start_step > 0 {
-            Some(start_step)
-        } else {
-            None
-        },
-        has_text_encoder,
-        has_vae,
-    )?;
-    let metadata = serde_json::from_value(metadata_json.clone())?;
-
-    Ok(ComfyUiWorkflow {
-        metadata,
-        metadata_json,
-        prompt,
-        negative_prompt,
-        width,
-        height,
-        batch_size,
-        seed,
-        steps,
-        cfg,
-        sampler_name,
-        scheduler_kind: scheduler.kind,
-        scheduler_spacing: spacing,
-        checkpoint,
-        denoise,
-        start_step,
-        loras,
-        controlnet,
-        controlnets,
-        source_image,
-        mask_image,
-    })
-}
-
-/// Convert ComfyUI denoise strength to the first executed diffusion step.
-///
-/// This is `num_steps - round_ties_even(num_steps * strength)`, matching
-/// diffusers `get_timesteps`. Strength zero therefore executes no denoise steps.
-pub fn strength_to_start_step(strength: f64, num_steps: u32) -> u32 {
-    if num_steps == 0 {
-        return 0;
-    }
-    let strength = strength.clamp(0.0, 1.0);
-    let rounded = round_ties_even(num_steps as f64 * strength) as i64;
-    (num_steps as i64 - rounded).clamp(0, num_steps as i64) as u32
-}
-
-/// Parse a ComfyUI API-format workflow from a JSON string.
-pub fn parse_workflow_str(json: &str) -> Result<ComfyUiWorkflow, ComfyUiConfigError> {
-    let value: Value = serde_json::from_str(json)?;
-    parse_workflow(&value)
-}
-
-/// Load and parse a ComfyUI API-format workflow JSON file.
-pub fn parse_workflow_file(path: impl AsRef<Path>) -> Result<ComfyUiWorkflow, ComfyUiConfigError> {
-    let text = std::fs::read_to_string(path)?;
-    parse_workflow_str(&text)
-}
-
-/// Round half to even (banker's rounding), matching numpy `round`.
-fn round_ties_even(x: f64) -> f64 {
-    let rounded = x.round();
-    if (x - x.trunc()).abs() == 0.5 {
-        // Exactly halfway: round to the nearest even integer.
-        let floor = x.floor();
-        if (floor as i64) % 2 == 0 {
-            floor
-        } else {
-            floor + 1.0
-        }
-    } else {
-        rounded
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn txt2img_graph() -> Value {
-        json!({
-            "3": {
-                "class_type": "KSampler",
-                "inputs": {
-                    "seed": 42,
-                    "steps": 20,
-                    "cfg": 7.5,
-                    "sampler_name": "euler",
-                    "scheduler": "karras",
-                    "denoise": 1.0,
-                    "model": ["4", 0],
-                    "positive": ["6", 0],
-                    "negative": ["7", 0],
-                    "latent_image": ["5", 0]
-                }
-            },
-            "4": {
-                "class_type": "CheckpointLoaderSimple",
-                "inputs": {"ckpt_name": "sd15.safetensors"}
-            },
-            "5": {
-                "class_type": "EmptyLatentImage",
-                "inputs": {"width": 768, "height": 512, "batch_size": 2}
-            },
-            "6": {
-                "class_type": "CLIPTextEncode",
-                "inputs": {"text": "a fox", "clip": ["4", 1]}
-            },
-            "7": {
-                "class_type": "CLIPTextEncode",
-                "inputs": {"text": "blurry", "clip": ["4", 1]}
-            },
-            "8": {
-                "class_type": "VAEDecode",
-                "inputs": {"samples": ["3", 0], "vae": ["4", 2]}
-            },
-            "9": {
-                "class_type": "SaveImage",
-                "inputs": {"images": ["8", 0]}
-            }
-        })
-    }
-
-    #[test]
-    fn parses_core_txt2img() {
-        let workflow = parse_workflow(&txt2img_graph()).unwrap();
-        assert_eq!(workflow.prompt.as_deref(), Some("a fox"));
-        assert_eq!(workflow.negative_prompt.as_deref(), Some("blurry"));
-        assert_eq!(
-            (workflow.width, workflow.height, workflow.batch_size),
-            (768, 512, 2)
-        );
-        assert_eq!(workflow.seed, 42);
-        assert_eq!(workflow.steps, 20);
-        assert_eq!(workflow.cfg, 7.5);
-        assert_eq!(workflow.sampler_name, "euler");
-        assert_eq!(workflow.scheduler_kind, "euler");
-        assert_eq!(workflow.scheduler_spacing, "karras");
-        assert_eq!(workflow.checkpoint.as_deref(), Some("sd15.safetensors"));
-        assert_eq!(workflow.start_step, 0);
-    }
-
-    #[test]
-    fn builds_iterative_pipeline_metadata() {
-        let workflow = parse_workflow(&txt2img_graph()).unwrap();
-        let pipeline = workflow.metadata.pipeline.expect("pipeline present");
-        // Three components: denoiser, text_encoder, vae.
-        assert!(pipeline.models.contains_key("denoiser"));
-        assert!(pipeline.models.contains_key("text_encoder"));
-        assert!(pipeline.models.contains_key("vae"));
-        let strategy = &pipeline.strategy;
-        assert_eq!(strategy.num_steps, Some(20));
-        assert_eq!(strategy.denoiser.as_deref(), Some("denoiser"));
-        assert_eq!(strategy.timestep_input.as_deref(), Some("timestep"));
-        // CFG on (cfg=7.5 != 1.0).
-        assert_eq!(strategy.guidance_scale, Some(7.5));
-        assert_eq!(
-            strategy.cfg_conditioning_input.as_deref(),
-            Some("encoder_hidden_states")
-        );
-        // Karras spacing propagated to the scheduler config.
-        let scheduler = strategy.scheduler_config.as_ref().unwrap();
-        assert_eq!(scheduler.kind, "euler");
-        assert_eq!(scheduler.use_karras_sigmas, Some(true));
-        // Loop-carried self-edge is present.
-        assert!(
-            pipeline
-                .dataflow
-                .iter()
-                .any(|e| e.from == "denoiser.noise_pred" && e.to == "denoiser.sample")
-        );
-    }
-
-    #[test]
-    fn cfg_one_disables_guidance() {
-        let mut graph = txt2img_graph();
-        graph["3"]["inputs"]["cfg"] = json!(1.0);
-        let workflow = parse_workflow(&graph).unwrap();
-        let strategy = workflow.metadata.pipeline.unwrap().strategy;
-        assert_eq!(strategy.guidance_scale, None);
-        assert_eq!(strategy.cfg_conditioning_input, None);
-    }
-
-    #[test]
-    fn denoise_below_one_sets_start_step() {
-        let mut graph = txt2img_graph();
-        graph["3"]["inputs"]["denoise"] = json!(0.6);
-        let workflow = parse_workflow(&graph).unwrap();
-        // 20 - round(20*0.6) = 20 - 12 = 8.
-        assert_eq!(workflow.start_step, 8);
-        assert_eq!(
-            workflow.metadata.pipeline.unwrap().strategy.start_step,
-            Some(8)
-        );
-    }
-
-    #[test]
-    fn strength_mapping_matches_hand_computed_diffusers_steps() {
-        for (strength, steps, expected) in [
-            (0.0, 20, 20),
-            (0.1, 20, 18),
-            (0.5, 21, 11), // 10.5 ties to even -> 10
-            (0.6, 20, 8),
-            (1.0, 20, 0),
-        ] {
-            assert_eq!(
-                strength_to_start_step(strength, steps),
-                expected,
-                "strength={strength}, steps={steps}"
-            );
-        }
-    }
-
-    #[test]
-    fn detects_txt2img_img2img_and_inpainting_from_latent_graph() {
-        let txt2img = parse_workflow(&txt2img_graph()).unwrap();
-        assert_eq!((txt2img.source_image, txt2img.mask_image), (None, None));
-
-        let mut img2img_graph = txt2img_graph();
-        img2img_graph["3"]["inputs"]["latent_image"] = json!(["10", 0]);
-        img2img_graph["10"] = json!({
-            "class_type": "VAEEncode",
-            "inputs": {"pixels": ["11", 0], "vae": ["4", 2]}
-        });
-        img2img_graph["11"] = json!({"class_type": "LoadImage", "inputs": {"image": "source.png"}});
-        let img2img = parse_workflow(&img2img_graph).unwrap();
-        assert_eq!(img2img.source_image.as_deref(), Some("source.png"));
-        assert_eq!(img2img.mask_image, None);
-
-        let mut inpaint_graph = txt2img_graph();
-        inpaint_graph["3"]["inputs"]["latent_image"] = json!(["10", 0]);
-        inpaint_graph["10"] = json!({
-            "class_type": "VAEEncodeForInpaint",
-            "inputs": {
-                "pixels": ["11", 0],
-                "mask": ["12", 0],
-                "vae": ["4", 2]
-            }
-        });
-        inpaint_graph["11"] = json!({"class_type": "LoadImage", "inputs": {"image": "source.png"}});
-        inpaint_graph["12"] =
-            json!({"class_type": "LoadImageMask", "inputs": {"image": "mask.png"}});
-        let inpaint = parse_workflow(&inpaint_graph).unwrap();
-        assert_eq!(inpaint.source_image.as_deref(), Some("source.png"));
-        assert_eq!(inpaint.mask_image.as_deref(), Some("mask.png"));
-    }
-
-    #[test]
-    fn traces_loras_in_application_order() {
-        let mut graph = txt2img_graph();
-        // KSampler.model -> LoraLoader(b) -> LoraLoader(a) -> checkpoint.
-        graph["3"]["inputs"]["model"] = json!(["10", 0]);
-        graph["10"] = json!({
-            "class_type": "LoraLoader",
-            "inputs": {"lora_name": "b.safetensors", "strength_model": 0.5, "model": ["11", 0]}
-        });
-        graph["11"] = json!({
-            "class_type": "LoraLoader",
-            "inputs": {"lora_name": "a.safetensors", "strength_model": 0.8, "model": ["4", 0]}
-        });
-        let workflow = parse_workflow(&graph).unwrap();
-        assert_eq!(
-            workflow.loras,
-            vec![
-                ("a.safetensors".to_owned(), 0.8),
-                ("b.safetensors".to_owned(), 0.5),
-            ]
-        );
-        assert_eq!(workflow.checkpoint.as_deref(), Some("sd15.safetensors"));
-    }
-
-    #[test]
-    fn finds_controlnet() {
-        let mut graph = txt2img_graph();
-        graph["3"]["inputs"]["positive"] = json!(["20", 0]);
-        graph["20"] = json!({
-            "class_type": "ControlNetApply",
-            "inputs": {
-                "strength": 0.9,
-                "control_net": ["21", 0],
-                "conditioning": ["6", 0],
-                "image": ["22", 0]
-            }
-        });
-        graph["21"] = json!({
-            "class_type": "ControlNetLoader",
-            "inputs": {"control_net_name": "canny.safetensors"}
-        });
-        graph["22"] = json!({"class_type": "LoadImage", "inputs": {"image": "control.png"}});
-        let workflow = parse_workflow(&graph).unwrap();
-        assert_eq!(
-            workflow.controlnet,
-            Some(("canny.safetensors".to_owned(), 0.9))
-        );
-        assert_eq!(
-            workflow.controlnets,
-            vec![ControlNet {
-                name: "canny.safetensors".to_owned(),
-                strength: 0.9,
-                image: Some("control.png".to_owned()),
-            }]
-        );
-    }
-
-    #[test]
-    fn traces_multiple_controlnets_in_conditioning_order_without_negative_duplicates() {
-        let mut graph = txt2img_graph();
-        graph["3"]["inputs"]["positive"] = json!(["20", 0]);
-        graph["3"]["inputs"]["negative"] = json!(["20", 1]);
-        graph["20"] = json!({
-            "class_type": "ControlNetApplyAdvanced",
-            "inputs": {
-                "strength": 0.25,
-                "control_net": ["21", 0],
-                "positive": ["23", 0],
-                "negative": ["23", 1],
-                "image": ["22", 0]
-            }
-        });
-        graph["21"] = json!({
-            "class_type": "ControlNetLoader",
-            "inputs": {"control_net_name": "depth.safetensors"}
-        });
-        graph["22"] = json!({"class_type": "LoadImage", "inputs": {"image": "depth.png"}});
-        graph["23"] = json!({
-            "class_type": "ControlNetApplyAdvanced",
-            "inputs": {
-                "strength": 0.75,
-                "control_net": ["24", 0],
-                "positive": ["6", 0],
-                "negative": ["7", 0],
-                "image": ["25", 0]
-            }
-        });
-        graph["24"] = json!({
-            "class_type": "ControlNetLoader",
-            "inputs": {"control_net_name": "canny.safetensors"}
-        });
-        graph["25"] = json!({"class_type": "LoadImage", "inputs": {"image": "canny.png"}});
-
-        let workflow = parse_workflow(&graph).unwrap();
-        assert_eq!(
-            workflow.controlnets,
-            vec![
-                ControlNet {
-                    name: "canny.safetensors".to_owned(),
-                    strength: 0.75,
-                    image: Some("canny.png".to_owned()),
-                },
-                ControlNet {
-                    name: "depth.safetensors".to_owned(),
-                    strength: 0.25,
-                    image: Some("depth.png".to_owned()),
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn unwraps_prompt_wrapper() {
-        let graph = json!({ "prompt": txt2img_graph() });
-        let workflow = parse_workflow(&graph).unwrap();
-        assert_eq!(workflow.prompt.as_deref(), Some("a fox"));
-    }
-
-    #[test]
-    fn rejects_unknown_sampler() {
-        let mut graph = txt2img_graph();
-        graph["3"]["inputs"]["sampler_name"] = json!("dpm_adaptive");
-        let err = parse_workflow(&graph).unwrap_err();
-        assert!(matches!(err, ComfyUiConfigError::Unsupported(_)));
-    }
-
-    #[test]
-    fn rejects_missing_sampler() {
-        let graph = json!({
-            "1": {"class_type": "CLIPTextEncode", "inputs": {"text": "hi"}}
-        });
-        assert!(parse_workflow(&graph).is_err());
-    }
-
-    #[test]
-    fn defaults_dims_without_latent_node() {
-        let mut graph = txt2img_graph();
-        // Point latent_image at a non-latent node.
-        graph["3"]["inputs"]["latent_image"] = json!(["4", 0]);
-        let workflow = parse_workflow(&graph).unwrap();
-        assert_eq!(
-            (workflow.width, workflow.height, workflow.batch_size),
-            (512, 512, 1)
-        );
-    }
-
-    #[test]
-    fn no_vae_or_text_encoder_omits_components() {
-        let graph = json!({
-            "3": {
-                "class_type": "KSampler",
-                "inputs": {
-                    "seed": 0, "steps": 4, "cfg": 1.0, "sampler_name": "ddim",
-                    "scheduler": "normal", "model": ["4", 0], "latent_image": ["5", 0]
-                }
-            },
-            "4": {"class_type": "UNETLoader", "inputs": {"unet_name": "unet.onnx"}},
-            "5": {"class_type": "EmptyLatentImage", "inputs": {"width": 64, "height": 64}}
-        });
-        let workflow = parse_workflow(&graph).unwrap();
-        let pipeline = workflow.metadata.pipeline.unwrap();
-        assert!(pipeline.models.contains_key("denoiser"));
-        assert!(!pipeline.models.contains_key("vae"));
-        assert!(!pipeline.models.contains_key("text_encoder"));
-        assert_eq!(workflow.checkpoint.as_deref(), Some("unet.onnx"));
-    }
-
-    #[test]
-    fn emitted_metadata_passes_runtime_validator() {
-        use onnx_genai_metadata::validate_pipeline_spec;
-        let workflow = parse_workflow(&txt2img_graph()).unwrap();
-        let pipeline = workflow.metadata.pipeline.expect("pipeline present");
-        // The real "can we run it" gate: the runtime pipeline validator accepts
-        // the emitted spec (loop-carried denoiser self-edge, single producers,
-        // acyclic across components).
-        validate_pipeline_spec(&pipeline).expect("emitted pipeline must be runnable");
-    }
+    declared == selected || stem(declared) == stem(selected)
 }

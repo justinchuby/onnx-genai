@@ -26,10 +26,10 @@ pub struct SharedBufferBatchOptions {
 /// keeping the batch a fixed `batch_size` every step.
 pub struct BatchedSharedBufferDecodeSession<'a> {
     session: &'a Session,
-    binding: IoBinding,
+    binding: IoBinding<'a>,
     kv_pairs: Vec<KvPair>,
     kv_buffers: HashMap<String, Arc<Value>>,
-    kv_allocator: Option<crate::Allocator>,
+    kv_allocator: Option<crate::Allocator<'a>>,
     batch_size: usize,
     max_len: usize,
     row_lens: Vec<usize>,
@@ -42,7 +42,7 @@ pub struct BatchedSharedBufferDecodeSession<'a> {
 
 /// Resolved decode-step graph-port roles for a shared-buffer batched session.
 ///
-/// Every role is selected from explicit `model.io` metadata or an unambiguous
+/// Every role is selected from the package's declared port roles or an unambiguous
 /// tensor-shape signal; graph port names are never interpreted.
 #[derive(Debug)]
 struct SharedBufferRoles {
@@ -55,7 +55,7 @@ struct SharedBufferRoles {
 impl SharedBufferRoles {
     fn resolve(
         session: &Session,
-        io: Option<&onnx_genai_metadata::ModelIoSpec>,
+        io: Option<&onnx_genai_metadata::DecoderAbi>,
         kv_pairs: &[KvPair],
     ) -> Result<Self> {
         Self::resolve_from_ports(session.inputs(), session.outputs(), io, kv_pairs)
@@ -64,7 +64,7 @@ impl SharedBufferRoles {
     fn resolve_from_ports(
         inputs: &[TensorInfo],
         outputs: &[TensorInfo],
-        io: Option<&onnx_genai_metadata::ModelIoSpec>,
+        io: Option<&onnx_genai_metadata::DecoderAbi>,
         kv_pairs: &[KvPair],
     ) -> Result<Self> {
         use crate::io_roles::{
@@ -93,31 +93,34 @@ impl SharedBufferRoles {
         let never = |_: &TensorInfo| false;
         let token_input = resolve_input(
             io.and_then(|io| io.token_input.as_deref()),
-            "model.io.token_input",
+            "token_input",
             is_rank_one_or_two_sequence,
         )?
         .ok_or_else(|| {
             OrtError::InvalidArgument(
-                "cannot resolve token input from tensor shape; declare model.io.token_input".into(),
+                "cannot resolve token_input from tensor shape; give the port the token_ids role \
+                 in pipeline.workflow.components.<component>.ports.roles"
+                    .into(),
             )
         })?;
         // The attention mask is shape-ambiguous against other integer sequence
         // inputs, so it is only ever taken from explicit metadata.
         let attention_mask_input = resolve_input(
             io.and_then(|io| io.attention_mask_input.as_deref()),
-            "model.io.attention_mask_input",
+            "attention_mask_input",
             never,
         )?
         .ok_or_else(|| {
             OrtError::InvalidArgument(
-                "shared-buffer batching derives each row's KV length from an attention mask; \
-                 declare model.io.attention_mask_input"
+                "shared-buffer batching derives each row's KV length from an attention mask, so \
+                 attention_mask_input must resolve; give the port the attention_mask role in \
+                 pipeline.workflow.components.<component>.ports.roles"
                     .into(),
             )
         })?;
         let position_ids_input = resolve_input(
             io.and_then(|io| io.position_ids_input.as_deref()),
-            "model.io.position_ids_input",
+            "position_ids_input",
             never,
         )?;
         let present_excluded = kv_pairs
@@ -127,7 +130,7 @@ impl SharedBufferRoles {
         let logits_output = resolve_port(
             outputs,
             io.and_then(|io| io.logits_output.as_deref()),
-            "model.io.logits_output",
+            "logits_output",
             |tensor| {
                 !present_excluded.contains(tensor.name.as_str())
                     && is_rank_one_to_three_output(tensor)
@@ -137,7 +140,8 @@ impl SharedBufferRoles {
         .map(|port| port.name)
         .ok_or_else(|| {
             OrtError::InvalidArgument(
-                "cannot resolve logits output from tensor shape; declare model.io.logits_output"
+                "cannot resolve logits_output from tensor shape; give the port the logits role in \
+                 pipeline.workflow.components.<component>.ports.roles"
                     .into(),
             )
         })?;
@@ -156,18 +160,18 @@ impl<'a> BatchedSharedBufferDecodeSession<'a> {
     /// head_dim]` on the session's device allocator when available.
     ///
     /// Graph-port roles (token, attention-mask, position, logits) and the
-    /// past/present KV pairs are resolved from explicit `model.io` metadata or an
+    /// past/present KV pairs are resolved from the declared state group or an
     /// unambiguous tensor-shape signal; graph port names are never interpreted.
     pub fn new(session: &'a Session, options: SharedBufferBatchOptions) -> Result<Self> {
         Self::new_with_io(session, options, None)
     }
 
     /// Create a batched share-buffer decode session using declarative
-    /// `model.io` graph-port roles when present.
+    /// declared graph-port roles when present.
     pub fn new_with_io(
         session: &'a Session,
         options: SharedBufferBatchOptions,
-        io: Option<&onnx_genai_metadata::ModelIoSpec>,
+        io: Option<&onnx_genai_metadata::DecoderAbi>,
     ) -> Result<Self> {
         let batch_size = usize::try_from(options.batch_size).map_err(|_| {
             OrtError::InvalidArgument(format!(
@@ -189,7 +193,7 @@ impl<'a> BatchedSharedBufferDecodeSession<'a> {
         if kv_pairs.is_empty() {
             return Err(OrtError::InvalidArgument(
                 "shared-buffer batching requires declared past/present KV pairs; declare \
-                 model.io.kv_inputs and model.io.kv_outputs"
+                 kv_inputs and kv_outputs"
                     .into(),
             ));
         }
@@ -602,7 +606,7 @@ impl<'a> BatchedDecodeSession<'a> for BatchedSharedBufferDecodeSession<'a> {
 mod tests {
     use super::*;
     use crate::{DataType, TensorInfo};
-    use onnx_genai_metadata::ModelIoSpec;
+    use onnx_genai_metadata::DecoderAbi;
 
     fn tensor(name: &str, dtype: DataType, shape: &[i64]) -> TensorInfo {
         TensorInfo {
@@ -621,7 +625,7 @@ mod tests {
         }
     }
 
-    fn io_with_roles() -> ModelIoSpec {
+    fn io_with_roles() -> DecoderAbi {
         serde_json::from_str(
             r#"{
                 "token_input": "opaque_tokens",
@@ -678,7 +682,7 @@ mod tests {
         let error =
             SharedBufferRoles::resolve_from_ports(&inputs, &outputs, None, &pairs).unwrap_err();
         assert!(
-            format!("{error:?}").contains("model.io.attention_mask_input"),
+            format!("{error:?}").contains("attention_mask_input"),
             "{error:?}"
         );
     }
@@ -699,9 +703,6 @@ mod tests {
         let pairs = vec![kv_pair("kv.past", "kv.present")];
         let error =
             SharedBufferRoles::resolve_from_ports(&inputs, &outputs, None, &pairs).unwrap_err();
-        assert!(
-            format!("{error:?}").contains("model.io.token_input"),
-            "{error:?}"
-        );
+        assert!(format!("{error:?}").contains("token_input"), "{error:?}");
     }
 }

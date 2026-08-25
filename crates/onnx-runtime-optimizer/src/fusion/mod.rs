@@ -66,7 +66,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use onnx_runtime_ir::{Attribute, DataType, Graph, Node, NodeId, ValueId, WeightRef};
+use onnx_runtime_ir::{Attribute, DataType, Graph, Node, NodeId, TensorData, ValueId, WeightRef};
 
 use crate::error::Result;
 use crate::pass::{OptimizationPass, PassContext};
@@ -1169,9 +1169,11 @@ impl FusionPattern {
     /// * **X** is the (shared) `Sub` operand that is not `mean`; **Scale** the
     ///   `Mul` operand that is not the `Div` output; **B** the final `Add`
     ///   operand that is not the `Mul` output. Order-independent disambiguation.
-    /// * **axis** must resolve to a *single concrete* axis read from the first
-    ///   `ReduceMean`'s `axes` **attribute** (axes-as-input / multi-axis / absent
-    ///   → decline; never silently assume `-1`).
+    /// * **axis** must resolve to the *same single concrete* axis for BOTH the
+    ///   mean and the variance `ReduceMean`, read from each node's `axes`
+    ///   **attribute** (opset < 18) or its axes **input** (opset-24 schema), with
+    ///   `keepdims = 1` on both; multi-axis / absent / reduce-all / mismatched
+    ///   axes / `keepdims = 0` → decline; never silently assume `-1`.
     /// * **epsilon** must be readable as a concrete f32 scalar constant (else
     ///   decline; never silently assume `1e-5`).
     fn layernorm_spec(&self, graph: &Graph, m: &PatternMatch) -> Option<FusedNodeSpec> {
@@ -1242,20 +1244,45 @@ impl FusionPattern {
         let eps_val = add_eps.input_values().find(|&v| v != var)?;
         let epsilon = read_scalar_f32(graph, eps_val)?;
 
-        // axis guard: a single concrete axis from the ReduceMean `axes` ATTRIBUTE.
-        // Absent (axes-as-input at opset ≥ 18, or reduce-all) or multi-axis →
-        // decline rather than silently defaulting to `-1`.
-        let axes = rm1.attr("axes").and_then(Attribute::as_ints)?;
-        let [axis] = axes else {
+        // axis guard: BOTH `ReduceMean` nodes must reduce a single concrete axis
+        // read from the `axes` ATTRIBUTE (opset < 18) or, for the opset-24 schema,
+        // the axes INPUT; both must keep the reduced dim (`keepdims = 1`, or its
+        // default). The mean and variance reductions must be over the SAME axis,
+        // otherwise this is not a LayerNorm — decline (never silently assume -1).
+        let axis = reduce_single_axis(graph, rm1)?;
+        if reduce_single_axis(graph, rm2)? != axis {
             return None;
-        };
+        }
 
         let mut attributes = HashMap::new();
-        attributes.insert("axis".to_string(), Attribute::Int(*axis));
+        attributes.insert("axis".to_string(), Attribute::Int(axis));
         attributes.insert("epsilon".to_string(), Attribute::Float(epsilon));
 
         Some((vec![Some(x), Some(scale), Some(bias)], attributes))
     }
+}
+
+/// Resolve the single concrete reduction axis of a `ReduceMean`, requiring the
+/// reduced dimension to be kept (`keepdims = 1`, or absent → the schema default
+/// of 1). The axes come from the `axes` **attribute** (opset < 18) or the axes
+/// **input** (opset-24 schema). Multi-axis / absent / reduce-all / `keepdims = 0`
+/// → `None`.
+fn reduce_single_axis(graph: &Graph, rm: &Node) -> Option<i64> {
+    if let Some(keepdims) = rm.attr("keepdims").and_then(Attribute::as_int)
+        && keepdims != 1
+    {
+        return None;
+    }
+    let axes: Vec<i64> = if let Some(axes) = rm.attr("axes").and_then(Attribute::as_ints) {
+        axes.to_vec()
+    } else {
+        let axes_value = rm.inputs.get(1).copied().flatten()?;
+        read_i64_vector(graph, axes_value)?
+    };
+    let [axis] = axes.as_slice() else {
+        return None;
+    };
+    Some(*axis)
 }
 
 /// Read a scalar (or leading) f32 element from an inline float initializer, if
@@ -1267,6 +1294,54 @@ fn read_scalar_f32(graph: &Graph, value: ValueId) -> Option<f32> {
         }
         _ => None,
     }
+}
+
+/// Resolve a 1-D int64 `axes` vector for the value `value`. Supports an inline
+/// int64 initializer and a not-yet-folded standard-domain `Constant` producer
+/// (the fusion pass may run before `ConstantFolding` materializes it — see the
+/// module-level pass order), covering both the `value` tensor and the
+/// `value_ints` attribute spellings. Any malformed encoding (non-int64 dtype,
+/// non-whole int64 byte length, wrong rank, dims/data mismatch, or a
+/// non-standard-domain `Constant`) yields `None` so the caller declines rather
+/// than mis-reading the axes.
+fn read_i64_vector(graph: &Graph, value: ValueId) -> Option<Vec<i64>> {
+    if let Some(WeightRef::Inline(tensor)) = graph.initializers.get(&value) {
+        return i64_axes_from_tensor(tensor);
+    }
+    // A not-yet-folded `Constant` producer must be a standard-domain op.
+    let producer = graph.value(value).producer?;
+    let node = graph.node(producer);
+    if node.op_type != "Constant" || !(node.domain.is_empty() || node.domain == "ai.onnx") {
+        return None;
+    }
+    if let Some(Attribute::Tensor(tensor)) = node.attr("value") {
+        return i64_axes_from_tensor(tensor);
+    }
+    // `Constant(value_ints=...)` carries an inherently 1-D int64 list.
+    if let Some(ints) = node.attr("value_ints").and_then(Attribute::as_ints) {
+        return Some(ints.to_vec());
+    }
+    None
+}
+
+/// Decode a strictly 1-D int64 `axes` tensor. Rejects a non-int64 dtype, a byte
+/// length that is not a whole number of int64 elements, a rank other than 1, or
+/// dims inconsistent with the element count. A rank-0 scalar is intentionally
+/// declined: its raw-byte equivalence to a rank-1 `[axis]` is ambiguous, so the
+/// fusion declines rather than guess.
+fn i64_axes_from_tensor(tensor: &TensorData) -> Option<Vec<i64>> {
+    if tensor.dtype != DataType::Int64 || !tensor.data.len().is_multiple_of(8) {
+        return None;
+    }
+    let numel = tensor.data.len() / 8;
+    if tensor.dims.len() != 1 || tensor.dims[0] != numel {
+        return None;
+    }
+    tensor
+        .data
+        .chunks_exact(8)
+        .map(|chunk| Some(i64::from_le_bytes(chunk.try_into().ok()?)))
+        .collect()
 }
 
 /// The parsed pieces of a matched SDPA core (see

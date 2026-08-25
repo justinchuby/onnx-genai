@@ -739,7 +739,9 @@ full 128-bit sector — that is a from-scratch kernel, out of scope for this bou
 LOP3 (4×`lop3.b32` + debias) — that is *why* the ALU pipe is at 65%. The one remaining ALU lever is to
 **fold the per-block scale into the dequant's zp-subtract**: replace the plain `q=(code-zp)` then a
 separate `__hmul2(q, scale)` with a single `fma(code, scale, -zp*scale)`, dropping **4 `__hmul2` per 8
-weights** (~20% fewer fp16 ALU ops in the MAC). Env `ONNX_GENAI_GEMV_FOLDSCALE`.
+weights** (~20% fewer fp16 ALU ops in the MAC). Env `ONNX_GENAI_GEMV_FOLDSCALE` — **retracted**:
+the kernel this selected was deleted by #1527 after the win failed to reproduce, so the variable
+no longer exists and setting it does nothing. See the re-measurement in §9.3.
 
 | variant | tok/s | Δ | dominant-kernel µs | DRAM% |
 | --- | --- | --- | --- | --- |
@@ -765,10 +767,16 @@ relative check fails). Plain split-K passes that guard.
 - BUT the optimistic roofline (60–75 tok/s via split-K + cp.async) **over-estimated**: the kernel is
   **ALU-co-bound** (65% dequant pipe), not purely latency-bound, so split-K (NO-GO) and small-granularity
   cp.async (NO-GO, −13%) do not raise achieved DRAM. The dequant is **already** LOP3/Marlin-style.
-- **The only realized kernel-level lever is fold-scale (+2.7%)**, and it carries a per-element accuracy
-  cost (fails the asymmetric-zp parity guard at rel 0.104). It is shipped **opt-in, default OFF**
-  (`ONNX_GENAI_GEMV_FOLDSCALE=1`); production + CI stay on the exact plain split-K path. **Chew gates**
-  whether the +2.7% is worth flipping the default given the accuracy trade.
+- **The only realized kernel-level lever was fold-scale (+2.7%)**, and it carried a per-element accuracy
+  cost (fails the asymmetric-zp parity guard at rel 0.104), so it shipped opt-in, default OFF
+  (`ONNX_GENAI_GEMV_FOLDSCALE=1`) while production + CI stayed on the plain split-K path.
+  **This lever no longer exists.** Re-measured 2026-08-20 on the same instrument and the same
+  Muse-Glimmer-30B/A100 workload, enabling it *cost* 2.9% (28.62 -> 29.46 and 29.54 ms/token, two
+  independent repeats against a 28.62/28.62 baseline). The fold-scale kernel was a fork of
+  `matmul_nbits_gemv_f16_scales_f16_splitk_tpl` and did not inherit the improvements the plain
+  template picked up afterwards, so the copy rotted into a regression while nothing selected it by
+  default. Removed rather than re-tuned: the accuracy trade was never worth re-paying for a path
+  that had already lost its speed argument.
 - **Bigger single-GPU wins require a from-scratch Marlin-style int4 kernel** (16 B/`.cg` cp.async over a
   tiled weight relayout, so the async pipeline actually amortizes) — a multi-week rewrite, not a bounded
   lever. Beyond the kernel, the ~39% non-GEMV tail Amdahl-caps decode; the large multipliers
@@ -799,8 +807,9 @@ don't, given the current weight layout, so the only realized lever is the ALU-re
 which lands at the byte-fold caution level for a *different, benign* reason (Amdahl on a modest real
 kernel win), not a flat-token / serial-dispatch pathology.
 
-Repro: `matmul_nbits.rs` fold-scale entries `..._foldscale_splitk` / `..._foldscale_zp_splitk`, gated by
-`gemv_foldscale_enabled()`; A/B with `ONNX_GENAI_GEMV_FOLDSCALE=1` vs unset on
+Repro (historical; the entries and `gemv_foldscale_enabled()` were removed 2026-08-20 after the win
+failed to reproduce): fold-scale entries `..._foldscale_splitk` / `..._foldscale_zp_splitk`, A/B'd with
+`ONNX_GENAI_GEMV_FOLDSCALE=1` vs unset on
 `profile_native --model <dir> --pipeline --ep cuda --backend native --steady --warmups 2 --runs 5 --tokens 128`.
 
 ---

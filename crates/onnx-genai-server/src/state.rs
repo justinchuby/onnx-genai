@@ -10,7 +10,7 @@ use onnx_genai::{Engine, EngineConfig};
 use onnx_genai_engine::NativeDecodeDevice;
 use onnx_genai_engine::{
     DeviceCompatibilityDomain, DeviceMemoryAuthority, KvDType, MappedGrowthMetrics,
-    MemoryAuthorityProvider, ResourceLimit,
+    MemoryAuthorityProvider, ProcessMemoryManager, ResourceLimit,
 };
 use onnx_genai_ort::{ChatTemplate, ModelDirectory, PipelineModelDirectory, Tokenizer};
 
@@ -33,6 +33,7 @@ const DEFAULT_MAX_BATCH: usize = 4;
 pub(crate) struct ServerMemoryAuthorities {
     effective_limit: Mutex<ResourceLimit>,
     authorities: Mutex<HashMap<DeviceCompatibilityDomain, DeviceMemoryAuthority>>,
+    process_memory_manager: ProcessMemoryManager,
 }
 
 impl ServerMemoryAuthorities {
@@ -40,6 +41,8 @@ impl ServerMemoryAuthorities {
         Self {
             effective_limit: Mutex::new(configured_limit),
             authorities: Mutex::new(HashMap::new()),
+            process_memory_manager: ProcessMemoryManager::new()
+                .expect("process memory manager identity is available"),
         }
     }
 
@@ -147,12 +150,12 @@ impl ServerMemoryAuthorities {
             .iter()
             .map(DeviceMemoryAuthority::pause_reconfiguration)
             .collect::<Vec<_>>();
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "native-cuda")]
         let pool_gates = ordered
             .iter()
             .map(DeviceMemoryAuthority::physical_pool_operation_gate)
             .collect::<Vec<_>>();
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "native-cuda")]
         let _pool_operations = pool_gates
             .iter()
             .map(|gate| {
@@ -220,6 +223,10 @@ impl ServerMemoryAuthorities {
 }
 
 impl MemoryAuthorityProvider for ServerMemoryAuthorities {
+    fn process_memory_manager(&self) -> ProcessMemoryManager {
+        self.process_memory_manager.clone()
+    }
+
     fn validate_limit(
         &self,
         domain: &DeviceCompatibilityDomain,
@@ -311,14 +318,19 @@ pub fn parse_native_device(s: &str) -> Result<NativeDecodeDevice, String> {
     ))
 }
 
-#[cfg(all(feature = "native-backend", feature = "cuda"))]
+#[cfg(feature = "native-cuda")]
 fn parse_native_cuda_device(index: Option<u32>) -> Result<NativeDecodeDevice, String> {
     Ok(NativeDecodeDevice::Cuda { index })
 }
 
-#[cfg(all(feature = "native-backend", not(feature = "cuda")))]
+#[cfg(all(feature = "native-backend", not(feature = "native-cuda")))]
 fn parse_native_cuda_device(_index: Option<u32>) -> Result<NativeDecodeDevice, String> {
-    Err("native CUDA requires building onnx-genai-server with the 'cuda' feature".to_string())
+    Err(
+        "native CUDA requires the 'native-cuda' feature, which this build of onnx-genai-server \
+         does not have (it already implies 'native-backend'); rebuild with \
+         `--features native-cuda`, or use `--native-device cpu`"
+            .to_string(),
+    )
 }
 
 #[derive(Clone)]
@@ -538,11 +550,11 @@ impl AppState {
             model_max_context,
             generation_defaults: None,
             fim_config,
-            pipeline: false,
             multimodal: None,
-            text_to_image: false,
-            text_to_audio: false,
-        });
+            speech: None,
+            image_pipeline: None,
+        })
+        .expect("test model handle");
         let registry = ModelRegistry::from_handle(Arc::new(handle), config.clone());
         Self {
             registry,
@@ -646,26 +658,33 @@ pub(crate) fn enforce_requested_max_batch(
 /// loading (`ModelRegistry::load`).  It is a **blocking** function (it calls
 /// `Engine::from_dir`, which takes seconds) and must therefore be invoked from a
 /// blocking context (e.g. at startup or via `tokio::task::spawn_blocking`).
-#[cfg(test)]
-pub(crate) fn build_handle(spec: &ModelSpec, config: &ServerConfig) -> anyhow::Result<ModelHandle> {
-    let authorities = Arc::new(ServerMemoryAuthorities::new(
-        config.engine_config.limits.vram_limit,
-    ));
-    build_handle_with_authorities(spec, config, authorities)
-}
-
 pub(crate) fn build_handle_with_authorities(
     spec: &ModelSpec,
     config: &ServerConfig,
     authorities: Arc<ServerMemoryAuthorities>,
 ) -> anyhow::Result<ModelHandle> {
-    onnx_genai_engine::validate_pipeline_backend_request(config.engine_config.decode_backend)?;
     let model_dir = spec.path.as_path();
     let model_id = spec.id.clone();
     let chat_template = load_chat_template(model_dir)?;
+    // Every package declares a workflow, including a single decoder — so
+    // "declares a workflow" no longer distinguishes a composed pipeline. Layer
+    // 1 of the shared classification answers "does this package need multimodal
+    // input specs". The engine's executor choice reads layer 2 of the *same*
+    // classification — layer 1 plus the decode contract — so it can never
+    // route a package this call classifies as composed.
     if let Some(directory) = PipelineModelDirectory::load_if_declared(model_dir)
         .map_err(|e| anyhow::anyhow!("Failed to discover pipeline directory: {e}"))?
+        .filter(|directory| {
+            !directory
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.pipeline.as_ref())
+                .is_some_and(|pipeline| {
+                    onnx_genai_metadata::is_single_decoder_workflow(&pipeline.workflow)
+                })
+        })
     {
+        onnx_genai_engine::validate_pipeline_backend_request(config.engine_config.decode_backend)?;
         // The directory already parsed this package's metadata; re-reading it
         // here could disagree with the pipeline built from it.
         let model_max_context = directory
@@ -694,10 +713,7 @@ pub(crate) fn build_handle_with_authorities(
         authorities,
     )?;
     let fim_config = engine.fim_config().cloned();
-    // Capture the model author's declared generation defaults before the engine
-    // is moved into the driver, so every request built for this handle can honor
-    // a model that ships `do_sample: true` instead of forcing greedy.
-    let generation_defaults = engine.metadata().generation.clone();
+    let generation_defaults = None;
     // Refuse an explicit `--max-batch > 1` the decode path cannot honor, rather
     // than accepting it and silently falling back to per-request decoding. The
     // check is sourced from the engine's decode path, not from whether an ORT
@@ -705,7 +721,7 @@ pub(crate) fn build_handle_with_authorities(
     enforce_requested_max_batch(&engine, config.max_batch)?;
     let requested_max_batch = config.max_batch.unwrap_or(DEFAULT_MAX_BATCH);
     let engine_driver = EngineDriver::start(engine, requested_max_batch, config.max_queue_depth);
-    Ok(ModelHandle::new(ModelHandleParts {
+    ModelHandle::new(ModelHandleParts {
         id: model_id,
         model_dir: model_dir.to_path_buf(),
         engine: engine_driver,
@@ -714,11 +730,10 @@ pub(crate) fn build_handle_with_authorities(
         model_max_context,
         generation_defaults,
         fim_config,
-        pipeline: false,
         multimodal: None,
-        text_to_image: false,
-        text_to_audio: false,
-    }))
+        speech: None,
+        image_pipeline: None,
+    })
 }
 
 fn build_pipeline_handle(
@@ -730,72 +745,72 @@ fn build_pipeline_handle(
     directory: PipelineModelDirectory,
     authorities: Arc<ServerMemoryAuthorities>,
 ) -> anyhow::Result<ModelHandle> {
+    let image_pipeline = crate::image_generation::ImagePipelineSpec::from_pipeline(&directory.spec);
     let tokenizer_path = crate::multimodal::tokenizer_path(model_dir, &directory)?;
     let tokenizer = Tokenizer::from_file(&tokenizer_path)
         .map_err(|e| anyhow::anyhow!("Failed to load pipeline tokenizer: {e}"))?;
 
-    // A package that declares a denoise loop can serve image generation; one
-    // whose pipeline ends in a waveform stage can serve speech.
-    let text_to_image = directory.spec.strategy.denoiser.is_some();
-    let text_to_audio = onnx_genai::text_to_audio::is_text_to_audio(&directory.spec);
-    let engine = Engine::from_pipeline_dir_with_memory_authority_provider(
+    let engine = Engine::from_dir_with_memory_authority_provider(
         model_dir,
         config.engine_config.clone(),
         authorities,
     )?;
-    let multimodal = crate::multimodal::build(&directory, engine.models())?;
-    // The package's own `generation` block is the pipeline's declared sampling
-    // regime, so honor it exactly as the CLI does. Without it every request
-    // decodes greedily at the OpenAI schema defaults, and a model that ships
-    // `do_sample: true` degenerates into repetition.
-    let generation_defaults = engine.generation_defaults().cloned();
-    Ok(ModelHandle::new(ModelHandleParts {
+    let multimodal = crate::multimodal::build(&directory, engine.models()?)?;
+    // Resolve one exact speech capability at load time: bind the single
+    // text-assembly processor to the single compatible buffered PCM16 WAV audio
+    // output that serving will encode. Fail closed on zero, ambiguous, or
+    // mismatched candidates so admission and encoding can never disagree about
+    // which output is served.
+    let speech = match crate::speech::load_speech_prompt_processor(model_dir)? {
+        None => None,
+        Some(processor) => {
+            let candidates = onnx_genai_engine::pipeline::buffered_pcm16_wav_output_names(
+                &directory.spec.workflow,
+            );
+            let audio_output = match candidates.as_slice() {
+                [] => anyhow::bail!(
+                    "model '{model_id}' declares an {} speech adapter but no workflow output declares a compatible buffered PCM16 WAV audio contract",
+                    crate::speech::TEXT_ASSEMBLY_ABI
+                ),
+                [single] => single.clone(),
+                many => anyhow::bail!(
+                    "model '{model_id}' declares {} workflow outputs with a compatible buffered PCM16 WAV audio contract ({}); exactly one is required to bind the speech text-assembly adapter",
+                    many.len(),
+                    many.join(", ")
+                ),
+            };
+            Some(crate::speech::SpeechCapability {
+                processor,
+                audio_output,
+            })
+        }
+    };
+    // The declared `generation` block was retired along with the rest of the
+    // superseded generation metadata surfaces, so the pipeline path resolves
+    // sampling from request options only — same as the non-pipeline path above.
+    let generation_defaults = None;
+    // The same admission the decoder path applies: an explicit `--max-batch`
+    // the decode path cannot honor is refused rather than silently ignored.
+    enforce_requested_max_batch(&engine, config.max_batch)?;
+    let requested_max_batch = config.max_batch.unwrap_or(DEFAULT_MAX_BATCH);
+    ModelHandle::new(ModelHandleParts {
         id: model_id,
         model_dir: model_dir.to_path_buf(),
-        engine: EngineDriver::start_pipeline(engine, config.max_queue_depth),
+        engine: EngineDriver::start(engine, requested_max_batch, config.max_queue_depth),
         tokenizer: Arc::new(tokenizer),
         chat_template: chat_template.map(Arc::new),
         model_max_context,
         generation_defaults,
         fim_config: None,
-        pipeline: true,
         multimodal: Some(multimodal),
-        text_to_image,
-        text_to_audio,
-    }))
+        speech,
+        image_pipeline,
+    })
 }
 
 #[cfg(test)]
 mod authority_tests {
-    #[cfg(not(feature = "native-backend"))]
-    use std::path::PathBuf;
-
     use super::*;
-
-    #[cfg(not(feature = "native-backend"))]
-    #[test]
-    fn shared_server_load_validates_native_backend_before_model_io() {
-        let spec = ModelSpec {
-            id: "missing-native".to_string(),
-            path: PathBuf::from("this-model-directory-does-not-exist"),
-            eager: true,
-            warmup: false,
-        };
-        let config = ServerConfig {
-            engine_config: EngineConfig {
-                decode_backend: onnx_genai_engine::EngineDecodeBackend::Native,
-                ..EngineConfig::default()
-            },
-            ..ServerConfig::default()
-        };
-
-        let error = build_handle(&spec, &config)
-            .err()
-            .expect("native backend validation must fail")
-            .to_string();
-        assert!(error.contains("compiled without the 'native-backend' feature"));
-        assert!(!error.contains("does not exist"), "{error}");
-    }
 
     #[test]
     fn concurrent_requests_create_one_authority() {
@@ -892,7 +907,7 @@ mod authority_tests {
         assert_eq!(future.limit_bytes(), 100);
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "native-cuda")]
     #[test]
     fn failed_multi_device_preflight_does_not_trim_an_earlier_pool() {
         use cudarc::driver::CudaContext;

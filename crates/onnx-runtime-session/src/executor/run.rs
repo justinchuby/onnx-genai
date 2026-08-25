@@ -60,6 +60,13 @@ impl Executor {
         }
         let _depth_guard = DepthGuard;
         let nested = depth > 0;
+        if !nested {
+            // The validation word is shared by eager and captured CUDA kernels,
+            // but its meaning is request-local. Clear any prior request before
+            // this one can enqueue work; failures are correctness failures and
+            // must propagate through the EP seam.
+            self.ep.reset_device_validation_error()?;
+        }
         self.reset_run_state()?;
 
         // Keep the setup span around shape resolution, Stage-2 restoration,
@@ -97,11 +104,58 @@ impl Executor {
             stage2,
             measure_activation_plan,
         );
+        let validation = if nested {
+            Ok(())
+        } else {
+            self.finish_device_validation()
+        };
         let unbound = self.unbind_borrowed_inputs();
-        match (outcome, unbound) {
-            (Ok(result), Ok(())) => Ok(result),
-            (Err(e), _) => Err(e),
-            (Ok(_), Err(e)) => Err(e),
+        match (outcome, validation, unbound) {
+            (_, Err(e), _) => Err(e),
+            (Err(e), _, _) => Err(e),
+            (Ok(_), _, Err(e)) => Err(e),
+            (Ok(result), Ok(()), Ok(())) => Ok(result),
+        }
+    }
+
+    fn finish_device_validation(&self) -> Result<()> {
+        // This is the one request-level host boundary for deferred eager work
+        // and for captured replay. The CUDA EP's explicit sync is unconditional,
+        // so the latch read observes every kernel from this request.
+        self.ep.sync()?;
+        let checked = self.ep.check_device_capture_error();
+        // Clear after the synchronized read as well as before the next request:
+        // callers inspecting a failed run cannot leave poison behind, and a
+        // reset failure is never silently discarded.
+        let reset = self.ep.reset_device_validation_error();
+        match (checked, reset) {
+            (Ok(0), Ok(())) => {
+                // The single coarse safe boundary: the request's kernels and any
+                // captured replay have completed (the sync above), the stream is
+                // no longer capturing, and the device validation latch is clean.
+                // Consume any completed route-telemetry window here and nowhere
+                // else (issue #1810 Slice 7C). Every EP declares this explicitly;
+                // non-residency EPs return Ok(()) and the CUDA EP is gated off by
+                // default, so this is byte-identical unless a provider opts in.
+                self.ep.consume_route_residency_at_boundary()?;
+                Ok(())
+            }
+            (Ok(flags), Ok(())) => Err(EpError::KernelFailed(format!(
+                "{}: device validation failed (flags=0x{flags:x})",
+                self.ep.name()
+            ))
+            .into()),
+            (Err(error), Ok(())) | (Ok(0), Err(error)) => Err(error.into()),
+            (Ok(flags), Err(reset_error)) => Err(SessionError::Internal(format!(
+                "{}: device validation failed (flags=0x{flags:x}); additionally failed to reset \
+                 the device validation latch: {reset_error}",
+                self.ep.name()
+            ))),
+            (Err(check_error), Err(reset_error)) => Err(SessionError::Internal(format!(
+                "{}: failed to check the device validation latch: {check_error}; additionally \
+                 failed to reset it: {reset_error}",
+                self.ep.name()
+            ))),
         }
     }
 
@@ -400,6 +454,33 @@ impl Executor {
             .copied()
             .collect::<HashSet<_>>();
         for &vid in &external_values {
+            // A producer-less value bound only as an external *output* (a bare
+            // initializer, or a value `ConstantFolding` collapsed to one
+            // because it has no *node* consumer — only being a graph output
+            // kept it alive) is never visited by node dispatch, so nothing
+            // ever refills this buffer once dropped here. Keep it resident —
+            // it is immutable for the session's lifetime (see
+            // `materialize_initializers`) — so `collect_run_outputs` can still
+            // seed the external binding from it after this per-run wipe,
+            // instead of leaving the caller's device buffer at its
+            // uninitialized allocation state forever.
+            //
+            // `value.producer.is_none()` is also true for a producer-less
+            // graph *input* passed straight through to an output (the other
+            // case `Graph::validate`'s rule 5 recognizes). That sub-case has
+            // no resident buffer from `materialize_initializers` (which only
+            // populates from `graph.initializers`), so it is unaffected by
+            // this guard either way — `collect_run_outputs`'s seed-copy below
+            // simply no-ops for it, same as before this fix, rather than
+            // regressing anything.
+            if !external.inputs.contains_key(&vid)
+                && self
+                    .graph
+                    .try_value(vid)
+                    .is_some_and(|value| value.producer.is_none())
+            {
+                continue;
+            }
             if let Some(old) = self.buffers.remove(&vid) {
                 self.ep.deallocate(old)?;
             }
@@ -619,8 +700,8 @@ impl Executor {
                 // ~600-entry resolved map every token would be pure waste and
                 // would defeat the memo's allocation amortization.
                 if !decode_memo_eligible {
-                    self.capture_warm_shapes = resolved.clone();
-                    self.capture_warm_signature = Some(external.capture_signature());
+                    self.cap_mut().capture_warm_shapes = resolved.clone();
+                    self.cap_mut().capture_warm_signature = Some(external.capture_signature());
                 }
             }
             RunMode::Capture => {
@@ -661,7 +742,7 @@ impl Executor {
                     ) {
                         Ok(_) => break 'capture schedule,
                         Err(error) => {
-                            let _ = self.ep.reset_device_graph();
+                            let _ = self.ep.reset_device_graph_in(self.graph_slot);
                             // Quarantine the op-type that aborted recording and
                             // retry, unless we already quarantined it (no
                             // progress), hit the attempt bound, or cannot
@@ -670,19 +751,23 @@ impl Executor {
                                 self.last_capture_failed_node.take().and_then(|node_id| {
                                     let node = self.graph.node(node_id);
                                     let key = (canonical_domain(node), node.op_type.clone());
-                                    self.capture_quarantine_ops.insert(key).then_some(())
+                                    self.cap_mut()
+                                        .capture_quarantine_ops
+                                        .insert(key)
+                                        .then_some(())
                                 });
                             if quarantined.is_some()
-                                && self.capture_quarantine_ops.len() < max_capture_attempts
+                                && self.cap().capture_quarantine_ops.len() < max_capture_attempts
                             {
                                 // Re-plan with the offending op-type forced eager.
                                 self.if_last_predicate.clear();
                                 continue 'capture;
                             }
-                            self.capture_schedule = None;
-                            self.capture_segmentation.clear();
-                            self.capture_cf_shapes.clear();
-                            self.capture_warm_seeded.clear();
+                            let cap = self.cap_mut();
+                            cap.capture_schedule = None;
+                            cap.capture_segmentation.clear();
+                            cap.capture_cf_shapes.clear();
+                            cap.capture_warm_seeded.clear();
                             return Ok(Some(ScopedRunResult::NotCapturable(
                                 CaptureDeclineReport::one(CaptureDecline::graph(format!(
                                     "segmented CUDA graph capture failed: {error}"
@@ -699,17 +784,19 @@ impl Executor {
                 // the shape restabilizes) or keeps this op eager. This upholds
                 // "recapture when any shape changes; never replay a stale graph."
                 if let Some((vid, seeded)) = self
+                    .cap()
                     .capture_warm_seeded
                     .iter()
                     .find(|(vid, seeded)| resolved.get(vid) != Some(*seeded))
                     .map(|(vid, seeded)| (*vid, seeded.clone()))
                 {
                     let current = resolved.get(&vid).cloned();
-                    let _ = self.ep.reset_device_graph();
-                    self.capture_schedule = None;
-                    self.capture_segmentation.clear();
-                    self.capture_cf_shapes.clear();
-                    self.capture_warm_seeded.clear();
+                    let _ = self.ep.reset_device_graph_in(self.graph_slot);
+                    let cap = self.cap_mut();
+                    cap.capture_schedule = None;
+                    cap.capture_segmentation.clear();
+                    cap.capture_cf_shapes.clear();
+                    cap.capture_warm_seeded.clear();
                     return Ok(Some(ScopedRunResult::NotCapturable(
                         CaptureDeclineReport::one(CaptureDecline::graph(format!(
                             "warm decode shape seed for value#{} ({seeded:?}) diverged from the \
@@ -721,21 +808,25 @@ impl Executor {
                 // Snapshot the concrete control-flow output shapes this capture
                 // assumed so a later replay can detect a branch flip that changes
                 // them and retire the now-stale installed graph.
-                self.capture_cf_shapes = self
+                let cf_shapes = self
                     .control_flow_output_values
                     .iter()
                     .filter_map(|vid| resolved.get(vid).map(|shape| (*vid, shape.clone())))
                     .collect();
-                self.capture_segmentation = schedule.boundaries.clone();
-                if capture_segmentation_logging_enabled() {
+                let boundaries = schedule.boundaries.clone();
+                let logging = capture_segmentation_logging_enabled();
+                if logging {
                     log_capture_segmentation(&schedule);
                 }
-                self.capture_schedule = Some(schedule);
+                let cap = self.cap_mut();
+                cap.capture_cf_shapes = cf_shapes;
+                cap.capture_segmentation = boundaries;
+                cap.capture_schedule = Some(schedule);
             }
             RunMode::Replay => {
                 // Move the schedule out so the segmented runner can take `&mut
                 // self`; restore it afterwards for the next step's replay.
-                let Some(schedule) = self.capture_schedule.take() else {
+                let Some(schedule) = self.cap_mut().capture_schedule.take() else {
                     return Ok(Some(ScopedRunResult::NotCapturable(
                         CaptureDeclineReport::one(CaptureDecline::graph(
                             "segmented device graph replay requested without a capture schedule",
@@ -750,17 +841,18 @@ impl Executor {
                     external,
                 )?;
                 if still_valid {
-                    self.capture_schedule = Some(schedule);
+                    self.cap_mut().capture_schedule = Some(schedule);
                 } else {
                     // A control-flow branch flip changed a seeded output shape:
                     // the remaining plan already ran eagerly this step (correct
                     // token), but the installed segments are stale. Retire the
                     // device graph so the caller re-warms and re-captures for the
                     // new branch. `capture_schedule` stays `None`.
-                    self.capture_segmentation.clear();
-                    self.capture_cf_shapes.clear();
-                    self.device_graph_signature = None;
-                    self.ep.reset_device_graph()?;
+                    let cap = self.cap_mut();
+                    cap.capture_segmentation.clear();
+                    cap.capture_cf_shapes.clear();
+                    cap.device_graph_signature = None;
+                    self.ep.reset_device_graph_in(self.graph_slot)?;
                 }
             }
         }
@@ -787,7 +879,28 @@ impl Executor {
         let mut host_output_bytes = 0usize;
         let output_vids: Vec<ValueId> = self.graph.outputs.clone();
         for vid in output_vids {
-            if external.outputs.contains_key(&vid) {
+            if let Some(ext) = external.outputs.get(&vid) {
+                // A graph output with no producing node (e.g. a bare
+                // initializer, or a value `ConstantFolding` collapsed to one
+                // because it has no *node* consumer — only being a graph
+                // output kept it alive) is never visited by node dispatch, so
+                // nothing ever writes through its externally-bound device
+                // pointer. Left alone, a CUDA IO-binding/capture caller reads
+                // back that binding's uninitialized allocation. Seed it here,
+                // every run, from the resident internal buffer — kept alive
+                // for exactly this purpose by `prepare_run_buffers` — which is
+                // a cheap, byte-identical copy of already-correct data, not a
+                // recomputation.
+                if self
+                    .graph
+                    .try_value(vid)
+                    .is_some_and(|value| value.producer.is_none())
+                    && let Some(src) = self.buffers.get(&vid)
+                {
+                    let mut dst = ext.writable_buffer()?;
+                    let size = src.len().min(dst.len());
+                    self.ep.copy(src, &mut dst, size)?;
+                }
                 results.push(None);
                 continue;
             }

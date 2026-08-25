@@ -53,6 +53,159 @@ pub(super) fn run_ep_scoped_passes(
     Ok(())
 }
 
+/// The S3 capacity-emission gate: rewrite every KV-cache-growth `Concat` the
+/// mask-cone classifier proves safe
+/// ([`geometry::kv_capacity_write_eligible_concats`]) into the
+/// CUDA-graph-capture-safe `pkg.nxrt::KvCacheCapacityAppend` op, so a
+/// decomposed-attention decode step becomes capture/replay-eligible instead of
+/// being permanently pinned to `captures == 0` — see that function's doc
+/// comment, and [`geometry::KV_CAPACITY_APPEND_OP`], for the full derivation
+/// of why a plain `Concat`'s own launch geometry cannot survive a captured
+/// replay while this op's can (it reads its one legitimately varying quantity,
+/// the destination row, from `position_ids`'s *device memory contents* at
+/// execute time instead of baking it into host launch parameters).
+///
+/// This is a **capability-gated structural rewrite, not a model allowlist**:
+/// every candidate is re-checked against `ep.supports_op` individually before
+/// it fires, so an EP that has not registered the op (every EP but CUDA
+/// today — the CPU EP, or a future EP that never adds the kernel) leaves the
+/// original growing `Concat` completely untouched, exactly as correct as it
+/// was before this pass existed. Nothing here inspects a model name, op
+/// count, or shape beyond what the classifier itself already requires.
+///
+/// Returns whether any rewrite fired, purely for the caller's bookkeeping (no
+/// caller currently branches on it, but it keeps this pass's contract
+/// explicit and testable in isolation).
+pub(super) fn rewrite_kv_capacity_appends(graph: &mut Graph, ep: &dyn ExecutionProvider) -> bool {
+    // `position_ids` is the load-bearing per-step signal the new op's kernel
+    // reads at execute time; a graph with no such input (e.g. an encoder, or
+    // any export that never threads position ids to begin with) has nothing
+    // for the rewrite to bind, so bail before even running the classifier.
+    let Some(position_ids) = graph
+        .inputs
+        .iter()
+        .copied()
+        .find(|&value| graph.value(value).name.as_deref() == Some("position_ids"))
+    else {
+        return false;
+    };
+
+    let mut eligible: Vec<NodeId> = kv_capacity_write_eligible_concats(graph)
+        .into_iter()
+        .collect();
+    if eligible.is_empty() {
+        return false;
+    }
+    // Deterministic order: `HashSet` iteration order is not stable, and this
+    // pass's effect (which nodes end up rewritten) must not depend on hash
+    // seed noise.
+    eligible.sort_by_key(|id| id.0);
+
+    // The op's registered version (see `onnx-runtime-shape-inference`'s
+    // `custom_ops::kv_cache_capacity_append` registration and the CUDA kernel
+    // factory's `OpKey`). Queried as a literal rather than via
+    // `effective_opset`, since `pkg.nxrt` may not yet be a graph opset-import
+    // for a decomposed-attention export that uses no other `pkg.nxrt` op —
+    // exactly the case this rewrite exists to upgrade.
+    const KV_CAPACITY_APPEND_OPSET: u64 = 1;
+
+    let mut rewritten = false;
+    for node_id in eligible {
+        let node = graph.node(node_id);
+        // The classifier's `is_kv_cache_growth_concat` also matches an
+        // *already*-rewritten node (so the mask-cone walk keeps recognizing
+        // its own output across re-placement); skip those here; there is
+        // nothing left for this pass to do to them.
+        if !(node.is_default_domain() && node.op_type == "Concat") {
+            continue;
+        }
+        // A KV-growth append is always binary: `Concat(past, current)`. A
+        // node that structurally matched but is not exactly this shape is not
+        // one this rewrite understands; leave it as an ordinary Concat.
+        if node.inputs.len() != 2 {
+            continue;
+        }
+        let (Some(past), Some(current)) = (node.inputs[0], node.inputs[1]) else {
+            continue;
+        };
+        let present = node.outputs[0];
+
+        // The eligibility classifier proves the *value provenance* of this
+        // `Concat`'s output is safe (it structurally reaches a proven-safe
+        // sink) -- it says nothing about which axis the concatenation grows
+        // on. The new op's kernel and `unsupported_reason` both hardcode that
+        // the growth axis is index 2 of a `[batch, heads, seq, head_dim]`
+        // physical layout; a `Concat` that structurally matched but grows on
+        // a different axis is not something this rewrite understands, and
+        // rewriting it anyway would silently write into the wrong physical
+        // dimension rather than fail loudly (the batch/heads/head_dim
+        // cross-shape checks in `unsupported_reason` only catch this
+        // incidentally, and only when every other axis happens to be
+        // statically known and distinct). Read the source `Concat`'s
+        // mandatory `axis` attribute, normalize a negative index against
+        // `past`'s rank, and decline unless it resolves to exactly axis 2 of
+        // a rank-4 tensor -- leaving the original `Concat`, which is
+        // axis-generic, untouched.
+        let past_rank = graph.value(past).shape.len();
+        let normalized_axis = node
+            .attr("axis")
+            .and_then(Attribute::as_int)
+            .and_then(|axis| {
+                let axis = if axis < 0 {
+                    axis + past_rank as i64
+                } else {
+                    axis
+                };
+                usize::try_from(axis).ok()
+            });
+        if past_rank != 4 || normalized_axis != Some(2) {
+            continue;
+        }
+
+        let mut candidate = Node::new(
+            node_id,
+            KV_CAPACITY_APPEND_OP,
+            vec![Some(past), Some(current), Some(position_ids)],
+            vec![present],
+        );
+        candidate.domain = KV_CAPACITY_APPEND_DOMAIN.to_string();
+
+        let shapes = [past, current, position_ids].map(|value| graph.value(value).shape.clone());
+        let dtypes = [past, current, position_ids].map(|value| graph.value(value).dtype);
+        let layouts = vec![TensorLayout::contiguous(); shapes.len()];
+        if !ep
+            .supports_op(
+                &candidate,
+                KV_CAPACITY_APPEND_OPSET,
+                &shapes,
+                &dtypes,
+                &layouts,
+            )
+            .is_supported()
+        {
+            // No kernel for this op on the current EP (e.g. CPU): leave the
+            // original Concat exactly as it was.
+            continue;
+        }
+
+        graph.replace_node(node_id, candidate);
+        graph
+            .opset_imports
+            .entry(KV_CAPACITY_APPEND_DOMAIN.to_string())
+            .or_insert(KV_CAPACITY_APPEND_OPSET);
+        rewritten = true;
+    }
+
+    if rewritten {
+        debug_assert!(
+            graph.validate().is_ok(),
+            "rewrite_kv_capacity_appends produced an invalid graph: {:?}",
+            graph.validate().err()
+        );
+    }
+    rewritten
+}
+
 pub(super) fn validate_if_branch_outputs(graph: &Graph, node: &Node) -> Result<()> {
     let Some(then_branch) = graph.subgraphs.get(&(node.id, "then_branch".to_string())) else {
         return Ok(());
@@ -364,21 +517,44 @@ pub(super) fn format_node_identity(scope: &str, node_id: NodeId, node: &Node) ->
     }
 }
 
-pub(super) fn build_lazy_weight_handles(
+/// Build lazy-weight handles exactly as before, plus (additively) per-expert
+/// region candidates for `com.microsoft::QMoE` expert-bank initializers.
+///
+/// The candidate map is measurement-neutral bookkeeping only (issue #82's
+/// first slice): nothing here changes which initializers become lazy, how
+/// many [`ExternalMmapRegion`]s a [`LazyWeight`] carries, or how many
+/// allocations/H2D copies the CUDA paging path performs. A QMoE initializer
+/// whose layout cannot be proven pageable is recorded with its
+/// [`onnx_runtime_loader::NonPageableReason`] rather than silently omitted.
+pub(super) fn build_lazy_weight_handles_and_candidates(
     graph: &Graph,
     weights: &Arc<WeightStore>,
     ep: &dyn ExecutionProvider,
-) -> Result<HashMap<ValueId, WeightHandle>> {
+) -> Result<(
+    HashMap<ValueId, WeightHandle>,
+    HashMap<ValueId, onnx_runtime_loader::WeightRegionCatalog>,
+)> {
     let capabilities = ep.capabilities();
     if !capabilities.advertises(onnx_runtime_ep_api::NXRT_WEIGHT_PAGING_CAPABILITY) {
-        return Ok(HashMap::new());
+        return Ok((HashMap::new(), HashMap::new()));
     }
 
+    let qmoe_layouts = qmoe_expert_layouts_by_value(graph);
+
     let mut handles = HashMap::new();
+    let mut candidates = HashMap::new();
     for candidate in lazy_weight_candidates(graph) {
         let value = candidate.value;
         let boundary = candidate.boundary;
         let weight = &graph.initializers[&value];
+        if boundary == LazyWeightBoundary::QMoe
+            && let Some(layout) = qmoe_layouts.get(&value)
+        {
+            candidates.insert(
+                value,
+                onnx_runtime_loader::WeightRegionCatalog::classify(weight, layout.clone()),
+            );
+        }
         let Some((mapping_id, offset, len)) = weights.external_mmap_provenance(weight) else {
             continue;
         };
@@ -407,10 +583,217 @@ pub(super) fn build_lazy_weight_handles(
         })?;
         handles.insert(value, WeightHandle::Lazy(lazy));
     }
-    Ok(handles)
+    Ok((handles, candidates))
+}
+
+/// Build the default [`onnx_runtime_ep_api::ResidencyPlan`] for this build's
+/// per-expert region candidates.
+///
+/// This is the one call site where a plan is *created*. It always uses
+/// [`onnx_runtime_ep_api::WholeBankResidentPolicy`] today — the only shipped
+/// policy — so the produced plan is handle-for-handle/byte-for-byte
+/// equivalent to pre-#82 behavior: every candidate value resolves to
+/// `WholeBankResident`. A future slice may take the policy as a parameter;
+/// this slice intentionally does not expose that knob outside tests.
+pub(super) fn plan_default_residency(
+    graph: &Graph,
+    candidates: &HashMap<ValueId, onnx_runtime_loader::WeightRegionCatalog>,
+) -> onnx_runtime_ep_api::ResidencyPlan {
+    plan_residency_with(
+        graph,
+        candidates,
+        &onnx_runtime_ep_api::WholeBankResidentPolicy,
+    )
+}
+
+/// Test/measurement seam: build a plan with an arbitrary
+/// [`onnx_runtime_ep_api::ResidencyPolicy`], to prove the boundary is
+/// substitutable without wiring a second production call site.
+pub(super) fn plan_residency_with(
+    graph: &Graph,
+    candidates: &HashMap<ValueId, onnx_runtime_loader::WeightRegionCatalog>,
+    policy: &dyn onnx_runtime_ep_api::ResidencyPolicy,
+) -> onnx_runtime_ep_api::ResidencyPlan {
+    let boundary_by_value: HashMap<ValueId, LazyWeightBoundary> = lazy_weight_candidates(graph)
+        .into_iter()
+        .map(|candidate| (candidate.value, candidate.boundary))
+        .collect();
+    let inputs = candidates.iter().filter_map(|(value, catalog)| {
+        boundary_by_value
+            .get(value)
+            .map(|&boundary| (*value, boundary, catalog))
+    });
+    onnx_runtime_ep_api::plan_residency(inputs, policy, None)
+}
+
+/// Derive an [`onnx_runtime_loader::ExpertTensorLayout`] for every QMoE
+/// expert-bank initializer value in `graph`, keyed by the initializer's
+/// [`ValueId`].
+///
+/// Mirrors `onnx-genai-engine::engine::placement::qmoe_layers`'s input-index
+/// convention (fc1 packed/scales/zero-points at 2/3/11, fc2 at 5/6/12, and an
+/// optional fc3 triple at 8/9/13) so both call sites derive layouts from the
+/// same node attributes/initializer shapes and cannot silently drift onto
+/// different byte-range formulas. A value absent from the returned map either
+/// isn't a QMoE expert-bank tensor, or its node/attributes/shape could not
+/// support deriving a layout at all (as opposed to deriving one that then
+/// fails [`onnx_runtime_loader::WeightRegionCatalog::classify`]'s validation,
+/// which is instead recorded as a `NonPageable` catalog by the caller).
+fn qmoe_expert_layouts_by_value(
+    graph: &Graph,
+) -> HashMap<ValueId, onnx_runtime_loader::ExpertTensorLayout> {
+    let mut layouts = HashMap::new();
+    for (_, node) in graph.nodes.iter() {
+        if !(node.op_type == "QMoE" && (node.domain.is_empty() || node.domain == "com.microsoft")) {
+            continue;
+        }
+        let Some(bits) = qmoe_int_attr(node, "expert_weight_bits", 4)
+            .ok()
+            .and_then(|value| usize::try_from(value).ok())
+            .filter(|bits| matches!(bits, 1 | 2 | 4 | 8))
+        else {
+            continue;
+        };
+        let Some(block_size) = qmoe_int_attr(node, "block_size", 0)
+            .ok()
+            .and_then(|value| usize::try_from(value).ok())
+            .filter(|block_size| *block_size > 0)
+        else {
+            continue;
+        };
+        for &(packed_idx, scales_idx, zero_idx) in &[(2, 3, 11), (5, 6, 12), (8, 9, 13)] {
+            if packed_idx == 8 && node.inputs.get(8).and_then(|slot| *slot).is_none() {
+                continue;
+            }
+            qmoe_push_expert_layout(
+                graph,
+                node,
+                scales_idx,
+                packed_idx,
+                bits,
+                block_size,
+                &mut layouts,
+            );
+            qmoe_push_expert_layout(
+                graph,
+                node,
+                scales_idx,
+                scales_idx,
+                bits,
+                block_size,
+                &mut layouts,
+            );
+            if node.inputs.get(zero_idx).and_then(|slot| *slot).is_some() {
+                qmoe_push_expert_layout(
+                    graph,
+                    node,
+                    scales_idx,
+                    zero_idx,
+                    bits,
+                    block_size,
+                    &mut layouts,
+                );
+            }
+        }
+    }
+    layouts
+}
+
+/// Derive and record the layout for one QMoE input tensor at `input_index`,
+/// using the sibling scales tensor at `scales_index` to read `blocks_per_row`
+/// (the scales tensor's own storage-elements-per-row axis).
+///
+/// Whenever `value` resolves to a graph initializer, an entry is always
+/// recorded (never silently omitted): a derivable expert-major layout is
+/// recorded as-is, and a value whose shape/sibling scales cannot support
+/// deriving one (e.g. non-rank-3 dims) is instead recorded with
+/// [`onnx_runtime_loader::ExpertStorageOrder::Interleaved`], which
+/// [`onnx_runtime_loader::WeightRegionCatalog::classify`] turns into an
+/// explicit `NonPageableReason::NotExpertMajor` rather than the value
+/// vanishing from the candidate map entirely.
+fn qmoe_push_expert_layout(
+    graph: &Graph,
+    node: &Node,
+    scales_index: usize,
+    input_index: usize,
+    bits: usize,
+    block_size: usize,
+    layouts: &mut HashMap<ValueId, onnx_runtime_loader::ExpertTensorLayout>,
+) -> Option<()> {
+    let value = node.inputs.get(input_index).and_then(|slot| *slot)?;
+    let weight = qmoe_initializer(graph, value)?;
+    let derived = (|| {
+        let scales_value = node.inputs.get(scales_index).and_then(|slot| *slot)?;
+        let scales_weight = qmoe_initializer(graph, scales_value)?;
+        let scales_dims = scales_weight.dims();
+        if scales_dims.len() != 3 {
+            return None;
+        }
+        let blocks_per_row = scales_dims[2];
+        onnx_runtime_loader::qmoe_expert_tensor_layout(
+            bits,
+            block_size,
+            blocks_per_row,
+            weight.dims(),
+        )
+    })();
+    let layout = derived.unwrap_or(onnx_runtime_loader::ExpertTensorLayout {
+        version: 1,
+        experts: 0,
+        rows_per_expert: 0,
+        storage_elements_per_row: 0,
+        order: onnx_runtime_loader::ExpertStorageOrder::Interleaved,
+        quantization: None,
+    });
+    layouts.insert(value, layout);
+    Some(())
+}
+
+/// Resolve `value` to the [`onnx_runtime_ir::WeightRef`] it initializes,
+/// following one `Cast` producer (the same convention
+/// `onnx-genai-engine::engine::placement` uses for QMoE inputs that a graph
+/// rewrite has cast to a wider compute dtype).
+fn qmoe_initializer(graph: &Graph, value: ValueId) -> Option<&onnx_runtime_ir::WeightRef> {
+    if let Some(weight) = graph.initializers.get(&value) {
+        return Some(weight);
+    }
+    let producer = graph.values.get(value)?.producer?;
+    let node = graph.nodes.get(producer)?;
+    if node.domain.is_empty() && node.op_type == "Cast" {
+        let source = node.inputs.first().and_then(|slot| *slot)?;
+        return graph.initializers.get(&source);
+    }
+    None
+}
+
+fn qmoe_int_attr(node: &Node, name: &'static str, default: i64) -> std::result::Result<i64, ()> {
+    match node.attr(name) {
+        Some(attr) => attr.as_int().ok_or(()),
+        None => Ok(default),
+    }
 }
 
 impl Executor {
+    /// Per-expert region candidates recorded for `com.microsoft::QMoE` lazy
+    /// weights, keyed by initializer [`ValueId`]. See
+    /// [`Executor::expert_region_candidates`](state) for the additive,
+    /// measurement-neutral contract this exposes.
+    #[cfg(test)]
+    pub(super) fn expert_region_candidates(
+        &self,
+    ) -> &HashMap<ValueId, onnx_runtime_loader::WeightRegionCatalog> {
+        &self.expert_region_candidates
+    }
+
+    /// The default [`onnx_runtime_ep_api::ResidencyPlan`] built for this
+    /// executor's expert region candidates. Read-only outside tests today —
+    /// no dispatch-time consumer exists yet; this exposes the plan purely
+    /// for telemetry/measurement and future policy wiring.
+    #[cfg(test)]
+    pub(super) fn residency_plan(&self) -> &onnx_runtime_ep_api::ResidencyPlan {
+        &self.residency_plan
+    }
+
     /// Compile a graph + weights into a runnable executor on the CPU EP.
     pub(crate) fn build(
         graph: Graph,
@@ -435,17 +818,34 @@ impl Executor {
             Self::place_graph(&mut graph, &weights, &mut ep, require_cuda)?;
         // Topological order up front: also validates the selected graph is a DAG.
         let order = graph.topological_order()?;
-        let weight_handles = {
+        let (weight_handles, expert_region_candidates) = {
             let mut span = trace_span("session.lazy_weight_handles", "session");
-            let handles = build_lazy_weight_handles(&graph, &weights, ep.as_ref())?;
+            let (handles, candidates) =
+                build_lazy_weight_handles_and_candidates(&graph, &weights, ep.as_ref())?;
             if let Some(span) = span.as_mut() {
                 span.set_args(
                     Args::new()
                         .with("handles", handles.len() as u64)
-                        .with("initializers", graph.initializers.len() as u64),
+                        .with("initializers", graph.initializers.len() as u64)
+                        .with("expert_region_candidates", candidates.len() as u64),
                 );
             }
-            handles
+            (handles, candidates)
+        };
+
+        let residency_plan = {
+            let mut span = trace_span("session.residency_plan", "session");
+            let plan = plan_default_residency(&graph, &expert_region_candidates);
+            if let Some(span) = span.as_mut() {
+                span.set_args(
+                    Args::new()
+                        .with("policy", plan.policy_name().to_string())
+                        .with("resident", plan.resident_count() as u64)
+                        .with("degraded", plan.degraded_count() as u64)
+                        .with("total", plan.len() as u64),
+                );
+            }
+            plan
         };
 
         let (mut value_shapes, mut value_dtypes, buffers, buffer_shapes) =
@@ -480,7 +880,10 @@ impl Executor {
             graph,
             weights,
             ep,
+            graph_slot: DeviceGraphSlot::Primary,
             weight_handles,
+            expert_region_candidates,
+            residency_plan,
             prefetch_issue_nodes: std::sync::Mutex::new(HashMap::new()),
             prefetch_lookahead_nodes: dense_weight_prefetch_lookahead_nodes(),
             buffers,
@@ -496,15 +899,8 @@ impl Executor {
             subgraph_execs: HashMap::new(),
             control_flow_stats: ControlFlowStats::default(),
             if_last_predicate: HashMap::new(),
-            device_graph_signature: None,
-            capture_schedule: None,
-            capture_segmentation: Vec::new(),
+            slot_capture: std::array::from_fn(|_| SlotCaptureState::default()),
             control_flow_output_values,
-            capture_cf_shapes: HashMap::new(),
-            capture_warm_signature: None,
-            capture_warm_shapes: HashMap::new(),
-            capture_warm_seeded: HashMap::new(),
-            capture_quarantine_ops: HashSet::new(),
             capture_growing_symbols,
             capacity_pinned_kv_symbols: HashSet::new(),
             last_capture_failed_node: None,
@@ -514,6 +910,7 @@ impl Executor {
             activation_memory_plan: None,
             shared_buffers: HashMap::new(),
             parked_input_buffers: Vec::new(),
+            capture_deferred_frees: Vec::new(),
             sequences: HashMap::new(),
             seq_elem_values: HashMap::new(),
             execution_provider_fallback_report,
@@ -535,12 +932,14 @@ impl Executor {
             decode_view_plan_sig_mismatch_streak: 0,
             decode_view_plan_disabled: false,
             compute_in_place_enabled: compute_in_place_env_enabled(),
+            release_dead_values_enabled: false,
             compute_in_place_alias_count: 0,
             scan_inline_single_trip_enabled: scan_inline_single_trip_env_enabled(),
             scan_inline_single_trip_count: 0,
             kernel_bindings: vec![None; plan_len],
             persistent_workspace: None,
             step_workspace: None,
+            pin_step_workspace: false,
             inherited_workspace: None,
             workspace_preparation_required: false,
         };
@@ -719,12 +1118,61 @@ impl Executor {
         Ok(Some(sibling))
     }
 
+    /// Build a verify-dedicated sibling executor for native MTP self-speculative
+    /// decode. Structurally identical to the main executor (same graph), but with
+    /// its **own** interior device-buffer arena (`buffers`/`buffer_shapes`) so the
+    /// fixed M=k+1 verify forward's JIT-sized interior scratch is never resized by
+    /// the interleaved M=1 base decode running on the main executor — the exact
+    /// clobber that made the shared-arena verify capture decline (interior
+    /// `Slice` sized `[1,1]` by the M=1 decode vs the `[1,2]` the M=2 verify
+    /// needs). Shares ONLY the immutable `Arc<WeightStore>` and
+    /// `Arc<dyn ExecutionProvider>` with the main executor, so a verify step
+    /// routed here binds the identical persistent **external** state buffers (KV
+    /// cache, recurrent/conv state, embeds) supplied through the caller's
+    /// `bindings`, while its **interior** scratch stays private and fixed at the
+    /// M=k+1 shape across every replay. Drives the [`DeviceGraphSlot::Verify`]
+    /// slot so its captured M=k+1 graph is independent of the main executor's
+    /// `Primary` M=1 decode graph (both coexist on the shared EP and each replays
+    /// by shape key). No graph transform is applied: unlike the decode-inline
+    /// sibling this is a plain structural clone, so it is available for **any**
+    /// model with recurrent state (including artifacts whose recurrent `Scan` is
+    /// not single-trip-inlineable).
+    pub(crate) fn build_verify_sibling(&self) -> Result<Self> {
+        let mut graph = self.graph.clone();
+        // Re-resolve interior shapes on the cloned (post-placement) graph before
+        // build, mirroring `build_decode_inline_sibling`'s permissive re-inference.
+        let registry = InferenceRegistry::default_registry();
+        let opset_imports = graph.opset_imports.clone();
+        registry.infer_graph(&mut graph, &opset_imports, MergePolicy::Permissive)?;
+        let mut sibling = Self::build(graph, Arc::clone(&self.weights), Arc::clone(&self.ep))?;
+        sibling.graph_slot = DeviceGraphSlot::Verify;
+        // Pin the sibling's StepScoped workspace. The sibling ONLY ever runs the
+        // fixed M=k+1 verify shape, so its workspace is reserved once at that peak
+        // and never needs to grow or shrink. Its captured verify graph bakes the
+        // workspace device pointer, so it must NOT be freed between replays:
+        // without the pin, `release_step_workspace` returns the workspace to the
+        // shared EP arena after each step, the interleaved M=1 decode on the main
+        // executor reserves that same freed slot, and the next verify replay reads
+        // reallocated memory (a nondeterministic illegal access, #1647's stale-ptr
+        // hazard). Pinning keeps the sibling's scratch pointer stable for every
+        // replay.
+        sibling.pin_step_workspace = true;
+        Ok(sibling)
+    }
+
     /// Place the graph on execution providers: reject incompatible graphs, run
     /// the EP-scoped optimizer passes, and — when the requested CUDA EP cannot
     /// cover the graph and CUDA is not required — fall back to the CPU EP.
     /// Reassigns `graph` and `ep` in place and returns the fallback report (if
     /// any) for the executor to retain. Preserves the `session.node_placement`
     /// tracing span and every span argument.
+    ///
+    /// Also runs [`rewrite_kv_capacity_appends`] (the S3 capacity-emission
+    /// gate) between the EP-scoped optimizer passes and the CUDA-coverage
+    /// fallback check: it must see the *stabilized* post-EP-pass graph (any
+    /// CUDA-only fusion that could otherwise touch a KV-growth `Concat` has
+    /// already run), and its own output must be accounted for by the coverage
+    /// check that follows.
     fn place_graph(
         graph: &mut Graph,
         weights: &Arc<WeightStore>,
@@ -754,6 +1202,7 @@ impl Executor {
         let ep_pass_nodes_before = graph.num_nodes();
         run_ep_scoped_passes(graph, weights, ep.as_ref())?;
         let ep_pass_nodes_after = graph.num_nodes();
+        rewrite_kv_capacity_appends(graph, ep.as_ref());
         let mut execution_provider_fallback_report = cuda_fallback_report(graph, ep.as_ref());
         let fallback_declines = execution_provider_fallback_report
             .as_ref()
@@ -1038,8 +1487,18 @@ impl Executor {
                 .collect();
             let output_dtypes: Vec<DataType> = outputs.iter().map(|v| value_dtypes[v]).collect();
             let mut lazy_weight_inputs = Vec::new();
+            // Dense (`MatMul`/`MatMulNBits`) and `BlockQuantizedMoE` weights may
+            // all be look-ahead prefetched: each boundary's EP-side
+            // `prefetch_lazy_weight` decides independently whether it can act on
+            // a given weight, so listing a boundary here only makes it eligible
+            // to be *offered* early, never that it will be. `QMoE`'s routed
+            // residency is intentionally excluded — it is a per-dispatch
+            // whole-bank guard (`RoutedResidencyProof`/`acquire_routed_residency`,
+            // #1797), not a look-ahead page-in, and mixing the two seams would
+            // require a second residency authority for the same weight.
             if LazyWeightBoundary::MatMul.matches(&node.domain, &node.op_type)
                 || LazyWeightBoundary::MatMulNBits.matches(&node.domain, &node.op_type)
+                || LazyWeightBoundary::BlockQuantizedMoe.matches(&node.domain, &node.op_type)
             {
                 for vid in inputs.iter().flatten() {
                     if weight_handles
@@ -1058,6 +1517,7 @@ impl Executor {
                 input_dtypes,
                 output_dtypes,
                 inplace_dead_inputs: Vec::new(),
+                dead_after: Vec::new(),
                 lazy_weight_inputs,
             });
         }
@@ -1091,6 +1551,27 @@ impl Executor {
                     })
                 })
                 .collect();
+            // Values this node consumes for the last time. Weights are excluded
+            // here rather than at runtime because an initializer's buffer is
+            // built once and reused by every later run -- releasing it after its
+            // final *use in this run* would leave the next run with no weights.
+            // Graph inputs are excluded for the same reason at a different
+            // lifetime: their storage belongs to the caller's binding.
+            let mut seen = std::collections::HashSet::new();
+            let dead_after: Vec<ValueId> = node
+                .inputs
+                .iter()
+                .flatten()
+                .copied()
+                .filter(|vid| {
+                    last_use.get(vid) == Some(&pi)
+                        && !graph_outputs.contains(vid)
+                        && !graph.initializers.contains_key(vid)
+                        && !graph.inputs.contains(vid)
+                        && seen.insert(*vid)
+                })
+                .collect();
+            node.dead_after = dead_after;
         }
         if let Some(span) = plan_span.as_mut() {
             span.set_args(
@@ -1742,6 +2223,10 @@ impl Executor {
                 !self.binding_consumers_use_padded_capacity(vid)
             }
         });
+        let decode_freeze_safe_mask = self
+            .input_index
+            .get(&input_name)
+            .is_some_and(|&vid| self.binding_mask_is_decode_freeze_safe(vid));
         DeviceIoBinding::allocate(
             self.ep.clone(),
             DeviceBindingSpec {
@@ -1752,6 +2237,7 @@ impl Executor {
                 physical_shape,
                 logical_shape,
                 expose_logical_input_shape,
+                decode_freeze_safe_mask,
                 allocation_bytes: None,
                 committed_ranges: None,
             },
@@ -1776,6 +2262,10 @@ impl Executor {
                 !self.binding_consumers_use_padded_capacity(vid)
             }
         });
+        let decode_freeze_safe_mask = self
+            .input_index
+            .get(&input_name)
+            .is_some_and(|&vid| self.binding_mask_is_decode_freeze_safe(vid));
         DeviceIoBinding::allocate(
             self.ep.clone(),
             DeviceBindingSpec {
@@ -1786,6 +2276,7 @@ impl Executor {
                 physical_shape,
                 logical_shape,
                 expose_logical_input_shape,
+                decode_freeze_safe_mask,
                 allocation_bytes: Some(allocation_bytes),
                 committed_ranges: Some(committed_ranges),
             },
@@ -1828,6 +2319,10 @@ impl Executor {
                 !self.binding_consumers_use_padded_capacity(vid)
             }
         });
+        let decode_freeze_safe_mask = self
+            .input_index
+            .get(&input_name)
+            .is_some_and(|&vid| self.binding_mask_is_decode_freeze_safe(vid));
         // SAFETY: delegated to this function's contract.
         unsafe {
             DeviceIoBinding::from_external_memory(
@@ -1840,6 +2335,7 @@ impl Executor {
                     physical_shape,
                     logical_shape,
                     expose_logical_input_shape,
+                    decode_freeze_safe_mask,
                     allocation_bytes: None,
                     committed_ranges: None,
                 },
@@ -1866,6 +2362,7 @@ impl Executor {
                 physical_shape,
                 logical_shape,
                 expose_logical_input_shape: false,
+                decode_freeze_safe_mask: false,
                 allocation_bytes: None,
                 committed_ranges: None,
             },
@@ -1888,7 +2385,70 @@ impl Executor {
         found
     }
 
+    /// Name the direct consumers of `input` that are **not** padded-capacity-safe
+    /// — the ones that force the binding to expose its logical valid length and
+    /// therefore forfeit CUDA-graph capture. The predicate itself only answers
+    /// yes/no, so bring-up on a new architecture otherwise has to re-derive the
+    /// offender from the graph by hand; report it instead of inferring it.
+    pub(super) fn padded_capacity_offenders(&self, input: ValueId) -> Vec<String> {
+        let mut offenders = Vec::new();
+        for plan in &self.plan {
+            for (slot, value) in plan.inputs.iter().enumerate() {
+                if *value != Some(input) {
+                    continue;
+                }
+                let node = self.graph.node(plan.node_id);
+                if let Some(described) = describe_non_padded_consumer(node, slot) {
+                    offenders.push(described);
+                }
+            }
+        }
+        offenders
+    }
+
     pub(super) fn binding_consumers_use_padded_capacity(&self, input: ValueId) -> bool {
+        let padded = self.binding_consumers_use_padded_capacity_inner(input);
+        if !padded {
+            self.report_padded_capacity_decline(input);
+        }
+        padded
+    }
+
+    /// Emit the attribution for a padded-capacity decline. Gated behind
+    /// `ONNX_GENAI_CUDA_DEBUG_MASK_CAPACITY` so the default path stays silent,
+    /// matching the RMSNorm-fold attribution added in #1671.
+    fn report_padded_capacity_decline(&self, input: ValueId) {
+        let offenders = self.padded_capacity_offenders(input);
+        if offenders.is_empty() {
+            return;
+        }
+        if std::env::var("ONNX_GENAI_CUDA_DEBUG_MASK_CAPACITY").is_ok_and(|v| v != "0") {
+            eprintln!(
+                "mask_capacity_decline: non-capacity-aware consumer(s) {}",
+                offenders.join(", ")
+            );
+            // The direct-consumer list only explains the fast path. When the
+            // topology-gated fallbacks also declined, name the reason each gave.
+            // `Disqualify` drives static freezing; `Allow` is the weaker
+            // decode-freeze-safe classification that actually decides whether a
+            // single-token decode step may still capture, so report both.
+            if let Some(reason) =
+                mask_cone_rejection(&self.graph, input, ShapeConsumptionPolicy::Disqualify)
+            {
+                eprintln!("mask_capacity_decline: static freeze rejected: {reason}");
+            }
+            match mask_cone_rejection(&self.graph, input, ShapeConsumptionPolicy::Allow) {
+                Some(reason) => {
+                    eprintln!("mask_capacity_decline: decode-freeze-safe rejected: {reason}")
+                }
+                None => eprintln!(
+                    "mask_capacity_decline: decode-freeze-safe HOLDS (capture may still proceed)"
+                ),
+            }
+        }
+    }
+
+    fn binding_consumers_use_padded_capacity_inner(&self, input: ValueId) -> bool {
         let mut found = false;
         let mut all_direct_padded = true;
         for plan in &self.plan {
@@ -1918,6 +2478,20 @@ impl Executor {
         mask_binding_feeds_capacity_form_attention(&self.graph, input)
     }
 
+    /// Whether the mask binding `input` is *decode-freeze-safe*: it feeds only the
+    /// additive causal-mask builder cone terminating at capacity-form `Attention`,
+    /// so a single-token decode step (`q_seq == 1`) can freeze the mask to
+    /// physical capacity even when [`Self::binding_consumers_use_padded_capacity`]
+    /// declines to freeze it *statically* (because `Shape(mask)` leaks the padded
+    /// width into the multi-token prefill query-position window). The decode
+    /// window saturates at `q_seq == 1`, so a frozen decode mask is byte-identical
+    /// and keeps `logical == physical`, restoring CUDA-graph capture eligibility
+    /// for these models (e.g. DeepSeek-V2-Lite). GLM-5.2's indexer `Add` cone is
+    /// still excluded, so it is not decode-freeze-safe.
+    pub(super) fn binding_mask_is_decode_freeze_safe(&self, input: ValueId) -> bool {
+        mask_binding_feeds_additive_causal_builder(&self.graph, input)
+    }
+
     /// The compiled graph, retained for the §55.4 EPContext dump path: the
     /// exporter needs the (post-optimize) graph to serialise a `*_ctx.onnx`
     /// context-cache model with compiled partitions spliced out.
@@ -1940,6 +2514,16 @@ impl Executor {
             child.set_trace_context(trace.clone());
         }
         self.trace = trace;
+    }
+
+    /// Enable/disable dead-value buffer release, propagating to control-flow
+    /// child executors so a Scan/Loop body frees its intermediates too -- the
+    /// vision encoder's per-image Scan bodies are a large part of its live set.
+    pub(crate) fn set_release_dead_values(&mut self, enabled: bool) {
+        for child in self.subgraph_execs.values_mut() {
+            child.set_release_dead_values(enabled);
+        }
+        self.release_dead_values_enabled = enabled;
     }
 
     /// Live weight bytes backing the graph, needed alongside [`Self::graph`] so

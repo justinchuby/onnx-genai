@@ -10,6 +10,21 @@ fn fixture() -> anyhow::Result<PathBuf> {
         .canonicalize()?)
 }
 
+/// Resolve a model path to whichever of the binary `.onnx` or the git-friendly
+/// `.onnx.textproto` fixture actually exists. In-sandbox the binary head cannot
+/// be rebuilt (Mobius is not importable), so only the textproto is checked in;
+/// `Session::new` transparently converts textproto fixtures.
+fn resolve_model(binary: &Path) -> PathBuf {
+    if binary.exists() {
+        return binary.to_path_buf();
+    }
+    let textproto = binary.with_extension("onnx.textproto");
+    if textproto.exists() {
+        return textproto;
+    }
+    binary.to_path_buf()
+}
+
 fn engine(fixture: &Path, speculative_mode: SpeculativeMode) -> anyhow::Result<Engine> {
     Engine::from_dir_with_session_options(
         fixture,
@@ -32,7 +47,7 @@ fn request() -> GenerateRequest {
 
 fn pre_phase1_mtp_mode(fixture: &Path) -> SpeculativeMode {
     SpeculativeMode::Mtp(MtpConfig {
-        head_model: fixture.join("mtp/model.onnx"),
+        head_model: resolve_model(&fixture.join("mtp/model.onnx")),
         target_hidden_output: "hidden_states.0".into(),
         embedding_weights: fixture.join("embedding.f32"),
         lm_head_weights: fixture.join("lm_head.f32"),

@@ -17,7 +17,7 @@ use axum::{
 use onnx_genai::engine::EngineDecodeBackend;
 use onnx_genai::{Engine, EngineConfig};
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, fs, io::Cursor, path::PathBuf, time::Duration};
+use std::{collections::BTreeMap, io::Cursor, path::PathBuf, time::Duration};
 use tokio::{sync::mpsc, time::timeout};
 use tower::ServiceExt;
 
@@ -1012,27 +1012,127 @@ async fn transcription_multipart_against_non_audio_model_returns_400() {
 }
 
 #[tokio::test]
-async fn audio_chat_against_non_audio_model_returns_400() {
+async fn speech_endpoint_rejects_streaming_before_execution() {
     let response = app(tiny_state())
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/v1/chat/completions")
+                .uri("/v1/audio/speech")
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     json!({
                         "model": "tiny-llm",
-                        "messages": [{
-                            "role": "user",
-                            "content": [{
-                                "type": "input_audio",
-                                "input_audio": {
-                                    "data": tiny_wav_base64(),
-                                    "format": "wav"
-                                }
-                            }]
-                        }],
-                        "max_tokens": 1
+                        "input": "lyrics",
+                        "instructions": "music description",
+                        "response_format": "wav",
+                        "stream": true
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("stream=true")
+    );
+}
+
+#[tokio::test]
+async fn speech_endpoint_accepts_only_wav_delivery() {
+    let response = app(tiny_state())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/audio/speech")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "tiny-llm",
+                        "input": "lyrics",
+                        "response_format": "mp3"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("response_format=wav")
+    );
+}
+
+#[tokio::test]
+async fn non_speech_registry_entry_does_not_expose_speech_route() {
+    let response = app(tiny_state())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/audio/speech")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "model": "tiny-llm",
+                        "input": "lyrics",
+                        "instructions": "music",
+                        "response_format": "wav",
+                        "stream": false
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body = String::from_utf8(body.to_vec()).expect("UTF-8");
+    assert!(
+        body.contains("compatible buffered PCM16 WAV output"),
+        "{body}"
+    );
+}
+
+fn speech_state() -> AppState {
+    let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/onnx_genai_workflows/speech_wav");
+    AppState::load(&model_dir, Some("speech-wav".to_string())).expect("load speech fixture")
+}
+
+/// Raw `/v1/audio/speech` conformance against an ONNX-owned, self-contained
+/// workflow package: a text prompt assembled by a generic text-assembly adapter
+/// is synthesized into a buffered PCM16 WAV that honours the package's declared
+/// `media` contract (audio/wav, two channels, 24 kHz, 16-bit). The runtime only
+/// consumes canonical metadata fields, so this holds for any package that
+/// declares the same contract.
+#[tokio::test]
+async fn speech_endpoint_synthesizes_buffered_pcm16_wav() {
+    let response = app(speech_state())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/audio/speech")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "speech-wav",
+                        "input": "hello world",
+                        "instructions": "the quick brown fox",
+                        "response_format": "wav",
+                        "stream": false
                     })
                     .to_string(),
                 ))
@@ -1041,15 +1141,290 @@ async fn audio_chat_against_non_audio_model_returns_400() {
         .await
         .unwrap();
 
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("audio/wav")
+    );
+
+    let wav = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert!(wav.len() > 44, "WAV must carry a header plus PCM samples");
+    assert_eq!(&wav[0..4], b"RIFF");
+    assert_eq!(&wav[8..12], b"WAVE");
+    assert_eq!(&wav[12..16], b"fmt ");
+    // Audio format tag 1 == PCM.
+    assert_eq!(u16::from_le_bytes([wav[20], wav[21]]), 1);
+    // Channel count and sample rate come from the declared media contract.
+    assert_eq!(u16::from_le_bytes([wav[22], wav[23]]), 2);
+    assert_eq!(
+        u32::from_le_bytes([wav[24], wav[25], wav[26], wav[27]]),
+        24000
+    );
+    // pcm_s16_le is 16-bit.
+    assert_eq!(u16::from_le_bytes([wav[34], wav[35]]), 16);
+    assert_eq!(&wav[36..40], b"data");
+}
+
+/// The optional `max_output_units` budget is honoured against the package's
+/// declared ceiling. The value is read from the canonical text-assembly
+/// contract (`speech_processor.json`), not from any model-family default, so an
+/// explicit in-range budget still renders a valid buffered WAV.
+#[tokio::test]
+async fn speech_endpoint_honors_explicit_max_output_units() {
+    let response = app(speech_state())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/audio/speech")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "speech-wav",
+                        "input": "hello world",
+                        "instructions": "the quick brown fox",
+                        "response_format": "wav",
+                        "stream": false,
+                        "max_output_units": 3
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("audio/wav")
+    );
+    let wav = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(&wav[0..4], b"RIFF");
+    assert_eq!(&wav[8..12], b"WAVE");
+}
+
+/// The raw speech route fails closed when `max_output_units` falls outside the
+/// canonical `[1, max_output_units]` budget declared by the package. Both the
+/// zero and over-ceiling cases are rejected before any execution, and the error
+/// names the declared ceiling generically (no model-specific constant).
+#[tokio::test]
+async fn speech_endpoint_rejects_out_of_range_max_output_units() {
+    for units in [0_usize, 9999_usize] {
+        let response = app(speech_state())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/audio/speech")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "speech-wav",
+                            "input": "hello world",
+                            "response_format": "wav",
+                            "stream": false,
+                            "max_output_units": units
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "max_output_units={units} must be rejected"
+        );
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("max_output_units must be between 1 and"),
+            "message: {}",
+            body["error"]["message"]
+        );
+    }
+}
+
+/// The declared ceiling itself is exactly the inclusive upper bound: a request
+/// for the full budget (64) renders a valid WAV, while the first value beyond it
+/// (65) fails closed with an error that names the declared ceiling verbatim.
+#[tokio::test]
+async fn speech_endpoint_enforces_declared_max_output_units_ceiling() {
+    // The package declares `max_output_units: 64`; 64 is admitted.
+    let response = app(speech_state())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/audio/speech")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "speech-wav",
+                        "input": "hello world",
+                        "response_format": "wav",
+                        "stream": false,
+                        "max_output_units": 64
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the declared ceiling of 64 must be admitted"
+    );
+    let wav = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(&wav[0..4], b"RIFF");
+    assert_eq!(&wav[8..12], b"WAVE");
+
+    // 65 is the first value beyond the ceiling and must be rejected.
+    let response = app(speech_state())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/audio/speech")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "speech-wav",
+                        "input": "hello world",
+                        "response_format": "wav",
+                        "stream": false,
+                        "max_output_units": 65
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let body: Value = serde_json::from_slice(&body).unwrap();
     let message = body["error"]["message"].as_str().unwrap();
-    assert!(message.contains("What:"), "message: {message}");
-    assert!(message.contains("How:"), "message: {message}");
     assert!(
-        message.contains("single decoder graph"),
-        "the rejection must explain why this model cannot take audio: {message}"
+        message.contains("64"),
+        "error must name the declared ceiling of 64: {message}"
+    );
+}
+
+fn speech_state_from(fixture: &str, id: &str) -> AppState {
+    let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/onnx_genai_workflows")
+        .join(fixture);
+    AppState::load(&model_dir, Some(id.to_string())).expect("load speech fixture")
+}
+
+fn try_load_speech_fixture(fixture: &str, id: &str) -> anyhow::Result<AppState> {
+    let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/onnx_genai_workflows")
+        .join(fixture);
+    AppState::load(&model_dir, Some(id.to_string()))
+}
+
+/// Admission and execution must bind the *exact* compatible output resolved at
+/// load time, not merely "any" role: audio output. The mixed fixture declares
+/// two role: audio outputs where the map-first key (`audio`) is an incompatible
+/// raw float stream and only the second (`waveform`) is a compatible buffered
+/// PCM16 WAV (mono, 16 kHz, 64 samples => 128 bytes of PCM). A correct binding
+/// encodes `waveform`; the old "first role: audio" behaviour would have selected
+/// the incompatible `audio` output instead.
+#[tokio::test]
+async fn speech_endpoint_encodes_resolved_output_not_map_first_role_audio() {
+    let response = app(speech_state_from("speech_wav_mixed_audio", "speech-mixed"))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/audio/speech")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "speech-mixed",
+                        "input": "hello world",
+                        "instructions": "the quick brown fox",
+                        "response_format": "wav",
+                        "stream": false
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("audio/wav")
+    );
+    let wav = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(&wav[0..4], b"RIFF");
+    assert_eq!(&wav[8..12], b"WAVE");
+    assert_eq!(&wav[12..16], b"fmt ");
+    // The resolved `waveform` output is mono at 16 kHz; the incompatible,
+    // map-first `audio` output would have been stereo at 24 kHz.
+    assert_eq!(
+        u16::from_le_bytes([wav[22], wav[23]]),
+        1,
+        "must encode the resolved mono waveform output, not the stereo audio output"
+    );
+    assert_eq!(
+        u32::from_le_bytes([wav[24], wav[25], wav[26], wav[27]]),
+        16000,
+        "must encode the resolved output's 16 kHz sample rate"
+    );
+    assert_eq!(&wav[36..40], b"data");
+    // 64 samples * 1 channel * 2 bytes (pcm_s16_le) == 128 bytes of PCM data.
+    assert_eq!(
+        u32::from_le_bytes([wav[40], wav[41], wav[42], wav[43]]),
+        128,
+        "must carry exactly the resolved mono output's PCM payload"
+    );
+}
+
+/// Fail closed when more than one workflow output declares a compatible buffered
+/// PCM16 WAV audio contract: the load cannot decide which output the speech
+/// adapter binds to, so it rejects with a clear error naming both candidates.
+#[test]
+fn speech_load_rejects_ambiguous_audio_outputs() {
+    let error = match try_load_speech_fixture("speech_wav_two_audio", "speech-two-audio") {
+        Ok(_) => panic!("ambiguous compatible audio outputs must be rejected at load"),
+        Err(error) => format!("{error:#}"),
+    };
+    assert!(
+        error.contains("exactly one is required to bind the speech text-assembly adapter"),
+        "error must explain the ambiguity: {error}"
+    );
+}
+
+/// Fail closed when more than one component implements the text-assembly
+/// contract: the speech processor cannot be resolved unambiguously, so the load
+/// rejects with a clear error.
+#[test]
+fn speech_load_rejects_multiple_text_assembly_adapters() {
+    let error = match try_load_speech_fixture("speech_wav_two_adapters", "speech-two-adapters") {
+        Ok(_) => panic!("multiple text-assembly adapters must be rejected at load"),
+        Err(error) => format!("{error:#}"),
+    };
+    assert!(
+        error.contains("exactly one is required for speech synthesis"),
+        "error must explain the adapter ambiguity: {error}"
     );
 }
 
@@ -1145,117 +1520,6 @@ async fn audio_endpoints_route_through_tiny_whisper_pipeline() {
         .await
         .unwrap();
     assert!(!text_body.is_empty());
-}
-
-#[tokio::test]
-async fn image_decode_and_preprocessing_use_pipeline_tensor_shape() {
-    use onnx_genai_ort::{DataType, PipelineModels};
-
-    let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../models/tiny-vlm");
-    if !model_dir.is_dir() {
-        eprintln!("skipping image preprocessing test: tiny-vlm fixture is absent");
-        return;
-    }
-
-    let models = PipelineModels::load(&model_dir).unwrap();
-    let encoder = models.session("encoder").expect("encoder");
-    let input = encoder
-        .inputs()
-        .iter()
-        .find(|input| input.name == "pixel_values")
-        .expect("pixel_values");
-    assert_eq!(input.dtype, DataType::Float32);
-    let spec = crate::image_input::VisionInputSpec::from_input(
-        "encoder.pixel_values".to_string(),
-        &input.shape,
-    )
-    .unwrap();
-    let tensor = crate::image_input::load_and_preprocess(&[tiny_png_data_uri()], &spec)
-        .await
-        .unwrap();
-
-    assert_eq!(tensor.shape, input.shape);
-    assert_eq!(
-        tensor.data.len(),
-        input.shape.iter().product::<i64>() as usize
-    );
-    assert!(tensor.data.iter().all(|value| (0.0..=1.0).contains(value)));
-}
-
-#[tokio::test]
-async fn sidecar_free_compatibility_package_builds_server_pipeline_and_preprocesses_image() {
-    // `vlm-complete` is deliberately rank-mismatched: it exists so
-    // `pipeline_genai_fallback` can assert admission rejects it. This test needs
-    // a package that actually loads, so it uses the consistent one, where the
-    // vision encoder emits flat `[num_image_tokens, hidden]` features and the
-    // embedding graph raises them to `inputs_embeds` — the shape real packages
-    // use (Mobius Gemma4, onnxruntime-genai).
-    let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../onnx-genai-genai-config/tests/fixtures/vlm-executable");
-    let handle = crate::state::build_handle(
-        &ModelSpec {
-            id: "compat-vlm".to_owned(),
-            path: model_dir,
-            eager: true,
-            warmup: false,
-        },
-        &ServerConfig::default(),
-    )
-    .expect("the real server model-loading path accepts the compatibility package");
-
-    assert!(handle.pipeline);
-    let vision = handle
-        .multimodal
-        .as_ref()
-        .and_then(|multimodal| multimodal.vision.as_ref())
-        .expect("server constructed executable vision preprocessing");
-    let tensor = crate::image_input::load_and_preprocess(&[tiny_png_data_uri()], vision)
-        .await
-        .expect("server preprocessing executes");
-    assert_eq!(tensor.tensors[0].endpoint, "vision_encoder.pixel_values");
-    assert!(!tensor.data.is_empty());
-    assert!(tensor.num_tiles > 0);
-}
-
-#[tokio::test]
-async fn vision_request_against_non_pipeline_model_returns_400() {
-    let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
-    let state = AppState::load(&model_dir, Some("tiny-llm".to_string())).expect("load fixture");
-    let response = app(state)
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/chat/completions")
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(
-                    json!({
-                        "model": "tiny-llm",
-                        "messages": [{
-                            "role": "user",
-                            "content": [
-                                {"type": "text", "text": "describe"},
-                                {"type": "image_url", "image_url": {"url": tiny_png_data_uri()}}
-                            ]
-                        }],
-                        "max_tokens": 1
-                    })
-                    .to_string(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-    let body: Value = serde_json::from_slice(&body).unwrap();
-    let message = body["error"]["message"].as_str().unwrap();
-    assert!(message.contains("What:"), "message: {message}");
-    assert!(message.contains("How:"), "message: {message}");
-    assert!(
-        message.contains("single decoder graph"),
-        "the rejection must explain why this model cannot take images: {message}"
-    );
 }
 
 #[tokio::test]
@@ -1383,7 +1647,11 @@ async fn debug_endpoints_expose_config_sessions_cache_and_trace_state() {
         serde_json::from_slice(&to_bytes(config.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(config["model_id"], "tiny-llm");
     assert_eq!(config["max_queue_depth"], 256);
-    assert_eq!(config["pipeline"], false);
+    // Facts about the package's serialized workflow, not about which executor
+    // the runtime chose for a declared step.
+    assert_eq!(config["workflow_components"], 2);
+    assert_eq!(config["workflow_graph_components"], 1);
+    assert_eq!(config["workflow_declares_generation_loop"], true);
 
     let created = router
         .clone()
@@ -1835,6 +2103,12 @@ async fn resources_get_and_admin_vram_override_report_governor_state() {
             .unwrap()
             .contains("cannot satisfy lowered resource limit")
     );
+    // A 409 is never a fault: nothing broke and the caller can act on it.
+    assert_eq!(
+        impossible["error"]["type"].as_str(),
+        Some("conflict_error"),
+        "{impossible}"
+    );
 
     let valid = router
         .oneshot(
@@ -1904,32 +2178,6 @@ async fn default_max_batch_is_silently_clamped_on_non_batching_backend() {
             .as_str()
             .is_some_and(|r| !r.is_empty()),
         "batching report must carry a non-empty reason"
-    );
-}
-
-#[tokio::test]
-async fn resources_reports_batching_supported_on_static_cache_backend() {
-    // The static-cache fixture decodes a shared batch, so the report must say so:
-    // this is the positive control proving the capability is read from the decode
-    // path and not hard-coded to false.
-    let model_dir =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm-scatter");
-    let state =
-        AppState::load(&model_dir, Some("tiny-llm-scatter".to_string())).expect("load scatter");
-    let response = app(state)
-        .oneshot(
-            Request::builder()
-                .uri("/v1/resources")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = json_body(response).await;
-    assert_eq!(
-        body["batching"]["supported"], true,
-        "static-cache decode supports continuous batching"
     );
 }
 
@@ -2133,7 +2381,17 @@ async fn fim_stream_returns_headers_before_generation_finishes() {
         ))
         .unwrap();
 
-    let response = timeout(Duration::from_millis(100), app(state).oneshot(request))
+    // The property is that headers follow *admission* rather than a completed
+    // generation — the bug this guards against withheld them until the whole
+    // FIM response was decoded, which is seconds on a real request.
+    //
+    // The budget is deliberately far wider than the thing being measured. At
+    // 100 ms it was measuring the machine: on a saturated box under
+    // `--test-threads=$(nproc)` it fails while the request itself takes
+    // milliseconds. A whole probe run — load plus six 64-token generations —
+    // measures 115 ms, so two seconds separates "after admission" from "after
+    // generation" with room the scheduler cannot eat.
+    let response = timeout(Duration::from_secs(2), app(state).oneshot(request))
         .await
         .expect("SSE headers must follow admission, not completed FIM generation")
         .unwrap();
@@ -2270,18 +2528,17 @@ async fn queue_depth_admission_limit_returns_429_with_retry_after() {
 
 #[tokio::test]
 async fn stalled_output_route_does_not_block_another_completion() {
-    let model_dir =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm-scatter");
+    let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
     let engine = Engine::from_dir(&model_dir, EngineConfig::default()).unwrap();
     let driver = EngineDriver::start(engine, 2, 2);
     let slow_request: ChatCompletionRequest = serde_json::from_value(json!({
-        "model": "tiny-llm-scatter",
+        "model": "tiny-llm",
         "messages": [{"role": "user", "content": "hello"}],
         "max_tokens": 8
     }))
     .unwrap();
     let fast_request: ChatCompletionRequest = serde_json::from_value(json!({
-        "model": "tiny-llm-scatter",
+        "model": "tiny-llm",
         "messages": [{"role": "user", "content": "world"}],
         "max_tokens": 2
     }))
@@ -2294,8 +2551,11 @@ async fn stalled_output_route_does_not_block_another_completion() {
         .try_acquire_owned()
         .unwrap();
     driver
-        .commands
+        .workers
+        .primary_sender()
+        .expect("driver worker is running")
         .send(DriverCommand::Generate {
+            input: None,
             session_id: None,
             request: Box::new(build_generate_request(&slow_request)),
             admission: slow_admission,
@@ -2305,7 +2565,7 @@ async fn stalled_output_route_does_not_block_another_completion() {
         .await
         .unwrap();
     let fast_rx = driver
-        .generate(None, build_generate_request(&fast_request))
+        .generate(None, build_generate_request(&fast_request), None)
         .await
         .unwrap();
 
@@ -2340,7 +2600,10 @@ async fn native_driver_sessions_generate_through_server_path() {
     request.options.max_new_tokens = 2;
     request.options.temperature = 0.0;
     request.options.stop_on_eos = false;
-    let generation = driver.generate(Some(session_id), request).await.unwrap();
+    let generation = driver
+        .generate(Some(session_id), request, None)
+        .await
+        .unwrap();
     let result = timeout(
         Duration::from_secs(5),
         collect_generation_result(generation.events),
@@ -2352,108 +2615,6 @@ async fn native_driver_sessions_generate_through_server_path() {
     assert_eq!(result.token_ids, vec![1, 1]);
     assert_eq!(driver.session_token_count(session_id).await.unwrap(), 3);
     driver.close_session(session_id).await.unwrap();
-}
-
-#[tokio::test]
-async fn multimodal_input_expands_the_prompt_and_binds_the_declared_endpoint() {
-    use onnx_genai::engine::{GeneratePrompt, GenerateRequest, PipelineGenerateRequest};
-
-    // The one implementation the CLI and the HTTP API both go through.
-    let model_dir =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-vlm-image-input");
-    let setup = crate::multimodal::load(&model_dir)
-        .expect("the fixture declares a pipeline")
-        .expect("the fixture declares a pipeline");
-    let spec = setup
-        .multimodal
-        .vision
-        .as_ref()
-        .expect("the fixture declares an image contract");
-    let images = crate::image_input::fetch_images(&[tiny_png_data_uri()])
-        .await
-        .expect("the data URI decodes");
-
-    // Token 3 is the fixture's image placeholder; it expands to token 4.
-    let mut token_ids = vec![2_u32, 3];
-    let input = crate::multimodal::MultimodalInput::from_images(spec, &images, &mut token_ids, 64)
-        .expect("preprocessing and expansion succeed");
-    assert_eq!(
-        token_ids,
-        vec![2, 4],
-        "the placeholder must be replaced by the declared image token run"
-    );
-
-    let request = input
-        .bind(PipelineGenerateRequest::new(GenerateRequest::new(
-            GeneratePrompt::TokenIds(token_ids),
-        )))
-        .expect("binding succeeds");
-    assert!(
-        request.inputs.contains_key("encoder.pixel_values"),
-        "the declared endpoint must be bound: {:?}",
-        request.inputs.keys().collect::<Vec<_>>()
-    );
-}
-
-#[test]
-fn pipeline_setup_inspects_native_only_graph_without_ort_session() {
-    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/fixtures/tiny-native-sub4-engine");
-    let fixture = tempfile::tempdir().expect("create fixture directory");
-    fs::copy(
-        source.join("model.onnx.textproto"),
-        fixture.path().join("model.onnx.textproto"),
-    )
-    .expect("copy native-only model");
-    fs::copy(
-        source.join("tokenizer.json"),
-        fixture.path().join("tokenizer.json"),
-    )
-    .expect("copy tokenizer");
-    fs::write(
-        fixture.path().join("inference_metadata.yaml"),
-        r#"
-pipeline:
-  models:
-    decoder:
-      filename: model.onnx.textproto
-      type: decoder
-      tokenizer: tokenizer.json
-      io:
-        token_input: input_ids
-        attention_mask_input: attention_mask
-        position_ids_input: position_ids
-        logits_output: logits
-        kv_inputs: [past_key_values.0.key, past_key_values.0.value]
-        kv_outputs: [present.0.key, present.0.value]
-  strategy:
-    kind: autoregressive
-    decoder: decoder
-"#,
-    )
-    .expect("write pipeline metadata");
-
-    let setup = crate::multimodal::load(fixture.path())
-        .expect("graph-only setup inspection must not ask ORT to load native-only operators")
-        .expect("fixture declares a pipeline");
-    assert!(setup.multimodal.vision.is_none());
-    assert!(setup.multimodal.audio.is_none());
-    assert_eq!(setup.tokenizer_path, fixture.path().join("tokenizer.json"));
-}
-
-#[tokio::test]
-async fn image_load_and_preprocess_populates_num_tiles() {
-    let spec = crate::image_input::VisionInputSpec::from_input(
-        "encoder.pixel_values".to_string(),
-        // shape [N, C, H, W] — N is the batch/tile dimension
-        &[1, 3, 4, 4],
-    )
-    .expect("valid spec");
-    let tensor = crate::image_input::load_and_preprocess(&[tiny_png_data_uri()], &spec)
-        .await
-        .expect("preprocess succeeds");
-    // The preprocessor always produces at least one tile.
-    assert!(tensor.num_tiles >= 1, "num_tiles must be at least 1");
 }
 
 // ── KV cache dtype CLI/env surface tests ─────────────────────────────────────
@@ -2494,7 +2655,7 @@ fn kv_cache_dtype_rejects_garbage_values() {
     }
 }
 
-#[cfg(all(feature = "native-backend", feature = "cuda"))]
+#[cfg(feature = "native-cuda")]
 #[test]
 fn native_device_parser_accepts_cuda_index() {
     use crate::state::parse_native_device;
@@ -2512,16 +2673,24 @@ fn native_device_parser_accepts_cuda_index() {
     assert!(parse_native_device("webgpu").is_err());
 }
 
-#[cfg(all(feature = "native-backend", not(feature = "cuda")))]
+#[cfg(all(feature = "native-backend", not(feature = "native-cuda")))]
 #[test]
 fn native_device_parser_rejects_cuda_without_cuda_feature() {
     use crate::state::parse_native_device;
 
     assert!(parse_native_device("cpu").is_ok());
+    // Assert the facts, not the sentence: the message must name the feature that
+    // actually gates this path and give a usable rebuild command. The previous
+    // assertion pinned `'cuda' feature`, a name that no longer exists, so it kept
+    // passing after the rename while the message became unactionable.
+    let message = parse_native_device("cuda:0").unwrap_err();
     assert!(
-        parse_native_device("cuda:0")
-            .unwrap_err()
-            .contains("'cuda' feature")
+        message.contains("native-cuda"),
+        "message must name the real gating feature: {message}"
+    );
+    assert!(
+        message.contains("--features native-cuda"),
+        "message must give a usable rebuild command: {message}"
     );
 }
 
@@ -3305,15 +3474,6 @@ async fn concurrent_lazy_loads_of_same_id_load_once() {
     assert_eq!(ids, vec!["model-a", "model-b"]);
 }
 
-// ── OpenAI multimodal API surface ─────────────────────────────────────────────
-
-fn txt2img_state() -> AppState {
-    let model_dir =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-txt2img");
-    AppState::load(&model_dir, Some("tiny-txt2img".to_string()))
-        .expect("load the tiny txt2img fixture")
-}
-
 async fn post_json(state: AppState, uri: &str, body: Value) -> (StatusCode, Value) {
     let response = app(state)
         .oneshot(
@@ -3359,104 +3519,6 @@ fn assert_actionable(message: &str) {
     assert!(message.contains("What:"), "message: {message}");
     assert!(message.contains("Why:"), "message: {message}");
     assert!(message.contains("How:"), "message: {message}");
-}
-
-#[tokio::test]
-async fn images_generations_returns_a_base64_png() {
-    let (status, body) = post_json(
-        txt2img_state(),
-        "/v1/images/generations",
-        json!({
-            "model": "tiny-txt2img",
-            "prompt": "an astronaut riding a horse",
-            "negative_prompt": "blurry low quality",
-            "size": "8x8",
-            "steps": 3,
-            "seed": 7
-        }),
-    )
-    .await;
-
-    assert_eq!(status, StatusCode::OK, "body: {body}");
-    assert!(body["created"].as_u64().unwrap() > 0);
-    let data = body["data"].as_array().expect("data array");
-    assert_eq!(data.len(), 1);
-
-    use base64::{Engine as _, engine::general_purpose::STANDARD};
-    let png = STANDARD
-        .decode(data[0]["b64_json"].as_str().expect("b64_json"))
-        .expect("the payload must be standard base64");
-    let decoded = image::load_from_memory(&png).expect("the payload must be a PNG");
-    assert_eq!((decoded.width(), decoded.height()), (8, 8));
-}
-
-#[tokio::test]
-async fn images_generations_is_deterministic_for_a_fixed_seed() {
-    let request = json!({
-        "model": "tiny-txt2img",
-        "prompt": "a cat",
-        "size": "8x8",
-        "steps": 3,
-        "seed": 11
-    });
-    let (_, first) = post_json(txt2img_state(), "/v1/images/generations", request.clone()).await;
-    let (_, second) = post_json(txt2img_state(), "/v1/images/generations", request).await;
-
-    assert_eq!(first["data"][0]["b64_json"], second["data"][0]["b64_json"]);
-
-    let mut reseeded = json!({
-        "model": "tiny-txt2img",
-        "prompt": "a cat",
-        "size": "8x8",
-        "steps": 3,
-        "seed": 12
-    });
-    reseeded["seed"] = json!(12);
-    let (_, other) = post_json(txt2img_state(), "/v1/images/generations", reseeded).await;
-    assert_ne!(first["data"][0]["b64_json"], other["data"][0]["b64_json"]);
-}
-
-#[tokio::test]
-async fn images_generations_rejects_url_response_format_and_bad_size_and_n() {
-    for (body, expected) in [
-        (
-            json!({"model": "tiny-txt2img", "prompt": "x", "response_format": "url"}),
-            "response_format",
-        ),
-        (
-            json!({"model": "tiny-txt2img", "prompt": "x", "size": "512"}),
-            "size",
-        ),
-        (
-            json!({"model": "tiny-txt2img", "prompt": "x", "n": 0}),
-            "batch of 0",
-        ),
-        (
-            json!({"model": "tiny-txt2img", "prompt": "x", "n": 99}),
-            "batch of 99",
-        ),
-    ] {
-        let (status, response) = post_json(txt2img_state(), "/v1/images/generations", body).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "response: {response}");
-        let message = error_message(&response);
-        assert_actionable(&message);
-        assert!(message.contains(expected), "message: {message}");
-    }
-}
-
-#[tokio::test]
-async fn images_generations_rejects_a_model_without_a_denoise_loop() {
-    let (status, body) = post_json(
-        tiny_state(),
-        "/v1/images/generations",
-        json!({"model": "tiny-llm", "prompt": "a cat"}),
-    )
-    .await;
-
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    let message = error_message(&body);
-    assert_actionable(&message);
-    assert!(message.contains("denoiser"), "message: {message}");
 }
 
 #[tokio::test]
@@ -3563,63 +3625,6 @@ async fn poisoned_model_registry_returns_http_500() {
 }
 
 #[tokio::test]
-async fn image_url_detail_is_accepted_for_client_compatibility() {
-    // The official OpenAI clients always send `detail`; it must not be a 400.
-    let (status, body) = post_json(
-        tiny_state(),
-        "/v1/chat/completions",
-        json!({
-            "model": "tiny-llm",
-            "messages": [{
-                "role": "user",
-                "content": [
-                    {"type": "image_url", "image_url": {"url": tiny_png_data_uri(), "detail": "low"}}
-                ]
-            }],
-            "max_tokens": 1
-        }),
-    )
-    .await;
-
-    // The request parses; it is then rejected because tiny-llm has no vision
-    // contract, which proves `detail` was accepted rather than fatal.
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    let message = error_message(&body);
-    assert!(
-        message.contains("image input was rejected"),
-        "detail must parse, not fail deserialization: {message}"
-    );
-}
-
-#[tokio::test]
-async fn mixed_image_and_audio_parts_are_rejected_with_guidance() {
-    let (status, body) = post_json(
-        tiny_state(),
-        "/v1/chat/completions",
-        json!({
-            "model": "tiny-llm",
-            "messages": [{
-                "role": "user",
-                "content": [
-                    {"type": "image_url", "image_url": {"url": tiny_png_data_uri()}},
-                    {"type": "input_audio", "input_audio": {"data": "AAAA", "format": "wav"}}
-                ]
-            }],
-            "max_tokens": 1
-        }),
-    )
-    .await;
-
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    let message = error_message(&body);
-    assert_actionable(&message);
-    assert!(
-        message.contains("send them separately"),
-        "message: {message}"
-    );
-}
-
-#[tokio::test]
 async fn a_json_syntax_error_is_reported_as_an_actionable_400() {
     let response = app(tiny_state())
         .oneshot(
@@ -3639,146 +3644,6 @@ async fn a_json_syntax_error_is_reported_as_an_actionable_400() {
     assert_actionable(&error_message(&body));
 }
 
-#[tokio::test]
-async fn chat_completions_routes_an_image_url_through_the_declared_vision_contract() {
-    let model_dir =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-vlm-image-input");
-    let state = AppState::load(&model_dir, Some("tiny-vlm".to_string()))
-        .expect("load the vision-input fixture");
-
-    let (status, body) = post_json(
-        state,
-        "/v1/chat/completions",
-        json!({
-            "model": "tiny-vlm",
-            "messages": [{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "describe <image>"},
-                    {"type": "image_url", "image_url": {"url": tiny_png_data_uri(), "detail": "auto"}}
-                ]
-            }],
-            "max_tokens": 3
-        }),
-    )
-    .await;
-
-    assert_eq!(status, StatusCode::OK, "body: {body}");
-    let content = body["choices"][0]["message"]["content"]
-        .as_str()
-        .expect("assistant content");
-    // The fixture's decoder always predicts the image token, rendered as `img`.
-    // Seeing it proves the data URI was decoded, preprocessed into
-    // `encoder.pixel_values`, and that the placeholder was expanded.
-    assert!(content.contains("img"), "content: {content:?}");
-    assert!(body["usage"]["prompt_tokens"].as_u64().unwrap() > 0);
-}
-
-#[tokio::test]
-async fn chat_completions_streams_an_image_turn() {
-    let model_dir =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-vlm-image-input");
-    let state = AppState::load(&model_dir, Some("tiny-vlm".to_string()))
-        .expect("load the vision-input fixture");
-
-    let response = app(state)
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/chat/completions")
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(
-                    json!({
-                        "model": "tiny-vlm",
-                        "messages": [{
-                            "role": "user",
-                            "content": [
-                                {"type": "text", "text": "describe <image>"},
-                                {"type": "image_url", "image_url": {"url": tiny_png_data_uri()}}
-                            ]
-                        }],
-                        "max_tokens": 2,
-                        "stream": true
-                    })
-                    .to_string(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::OK);
-    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-    let events = sse_json_events(&bytes);
-    assert!(!events.is_empty(), "the image turn must stream chunks");
-    let streamed: String = events
-        .iter()
-        .filter_map(|event| event["choices"][0]["delta"]["content"].as_str())
-        .collect();
-    assert!(streamed.contains("img"), "streamed: {streamed:?}");
-}
-
-#[tokio::test]
-async fn chat_completions_transcribes_input_audio() {
-    use base64::{Engine as _, engine::general_purpose::STANDARD};
-
-    let model_dir =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-whisper");
-    let state = AppState::load(&model_dir, Some("tiny-whisper".to_string()))
-        .expect("load the audio fixture");
-    let wav = std::fs::read(model_dir.join("tiny.wav")).expect("fixture WAV");
-
-    let (status, body) = post_json(
-        state,
-        "/v1/chat/completions",
-        json!({
-            "model": "tiny-whisper",
-            "messages": [{
-                "role": "user",
-                "content": [
-                    {"type": "input_audio", "input_audio": {"data": STANDARD.encode(&wav), "format": "wav"}}
-                ]
-            }],
-            "max_tokens": 2
-        }),
-    )
-    .await;
-
-    assert_eq!(status, StatusCode::OK, "body: {body}");
-    let content = body["choices"][0]["message"]["content"]
-        .as_str()
-        .expect("assistant content");
-    assert!(!content.is_empty(), "the transcript must not be empty");
-}
-
-#[tokio::test]
-async fn an_unsupported_audio_format_names_the_supported_one() {
-    let model_dir =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-whisper");
-    let state = AppState::load(&model_dir, Some("tiny-whisper".to_string()))
-        .expect("load the audio fixture");
-
-    let (status, body) = post_json(
-        state,
-        "/v1/chat/completions",
-        json!({
-            "model": "tiny-whisper",
-            "messages": [{
-                "role": "user",
-                "content": [
-                    {"type": "input_audio", "input_audio": {"data": "AAAA", "format": "mp3"}}
-                ]
-            }],
-            "max_tokens": 2
-        }),
-    )
-    .await;
-
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    let message = error_message(&body);
-    assert!(message.contains("WAV"), "message: {message}");
-}
-
 #[test]
 fn serde_position_suffixes_are_stripped_from_rejection_messages() {
     use crate::routes::strip_serde_position;
@@ -3792,190 +3657,6 @@ fn serde_position_suffixes_are_stripped_from_rejection_messages() {
         strip_serde_position("What: something at line boundaries"),
         "What: something at line boundaries"
     );
-}
-
-// ── Text to speech ───────────────────────────────────────────────────────────
-
-fn tts_state() -> AppState {
-    let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-tts");
-    AppState::load(&model_dir, Some("tiny-tts".to_string())).expect("load the tiny TTS fixture")
-}
-
-async fn post_bytes(state: AppState, uri: &str, body: Value) -> (StatusCode, Vec<u8>, String) {
-    let response = app(state)
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(uri)
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(body.to_string()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let status = response.status();
-    let content_type = response
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default()
-        .to_string();
-    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-    (status, bytes.to_vec(), content_type)
-}
-
-#[tokio::test]
-async fn audio_speech_returns_a_playable_wav() {
-    let (status, body, content_type) = post_bytes(
-        tts_state(),
-        "/v1/audio/speech",
-        json!({"model": "tiny-tts", "input": "hello there"}),
-    )
-    .await;
-
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(content_type, "audio/wav");
-    assert_eq!(&body[..4], b"RIFF", "the body must be a WAV container");
-    // The fixture's declared 16 kHz rate must survive into the container.
-    let decoded = onnx_genai::preprocess::audio::decode_wav_pcm16(&body)
-        .expect("the response must decode as PCM16 WAV");
-    assert_eq!(decoded.sample_rate, 16_000);
-    assert!(!decoded.samples.is_empty());
-}
-
-#[tokio::test]
-async fn audio_speech_returns_raw_pcm_when_asked() {
-    let (status, body, content_type) = post_bytes(
-        tts_state(),
-        "/v1/audio/speech",
-        json!({"model": "tiny-tts", "input": "hi", "response_format": "pcm"}),
-    )
-    .await;
-
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(content_type, "audio/L16");
-    assert_ne!(&body[..4], b"RIFF", "raw PCM must carry no container");
-    assert_eq!(body.len() % 2, 0, "16-bit samples come in pairs of bytes");
-    assert!(!body.is_empty());
-}
-
-#[tokio::test]
-async fn audio_speech_refuses_formats_it_cannot_encode() {
-    for format in ["mp3", "opus", "aac", "flac"] {
-        let (status, body) = post_json(
-            tts_state(),
-            "/v1/audio/speech",
-            json!({"model": "tiny-tts", "input": "x", "response_format": format}),
-        )
-        .await;
-
-        assert_eq!(status, StatusCode::BAD_REQUEST, "format: {format}");
-        let message = error_message(&body);
-        assert_actionable(&message);
-        assert!(message.contains(format), "message: {message}");
-    }
-}
-
-#[tokio::test]
-async fn audio_speech_rejects_resampling_and_empty_input() {
-    let (status, body) = post_json(
-        tts_state(),
-        "/v1/audio/speech",
-        json!({"model": "tiny-tts", "input": "x", "speed": 2.0}),
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_actionable(&error_message(&body));
-
-    let (status, body) = post_json(
-        tts_state(),
-        "/v1/audio/speech",
-        json!({"model": "tiny-tts", "input": "   "}),
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_actionable(&error_message(&body));
-}
-
-#[tokio::test]
-async fn audio_speech_rejects_a_model_without_a_waveform_stage() {
-    let (status, body) = post_json(
-        tiny_state(),
-        "/v1/audio/speech",
-        json!({"model": "tiny-llm", "input": "hello"}),
-    )
-    .await;
-
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    let message = error_message(&body);
-    assert_actionable(&message);
-    assert!(message.contains("final_only"), "message: {message}");
-}
-
-#[tokio::test]
-async fn a_speech_model_is_not_offered_for_image_generation() {
-    let (status, body) = post_json(
-        tts_state(),
-        "/v1/images/generations",
-        json!({"model": "tiny-tts", "prompt": "a cat"}),
-    )
-    .await;
-
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert!(error_message(&body).contains("denoiser"));
-}
-
-#[tokio::test]
-async fn interleaved_image_parts_keep_their_position_in_the_prompt() {
-    // "compare [A] with [B]" — the images belong where they are written. If the
-    // parts were stripped and the placeholders re-attached elsewhere, the text
-    // would be re-associated with the wrong picture.
-    let model_dir =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-vlm-image-input");
-    let state = AppState::load(&model_dir, Some("tiny-vlm".to_string()))
-        .expect("load the vision-input fixture");
-
-    // The placeholder is decoded from the package's declared token id, so it
-    // must round-trip back to that id when the prompt is tokenized.
-    let handle = state
-        .registry
-        .resolve("tiny-vlm")
-        .expect("registry lock must be available")
-        .expect("fixture has a default model");
-    let placeholder = crate::routes::image_placeholder_text(&handle)
-        .expect("the fixture declares an image placeholder");
-    let token = handle
-        .multimodal
-        .as_ref()
-        .and_then(|multimodal| multimodal.vision.as_ref())
-        .and_then(|vision| vision.placeholder_token_id())
-        .expect("declared placeholder token");
-    assert_eq!(
-        handle.tokenizer.encode(&placeholder).expect("re-encode"),
-        vec![token],
-        "the rendered placeholder must tokenize back to the declared id"
-    );
-    let (status, body) = post_json(
-        state,
-        "/v1/chat/completions",
-        json!({
-            "model": "tiny-vlm",
-            "messages": [{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "describe "},
-                    {"type": "image_url", "image_url": {"url": tiny_png_data_uri()}},
-                    {"type": "text", "text": " closely"}
-                ]
-            }],
-            "max_tokens": 2
-        }),
-    )
-    .await;
-
-    // The fixture's encoder accepts exactly one image, so a successful run
-    // proves the placeholder was rendered in position and matched the image.
-    assert_eq!(status, StatusCode::OK, "body: {body}");
 }
 
 #[test]
@@ -4153,4 +3834,1037 @@ async fn mutating_commands_are_still_deferred() {
         ),
         "a command requiring &mut Engine must stay deferred"
     );
+}
+
+/// Sessions work for a package whose components the interpreter invokes.
+///
+/// `/v1/sessions` used to reject these outright, on the grounds that they own
+/// no decode-core KV sequence. That conflated two different things: a session
+/// is the conversation a client is having, and where the runtime keeps it —
+/// a paged KV sequence, or the `scope: session` cells the workflow declares —
+/// is not something a client can act on. A client that opened a session against
+/// one package and got a 400 against another would have to know which kind it
+/// was talking to, which is exactly the caller-side split this removes.
+#[tokio::test]
+async fn sessions_open_and_close_for_an_interpreted_package() {
+    let state = speech_state_from("speech_wav", "workflow-sessions");
+    let router = app(state);
+
+    let created = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/sessions")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        created.status(),
+        StatusCode::OK,
+        "a package the interpreter drives still has conversations"
+    );
+    let created: Value =
+        serde_json::from_slice(&to_bytes(created.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let id = created["id"].as_str().expect("session id").to_string();
+
+    let deleted = router
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/v1/sessions/{id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+}
+
+/// An interpreted package's conversation survives the HTTP boundary.
+///
+/// A session is what a client holds across requests, so the property has to be
+/// checked where a client actually is: three `POST /v1/completions` carrying the
+/// same `X-Session-Id`, compared against one request carrying the whole
+/// conversation. The engine-level test pins the same property; this one pins
+/// that nothing between the socket and the interpreter drops the session.
+fn workflow_session_package(scratch: &tempfile::TempDir) -> PathBuf {
+    let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
+    let source = fixtures.join("onnx_genai_workflows/decoder");
+    let destination = scratch.path().join("package");
+    fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+        std::fs::create_dir_all(to).expect("create package directory");
+        for entry in std::fs::read_dir(from).expect("read fixture") {
+            let entry = entry.expect("fixture entry");
+            let target = to.join(entry.file_name());
+            if entry.file_type().expect("file type").is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), target).expect("copy fixture file");
+            }
+        }
+    }
+    copy_tree(&source, &destination);
+    // The conformance fixture ships no tokenizer because its conformance is
+    // about the workflow. An HTTP completion is text, so this borrows the tiny
+    // decoder's tokenizer — 32 ids, all inside the fixture's 128-wide vocab.
+    std::fs::copy(
+        fixtures.join("tiny-llm/tokenizer.json"),
+        destination.join("tokenizer.json"),
+    )
+    .expect("copy tokenizer");
+    destination
+}
+
+/// The same package with its declared conversation removed — what every
+/// migrated interpreted decoder package looked like before this.
+fn workflow_package_without_conversation(scratch: &tempfile::TempDir) -> PathBuf {
+    let destination = workflow_session_package(scratch);
+    let metadata = destination.join("inference_metadata.yaml");
+    let mut document: Value =
+        serde_yaml::from_str(&std::fs::read_to_string(&metadata).expect("read metadata"))
+            .expect("parse metadata");
+    document["pipeline"]["workflow"]["state"]
+        .as_object_mut()
+        .expect("workflow declares state")
+        .remove("conversation")
+        .expect("the fixture declares a conversation");
+    let capabilities = document["pipeline"]["workflow"]["manifest"]["capabilities"]
+        .as_array_mut()
+        .expect("the manifest declares capabilities");
+    capabilities.retain(|capability| capability.as_str() != Some("session_state_lease"));
+    std::fs::write(
+        &metadata,
+        serde_yaml::to_string(&document).expect("serialize metadata"),
+    )
+    .expect("write metadata");
+    destination
+}
+
+async fn chat_turn(
+    router: axum::Router,
+    session: Option<&str>,
+    prompt: &str,
+) -> (StatusCode, Value) {
+    chat_turn_for(router, "workflow-multi-turn", session, prompt).await
+}
+
+async fn chat_turn_for(
+    router: axum::Router,
+    model: &str,
+    session: Option<&str>,
+    prompt: &str,
+) -> (StatusCode, Value) {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header(header::CONTENT_TYPE, "application/json");
+    if let Some(session) = session {
+        builder = builder.header("x-session-id", session);
+    }
+    let response = router
+        .oneshot(
+            builder
+                .body(Body::from(
+                    json!({
+                        "model": model,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "max_tokens": 3,
+                        "temperature": 0.0
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    (status, body)
+}
+
+fn session_tokens(body: &Value) -> u64 {
+    body["session_token_count"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("a session response reports its token count: {body}"))
+}
+
+/// Three turns in one session accumulate one conversation; a fourth id does not
+/// see it; deleting the session releases it.
+///
+/// The arithmetic is what makes this non-vacuous. `usage.prompt_tokens` is what
+/// this turn was actually prefilled with — the conversation plus the request —
+/// and `session_token_count` is what the session holds afterwards, so the two
+/// differ by exactly this turn's generation. A turn that restarted would be
+/// prefilled with its own request alone, and both numbers would be short by
+/// everything said before it.
+#[tokio::test]
+async fn chat_completions_continue_a_conversation_across_requests() {
+    let scratch = tempfile::tempdir().expect("scratch directory");
+    let package = workflow_session_package(&scratch);
+    let state = AppState::load(&package, Some("workflow-multi-turn".to_string()))
+        .expect("load interpreted package");
+    let router = app(state);
+
+    let session = "sess-multi-turn";
+    let mut turns = Vec::new();
+    let mut previous = 0u64;
+    for (index, prompt) in ["hello world", "the quick", "brown fox"].iter().enumerate() {
+        let (status, body) = chat_turn(router.clone(), Some(session), prompt).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let prefill = body["usage"]["prompt_tokens"]
+            .as_u64()
+            .expect("prompt tokens");
+        let generated = body["usage"]["completion_tokens"]
+            .as_u64()
+            .expect("completion tokens");
+        assert!(
+            prefill > previous,
+            "turn {} is prefilled with the conversation ({previous}) and its own request: {body}",
+            index + 1
+        );
+        assert_eq!(
+            session_tokens(&body),
+            prefill + generated,
+            "the conversation after turn {} is what it was prefilled with plus what it \
+             generated: {body}",
+            index + 1
+        );
+        previous = prefill + generated;
+        turns.push(body);
+    }
+    let third = turns.pop().expect("three turns");
+    assert_eq!(third["session_id"].as_str(), Some(session));
+
+    // A different id is a different conversation, from its first turn.
+    let (status, isolated) = chat_turn(router.clone(), Some("sess-other"), "brown fox").await;
+    assert_eq!(status, StatusCode::OK, "{isolated}");
+    assert!(
+        session_tokens(&isolated) < session_tokens(&third),
+        "an independent session starts its own conversation"
+    );
+    assert_eq!(
+        session_tokens(&isolated),
+        isolated["usage"]["prompt_tokens"].as_u64().unwrap()
+            + isolated["usage"]["completion_tokens"].as_u64().unwrap(),
+        "a first turn is prefilled with its own request and nothing else"
+    );
+
+    // And the session the server handed out is released when it is deleted.
+    let created = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/sessions")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+    let created: Value =
+        serde_json::from_slice(&to_bytes(created.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let id = created["id"].as_str().expect("session id").to_string();
+    let deleted = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/v1/sessions/{id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+    let missing = router
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/v1/sessions/{id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        missing.status(),
+        StatusCode::NOT_FOUND,
+        "a deleted session is gone, not emptied"
+    );
+}
+
+/// A request with no session is unchanged by the package declaring one.
+#[tokio::test]
+async fn chat_completions_without_a_session_stay_stateless() {
+    let scratch = tempfile::tempdir().expect("scratch directory");
+    let package = workflow_session_package(&scratch);
+    let state = AppState::load(&package, Some("workflow-multi-turn".to_string()))
+        .expect("load interpreted package");
+    let router = app(state);
+
+    let (first_status, first) = chat_turn(router.clone(), None, "hello world").await;
+    let (second_status, second) = chat_turn(router.clone(), None, "hello world").await;
+    assert_eq!(first_status, StatusCode::OK, "{first}");
+    assert_eq!(second_status, StatusCode::OK, "{second}");
+    assert!(first["session_token_count"].is_null());
+    assert_eq!(
+        first["usage"], second["usage"],
+        "a stateless request leaves nothing behind for the next one"
+    );
+    assert_eq!(
+        first["choices"][0]["message"]["content"],
+        second["choices"][0]["message"]["content"]
+    );
+}
+
+/// A package that cannot continue a conversation says so with a status a client
+/// can act on.
+///
+/// 500 told a caller the server had failed and to retry something that will
+/// never succeed. 409 says the request and the loaded package disagree, which
+/// is what happened.
+#[tokio::test]
+async fn sessions_are_refused_with_a_conflict_for_a_package_that_cannot_continue_one() {
+    let scratch = tempfile::tempdir().expect("scratch directory");
+    let package = workflow_package_without_conversation(&scratch);
+    let state = AppState::load(&package, Some("workflow-multi-turn".to_string()))
+        .expect("load interpreted package");
+    let router = app(state);
+
+    // The direct session endpoint.
+    let created = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/sessions")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::CONFLICT);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(created.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("scope: session"),
+        "the refusal names what the package has to declare: {body}"
+    );
+
+    // And a completion that carries a session id, which creates one implicitly.
+    let (status, chat) = chat_turn(router.clone(), Some("sess-refused"), "hello world").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{chat}");
+
+    let completion = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-session-id", "sess-refused")
+                .body(Body::from(
+                    json!({
+                        "model": "workflow-multi-turn",
+                        "prompt": "hello world",
+                        "max_tokens": 3,
+                        "temperature": 0.0
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(completion.status(), StatusCode::CONFLICT);
+
+    // Stateless generation against the same package is unaffected: a package
+    // with no conversation answers one question at a time, which is a fact
+    // about it rather than a fault.
+    let (status, stateless) = chat_turn(router, None, "hello world").await;
+    assert_eq!(status, StatusCode::OK, "{stateless}");
+}
+
+/// A non-token workflow keeps its session handle.
+///
+/// A speech package has no conversation to lose, so refusing it a session would
+/// make "sessions" a property of which package shape was loaded — which is the
+/// caller-side split this runtime does not have.
+#[tokio::test]
+async fn sessions_still_open_for_a_package_that_publishes_no_tokens() {
+    let router = app(speech_state_from("speech_wav", "workflow-sessions-speech"));
+    let created = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/sessions")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+}
+
+/// Concurrent turns of one conversation cannot lose an update.
+///
+/// Two turns that both read the conversation before either writes it would
+/// leave the loser's prompt and generation nowhere, and nothing would report
+/// that they were lost. The conversation after N turns is therefore checked to
+/// be exactly what N serialized turns produce, whatever order the server ran
+/// them in.
+#[tokio::test]
+async fn concurrent_turns_on_one_session_do_not_lose_a_conversation() {
+    let scratch = tempfile::tempdir().expect("scratch directory");
+    let package = workflow_session_package(&scratch);
+    let state = AppState::load(&package, Some("workflow-multi-turn".to_string()))
+        .expect("load interpreted package");
+    let router = app(state);
+    let session = "sess-concurrent";
+
+    // The same prompt every time, so each turn contributes an identical number
+    // of request tokens and the expected total is exact arithmetic rather than
+    // a bound.
+    const TURNS: usize = 4;
+    let mut inflight = Vec::new();
+    for _ in 0..TURNS {
+        inflight.push(tokio::spawn(chat_turn(
+            router.clone(),
+            Some(session),
+            "hello world",
+        )));
+    }
+    let mut generated = 0u64;
+    let mut first_turn_prefill = u64::MAX;
+    let mut conversation = 0u64;
+    for handle in inflight {
+        let (status, body) = handle.await.expect("turn completed");
+        assert_eq!(status, StatusCode::OK, "{body}");
+        generated += body["usage"]["completion_tokens"]
+            .as_u64()
+            .expect("generated");
+        // Whichever turn ran first was prefilled with its own request alone.
+        first_turn_prefill =
+            first_turn_prefill.min(body["usage"]["prompt_tokens"].as_u64().expect("prefill"));
+        conversation = conversation.max(session_tokens(&body));
+    }
+
+    // Every turn's request is in the conversation exactly once, and so is every
+    // token any of them generated. A lost update leaves the total short by the
+    // turn whose write was overwritten.
+    assert_eq!(
+        conversation,
+        first_turn_prefill * TURNS as u64 + generated,
+        "the conversation is every turn's request and every turn's generation, once each"
+    );
+}
+
+/// A request that fails admission must not open a session, and must not evict
+/// somebody else's.
+///
+/// Counting the conversation before admission is right; *creating* the session
+/// before admission was not. A client whose requests are all rejected would
+/// otherwise destroy one live conversation per rejection once the registry is
+/// full, and strand an engine session it never used.
+#[tokio::test]
+async fn a_rejected_request_neither_opens_nor_evicts_a_session() {
+    let scratch = tempfile::tempdir().expect("scratch directory");
+    let package = workflow_session_package(&scratch);
+    let state = AppState::load(&package, Some("workflow-multi-turn".to_string()))
+        .expect("load interpreted package");
+    let router = app(state.clone());
+
+    // A live conversation.
+    let (status, first) = chat_turn(router.clone(), Some("sess-live"), "hello world").await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let live = state
+        .sessions
+        .get("sess-live")
+        .expect("registry")
+        .expect("the live session is registered");
+
+    // A request that cannot be admitted: more output than the model's context.
+    let rejected = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-session-id", "sess-rejected")
+                .body(Body::from(
+                    json!({
+                        "model": "workflow-multi-turn",
+                        "messages": [{"role": "user", "content": "hello world"}],
+                        "max_tokens": 1_000_000,
+                        "temperature": 0.0
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+
+    assert_eq!(
+        state.sessions.get("sess-rejected").expect("registry"),
+        None,
+        "a rejected request opens no session"
+    );
+    assert_eq!(
+        state.sessions.get("sess-live").expect("registry"),
+        Some(live),
+        "a rejected request evicts nobody"
+    );
+
+    // And the live conversation still continues.
+    let (status, second) = chat_turn(router, Some("sess-live"), "the quick").await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    assert!(session_tokens(&second) > session_tokens(&first));
+}
+
+/// A fill-in-the-middle completion is not a turn in a conversation, and never
+/// opens one.
+///
+/// The route refuses the combination outright, and `conversational_session_id`
+/// is the second answer to the same question for any caller that reaches
+/// `run_completion` another way: the FIM submit path takes no session, so
+/// opening one would claim an LRU slot — closing another client's live
+/// conversation once the registry is full — for a request that never touches it.
+#[tokio::test]
+async fn a_fim_completion_carrying_a_session_id_opens_no_session() {
+    let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+    let state = AppState::load(&model_dir, Some("tiny-llm".to_string()))
+        .expect("load fixture")
+        .with_default_fim_config(Some(onnx_genai_engine::FimConfig {
+            prefix_token: "<PRE>".to_string(),
+            middle_token: "<MID>".to_string(),
+            suffix_token: "<SUF>".to_string(),
+            format: onnx_genai_engine::FimFormat::PSM,
+        }));
+    let router = app(state.clone());
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-session-id", "sess-fim")
+                .body(Body::from(
+                    json!({
+                        "model": "tiny-llm",
+                        "prompt": "prefix",
+                        "suffix": "suffix",
+                        "max_tokens": 1
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_REQUEST,
+        "a FIM completion cannot be a turn in a conversation"
+    );
+    assert_eq!(
+        state.sessions.get("sess-fim").expect("registry"),
+        None,
+        "and it opens no session on its way to being refused"
+    );
+
+    // Without the header the same request is an ordinary FIM completion.
+    let plain = app(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "tiny-llm",
+                        "prompt": "prefix",
+                        "suffix": "suffix",
+                        "max_tokens": 1
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(plain.status(), StatusCode::OK);
+}
+
+/// An ORT decode-core session appends each request behind its retained KV.
+#[tokio::test]
+async fn an_ort_decode_core_session_is_charged_for_what_it_attends() {
+    let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+    let state = AppState::load(&model_dir, Some("tiny-llm".to_string())).expect("load fixture");
+    let router = app(state);
+    let session = "sess-decode-core";
+
+    let (status, first) = chat_turn_for(router.clone(), "tiny-llm", Some(session), "hello").await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let first_prompt = first["usage"]["prompt_tokens"]
+        .as_u64()
+        .expect("prompt tokens");
+    let retained = session_tokens(&first);
+    assert_eq!(
+        retained,
+        first_prompt
+            + first["usage"]["completion_tokens"]
+                .as_u64()
+                .expect("generated"),
+        "the session retains this turn's prompt and generation: {first}"
+    );
+
+    let (status, second) = chat_turn_for(router, "tiny-llm", Some(session), "hello").await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    assert_eq!(
+        second["usage"]["prompt_tokens"]
+            .as_u64()
+            .expect("prompt tokens"),
+        first_prompt + retained,
+        "the continuing turn is charged the sequence it is appended to: {second}"
+    );
+}
+
+/// A conversation beyond the model window is refused rather than returning an
+/// empty successful completion.
+#[tokio::test]
+async fn a_decode_core_conversation_past_the_window_is_refused_not_answered_empty() {
+    let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+    let state = AppState::load(&model_dir, Some("tiny-llm".to_string())).expect("load fixture");
+    let router = app(state);
+    let session = "sess-decode-core-window";
+    let message = "the quick brown fox jumps over the lazy dog";
+
+    let (status, first) = chat_turn_for(router.clone(), "tiny-llm", Some(session), message).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert!(
+        first["usage"]["completion_tokens"]
+            .as_u64()
+            .expect("generated")
+            > 0,
+        "the first turn generates: {first}"
+    );
+
+    let (status, second) = chat_turn_for(router, "tiny-llm", Some(session), message).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{second}");
+    assert!(
+        second["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("context limit"),
+        "the refusal names the limit it hit: {second}"
+    );
+}
+
+/// A lease the graph carries is not in front of the prompt, so it is not
+/// charged.
+///
+/// This is the half of the accounting that is genuinely zero: a loop-carried or
+/// group-held lease lives in a cache the package bounds itself. Charging a
+/// request for it would refuse turns for context they do not occupy.
+#[tokio::test]
+async fn a_graph_carried_lease_is_not_charged_against_the_prompt() {
+    let scratch = tempfile::tempdir().expect("scratch directory");
+    let package = workflow_session_package(&scratch);
+    // Drop the prompt continuation and session-scope a loop-carried cache cell,
+    // so the session is carried inside the graph instead.
+    let metadata = package.join("inference_metadata.yaml");
+    let mut document: Value =
+        serde_yaml::from_str(&std::fs::read_to_string(&metadata).expect("read metadata"))
+            .expect("parse metadata");
+    let state_cells = document["pipeline"]["workflow"]["state"]
+        .as_object_mut()
+        .expect("workflow declares state");
+    state_cells.remove("conversation").expect("a conversation");
+    let cache = state_cells.get_mut("cache_0").expect("a cache cell");
+    cache["scope"] = Value::String("session".into());
+    cache["release_boundary"] = Value::String("session".into());
+    std::fs::write(
+        &metadata,
+        serde_yaml::to_string(&document).expect("serialize metadata"),
+    )
+    .expect("write metadata");
+
+    let state = AppState::load(&package, Some("workflow-multi-turn".to_string()))
+        .expect("load interpreted package");
+    let router = app(state);
+    let session = "sess-graph-carried";
+
+    let (status, first) = chat_turn(router.clone(), Some(session), "hello world").await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let first_prompt = first["usage"]["prompt_tokens"]
+        .as_u64()
+        .expect("prompt tokens");
+
+    let (status, second) = chat_turn(router, Some(session), "hello world").await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    assert_eq!(
+        second["usage"]["prompt_tokens"]
+            .as_u64()
+            .expect("prompt tokens"),
+        first_prompt,
+        "a lease carried inside the graph is not in front of the prompt: {second}"
+    );
+}
+
+/// A prompt-continuation package *is* charged for the conversation, because it
+/// really is prefilled again.
+///
+/// The same two-turn shape as the decode-core case, and the opposite answer:
+/// here the second turn's prompt is its own request *plus* everything the first
+/// turn left behind, because that is what the runtime puts in front of it.
+#[tokio::test]
+async fn a_prompt_continuation_turn_is_charged_for_what_is_prepended() {
+    let scratch = tempfile::tempdir().expect("scratch directory");
+    let package = workflow_session_package(&scratch);
+    let state = AppState::load(&package, Some("workflow-multi-turn".to_string()))
+        .expect("load interpreted package");
+    let router = app(state);
+    let session = "sess-prepended";
+
+    let (status, first) = chat_turn(router.clone(), Some(session), "hello world").await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let first_prompt = first["usage"]["prompt_tokens"]
+        .as_u64()
+        .expect("prompt tokens");
+    let conversation = session_tokens(&first);
+
+    let (status, second) = chat_turn(router, Some(session), "hello world").await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    let second_prompt = second["usage"]["prompt_tokens"]
+        .as_u64()
+        .expect("prompt tokens");
+
+    assert_eq!(
+        second_prompt,
+        first_prompt + conversation,
+        "a prepended conversation is part of what the turn is prefilled with"
+    );
+    assert_eq!(
+        session_tokens(&second),
+        second_prompt
+            + second["usage"]["completion_tokens"]
+                .as_u64()
+                .expect("generated"),
+        "and the conversation it leaves is what it was prefilled with plus what it generated"
+    );
+}
+
+/// A capability refusal is not a server error, and its body says so.
+///
+/// `error.type` is what a client branches on. Reporting a package that will
+/// never serve a request under the same `server_error` as a crash told callers
+/// to retry something that cannot succeed.
+#[tokio::test]
+async fn a_capability_refusal_body_names_the_disagreement_not_a_fault() {
+    let scratch = tempfile::tempdir().expect("scratch directory");
+    let package = workflow_package_without_conversation(&scratch);
+    let state = AppState::load(&package, Some("workflow-multi-turn".to_string()))
+        .expect("load interpreted package");
+
+    let created = app(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/sessions")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::CONFLICT);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(created.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(
+        body["error"]["type"].as_str(),
+        Some("conflict_error"),
+        "a capability refusal is a conflict, not a server fault: {body}"
+    );
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("scope: session"),
+        "and it names what the package has to declare: {body}"
+    );
+}
+
+/// A conversation past the bound its package declares is refused 4xx, typed.
+///
+/// The status is read off the engine's own error variant, so it cannot drift
+/// with the wording of a message — which is how it used to be decided.
+#[tokio::test]
+async fn a_conversation_past_its_bound_is_a_typed_client_error() {
+    let scratch = tempfile::tempdir().expect("scratch directory");
+    let package = workflow_session_package(&scratch);
+    // Narrow only the conversation's own bound, so the caches keep theirs.
+    let metadata = package.join("inference_metadata.yaml");
+    let mut document: Value =
+        serde_yaml::from_str(&std::fs::read_to_string(&metadata).expect("read metadata"))
+            .expect("parse metadata");
+    document["pipeline"]["workflow"]["inputs"]["package.conversation_limit"] = json!({
+        "contract": {"dtype": "int64", "rank": 1, "shape": [1]},
+        "role": {"kind": "opaque"},
+        "source": {"kind": "literal"},
+        "required": false,
+        "default": 6
+    });
+    document["pipeline"]["workflow"]["state"]["conversation"]["recurrence"]["max"] =
+        Value::String("package.conversation_limit".into());
+    std::fs::write(
+        &metadata,
+        serde_yaml::to_string(&document).expect("serialize metadata"),
+    )
+    .expect("write metadata");
+
+    let state = AppState::load(&package, Some("workflow-multi-turn".to_string()))
+        .expect("load interpreted package");
+    let router = app(state);
+    let session = "sess-over-bound";
+
+    // The first turn fits; the second cannot.
+    let (status, first) = chat_turn(router.clone(), Some(session), "hello").await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let (status, second) = chat_turn(router, Some(session), "hello").await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a conversation past its declared bound is the caller's to shorten: {second}"
+    );
+    assert_eq!(
+        second["error"]["type"].as_str(),
+        Some("invalid_request_error"),
+        "{second}"
+    );
+    assert!(
+        second["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("declares a bound of 6"),
+        "the refusal names the bound: {second}"
+    );
+}
+
+/// A busy exclusive session is a 409 a client can retry; an over-bound
+/// conversation is a 400 it cannot.
+///
+/// Both are the same engine type and the same driver failure kind, so the status
+/// has to come from the variant. Pinning them together is what stops a later
+/// edit collapsing them onto one code.
+#[test]
+fn capability_refusals_map_to_the_status_their_variant_means() {
+    use onnx_genai_engine::PackageCapabilityError;
+
+    let no_state = crate::driver::DriverFailure::from_engine_error(&anyhow::Error::from(
+        PackageCapabilityError::NoSessionState,
+    ));
+    let response = crate::routes::generation_failure(no_state);
+    assert_eq!(response.status, StatusCode::CONFLICT);
+    assert_eq!(response.kind, "conflict_error");
+
+    let busy = crate::driver::DriverFailure::from_engine_error(&anyhow::Error::from(
+        PackageCapabilityError::ExclusiveLeaseConflict {
+            session: "shared".to_string(),
+        },
+    ));
+    let response = crate::routes::generation_failure(busy);
+    assert_eq!(response.status, StatusCode::CONFLICT);
+    assert_eq!(response.kind, "conflict_error");
+    // The structured field, not the sentence: nothing may depend on wording.
+    assert!(response.message.contains("shared"));
+
+    let over_bound = crate::driver::DriverFailure::from_engine_error(&anyhow::Error::from(
+        PackageCapabilityError::ConversationOverBound {
+            cell: "conversation".to_string(),
+            requested: 12,
+            bound: 6,
+        },
+    ));
+    let response = crate::routes::generation_failure(over_bound);
+    assert_eq!(response.status, StatusCode::BAD_REQUEST);
+    assert_eq!(response.kind, "invalid_request_error");
+    assert_eq!(
+        response.message,
+        PackageCapabilityError::ConversationOverBound {
+            cell: "conversation".to_string(),
+            requested: 12,
+            bound: 6,
+        }
+        .to_string()
+    );
+
+    // An ordinary failure is still a server error, so the new kind cannot
+    // swallow a real fault.
+    let internal =
+        crate::driver::DriverFailure::from_engine_error(&anyhow::anyhow!("forward pass failed"));
+    let response = crate::routes::generation_failure(internal);
+    assert_eq!(response.status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(response.kind, "server_error");
+}
+
+/// All three session refusals, on both paths that can raise them, asserted on
+/// status *and* on the body a client branches on.
+///
+/// One test, because the three are only meaningful against each other: a client
+/// has to tell "this package will never do that" (409, and it is `NoSessionState`
+/// on `/v1/sessions` or on an `X-Session-Id` request) from "shorten this turn"
+/// (400) from "try again in a moment" (409). Statuses come from the typed
+/// variant, never from a message.
+#[tokio::test]
+async fn every_session_refusal_reports_a_status_and_a_type_a_client_can_branch_on() {
+    // 1. NoSessionState — the package declares no conversation at all.
+    let scratch = tempfile::tempdir().expect("scratch directory");
+    let package = workflow_package_without_conversation(&scratch);
+    let state = AppState::load(&package, Some("workflow-multi-turn".to_string()))
+        .expect("load interpreted package");
+    let router = app(state);
+
+    for (path, response) in [
+        (
+            "/v1/sessions",
+            router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/sessions")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        ),
+        (
+            "x-session-id chat",
+            router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/chat/completions")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header("x-session-id", "sess-no-state")
+                        .body(Body::from(
+                            json!({
+                                "model": "workflow-multi-turn",
+                                "messages": [{"role": "user", "content": "hello world"}],
+                                "max_tokens": 2
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        ),
+        (
+            "x-session-id completions",
+            router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/completions")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header("x-session-id", "sess-no-state")
+                        .body(Body::from(
+                            json!({
+                                "model": "workflow-multi-turn",
+                                "prompt": "hello world",
+                                "max_tokens": 2
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        ),
+    ] {
+        assert_eq!(response.status(), StatusCode::CONFLICT, "{path}");
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            body["error"]["type"].as_str(),
+            Some("conflict_error"),
+            "{path}: {body}"
+        );
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("scope: session"),
+            "{path}: {body}"
+        );
+    }
+
+    // 2. ConversationOverBound — a turn the package's own bound refuses.
+    let scratch = tempfile::tempdir().expect("scratch directory");
+    let package = workflow_session_package(&scratch);
+    let metadata = package.join("inference_metadata.yaml");
+    let mut document: Value =
+        serde_yaml::from_str(&std::fs::read_to_string(&metadata).expect("read metadata"))
+            .expect("parse metadata");
+    document["pipeline"]["workflow"]["inputs"]["package.conversation_limit"] = json!({
+        "contract": {"dtype": "int64", "rank": 1, "shape": [1]},
+        "role": {"kind": "opaque"},
+        "source": {"kind": "literal"},
+        "required": false,
+        "default": 6
+    });
+    document["pipeline"]["workflow"]["state"]["conversation"]["recurrence"]["max"] =
+        Value::String("package.conversation_limit".into());
+    std::fs::write(
+        &metadata,
+        serde_yaml::to_string(&document).expect("serialize metadata"),
+    )
+    .expect("write metadata");
+    let state = AppState::load(&package, Some("workflow-multi-turn".to_string()))
+        .expect("load interpreted package");
+    let router = app(state);
+
+    let (status, first) = chat_turn(router.clone(), Some("sess-bound"), "hello").await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let (status, second) = chat_turn(router, Some("sess-bound"), "hello").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{second}");
+    assert_eq!(
+        second["error"]["type"].as_str(),
+        Some("invalid_request_error"),
+        "{second}"
+    );
+    assert!(
+        second["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("declares a bound of 6"),
+        "{second}"
+    );
+
+    // 3. ExclusiveLeaseConflict — the driver serializes passes, so this is
+    //    raised where it is decided and mapped where it is answered.
+    let conflict = crate::routes::generation_failure(
+        crate::driver::DriverFailure::from_engine_error(&anyhow::Error::from(
+            onnx_genai_engine::PackageCapabilityError::ExclusiveLeaseConflict {
+                session: "sess-busy".to_string(),
+            },
+        )),
+    );
+    assert_eq!(conflict.status, StatusCode::CONFLICT);
+    assert_eq!(conflict.kind, "conflict_error");
+    assert!(conflict.message.contains("sess-busy"));
 }

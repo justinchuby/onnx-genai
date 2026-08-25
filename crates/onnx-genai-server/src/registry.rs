@@ -3,7 +3,7 @@ use std::{
     fmt,
     path::{Path, PathBuf},
     sync::{
-        Arc, RwLock, RwLockReadGuard, RwLockWriteGuard,
+        Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -17,6 +17,7 @@ use onnx_genai_ort::{ChatTemplate, Tokenizer};
 
 use crate::{
     driver::EngineDriver,
+    image_generation::ImagePipelineSpec,
     models_config::ModelSpec,
     multimodal::MultimodalSpecs,
     state::{ServerConfig, ServerMemoryAuthorities, build_handle_with_authorities},
@@ -39,9 +40,6 @@ pub enum EvictionPolicy {
 /// by Axum's `State` extractor.
 pub(crate) struct ModelHandle {
     pub(crate) id: String,
-    /// Directory the model was loaded from, needed by routes that resolve
-    /// package-relative files (the diffusion tokenizer and prompt encoder).
-    pub(crate) model_dir: PathBuf,
     pub(crate) engine: EngineDriver,
     pub(crate) tokenizer: Arc<Tokenizer>,
     pub(crate) chat_template: Option<Arc<ChatTemplate>>,
@@ -54,16 +52,11 @@ pub(crate) struct ModelHandle {
     /// default instead of being forced greedy, matching the CLI.
     pub(crate) generation_defaults: Option<GenerationDefaults>,
     pub(crate) fim_config: Option<FimConfig>,
-    pub(crate) pipeline: bool,
     /// Declared image/audio input contracts, or `None` for a single decoder
     /// graph. Shared with the CLI so both front ends admit the same inputs.
     pub(crate) multimodal: Option<MultimodalSpecs>,
-    /// Whether the package declares a denoise loop, i.e. whether it can serve
-    /// `POST /v1/images/generations`.
-    pub(crate) text_to_image: bool,
-    /// Whether the package's pipeline ends in a waveform stage, i.e. whether it
-    /// can serve `POST /v1/audio/speech`.
-    pub(crate) text_to_audio: bool,
+    pub(crate) speech: Option<crate::speech::SpeechCapability>,
+    pub(crate) image_pipeline: Option<ImagePipelineSpec>,
     /// Whether the package declares a channel whose content the caller must not
     /// be shown, i.e. whether a generated turn carries private reasoning that
     /// has to be filtered out of everything this server returns.
@@ -82,6 +75,9 @@ pub(crate) struct ModelHandle {
 /// optional and same-typed, so positional construction was easy to get wrong.
 pub(crate) struct ModelHandleParts {
     pub(crate) id: String,
+    /// Directory the model was loaded from. Read once at construction to decide
+    /// whether the package declares a private reasoning channel; not retained
+    /// on the handle, which has no other package-relative file to resolve.
     pub(crate) model_dir: PathBuf,
     pub(crate) engine: EngineDriver,
     pub(crate) tokenizer: Arc<Tokenizer>,
@@ -89,14 +85,13 @@ pub(crate) struct ModelHandleParts {
     pub(crate) model_max_context: Option<usize>,
     pub(crate) generation_defaults: Option<GenerationDefaults>,
     pub(crate) fim_config: Option<FimConfig>,
-    pub(crate) pipeline: bool,
     pub(crate) multimodal: Option<MultimodalSpecs>,
-    pub(crate) text_to_image: bool,
-    pub(crate) text_to_audio: bool,
+    pub(crate) speech: Option<crate::speech::SpeechCapability>,
+    pub(crate) image_pipeline: Option<ImagePipelineSpec>,
 }
 
 impl ModelHandle {
-    pub(crate) fn new(parts: ModelHandleParts) -> Self {
+    pub(crate) fn new(parts: ModelHandleParts) -> anyhow::Result<Self> {
         let ModelHandleParts {
             id,
             model_dir,
@@ -106,34 +101,41 @@ impl ModelHandle {
             model_max_context,
             generation_defaults,
             fim_config,
-            pipeline,
             multimodal,
-            text_to_image,
-            text_to_audio,
+            speech,
+            image_pipeline,
         } = parts;
         let private_channels = declares_private_channels(&model_dir);
-        Self {
+        Ok(Self {
             id,
-            model_dir,
             engine,
             tokenizer,
             chat_template,
             model_max_context,
             generation_defaults,
             fim_config,
-            pipeline,
             multimodal,
-            text_to_image,
-            text_to_audio,
+            speech,
+            image_pipeline,
             private_channels,
             last_request_at: AtomicU64::new(now_millis()),
             warmed: AtomicBool::new(false),
             warmup_lock: std::sync::Mutex::new(()),
-        }
+        })
     }
 
-    /// Run exactly one deterministic token generation to initialize lazy runtime
-    /// allocations. Repeated calls after a successful warmup are no-ops.
+    /// Stop this model's engine worker and wait for it to exit.
+    ///
+    /// **Blocking.** The engine is thread-affine: its ORT sessions, KV pages,
+    /// and device allocations are destroyed on the worker thread that created
+    /// them, and this is the call that makes that destruction ordered with
+    /// respect to the caller instead of merely eventual.
+    fn shutdown(&self) {
+        self.engine.shutdown();
+    }
+
+    /// Run one deterministic generation matching the loaded model's output
+    /// contract to initialize lazy runtime allocations.
     fn warmup(&self) -> anyhow::Result<Duration> {
         if self.warmed.load(Ordering::Acquire) {
             return Ok(Duration::ZERO);
@@ -145,22 +147,24 @@ impl ModelHandle {
         if self.warmed.load(Ordering::Acquire) {
             return Ok(Duration::ZERO);
         }
-        let prompt = self
-            .tokenizer
-            .encode("warmup")
-            .context("failed to tokenize warmup prompt")?;
         let started = Instant::now();
-        self.engine.warmup(
-            GenerateRequest {
+        if let Some(image_pipeline) = &self.image_pipeline {
+            let request = image_pipeline.warmup_request(&self.tokenizer, self.model_max_context)?;
+            self.engine.warmup_image(request)?;
+        } else {
+            let prompt = self
+                .tokenizer
+                .encode("warmup")
+                .context("failed to tokenize warmup prompt")?;
+            self.engine.warmup(GenerateRequest {
                 prompt: GeneratePrompt::TokenIds(prompt),
                 options: GenerateOptions {
                     max_new_tokens: 1,
                     max_context: self.model_max_context,
                     ..GenerateOptions::default()
                 },
-            },
-            self.pipeline,
-        )?;
+            })?;
+        }
         self.warmed.store(true, Ordering::Release);
         Ok(started.elapsed())
     }
@@ -563,10 +567,17 @@ impl ModelRegistry {
         let handle = Arc::new(handle);
 
         // Insert + evict under the write lock (no await held).
-        {
+        let evicted = {
             let mut inner = self.write()?;
             inner.insert_loaded(Arc::clone(&handle));
-            inner.enforce_eviction(self.config.max_loaded_models, id);
+            inner.enforce_eviction(self.config.max_loaded_models, id)
+        };
+        // Stopping an evicted engine waits for its worker, so it happens off the
+        // async executor and outside the registry lock.
+        if !evicted.is_empty() {
+            tokio::task::spawn_blocking(move || release_handles(evicted))
+                .await
+                .context("model eviction task panicked")?;
         }
         if spec.warmup {
             let registry = self.clone();
@@ -594,14 +605,25 @@ impl ModelRegistry {
     /// `available` so it can be lazily reloaded.  In-flight requests that already
     /// hold an `Arc<ModelHandle>` keep the engine alive until they finish.
     ///
+    /// When this call holds the last reference, it waits for the engine worker
+    /// to stop, so the ORT sessions and device memory are gone before it
+    /// returns rather than at some unobservable later moment.
+    ///
+    /// **Blocking**, for that reason: an async caller must go through
+    /// `spawn_blocking`.
+    ///
     /// Returns an error if the id is not currently loaded (mapped to 404).
     pub(crate) fn unload(&self, id: &str) -> anyhow::Result<()> {
-        let mut inner = self.write()?;
-        if inner.remove_loaded(id) {
-            tracing::info!(id = %id, "unloaded model");
-            Ok(())
-        } else {
-            anyhow::bail!("model '{id}' is not loaded")
+        // The write lock is released before the join: waiting for a generation
+        // to finish while holding it would stall every other model's requests.
+        let unloaded = self.write()?.remove_loaded(id);
+        match unloaded {
+            Some(handle) => {
+                release_handle(handle);
+                tracing::info!(id = %id, "unloaded model");
+                Ok(())
+            }
+            None => anyhow::bail!("model '{id}' is not loaded"),
         }
     }
 
@@ -632,6 +654,27 @@ impl ModelRegistry {
     }
 }
 
+impl Drop for ModelRegistry {
+    /// Tear the node down the way an unload does, one model at a time.
+    ///
+    /// The last registry clone owns every loaded model, so this is where a
+    /// server shutdown destroys them: each engine is stopped and joined, and
+    /// its device memory released on the worker thread that allocated it,
+    /// before the process moves on. Runs only for the final clone — a route
+    /// handler dropping its `AppState` clone unloads nothing.
+    fn drop(&mut self) {
+        if Arc::strong_count(&self.inner) != 1 {
+            return;
+        }
+        let handles = {
+            let mut inner = self.inner.write().unwrap_or_else(PoisonError::into_inner);
+            inner.order.clear();
+            inner.models.drain().map(|(_, handle)| handle).collect()
+        };
+        release_handles(handles);
+    }
+}
+
 impl RegistryInner {
     /// Insert a loaded handle, appending to `order` if the id is new.  Never
     /// changes `default_id` (that is fixed at construction).
@@ -643,15 +686,13 @@ impl RegistryInner {
         self.models.insert(id, handle);
     }
 
-    /// Remove a loaded handle from `models` and `order`.  Returns `true` if it
-    /// was present.  The spec stays in `available` for later reloads.
-    fn remove_loaded(&mut self, id: &str) -> bool {
-        if self.models.remove(id).is_some() {
-            self.order.retain(|existing| existing != id);
-            true
-        } else {
-            false
-        }
+    /// Remove a loaded handle from `models` and `order`, returning it so the
+    /// caller can stop its worker outside the lock.  The spec stays in
+    /// `available` for later reloads.
+    fn remove_loaded(&mut self, id: &str) -> Option<Arc<ModelHandle>> {
+        let removed = self.models.remove(id)?;
+        self.order.retain(|existing| existing != id);
+        Some(removed)
     }
 
     /// Evict least-recently-used models until `models.len() <= max`.
@@ -660,17 +701,26 @@ impl RegistryInner {
     /// default model is only evicted as a last resort.  Because eviction only
     /// runs when `len > max` and `max >= 1`, the registry never drops below one
     /// loaded model.
-    fn enforce_eviction(&mut self, max_loaded: Option<usize>, loading_id: &str) {
+    ///
+    /// Returns the evicted handles so the caller can stop their workers once the
+    /// registry lock is released.
+    fn enforce_eviction(
+        &mut self,
+        max_loaded: Option<usize>,
+        loading_id: &str,
+    ) -> Vec<Arc<ModelHandle>> {
+        let mut evicted = Vec::new();
         let Some(max) = max_loaded else {
-            return;
+            return evicted;
         };
         while self.models.len() > max {
             let Some(victim) = self.pick_lru_victim(loading_id) else {
                 break;
             };
             tracing::info!(id = %victim, "evicting model (LRU)");
-            self.remove_loaded(&victim);
+            evicted.extend(self.remove_loaded(&victim));
         }
+        evicted
     }
 
     /// Choose the LRU victim, excluding `loading_id` and preferring non-default
@@ -693,6 +743,36 @@ impl RegistryInner {
             .filter(|(id, _)| id.as_str() != loading_id)
             .min_by_key(|(_, h)| h.last_request_at.load(Ordering::Relaxed))
             .map(|(id, _)| id.clone())
+    }
+}
+
+/// Stop the engine behind a handle the registry has just dropped, if nobody
+/// else still holds it.
+///
+/// A request that is mid-generation holds its own `Arc<ModelHandle>`; stopping
+/// that engine now would abort a caller's live response. In that case the
+/// handle is simply released: the worker still shuts itself down and destroys
+/// the engine on its own thread when the last in-flight request finishes — what
+/// is lost is only the ordering guarantee, which no caller is waiting on.
+///
+/// **Blocking** in the common case, where this is the last owner.
+fn release_handle(handle: Arc<ModelHandle>) {
+    let id = handle.id.clone();
+    match Arc::into_inner(handle) {
+        Some(handle) => {
+            handle.shutdown();
+            tracing::debug!(id = %id, "engine worker stopped and joined");
+        }
+        None => tracing::debug!(
+            id = %id,
+            "engine still serving in-flight requests; it will stop when they finish",
+        ),
+    }
+}
+
+fn release_handles(handles: Vec<Arc<ModelHandle>>) {
+    for handle in handles {
+        release_handle(handle);
     }
 }
 
@@ -744,8 +824,11 @@ impl ModelRegistry {
 
     /// Enforce eviction directly (used by eviction unit tests).
     pub(crate) fn enforce_eviction_for_test(&self, max_loaded: Option<usize>, loading_id: &str) {
-        let mut inner = self.inner.write().unwrap();
-        inner.enforce_eviction(max_loaded, loading_id);
+        let evicted = {
+            let mut inner = self.inner.write().unwrap();
+            inner.enforce_eviction(max_loaded, loading_id)
+        };
+        release_handles(evicted);
     }
 
     /// Replace the default model's `fim_config` in place (test-only helper).
@@ -794,6 +877,12 @@ fn declares_private_channels(model_dir: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::{path::PathBuf, sync::Arc};
+
+    use tokio::sync::{Semaphore, mpsc};
+
+    use super::*;
+    use crate::driver::EngineDriver;
 
     // Only a package that declares a private reasoning channel needs its output
     // filtered, so the flag is read from the package rather than guessed at.
@@ -833,12 +922,6 @@ mod tests {
 
         assert!(!declares_private_channels(dir.path()));
     }
-    use std::sync::Arc;
-
-    use tokio::sync::{Semaphore, mpsc};
-
-    use super::*;
-    use crate::driver::EngineDriver;
 
     /// Build a minimal `ModelHandle` stub backed by the tiny-llm tokenizer fixture.
     /// The stub has a dead command channel (no engine thread); it is only used to
@@ -852,44 +935,91 @@ mod tests {
         tokenizer: Arc<Tokenizer>,
         last_request_at: u64,
     ) -> Arc<ModelHandle> {
-        let (tx, _rx) = mpsc::channel(1);
         Arc::new(ModelHandle {
             id: id.to_string(),
-            model_dir: PathBuf::new(),
-            engine: EngineDriver {
-                commands: tx,
-                generation_capacity: Arc::new(Semaphore::new(0)),
-                generation_capacity_size: 0,
-                // A test double drives no engine, so there is no pool to
-                // mirror. Left in the default `Unknown` state rather than
-                // asserted not-applicable: nothing here has determined a
-                // decode path, and "pending" is the only claim that holds.
-                kv_telemetry: Default::default(),
-                resource_snapshot: Default::default(),
-                memory_strategy_plan: Arc::new(onnx_genai_engine::MemoryStrategyPlan::unknown(
-                    0,
-                    None,
-                    "registry test stub",
-                )),
-                device_authority: None,
-                // A stub drives no engine, so it advertises the honest "no
-                // batching" report used by every non-batching backend.
-                batching: Arc::new(crate::driver::BatchingReport::single_sequence_stub()),
-            },
+            engine: stub_engine_driver(),
             tokenizer,
             chat_template: None,
             model_max_context: None,
             generation_defaults: None,
             fim_config: None,
-            pipeline: false,
             multimodal: None,
-            text_to_image: false,
-            text_to_audio: false,
+            speech: None,
+            image_pipeline: None,
             private_channels: false,
             last_request_at: AtomicU64::new(last_request_at),
             warmed: AtomicBool::new(false),
             warmup_lock: std::sync::Mutex::new(()),
         })
+    }
+
+    fn stub_engine_driver() -> EngineDriver {
+        let (tx, _rx) = mpsc::channel(1);
+        EngineDriver {
+            workflow_facts: crate::driver::WorkflowFacts {
+                components: 0,
+                graph_components: 0,
+                declares_generation_loop: false,
+            },
+            // A pool of one detached worker: a command channel with no engine
+            // thread behind it, so shutting it down joins nothing.
+            workers: crate::worker::WorkerPool::single(crate::worker::WorkerHandle::detached(
+                crate::worker::WorkerId::PRIMARY,
+                tx,
+            )),
+            generation_capacity: Arc::new(Semaphore::new(0)),
+            generation_capacity_size: 0,
+            // A test double drives no engine, so there is no pool to
+            // mirror. Left in the default `Unknown` state rather than
+            // asserted not-applicable: nothing here has determined a
+            // decode path, and "pending" is the only claim that holds.
+            kv_telemetry: Default::default(),
+            resource_snapshot: Default::default(),
+            memory_strategy_plan: Arc::new(onnx_genai_engine::MemoryStrategyPlan::unknown(
+                0,
+                None,
+                "registry test stub",
+            )),
+            device_authority: None,
+            // A stub drives no engine, so it advertises the honest "no
+            // batching" report used by every non-batching backend.
+            batching: Arc::new(crate::driver::BatchingReport::single_sequence_stub()),
+        }
+    }
+
+    #[test]
+    fn registry_does_not_infer_speech_capability_from_adapter_files_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("inference_metadata.yaml"),
+            "pipeline:\n  workflow:\n    components:\n      prompt:\n        contract:\n          id: onnx-genai.text-assembly\n        implementation:\n          artifact: speech_processor.json\n",
+        )
+        .expect("metadata");
+        std::fs::write(
+            dir.path().join("speech_processor.json"),
+            r#"{"max_input_tokens":1,"max_output_units":1,"segments":[{"literal":"x"}]}"#,
+        )
+        .expect("processor");
+
+        let handle = ModelHandle::new(ModelHandleParts {
+            id: "adapter-only".to_string(),
+            model_dir: dir.path().to_path_buf(),
+            engine: stub_engine_driver(),
+            tokenizer: load_tokenizer(),
+            chat_template: None,
+            model_max_context: None,
+            generation_defaults: None,
+            fim_config: None,
+            multimodal: None,
+            speech: None,
+            image_pipeline: None,
+        })
+        .expect("handle");
+
+        assert!(
+            handle.speech.is_none(),
+            "registry must require the loader's compatible audio-output decision"
+        );
     }
 
     fn load_tokenizer() -> Arc<Tokenizer> {
@@ -981,56 +1111,6 @@ mod tests {
             metrics_snapshot.vram.headroom,
             first_authority.headroom_bytes()
         );
-    }
-
-    #[tokio::test]
-    async fn production_pipeline_loads_reserve_all_components_on_shared_ledger() {
-        let model_dir =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-txt2img");
-        let specs = vec![
-            ModelSpec {
-                id: "pipeline-a".to_string(),
-                path: model_dir.clone(),
-                eager: true,
-                warmup: false,
-            },
-            ModelSpec {
-                id: "pipeline-b".to_string(),
-                path: model_dir,
-                eager: true,
-                warmup: false,
-            },
-        ];
-        let registry = ModelRegistry::from_specs(&specs, ServerConfig::default()).unwrap();
-        let first = registry.resolve("pipeline-a").unwrap().unwrap();
-        let second = registry.resolve("pipeline-b").unwrap().unwrap();
-        assert!(first.pipeline);
-        let first_authority = first.engine.device_authority.as_ref().unwrap().clone();
-        let second_authority = second.engine.device_authority.as_ref().unwrap().clone();
-        assert_eq!(
-            first_authority.authority_id(),
-            second_authority.authority_id()
-        );
-        assert!(first_authority.used_bytes() > 0);
-        assert_eq!(
-            first.engine.resource_snapshot().await.unwrap().vram.used,
-            first_authority.used_bytes()
-        );
-        assert_eq!(
-            second.engine.resource_snapshot().await.unwrap().vram.used,
-            first_authority.used_bytes()
-        );
-        let aggregate_used = first_authority.used_bytes();
-        drop(first);
-        registry.unload("pipeline-a").unwrap();
-        for _ in 0..500 {
-            if first_authority.used_bytes() < aggregate_used {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(first_authority.used_bytes() < aggregate_used);
-        assert!(first_authority.used_bytes() > 0);
     }
 
     #[tokio::test]
@@ -1200,6 +1280,65 @@ mod tests {
         assert_eq!(registry.ids().unwrap(), vec!["a"]);
         // Unloading an id that is not loaded is an error (mapped to 404).
         assert!(registry.unload("b").is_err());
+    }
+
+    /// Unloading a real model stops its engine worker and waits for it, so the
+    /// engine is destroyed on its owner thread before the call returns.
+    #[tokio::test]
+    async fn unload_stops_and_joins_the_engine_worker() {
+        let model_dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+        let specs = vec![ModelSpec {
+            id: "tiny".to_string(),
+            path: model_dir,
+            eager: true,
+            warmup: false,
+        }];
+        let registry = ModelRegistry::from_specs(&specs, ServerConfig::default()).unwrap();
+        // Keep the worker addressable without keeping the *handle* alive: the
+        // registry must be the last owner for the unload to be able to join.
+        let worker = {
+            let handle = registry.resolve("tiny").unwrap().unwrap();
+            Arc::clone(handle.engine.workers.primary())
+        };
+        assert!(worker.is_running());
+
+        registry.unload("tiny").expect("unload loaded model");
+
+        assert!(
+            worker.is_joined(),
+            "unload must join the engine worker before returning",
+        );
+        assert!(!worker.is_running());
+        assert_eq!(registry.ids().unwrap(), Vec::<String>::new());
+        // The spec stays available, so the model can be lazily reloaded.
+        assert!(registry.contains_available("tiny").unwrap());
+    }
+
+    /// An unload racing an in-flight request does not tear the engine out from
+    /// under it: the worker keeps running for whoever still holds the handle.
+    #[tokio::test]
+    async fn unload_leaves_an_in_flight_engine_running() {
+        let model_dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+        let specs = vec![ModelSpec {
+            id: "tiny".to_string(),
+            path: model_dir,
+            eager: true,
+            warmup: false,
+        }];
+        let registry = ModelRegistry::from_specs(&specs, ServerConfig::default()).unwrap();
+        let in_flight = registry.resolve("tiny").unwrap().unwrap();
+
+        registry.unload("tiny").expect("unload loaded model");
+
+        let worker = in_flight.engine.workers.primary();
+        assert!(!worker.is_joined());
+        assert!(
+            worker.is_running(),
+            "an engine still serving a request must keep answering it",
+        );
+        assert!(in_flight.engine.create_session().await.is_ok());
     }
 
     #[test]

@@ -135,3 +135,86 @@ pub fn trilu(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     ctx.set_output_type(0, input);
     Ok(())
 }
+
+/// `TensorScatter` (opset 24): the cache keeps its shape, so the output type
+/// and shape are those of `past_cache`. `update` differs only in the sequence
+/// dimension named by `axis`, which lets us validate the static parts of that
+/// contract here rather than at execute time.
+pub fn tensor_scatter(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    let Some(past_cache) = ctx.input_type(0).cloned() else {
+        return Ok(());
+    };
+    // The op needs a batch dimension and a sequence dimension after it, and
+    // `write_indices` is indexed by the batch coordinate.
+    if past_cache.rank() < 2 {
+        return Err(ShapeInferError::InvalidRank {
+            op: "TensorScatter".into(),
+            index: 0,
+            rank: past_cache.rank(),
+            detail: "past_cache must have rank at least 2 (batch and sequence)".into(),
+        });
+    }
+    let axis = ctx
+        .node
+        .attr("axis")
+        .and_then(Attribute::as_int)
+        .unwrap_or(-2);
+    let axis = checked_axis(axis, past_cache.rank()).ok_or_else(|| ShapeInferError::Invalid {
+        op: "TensorScatter".into(),
+        detail: format!("axis {axis} is out of range for rank {}", past_cache.rank()),
+    })?;
+    if axis == 0 {
+        return Err(ShapeInferError::Invalid {
+            op: "TensorScatter".into(),
+            detail: "axis must not select the batch dimension".into(),
+        });
+    }
+    if let Some(update_rank) = ctx.input_rank(1)
+        && update_rank != past_cache.rank()
+    {
+        return Err(ShapeInferError::InvalidRank {
+            op: "TensorScatter".into(),
+            index: 1,
+            rank: update_rank,
+            detail: format!(
+                "update must have the same rank {} as past_cache",
+                past_cache.rank()
+            ),
+        });
+    }
+    if let Some(update) = ctx.input_shape(1).map(<[DimExpr]>::to_vec)
+        && update.len() == past_cache.rank()
+    {
+        let cache_shape = past_cache.shape.clone();
+        for dimension in 0..past_cache.rank() {
+            let (Some(cache_dim), Some(update_dim)) = (
+                cache_shape[dimension].as_const(),
+                update[dimension].as_const(),
+            ) else {
+                continue;
+            };
+            if dimension == axis {
+                // The update writes a window into a fixed-capacity buffer.
+                if update_dim > cache_dim {
+                    return Err(ShapeInferError::Invalid {
+                        op: "TensorScatter".into(),
+                        detail: format!(
+                            "update sequence length {update_dim} exceeds cache capacity \
+                             {cache_dim} at axis {axis}"
+                        ),
+                    });
+                }
+            } else if update_dim != cache_dim {
+                return Err(ShapeInferError::Invalid {
+                    op: "TensorScatter".into(),
+                    detail: format!(
+                        "update dimension {update_dim} at index {dimension} must match \
+                         past_cache dimension {cache_dim}; only the sequence axis {axis} may differ"
+                    ),
+                });
+            }
+        }
+    }
+    ctx.set_output_type(0, past_cache);
+    Ok(())
+}

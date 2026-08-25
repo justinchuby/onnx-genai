@@ -1,9 +1,7 @@
 use super::*;
 use onnx_runtime_ep_cpu::{LayerWeightRegions, PlacementPlan, plan_placement};
 use onnx_runtime_ir::{Graph, Node, WeightRef};
-use onnx_runtime_loader::{
-    ExpertQuantization, ExpertStorageOrder, ExpertTensorLayout, WeightRegionCatalog,
-};
+use onnx_runtime_loader::{WeightRegionCatalog, qmoe_expert_tensor_layout};
 use onnx_runtime_session::InferenceSession;
 
 impl From<PlacementPlan> for WeightPlacementReport {
@@ -92,17 +90,13 @@ fn qmoe_layer(
     if block_size == 0 {
         return Ok(None);
     }
-    let quantization = |blocks_per_row| ExpertQuantization {
-        bits: bits as usize,
-        block_size,
-        blocks_per_row,
-    };
-
+    let bits = bits as usize;
     let mut regions = Vec::new();
-    push_qmoe_pair(graph, node, 2, 3, 11, quantization, &mut regions)?;
-    push_qmoe_pair(graph, node, 5, 6, 12, quantization, &mut regions)?;
+    let quant = QmoeQuant { bits, block_size };
+    push_qmoe_pair(graph, node, QmoeExpertSlots::FC1, quant, &mut regions)?;
+    push_qmoe_pair(graph, node, QmoeExpertSlots::FC2, quant, &mut regions)?;
     if node.inputs.get(8).and_then(|slot| *slot).is_some() {
-        push_qmoe_pair(graph, node, 8, 9, 13, quantization, &mut regions)?;
+        push_qmoe_pair(graph, node, QmoeExpertSlots::FC3, quant, &mut regions)?;
     }
     if regions.is_empty() {
         return Ok(None);
@@ -119,55 +113,77 @@ fn qmoe_layer(
     }))
 }
 
+/// The three input slots one QMoE expert weight occupies: packed weights,
+/// scales, and optional zero points.
+///
+/// A struct rather than three positional `usize` arguments because the call
+/// sites otherwise read `2, 3, 11` and there is nothing in that to stop a
+/// scales index landing in the zero-points slot.
+#[derive(Clone, Copy)]
+struct QmoeExpertSlots {
+    packed: usize,
+    scales: usize,
+    zero_points: usize,
+}
+
+impl QmoeExpertSlots {
+    /// `fc1_experts_weights` / `_scales` / `_zero_points`.
+    const FC1: Self = Self {
+        packed: 2,
+        scales: 3,
+        zero_points: 11,
+    };
+    /// `fc2_experts_weights` / `_scales` / `_zero_points`.
+    const FC2: Self = Self {
+        packed: 5,
+        scales: 6,
+        zero_points: 12,
+    };
+    /// `fc3_experts_weights` / `_scales` / `_zero_points`, present only on
+    /// gated MoE variants.
+    const FC3: Self = Self {
+        packed: 8,
+        scales: 9,
+        zero_points: 13,
+    };
+}
+
+/// The quantisation parameters shared by every expert tensor of one QMoE node.
+#[derive(Clone, Copy)]
+struct QmoeQuant {
+    bits: usize,
+    block_size: usize,
+}
+
 fn push_qmoe_pair(
     graph: &Graph,
     node: &Node,
-    packed_index: usize,
-    scales_index: usize,
-    zero_points_index: usize,
-    quantization: impl Fn(usize) -> ExpertQuantization,
+    slots: QmoeExpertSlots,
+    quant: QmoeQuant,
     regions: &mut Vec<WeightRegionCatalog>,
 ) -> anyhow::Result<()> {
+    let QmoeExpertSlots {
+        packed: packed_index,
+        scales: scales_index,
+        zero_points: zero_points_index,
+    } = slots;
+    let QmoeQuant { bits, block_size } = quant;
     let packed = required_initializer(graph, node, packed_index)?;
     let scales = required_initializer(graph, node, scales_index)?;
     let packed_dims = qmoe_dims(packed, packed_index)?;
     let scale_dims = qmoe_dims(scales, scales_index)?;
     let blocks_per_row = scale_dims[2];
-    regions.push(WeightRegionCatalog::classify(
-        packed,
-        ExpertTensorLayout {
-            version: 1,
-            experts: packed_dims[0],
-            rows_per_expert: packed_dims[1],
-            storage_elements_per_row: packed_dims[2],
-            order: ExpertStorageOrder::ExpertMajor,
-            quantization: Some(quantization(blocks_per_row)),
-        },
-    ));
-    regions.push(WeightRegionCatalog::classify(
-        scales,
-        ExpertTensorLayout {
-            version: 1,
-            experts: scale_dims[0],
-            rows_per_expert: scale_dims[1],
-            storage_elements_per_row: scale_dims[2],
-            order: ExpertStorageOrder::ExpertMajor,
-            quantization: Some(quantization(blocks_per_row)),
-        },
-    ));
+    let packed_layout = qmoe_expert_tensor_layout(bits, block_size, blocks_per_row, packed_dims)
+        .with_context(|| format!("QMoE input {packed_index} must be rank-3"))?;
+    regions.push(WeightRegionCatalog::classify(packed, packed_layout));
+    let scales_layout = qmoe_expert_tensor_layout(bits, block_size, blocks_per_row, scale_dims)
+        .with_context(|| format!("QMoE input {scales_index} must be rank-3"))?;
+    regions.push(WeightRegionCatalog::classify(scales, scales_layout));
     if let Some(zero_points) = optional_initializer(graph, node, zero_points_index)? {
         let zero_dims = qmoe_dims(zero_points, zero_points_index)?;
-        regions.push(WeightRegionCatalog::classify(
-            zero_points,
-            ExpertTensorLayout {
-                version: 1,
-                experts: zero_dims[0],
-                rows_per_expert: zero_dims[1],
-                storage_elements_per_row: zero_dims[2],
-                order: ExpertStorageOrder::ExpertMajor,
-                quantization: Some(quantization(blocks_per_row)),
-            },
-        ));
+        let zero_layout = qmoe_expert_tensor_layout(bits, block_size, blocks_per_row, zero_dims)
+            .with_context(|| format!("QMoE input {zero_points_index} must be rank-3"))?;
+        regions.push(WeightRegionCatalog::classify(zero_points, zero_layout));
     }
     Ok(())
 }

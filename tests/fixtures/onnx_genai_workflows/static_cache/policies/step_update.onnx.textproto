@@ -1,0 +1,208 @@
+ir_version: 11
+graph {
+  node {
+    input: "capacity"
+    input: "one_1d"
+    output: "last_slot"
+    op_type: "Sub"
+  }
+  node {
+    input: "write_indices"
+    input: "one_1d"
+    output: "raw_write"
+    op_type: "Add"
+  }
+  node {
+    input: "raw_write"
+    input: "last_slot"
+    output: "next_write_indices"
+    op_type: "Min"
+  }
+  node {
+    input: "cache_lengths"
+    input: "one_1d"
+    output: "raw_length"
+    op_type: "Add"
+  }
+  node {
+    input: "raw_length"
+    input: "capacity"
+    output: "grown_length"
+    op_type: "Min"
+  }
+  node {
+    input: "active"
+    input: "grown_length"
+    input: "cache_lengths"
+    output: "next_cache_lengths"
+    op_type: "Where"
+  }
+  node {
+    input: "raw_length"
+    input: "capacity"
+    output: "has_room"
+    op_type: "Less"
+  }
+  node {
+    input: "active"
+    input: "has_room"
+    output: "next_active"
+    op_type: "And"
+  }
+  node {
+    input: "next_active"
+    output: "next_done"
+    op_type: "Not"
+  }
+  node {
+    input: "active"
+    output: "accepted_len"
+    op_type: "Cast"
+    attribute {
+      name: "to"
+      i: 7
+      type: INT
+    }
+  }
+  name: "static_cache_step_update"
+  initializer {
+    dims: 1
+    data_type: 7
+    name: "one_1d"
+    raw_data: "\001\000\000\000\000\000\000\000"
+  }
+  input {
+    name: "write_indices"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "cache_lengths"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "capacity"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "active"
+    type {
+      tensor_type {
+        elem_type: 9
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "next_write_indices"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "next_cache_lengths"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "next_active"
+    type {
+      tensor_type {
+        elem_type: 9
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "next_done"
+    type {
+      tensor_type {
+        elem_type: 9
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "accepted_len"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "one_1d"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+}
+opset_import {
+  domain: ""
+  version: 24
+}

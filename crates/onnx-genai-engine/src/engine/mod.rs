@@ -7,9 +7,7 @@ pub(crate) use crate::decode::{
     DecodeState, ModelDecodePath, detect_model_decode_path, next_session_token_argmax,
     next_session_token_logits, next_session_token_sampled,
 };
-pub(crate) use crate::decode_loop::{
-    DecodeLoopBackend, DecodeLoopState, exceeded_context_limit, run_decode_loop, step_decode_loop,
-};
+pub(crate) use crate::decode_loop::{DecodeLoopBackend, DecodeLoopState, exceeded_context_limit};
 pub(crate) use crate::kv_bridge::{
     KvModelInfo, PlacedPayload, RewindRequest, RewindRunnerPolicy, attach_pages_to_sequence,
     chunk_payload_from_exported, common_prefix_len, exported_layers_from_runner,
@@ -29,10 +27,10 @@ pub(crate) use anyhow::Context;
 pub(crate) use onnx_genai_kv::{
     Device, KvCacheOps, KvDType, LocalTieredConnector, PagedKvCache, PrefixCache,
 };
-pub(crate) use onnx_genai_metadata::{InferenceMetadata, ProposalType, SpeculatorProposerStatus};
+pub(crate) use onnx_genai_metadata::InferenceMetadata;
 pub(crate) use onnx_genai_ort::{
     DataType, Eagle3DecodeSession, Environment, ModelDirectory, MtpDecodeSession, Session,
-    SessionOptions, SharedKvProposerSession, Tokenizer,
+    SessionOptions, Tokenizer,
 };
 pub(crate) use onnx_genai_scheduler::{
     CapacityProvider, CapacityProviders, FixedCapacity, GovernorReconfigureOutcome,
@@ -54,18 +52,25 @@ pub use crate::config::{
     MirostatConfig, MirostatVersion, MtpCacheScope, MtpConfig, MtpHiddenLayout, MtpWeightSource,
     PrioritizedGenerateRequest, PrioritizedGenerateResult, RecurrentPrefixCacheStats,
     RewindTokenCount, SamplingOverrides, ScheduledGenerateArrival, SessionCheckpoint,
-    SessionForkCapability, SessionId, SessionPosition, SharedKvBinding, SharedKvProposerConfig,
-    SpeculativeMode, TokenLogprob, WeightAccessPattern, WeightPlacementReport, XtcConfig,
-    parse_device_policy, parse_resource_limit,
+    SessionForkCapability, SessionId, SessionPosition, SpeculativeMode, TokenLogprob,
+    WeightAccessPattern, WeightPlacementReport, XtcConfig, parse_device_policy,
+    parse_resource_limit,
 };
 pub use crate::connector_bridge::{ConnectorLookupOutcome, ConnectorStats};
 pub(crate) use crate::speculative::{
     LinearEmbedder, LinearLmHead, MtpEmbedder, MtpLmHead, SpeculativeStats,
     load_target_initializer_adapters,
 };
+// The MTP proposer is driven only from the native decode path; an ORT-only
+// build has no consumer for it and would see an unused import. Its only runtime
+// use is the native cold-generation path.
+#[cfg(feature = "native-backend")]
+pub(crate) use crate::speculative::MtpProposer;
 
+mod capability;
 mod decode_backend;
 mod governor;
+mod ids;
 mod load;
 pub(crate) mod memory_plan;
 mod memory_strategy;
@@ -74,19 +79,20 @@ mod model;
 #[cfg(feature = "native-backend")]
 mod placement;
 mod runtime;
+pub(crate) use runtime::apply_eos_policy;
 pub(crate) mod session_state;
 mod speculative_load;
+mod workflow_api;
+pub use capability::{PackageCapabilityError, SessionPrefillCarry, package_capability_error};
+pub use metadata::graph_port_contracts;
 
 pub(crate) use decode_backend::*;
 pub(crate) use governor::*;
 pub use governor::{EngineGovernorError, EngineResourceGovernor, resolve_device_vram_limit_bytes};
-#[cfg(all(feature = "cuda", feature = "native-backend"))]
-pub(crate) use load::managed_vmm_default_enabled;
+pub(crate) use ids::SharedSessionIds;
 pub(crate) use load::{
-    force_managed_weight_streaming_enabled, kv_pages_for_budget, session_device_domain,
-    validate_shared_authority_limit,
+    force_managed_weight_streaming_enabled, session_device_domain, validate_shared_authority_limit,
 };
-#[cfg(feature = "native-backend")]
 pub(crate) use memory_plan::Holder;
 pub(crate) use memory_strategy::*;
 pub(crate) use metadata::*;
@@ -106,28 +112,13 @@ mod tests {
     };
     use crate::sampling::Sampler;
     #[cfg(feature = "native-backend")]
-    use onnx_genai_metadata::{KvOwnership, ModelIoSpec, SequenceInputKind};
+    use onnx_genai_metadata::{DecoderAbi, KvOwnership, SequenceInputKind};
     #[cfg(feature = "native-backend")]
     use onnx_runtime_ir::{Attribute, DataType as IrDataType, Graph, Node, NodeId, Shape};
     use proptest::prelude::*;
     #[cfg(feature = "native-backend")]
     use std::collections::BTreeMap;
     use std::collections::HashMap;
-
-    #[test]
-    fn cap_kv_len_uncapped_returns_model_max() {
-        assert_eq!(cap_kv_len(32_768, None), 32_768);
-    }
-
-    #[test]
-    fn cap_kv_len_caps_when_smaller() {
-        assert_eq!(cap_kv_len(40_960, Some(512)), 512);
-    }
-
-    #[test]
-    fn cap_kv_len_ignores_cap_larger_than_model_max() {
-        assert_eq!(cap_kv_len(512, Some(40_960)), 512);
-    }
 
     #[test]
     fn paged_kv_fork_shares_prefix_then_diverges_copy_on_write() -> anyhow::Result<()> {
@@ -206,6 +197,7 @@ mod tests {
         )?;
 
         Ok(Engine {
+            workflow: Box::new(crate::pipeline::generation::test_decoder_runtime()?),
             decode_backend: EngineDecodeBackend::Ort,
             metadata: InferenceMetadata::default(),
             metadata_hints: MetadataHints::default(),
@@ -213,10 +205,12 @@ mod tests {
             prefix_cache: PrefixCache::new(),
             token_prefix_cache: Vec::new(),
             kv_model: None,
-            decode_path: ModelDecodePath::Legacy,
+            decode_path: ModelDecodePath::Generic,
             scheduler: Scheduler::new(onnx_genai_scheduler::SchedulerConfig::default()),
             governor,
             sessions,
+            workflow_sessions: HashMap::new(),
+            workflow_session_ids: SharedSessionIds::new(),
             session: None,
             #[cfg(feature = "native-backend")]
             native_session: None,
@@ -228,7 +222,7 @@ mod tests {
             #[cfg(feature = "native-backend")]
             native_active_session: None,
             #[cfg(feature = "native-backend")]
-            native_session_counter: 0,
+            native_session_ids: SharedSessionIds::new(),
             #[cfg(feature = "native-backend")]
             native_access_counter: 0,
             #[cfg(feature = "native-backend")]
@@ -236,14 +230,12 @@ mod tests {
             #[cfg(feature = "native-backend")]
             native_max_sessions: 8,
             #[cfg(feature = "native-backend")]
-            native_shared_kv_proposer: None,
             #[cfg(feature = "native-backend")]
             native_recurrent_prefix_stats: RecurrentPrefixCacheStats::default(),
             draft: None,
             mtp: None,
             eagle3: None,
-            shared_kv_proposer: None,
-            tokenizer,
+            tokenizer: Some(tokenizer),
             fim_config: None,
             num_speculative_tokens: 1,
             speculative_mode: SpeculativeMode::None,
@@ -594,8 +586,8 @@ mod tests {
     }
 
     #[cfg(feature = "native-backend")]
-    fn tiny_dense_decoder_io() -> ModelIoSpec {
-        ModelIoSpec {
+    fn tiny_dense_decoder_io() -> DecoderAbi {
+        DecoderAbi {
             sequence_source: Some(SequenceInputKind::TokenIds),
             kv_ownership: Some(KvOwnership::Owned),
             kv_layout: None,
@@ -614,10 +606,10 @@ mod tests {
             audio_features_input: None,
             cross_kv_inputs: None,
             cross_kv_outputs: None,
-            kv_update: None,
             state_pairs: None,
             optional_inputs: BTreeMap::new(),
             static_cache: None,
+            aliasing: None,
         }
     }
 
@@ -1502,6 +1494,10 @@ mod tests {
     #[test]
     fn processor_chain_uses_documented_order() {
         let options = GenerateOptions {
+            // `GenerateOptions::default()` is greedy, and a greedy request
+            // builds no sampling warpers at all. This test is about the order
+            // the warpers take when they *are* built, so it must ask to sample.
+            greedy: false,
             temperature: 0.7,
             top_p: 0.9,
             top_k: 10,
@@ -1529,7 +1525,7 @@ mod tests {
             stop_sequences: vec![StopSequence::Tokens(vec![42])],
             ..Default::default()
         };
-        let chain = build_processor_chain(&options, None).unwrap();
+        let chain = build_processor_chain(&options, None, false).unwrap();
         assert_eq!(
             chain.names(),
             vec![
@@ -1561,6 +1557,7 @@ mod tests {
         let tokenizer = Tokenizer::from_file(&fixture)
             .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {e}"))?;
         let options = GenerateOptions {
+            greedy: false,
             temperature: 0.7,
             top_p: 0.9,
             top_k: 10,
@@ -1574,7 +1571,7 @@ mod tests {
             ..Default::default()
         };
 
-        let chain = build_processor_chain(&options, Some(&tokenizer))?;
+        let chain = build_processor_chain(&options, Some(&tokenizer), false)?;
 
         assert_eq!(
             chain.names(),
@@ -1600,7 +1597,7 @@ mod tests {
             top_k: 2,
             ..Default::default()
         };
-        let chain = build_processor_chain(&options, None).unwrap();
+        let chain = build_processor_chain(&options, None, false).unwrap();
         let context = ProcessorContext::default();
         let mut logits = vec![0.0, 2.0, 4.0, 3.0];
         assert_eq!(
@@ -1615,7 +1612,7 @@ mod tests {
             greedy: false,
             ..Default::default()
         };
-        let chain = build_processor_chain(&options, None).unwrap();
+        let chain = build_processor_chain(&options, None, false).unwrap();
         let context = ProcessorContext::default();
         let mut logits = vec![0.0, 0.0];
         assert_eq!(
@@ -1642,7 +1639,9 @@ mod tests {
             top_k: 2,
             ..Default::default()
         };
-        let chain = build_processor_chain(&options, None).unwrap();
+        // A custom sampler is not necessarily greedy, so it keeps the warpers
+        // even on these (greedy-by-default) options.
+        let chain = build_processor_chain(&options, None, true).unwrap();
         let context = ProcessorContext::default();
         let mut logits = vec![0.0, 2.0, 4.0, 3.0];
         let mut sampler = LastTokenSampler;
@@ -1658,7 +1657,7 @@ mod tests {
     #[test]
     fn default_processor_chain_is_empty_for_unchanged_defaults() {
         let options = GenerateOptions::default();
-        let chain = build_processor_chain(&options, None).unwrap();
+        let chain = build_processor_chain(&options, None, false).unwrap();
         assert!(chain.names().is_empty());
     }
 
@@ -1669,7 +1668,7 @@ mod tests {
             stop_sequences: vec![StopSequence::Tokens(vec![7])],
             ..Default::default()
         };
-        let chain = build_processor_chain(&options, None).unwrap();
+        let chain = build_processor_chain(&options, None, false).unwrap();
         let context = ProcessorContext {
             generated_tokens: vec![7],
             ..Default::default()
@@ -1686,7 +1685,7 @@ mod tests {
             stop_sequences: vec![StopSequence::Tokens(vec![2, 3])],
             ..Default::default()
         };
-        let chain = build_processor_chain(&options, None).unwrap();
+        let chain = build_processor_chain(&options, None, false).unwrap();
         let context = ProcessorContext {
             generated_tokens: vec![1, 2, 3],
             ..Default::default()
@@ -1708,7 +1707,7 @@ mod tests {
             stop_sequences: options.stop_sequences.clone(),
             ..Default::default()
         };
-        let chain = build_processor_chain(&chain_options, None).unwrap();
+        let chain = build_processor_chain(&chain_options, None, false).unwrap();
         let incomplete = ProcessorContext {
             generated_text: "{\"value\":".to_string(),
             ..Default::default()
@@ -1843,25 +1842,15 @@ mod tests {
     }
 
     #[test]
-    fn scatter_fixture_uses_static_cache_decode_session_with_stable_greedy_output()
-    -> anyhow::Result<()> {
+    fn scatter_fixture_does_not_select_static_cache_from_metadata() -> anyhow::Result<()> {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/tiny-llm-scatter")
             .canonicalize()?;
-        let mut engine = Engine::from_dir(&fixture, EngineConfig::default())?;
-        assert!(matches!(
+        let engine = Engine::from_dir(&fixture, EngineConfig::default())?;
+        assert!(!matches!(
             engine.decode_path,
-            ModelDecodePath::StaticCache { max_len } if max_len > 0
+            ModelDecodePath::StaticCache { .. }
         ));
-        let mut request = GenerateRequest::new("hello");
-        request.options.max_new_tokens = 3;
-        request.options.temperature = 0.0;
-        request.options.stop_on_eos = false;
-
-        let result = engine.generate(request)?;
-
-        assert_eq!(result.token_ids, vec![23, 15, 28]);
-        assert_eq!(result.finish_reason, FinishReason::MaxTokens);
         Ok(())
     }
 

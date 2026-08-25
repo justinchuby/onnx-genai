@@ -8,10 +8,32 @@ repository.workspace = true
 keywords = ["onnx", "execution-provider", "plugin", "ffi", "runtime"]
 categories = ["science", "hardware-support"]
 
+[features]
+# Per-phase dispatch counters and optional timing for issue #1077. Off by
+# default: with the feature disabled the guards are zero-sized and the counter
+# calls are empty, so production builds carry none of it. Timing is gated a
+# second time at runtime by ONNX_GENAI_PROFILE_DISPATCH=1.
+dispatch_probe = []
+# Cross-crate shape-table agreement hooks. Shipped artifacts do not enable this.
+testutil = []
+
 [dependencies]
 onnx-runtime-ep-api = { workspace = true }
 onnx-runtime-ir = { workspace = true }
+onnx-runtime-shape-inference = { workspace = true }
 onnx-genai-ort-sys = { workspace = true }
+
+# `pin.rs` takes one never-released reference to this library's own module so
+# ORT's unregister cannot unmap text that thread-local destructors and
+# instrumentation callbacks still point into.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+] }
 
 [dev-dependencies]
 onnx-runtime-ort-testkit = { workspace = true }
@@ -19,6 +41,7 @@ libloading = { workspace = true }
 onnx-runtime-ep-cpu = { workspace = true }
 onnx-runtime-ep-api = { workspace = true }
 onnx-runtime-ir = { workspace = true }
+onnx-runtime-memory-governor = { workspace = true }
 
 [[test]]
 name = "trait_cabi_parity"

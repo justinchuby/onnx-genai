@@ -14,6 +14,7 @@ pub(crate) enum CudaLibrary {
     #[allow(dead_code)]
     Cublas,
     CublasLt,
+    Cufft,
     Cudnn,
     Nvrtc,
     // Kept for the crate-local loader surface; CUPTI loading currently lives in the tracer crate.
@@ -102,6 +103,9 @@ fn candidates_for(os: TargetOs, library: CudaLibrary) -> &'static [&'static str]
         (TargetOs::Linux, CudaLibrary::CublasLt) => {
             &["libcublasLt.so.13", "libcublasLt.so.12", "libcublasLt.so"]
         }
+        (TargetOs::Linux, CudaLibrary::Cufft) => {
+            &["libcufft.so.12", "libcufft.so.11", "libcufft.so"]
+        }
         (TargetOs::Linux, CudaLibrary::Cudnn) => &["libcudnn.so.9", "libcudnn.so"],
         (TargetOs::Linux, CudaLibrary::Nvrtc) => {
             &["libnvrtc.so.13", "libnvrtc.so.12", "libnvrtc.so"]
@@ -113,6 +117,7 @@ fn candidates_for(os: TargetOs, library: CudaLibrary) -> &'static [&'static str]
         (TargetOs::Macos, CudaLibrary::Driver) => &["libcuda.dylib"],
         (TargetOs::Macos, CudaLibrary::Cublas) => &["libcublas.dylib"],
         (TargetOs::Macos, CudaLibrary::CublasLt) => &["libcublasLt.dylib"],
+        (TargetOs::Macos, CudaLibrary::Cufft) => &["libcufft.dylib"],
         (TargetOs::Macos, CudaLibrary::Cudnn) => &["libcudnn.dylib"],
         (TargetOs::Macos, CudaLibrary::Nvrtc) => &["libnvrtc.dylib"],
         (TargetOs::Macos, CudaLibrary::Cupti) => &["libcupti.dylib"],
@@ -123,6 +128,9 @@ fn candidates_for(os: TargetOs, library: CudaLibrary) -> &'static [&'static str]
         }
         (TargetOs::Windows, CudaLibrary::CublasLt) => {
             &["cublasLt64_13.dll", "cublasLt64_12.dll", "cublasLt.dll"]
+        }
+        (TargetOs::Windows, CudaLibrary::Cufft) => {
+            &["cufft64_12.dll", "cufft64_11.dll", "cufft.dll"]
         }
         (TargetOs::Windows, CudaLibrary::Cudnn) => &["cudnn64_9.dll", "cudnn64_8.dll", "cudnn.dll"],
         (TargetOs::Windows, CudaLibrary::Nvrtc) => &[
@@ -145,33 +153,40 @@ fn nvidia_component(library: CudaLibrary) -> Option<&'static str> {
         CudaLibrary::Driver => None,
         CudaLibrary::Runtime => Some("cuda_runtime"),
         CudaLibrary::Cublas | CudaLibrary::CublasLt => Some("cublas"),
+        CudaLibrary::Cufft => Some("cufft"),
         CudaLibrary::Cudnn => Some("cudnn"),
         CudaLibrary::Nvrtc => Some("cuda_nvrtc"),
         CudaLibrary::Cupti => Some("cuda_cupti"),
     }
 }
 
-fn wheel_library_directory(os: TargetOs) -> &'static str {
-    match os {
-        TargetOs::Windows => "bin",
-        TargetOs::Linux | TargetOs::Macos | TargetOs::Other => "lib",
-    }
+/// Directories a wheel root may hold this library in, newest layout first.
+///
+/// The layout itself lives in `onnx-genai-cuda-version-guard` beside the library
+/// names: the CUDA EP and the tracer both search wheels, and when NVIDIA
+/// republished them under a consolidated layout, two hand-written copies of the
+/// old shape both went stale at once.
+fn wheel_library_directories(root: &Path, os: TargetOs, library: CudaLibrary) -> Vec<PathBuf> {
+    // The driver ships with the display driver and is never redistributed in a
+    // wheel, so it has no component and must not acquire candidates from either
+    // layout.
+    let Some(component) = nvidia_component(library) else {
+        return Vec::new();
+    };
+    onnx_genai_cuda_version_guard::wheel_component_directories(component, host_os(os))
+        .into_iter()
+        .map(|relative| root.join(relative))
+        .collect()
 }
 
 fn wheel_candidates_for(root: &Path, os: TargetOs, library: CudaLibrary) -> Vec<PathBuf> {
     if !root.is_absolute() {
         return Vec::new();
     }
-    let Some(component) = nvidia_component(library) else {
-        return Vec::new();
-    };
-    let directory = root
-        .join("nvidia")
-        .join(component)
-        .join(wheel_library_directory(os));
-    candidates_for(os, library)
-        .iter()
-        .map(|name| directory.join(name))
+    let names = candidates_for(os, library);
+    wheel_library_directories(root, os, library)
+        .into_iter()
+        .flat_map(|directory| names.iter().map(move |name| directory.join(name)))
         .collect()
 }
 
@@ -228,18 +243,13 @@ fn wheel_roots_from_environment() -> Vec<PathBuf> {
     unique
 }
 
-/// The root a `<root>/nvidia/<component>/{bin,lib}` entry belongs to.
+/// The wheel root a library directory belongs to.
+///
+/// Delegates to the shared definition in `onnx-genai-cuda-version-guard`; see
+/// there for why the component level between `nvidia` and the library directory
+/// is load-bearing.
 fn wheel_root_of(entry: &Path) -> Option<PathBuf> {
-    let library_directory = entry.file_name()?;
-    if library_directory != "bin" && library_directory != "lib" {
-        return None;
-    }
-    let component = entry.parent()?;
-    let nvidia = component.parent()?;
-    if nvidia.file_name()? != "nvidia" {
-        return None;
-    }
-    Some(nvidia.parent()?.to_path_buf())
+    onnx_genai_cuda_version_guard::wheel_root_of(entry)
 }
 
 fn wheel_search_paths() -> &'static Mutex<Vec<PathBuf>> {
@@ -317,9 +327,18 @@ pub(crate) fn wheel_cuda_include_paths() -> Vec<PathBuf> {
         .into_iter()
         .flat_map(|root| {
             let nvidia = root.join("nvidia");
-            ["cuda_runtime", "cuda_nvcc"]
+            // Consolidated layout keeps one `include` per CUDA line; the older
+            // per-component layout splits the headers NVRTC needs across the
+            // runtime and nvcc wheels.
+            let consolidated = onnx_genai_cuda_version_guard::WHEEL_CUDA_MAJORS
+                .iter()
+                .map(|major| nvidia.join(major).join("include"))
+                .collect::<Vec<_>>();
+            let per_component = ["cuda_runtime", "cuda_nvcc"]
                 .into_iter()
-                .map(move |component| nvidia.join(component).join("include"))
+                .map(|component| nvidia.join(component).join("include"))
+                .collect::<Vec<_>>();
+            consolidated.into_iter().chain(per_component)
         })
         .collect()
 }
@@ -458,6 +477,31 @@ pub(crate) fn require(library: CudaLibrary) -> Result<(), String> {
     Ok(())
 }
 
+/// Resolve one function from a library loaded through the canonical CUDA wheel
+/// search path. The copied function pointer remains valid because `require`
+/// retains the owning [`Library`] for the process lifetime.
+pub(crate) fn symbol<T: Copy>(library: CudaLibrary, name: &[u8]) -> Result<T, String> {
+    require(library)?;
+    let loaded = loaded_libraries()
+        .lock()
+        .expect("CUDA loaded-library lock poisoned");
+    let handle = loaded
+        .iter()
+        .find_map(|(loaded_library, handle)| (*loaded_library == library).then_some(handle))
+        .ok_or_else(|| format!("CUDA {library:?} library was not retained after loading"))?;
+    // SAFETY: callers request a symbol using its exact vendor ABI type. The
+    // returned function pointer is copied while the owning library remains
+    // retained in `loaded_libraries`.
+    unsafe { handle.get::<T>(name) }
+        .map(|function| *function)
+        .map_err(|error| {
+            format!(
+                "CUDA {library:?} symbol {:?} was not found: {error}",
+                String::from_utf8_lossy(name)
+            )
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -471,6 +515,10 @@ mod tests {
         assert_eq!(
             candidates_for(TargetOs::Linux, CudaLibrary::Cupti),
             ["libcupti.so.13", "libcupti.so.12", "libcupti.so"]
+        );
+        assert_eq!(
+            candidates_for(TargetOs::Linux, CudaLibrary::Cufft),
+            ["libcufft.so.12", "libcufft.so.11", "libcufft.so"]
         );
     }
 
@@ -497,6 +545,7 @@ mod tests {
             candidates_for(TargetOs::Windows, CudaLibrary::Nvrtc).contains(&"nvrtc64_130_0.dll")
         );
         assert!(candidates_for(TargetOs::Windows, CudaLibrary::Cupti).contains(&"cupti64_13.dll"));
+        assert!(candidates_for(TargetOs::Windows, CudaLibrary::Cufft).contains(&"cufft64_12.dll"));
     }
 
     #[test]
@@ -504,24 +553,46 @@ mod tests {
         let root = std::env::current_dir()
             .expect("current directory should be available")
             .join("site-packages");
+        // Consolidated layout first (it is what current wheels publish), then
+        // the older per-component one, so a machine carrying both prefers the
+        // newer.
+        let linux = wheel_candidates_for(&root, TargetOs::Linux, CudaLibrary::CublasLt);
         assert_eq!(
-            wheel_candidates_for(&root, TargetOs::Linux, CudaLibrary::CublasLt),
-            vec![
-                root.join("nvidia/cublas/lib/libcublasLt.so.13"),
-                root.join("nvidia/cublas/lib/libcublasLt.so.12"),
-                root.join("nvidia/cublas/lib/libcublasLt.so"),
-            ]
+            linux.first(),
+            Some(&root.join("nvidia/cu13/lib/x86_64/libcublasLt.so.13"))
+        );
+        assert!(linux.contains(&root.join("nvidia/cublas/lib/libcublasLt.so.13")));
+        assert!(linux.contains(&root.join("nvidia/cublas/lib/libcublasLt.so")));
+
+        let windows = wheel_candidates_for(&root, TargetOs::Windows, CudaLibrary::Nvrtc);
+        // The exact file the current `nvidia-cuda-nvrtc` wheel installs.
+        assert!(windows.contains(&root.join("nvidia/cu13/bin/x86_64/nvrtc64_130_0.dll")));
+        // ...and the older layout is still reachable.
+        assert!(windows.contains(&root.join("nvidia/cuda_nvrtc/bin/nvrtc64_120_0.dll")));
+
+        let cufft = wheel_candidates_for(&root, TargetOs::Windows, CudaLibrary::Cufft);
+        assert!(cufft.contains(&root.join("nvidia/cu13/bin/x86_64/cufft64_12.dll")));
+        assert!(cufft.contains(&root.join("nvidia/cufft/bin/cufft64_12.dll")));
+    }
+
+    #[test]
+    fn a_consolidated_wheel_library_directory_identifies_its_root() {
+        // `nvidia/cu13/bin/x86_64` is three levels below `nvidia`, one deeper
+        // than the per-component layout. Recovering the root from it is what
+        // lets a loader-path entry imply the wheel root.
+        let root = std::env::current_dir()
+            .expect("current directory should be available")
+            .join("site-packages");
+        assert_eq!(
+            wheel_root_of(&root.join("nvidia/cu13/bin/x86_64")),
+            Some(root.clone())
         );
         assert_eq!(
-            wheel_candidates_for(&root, TargetOs::Windows, CudaLibrary::Nvrtc),
-            vec![
-                root.join("nvidia/cuda_nvrtc/bin/nvrtc64_130_0.dll"),
-                root.join("nvidia/cuda_nvrtc/bin/nvrtc64_120_0.dll"),
-                root.join("nvidia/cuda_nvrtc/bin/nvrtc64_13.dll"),
-                root.join("nvidia/cuda_nvrtc/bin/nvrtc64_12.dll"),
-                root.join("nvidia/cuda_nvrtc/bin/nvrtc.dll"),
-            ]
+            wheel_root_of(&root.join("nvidia/cu13/lib/x64")),
+            Some(root.clone())
         );
+        // The bare consolidated directory, without the architecture level.
+        assert_eq!(wheel_root_of(&root.join("nvidia/cu13/bin")), Some(root));
     }
 
     #[test]
@@ -603,6 +674,14 @@ mod tests {
             "/opt/site-packages/nvidia/cublas",
             "/opt/site-packages/nvidia/cublas/lib64",
             "/opt/notnvidia/cublas/lib",
+            // A library directory sitting directly under `nvidia`, with no
+            // component level. This is what a plain system install looks like,
+            // and claiming it would make `/opt` a search root that nothing was
+            // ever installed to.
+            "/opt/nvidia/bin",
+            // An architecture level is allowed, but only one, and only beneath
+            // a real library directory.
+            "/opt/site-packages/nvidia/cu13/bin/x86_64/extra",
         ] {
             assert_eq!(
                 wheel_root_of(Path::new(entry)),

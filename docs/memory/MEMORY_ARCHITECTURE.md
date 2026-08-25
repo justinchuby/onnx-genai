@@ -61,14 +61,16 @@ when in fact it is 1955 lines.
 | L3b HostGovernor | §5 | **implemented; adapter in `HostLeaseGovernor`** | `crates/onnx-genai-scheduler/src/pressure.rs`, 1955 lines, modelled in `specs/tla/PressureProtocol.tla` |
 | L4 ClusterCoordinator | §6 | **design only** | no type exists |
 | Lease contract | §1.1 | **implemented** | `crates/onnx-runtime-memory-governor` |
-| Allocator contract | §1.2, §1.3, §1.5 | **implemented on all three backends** | `onnx-runtime-memory-governor/src/allocator.rs`; CPU EP, ONNX Runtime and CUDA EP each implement it |
-| Virtual contiguity | §1.6 | **implemented; managed no-spill VMM is the default for native CUDA (#755)** | `crates/onnx-runtime-virtual-memory`; `CudaVmmAllocator` in `onnx-runtime-cuda-memory` reserves one range and maps 2 MiB granules on demand, leasing each before it maps it. On native CUDA the authority-governed VMM/pool path is now selected **by default, without a flag** (#755): memory-strategy inference runs unconditionally (#752) and drives policy, so a plain `serve` gets managed **no-spill** mode and does not rely on WDDM shared-memory fallback. An explicit `serve --vram-limit <bytes>` now **overrides the inferred device budget** rather than being the trigger. When the resolved budget cannot hold the package weights the runtime **automatically enables weight streaming/offload** instead of failing, so being larger than the budget is a supported configuration; a model that fits stays `FullResident` and does **not** page. **Exception (#864): on Windows/WDDM the OS shared-memory fallback pages over-budget weights from host RAM over PCIe ~30× faster than managed streaming for the single-touch decode access pattern, so managed weight streaming is *not* auto-enabled there — the effective strategy becomes `Compatibility` (`weight_offload_enabled=false`, `managed_no_spill=false`).** This affects only the *inferred* default: an explicit `ONNX_GENAI_WEIGHT_OFFLOAD=1`, `--vram-limit`, or device-budget override still selects managed streaming, and `ONNX_GENAI_MANAGED_WEIGHT_STREAMING=1` forces it. On Linux there is no shared-memory fallback, so the managed path is unchanged (#783). Failure to construct the required VMM arena/pool is fatal before model allocation and names both the requested limit and provider failure; it never silently falls back to ungoverned `cuMemAlloc`. The legacy allocator remains reachable for one release via `ONNX_GENAI_LEGACY_ALLOCATOR=1` (back-compat: `ONNX_GENAI_DYNAMIC_KV_WEIGHT_LENDING=0`), which restores the compatibility fallback. The resolved budget, chosen strategy and offload state are printed at startup and exposed in `/v1/resources` (`memory_strategy`). |
+| Memory mechanism contracts | #1186 Phases 1-2 | **implemented** | low-dependency `crates/onnx-runtime-memory-api`; existing governor paths re-export the moved types and traits |
+| Process memory manager | #1186 Phase 5 | **implemented for registration plus session workspace transactions** | `ProcessMemoryManager` in `onnx-runtime-memory-governor`; native CUDA and `onnx-runtime-session` workspace preparation use manager-issued scoped bindings, while remaining generic allocation adapters are reported as compatibility/unattributed |
+| Allocator capabilities | §1.2, §1.3, §1.5 | **implemented on all three backends** | minimal `DeviceAllocator` plus optional `VirtualBacking` and independent `SharedMapping`; CPU/eager implements only the minimum, while CUDA VMM discovers capabilities from its selected allocator |
+| Virtual contiguity | §1.6 | **implemented; managed no-spill VMM is the default for native CUDA (#755)** | `crates/onnx-runtime-virtual-memory`; `CudaVmmAllocator` in `onnx-runtime-cuda-memory` reserves one range and maps 2 MiB granules on demand, leasing each before it maps it. On native CUDA the authority-governed VMM/pool path is now selected **by default, without a flag** (#755): memory-strategy inference runs unconditionally (#752) and drives policy, so a plain `serve` gets managed **no-spill** mode and does not rely on WDDM shared-memory fallback. An explicit `serve --vram-limit <bytes>` now **overrides the inferred device budget** rather than being the trigger. When the resolved budget cannot hold the package weights the runtime **automatically enables weight streaming/offload** instead of failing, so being larger than the budget is a supported configuration; a model that fits stays `FullResident` and does **not** page. **Exception (#864): on Windows/WDDM the OS shared-memory fallback pages over-budget weights from host RAM over PCIe ~30× faster than managed streaming for the single-touch decode access pattern, so managed weight streaming is *not* auto-enabled there — the effective strategy becomes `Compatibility` (`weight_offload_enabled=false`, `managed_no_spill=false`).** This affects only the *inferred* default: an explicit `ONNX_GENAI_WEIGHT_OFFLOAD=1`, `--vram-limit`, or device-budget override still selects managed streaming, and `ONNX_GENAI_MANAGED_WEIGHT_STREAMING=1` forces it. On Linux there is no shared-memory fallback, so the managed path is unchanged (#783). Failure to construct the VMM arena/pool is fatal at provider construction and names the device, the driver error, the support boundary and any requested limit; it never silently falls back to ungoverned `cuMemAlloc`. **Since #1186 Phase 7 there is no built-in eager allocator to fall back to at all** — `ONNX_GENAI_LEGACY_ALLOCATOR=1` and `ONNX_GENAI_DYNAMIC_KV_WEIGHT_LENDING=0` still select the non-lending arena configuration, but they no longer select a different *mechanism*. A caller who needs eager `cuMemAlloc` implements `DeviceAllocator` and injects it through `CudaExecutionProvider::with_memory`, which is authoritative. The resolved budget, chosen strategy and offload state are printed at startup and exposed in `/v1/resources` (`memory_strategy`). |
 | Composability of the memory paths | — | **authority-governed native path implemented** | The historical independent VMM and weight-offload toggles did not compose (#704). On native CUDA — by default under #755, or under an explicit byte limit — native CUDA constructs one authority before the allocator, charges the physical-handle pool once, registers reloadable weight residency explicitly, and admits KV/workspace growth transactionally. The compatibility path remains available through the legacy-allocator opt-out; performance parity with WDDM remains separate work. |
 | Weight offload vs the OS | — | **fixed 2026-08-12: WDDM shared memory is now the default on Windows for inferred-over-budget models (#874)** | Measured directly on `qwen14b-zp` (8.33 GB weights vs a 7.73 GB budget), same binary, same prompt, byte-identical output, solo with `nvidia-smi` verified empty before every run: **WDDM 8.09/7.78 tok/s with `htod_bytes_per_token = 0`** (true zero-copy — the kernel reads weights in place from host RAM over PCIe) against **managed streaming 0.11 tok/s**. On `main` immediately prior the managed default measured 0.05–0.08 tok/s, so the end-to-end effect on this box is ~100×. **The cause is structural, not a tuning gap:** each weight is read *exactly once per decode step* (922 initializers, ~867 lookups/step, `SequentialDense`), so both paths move the same bytes over the same link, but ours adds a CPU memcpy into pinned staging, a VRAM allocation, a `cuMemMap`, an eviction and a synchronize — to buy VRAM residency that is discarded before it is ever re-read. **Copying to VRAM only pays off when the data is re-read from VRAM before eviction, and there is no intra-step reuse.** #874 therefore stops auto-enabling managed streaming on Windows when the OS fallback is available; explicit requests (`ONNX_GENAI_WEIGHT_OFFLOAD=1`, `--vram-limit`, a device-budget override) are still honoured, and `ONNX_GENAI_MANAGED_WEIGHT_STREAMING=1` forces the managed path back (parsed so an *unrecognized* value keeps the fast default — the inverse of the `ASYNC_PAGEIN` trap). Linux is unchanged and must stay so: with no shared-memory fallback an over-budget model simply fails there, so managed streaming competes with "does not run", not with something faster (#783's lesson about not inheriting a platform-specific conclusion). Trade stated plainly: the `Compatibility` arm has **no device budget** (`managed_limit_bytes=None`), so on a host short of RAM an over-budget model can thrash, and the governor cannot see system-wide pressure (#863). Keeping the no-spill arena while merely disabling offload is **not** an option — the physical-handle pool is a hard cap and `cuMemCreate` cannot spill, so with nothing paging the remainder the load fails outright. The durable fix remains the hybrid in #864: a resident hot set **plus zero-copy cold reads**, which is what would beat the OS rather than merely stop losing to it — **and which has since been built and measured to fail here; see the CLOSED NEGATIVE note at the end of this row.** **Feasibility is measured** (`scripts/zero_copy_host_map_probe.py`, #877; real-kernel follow-up #880): `cuMemHostRegister(READ_ONLY|DEVICEMAP)` on a read-only weight mapping succeeds and costs 3.1 ms per GiB, and **CUDA graph capture with a host-mapped weight pointer is supported, replaying bit-identically to eager** (#880) — so the cold path does not forfeit the `captures > 0` / `fallbacks == 0` gates. On bandwidth, **the sequential-proxy figure was optimistic by ~2× and is superseded**: #877 measured 11.41 GB/s with a `cuMemcpyDtoD` *from* mapped host memory, but #880 ran the **real strided int4 GEMV** — the exact kernel and launch config the engine selects — with only the weight pointer differing, and measured **~5.6 GB/s steady-state** from host-mapped memory against **~100–133 GB/s** resident, outputs bit-identical at every size. **Use 5.6 GB/s, not 11.4, when sizing the hybrid's cold path.** The correction is corroborated independently: WDDM reaches ~8 tok/s on qwen14b-zp by keeping ~7.7 GB resident and reading the ~0.6 GB remainder from host each step ≈ 4.8 GB/s of PCIe traffic — the same order, and impossible if zero-copy were ~1 GB/s. Sweeping the packed size mattered: the realistic ~12 MiB per-tensor read fits this GPU's L2, so a single-point measurement there compares a cached read against a PCIe read; the ≥64 MiB points are the honest ones, since the real 8.33 GB layer walk reads each weight once and vastly exceeds L2. Two consequences, the second of which **reverses the priority order originally assumed on #864**: zero-copy is **not** a bandwidth win (1.01× against an explicit copy) — it removes the copy's *second* pass and its machinery (staging fill, VRAM alloc, `cuMemMap`, eviction, synchronize), which subsumes #837 items 1–2 rather than competing with them; and **the resident hot set is worth ~9.7× at the realistic per-op shape, rising to ~15–24× at large N**, so maximising residency comes first and de-copying the remainder second. Registering all 8.33 GB of referenced weights also page-locks that much host RAM, which needs a policy on smaller hosts. **CLOSED NEGATIVE 2026-08-13 (#912): the hybrid was built end-to-end on this reasoning and it does not beat the OS here.** Both feasibility findings above held — real strided GEMV at ~5.6 GB/s, capture bit-identical with host-mapped pointers — so what defeated it was a limit neither probe looked for: **aggregate distinct host-mapped bytes read per decode step above ~0.44–0.65 GB silently return stale data** (48 cold weights collapsed generation 16 → 3 tokens; a single read stays bit-identical at 1/8/16/32, and a copy-instead A/B places the fault on the read), and capped at a provably safe 256 MiB the arm measured **0.73 tok/s against WDDM's 7.84** in the same session. The safe aperture (0.26 GB/step) is smaller than the traffic it must displace (~0.6 GB/step), so the lever is short by construction. It ships default-OFF behind `ONNX_GENAI_ZERO_COPY_HYBRID` with the conservative budget, as instrumentation for parts with larger host apertures — **re-measure there rather than inheriting this result in either direction.** **The closure is WDDM-scoped, and the Linux question is now answered (#925, default raised in #936).** On Linux there is no shared-memory fallback, so the 7.84 tok/s comparison arm does not exist: the hybrid's competitor is managed streaming or outright failure — and it wins by **~8×, 67 tok/s against ~8.5 median**. The aperture ceiling is a VidMm behaviour, as #863 suggested (it measured WDDM demoting our own VMM granules; a host registration being silently remapped is the same family), and it is **measured absent** on H200 (driver 580.105.08, CUDA 13, kernel 6.6): byte-identical to baseline with `fallbacks=0` up to **6.795 GB** of distinct host-mapped weights bound and re-read per decode step (704 `cuMemHostRegister` binds, n=3, all byte-identical) — ~15× the WDDM ~0.44 GB onset. The default budget is now platform-conditional: 256 MiB on Windows, 2 GiB elsewhere, deliberately bounded at >3× under the measured-safe figure because only one GPU class was tested. #783's lesson applied in both directions — the WDDM negative was not inherited onto Linux, and the Linux positive is not extrapolated past its hardware. With the hybrid closed on WDDM, the remaining levers on this row are **batching** (which creates the intra-step reuse that makes residency pay at all, #884/#891) and the **admission** side of the residency gap (~90% of it, #901). Historical figures this row previously carried (6.01 tok/s WDDM, 27× behind, `h2d_copy` 18.8% / `staging_fill` 9.0% / `vram_free` 9.0% / `vram_alloc` 2.3%, capture disabled under offload) are superseded: capture now runs under offload (#796) and the eviction-policy defect was fixed (#723). #705, #864, #874, #877, #880, #912, #925 |
 | `--vram-limit` | — | **override, not trigger; managed no-spill is the default (#755)** | Under #755 memory-strategy inference runs on every native CUDA load and selects managed no-spill by default; `--vram-limit` now **overrides** the inferred device budget rather than being what turns the managed path on. If package weights exceed the resolved budget, weight offload is enabled automatically and its allowance is derived as `budget − governed device state`; the same authority owns physical VMM handles, mapped weights, KV, and workspace. A 6 GiB qwen2.5-14b int4 live run loaded, generated the expected `Paris`, stayed at 5,534,384,128 owned bytes, rejected an 8K request pre-header with 429, and completed four queued short requests without overlap-only rejection. Crossing the first physical KV-growth boundary transferred 201,326,592 bytes through one grant and reported 201,326,592 mapped KV bytes; later governed capacity exhaustion returned 429 rather than 500/OOM. Managed initialization failure is an early arithmetic/provider error, while `ONNX_GENAI_LEGACY_ALLOCATOR=1` (back-compat `ONNX_GENAI_DYNAMIC_KV_WEIGHT_LENDING=0`) restores the prior non-VMM/WDDM-capable compatibility fallback. Limitation: the native server's FIFO per-request engine queue verified ordering and absence of overlap-only rejection, but did not demonstrate simultaneous live KV accumulation. Caveat carried, not closed: `activations_bytes=unknown` and `runtime_overhead_bytes=unknown` are not subtracted (#514). PRs #717, #736. || Managed no-spill VMM default (#755) | — | **implemented; measured on native CUDA** | Memory-strategy inference selects the managed no-spill VMM path by default (no flag) on native CUDA, and auto-enables weight streaming when the resolved budget cannot hold the weights. Locked by the ignored live test `qwen2_5_0_5b_managed_vmm_default_e2e` (Qwen2.5-0.5B int4 mobius, same process): **(A)** default no flag → `strategy=FullResident`, `weight_offload_enabled=false`, `managed_no_spill=true`, resolved budget 7,730,940,928 bytes, committed 381,681,664 device bytes, **0 page-ins** (a fitting model does not start paging); **(B)** synthetic over-budget via an explicit 268,435,456-byte `--vram-limit` → `strategy=DynamicWeightResidency`, `weight_offload_enabled=true`, `managed_no_spill=true`, streaming engaged with **434 page-ins / 432 evictions**, committed bounded to 90,177,536 device bytes (« the cap — no WDDM spill), and at that extreme synthetic cap the residency arithmetic **refused cleanly** ("no page is evictable") rather than spilling; **(C)** `ONNX_GENAI_LEGACY_ALLOCATOR=1` → `managed_no_spill=false` (legacy allocator observable); **(D)** an explicit `--vram-limit` overrides the resolved device budget. Deterministic counters only; wall-clock omitted (this box ranged 3.9–28 tok/s across identical runs, and other agents build concurrently). A native large-model run that genuinely exceeds VRAM was not measured: `qwen14b-zp` lacks `inference_metadata.yaml` (#384), so the over-budget condition was synthesized with a small explicit budget, as noted. CUDA-graph segment count is not a public counter; capture-ON-under-offload on the stable-VA path is pinned by the #796 unit tests, not re-measured here. |
 | WDDM prefers OS shared-memory over managed streaming by default (#864) | — | **implemented; measured on native CUDA (`qwen14b-zp`, genuinely over budget)** | On Windows/WDDM the #755 auto-enable of managed weight streaming for an *inferred* over-budget model is now skipped in favor of the OS shared-memory fallback (weights sit in host RAM and are read in place over PCIe), which #864 measured ~30× faster for the single-touch decode access pattern — copying a weight into VRAM only to evict it before any intra-step re-read is pure overhead. The effective strategy becomes `Compatibility` with `weight_offload_enabled=false`, `managed_no_spill=false`, no governed device budget; residency is handed to the OS (trade: on a host with little free RAM an over-budget model may thrash — the governor cannot see system-wide pressure, per #863). Decided in `memory_strategy.rs` (policy change only; the residency cache, arena, and offload implementation are untouched). Gated on `cfg!(windows)` as a pragmatic stand-in for WDDM — detecting WDDM vs TCC at this layer would cross into architecture; under TCC `cuMemCreate` fails at the physical limit rather than spilling, so TCC-mode Windows users needing the managed path use the force knob. **Scope guards:** honored, not overridden — an explicit `ONNX_GENAI_WEIGHT_OFFLOAD=1`, `--vram-limit`, or `ONNX_GENAI_WEIGHT_OFFLOAD_DEVICE_BYTES` still selects managed streaming; `ONNX_GENAI_MANAGED_WEIGHT_STREAMING=1` forces it (opt-in, unrecognized values keep the fast fallback — deliberately *not* the `ASYNC_PAGEIN` trap shape); Linux is unchanged (no fallback exists, #783). Measured direct A/B, same binary, same prompt, GPU verified clear before every run, **token IDs byte-identical across all 7 runs**: WDDM default n=4 **median 7.18 tok/s** (7.10–7.67), prefill ~191 ms, `htod_bytes_per_token=0`, `page_ins_per_token=0`; forced managed (`ONNX_GENAI_MANAGED_WEIGHT_STREAMING=1`) n=3 **median 0.86 tok/s** (0.84–0.88), prefill ~1,097 ms, `htod_bytes_per_token=3,943,690,240`, `page_ins_per_token=372` — **8.3× on medians on a quiet box** (the issue's 30.7× was under this box's characteristic noise; the deterministic counters match exactly and confirm which path ran). Unit-locked in `memory_strategy.rs` (`wddm_over_budget_prefers_shared_memory_and_disables_streaming`, the WDDM/MoE/fitting/override/force variants, and `managed_default_no_flag_over_budget_model_auto_streams` proving Linux still streams). |
 | Weight residency cache (CUDA) | — | **had a 0% hit rate for its entire life; fixed 2026-08-06** | `evict_to_fit` was a plain LRU evicting from the least-recently-used end, while the decode weight walk is a **cyclic sequential scan** over the layers — the pessimal pairing, which returns the hit rate to zero at *every* capacity. Measured: **6,936 page-ins, 0 hits, at both 3 GB and 6 GB budgets**, with staged bytes identical (7,870,916,608 per step) because miss traffic under this pathology is invariant to capacity. Rivals eliminated on hardware: the budget knob works (peak resident 3.0 vs 6.0 GB) and staged bytes reconcile with `page_ins × page size`. A stable-resident-subset policy measures **74.18%** against a `B/W ≈ 76%` ceiling, page-ins 6,936 → 1,791, evictions 6,286 → **0**. #720, PR #723 |
-| KV page storage | — | **contract opened 2026-08-06; still host-only** | `onnx-genai-kv` implements paging, ref-counting/CoW, prefix sharing and quantization layout, and **never touched device memory**: storage was host `Vec`, `Device::Gpu(0)` a label on a struct field, and a tier migration one enum assignment moving zero bytes. Documented as a placeholder in `tiered.rs` from the start — the seam was designed in and the GPU backend behind it was never built. `PageTable` now holds `Box<dyn KvPageStore>` so a third party can supply a store without patching the crate; host stores expose slices, device stores expose an opaque span, and a host view of a device page requires explicit materialization. Stages 2–5 in #721. PR #726. Device KV paging is **not** owned by `onnx-genai-kv`: under the VMM design it is owned by the CUDA VMM layer (`CudaVmmAllocator`, the #740 physical-handle pool), with committed-granule admission (#745) and growth grants (#748). `native_decode/cuda.rs` still has no `PageTable`/`PagedKvCache` consumer, and `paged_gqa.rs` is a batch-1 CPU primitive. |
+| KV page storage | — | **contract opened 2026-08-06; still host-only** | `onnx-genai-kv` implements paging, ref-counting/CoW, prefix sharing and quantization layout, and **never touched device memory**: storage was host `Vec`, `Device::Gpu(0)` a label on a struct field, and a tier migration one enum assignment moving zero bytes. Documented as a placeholder in `tiered.rs` from the start — the seam was designed in and the GPU backend behind it was never built. `PageTable` now holds `Box<dyn KvPageStore>` so a third party can supply a store without patching the crate; host stores expose slices, device stores expose an opaque span, and a host view of a device page requires explicit materialization. Stage status in #721: stage 1 (store extraction) merged in #726, stage 2 (real tier migration, charged to the governor) merged in #742, and **stages 3–4 superseded** — a `CudaPageStore` and a native CUDA decode that consumes `PageTable` are not the native-CUDA architecture, because device KV paging is owned by the VMM layer below (next sentence). Do not build them; the issue body carries the authoritative status. Device KV paging is **not** owned by `onnx-genai-kv`: under the VMM design it is owned by the CUDA VMM layer (`CudaVmmAllocator`, the #740 physical-handle pool), with committed-granule admission (#745) and growth grants (#748). `native_decode/cuda.rs` still has no `PageTable`/`PagedKvCache` consumer, and `paged_gqa.rs` is a batch-1 CPU primitive. |
 | Captured graphs across a VMM remap | — | **verified on hardware 2026-08-06** | A CUDA graph instantiated before `cuMemUnmap`/`cuMemCreate`/`cuMemMap` at the same virtual address replays correctly afterwards and writes into the **new** physical pages — sentinel-proven, closing the page-recycling confound. The growth-shaped case passes, and one physical handle mapped at two virtual addresses is readable by captured work through either. Untested and treated as unsafe: unmapping while a replay is in flight. `cuMemMap` during capture returns `CUDA_SUCCESS` but is **not** proven replayable, so growth is issued outside the captured segment. This is the premise under #721 stage 4 and under re-scoping #716, and its stated falsifier did not fire. PR #727 |
 | Activation planning | — | **wired for measurement; not yet allocating** | `crates/onnx-runtime-memory` now has a consumer: the session executor builds a `ViewMap`, runs the planner, and reports peak vs naive. Measured 2.4x-2.7x on qwen2.5-0.5b, though see #671 for a review finding that may inflate that. Sharing slots for real is #670 |
 | Native KV page size | — | **wrong unit** | `governor_kv_config` puts a token count in `page_size_bytes` when the geometry is unknown, so the native `bytes_per_token` is 1 (#628) |
@@ -83,10 +85,15 @@ Updated through #736 (default-domain `Attention` staged K/V) on 2026-08-12.
 Scope: production code in `crates/onnx-runtime-ep-cuda`,
 `crates/onnx-runtime-session`, and CUDA kernel launch support. Test-only
 `alloc_raw` calls under `#[cfg(test)]` are excluded. The only direct `cuMemAlloc`
-entry point in this scope remains `CudaRuntime::alloc_raw`
-(`crates/onnx-runtime-ep-cuda/src/runtime.rs:898`); the replaceable
-`CudaDeviceAllocator`/VMM allocator path is the EP allocation authority seam, not
-a kernel scratch bypass. `crates/onnx-runtime-session` has no CUDA raw allocation
+entry points in this scope are `CudaRuntime::alloc_raw`
+(`crates/onnx-runtime-ep-cuda/src/runtime.rs`, kernel metadata uploads) and the
+cuDNN workspace (`crates/onnx-runtime-ep-cuda/src/cudnn/mod.rs`). Since #1186
+Phase 7 there is **no** eager `cuMemAlloc` allocator behind the EP allocation
+authority seam at all: the VMM allocator is the sole built-in mechanism there,
+and the two sites above are kernel scratch, not the allocation authority. The
+exact set is pinned by
+`crates/onnx-runtime-ep-cuda/tests/no_built_in_eager_allocator.rs`, so adding a
+third site fails a test rather than quietly widening this paragraph. `crates/onnx-runtime-session` has no CUDA raw allocation
 call; it owns the governed workspace preparation path
 (`executor/bindings.rs:16`, `executor/dispatch.rs:1538`).
 
@@ -658,7 +665,7 @@ measured 2 MiB CUDA granule:
 >    in-place VMM growth path**, not on the default bucket-*reallocation* path. A
 >    reallocation fills a fresh buffer, so it copies the live prefix either way;
 >    seq-major's win there is one contiguous copy instead of `kv_heads` stripes,
->    not a smaller byte count. Under `ONNX_GENAI_CUDA_VMM=1` (`commits_on_demand`,
+>    not a smaller byte count. On the VMM arena (`commits_on_demand`,
 >    growth maps granules onto the same base VA) the capacity-independent
 >    `kv_heads × head_dim` per-token stride keeps the prefix in place.
 >
@@ -1018,33 +1025,30 @@ the seven duplicate copies saves about **2.56 GiB** (#777/#787). This uses the
 multi-map primitive proven in #727, but detection, lifetime, read-only/COW
 enforcement, and 1:N handle bookkeeping are **not yet implemented**.
 
-The #777 isolating GPU probe has now cleared all five primitive questions with
-no kill finding — N-way multi-map under captured-graph replay, charge-once in the
-real #740 ledger, non-sticky/non-corrupting write protection, coexistence with
-the #759 dummy page, and a one-time ~5.5 ms pooled copy-on-write at the boundary.
-Measured answers, the concurrency/saving and capacity tables, and the design for
-an explicit pinned-prefix API (the smallest next increment) are in
+The #777 isolating GPU probe validates N-way multi-map, charge-once accounting,
+dummy-page composition, and the measured copy-on-write boundary cost. Its
+production-shaped kernel-store probe clarifies the protection contract: writing
+a `PROT_READ` alias is a fail-stop CUDA illegal-address error, not a recoverable
+kernel fault. Measured answers are in
 [`PREFIX_SHARE_INVESTIGATION.md`](PREFIX_SHARE_INVESTIGATION.md).
 
-**First production consumer landed (#777).** The prefix-sharing primitive
-(`create_shared_prefix`/`commit_shared_prefix`, #803) previously had no live
-caller — only its definition and GPU tests. It is now reachable from production
-code through an allocator-agnostic seam on the `DeviceAllocator` trait
-(`create_shared_prefix` / `incremental_owned_bytes_for_shared_prefix` /
-`commit_shared_prefix`, returning an opaque `dyn SharedDevicePrefix`), so a
-caller holding only `dyn DeviceAllocator` can pin a token prefix once and have
-subsequent sequences map it. Non-VMM allocators keep the default impls, which
-refuse (`InvalidRequest`) rather than mis-map. The **seq-major** fused fp16 GQA
-decode kernel is the first consumer: a GPU parity test
+**First production consumer landed (#777).** A pooled CUDA allocator exposes
+`create_shared_prefix`/`commit_shared_prefix` through the optional
+`SharedMapping` capability; pool-less allocators report `None`. The
+**seq-major** fused fp16 GQA GPU parity test
 (`crates/onnx-runtime-ep-cuda/tests/gqa_shared_prefix_parity_gpu.rs`) drives the
-real kernel over shared-prefix VMM KV and proves two sequences sharing one pinned
-seq-major prefix (`layers × 2` contiguous ranges) produce **byte-identical**
-output to two independent sequences. Measured at KV_HEADS=8, HEAD_DIM=128, f16,
-1024-token prefix + 1024-token private tail per sequence: independent = 8
-granules (16,777,216 B), shared = 6 granules (12,582,912 B); the prefix is
+real kernel over shared-prefix VMM KV and proves two sharing requests plus one
+private-fallback request, each decoded for two interleaved steps, produce
+**byte-identical** output to independent GPU caches and the CPU reference.
+Measured at KV_HEADS=8, HEAD_DIM=128, f16, 1024-token prefix + 1024-token private
+tail per sequence: independent = 12 granules (25,165,824 B), shared-plus-fallback
+= 10 granules (20,971,520 B); the prefix is
 charged **once** (`incremental_owned_bytes_for_shared_prefix` = 0) and the second
 sharer's admission is **only its private bytes** (4,194,304 B = its two private
 tails), so sharing removes `(C−1)×(K_prefix+V_prefix)` = 2 granules.
+`commit_shared_prefix_pair` makes K/V admission all-or-private: when the V map
+is rejected, it decommits the successful K map before permitting private
+fallback. A rollback failure is explicitly non-fallbackable.
 
 **What remains structural.** The *engine generation loop* cannot yet call this
 seam automatically: `persistent_state_shapes` in
@@ -1056,6 +1060,8 @@ use. Hash-based automatic detection, token-major (one multi-map per sequence),
 and copy-on-write at divergence remain the later increments named below. The
 delivered consumer is explicit (a caller declares the shared prefix) and is
 restricted to prefixes that are read-only for the sharers' lifetime.
+This test and transaction API prove the allocator/governor seam; the live server
+request path does not yet consume physical shared-prefix metadata.
 
 #### Layout belongs to the KV owner
 
@@ -1639,6 +1645,355 @@ nobody outside the crate could implement — the accounting *had* to be ours. Ev
 test passed, because every test lived inside the crate where private fields are
 reachable. The proof now lives in `tests/`, where it sees exactly what a third
 party sees and stops compiling if the contract closes again.
+
+Phases 1-5 of #1186 establish the dependency, capability, binding-lifetime,
+ordered-release, and process-transaction boundaries.
+`onnx-runtime-memory-api` owns `Tier`, `MemoryRole`, `MemoryError`, the primitive
+allocation/prefix types, the minimal `DeviceAllocator`, `HostAllocator`, and the
+optional `VirtualBacking`/`SharedMapping` traits. It also owns the narrow
+`BindingRegistry`: manager-issued registration/binding identity and the
+lifetime pins needed to keep one selected mechanism usable. Governor-specific
+capacity tokens, holder identities, ledgers, grants, leases, pressure
+responders, shareability analysis, and policy remain in
+`onnx-runtime-memory-governor`; its former paths re-export the memory-API public
+surface for compatibility.
+
+Capability coherence is a trusted part of the raw-pointer allocator boundary.
+Any capability returned from an allocator reference must operate on that same
+selected mechanism and device, and whole-allocation release always returns
+through `DeviceAllocator`/the owning EP. In-tree mechanisms satisfy and test
+that contract. Rust does **not** structurally prove that an adversarial wrapper
+delegates ordinary allocation, optional capabilities, and release to one inner
+object; runtime identity heuristics are not used as a fake proof.
+`BindingRegistry::register_trusted_composite` is therefore an explicit unsafe
+attestation for a transparent/split-inner bundle, not a claim that the type
+system proved it coherent.
+
+`VirtualBacking` capability presence alone does not assert governed accounting.
+The separate `DeviceAllocator::commits_on_demand()` signal is `true` only when a
+mechanism both maps physical memory lazily and charges a governor as it commits;
+eager and ungoverned-capability implementations retain the safe `false`
+default. Likewise, `SharedMapping` rejects foreign device/pool-authority
+prefixes before reporting incremental owned cost, so an unmappable prefix can
+never appear free to admission control.
+
+#### Phase 3 binding identity, lifetime, and teardown
+
+`BindingRegistry` is deliberately smaller than `ProcessMemoryManager`. It owns
+no budget, lease, holder, transaction, eviction, or victim policy. The process
+manager embeds it as the only mechanism registry; it does not copy the
+registration or selection ledger.
+
+The registry, rather than `DeviceAllocator`, `VirtualBacking`, or
+`SharedMapping`, issues all identity used at the binding boundary:
+
+| Identity | Meaning |
+|---|---|
+| `ProviderContextIdentity` | one registered provider/context lifetime |
+| `AuthorityIdentity` | one registered accounting-authority lifetime |
+| `MechanismIdentity` | one ordinary allocator plus its registered coherent optional capabilities |
+| `BindingId` + `BindingGeneration` | one lookup of one mechanism/context/authority tuple |
+| `AllocationGeneration` | a never-pointer-derived cookie for one allocation at one binding |
+
+Each `MemoryBinding` holds one `Arc<MechanismEntry>`. That entry holds the
+selected `Arc<dyn DeviceAllocator>`, provider-context `BindingResource`, and
+authority `BindingResource`. `BoundAllocation`, `BoundMemoryView`, and bound
+capability handles clone that same binding. Dropping a session/EP front-end or
+the registry therefore cannot destroy the context while any bound metadata or
+active operation still references it. Within that entry the allocator and its
+two pins live in one resource owner whose field order is load-bearing: the
+allocator is destroyed first, so a third-party allocator that releases device
+state from `Drop` still observes a live provider context and authority, and the
+provider context — the deepest resource — is released last.
+`BoundAllocation` has no `Drop` release;
+whole-allocation release remains explicit through `MemoryBinding::release` and
+the original `DeviceAllocator`. Phase 3 calls canonical `deallocate` and does
+not expose the EP's mapped-attribution refund from `deallocate_with_unmapped`;
+EP adoption must wait for Phase-4 accounting reconciliation.
+
+Changing the selected mechanism affects only later `bind(device)` calls. An old
+binding remains pinned to its original mechanism and explicitly releases there.
+Retiring a mechanism rejects new bindings/capability work while permitting
+existing allocations to release. Two separately issued bindings do not become
+interchangeable merely because they name the same device or allocator:
+cross-binding, cross-mechanism, cross-authority, and cross-device metadata is
+rejected before a capability or validated device callback runs. When a virtual
+address is reused, its new `AllocationGeneration` differs and a stale view
+fails validation.
+
+Selection publishes a candidate and then re-checks it, because a mechanism can
+be retired or lost in between. Withdrawing a failed candidate never leaves a
+dead selection behind. A candidate is withdrawn only while it still owns the
+device's selection, so a losing candidate cannot overwrite a newer selection
+published concurrently. The previous selection is restored only while it is
+still registered **and** `Active`, so a concurrently retired, lost, or removed
+predecessor is never resurrected. Otherwise the selection is cleared, because an
+absent selection is the only state a later registration self-heals — a stale
+identity left in the slot would wedge the device permanently. A restored
+predecessor is re-checked exactly like the candidate was, and that retry carries
+no further fallback. Withdrawal changes identity state only: it makes no
+allocator callback and, like every other registry path, releases the registry
+lock before each mechanism lifecycle snapshot.
+
+Retirement and device loss cooperate with that re-check by making the lifecycle
+terminal **before** dropping the selection. Because the registry lock and a
+mechanism lock may never be held together, dropping the selection first would
+leave a window in which a `select` that already validated the mechanism
+publishes it after the clear and still observes `Active` at its own re-check —
+wedging the device on a retired or lost selection that no later registration can
+heal. Retiring first closes that window: any selection published afterwards must
+have validated earlier, so it fails its re-check and withdraws itself. Device
+loss drops only a selection naming a mechanism it actually invalidated, so a
+registration that lands after the call returns is never deselected by it; one
+that lands mid-call may be left unselected, which fails closed and heals on the
+next registration or explicit selection.
+
+Device loss removes the current selection and makes every affected binding
+return an explicit `DeviceLost` error, including on attempted release. That path
+does **not** call the allocator, free physical memory, release a lease, or refund
+delegated quota. After the owner has observed provider-context/process
+termination and all active callbacks have quiesced,
+`confirm_context_terminated` makes allocation identities terminal; the
+accounting authority separately reconciles charge only at its required
+termination boundary. Normal retirement and device loss are intentionally
+different: a valid retired mechanism can still release, while a lost device
+cannot be assumed callable.
+
+The registry has two lock classes and never nests them:
+
+1. the registry lock protects registration and current selection;
+2. one per-mechanism lock protects lifecycle and live allocation identities.
+
+Lookup copies an `Arc` and releases the registry lock before inspecting a
+mechanism. Allocation, capability, validated-device, and deallocation callbacks
+run with neither lock held. Invalidation never waits; termination confirmation
+returns `ContextNotQuiescent` while callbacks remain, so callers wait or poll
+outside registry/governance locks. Resource removal is a separate non-callback
+step after mechanism registrations are quiescent and removed.
+
+At the Phase-3 boundary there is no deferred-free queue, fence/event scheduling, owning allocation
+RAII, physical-release completeness state, partial-unmap recovery, quarantine,
+or pointer-only retry API. `BoundSharedPrefix` teardown is still drop-driven,
+not lifecycle-gated by the registry; field order only guarantees that its
+provider-context/resource pin outlives physical-prefix destruction. Allocator
+teardown carries the same limit: field order guarantees only that the
+provider-context and authority pins outlive the allocator's destructor, not that
+the destructor's device work is ordered against a stream. True stream-ordered,
+partial-failure-safe teardown remains Phase 4 work.
+
+#### Phase 4 owning release, deferred ordering, and quarantine
+
+Phase 4 adds ownership and release ordering without moving policy into the
+allocation handle. `OwningAllocation` wraps one exact `BoundAllocation`; it is
+not `Clone` or `Copy`, and its final release consumes the binding identity plus
+`AllocationGeneration`. `OwnedView` is cloneable borrowed metadata only. A live
+view blocks release, and neither a view nor a raw pointer has a release method.
+The execution-facing `DeviceBuffer` can carry this owner directly. Its raw
+escape hatch refuses to discard the owner, and the ORT plugin allocator retains
+the exact EP-issued buffer until `Free` rather than reconstructing release
+authority from a pointer and size.
+
+The lifecycle is explicit:
+
+```text
+live/mapped
+  | prepare_release(binding + allocation generation)
+  v
+queued -- both compute/copy fences complete --> released-or-pooled
+  | enqueue refusal / abandoned request
+  +-----------------------------------------> quarantined
+  | device loss
+  +-----------------------------------------> device-lost quarantine
+
+partially unmapped
+  | residual mappings/handles/VA/context stay owned
+  +-----------------------------------------> quarantined (never reusable)
+```
+
+Preparation removes the live generation exactly once under the mechanism lock
+and returns a `PreparedAllocationRelease` that pins the allocator, authority,
+and provider context. Dropping either an unreleased owner or an unexecuted
+prepared request does not free and does not wait: it records quarantine.
+`MemoryBinding::release(BoundAllocation)` remains the migration adapter, but it
+uses the same generation-checked preparation and cannot retry a pointer after
+virtual-address reuse.
+
+CUDA owns one `CudaDeferredReleaseQueue` per provider context. Production does
+not reject already-existing ownership solely because earlier fences are still
+pending; custom/test queues may set a finite capacity to exercise fail-safe
+`Full` handling. Enqueue
+records one event at the current compute-stream tail and one at the current
+copy-stream tail, then returns without a stream or device synchronization. A
+worker uses non-blocking event queries and executes ready releases outside the
+queue lock. Provider `Drop` and shutdown initiate a non-blocking drain; already
+accepted work keeps the queue, streams, context, and exact ownership alive.
+Queue refusal returns the exact request. Device loss stops event queries and
+allocator calls and retains pending ownership without a refund. Explicit
+partial decommit is different: its caller asks for the range to be unavailable
+before proceeding, so it waits only on freshly recorded events for these two
+streams, never on the whole device.
+
+CUDA VMM release has two independent accounting axes:
+
+| observed transition | mapped attribution | physical ownership / lease |
+|---|---:|---:|
+| `cuMemUnmap` failed | unchanged | unchanged |
+| unmap succeeded, handle returned to retained pool | refund actual unmapped bytes | pool remains charged |
+| unmap and `cuMemRelease` succeeded | refund actual unmapped bytes | release owned bytes |
+| unmap succeeded, pool return / handle release failed | refund actual unmapped bytes | retain exact handle and charge in quarantine |
+| rollback remapped every block | unchanged | unchanged |
+| rollback/remap failed | refund only mappings that stayed removed | retain the whole poisoned span and every residual |
+
+Zero unmapped bytes is therefore a valid `Complete` result, not an error
+sentinel. `AllocationReleaseOutcome` distinguishes `Complete`, `Quarantined`,
+and pre-mutation `Failed`; after any CUDA mutation the only non-complete answer
+is `Quarantined` with actual accounting and residual ownership.
+
+The VMM arena never returns a span to its free list until release reaches a
+consistent terminal state. Failed unmaps leave exact mappings recorded.
+Successfully unmapped handles that could not be returned enter a pool
+quarantine that is never checked out. Transactional decommit retains handles
+through its unmap phase so it can restore the original mapping and access
+protection. A remap failure moves the whole allocation out of the live set,
+poisons its granules, retains its VA/mappings/handles/context/lease, and rejects
+all later commit, decommit, or release attempts. Shared-prefix handles keep
+their cross-reservation mapping reference count, so the physical backing
+survives until the last owner or mapping retires.
+
+Production CUDA EP allocation, committed allocation, mapped-capacity adoption,
+weight paging, stable weight slots, reservation teardown, provider shutdown,
+and the ORT plugin allocator use this lifecycle. Mapped refunds and provider
+free counters are applied by observers only after the structured release
+outcome is known. Stable slots remain pending until their deferred decommit
+settles and become permanently poisoned after incomplete or refused release.
+Authority-driven reclaim and admission that require immediate headroom wait
+with a finite deadline for the relevant deferred queue; a timeout fails closed
+without claiming capacity that is still charged.
+
+The lock order remains leaf-oriented:
+
+1. Registry lock: registration and selected mechanism only.
+2. Per-mechanism lock: lifecycle, live generations, queued count, quarantine.
+3. CUDA arena and physical-pool bookkeeping locks.
+4. Deferred queue state and execution gate.
+
+Registry and mechanism locks are never nested. Queue locks are never held
+across event recording/query, allocator or observer calls, governor/allowance
+calls, release execution, or waits. CUDA driver operations do not run under a
+physical-pool state lock. Any bounded admission/reclaim wait occurs outside
+registry and governance locks.
+
+At the Phase-4 boundary there is not yet a `ProcessMemoryManager`, plugin ABI,
+adapter removal, eager-CUDA removal, or allocator-selection default change.
+Phase 5 adds the manager described below; the other items remain later phases.
+
+#### Phase 5 process manager and scoped allocation transactions
+
+`ProcessMemoryManager` centralizes process-local registration, current mechanism
+selection, binding issuance, authority/holder identity, parent-quota
+delegation, and allocation transaction coordination. It does **not** become a
+second state owner:
+
+| concern | source of truth |
+|---|---|
+| context/authority/mechanism registration, selection, lifecycle, allocation generation | embedded `BindingRegistry` |
+| local capacity, policy, leases, mapped-growth grants | `MemoryGovernor` / physical authority |
+| what may be reclaimed and how | registered holder / `PressureResponder` |
+| stream, copy, commit/decommit, fence, deferred-release ordering | execution provider context |
+| process parent quota and transaction settlement | `ProcessMemoryManager` |
+
+A `ScopedMemoryBinding` pins one device, mechanism, provider context, and
+canonical authority. It exposes transaction-only allocation and
+non-allocating bound capability operations; it does not hand callers the raw
+registry or a raw allocation path. Registering the same
+`MemoryAuthorityId` again recovers the canonical authority registration, so two
+sessions or UMA/shared aliases cannot create independently grantable capacity
+for one physical pool. A mechanism switch affects only later bindings; existing
+allocations and queued releases retain the original allocator/context/authority
+path.
+
+Each provider context also owns a manager transaction gate (policy metadata,
+not a second registration ledger). Allocation commit/publication, weight
+page-in, and other provider-owned device work hold a context operation token.
+The context lifecycle is monotonic (`active -> retiring/lost -> terminated`):
+normal teardown and device loss reject new tokens, then wait for existing
+tokens with no manager/registry/governor lock held. A process-wide weak listener
+set broadcasts device loss to every same-device provider queue before registry
+invalidation, so sibling contexts cannot continue fence queries or allocator
+calls after only one queue learned of loss.
+
+The allocation state machine is:
+
+```text
+preflight pressure/delegation (no reservation held)
+  -> reserve process parent quota (unless already delegated)
+  -> reserve local authority lease (unless allocator-managed/compatibility)
+  -> allocate through the scoped binding
+  -> provider commit/map
+  -> publish allocation identity + independent accounting axes
+```
+
+Every failure before allocation drops provisional reservations exactly once.
+Every failure after allocation rolls back through `OwningAllocation` and the
+Phase-4 structured release. A complete rollback returns the reservation; a
+partial/failed rollback retains the exact residual charge and never makes the
+span reusable. If physical ownership exists but an allocation identity could
+not be issued, provisional tokens are deliberately retained rather than
+manufacturing a refund.
+
+`ManagedAllocation` keeps the authority lease and process reservation attached
+to physical ownership. Preparing a deferred release moves the same settlement
+token into the provider queue. The queue observer settles from the actual
+`AllocationReleaseOutcome`: complete release returns the charge, quarantine
+returns only the released portion and retains the residual, and device loss
+returns nothing. Enqueue refusal and abandoned prepared actions also report a
+quarantine outcome. Invalidation alone never refunds; only externally confirmed
+context/process termination discharges device-loss ownership.
+
+Snapshots keep these axes independent:
+
+| axis | meaning |
+|---|---|
+| charged bytes | bytes attributed to an authority/holder/role |
+| process-reserved bytes | live parent quota, excluding fixed authority delegation |
+| physical bytes | known owned backing, deduplicated by `SharedPhysicalIdentity` |
+| mapped bytes | per-mapping attribution; aliases may legitimately sum above physical |
+| unattributed bytes | compatibility allocations whose physical presence is known but whose authority charge is not |
+
+No snapshot infers residency from charge. Shared aliases reuse one
+authority-scoped physical identity and therefore count physical bytes once.
+Allocator-managed VMM transactions report delegated charge but do not take a
+transaction-scoped process lease: retained physical-handle pools can outlive one
+allocation, so refunding parent quota at allocation release would be false.
+Callers that need a finite process cap delegate a fixed parent-quota slice to
+the local authority once; the local governor then arbitrates within that slice
+without a second grant. Finite limits require the whole local authority extent
+to fit the slice; raising the local extent past it blocks further transactions,
+and lowering the parent below live slices is rejected.
+
+The manager lock order is:
+
+1. the registration gate may enter the registry for non-callback registration;
+2. manager state is copied and released before any registry/governor/holder call;
+3. registry and mechanism locks follow their existing never-nested rule;
+4. process quota and governor claims are completed independently;
+5. holder pressure, allocator/device work, queue callbacks, observers, and waits
+   run with manager/registry/governance locks dropped.
+
+Settlement tokens hold the allocation charge book, not the manager/registry, so
+the queue cannot form a manager → context → queue → manager `Arc` cycle.
+Manager teardown may precede a live/queued allocation; the token and binding
+pins keep settlement resources alive. If all coordination objects disappear
+without a terminal physical outcome, the implementation fails closed by
+retaining accounting rather than refunding possibly resident bytes.
+
+Confirmed CUDA context termination has explicit no-driver-call reconciliation:
+manager-published charges, mapped allowances (including every clone),
+weight-residency leases, and the matching physical-handle pool lease are
+discharged only after context operations quiesce. The pool is keyed by the
+stable CUDA context identity, not an `Arc` wrapper address. Later destructors
+observe the terminated marker and cannot call CUDA or release the same
+accounting twice.
 
 ### 1.2 Two directions, both backends
 

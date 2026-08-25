@@ -30,7 +30,7 @@
 //! `position_ids` and must construct the rank-3 mrope coordinates this hybrid
 //! decoder declares before native CUDA can drive it. See
 //! `.squad/decisions/inbox/cohaagen-hybrid-loader.md`.
-#![cfg(all(feature = "cuda", feature = "native-backend"))]
+#![cfg(feature = "native-cuda")]
 
 use std::path::PathBuf;
 
@@ -79,7 +79,7 @@ fn qwen35_0_8b_hybrid_text_decode_is_coherent_and_locked() -> anyhow::Result<()>
         return Ok(());
     };
 
-    let mut engine = Engine::from_pipeline_dir(&dir, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&dir, EngineConfig::default())?;
     let mut request = GenerateRequest::new(GeneratePrompt::Text(PROMPT.to_string()));
     request.options = GenerateOptions {
         max_new_tokens: MAX_NEW_TOKENS,

@@ -38,13 +38,16 @@ pub mod conv;
 pub mod conv_transpose;
 pub mod csa_checkpoint;
 pub mod csa_device_state;
+pub mod csa_state_group;
 pub mod cumprod;
 pub mod cumsum;
 pub mod data_transform;
 pub(crate) mod device_argmax;
 pub(crate) mod device_token_writer;
+pub mod dft;
 pub mod dropout;
 pub mod elementwise;
+pub mod expert_route_telemetry;
 mod flash_attention;
 pub mod fused_gelu;
 pub mod fused_gemm;
@@ -62,6 +65,7 @@ pub mod hardmax;
 pub mod index_share;
 pub mod index_transform;
 pub mod indexing;
+pub mod kv_cache_capacity_append;
 pub(crate) mod kv_stride;
 pub mod linear_attention;
 pub mod log_softmax;
@@ -70,12 +74,14 @@ pub mod matmul;
 pub mod matmul_nbits;
 pub mod mod_op;
 pub mod movement;
+pub mod multi_head_attention;
 pub mod nary;
 pub mod nonzero;
 pub mod normalization;
 pub mod onehot;
 pub mod packed_varlen_attention;
 pub mod pad;
+pub mod paged_attention;
 pub mod pointwise;
 pub mod pooling;
 pub mod prelu;
@@ -95,6 +101,7 @@ pub mod sparse_kv_gather;
 pub mod standard_attention;
 pub(crate) mod standard_claims;
 pub mod structural;
+pub mod tensor_scatter;
 pub mod topk;
 pub mod trilu;
 pub mod unary_predicate;
@@ -179,12 +186,14 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "SparseKvGather",
     "CompressedSparseAttention",
     "IndexShare",
+    "KvCacheCapacityAppend",
     "PackedVarlenAttention",
     "VarlenAttention",
     "Gemm",
     "FusedMatMulBias",
     "FusedGemm",
     "Conv",
+    "DFT",
     "MaxPool",
     "AveragePool",
     "LpPool",
@@ -204,6 +213,8 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "Max",
     "Attention",
     "GroupQueryAttention",
+    "MultiHeadAttention",
+    "PagedAttention",
     "RotaryEmbedding",
     "Softmax",
     "LayerNormalization",
@@ -235,6 +246,7 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "Sin",
     "Cos",
     "Softplus",
+    "Mish",
     "Tan",
     "Sinh",
     "Cosh",
@@ -259,6 +271,7 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "Clip",
     "Softsign",
     "Selu",
+    "Celu",
     "Gather",
     "Shape",
     "Constant",
@@ -309,6 +322,7 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "Pad",
     "Range",
     "ScatterND",
+    "TensorScatter",
     "HannWindow",
     "HammingWindow",
     "BlackmanWindow",
@@ -369,6 +383,9 @@ pub struct CudaOpDescriptor {
 
 /// Float compute types the CUDA kernels handle (cuBLASLt + custom kernels).
 static CUDA_FLOAT_DTYPES: &[DataType] = &[DataType::Float32, DataType::Float16, DataType::BFloat16];
+
+/// DFT data/output are f32; its optional length and axis inputs are i64.
+static CUDA_DFT_DTYPES: &[DataType] = &[DataType::Float32, DataType::Int64];
 
 /// Every element type the CUDA EP can move byte-for-byte through a structural
 /// op (Reshape, Transpose, Gather, Concat, Cast, Shape, …). These kernels do
@@ -471,6 +488,8 @@ static CUDA_ATTENTION_DTYPES: &[DataType] = &[
 /// kernels. Fail closed to the float compute set for unrecognised ops.
 pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataType] {
     match (op_type, domain) {
+        ("DFT", "") => CUDA_DFT_DTYPES,
+
         // Block-quantized GEMM / MoE: f16/f32 activation + Uint8 packed weight.
         ("MatMulNBits", "com.microsoft")
         | ("QMoE", "com.microsoft")
@@ -485,10 +504,16 @@ pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [Da
         ("GatherBlockQuantized", _) => CUDA_GATHER_QUANT_DTYPES,
 
         // Attention family: f16/bf16 Q/K/V + Int32 seqlens.
+        // `PackedMultiHeadAttention` is deliberately absent — see the non-gap
+        // note in `docs/execution/CUDA_COVERAGE.md`. It had an arm here while
+        // having no factory and no `CUDA_COVERED_OPS` entry, which is the
+        // five-place registration contract half-wired: harmless today because
+        // this function is only reached for ops the EP actually claims, but it
+        // would let a future kernel look more registered than it is.
         ("Attention", _)
         | ("GroupQueryAttention", _)
         | ("MultiHeadAttention", _)
-        | ("PackedMultiHeadAttention", _)
+        | ("PagedAttention", _)
         | ("PackedVarlenAttention", _)
         | ("VarlenAttention", _)
         | ("CompressedSparseAttention", _)
@@ -513,6 +538,9 @@ pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [Da
         | ("GatherND", _)
         | ("ScatterElements", _)
         | ("ScatterND", _)
+        // `TensorScatter` moves bytes into a fixed-capacity cache, so the
+        // kernel is dtype-agnostic like the other byte movers.
+        | ("TensorScatter", _)
         | ("Shape", _)
         | ("Size", _)
         | ("Pad", _)
@@ -630,6 +658,15 @@ pub fn build_cuda_registry_with_metrics(
 ) -> OpRegistry {
     let mut reg = OpRegistry::new();
 
+    let dft_plans = Arc::new(crate::cufft::CufftPlanCache::default());
+    reg.register(
+        OpKey::new("DFT", "", 17),
+        Box::new(dft::DftFactory {
+            runtime: runtime.clone(),
+            plans: dft_plans,
+        }),
+    );
+
     // GEMM family (cuBLASLt).
     reg.register(
         OpKey::new("MatMul", "", 1),
@@ -667,6 +704,13 @@ pub fn build_cuda_registry_with_metrics(
             }),
         );
     }
+    // TensorScatter (opset 24) standardizes the KV-cache update.
+    reg.register(
+        OpKey::new("TensorScatter", "", 24),
+        Box::new(tensor_scatter::TensorScatterFactory {
+            runtime: runtime.clone(),
+        }),
+    );
     reg.register(
         OpKey::new("CumSum", "", 11),
         Box::new(cumsum::CumSumFactory {
@@ -1007,6 +1051,18 @@ pub fn build_cuda_registry_with_metrics(
             runtime: runtime.clone(),
         }),
     );
+    // Standard ONNX-domain spelling, opset 27. Same contract as the contrib op
+    // (rank-3 `[B, C, L]`, depthwise `[C, 1, k]` weight, `k-1` carry state,
+    // `none`/`silu`/`swish` activation), so it reuses the same kernel rather
+    // than growing a second implementation to keep in step — matching what the
+    // CPU EP does for this op and what both EPs already do for
+    // `LinearAttention`.
+    reg.register(
+        OpKey::new("CausalConvWithState", "", 27),
+        Box::new(causal_conv_with_state::CausalConvWithStateFactory {
+            runtime: runtime.clone(),
+        }),
+    );
     reg.register(
         OpKey::new("LinearAttention", "com.microsoft", 1),
         Box::new(linear_attention::LinearAttentionFactory {
@@ -1057,6 +1113,12 @@ pub fn build_cuda_registry_with_metrics(
     reg.register(
         OpKey::new("IndexShare", "pkg.nxrt", 1),
         Box::new(index_share::IndexShareFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("KvCacheCapacityAppend", "pkg.nxrt", 1),
+        Box::new(kv_cache_capacity_append::KvCacheCapacityAppendFactory {
             runtime: runtime.clone(),
         }),
     );
@@ -1195,6 +1257,13 @@ pub fn build_cuda_registry_with_metrics(
         }),
     );
     reg.register(
+        OpKey::new("Celu", "", 12),
+        Box::new(ActivationFactory {
+            name: "Celu",
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
         OpKey::new("Swish", "", 24),
         Box::new(ActivationFactory {
             name: "Swish",
@@ -1250,6 +1319,18 @@ pub fn build_cuda_registry_with_metrics(
     reg.register(
         OpKey::new("GroupQueryAttention", "com.microsoft", 1),
         Box::new(group_query_attention::GroupQueryAttentionFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("PagedAttention", "com.microsoft", 1),
+        Box::new(paged_attention::PagedAttentionFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("MultiHeadAttention", "com.microsoft", 1),
+        Box::new(multi_head_attention::MultiHeadAttentionFactory {
             runtime: runtime.clone(),
         }),
     );
@@ -1427,6 +1508,9 @@ pub fn build_cuda_registry_with_metrics(
         ("Sin", UnaryMathOp::Sin),
         ("Cos", UnaryMathOp::Cos),
         ("Softplus", UnaryMathOp::Softplus),
+        // Mish (opset 22) is attribute-free and shape-preserving, so it rides
+        // the same channel rather than needing its own factory.
+        ("Mish", UnaryMathOp::Mish),
         ("Tan", UnaryMathOp::Tan),
         ("Sinh", UnaryMathOp::Sinh),
         ("Cosh", UnaryMathOp::Cosh),
@@ -1576,7 +1660,84 @@ pub fn build_cuda_registry_with_metrics(
 
 #[cfg(test)]
 mod tests {
-    use super::CUDA_COVERED_OPS;
+    use super::{
+        CUDA_COVERED_OPS, CUDA_DFT_DTYPES, CUDA_FLOAT_DTYPES, cuda_supported_dtypes_for_op,
+    };
+
+    /// Every operator the CPU EP registers but CUDA does not must be named in
+    /// the coverage document.
+    ///
+    /// This is a **set** check, not a count check, for the reason recorded in
+    /// #1923: a count detects that a number changed, and nothing else. It does
+    /// not detect a rename, and — the failure that produced this test — it does
+    /// not detect a *new* gap arriving while some other number happens to stay
+    /// plausible. `ai.onnx::DFT` sat in exactly that blind spot: registered on
+    /// CPU, absent from CUDA, mentioned nowhere in the document, while the
+    /// document simultaneously asserted "the 2 remaining CPU `ai.onnx` gaps are
+    /// `NonMaxSuppression` and `Unique`". Both the omission and the false claim
+    /// survived because the numbers beside them were hand-maintained prose.
+    ///
+    /// A gap is allowed to exist. What is not allowed is a gap nobody wrote
+    /// down, because that is indistinguishable from an oversight and gets
+    /// rediscovered by whoever next audits the registries.
+    ///
+    /// Two ways this could pass while proving nothing, both closed below:
+    ///
+    /// * **A bare substring match.** `DOC.contains("Pad")` is satisfied 32 times
+    ///   over by the word "padding", so a future gap with a short or common name
+    ///   would be waved through. The match is therefore delimited: the name must
+    ///   appear as `` `Name` `` or `` `domain::Name` ``, which is how this
+    ///   document writes operators.
+    /// * **An empty registry.** If `build_cpu_registry` ever returned nothing,
+    ///   the difference would be empty and this test would go green having
+    ///   checked nothing. A floor guards that.
+    ///
+    /// Deliberately GPU-free: it reads `CUDA_COVERED_OPS`, which is a const, and
+    /// builds only the CPU registry, so it runs on every lane rather than the
+    /// CUDA ones alone. Note the limit of that choice — no test anywhere
+    /// compares `CUDA_COVERED_OPS` against the real factory table built by
+    /// `build_cuda_registry`, so if the const ever *overstated* coverage, this
+    /// test would treat the named op as covered and never demand it be
+    /// documented. Closing that needs a GPU-lane test and is left for one.
+    #[test]
+    fn every_cpu_only_op_is_named_in_the_coverage_doc() {
+        const DOC: &str = include_str!("../../../../docs/execution/CUDA_COVERAGE.md");
+        // The CPU EP registers well over a hundred operators; anything near zero
+        // means the registry failed to build rather than that the gap closed.
+        const MIN_PLAUSIBLE_CPU_OPS: usize = 100;
+
+        let cpu_registry = onnx_runtime_ep_cpu::kernels::build_cpu_registry();
+        let mut cpu_ops: Vec<String> = cpu_registry.keys().map(|key| key.op_type.clone()).collect();
+        cpu_ops.sort();
+        cpu_ops.dedup();
+        assert!(
+            cpu_ops.len() >= MIN_PLAUSIBLE_CPU_OPS,
+            "CPU registry has only {} operators, which means it failed to build: \
+             this test would otherwise pass by comparing an empty set",
+            cpu_ops.len()
+        );
+
+        // Delimited, not substring: this document writes operators as `Name` or
+        // `domain::Name`, and a bare `contains` would let "Pad" be satisfied by
+        // "padding".
+        let documented =
+            |op: &str| DOC.contains(&format!("`{op}`")) || DOC.contains(&format!("::{op}`"));
+
+        let undocumented: Vec<&String> = cpu_ops
+            .iter()
+            .filter(|op| !CUDA_COVERED_OPS.contains(&op.as_str()))
+            .filter(|op| !documented(op))
+            .collect();
+
+        assert!(
+            undocumented.is_empty(),
+            "these operators are registered on CPU, absent from CUDA, and named \
+             nowhere in docs/execution/CUDA_COVERAGE.md: {undocumented:?}\n\
+             Either implement them on CUDA, or document why the gap is deliberate \
+             (see the MoE and PackedMultiHeadAttention entries for the shape of \
+             that write-up). A gap is fine; an undocumented one is not."
+        );
+    }
 
     #[test]
     fn wave2_ops_are_listed_in_coverage() {
@@ -1639,6 +1800,56 @@ mod tests {
             CUDA_COVERED_OPS.len(),
             unique_ops.len(),
             "CUDA_COVERED_OPS contains duplicate entries"
+        );
+    }
+
+    /// `com.microsoft::PackedMultiHeadAttention` is a *documented non-gap*, not
+    /// an oversight — this test pins that decision so nobody re-opens it.
+    ///
+    /// Upstream emits it only from ORT's **opt-in packing-mode conversion**
+    /// (`python/tools/transformers/convert_to_packing_mode.py`), a separate
+    /// tool a user runs deliberately — not part of default graph optimization,
+    /// so it cannot arrive through ordinary export. It never appears on the
+    /// decoder-only LLM path this project targets (which uses `Attention` /
+    /// `MultiHeadAttention` / `GroupQueryAttention`, plus the runtime-invented
+    /// `pkg.nxrt::PackedVarlenAttention` for packed sequences). The real
+    /// Qwen3.5-0.8B hybrid decode graph places on CUDA with zero declines, and
+    /// the only producer anywhere in the repo is a synthetic CPU-EP fixture.
+    /// See the non-gap write-up in `docs/execution/CUDA_COVERAGE.md`, which
+    /// records the exact condition that would flip this decision.
+    ///
+    /// This checks both halves of the registration state, because half-wiring
+    /// is the failure this file is prone to: an op present in one of the five
+    /// registration places and absent from the others is silently declined at
+    /// runtime rather than reported.
+    ///
+    /// If a real target model ever emits this op, implement it as an adapter
+    /// over the packed varlen SDPA core (`packed_varlen_attention.rs`), add it
+    /// to the five-place registration contract, and delete this test.
+    #[test]
+    fn packed_multi_head_attention_is_a_documented_non_gap() {
+        assert!(
+            !CUDA_COVERED_OPS.contains(&"PackedMultiHeadAttention"),
+            "PackedMultiHeadAttention was added to CUDA_COVERED_OPS: if this is a \
+             real implementation, remove this non-gap test and update \
+             docs/execution/CUDA_COVERAGE.md; if it is accidental, revert it"
+        );
+        assert_eq!(
+            cuda_supported_dtypes_for_op("PackedMultiHeadAttention", "com.microsoft"),
+            CUDA_FLOAT_DTYPES,
+            "PackedMultiHeadAttention gained an attention-family dtype arm without a \
+             kernel: that is the registration contract half-wired, and it makes an \
+             unregistered op look registered"
+        );
+    }
+
+    #[test]
+    fn dft_registration_advertises_only_implemented_input_types() {
+        assert!(CUDA_COVERED_OPS.contains(&"DFT"));
+        assert_eq!(
+            cuda_supported_dtypes_for_op("DFT", ""),
+            CUDA_DFT_DTYPES,
+            "DFT must advertise f32 data plus its Int64 scalar inputs"
         );
     }
 
@@ -1744,6 +1955,7 @@ mod tests {
             "Clip",
             "Softsign",
             "Selu",
+            "Celu",
         ] {
             assert!(
                 CUDA_COVERED_OPS.contains(&op),

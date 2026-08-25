@@ -30,28 +30,33 @@ use onnx_runtime_ir::{Attribute, Node, NodeId, ValueId};
 /// Three groups, and only the third is work we intend to do.
 const DECLINED: &[(&str, &str)] = &[
     // ── 1. Data-dependent. The output shape is a function of an input's
-    //       *values*, not its shape, so it cannot be inferred at capability
-    //       time. Correctly declined; not a gap.
-    ("", "Compress"),          // output length = count of true in condition
+    //       *values*, not its shape.
+    //
+    //       Being data-dependent is **not** by itself a reason to decline.
+    //       `for_node` runs at capability time and sees only shapes, so it
+    //       cannot compute the extent — but it does not have to. It only has to
+    //       return a rule. `infer_shapes` then runs at **Compute** time with
+    //       `TensorView`s, values included, and resolves the real extent there.
+    //       `Compress` and `DFT` are claimed that way.
+    //
+    //       What keeps the rest here is cost, not possibility: for `Unique` and
+    //       `NonMaxSuppression` the extent *is* the whole algorithm, so pinning
+    //       it in `infer_shapes` means running it twice. Those need the Compute
+    //       path to let a kernel size its own output before they are worth
+    //       claiming.
     ("", "NonMaxSuppression"), // output length = number of boxes kept
     ("", "NonZero"),           // output length = count of non-zeros
     ("", "Unique"),            // output length = number of distinct values
-    ("", "BlackmanWindow"),    // size comes from the input tensor's value
-    ("", "HammingWindow"),
-    ("", "HannWindow"),
-    ("", "ConstantOfShape"), // shape comes from input[0]'s values
-    ("", "Expand"),          // shape comes from input[1]'s values
-    ("", "Range"),           // length = ceil((limit - start) / delta)
-    ("", "Tile"),            // repeats come from input[1]'s values
-    ("", "OneHot"),          // depth comes from input[1]'s value
-    ("", "Pad"),             // pads come from input[1]'s values (opset 11+)
-    ("", "TopK"),            // K comes from input[1]'s value (opset 10+)
-    ("", "Split"),           // split sizes come from input[1] (opset 13+)
-    ("", "Unsqueeze"),       // axes come from input[1] (opset 13+)
-    ("", "Resize"),          // scales/sizes come from input[2]/input[3]
-    ("", "AffineGrid"),      // output size comes from input[1]'s values
-    ("", "Col2Im"),          // image_shape comes from input[1]'s values
-    ("", "CenterCropPad"),   // target shape comes from input[1]'s values
+    ("", "Range"),             // length = ceil((limit - start) / delta)
+    ("", "OneHot"),            // depth comes from input[1]'s value
+    ("", "Pad"),               // pads come from input[1]'s values (opset 11+)
+    ("", "TopK"),              // K comes from input[1]'s value (opset 10+)
+    ("", "Split"),             // split sizes come from input[1] (opset 13+)
+    ("", "Unsqueeze"),         // axes come from input[1] (opset 13+)
+    ("", "Resize"),            // scales/sizes come from input[2]/input[3]
+    ("", "AffineGrid"),        // output size comes from input[1]'s values
+    ("", "Col2Im"),            // image_shape comes from input[1]'s values
+    ("", "CenterCropPad"),     // target shape comes from input[1]'s values
     // Several of these carry a *constant initializer* in practice, so a
     // future pass that resolves initializer values at capability time could
     // claim them. Until such a pass exists, declining is the honest answer.
@@ -72,13 +77,6 @@ const DECLINED: &[(&str, &str)] = &[
     //       have a kernel, and we hand them to ORT anyway. This is the work.
     //
     //       Shape-preserving — output shape == input[0].shape. One line each.
-    ("", "BitwiseNot"),
-    ("", "CastLike"),
-    ("", "CumProd"),
-    ("", "CumSum"),
-    ("", "DequantizeLinear"),
-    ("", "EyeLike"),
-    ("", "QuantizeLinear"),
     //       Pooling and CNN geometry: inferrable from `kernel_shape`,
     //       `strides`, `pads`, `dilations` and `ceil_mode`, exactly as
     //       `build_conv` already does for `Conv`.
@@ -94,8 +92,7 @@ const DECLINED: &[(&str, &str)] = &[
     //       Inferrable from attributes or a fixed rule.
     ("", "ArgMax"), // reduce over `axis`, honouring `keepdims`
     ("", "ArgMin"),
-    ("", "Constant"), // shape of the `value` attribute's tensor
-    ("", "DFT"),
+    ("", "Constant"),              // shape of the `value` attribute's tensor
     ("", "DynamicQuantizeLinear"), // y == input, scale/zero_point scalar
     ("", "Flatten"),               // 2-D, split at `axis` (default 1)
     ("", "GatherElements"),        // output shape == indices shape
@@ -106,7 +103,6 @@ const DECLINED: &[(&str, &str)] = &[
     //       ORT has no kernel for these at all, so handing them over does not
     //       get a faster implementation — it gets a load failure.
     ("", "LinearAttention"),
-    ("com.microsoft", "CausalConvWithState"),
     ("com.microsoft", "LinearAttention"),
 ];
 

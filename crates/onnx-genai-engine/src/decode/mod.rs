@@ -35,17 +35,20 @@ mod values;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use logits::{extract_logits_sequence_with_io, extract_next_token_logits_from_outputs};
+pub(crate) use logits::extract_logits_sequence_with_io;
+#[cfg(test)]
+pub(crate) use logits::extract_next_token_logits_from_outputs;
 #[cfg(feature = "native-backend")]
 pub(crate) use metadata::{KeySequenceLengthsPolicy, key_sequence_lengths_policy};
 pub(crate) use metadata::{
-    detect_model_decode_path, shared_kv_buffer_len_from_metadata, sink_tokens_from_metadata,
+    SharedKvOffer, detect_model_decode_path, graph_accepts_padded_past,
+    graph_uses_explicit_kv_length_attention, sink_tokens_from_metadata,
     sliding_window_from_metadata,
 };
 pub(crate) use state::DecodeState;
 #[cfg(feature = "native-backend")]
 pub(crate) use step::position_ids_from_starts;
-pub(crate) use step::{run_decode_session_logits, run_decode_step, run_decode_step_with_extra};
+pub(crate) use step::{run_decode_session_logits, run_decode_step};
 pub(crate) use token_sampling::{
     DraftProposalRequest, apply_paged_sliding_window, next_session_token_argmax,
     next_session_token_logits, next_session_token_logits_and_hidden,
@@ -58,6 +61,9 @@ use logits::{extract_logits_value_next, extract_logits_value_sequence};
 #[derive(Debug, Clone)]
 /// Model-I/O strategy used to construct the appropriate [`DecodeBackend`].
 pub(crate) enum ModelDecodePath {
+    /// Explicit generic static-cache execution. Metadata loading no longer
+    /// selects this path; callers must opt into the low-level static-cache API.
+    #[allow(dead_code)]
     StaticCache {
         max_len: usize,
     },
@@ -69,7 +75,55 @@ pub(crate) enum ModelDecodePath {
         /// alongside the sliding window. `None`/`0` disables sink retention.
         sink_tokens: Option<usize>,
     },
-    Legacy,
+    Generic,
+}
+
+impl ModelDecodePath {
+    /// One-line summary of the decode path actually chosen, for startup
+    /// reporting.
+    ///
+    /// This exists because the choice is invisible at the call site and silently
+    /// changes what a measurement means. ORT CUDA-graph capture needs **two**
+    /// things, and only one of them is the `enable_cuda_graph` request: the
+    /// decode session captures only on `DecodeKvMode::SharedBuffer` (see
+    /// `will_sample_on_device`). `PastPresent { shared_buffer: false }` rebinds a
+    /// growing past every step, so it runs uncaptured no matter what the session
+    /// options say, and per-token cost scales with context.
+    ///
+    /// Measured consequence: a native-vs-ORT benchmark can put captured,
+    /// fixed-capacity native against uncaptured, growing-KV ORT and read like a
+    /// backend comparison. Nothing in the output said so before this line.
+    pub fn summary(&self) -> String {
+        match self {
+            Self::StaticCache { max_len } => {
+                format!("static-cache max_len={max_len}")
+            }
+            Self::PastPresent {
+                shared_buffer,
+                max_len,
+                sliding_window,
+                sink_tokens,
+            } => {
+                let kv = if *shared_buffer {
+                    "shared-buffer (fixed capacity, capture-eligible)"
+                } else {
+                    "zero-copy-rebind (growing past, capture-ineligible)"
+                };
+                let mut out = format!("past-present kv={kv}");
+                if let Some(max_len) = max_len {
+                    out.push_str(&format!(" max_len={max_len}"));
+                }
+                if let Some(window) = sliding_window {
+                    out.push_str(&format!(" sliding_window={window}"));
+                }
+                if let Some(sinks) = sink_tokens {
+                    out.push_str(&format!(" sink_tokens={sinks}"));
+                }
+                out
+            }
+            Self::Generic => "generic".to_string(),
+        }
+    }
 }
 
 /// Engine-facing boundary over low-level ORT forward-pass/KV-buffer sessions.
@@ -136,6 +190,18 @@ impl DecodeRunner {
             DecodeRunner::PastPresent(runner) => runner.supports_argmax(),
             #[cfg(feature = "native-backend")]
             DecodeRunner::Native(runner) => runner.supports_argmax(),
+        }
+    }
+
+    /// The native runner iff it carries recurrent (Gated-DeltaNet SSM / conv1d)
+    /// state, for the speculative recurrent-state commit. Every other runner —
+    /// and a pure-dense native runner — answers `None`, so the commit machinery
+    /// stays inert outside hybrid recurrent targets.
+    #[cfg(feature = "native-backend")]
+    fn native_recurrent_mut(&mut self) -> Option<&mut crate::native_decode::NativeDecodeSession> {
+        match self {
+            DecodeRunner::Native(runner) if runner.has_recurrent_state() => Some(runner),
+            _ => None,
         }
     }
 

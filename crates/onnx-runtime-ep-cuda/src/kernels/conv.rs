@@ -6,12 +6,20 @@
 
 use std::ffi::c_void;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use cudarc::driver::{LaunchConfig, PushKernelArg};
-use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
-use onnx_runtime_ir::{DataType, Node};
+use onnx_runtime_ep_api::{
+    EpError, Kernel, KernelFactory, Result, TensorMetadata, TensorMut, TensorView,
+    WorkspaceRequirement, WorkspaceView,
+};
+use onnx_runtime_ir::{DataType, Node, compute_contiguous_strides};
 
-use crate::cudnn::{CudnnConvBuffers, CudnnConvSpec, CudnnTensorType};
+use crate::cudnn::{
+    CudnnConvBuffers, CudnnConvPlanCache, CudnnConvSpec, CudnnTensorType,
+    governed_workspace_requirement,
+};
 use crate::error::{driver_err, not_implemented};
 use crate::runtime::{CudaRuntime, cuptr};
 
@@ -126,6 +134,8 @@ impl KernelFactory for ConvFactory {
                 .transpose()?
                 .unwrap_or("NOTSET")
                 .to_owned(),
+            conv_plan: Mutex::new(CudnnConvPlanCache::new()),
+            last_call_capture_safe: AtomicBool::new(false),
         }))
     }
 }
@@ -148,6 +158,8 @@ pub struct ConvKernel {
     kernel_shape: Option<Vec<i64>>,
     group: i64,
     auto_pad: String,
+    conv_plan: Mutex<CudnnConvPlanCache>,
+    last_call_capture_safe: AtomicBool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -386,7 +398,68 @@ impl ConvKernel {
         })
     }
 
-    fn run(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+    fn workspace_requirement_for_metadata(
+        &self,
+        inputs: &[TensorMetadata<'_>],
+        capturing: bool,
+    ) -> Result<WorkspaceRequirement> {
+        let (Some(x), Some(w)) = (inputs.first(), inputs.get(1)) else {
+            return Ok(WorkspaceRequirement::NONE);
+        };
+        if !x.present || !w.present {
+            return Ok(WorkspaceRequirement::NONE);
+        }
+        if x.shape.len() == 3 || w.shape.len() == 3 {
+            return Ok(WorkspaceRequirement::NONE);
+        }
+        if !matches!(
+            x.dtype,
+            DataType::Float32 | DataType::Float16 | DataType::BFloat16
+        ) || w.dtype != x.dtype
+        {
+            return Ok(WorkspaceRequirement::NONE);
+        }
+        let Some(plan) = self.plan(x.shape, w.shape).ok() else {
+            return Ok(WorkspaceRequirement::NONE);
+        };
+        let bias_present = inputs.get(2).is_some_and(|bias| bias.present);
+        if bias_present && inputs.get(2).is_some_and(|bias| bias.dtype != x.dtype) {
+            return Ok(WorkspaceRequirement::NONE);
+        }
+        if !self.runtime.cudnn().is_available() {
+            return Ok(WorkspaceRequirement::NONE);
+        }
+
+        let x_strides = compute_contiguous_strides(x.shape);
+        let y_strides = compute_contiguous_strides(&plan.output_shape);
+        let spec = CudnnConvSpec {
+            dtype: CudnnTensorType::from_onnx(x.dtype)?,
+            input_dims: dims4(x.shape, "input")?,
+            input_strides: strides4(&x_strides, "input")?,
+            filter_dims: dims4(w.shape, "filter")?,
+            output_dims: dims4(&plan.output_shape, "output")?,
+            output_strides: strides4(&y_strides, "output")?,
+            pads: i32_pair(plan.pads, "pads")?,
+            strides: i32_pair(plan.strides, "strides")?,
+            dilations: i32_pair(plan.dilations, "dilations")?,
+            groups: i32::try_from(plan.groups)
+                .map_err(|_| EpError::KernelFailed("cuda_ep Conv: group exceeds i32".into()))?,
+        };
+        let mut cache = self.conv_plan.lock().map_err(|_| {
+            EpError::KernelFailed("cuda_ep Conv: cuDNN plan cache lock was poisoned".into())
+        })?;
+        let bytes = self.runtime.cudnn().with_handle(|handle| {
+            handle.conv_workspace_bytes(&mut cache, &spec, bias_present, capturing)
+        })?;
+        Ok(governed_workspace_requirement(bytes))
+    }
+
+    fn run(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
         if !(2..=3).contains(&inputs.len()) || outputs.len() != 1 {
             return Err(EpError::KernelFailed(format!(
                 "cuda_ep Conv: expected X, W, optional B and one output, got {} inputs and {} outputs",
@@ -429,7 +502,11 @@ impl ConvKernel {
         }
 
         if x.shape.len() == 3 || w.shape.len() == 3 {
-            return self.run_1d(x, w, bias, &mut outputs[0]);
+            let result = self.run_1d(x, w, bias, &mut outputs[0]);
+            if result.is_ok() {
+                self.last_call_capture_safe.store(true, Ordering::Relaxed);
+            }
+            return result;
         }
         let plan = self.plan(x.shape, w.shape)?;
         if outputs[0].shape != plan.output_shape {
@@ -473,10 +550,19 @@ impl ConvKernel {
             bias_numel: bias.map_or(0, TensorView::numel),
             output_numel: outputs[0].numel(),
         };
-        self.runtime
-            .cudnn()
-            .with_handle(|handle| handle.conv2d(&spec, buffers))?;
-        self.runtime.synchronize()
+        let capturing = self.runtime.is_capturing()?;
+        let mut conv_plan = self.conv_plan.lock().map_err(|_| {
+            EpError::KernelFailed("cuda_ep Conv: cuDNN plan cache lock was poisoned".into())
+        })?;
+        self.runtime.cudnn().with_handle(|handle| {
+            handle.conv2d(&mut conv_plan, &spec, buffers, workspace, capturing)
+        })?;
+        drop(conv_plan);
+        if !capturing {
+            self.runtime.synchronize()?;
+        }
+        self.last_call_capture_safe.store(true, Ordering::Relaxed);
+        Ok(())
     }
 
     fn run_1d(
@@ -648,7 +734,20 @@ fn i32_pair(values: [usize; 2], name: &str) -> Result<[i32; 2]> {
 
 impl Kernel for ConvKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
-        self.run(inputs, outputs)
+        self.run(inputs, outputs, None)
+    }
+
+    fn workspace_requirement(&self, inputs: &[TensorMetadata<'_>]) -> Result<WorkspaceRequirement> {
+        self.workspace_requirement_for_metadata(inputs, self.runtime.is_capturing()?)
+    }
+
+    fn execute_with_workspace(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
+        self.run(inputs, outputs, workspace)
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
@@ -656,9 +755,13 @@ impl Kernel for ConvKernel {
     }
 
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
-        onnx_runtime_ep_api::CaptureSupport::unsupported(
-            "convolution creates per-call cuDNN descriptors and performs a trailing host stream synchronization",
-        )
+        if self.last_call_capture_safe.load(Ordering::Relaxed) {
+            onnx_runtime_ep_api::CaptureSupport::Supported
+        } else {
+            onnx_runtime_ep_api::CaptureSupport::unsupported(
+                "requires a warmed fixed-shape cuDNN convolution plan and prepared persistent workspace",
+            )
+        }
     }
 }
 

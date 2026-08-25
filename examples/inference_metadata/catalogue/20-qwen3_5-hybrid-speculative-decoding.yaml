@@ -1,0 +1,320 @@
+# Qwen3.5 hybrid decoder with full-attention KV, linear-attention recurrence,
+# and causal-convolution history. Verification takes one atomic snapshot of all
+# three target-owned state groups before running the candidate block. Acceptance
+# commits the common prefix to every group; rejection restores KV length, the
+# linear accumulator, and causal-convolution history to the same accepted
+# position. No group may commit or roll back independently. The independent
+# proposer is recomputed from committed tokens and owns no persistent state.
+schema_version: v1
+pipeline:
+  workflow:
+    manifest:
+      capabilities:
+      - workflow_ssa
+      - typed_emit
+      - serving_service_contract
+    inputs:
+      request.active:
+        contract:
+          dtype: bool
+          rank: 1
+          shape: [batch]
+          batch_layout: {kind: request_aligned, axis: 0}
+        role: {kind: opaque}
+        source: {kind: application, name: active}
+        required: true
+      request.done:
+        contract:
+          dtype: bool
+          rank: 1
+          shape: [batch]
+          batch_layout: {kind: request_aligned, axis: 0}
+        role: {kind: opaque}
+        source: {kind: application, name: done}
+        required: true
+      request.accepted_len:
+        contract:
+          dtype: int64
+          rank: 1
+          shape: [batch]
+          batch_layout: {kind: request_aligned, axis: 0}
+        role: {kind: opaque}
+        source: {kind: application, name: accepted_len}
+        required: true
+      request.input_ids:
+        contract:
+          dtype: int64
+          rank: 2
+          shape: [batch, sequence]
+          batch_layout: {kind: request_aligned, axis: 0}
+        role: {kind: runtime, version: '1.0', role: prompt_tokens}
+        source: {kind: request}
+        required: true
+      request.attention_key:
+        contract:
+          dtype: float16
+          rank: 4
+          shape: [batch, kv_heads, sequence, head_dim]
+          batch_layout: {kind: request_aligned, axis: 0}
+        role: {kind: opaque}
+        source: {kind: application, name: attention_key}
+        required: true
+      request.attention_value:
+        contract:
+          dtype: float16
+          rank: 4
+          shape: [batch, kv_heads, sequence, head_dim]
+          batch_layout: {kind: request_aligned, axis: 0}
+        role: {kind: opaque}
+        source: {kind: application, name: attention_value}
+        required: true
+      request.linear_accumulator:
+        contract:
+          dtype: float32
+          rank: 4
+          shape: [batch, linear_heads, key_feature, value_feature]
+          batch_layout: {kind: request_aligned, axis: 0}
+        role: {kind: opaque}
+        source: {kind: application, name: linear_accumulator}
+        required: true
+      request.causal_conv_history:
+        contract:
+          dtype: float16
+          rank: 3
+          shape: [batch, channels, kernel_history]
+          batch_layout: {kind: request_aligned, axis: 0}
+        role: {kind: opaque}
+        source: {kind: application, name: causal_conv_history}
+        required: true
+    outputs:
+      target_logits:
+        contract:
+          dtype: float16
+          rank: 3
+          shape: [batch, proposal, vocab]
+          batch_layout: {kind: request_aligned, axis: 0}
+        role: tensor
+        stage: pre_adapter
+    components:
+      proposer:
+        implementation:
+          kind: onnx
+          artifact: qwen3_5_hybrid/draft_decoder.onnx.textproto
+        ports:
+          inputs:
+            input_ids:
+              dtype: int64
+              rank: 2
+              shape: [batch, sequence]
+              batch_layout: {kind: request_aligned, axis: 0}
+          outputs:
+            draft_tokens:
+              dtype: int64
+              rank: 2
+              shape: [batch, proposal]
+              batch_layout: {kind: request_aligned, axis: 0}
+          roles:
+            input_ids: token_ids
+      target_decoder:
+        implementation:
+          kind: onnx
+          artifact: qwen3_5_hybrid/target_decoder.onnx.textproto
+        ports:
+          inputs:
+            input_ids:
+              dtype: int64
+              rank: 2
+              shape: [batch, proposal]
+              batch_layout: {kind: request_aligned, axis: 0}
+            past_key:
+              dtype: float16
+              rank: 4
+              shape: [batch, kv_heads, sequence, head_dim]
+              batch_layout: {kind: request_aligned, axis: 0}
+            past_value:
+              dtype: float16
+              rank: 4
+              shape: [batch, kv_heads, sequence, head_dim]
+              batch_layout: {kind: request_aligned, axis: 0}
+            linear_state:
+              dtype: float32
+              rank: 4
+              shape: [batch, linear_heads, key_feature, value_feature]
+              batch_layout: {kind: request_aligned, axis: 0}
+            conv_state:
+              dtype: float16
+              rank: 3
+              shape: [batch, channels, kernel_history]
+              batch_layout: {kind: request_aligned, axis: 0}
+          outputs:
+            logits:
+              dtype: float16
+              rank: 3
+              shape: [batch, proposal, vocab]
+              batch_layout: {kind: request_aligned, axis: 0}
+            present_key:
+              dtype: float16
+              rank: 4
+              shape: [batch, kv_heads, sequence, head_dim]
+              batch_layout: {kind: request_aligned, axis: 0}
+            present_value:
+              dtype: float16
+              rank: 4
+              shape: [batch, kv_heads, sequence, head_dim]
+              batch_layout: {kind: request_aligned, axis: 0}
+            next_linear_state:
+              dtype: float32
+              rank: 4
+              shape: [batch, linear_heads, key_feature, value_feature]
+              batch_layout: {kind: request_aligned, axis: 0}
+            next_conv_state:
+              dtype: float16
+              rank: 3
+              shape: [batch, channels, kernel_history]
+              batch_layout: {kind: request_aligned, axis: 0}
+          roles:
+            input_ids: token_ids
+            logits: logits
+    state:
+      attention_key:
+        contract:
+          dtype: float16
+          rank: 4
+          shape: [batch, kv_heads, sequence, head_dim]
+          batch_layout: {kind: request_aligned, axis: 0}
+        scope: invocation
+        initializer: request.attention_key
+        recurrence: {kind: invariant}
+        management: runtime
+        release_boundary: invocation
+        service_group: attention_kv
+      attention_value:
+        contract:
+          dtype: float16
+          rank: 4
+          shape: [batch, kv_heads, sequence, head_dim]
+          batch_layout: {kind: request_aligned, axis: 0}
+        scope: invocation
+        initializer: request.attention_value
+        recurrence: {kind: invariant}
+        management: runtime
+        release_boundary: invocation
+        service_group: attention_kv
+      linear_accumulator:
+        contract:
+          dtype: float32
+          rank: 4
+          shape: [batch, linear_heads, key_feature, value_feature]
+          batch_layout: {kind: request_aligned, axis: 0}
+        scope: invocation
+        initializer: request.linear_accumulator
+        recurrence: {kind: invariant}
+        management: runtime
+        release_boundary: invocation
+        service_group: linear_recurrence
+      causal_conv_history:
+        contract:
+          dtype: float16
+          rank: 3
+          shape: [batch, channels, kernel_history]
+          batch_layout: {kind: request_aligned, axis: 0}
+        scope: invocation
+        initializer: request.causal_conv_history
+        recurrence: {kind: invariant}
+        management: runtime
+        release_boundary: invocation
+        service_group: causal_conv
+    steps:
+    - kind: invoke
+      component: proposer
+      inputs:
+        input_ids: request.input_ids
+      outputs:
+        draft_tokens: draft.tokens
+    - kind: invoke
+      component: target_decoder
+      inputs:
+        input_ids: draft.tokens
+        past_key: request.attention_key
+        past_value: request.attention_value
+        linear_state: request.linear_accumulator
+        conv_state: request.causal_conv_history
+      outputs:
+        logits: target.logits
+        present_key: target.attention_key
+        present_value: target.attention_value
+        next_linear_state: target.linear_accumulator
+        next_conv_state: target.causal_conv_history
+    - kind: emit
+      value: target.logits
+      output: target_logits
+      mode: replace
+    serving:
+      active: request.active
+      done: request.done
+      accepted_len: request.accepted_len
+      state_service:
+        groups:
+          attention_kv:
+            kind: full_attention
+            sequence_axis: 2
+            layout: bnsh
+            update: {kind: append}
+            capabilities:
+              rollback_positions: 4
+              snapshot: true
+              fork: true
+              cascade: [linear_recurrence, causal_conv]
+            ports:
+              target_decoder:
+                attention_key:
+                  input: past_key
+                  output: present_key
+                  role: key
+                  layer: 0
+                attention_value:
+                  input: past_value
+                  output: present_value
+                  role: value
+                  layer: 0
+          linear_recurrence:
+            kind: recurrent
+            layout: bhfv
+            update: {kind: replace}
+            capabilities:
+              rollback_positions: 4
+              snapshot: true
+              fork: true
+              cascade: [attention_kv, causal_conv]
+            ports:
+              target_decoder:
+                linear_accumulator:
+                  input: linear_state
+                  output: next_linear_state
+                  layer: 1
+          causal_conv:
+            kind: recurrent
+            layout: bch
+            update: {kind: replace}
+            capabilities:
+              rollback_positions: 4
+              snapshot: true
+              fork: true
+              cascade: [attention_kv, linear_recurrence]
+            ports:
+              target_decoder:
+                causal_conv_history:
+                  input: conv_state
+                  output: next_conv_state
+                  layer: 1
+speculative:
+  proposer: proposer
+  target: target_decoder
+  vocabulary: {kind: identical}
+  max_proposal_width: 4
+  distribution_preserving: true
+  rollback_state:
+  - attention_key
+  - attention_value
+  - linear_accumulator
+  - causal_conv_history

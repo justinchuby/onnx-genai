@@ -10,7 +10,7 @@
 //!   --features native-backend,cuda --test glm4_9b_decode_lock \
 //!   -- --ignored --nocapture
 //! ```
-#![cfg(all(feature = "native-backend", feature = "cuda"))]
+#![cfg(feature = "native-cuda")]
 
 #[path = "common/decode_lock.rs"]
 mod decode_lock;

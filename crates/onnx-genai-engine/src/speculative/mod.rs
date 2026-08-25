@@ -30,9 +30,9 @@ use crate::{
 };
 use anyhow::Context;
 use onnx_genai_kv::KvCacheOps;
+use onnx_genai_metadata::decoder_workflow::IterationPolicy;
 use onnx_genai_ort::{
     Eagle3DecodeOptions, Eagle3DecodeSession, MtpDecodeOptions, MtpDecodeSession, Session,
-    SharedKvInput, SharedKvProposerSession,
 };
 use onnx_runtime_ir::{DataType as IrDataType, WeightRef};
 use onnx_runtime_loader::WeightStore;
@@ -48,6 +48,9 @@ pub use tree::{
 /// Produces a target-model token embedding for an MTP proposal step.
 pub trait TokenEmbedder {
     fn hidden_size(&self) -> usize;
+    /// Number of token ids this embedder can embed. A token id at or beyond it
+    /// has no embedding row, so it can be neither embedded nor verified.
+    fn vocab_size(&self) -> usize;
     fn embed(&self, token: TokenId, out: &mut [f32]) -> anyhow::Result<()>;
 }
 
@@ -84,6 +87,10 @@ impl LinearEmbedder {
 impl TokenEmbedder for LinearEmbedder {
     fn hidden_size(&self) -> usize {
         self.hidden
+    }
+
+    fn vocab_size(&self) -> usize {
+        self.vocab
     }
 
     fn embed(&self, token: TokenId, out: &mut [f32]) -> anyhow::Result<()> {
@@ -201,6 +208,10 @@ impl TokenEmbedder for TargetInitializerEmbedder {
         self.matrix.cols
     }
 
+    fn vocab_size(&self) -> usize {
+        self.matrix.rows
+    }
+
     fn embed(&self, token: TokenId, out: &mut [f32]) -> anyhow::Result<()> {
         let token = token as usize;
         if token >= self.matrix.rows {
@@ -292,6 +303,13 @@ impl TokenEmbedder for MtpEmbedder {
         }
     }
 
+    fn vocab_size(&self) -> usize {
+        match self {
+            Self::Linear(embedder) => embedder.vocab_size(),
+            Self::TargetInitializer(embedder) => embedder.vocab_size(),
+        }
+    }
+
     fn embed(&self, token: TokenId, out: &mut [f32]) -> anyhow::Result<()> {
         match self {
             Self::Linear(embedder) => embedder.embed(token, out),
@@ -305,6 +323,11 @@ impl TokenEmbedder for MtpEmbedder {
 pub(crate) enum MtpLmHead {
     Linear(LinearLmHead),
     TargetInitializer(TargetInitializerLmHead),
+    /// int4 `MatMulNBits` shared LM-head projected on the GPU (or CPU) via a
+    /// standalone single-node session that reuses the target's quantised
+    /// initializers zero-copy. Selected when the target LM-head is quantised.
+    #[cfg(feature = "native-backend")]
+    Quantized(QuantizedDraftLmHead),
 }
 
 impl LmHead for MtpLmHead {
@@ -312,6 +335,8 @@ impl LmHead for MtpLmHead {
         match self {
             Self::Linear(lm_head) => lm_head.vocab_size(),
             Self::TargetInitializer(lm_head) => lm_head.vocab_size(),
+            #[cfg(feature = "native-backend")]
+            Self::Quantized(lm_head) => lm_head.vocab_size(),
         }
     }
 
@@ -319,8 +344,39 @@ impl LmHead for MtpLmHead {
         match self {
             Self::Linear(lm_head) => lm_head.logits(hidden, out),
             Self::TargetInitializer(lm_head) => lm_head.logits(hidden, out),
+            #[cfg(feature = "native-backend")]
+            Self::Quantized(lm_head) => lm_head.logits(hidden, out),
         }
     }
+}
+
+/// Device on which the int4 draft LM-head `MatMulNBits` projection runs.
+///
+/// The projection is a standalone single-node session built from the target's
+/// own quantised LM-head initializers. It runs *outside* the captured native
+/// decode step (during proposal), so it never affects CUDA-graph capture of the
+/// target decode step.
+#[derive(Debug, Clone, Copy)]
+// An ORT-only build still threads `Option<DraftProjectionDevice>` through the
+// adapter loader, but only the native path ever constructs one; outside that
+// feature, constructions are limited to tests.
+#[cfg_attr(not(feature = "native-backend"), allow(dead_code))]
+pub(crate) enum DraftProjectionDevice {
+    /// Project on the CPU int4 `MatMulNBits` kernel (used by unit tests and the
+    /// native CPU backend).
+    Cpu,
+    /// Project on the native CUDA int4 `MatMulNBits` kernel at the given ordinal.
+    Cuda {
+        #[cfg_attr(not(feature = "native-cuda"), allow(dead_code))]
+        index: u32,
+    },
+}
+
+fn is_dense_float_dtype(dtype: IrDataType) -> bool {
+    matches!(
+        dtype,
+        IrDataType::Float32 | IrDataType::Float16 | IrDataType::BFloat16
+    )
 }
 
 pub(crate) fn load_target_initializer_adapters(
@@ -328,6 +384,7 @@ pub(crate) fn load_target_initializer_adapters(
     embedding_name: &str,
     lm_head_name: &str,
     hidden_size: usize,
+    projection: Option<DraftProjectionDevice>,
 ) -> anyhow::Result<(MtpEmbedder, MtpLmHead, usize)> {
     let (graph, store) =
         onnx_runtime_loader::load_model_with_weights(model_path).with_context(|| {
@@ -354,7 +411,54 @@ pub(crate) fn load_target_initializer_adapters(
         );
     }
     let vocab_size = embedding_dims[0];
+    let embedder = TargetInitializerEmbedder {
+        matrix: TargetInitializerMatrix::new(
+            Arc::clone(&store),
+            embedding_weight,
+            vocab_size,
+            hidden_size,
+        )?,
+    };
     let lm_head_dims = lm_head_weight.dims();
+    // The MTP draft head reuses the target's shared LM-head to project its hidden
+    // state into draft logits. A *dense* [vocab, hidden] / [hidden, vocab] weight
+    // (f32/f16/bf16) is projected host-side by `TargetInitializerLmHead`. An int4
+    // MatMulNBits-quantised lm_head is stored as a 3-D packed uint8 blob with
+    // companion scales / zero_points: dequantising the full matrix is multi-GB
+    // and a host-side draft GEMV per step is not throughput-viable, so it is
+    // projected on the GPU (or CPU) via a standalone single-node MatMulNBits
+    // session that reuses the target's own quantised initializers zero-copy —
+    // running *outside* the captured decode step, so capture-safety is preserved.
+    if lm_head_dims.len() != 2 || !is_dense_float_dtype(lm_head_weight.dtype()) {
+        #[cfg(feature = "native-backend")]
+        if let Some(projection) = projection {
+            let (lm_head, head_vocab) = build_quantized_draft_lm_head(
+                &graph,
+                Arc::clone(&store),
+                lm_head_name,
+                hidden_size,
+                projection,
+            )?;
+            if head_vocab != vocab_size {
+                anyhow::bail!(
+                    "target quantised LM-head vocabulary {head_vocab} does not match embedding vocabulary {vocab_size}"
+                );
+            }
+            return Ok((
+                MtpEmbedder::TargetInitializer(embedder),
+                MtpLmHead::Quantized(lm_head),
+                vocab_size,
+            ));
+        }
+        anyhow::bail!(
+            "target LM-head initializer '{lm_head_name}' has shape {lm_head_dims:?} dtype {:?}, \
+             which is not a dense f32/f16/bf16 [vocab, hidden] matrix. A quantised (e.g. int4 \
+             MatMulNBits) shared LM-head requires a GPU/CPU projection device (only the native \
+             backend supplies one); it cannot be dequantised host-side.",
+            lm_head_weight.dtype()
+        );
+    }
+    let _ = projection;
     let (layout, rows, cols) = if lm_head_dims == [hidden_size, vocab_size] {
         (
             LmHeadInitializerLayout::HiddenVocab,
@@ -372,14 +476,6 @@ pub(crate) fn load_target_initializer_adapters(
             "target LM-head initializer '{lm_head_name}' shape {lm_head_dims:?} must be [{hidden_size}, {vocab_size}] or [{vocab_size}, {hidden_size}]"
         );
     };
-    let embedder = TargetInitializerEmbedder {
-        matrix: TargetInitializerMatrix::new(
-            Arc::clone(&store),
-            embedding_weight,
-            vocab_size,
-            hidden_size,
-        )?,
-    };
     let lm_head = TargetInitializerLmHead {
         matrix: TargetInitializerMatrix::new(store, lm_head_weight, rows, cols)?,
         layout,
@@ -390,6 +486,304 @@ pub(crate) fn load_target_initializer_adapters(
         MtpEmbedder::TargetInitializer(embedder),
         MtpLmHead::TargetInitializer(lm_head),
         vocab_size,
+    ))
+}
+
+/// A shared int4 `MatMulNBits` LM-head projected on-device (or on the CPU int4
+/// kernel) for MTP draft-token generation.
+///
+/// The projection is a standalone single-node `InferenceSession` built from the
+/// target model's *own* quantised LM-head initializers (weight / scales /
+/// zero_points), reused zero-copy through the same [`WeightStore`] mmap — no
+/// re-export, no host-side dequantisation. `logits` feeds one hidden vector per
+/// draft step and reads back the full vocabulary logits. This runs during
+/// proposal, *outside* the captured native decode step, so it never perturbs
+/// CUDA-graph capture of the target step (fallbacks stay at zero). Draft-token
+/// exactness is not required for correctness — drafts are verified against the
+/// target, so an imperfect projection only lowers the acceptance rate.
+#[cfg(feature = "native-backend")]
+pub(crate) struct QuantizedDraftLmHead {
+    session: Arc<std::sync::Mutex<onnx_runtime_session::InferenceSession>>,
+    input_name: String,
+    hidden: usize,
+    vocab: usize,
+}
+
+#[cfg(feature = "native-backend")]
+impl std::fmt::Debug for QuantizedDraftLmHead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QuantizedDraftLmHead")
+            .field("hidden", &self.hidden)
+            .field("vocab", &self.vocab)
+            .finish()
+    }
+}
+
+#[cfg(feature = "native-backend")]
+impl Clone for QuantizedDraftLmHead {
+    fn clone(&self) -> Self {
+        Self {
+            session: Arc::clone(&self.session),
+            input_name: self.input_name.clone(),
+            hidden: self.hidden,
+            vocab: self.vocab,
+        }
+    }
+}
+
+#[cfg(feature = "native-backend")]
+impl LmHead for QuantizedDraftLmHead {
+    fn vocab_size(&self) -> usize {
+        self.vocab
+    }
+
+    fn logits(&self, hidden: &[f32], out: &mut [f32]) -> anyhow::Result<()> {
+        if hidden.len() != self.hidden {
+            anyhow::bail!(
+                "quantised lm-head input length {} != hidden {}",
+                hidden.len(),
+                self.hidden
+            );
+        }
+        if out.len() != self.vocab {
+            anyhow::bail!(
+                "quantised lm-head output length {} != vocab {}",
+                out.len(),
+                self.vocab
+            );
+        }
+        let input = onnx_runtime_session::Tensor::from_f32(&[1, self.hidden], hidden)
+            .context("build draft lm-head projection input")?;
+        let mut session = self
+            .session
+            .lock()
+            .map_err(|_| anyhow::anyhow!("draft lm-head projection session lock poisoned"))?;
+        let outputs = session
+            .run(&[(self.input_name.as_str(), &input)])
+            .context("run draft lm-head projection")?;
+        let logits = outputs
+            .into_iter()
+            .next()
+            .context("draft lm-head projection produced no output")?;
+        match logits.dtype {
+            IrDataType::Float32 => {
+                let values = logits.to_vec_f32();
+                if values.len() != self.vocab {
+                    anyhow::bail!(
+                        "draft lm-head projection returned {} logits, expected {}",
+                        values.len(),
+                        self.vocab
+                    );
+                }
+                out.copy_from_slice(&values);
+            }
+            other => anyhow::bail!("draft lm-head projection returned unsupported dtype {other:?}"),
+        }
+        Ok(())
+    }
+}
+
+/// Build a [`QuantizedDraftLmHead`] from a loaded target `graph` by locating the
+/// `MatMulNBits` node that consumes `lm_head_name` and cloning it into a
+/// standalone single-node projection session on `projection`.
+///
+/// All shape/quantisation parameters (`K`, `N`, `bits`, `block_size`, the
+/// scales / zero_points inputs) are derived from the discovered node — nothing
+/// is hardcoded. The three quantised initializers are reused zero-copy from the
+/// same [`WeightStore`], which is handed to the projection session so its mmap
+/// stays alive.
+#[cfg(feature = "native-backend")]
+fn build_quantized_draft_lm_head(
+    graph: &onnx_runtime_ir::Graph,
+    store: Arc<WeightStore>,
+    lm_head_name: &str,
+    hidden_size: usize,
+    projection: DraftProjectionDevice,
+) -> anyhow::Result<(QuantizedDraftLmHead, usize)> {
+    use onnx_runtime_ir::{Attribute, Node, NodeId, static_shape};
+
+    // The native loader lowers int4 `MatMulNBits` into an explicit dequant +
+    // dense `MatMul` subgraph (BitShift / BitwiseAnd / Cast / Sub / Mul), so the
+    // loaded IR contains no `MatMulNBits` node to clone. The three quantised
+    // initializers (weight / scales / zero_points) do persist, however, so we
+    // reconstruct a clean single-node `MatMulNBits` projection from them and let
+    // the projection session's EP re-run the quantised GEMV. `weight`/`scales`
+    // are required; `zero_points` is optional (symmetric quantisation).
+    let find_initializer = |name: &str| -> Option<WeightRef> {
+        graph.initializers.iter().find_map(|(&vid, weight)| {
+            (graph.value(vid).name.as_deref() == Some(name)).then(|| weight.clone())
+        })
+    };
+    let weight_ref = find_initializer(lm_head_name)
+        .with_context(|| format!("shared LM-head initializer '{lm_head_name}' was not found"))?;
+    // Companion scales / zero_points follow the `MatMulNBits` export convention:
+    // the same prefix as the packed weight with a `.scales` / `.zero_points`
+    // suffix (e.g. `lm_head.weight` -> `lm_head.scales`).
+    let prefix = lm_head_name
+        .rsplit_once('.')
+        .map(|(head, _)| head)
+        .unwrap_or(lm_head_name);
+    let scales_name = format!("{prefix}.scales");
+    let zero_points_name = format!("{prefix}.zero_points");
+    let scales_ref = find_initializer(&scales_name).with_context(|| {
+        format!(
+            "quantised LM-head '{lm_head_name}' companion scales initializer '{scales_name}' \
+             was not found"
+        )
+    })?;
+    let zero_points_ref = find_initializer(&zero_points_name);
+
+    // Derive all quantisation geometry from the initializer shapes and the
+    // configured hidden size — nothing is hardcoded. The packed weight is
+    // [N, k_blocks, blob] uint8; K = hidden_size; block_size = K / k_blocks;
+    // bits = blob_bytes * 8 / block_size (int4 packs two weights per byte).
+    let weight_dims = weight_ref.dims();
+    if weight_dims.len() != 3 {
+        anyhow::bail!(
+            "quantised LM-head weight '{lm_head_name}' must be a 3-D packed [N, k_blocks, blob] \
+             tensor, got shape {weight_dims:?}"
+        );
+    }
+    let n = weight_dims[0];
+    let k_blocks = weight_dims[1];
+    let blob = weight_dims[2];
+    let k = hidden_size;
+    if k_blocks == 0 || !k.is_multiple_of(k_blocks) {
+        anyhow::bail!(
+            "quantised LM-head weight '{lm_head_name}' k_blocks {k_blocks} does not divide hidden \
+             size {k}"
+        );
+    }
+    let block_size = (k / k_blocks) as i64;
+    if block_size == 0 || (blob * 8) % (block_size as usize) != 0 {
+        anyhow::bail!(
+            "quantised LM-head weight '{lm_head_name}' blob {blob} incompatible with block_size \
+             {block_size}"
+        );
+    }
+    let bits = (blob * 8 / block_size as usize) as i64;
+    let scales_dims = scales_ref.dims().to_vec();
+    if scales_dims != [n, k_blocks] {
+        anyhow::bail!(
+            "quantised LM-head scales '{scales_name}' shape {scales_dims:?} does not match \
+             weight-derived [N={n}, k_blocks={k_blocks}]"
+        );
+    }
+    // The MatMulNBits CUDA kernel requires Float32 scales; the exported artifact
+    // stores them as BFloat16 (or Float16). Convert once, at build time, into an
+    // inline Float32 initializer so the reconstructed projection node satisfies
+    // the kernel's dtype contract. Float32 scales are passed through untouched.
+    let scales_ref = match scales_ref.dtype() {
+        IrDataType::Float32 => scales_ref,
+        dtype @ (IrDataType::BFloat16 | IrDataType::Float16) => {
+            let raw = store.bytes(&scales_ref).with_context(|| {
+                format!("resolve bytes for quantised LM-head scales '{scales_name}'")
+            })?;
+            if raw.len() % 2 != 0 {
+                anyhow::bail!(
+                    "quantised LM-head scales '{scales_name}' byte length {} is not 2-byte aligned",
+                    raw.len()
+                );
+            }
+            let mut f32_bytes = Vec::with_capacity(raw.len() * 2);
+            for chunk in raw.chunks_exact(2) {
+                let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
+                let value = match dtype {
+                    IrDataType::BFloat16 => half::bf16::from_bits(bits).to_f32(),
+                    _ => half::f16::from_bits(bits).to_f32(),
+                };
+                f32_bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            WeightRef::Inline(onnx_runtime_ir::TensorData::from_raw(
+                IrDataType::Float32,
+                scales_dims.to_vec(),
+                f32_bytes,
+            ))
+        }
+        other => anyhow::bail!(
+            "quantised LM-head scales '{scales_name}' has unsupported dtype {other:?}; \
+             expected Float32, BFloat16, or Float16"
+        ),
+    };
+    let mut projection_graph = onnx_runtime_ir::Graph::default();
+    projection_graph
+        .opset_imports
+        .insert("com.microsoft".to_string(), 1);
+    let hidden_value = projection_graph.create_named_value(
+        "draft_hidden",
+        IrDataType::Float32,
+        static_shape([1, k]),
+    );
+    projection_graph.add_input(hidden_value);
+    let add_initializer = |graph: &mut onnx_runtime_ir::Graph, name: &str, weight: &WeightRef| {
+        let value = graph.create_named_value(
+            name,
+            weight.dtype(),
+            static_shape(weight.dims().iter().copied()),
+        );
+        graph.set_initializer(value, weight.clone());
+        value
+    };
+    let weight_value = add_initializer(&mut projection_graph, "draft_lm_head.weight", &weight_ref);
+    let scales_value = add_initializer(&mut projection_graph, "draft_lm_head.scales", &scales_ref);
+    let mut inputs = vec![Some(hidden_value), Some(weight_value), Some(scales_value)];
+    if let Some(zero_points_ref) = &zero_points_ref {
+        let zero_points_value = add_initializer(
+            &mut projection_graph,
+            "draft_lm_head.zero_points",
+            zero_points_ref,
+        );
+        inputs.push(Some(zero_points_value));
+    }
+    let logits_value = projection_graph.create_named_value(
+        "draft_logits",
+        IrDataType::Float32,
+        static_shape([1, n]),
+    );
+    let mut projection_node = Node::new(NodeId(0), "MatMulNBits", inputs, vec![logits_value]);
+    projection_node.domain = "com.microsoft".to_string();
+    projection_node
+        .attributes
+        .insert("K".to_string(), Attribute::Int(k as i64));
+    projection_node
+        .attributes
+        .insert("N".to_string(), Attribute::Int(n as i64));
+    projection_node
+        .attributes
+        .insert("bits".to_string(), Attribute::Int(bits));
+    projection_node
+        .attributes
+        .insert("block_size".to_string(), Attribute::Int(block_size));
+    projection_graph.insert_node(projection_node);
+    projection_graph.add_output(logits_value);
+
+    let provider: Arc<dyn onnx_runtime_ep_api::ExecutionProvider> = match projection {
+        DraftProjectionDevice::Cpu => Arc::new(onnx_runtime_ep_cpu::CpuExecutionProvider::new()),
+        #[cfg(feature = "native-cuda")]
+        DraftProjectionDevice::Cuda { index } => Arc::new(
+            onnx_runtime_ep_cuda::CudaExecutionProvider::initialized(index)
+                .context("initialize CUDA EP for int4 draft LM-head projection")?,
+        ),
+        #[cfg(not(feature = "native-cuda"))]
+        DraftProjectionDevice::Cuda { .. } => anyhow::bail!(
+            "int4 draft LM-head projection on CUDA requires the `native-cuda` feature"
+        ),
+    };
+    let session = onnx_runtime_session::InferenceSession::from_graph_with_provider(
+        projection_graph,
+        store,
+        Path::new("."),
+        provider,
+    )
+    .context("build int4 draft LM-head projection session")?;
+    Ok((
+        QuantizedDraftLmHead {
+            session: Arc::new(std::sync::Mutex::new(session)),
+            input_name: "draft_hidden".to_string(),
+            hidden: hidden_size,
+            vocab: n,
+        },
+        n,
     ))
 }
 
@@ -493,8 +887,6 @@ pub struct SpeculativeProposerContext<'a> {
     pub target_hidden_layers: Option<&'a [Vec<f32>]>,
     /// Target model's unprocessed greedy next token.
     pub guaranteed_token: Option<TokenId>,
-    /// Target KV slices bound to a shared-KV proposer's `shared_kv.*` inputs.
-    pub shared_kv_slices: Option<&'a [SharedKvInput]>,
 }
 
 /// Aggregate diagnostics for one speculative generation.
@@ -781,6 +1173,7 @@ where
 pub struct Eagle3Proposer<'a, E = LinearEmbedder> {
     session: Eagle3DecodeSession<'a>,
     embedder: E,
+    token_map: Option<Vec<TokenId>>,
 }
 
 impl<'a, E> Eagle3Proposer<'a, E>
@@ -801,7 +1194,42 @@ where
                 embedder.hidden_size()
             );
         }
-        Ok(Self { session, embedder })
+        Ok(Self {
+            session,
+            embedder,
+            token_map: None,
+        })
+    }
+
+    /// Translate proposer vocabulary ids before embedding and verification.
+    pub fn with_token_map(mut self, token_map: Vec<TokenId>) -> anyhow::Result<Self> {
+        if token_map.len() < self.session.signature().draft_vocab_size {
+            anyhow::bail!(
+                "proposer token map has {} entries but logits expose {} ids",
+                token_map.len(),
+                self.session.signature().draft_vocab_size
+            );
+        }
+        // Every mapped id is embedded through the target embedding table and
+        // verified against the target vocabulary, so an id at or beyond that
+        // vocabulary has no row and cannot be a real target token. Reject the
+        // whole map at load time rather than faulting mid-proposal on whichever
+        // draft id happens to select the out-of-range entry.
+        let vocab = self.embedder.vocab_size();
+        if let Some((index, mapped)) = token_map
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|&(_, id)| id as usize >= vocab)
+        {
+            anyhow::bail!(
+                "proposer token map entry {index} maps to target id {mapped}, but the \
+                 target/embedder vocabulary has only {vocab} ids; every mapped id must be a \
+                 valid target token"
+            );
+        }
+        self.token_map = Some(token_map);
+        Ok(self)
     }
 }
 
@@ -861,10 +1289,15 @@ where
                 .session
                 .step(&embedding, &fused_hidden, &running_hidden, position)
                 .map_err(|error| anyhow::anyhow!("EAGLE-3 proposal step failed: {error}"))?;
-            let token = TokenId::try_from(
-                argmax(&output.logits).context("EAGLE-3 head produced empty draft logits")?,
-            )
-            .context("EAGLE-3 token id exceeds u32 range")?;
+            let draft_id =
+                argmax(&output.logits).context("EAGLE-3 head produced empty draft logits")?;
+            let token = if let Some(token_map) = &self.token_map {
+                *token_map
+                    .get(draft_id)
+                    .context("proposer token id is absent from the declared vocabulary map")?
+            } else {
+                TokenId::try_from(draft_id).context("EAGLE-3 token id exceeds u32 range")?
+            };
             tokens.push(token);
             previous_token = token;
             running_hidden = output.hidden;
@@ -886,124 +1319,6 @@ where
 
     fn name(&self) -> &str {
         "eagle3"
-    }
-}
-
-/// Shared-KV draft proposer (originally introduced for Gemma4 `*-assistant`).
-///
-/// The assistant owns no KV cache: it reads slices of the target model's paged
-/// KV cache through `shared_kv.*` inputs (provided via the proposer context) and
-/// carries its own internal `lm_head`. Each step consumes
-/// `inputs_embeds = concat(target_input_embedding(last_token), hidden)` (each `H`
-/// wide), emits full draft `logits`, and threads its `projected_state` output
-/// forward as the next step's `hidden`. The first step seeds `hidden` from the
-/// target's last hidden state and `last_token` from the last context token; the
-/// guaranteed target token is emitted for free and its assistant step only
-/// advances the threaded hidden state before real drafts begin.
-pub struct SharedKvProposer<'a> {
-    session: SharedKvProposerSession<'a>,
-    embedder: &'a dyn TokenEmbedder,
-}
-
-impl<'a> SharedKvProposer<'a> {
-    pub fn new(model: &'a Session, embedder: &'a dyn TokenEmbedder) -> anyhow::Result<Self> {
-        let session = SharedKvProposerSession::new(model).map_err(|error| {
-            anyhow::anyhow!("Failed to create shared-KV proposer decode session: {error}")
-        })?;
-        let hidden_size = session.signature().backbone_hidden_size;
-        if embedder.hidden_size() != hidden_size {
-            anyhow::bail!(
-                "shared-KV proposer embedding hidden size {} != backbone hidden size {hidden_size}",
-                embedder.hidden_size()
-            );
-        }
-        Ok(Self { session, embedder })
-    }
-
-    /// Target backbone hidden size `H` expected by this assistant.
-    pub fn hidden_size(&self) -> usize {
-        self.session.signature().backbone_hidden_size
-    }
-}
-
-impl SpeculativeProposer for SharedKvProposer<'_> {
-    fn propose(
-        &mut self,
-        context: &SpeculativeProposerContext<'_>,
-    ) -> anyhow::Result<SpeculativeProposal> {
-        let hidden = context
-            .target_hidden
-            .context("shared-KV proposer requires the target model's last hidden state")?;
-        let guaranteed_token = context
-            .guaranteed_token
-            .context("shared-KV proposer requires the target model's greedy next token")?;
-        let shared_kv = context
-            .shared_kv_slices
-            .context("shared-KV proposer requires target shared-KV slices")?;
-        let hidden_size = self.session.signature().backbone_hidden_size;
-        if hidden.len() != hidden_size {
-            anyhow::bail!(
-                "target_hidden length {} != shared-KV proposer hidden {hidden_size}",
-                hidden.len()
-            );
-        }
-        let seed_token = context
-            .context_tokens
-            .last()
-            .copied()
-            .context("shared-KV proposer requires at least one context token")?;
-
-        let draft_count = context.width.saturating_sub(1);
-        let mut tokens = Vec::with_capacity(draft_count + 1);
-        tokens.push(guaranteed_token);
-
-        // Reference contract (HF `SinglePositionMultiTokenCandidateGenerator`):
-        // each step feeds `inputs_embeds = concat(embed(last_token), hidden)`,
-        // where `embed` is the *target* model's raw input-token embedding and
-        // `hidden` is the target's last hidden state (step 0) or the assistant's
-        // own threaded `projected_state` (later steps). The RoPE position is held
-        // constant by the exported graph (derived from the shared-KV length), so
-        // the token embedding is the only per-step positional cue.
-        //
-        // The guaranteed target token is taken for free, but the assistant is
-        // still run once to advance the threaded hidden state to the position
-        // that follows it; that bootstrap step's own draft is discarded and
-        // `last_token` is pinned to the guaranteed token. Subsequent steps emit
-        // the real draft tokens.
-        let mut last_hidden = hidden.to_vec();
-        let mut last_token = seed_token;
-        let mut inputs_embeds = vec![0.0f32; 2 * hidden_size];
-        let position = i64::try_from(context.context_tokens.len().saturating_sub(1))
-            .context("shared-KV proposer position exceeds i64")?;
-        for step in 0..context.width {
-            self.embedder
-                .embed(last_token, &mut inputs_embeds[..hidden_size])?;
-            inputs_embeds[hidden_size..].copy_from_slice(&last_hidden);
-            let output = self
-                .session
-                .step(&inputs_embeds, position, shared_kv)
-                .map_err(|error| {
-                    anyhow::anyhow!("shared-KV proposer proposal step failed: {error}")
-                })?;
-            let drafted = TokenId::try_from(
-                argmax(&output.logits).context("shared-KV proposer produced empty draft logits")?,
-            )
-            .context("shared-KV proposer token id exceeds u32 range")?;
-            last_hidden = output.projected_state;
-            if step == 0 {
-                // Bootstrap: pin to the guaranteed target token so the drafts
-                // that follow condition on it exactly.
-                last_token = guaranteed_token;
-            } else {
-                tokens.push(drafted);
-                last_token = drafted;
-            }
-        }
-        Ok(SpeculativeProposal::linear(tokens))
-    }
-
-    fn name(&self) -> &str {
-        "shared_kv_proposer"
     }
 }
 
@@ -1109,6 +1424,122 @@ pub(crate) struct SpeculativeLoopState<'state, 'callback> {
     pub(crate) callback: Option<&'state mut GenerateTokenCallback<'callback>>,
 }
 
+/// Everything one proposal block needs, carried between iterations.
+///
+/// The interpreter owns the loop; this owns the state a block advances. Split
+/// that way so the executor can be handed exactly one node at a time, which is
+/// what makes the speculative algorithm a *step inside* a declared workflow
+/// rather than a second loop beside one.
+pub(crate) struct SpeculativeBlock<'state, 'callback> {
+    session_id: SessionId,
+    state: &'state mut EngineSession,
+    options: &'state GenerateOptions,
+    chain: &'state ProcessorChain,
+    max_context: Option<usize>,
+    prefix_cache_hit_len: usize,
+    generated_tokens: &'state mut Vec<TokenId>,
+    generated_text: &'state mut String,
+    generated_logprobs: &'state mut Option<Vec<crate::config::TokenLogprob>>,
+    rng: &'state mut SamplingRng,
+    callback: Option<&'state mut GenerateTokenCallback<'callback>>,
+    speculative_mode: SpeculativeMode,
+    draft_width: usize,
+    mtp_proposer: Option<MtpProposer<'static, MtpEmbedder, MtpLmHead>>,
+    step: usize,
+}
+
+/// The propose-verify-accept executor, as the interpreter reaches it.
+struct SpeculativeBlockHost<'engine, 'state, 'callback> {
+    engine: &'engine mut Engine,
+    block: SpeculativeBlock<'state, 'callback>,
+    /// The stop this executor reached, if a block reached one.
+    finished: Option<GenerateResult>,
+}
+
+impl crate::pipeline::WorkflowNodeHost for SpeculativeBlockHost<'_, '_, '_> {
+    fn hosted_contracts(&self) -> &'static [&'static str] {
+        crate::pipeline::generation::SPECULATIVE_BLOCK_CONTRACTS
+    }
+
+    fn execute_contract_node(
+        &mut self,
+        mut request: crate::pipeline::WorkflowNodeRequest<'_>,
+    ) -> anyhow::Result<bool> {
+        if request.contract != onnx_genai_metadata::decoder_workflow::SPECULATIVE_BLOCK_CONTRACT {
+            return Ok(false);
+        }
+        // Defensive, not load-bearing: the loop reads its predicate before the
+        // body and writes the carry after it, and the liveness read is never
+        // skipped while a host implements a node in this body, so a stopped
+        // block is not re-entered. Republishing the stop rather than decoding
+        // past it keeps that a local property instead of a claim about the
+        // interpreter.
+        if self.finished.is_some() {
+            self.publish_block_outputs(&mut request, &[])?;
+            return Ok(true);
+        }
+        let before = self.block.generated_tokens.len();
+        let finished = self.engine.advance_speculative_block(&mut self.block)?;
+        let committed = self.block.generated_tokens[before..].to_vec();
+        self.finished = finished;
+        self.publish_block_outputs(&mut request, &committed)?;
+        Ok(true)
+    }
+}
+
+impl SpeculativeBlockHost<'_, '_, '_> {
+    /// Define the SSA values the block node declares.
+    ///
+    /// `token` carries the whole accepted block and `accepted_len` says how much
+    /// of it is real, which is what lets one iteration publish a variable number
+    /// of tokens through the same emit a single-token body uses. A rejected
+    /// suffix never appears here: it was rolled back before the commit that
+    /// produced these tokens.
+    fn publish_block_outputs(
+        &self,
+        request: &mut crate::pipeline::WorkflowNodeRequest<'_>,
+        committed: &[TokenId],
+    ) -> anyhow::Result<()> {
+        let width = committed.len().max(1) as i64;
+        for (port, value) in request.outputs.iter() {
+            let tensor = match port.as_str() {
+                "token" => {
+                    let mut tokens = committed
+                        .iter()
+                        .map(|id| i64::from(*id))
+                        .collect::<Vec<_>>();
+                    tokens.resize(width as usize, 0);
+                    onnx_genai_ort::Value::from_slice_i64(&tokens, &[1, width])?
+                }
+                "active" => block_flag(self.finished.is_none())?,
+                "done" => block_flag(self.finished.is_some())?,
+                "accepted_len" => {
+                    onnx_genai_ort::Value::from_slice_i64(&[committed.len() as i64], &[1])?
+                }
+                "cache_lengths" | "lengths" => onnx_genai_ort::Value::from_slice_i64(
+                    &[i64::try_from(self.block.state.tokens.len())
+                        .context("cache length exceeds int64")?],
+                    &[1],
+                )?,
+                // State ports the block also declares are the decode session's
+                // buffers, exactly as they are for the single-row decode core.
+                _ => continue,
+            };
+            request.values.insert(value.clone(), tensor);
+        }
+        Ok(())
+    }
+}
+
+fn block_flag(value: bool) -> anyhow::Result<onnx_genai_ort::Value> {
+    onnx_genai_ort::Value::from_raw_bytes(
+        vec![u8::from(value)],
+        &[1],
+        onnx_genai_ort::DataType::Bool,
+    )
+    .map_err(Into::into)
+}
+
 /// Target-model forward result for one speculative step: the base next-token
 /// logits, any hidden state(s) the active proposer consumes, and the target's
 /// unprocessed greedy next token (used by hidden-state proposers).
@@ -1125,7 +1556,6 @@ struct CandidateProposalInputs<'a> {
     step: usize,
     base_len: usize,
     prediction: &'a TargetPrediction,
-    shared_kv_slices: Option<&'a [SharedKvInput]>,
     generated_tokens: &'a [TokenId],
     generated_text: &'a str,
     options: &'a GenerateOptions,
@@ -1149,7 +1579,37 @@ impl Engine {
             .unwrap_or_else(|| self.speculative_mode.clone())
     }
 
+    /// Whether the package permits the runtime to turn speculation on by itself.
+    ///
+    /// Speculation replaces one implementation of a contract with an equivalent
+    /// one, so the package's declared equivalence class decides whether the swap
+    /// is silently allowed. Only a `bitwise` or `distribution_preserving`
+    /// contract may be substituted without the caller asking: a merely
+    /// `semantic` equivalence is free to change the output distribution, which
+    /// is exactly what a caller who did not ask for speculation did not agree to.
+    ///
+    /// A component that declares nothing is treated as `semantic` — the schema
+    /// default — so silence never buys an automatic optimization. Note that an
+    /// absent contract must be *counted* as semantic rather than skipped:
+    /// filtering undeclared components out would make `all` vacuously true for a
+    /// package whose components declare no contracts at all.
+    pub(crate) fn permits_automatic_speculation(&self) -> bool {
+        let Some(pipeline) = &self.metadata.pipeline else {
+            return false;
+        };
+        components_permit_automatic_speculation(&pipeline.workflow.components)
+    }
+
     pub(crate) fn should_use_speculative(&self, options: &GenerateOptions) -> bool {
+        // Naming a mode — on the request or in the engine configuration — is an
+        // explicit opt-in. Anything else is the runtime substituting a different
+        // implementation of the same contract on its own, which only a
+        // bitwise or distribution-preserving equivalence class permits.
+        let opted_in = options.speculative_mode.is_some()
+            || !matches!(self.speculative_mode, SpeculativeMode::None);
+        if !opted_in && !self.permits_automatic_speculation() {
+            return false;
+        }
         let mode_available = match self.speculative_mode(options) {
             SpeculativeMode::None => false,
             SpeculativeMode::DraftModel => self.draft.is_some(),
@@ -1161,19 +1621,29 @@ impl Engine {
                 .eagle3
                 .as_ref()
                 .is_some_and(|eagle3| eagle3.config == config),
-            SpeculativeMode::SharedKv(config) => self
-                .shared_kv_proposer
-                .as_ref()
-                .is_some_and(|assistant| assistant.config == config),
         };
         mode_available
             // Grammar processors carry per-request parser state; draft/verify
             // would need separate parser branches for speculative candidates.
             && options.constraint.is_none()
-            && (options.greedy || options.temperature == 0.0)
+            && options.selects_greedily()
             && self.kv_model.is_some()
     }
 
+    /// Generate through the package's loop re-authored as a proposal block.
+    ///
+    /// The iteration is the workflow's: the interpreter reads the bound, the
+    /// liveness predicate, the carried cells and the emit that publishes the
+    /// token stream from the authored document, and the body's single node
+    /// declares `onnx-genai.speculative-block`. This runtime registered an
+    /// executor for that contract, so the propose-verify-accept-rollback step
+    /// below is reached the same way the single-token decode core is — by the
+    /// contract a declared node names, not by a request option branching into a
+    /// second loop.
+    ///
+    /// What the request option still decides is *whether* to ask for the block
+    /// body at all, which is a caller's choice about equivalence class, not the
+    /// runtime inspecting the package.
     pub(crate) fn generate_speculative_loop(
         &mut self,
         loop_state: SpeculativeLoopState<'_, '_>,
@@ -1189,11 +1659,11 @@ impl Engine {
             generated_text,
             generated_logprobs,
             rng,
-            mut callback,
+            callback,
         } = loop_state;
         let speculative_mode = self.speculative_mode(options);
         let draft_width = self.resolve_draft_width(options, &speculative_mode)?;
-        let mut mtp_proposer = if matches!(&speculative_mode, SpeculativeMode::Mtp(_)) {
+        let mtp_proposer = if matches!(&speculative_mode, SpeculativeMode::Mtp(_)) {
             let mtp = self
                 .mtp
                 .as_ref()
@@ -1216,138 +1686,260 @@ impl Engine {
         } else {
             None
         };
-        let mut step = 0;
-
-        loop {
-            if let Some(result) = self.check_speculative_termination(
+        let runtime = self
+            .workflow
+            .iteration_runtime(IterationPolicy::SpeculativeBlock)?;
+        // The loop's declared bound counts *blocks*, and every block that
+        // continues commits at least one token, so the request's token budget
+        // bounds them too. The per-token stop stays the executor's, exactly as
+        // it is for a single-token body.
+        let request = crate::pipeline::PipelineGenerateRequest::new(crate::GenerateRequest {
+            prompt: crate::GeneratePrompt::TokenIds(vec![0]),
+            options: options.clone(),
+        });
+        let mut host = SpeculativeBlockHost {
+            engine: self,
+            block: SpeculativeBlock {
+                session_id,
+                state,
+                options,
+                chain,
+                max_context,
+                prefix_cache_hit_len,
                 generated_tokens,
                 generated_text,
                 generated_logprobs,
-                state.tokens.len(),
-                options,
-                max_context,
-                prefix_cache_hit_len,
-            )? {
-                return Ok(result);
-            }
-
-            let remaining_tokens = options.max_new_tokens - generated_tokens.len();
-            let remaining_context = max_context
-                .map(|limit| limit.saturating_sub(state.tokens.len()))
-                .unwrap_or(remaining_tokens);
-            let width = draft_width
-                .min(remaining_tokens)
-                .min(remaining_context)
-                .max(1);
-
-            let base_len = state.tokens.len();
-            let base_generated_len = generated_tokens.len();
-
-            let prediction = self.load_target_prediction(session_id, state, &speculative_mode)?;
-
-            // Slice the target's paged KV for the assistant's shared_kv.* inputs.
-            let shared_kv_slices = if let SpeculativeMode::SharedKv(_) = &speculative_mode {
-                Some(self.shared_kv_proposer_slices(session_id)?)
-            } else {
-                None
-            };
-
-            let draft_tokens = self.propose_candidates(
-                &speculative_mode,
-                state,
-                &mut mtp_proposer,
                 rng,
-                CandidateProposalInputs {
-                    width,
-                    step,
-                    base_len,
-                    prediction: &prediction,
-                    shared_kv_slices: shared_kv_slices.as_deref(),
-                    generated_tokens,
-                    generated_text,
-                    options,
-                    chain,
-                },
-            )?;
-
-            let verified_logits =
-                self.run_target_verification(session_id, state, &draft_tokens, base_len)?;
-
-            let mut target_logits = Vec::with_capacity(draft_tokens.len() + 1);
-            target_logits.push(prediction.base_logits);
-            target_logits.extend(verified_logits);
-
-            let accepted_prefix = self.choose_accepted_prefix(
-                &mut target_logits,
-                &draft_tokens,
-                base_len,
-                state,
-                generated_tokens,
-                options,
-                chain,
-                rng,
-                step,
-            )?;
-            let accepted = accepted_prefix.accepted;
-
-            // Rewind the target KV to the accepted prefix and pick any correction
-            // or bonus token. The rewind happens inside assemble_commit_tokens
-            // BEFORE the token push in commit_speculative_tokens, so the commit
-            // starts from exactly the accepted boundary (base_len + accepted).
-            let (commit_tokens, commit_logprobs) = self.assemble_commit_tokens(
-                &accepted_prefix,
-                &draft_tokens,
-                base_len,
-                state,
-                &mut target_logits,
-                generated_tokens,
-                options,
-                chain,
-                rng,
-                step,
-                max_context,
-                session_id,
-            )?;
-
-            if matches!(&speculative_mode, SpeculativeMode::DraftModel) {
-                self.notify_draft_acceptance(state, accepted, &commit_tokens)?;
-            } else if let Some(proposer) = mtp_proposer.as_mut() {
-                proposer.accept(&SpeculativeAcceptContext {
-                    accepted_prefix_len: accepted,
-                    committed_tokens: &commit_tokens,
-                    target_tokens: &state.tokens,
-                })?;
-            }
-
-            if let Some(result) = self.commit_speculative_tokens(
-                session_id,
-                state,
-                generated_tokens,
-                generated_text,
-                generated_logprobs,
-                commit_tokens,
-                commit_logprobs,
-                accepted,
-                base_len,
-                prefix_cache_hit_len,
-                options,
-                chain,
-                &speculative_mode,
-                &mut step,
-                &mut callback,
-                max_context,
-            )? {
-                return Ok(result);
-            }
-
-            if matches!(&speculative_mode, SpeculativeMode::DraftModel) {
-                self.sync_draft_to_target(state)?;
-            }
-
-            if generated_tokens.len() == base_generated_len {
-                anyhow::bail!("speculative decoding made no progress");
+                callback,
+                speculative_mode,
+                draft_width,
+                mtp_proposer,
+                step: 0,
+            },
+            finished: None,
+        };
+        let mut cursor = {
+            let mut node: Option<&mut dyn crate::pipeline::WorkflowNodeHost> = Some(&mut host);
+            crate::pipeline::WorkflowGenerationCursor::start(
+                &runtime,
+                request,
+                crate::pipeline::generation::SPECULATIVE_BLOCK_CONTRACTS,
+                &mut node,
+            )?
+        };
+        while {
+            let mut node: Option<&mut dyn crate::pipeline::WorkflowNodeHost> = Some(&mut host);
+            cursor.advance(&runtime, &mut node)?
+        } {}
+        let finished = host.finished.take();
+        let committed = host.block.generated_tokens.clone();
+        let logprobs = host.block.generated_logprobs.clone();
+        let unfinished_text = host.block.generated_text.clone();
+        drop(host);
+        // The declared emit and the block executor describe the same
+        // generation. Checking them against each other is what keeps the emit
+        // load-bearing rather than decorative: a block that published fewer
+        // tokens than it accepted, or republished a rolled-back suffix, would
+        // otherwise be invisible.
+        crate::pipeline::generation::verify_emitted_tokens(&runtime, &cursor, &committed)?;
+        match finished {
+            Some(result) => Ok(result),
+            None => {
+                // The bound ran out rather than the policy stopping. Report it
+                // the way every other exhausted budget is reported.
+                ensure_constrained_finish(options, &unfinished_text, FinishReason::MaxTokens)?;
+                self.finish_result(
+                    &committed,
+                    FinishReason::MaxTokens,
+                    prefix_cache_hit_len,
+                    logprobs.as_deref(),
+                )
             }
         }
+    }
+
+    /// Run one proposal block: propose, verify, accept the agreeing prefix and
+    /// roll the rejected suffix back out of every cell that advanced.
+    ///
+    /// Exactly one iteration, and nothing about the loop around it. `Ok(None)`
+    /// means the block committed and generation may continue; `Ok(Some(result))`
+    /// means this block reached a stop.
+    fn advance_speculative_block(
+        &mut self,
+        block: &mut SpeculativeBlock<'_, '_>,
+    ) -> anyhow::Result<Option<GenerateResult>> {
+        let SpeculativeBlock {
+            session_id,
+            state,
+            options,
+            chain,
+            max_context,
+            prefix_cache_hit_len,
+            generated_tokens,
+            generated_text,
+            generated_logprobs,
+            rng,
+            callback,
+            speculative_mode,
+            draft_width,
+            mtp_proposer,
+            step,
+        } = block;
+        let session_id = *session_id;
+        let options = *options;
+        let chain = *chain;
+        let max_context = *max_context;
+        let prefix_cache_hit_len = *prefix_cache_hit_len;
+        let draft_width = *draft_width;
+        let speculative_mode = speculative_mode.clone();
+
+        if let Some(result) = self.check_speculative_termination(
+            generated_tokens,
+            generated_text,
+            generated_logprobs,
+            state.tokens.len(),
+            options,
+            max_context,
+            prefix_cache_hit_len,
+        )? {
+            return Ok(Some(result));
+        }
+
+        let remaining_tokens = options.max_new_tokens - generated_tokens.len();
+        let remaining_context = max_context
+            .map(|limit| limit.saturating_sub(state.tokens.len()))
+            .unwrap_or(remaining_tokens);
+        let width = draft_width
+            .min(remaining_tokens)
+            .min(remaining_context)
+            .max(1);
+
+        let base_len = state.tokens.len();
+        let base_generated_len = generated_tokens.len();
+
+        let prediction = self.load_target_prediction(session_id, state, &speculative_mode)?;
+
+        let draft_tokens = self.propose_candidates(
+            &speculative_mode,
+            state,
+            mtp_proposer,
+            rng,
+            CandidateProposalInputs {
+                width,
+                step: *step,
+                base_len,
+                prediction: &prediction,
+                generated_tokens,
+                generated_text,
+                options,
+                chain,
+            },
+        )?;
+
+        // Snapshot the pre-draft recurrent/conv state of a hybrid native
+        // target BEFORE the verify window destructively advances it, so the
+        // accept path can commit it to exactly the accepted prefix. Inert for
+        // every non-native / pure-dense target (returns `None`).
+        #[cfg(feature = "native-backend")]
+        let recurrent_snapshot = match state.decode_state.native_recurrent_runner_mut() {
+            Some(native) => Some(native.snapshot_recurrent_state()?),
+            None => None,
+        };
+
+        let verified_logits =
+            self.run_target_verification(session_id, state, &draft_tokens, base_len)?;
+
+        let mut target_logits = Vec::with_capacity(draft_tokens.len() + 1);
+        target_logits.push(prediction.base_logits);
+        target_logits.extend(verified_logits);
+
+        let accepted_prefix = self.choose_accepted_prefix(
+            &mut target_logits,
+            &draft_tokens,
+            base_len,
+            state,
+            generated_tokens,
+            options,
+            chain,
+            rng,
+            *step,
+        )?;
+        let accepted = accepted_prefix.accepted;
+
+        // Commit the hybrid native target's recurrent/conv state to the
+        // accepted prefix. Attention KV keeps the ordinary prefix-slice rewind
+        // in `assemble_commit_tokens`; this only rebuilds the destructive
+        // rolling caches (snapshot + accepted-token re-advance), then squares
+        // the paged length bookkeeping so that rewind becomes a no-op.
+        #[cfg(feature = "native-backend")]
+        if let Some(snapshot) = recurrent_snapshot.as_ref() {
+            self.commit_native_recurrent_target(
+                session_id,
+                state,
+                base_len,
+                &draft_tokens[..accepted],
+                snapshot,
+            )?;
+        }
+
+        // Rewind the target KV to the accepted prefix and pick any correction
+        // or bonus token. The rewind happens inside assemble_commit_tokens
+        // BEFORE the token push in commit_speculative_tokens, so the commit
+        // starts from exactly the accepted boundary (base_len + accepted).
+        let (commit_tokens, commit_logprobs) = self.assemble_commit_tokens(
+            &accepted_prefix,
+            &draft_tokens,
+            base_len,
+            state,
+            &mut target_logits,
+            generated_tokens,
+            options,
+            chain,
+            rng,
+            *step,
+            max_context,
+            session_id,
+        )?;
+
+        if matches!(&speculative_mode, SpeculativeMode::DraftModel) {
+            self.notify_draft_acceptance(state, accepted, &commit_tokens)?;
+        } else if let Some(proposer) = mtp_proposer.as_mut() {
+            proposer.accept(&SpeculativeAcceptContext {
+                accepted_prefix_len: accepted,
+                committed_tokens: &commit_tokens,
+                target_tokens: &state.tokens,
+            })?;
+        }
+
+        if let Some(result) = self.commit_speculative_tokens(
+            session_id,
+            state,
+            generated_tokens,
+            generated_text,
+            generated_logprobs,
+            commit_tokens,
+            commit_logprobs,
+            accepted,
+            base_len,
+            prefix_cache_hit_len,
+            options,
+            chain,
+            &speculative_mode,
+            step,
+            callback,
+            max_context,
+        )? {
+            return Ok(Some(result));
+        }
+
+        if matches!(&speculative_mode, SpeculativeMode::DraftModel) {
+            self.sync_draft_to_target(state)?;
+        }
+
+        if generated_tokens.len() == base_generated_len {
+            anyhow::bail!("speculative decoding made no progress");
+        }
+        Ok(None)
     }
 
     /// Resolve the configured maximum draft width for the active speculative
@@ -1379,19 +1971,6 @@ impl Engine {
                             .unwrap_or(eagle3.num_speculative_tokens)
                     })
                     .context("EAGLE-3 speculation requested without a loaded EAGLE-3 head")?
-                    + 1
-            }
-            SpeculativeMode::SharedKv(_) => {
-                self.shared_kv_proposer
-                    .as_ref()
-                    .map(|assistant| {
-                        options
-                            .num_speculative_tokens
-                            .unwrap_or(assistant.num_speculative_tokens)
-                    })
-                    .context(
-                        "shared-KV proposer speculation requested without a loaded proposer model",
-                    )?
                     + 1
             }
             _ => options
@@ -1485,27 +2064,6 @@ impl Engine {
                     .cloned()
                     .context("EAGLE-3 target hidden-state list was empty")?;
                 (logits, Some(last_hidden), Some(layers))
-            } else if let SpeculativeMode::SharedKv(_) = speculative_mode {
-                let hidden_output = self
-                    .shared_kv_proposer
-                    .as_ref()
-                    .context(
-                        "shared-KV proposer speculation requested without a loaded proposer model",
-                    )?
-                    .config
-                    .target_hidden_output
-                    .clone();
-                let (logits, hidden) = next_session_token_logits_and_hidden(
-                    self.session
-                        .as_deref()
-                        .ok_or_else(|| anyhow::anyhow!(MISSING_ORT_SESSION))?,
-                    self.kv_model.as_ref(),
-                    &mut self.kv_cache,
-                    session_id,
-                    state,
-                    &hidden_output,
-                )?;
-                (logits, Some(hidden), None)
             } else {
                 (
                     next_session_token_logits(
@@ -1556,7 +2114,6 @@ impl Engine {
             target_hidden: inputs.prediction.target_hidden.as_deref(),
             target_hidden_layers: inputs.prediction.target_hidden_layers.as_deref(),
             guaranteed_token: inputs.prediction.guaranteed_token,
-            shared_kv_slices: inputs.shared_kv_slices,
         };
         let draft_tokens = match speculative_mode {
             SpeculativeMode::None => Vec::new(),
@@ -1590,24 +2147,18 @@ impl Engine {
                     .eagle3
                     .as_ref()
                     .context("EAGLE-3 speculation requested without a loaded EAGLE-3 head")?;
-                Eagle3Proposer::new(
+                let mut proposer = Eagle3Proposer::new(
                     &eagle3.session,
                     Eagle3DecodeOptions {
                         kv_mode: eagle3.kv_mode,
                         batch_size: 1,
                     },
                     eagle3.embedder.clone(),
-                )?
-                .propose(&proposer_context)?
-                .tokens
-            }
-            SpeculativeMode::SharedKv(_) => {
-                let assistant = self.shared_kv_proposer.as_ref().context(
-                    "shared-KV proposer speculation requested without a loaded proposer model",
                 )?;
-                SharedKvProposer::new(&assistant.session, &assistant.embedder)?
-                    .propose(&proposer_context)?
-                    .tokens
+                if let Some(token_map) = &eagle3.token_map {
+                    proposer = proposer.with_token_map(token_map.clone())?;
+                }
+                proposer.propose(&proposer_context)?.tokens
             }
         };
         Ok(draft_tokens)
@@ -1685,6 +2236,45 @@ impl Engine {
         Ok(verified_logits)
     }
 
+    /// Commit a hybrid native target's recurrent/conv state to the accepted
+    /// prefix after a verify window advanced it over every draft token.
+    ///
+    /// Gated-DeltaNet SSM + conv1d state is a destructive rolling cache with no
+    /// per-step history to prefix-slice, so — following vLLM — the committed
+    /// state is rebuilt from the pre-draft `snapshot`: attention KV is
+    /// prefix-sliced back to `base_len` and the recurrent/conv bindings are
+    /// restored, then exactly `accepted_tokens` are re-run so the state equals
+    /// feeding only the accepted continuation from the snapshot. The re-run also
+    /// leaves the native attention KV at `base_len + accepted`, so this squares
+    /// the paged length bookkeeping the runner mirrors, letting the ordinary
+    /// rewind in [`Self::assemble_commit_tokens`] become a no-op.
+    #[cfg(feature = "native-backend")]
+    fn commit_native_recurrent_target(
+        &mut self,
+        session_id: SessionId,
+        state: &mut EngineSession,
+        base_len: usize,
+        accepted_tokens: &[TokenId],
+        snapshot: &crate::native_decode::RecurrentStateSnapshot,
+    ) -> anyhow::Result<()> {
+        {
+            let native = state
+                .decode_state
+                .native_recurrent_runner_mut()
+                .context("native recurrent target is no longer available for commit")?;
+            native.commit_recurrent_state_to_accepted(snapshot, base_len, accepted_tokens)?;
+        }
+        let committed = base_len + accepted_tokens.len();
+        self.kv_cache
+            .rewind_to(session_id, committed)
+            .map_err(|e| {
+                anyhow::anyhow!("Failed to rewind KV sequence {session_id} to {committed}: {e}")
+            })?;
+        state.kv_token_count = committed;
+        state.tokens.truncate(committed);
+        Ok(())
+    }
+
     /// Select the target token for each proposed position and count the longest
     /// accepted prefix, recording the correction token at the first mismatch.
     #[allow(clippy::too_many_arguments)]
@@ -1712,7 +2302,7 @@ impl Engine {
                     .chain(draft_tokens[..idx].iter().copied())
                     .collect(),
                 generated_text: self
-                    .tokenizer
+                    .require_tokenizer()?
                     .decode(
                         &generated_tokens
                             .iter()
@@ -1809,7 +2399,7 @@ impl Engine {
                     .chain(draft_tokens.iter().copied())
                     .collect(),
                 generated_text: self
-                    .tokenizer
+                    .require_tokenizer()?
                     .decode(
                         &generated_tokens
                             .iter()
@@ -1904,7 +2494,7 @@ impl Engine {
                 token_id,
                 options,
                 chain,
-                &self.tokenizer,
+                self.require_tokenizer()?,
                 callback.as_deref_mut(),
             )?;
             *generated_tokens = commit_state.generated_tokens;
@@ -1936,26 +2526,6 @@ impl Engine {
         Ok(None)
     }
 
-    /// Slice the target model's paged KV cache into per-group `shared_kv.*`
-    /// tensors for the shared-KV proposer. Each configured group binds a single
-    /// representative target layer (the last listed `target_layers` index); the
-    /// assistant has no cache of its own, so these slices are materialized once
-    /// at the current base position and reused across all draft steps.
-    fn shared_kv_proposer_slices(
-        &self,
-        session_id: SessionId,
-    ) -> anyhow::Result<Vec<SharedKvInput>> {
-        let assistant = self
-            .shared_kv_proposer
-            .as_ref()
-            .context("shared-KV slicing requested without a loaded proposer model")?;
-        let materialized = self
-            .kv_cache
-            .materialize_sequence(session_id)
-            .map_err(|e| anyhow::anyhow!("Failed to materialize target KV for shared_kv: {e}"))?;
-        shared_kv_slices_from_materialized(&assistant.config.shared_kv, &materialized)
-    }
-
     pub(crate) fn sync_draft_to_target(&mut self, state: &mut EngineSession) -> anyhow::Result<()> {
         if let (Some(draft_model), Some(draft_state)) = (&mut self.draft, &mut state.draft) {
             DraftModelProposer::new(draft_model, draft_state).rewind(&state.tokens)?;
@@ -1982,38 +2552,26 @@ impl Engine {
     }
 }
 
-/// Slice a materialized target KV cache into per-group `shared_kv.*` proposer
-/// inputs, reading each group's `num_kv_heads`/`head_dim` from the **specific**
-/// target layer it references (the last listed `target_layers` index) rather
-/// than a single global geometry. This makes heterogeneous per-layer head_dim
-/// models (e.g. Gemma-4 sliding vs full) bind correctly.
-pub(crate) fn shared_kv_slices_from_materialized(
-    groups: &[crate::config::SharedKvBinding],
-    materialized: &onnx_genai_kv::MaterializedKv,
-) -> anyhow::Result<Vec<SharedKvInput>> {
-    let num_layers = materialized.layers.len();
-    let mut slices = Vec::with_capacity(groups.len());
-    for group in groups {
-        let layer_idx =
-            group.target_layers.last().copied().with_context(|| {
-                format!("shared_kv group '{}' has no target layers", group.name)
-            })?;
-        let layer = materialized.layers.get(layer_idx).with_context(|| {
-            format!(
-                "shared_kv group '{}' references target layer {} but only {} layers exist",
-                group.name, layer_idx, num_layers
-            )
-        })?;
-        slices.push(SharedKvInput {
-            name: group.name.clone(),
-            key: layer.key.clone(),
-            value: layer.value.clone(),
-            kv_heads: layer.num_kv_heads,
-            kv_len: materialized.sequence_len,
-            head_dim: layer.head_dim,
-        });
+/// Whether every component may be silently swapped for an equivalent one.
+///
+/// An absent contract counts as `EquivalenceClass::Semantic` — the schema
+/// default — rather than being skipped. Filtering undeclared components out
+/// would make the `all` vacuously true for a package whose components declare no
+/// contracts at all, which is precisely the package that promised nothing.
+fn components_permit_automatic_speculation(
+    components: &std::collections::BTreeMap<String, onnx_genai_metadata::WorkflowComponent>,
+) -> bool {
+    if components.is_empty() {
+        return false;
     }
-    Ok(slices)
+    components.values().all(|component| {
+        component
+            .contract
+            .as_ref()
+            .map(|contract| contract.equivalence)
+            .unwrap_or_default()
+            .permits_automatic_speculation()
+    })
 }
 
 #[cfg(test)]
@@ -2023,83 +2581,114 @@ mod tests {
     use std::path::Path;
     use std::sync::{Mutex, OnceLock};
 
-    /// The shared-KV slicer must read each group's `num_kv_heads`/`head_dim`
-    /// from the specific target layer it references, not a single global value.
-    /// With a heterogeneous cache (layer 0: 2×8 sliding, layer 1: 3×16 full),
-    /// the sliding group must bind 8-dim slices and the full group 16-dim, each
-    /// with its layer's own head count and buffer.
+    /// The int4 draft LM-head projection primitive must reproduce a `MatMulNBits`
+    /// GEMV from the target's own quantised initializers, argmax-correctly, on
+    /// the CPU int4 kernel — the GPU path shares this exact builder. A one-hot
+    /// hidden vector isolates a single weight column: setting one column's lead
+    /// nibble to the maximum code (15, i.e. +7 after the symmetric zero-point)
+    /// while every other column stays at the zero code (8) makes that column the
+    /// unique argmax, independent of the exact scale, proving the projection
+    /// routes hidden→logits through the real quantised kernel rather than a stub.
+    #[cfg(feature = "native-backend")]
     #[test]
-    fn shared_kv_slices_pick_per_layer_geometry() -> anyhow::Result<()> {
-        use crate::config::SharedKvBinding;
-        use onnx_genai_kv::{MaterializedKv, MaterializedLayerKv};
-
-        let seq_len = 2;
-        // Layer 0 (sliding): num_kv_heads=2, head_dim=8 → 2*2*8 = 32 floats.
-        let sliding_key: Vec<f32> = (0..2 * seq_len * 8).map(|v| v as f32).collect();
-        let sliding_value: Vec<f32> = (0..2 * seq_len * 8).map(|v| (v + 1000) as f32).collect();
-        // Layer 1 (full): num_kv_heads=3, head_dim=16 → 3*2*16 = 96 floats.
-        let full_key: Vec<f32> = (0..3 * seq_len * 16).map(|v| (v + 2000) as f32).collect();
-        let full_value: Vec<f32> = (0..3 * seq_len * 16).map(|v| (v + 3000) as f32).collect();
-
-        let materialized = MaterializedKv {
-            start_position: 0,
-            sink_len: 0,
-            sequence_len: seq_len,
-            layers: vec![
-                MaterializedLayerKv {
-                    key: sliding_key.clone(),
-                    value: sliding_value.clone(),
-                    num_kv_heads: 2,
-                    head_dim: 8,
-                },
-                MaterializedLayerKv {
-                    key: full_key.clone(),
-                    value: full_value.clone(),
-                    num_kv_heads: 3,
-                    head_dim: 16,
-                },
-            ],
+    fn quantized_draft_lm_head_projects_int4_argmax() -> anyhow::Result<()> {
+        use onnx_runtime_ir::{
+            Attribute, DataType, Graph, Node, NodeId, TensorData, WeightRef, static_shape,
         };
 
-        let groups = vec![
-            SharedKvBinding {
-                name: "sliding_attention".into(),
-                target_layers: vec![0],
-            },
-            SharedKvBinding {
-                name: "full_attention".into(),
-                target_layers: vec![1],
-            },
-        ];
+        // K=32 (one block), N=4 columns, symmetric int4 (no zero_points input).
+        let k = 32usize;
+        let n = 4usize;
+        let block_size = 32i64;
+        let k_blocks = 1usize;
+        let blob = 16usize; // block_size / 2, two int4 weights per byte.
+        let target_col = 2usize;
 
-        let slices = shared_kv_slices_from_materialized(&groups, &materialized)?;
-        assert_eq!(slices.len(), 2);
+        // Every packed byte is 0x88 → both nibbles are code 8 (zero after the
+        // symmetric zero-point). For the target column, the first weight (k=0,
+        // the low nibble of byte 0) is code 15 (+7).
+        let mut weight = vec![0x88u8; n * k_blocks * blob];
+        weight[target_col * k_blocks * blob] = 0x8F;
+        let scales = vec![1.0f32; n * k_blocks];
 
-        let sliding = &slices[0];
-        assert_eq!(sliding.name, "sliding_attention");
-        assert_eq!(sliding.kv_heads, 2, "sliding group must use layer 0 heads");
-        assert_eq!(
-            sliding.head_dim, 8,
-            "sliding group must use layer 0 head_dim"
+        let mut graph = Graph::default();
+        graph.opset_imports.insert("com.microsoft".to_string(), 1);
+        let activation = graph.create_named_value("A", DataType::Float32, static_shape([1, k]));
+        let weight_value = graph.create_named_value(
+            "lm_head.weight",
+            DataType::Uint8,
+            static_shape([n, k_blocks, blob]),
         );
-        assert_eq!(sliding.kv_len, seq_len);
-        assert_eq!(sliding.key, sliding_key);
-        assert_eq!(sliding.value, sliding_value);
+        graph.set_initializer(
+            weight_value,
+            WeightRef::Inline(TensorData::from_raw(
+                DataType::Uint8,
+                vec![n, k_blocks, blob],
+                weight,
+            )),
+        );
+        let scales_value = graph.create_named_value(
+            "lm_head.scales",
+            DataType::Float32,
+            static_shape([n, k_blocks]),
+        );
+        graph.set_initializer(
+            scales_value,
+            WeightRef::Inline(TensorData::from_raw(
+                DataType::Float32,
+                vec![n, k_blocks],
+                scales.iter().flat_map(|v| v.to_le_bytes()).collect(),
+            )),
+        );
+        let logits_value =
+            graph.create_named_value("logits", DataType::Float32, static_shape([1, n]));
+        let mut node = Node::new(
+            NodeId(0),
+            "MatMulNBits",
+            vec![Some(activation), Some(weight_value), Some(scales_value)],
+            vec![logits_value],
+        );
+        node.domain = "com.microsoft".to_string();
+        node.attributes
+            .insert("K".to_string(), Attribute::Int(k as i64));
+        node.attributes
+            .insert("N".to_string(), Attribute::Int(n as i64));
+        node.attributes
+            .insert("bits".to_string(), Attribute::Int(4));
+        node.attributes
+            .insert("block_size".to_string(), Attribute::Int(block_size));
+        graph.insert_node(node);
 
-        let full = &slices[1];
-        assert_eq!(full.name, "full_attention");
-        assert_eq!(full.kv_heads, 3, "full group must use layer 1 heads");
-        assert_eq!(full.head_dim, 16, "full group must use layer 1 head_dim");
-        assert_eq!(full.kv_len, seq_len);
-        assert_eq!(full.key, full_key);
-        assert_eq!(full.value, full_value);
+        let (lm_head, vocab) = build_quantized_draft_lm_head(
+            &graph,
+            Arc::new(WeightStore::new()),
+            "lm_head.weight",
+            k,
+            DraftProjectionDevice::Cpu,
+        )?;
+        assert_eq!(vocab, n);
+        assert_eq!(lm_head.vocab_size(), n);
 
-        // An out-of-range target layer is a clear error, not a silent misread.
-        let bad = vec![SharedKvBinding {
-            name: "oob".into(),
-            target_layers: vec![9],
-        }];
-        assert!(shared_kv_slices_from_materialized(&bad, &materialized).is_err());
+        // One-hot hidden at k=0 selects each column's lead weight.
+        let mut hidden = vec![0.0f32; k];
+        hidden[0] = 1.0;
+        let mut logits = vec![0.0f32; n];
+        lm_head.logits(&hidden, &mut logits)?;
+
+        let best = argmax(&logits).expect("argmax over non-empty logits");
+        assert_eq!(
+            best, target_col,
+            "int4 draft projection argmax {best} != expected column {target_col}; logits {logits:?}"
+        );
+        for (col, &value) in logits.iter().enumerate() {
+            if col != target_col {
+                assert!(
+                    logits[target_col] > value,
+                    "target column logit {} not strictly greatest vs col {col} = {value}",
+                    logits[target_col]
+                );
+            }
+        }
         Ok(())
     }
 
@@ -2153,7 +2742,6 @@ mod tests {
             target_hidden: None,
             target_hidden_layers: None,
             guaranteed_token: None,
-            shared_kv_slices: None,
         })?;
         proposer.accept(&SpeculativeAcceptContext {
             accepted_prefix_len: 1,
@@ -2184,7 +2772,6 @@ mod tests {
             target_hidden: None,
             target_hidden_layers: None,
             guaranteed_token: None,
-            shared_kv_slices: None,
         })?;
 
         assert_eq!(proposal.tokens, vec![9, 4, 7]);
@@ -2215,7 +2802,6 @@ mod tests {
             target_hidden: None,
             target_hidden_layers: None,
             guaranteed_token: None,
-            shared_kv_slices: None,
         };
         let mut proposer = NgramProposer::new(2, 4)?;
 
@@ -2242,7 +2828,6 @@ mod tests {
             target_hidden: None,
             target_hidden_layers: None,
             guaranteed_token: None,
-            shared_kv_slices: None,
         })?;
         assert_eq!(proposal.tokens, vec![3, 4]);
 
@@ -2258,7 +2843,6 @@ mod tests {
             target_hidden: None,
             target_hidden_layers: None,
             guaranteed_token: None,
-            shared_kv_slices: None,
         })?;
         assert_eq!(proposal.tokens, vec![3]);
         Ok(())
@@ -2333,7 +2917,6 @@ mod tests {
             target_hidden: Some(&hidden),
             target_hidden_layers: None,
             guaranteed_token: Some(guaranteed),
-            shared_kv_slices: None,
         })?;
 
         assert_eq!(proposer.name(), "mtp");
@@ -2350,6 +2933,10 @@ mod tests {
     impl TokenEmbedder for ConstantEmbedder {
         fn hidden_size(&self) -> usize {
             2
+        }
+
+        fn vocab_size(&self) -> usize {
+            usize::MAX
         }
 
         fn embed(&self, _token: TokenId, out: &mut [f32]) -> anyhow::Result<()> {
@@ -2421,7 +3008,6 @@ mod tests {
             target_hidden: Some(&target_hc),
             target_hidden_layers: None,
             guaranteed_token: Some(0),
-            shared_kv_slices: None,
         })?;
 
         assert_eq!(proposal.tokens, vec![0, 0, 0]);
@@ -2443,6 +3029,7 @@ mod tests {
             "transformer.wte.weight",
             "lm_head.weight_t",
             16,
+            None,
         )?;
         assert_eq!(vocab_size, 32);
 
@@ -2450,8 +3037,10 @@ mod tests {
         embedder.embed(7, &mut embedded)?;
         let raw_embedding = std::fs::read(fixture.join("embedding.f32"))?;
         let expected_embedding = raw_embedding
-            .chunks_exact(4)
-            .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("four bytes")))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|bytes| f32::from_le_bytes(*bytes))
             .collect::<Vec<_>>();
         assert_eq!(embedded, expected_embedding[7 * 16..8 * 16]);
 
@@ -2461,8 +3050,10 @@ mod tests {
         let raw_lm_head = std::fs::read(fixture.join("lm_head.f32"))?;
         let linear_lm_head = LinearLmHead::new(
             raw_lm_head
-                .chunks_exact(4)
-                .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("four bytes")))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|bytes| f32::from_le_bytes(*bytes))
                 .collect(),
             16,
             32,
@@ -2502,7 +3093,6 @@ mod tests {
             target_hidden: Some(&layers[2]),
             target_hidden_layers: Some(&layers),
             guaranteed_token: Some(7),
-            shared_kv_slices: None,
         })?;
 
         assert_eq!(proposer.name(), "eagle3");
@@ -2511,6 +3101,88 @@ mod tests {
         assert!(proposal.tokens.iter().all(|&token| token < VOCAB as u32));
         assert!(proposal.positions.is_none());
         assert!(proposal.tree.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn chained_proposer_applies_declared_vocabulary_mapping() -> anyhow::Result<()> {
+        const HIDDEN: usize = 16;
+        const VOCAB: usize = 32;
+        let _guard = eagle3_test_lock()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("chained proposer test lock poisoned"))?;
+        let head = load_eagle3_head()?;
+        let layers = vec![
+            lcg_weights(0x1000_0001, HIDDEN),
+            lcg_weights(0x2000_0002, HIDDEN),
+            lcg_weights(0x3000_0003, HIDDEN),
+        ];
+        let options = GenerateOptions::default();
+        let chain = ProcessorChain::new();
+        let context = SpeculativeProposerContext {
+            width: 2,
+            context_tokens: &[1, 2],
+            generated_tokens: &[],
+            generated_text: "",
+            first_step: 0,
+            options: &options,
+            chain: &chain,
+            target_hidden: Some(&layers[2]),
+            target_hidden_layers: Some(&layers),
+            guaranteed_token: Some(7),
+        };
+        let weights = lcg_weights(0x5555_6666, VOCAB * HIDDEN);
+        let mut plain = Eagle3Proposer::new(
+            &head,
+            Eagle3DecodeOptions::default(),
+            LinearEmbedder::new(weights.clone(), VOCAB, HIDDEN)?,
+        )?;
+        let plain = plain.propose(&context)?;
+        let map = (0..VOCAB as TokenId)
+            .map(|token| token ^ 1)
+            .collect::<Vec<_>>();
+        let mut mapped = Eagle3Proposer::new(
+            &head,
+            Eagle3DecodeOptions::default(),
+            LinearEmbedder::new(weights, VOCAB, HIDDEN)?,
+        )?
+        .with_token_map(map.clone())?;
+        let mapped = mapped.propose(&context)?;
+        assert_eq!(mapped.tokens[0], plain.tokens[0]);
+        assert_eq!(mapped.tokens[1], map[plain.tokens[1] as usize]);
+        Ok(())
+    }
+
+    /// Load-closed vocabulary bound: a token-map entry that indexes at or past
+    /// the target/embedder vocabulary has no embedding row and could never be a
+    /// real target token, so the map is rejected when it is installed — not
+    /// mid-proposal on whichever draft id happens to select it.
+    #[test]
+    fn eagle3_token_map_rejects_ids_beyond_target_vocab() -> anyhow::Result<()> {
+        const HIDDEN: usize = 16;
+        const VOCAB: usize = 32;
+        let _guard = eagle3_test_lock()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("eagle3 token-map test lock poisoned"))?;
+        let head = load_eagle3_head()?;
+        let weights = lcg_weights(0x2468_1357, VOCAB * HIDDEN);
+        // A full-length map (so it clears the length check) whose last entry
+        // indexes exactly at the vocabulary size — one past the last valid id.
+        let mut out_of_range = (0..VOCAB as TokenId).collect::<Vec<_>>();
+        *out_of_range.last_mut().expect("non-empty map") = VOCAB as TokenId;
+        let error = Eagle3Proposer::new(
+            &head,
+            Eagle3DecodeOptions::default(),
+            LinearEmbedder::new(weights, VOCAB, HIDDEN)?,
+        )?
+        .with_token_map(out_of_range)
+        .err()
+        .expect("an out-of-range token map must be rejected at load time");
+        let message = error.to_string();
+        assert!(
+            message.contains("target/embedder vocabulary") && message.contains(&VOCAB.to_string()),
+            "error must name the vocabulary bound: {message}"
+        );
         Ok(())
     }
 
@@ -2542,7 +3214,6 @@ mod tests {
             target_hidden: Some(&layers[2]),
             target_hidden_layers: Some(&layers),
             guaranteed_token: Some(9),
-            shared_kv_slices: None,
         };
         let mut proposer = Eagle3Proposer::new(&head, Eagle3DecodeOptions::default(), embedder)?;
 
@@ -2575,7 +3246,6 @@ mod tests {
             SpeculativeMode::Eagle3(_) => "eagle3",
             SpeculativeMode::DraftModel => "draft_model",
             SpeculativeMode::PromptLookup { .. } => "prompt_lookup",
-            SpeculativeMode::SharedKv(_) => "shared_kv_proposer",
             SpeculativeMode::None => "none",
         };
         assert_eq!(selected, "mtp");
@@ -2587,6 +3257,7 @@ mod tests {
             head_model: "eagle3.onnx".into(),
             target_hidden_outputs: vec!["low".into(), "mid".into(), "high".into()],
             embedding_weights: "embed.f32".into(),
+            token_map: None,
             vocab_size: 32,
             hidden_size: 16,
             kv_mode: onnx_genai_ort::Eagle3DraftKvMode::HiddenThreaded,
@@ -2597,9 +3268,73 @@ mod tests {
             SpeculativeMode::Mtp(_) => "mtp",
             SpeculativeMode::DraftModel => "draft_model",
             SpeculativeMode::PromptLookup { .. } => "prompt_lookup",
-            SpeculativeMode::SharedKv(_) => "shared_kv_proposer",
             SpeculativeMode::None => "none",
         };
         assert_eq!(selected, "eagle3");
+    }
+}
+
+#[cfg(test)]
+mod equivalence_gate_tests {
+    use super::components_permit_automatic_speculation;
+    use onnx_genai_metadata::WorkflowComponent;
+    use std::collections::BTreeMap;
+
+    fn component(equivalence: Option<&str>) -> WorkflowComponent {
+        let contract = equivalence
+            .map(|class| {
+                format!(
+                    "\ncontract:\n  id: onnx-genai.decoder\n  version: \"1\"\n  \
+                     equivalence: {class}\n"
+                )
+            })
+            .unwrap_or_default();
+        serde_yaml::from_str(&format!(
+            "implementation: {{ kind: onnx, artifact: decoder.onnx }}\nports: {{}}{contract}"
+        ))
+        .expect("component parses")
+    }
+
+    fn gate(components: &[(&str, Option<&str>)]) -> bool {
+        let map = components
+            .iter()
+            .map(|(name, class)| ((*name).to_string(), component(*class)))
+            .collect::<BTreeMap<_, _>>();
+        components_permit_automatic_speculation(&map)
+    }
+
+    /// Silence must never buy an automatic optimization. A package whose
+    /// components declare no contract at all promised nothing, so it must be
+    /// read as `semantic` — not skipped, which would make `all` vacuously true.
+    #[test]
+    fn a_package_that_declares_no_contracts_permits_nothing() {
+        assert!(!gate(&[("decoder", None)]));
+        assert!(!gate(&[("decoder", None), ("draft", None)]));
+        assert!(!gate(&[]), "an empty package promised nothing either");
+    }
+
+    /// One undeclared component is enough to withhold consent, even when every
+    /// component that did declare one is distribution-preserving.
+    #[test]
+    fn one_undeclared_component_withholds_consent() {
+        assert!(gate(&[("decoder", Some("distribution_preserving"))]));
+        assert!(!gate(&[
+            ("decoder", Some("distribution_preserving")),
+            ("draft", None),
+        ]));
+    }
+
+    /// Only bitwise and distribution-preserving equivalence permit a silent
+    /// swap; merely semantic equivalence is free to change the output
+    /// distribution, which an unasking caller did not agree to.
+    #[test]
+    fn only_distribution_preserving_classes_permit_a_silent_swap() {
+        assert!(gate(&[("decoder", Some("bitwise"))]));
+        assert!(gate(&[("decoder", Some("distribution_preserving"))]));
+        assert!(!gate(&[("decoder", Some("semantic"))]));
+        assert!(!gate(&[
+            ("decoder", Some("bitwise")),
+            ("draft", Some("semantic")),
+        ]));
     }
 }

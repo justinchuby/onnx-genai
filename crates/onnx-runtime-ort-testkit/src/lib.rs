@@ -18,7 +18,7 @@
 //!
 //! | Variable | Effect |
 //! |---|---|
-//! | `NXRT_ORT_LIB_DIR` | Explicit directory containing the ORT shared library. |
+//! | `NXRT_ORT_LIB_DIR` | Explicit directory containing the ORT shared library. Also the way to resolve a refusal when several stale `onnx-genai-ort-sys-*` build dirs disagree about their ORT version. |
 //! | `NXRT_REQUIRE_ORT_TESTS=1` | Turn "skip because ORT is missing" into a hard failure. Used in CI to prove the real-ORT tests actually ran. |
 //! | `NXRT_<PLUGIN>_PLUGIN_PATH` | Explicit path to a plugin cdylib (see [`find_plugin_cdylib`]). |
 //! | `NXRT_SKIP_PLUGIN_REBUILD=1` | Never shell out to `cargo build`; use whatever artifact already exists. |
@@ -54,19 +54,245 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// Look for `onnx-genai-ort-sys-*/out/ort-prebuilt/lib` under a cargo `build` dir.
-fn scan_build_dir(build_dir: &Path) -> Option<PathBuf> {
-    let entries = std::fs::read_dir(build_dir).ok()?;
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        if name.to_string_lossy().starts_with("onnx-genai-ort-sys-") {
-            let lib_dir = entry.path().join("out/ort-prebuilt/lib");
-            if lib_dir.join(ort_lib_name()).exists() {
-                return Some(lib_dir);
-            }
-        }
+/// The ORT version this workspace pins, read from `ort-sys`' build script.
+///
+/// `ort-sys` declares `const ORT_VERSION: &str = "x.y.z"` and downloads exactly
+/// that tarball, so the build script is the single source of truth. The testkit
+/// carries no dependencies (it is `publish = false` and must never be linked
+/// into a shipped artifact), so it reads the declaration rather than importing
+/// it.
+///
+/// `None` means the pin could not be established — the source tree is not
+/// present beside the test binary, which happens when a prebuilt binary is run
+/// on a machine that no longer has the checkout. Callers must degrade
+/// *visibly*, never silently.
+fn pinned_ort_version() -> Option<String> {
+    static PIN: OnceLock<Option<String>> = OnceLock::new();
+    PIN.get_or_init(|| {
+        let build_rs = workspace_root().join("crates/onnx-genai-ort/ort-sys/build.rs");
+        let text = std::fs::read_to_string(build_rs).ok()?;
+        parse_pinned_version(&text)
+    })
+    .clone()
+}
+
+/// Extract `const ORT_VERSION: &str = "..."` from `ort-sys`' build script.
+///
+/// Split out from the read so the parse can be tested against the real file
+/// contents without a filesystem fixture.
+fn parse_pinned_version(build_rs: &str) -> Option<String> {
+    let line = build_rs
+        .lines()
+        .find(|line| line.trim_start().starts_with("const ORT_VERSION"))?;
+    let value = line.split('"').nth(1)?;
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+/// Version recorded by the ORT release tarball itself, as extracted by
+/// `ort-sys`' build script.
+///
+/// `<candidate>/out/ort-prebuilt/lib` is the library directory, so the marker
+/// sits one level up. Absent or unreadable is reported as `None` rather than
+/// guessed at: an unknown version cannot be shown to match anything.
+fn candidate_ort_version(lib_dir: &Path) -> Option<String> {
+    let marker = lib_dir.parent()?.join("VERSION_NUMBER");
+    let text = std::fs::read_to_string(marker).ok()?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
     }
-    None
+    Some(trimmed.to_string())
+}
+
+/// Every `onnx-genai-ort-sys-*/out/ort-prebuilt/lib` under a cargo `build` dir
+/// that actually holds a loadable library, in a stable order.
+///
+/// `read_dir` yields entries in filesystem order, which is neither sorted nor
+/// stable across machines, so the names are sorted before use. Returning *all*
+/// of them — rather than the first — is what lets the caller notice that a
+/// stale build directory is sitting next to the current one.
+fn scan_build_dir(build_dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(build_dir) else {
+        return Vec::new();
+    };
+    let mut found: Vec<PathBuf> = entries
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("onnx-genai-ort-sys-")
+        })
+        .map(|entry| entry.path().join("out/ort-prebuilt/lib"))
+        .filter(|lib_dir| lib_dir.join(ort_lib_name()).exists())
+        .collect();
+    found.sort();
+    found
+}
+
+/// Reduce the candidates found under one `build` dir to the single one that may
+/// be used, or panic naming what was found.
+///
+/// A cargo `build` directory accumulates one `onnx-genai-ort-sys-<hash>` per
+/// distinct feature/profile/dependency resolution, and **nothing ever removes
+/// the old ones**. After an ORT version bump a developer's tree therefore holds
+/// several, only one of which matches the pin — six stale `1.28.0` beside one
+/// `1.29.0` is a real observed case. Taking the first `read_dir` entry picks
+/// among them effectively at random.
+///
+/// The loud failure is `GetApi(ORT_API_VERSION=<n>) returned null`. The quiet
+/// one is worse and is the reason this function exists: when the stale library
+/// satisfies the requested API version — which it does whenever the pin moves
+/// *backwards*, and can do across a bump — everything runs and the results are
+/// attributed to the version the workspace *declares* rather than the one that
+/// executed. Benchmarks are the obvious casualty, but any behavioural test
+/// compared against upstream is equally affected.
+///
+/// So the pin decides. Candidates that are not the pinned version are not
+/// eligible, however many or few there are, and a single stale extraction is
+/// refused exactly like a mixed set. Only when the pin cannot be read at all
+/// does this fall back to requiring the candidates to agree with each other.
+fn single_candidate(build_dir: &Path) -> Option<PathBuf> {
+    let candidates = scan_build_dir(build_dir);
+    let versions: Vec<Option<String>> = candidates
+        .iter()
+        .map(|d| candidate_ort_version(d))
+        .collect();
+    let pin = pinned_ort_version();
+    if pin.is_none() && !candidates.is_empty() {
+        warn_pin_unreadable();
+    }
+    match resolve_candidates(&candidates, &versions, pin.as_deref()) {
+        Resolved::Absent => None,
+        Resolved::Chosen(dir) => Some(dir),
+        Resolved::Ambiguous => panic!(
+            "{}",
+            ambiguity_message(build_dir, &candidates, &versions, pin.as_deref())
+        ),
+    }
+}
+
+/// Outcome of the selection rule.
+/// Outcome of the selection rule.
+///
+/// `Absent` and `Ambiguous` are separate variants on purpose. A first draft
+/// collapsed both into `None`, which turned every tree with no ORT at all into
+/// a panic — absence is the ordinary case that must fall through to the next
+/// root and then to [`require_or_skip`]. Two conditions sharing one value is
+/// the same defect this whole change is about, one level down.
+#[derive(Debug, PartialEq, Eq)]
+enum Resolved {
+    /// Nothing here; keep looking.
+    Absent,
+    /// Exactly one eligible ORT.
+    Chosen(PathBuf),
+    /// Nothing eligible, or no way to tell which is; refuse rather than pick.
+    Ambiguous,
+}
+
+/// Pure core of [`single_candidate`].
+///
+/// Split out from the filesystem walk so the rule can be tested directly — a
+/// `build` directory with a curated mix of ORT versions cannot be conjured on
+/// demand inside a unit test.
+fn resolve_candidates(
+    candidates: &[PathBuf],
+    versions: &[Option<String>],
+    pin: Option<&str>,
+) -> Resolved {
+    if candidates.is_empty() {
+        return Resolved::Absent;
+    }
+
+    if let Some(pin) = pin {
+        // Several build hashes matching the pin is the normal case — different
+        // profiles and feature sets each extract the same tarball — and they
+        // are interchangeable, so the sorted-first one is a stable choice.
+        let mut matching = candidates
+            .iter()
+            .zip(versions)
+            .filter(|(_, version)| version.as_deref() == Some(pin))
+            .map(|(dir, _)| dir.clone());
+        return matching
+            .next()
+            .map_or(Resolved::Ambiguous, Resolved::Chosen);
+    }
+
+    // The pin is unknown, so staleness cannot be detected; fall back to the
+    // weaker property that at least the candidates do not contradict each
+    // other. `single_candidate` warns when it takes this path.
+    if candidates.len() == 1 {
+        return Resolved::Chosen(candidates[0].clone());
+    }
+    let first = &versions[0];
+    if first.is_some() && versions.iter().all(|v| v == first) {
+        Resolved::Chosen(candidates[0].clone())
+    } else {
+        Resolved::Ambiguous
+    }
+}
+
+/// Warn, once per process, that staleness cannot be detected.
+///
+/// The pin is only unreadable when the source tree is gone from beside the test
+/// binary, which is rare but real (a prebuilt binary shipped to another
+/// machine). Degrading to the weaker "candidates must agree" rule is the right
+/// behaviour, but doing it silently would leave a reader believing a check ran
+/// that did not — the failure this whole change exists to prevent.
+fn warn_pin_unreadable() {
+    static WARNED: OnceLock<()> = OnceLock::new();
+    WARNED.get_or_init(|| {
+        eprintln!(
+            "warning: could not read the pinned ORT version from \
+             crates/onnx-genai-ort/ort-sys/build.rs; ORT discovery can no longer \
+             detect a stale extraction, only a disagreement between several. \
+             Set NXRT_ORT_LIB_DIR to be certain which library is loaded."
+        );
+    });
+}
+
+/// Diagnostic listing every candidate, the version it holds, and the pin.
+///
+/// Prints the whole set deliberately: the actionable facts are which
+/// directories exist and which one the reader wants, and a message naming only
+/// the conflict would send them back to the filesystem to find that out.
+fn ambiguity_message(
+    build_dir: &Path,
+    candidates: &[PathBuf],
+    versions: &[Option<String>],
+    pin: Option<&str>,
+) -> String {
+    let mut msg = match pin {
+        Some(pin) => format!(
+            "no usable ONNX Runtime: none of the {} candidate directories under {} \
+             holds the pinned version {}.\n",
+            candidates.len(),
+            build_dir.display(),
+            pin
+        ),
+        None => format!(
+            "ambiguous ONNX Runtime discovery: {} candidate directories under {} \
+             hold different (or unidentifiable) ORT versions, and the pinned \
+             version could not be read, so which one a test loads would depend \
+             on filesystem ordering.\n",
+            candidates.len(),
+            build_dir.display()
+        ),
+    };
+    for (dir, version) in candidates.iter().zip(versions) {
+        msg.push_str(&format!(
+            "  {} -> {}\n",
+            version.as_deref().unwrap_or("<no VERSION_NUMBER>"),
+            dir.display()
+        ));
+    }
+    msg.push_str(
+        "Rebuild so ort-sys extracts the pinned release, set NXRT_ORT_LIB_DIR to \
+         the directory you mean, or `cargo clean` to drop the stale build \
+         directories. Refusing to guess: a stale-but-loadable ORT runs to \
+         completion and reports results under the wrong version.",
+    );
+    msg
 }
 
 /// Locate the directory containing a real `libonnxruntime`.
@@ -79,6 +305,13 @@ fn scan_build_dir(build_dir: &Path) -> Option<PathBuf> {
 ///
 /// Build-script output lives under `<target-dir>/<profile>/build/` even when
 /// `--target` is used, so the triple is deliberately not part of the path.
+///
+/// # Panics
+///
+/// When a `build` directory holds several `onnx-genai-ort-sys-*` extractions
+/// that disagree about their ORT version — see [`single_candidate`]. Set
+/// `NXRT_ORT_LIB_DIR` to resolve it; the override is checked first and never
+/// panics.
 pub fn find_ort_lib_dir() -> Option<PathBuf> {
     if let Ok(dir) = std::env::var("NXRT_ORT_LIB_DIR") {
         let p = PathBuf::from(dir);
@@ -104,7 +337,7 @@ pub fn find_ort_lib_dir() -> Option<PathBuf> {
 
     roots
         .into_iter()
-        .find_map(|root| scan_build_dir(&root.join("build")))
+        .find_map(|root| single_candidate(&root.join("build")))
 }
 
 /// Full path to the ORT shared library, if one can be found.
@@ -513,6 +746,346 @@ impl OrtPathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a fake cargo `build` directory holding one `onnx-genai-ort-sys-*`
+    /// per `(hash, version)`, each with a library file so it counts as a real
+    /// candidate. `None` writes no `VERSION_NUMBER` at all.
+    fn fake_build_dir(root: &Path, candidates: &[(&str, Option<&str>)]) -> PathBuf {
+        let build = root.join("build");
+        for (hash, version) in candidates {
+            let prebuilt = build
+                .join(format!("onnx-genai-ort-sys-{hash}"))
+                .join("out/ort-prebuilt");
+            let lib = prebuilt.join("lib");
+            std::fs::create_dir_all(&lib).expect("create fake candidate");
+            std::fs::write(lib.join(ort_lib_name()), b"not a real library")
+                .expect("write fake library");
+            if let Some(version) = version {
+                std::fs::write(prebuilt.join("VERSION_NUMBER"), version)
+                    .expect("write VERSION_NUMBER");
+            }
+        }
+        build
+    }
+
+    /// A scratch directory under the crate's own `target`, removed on drop.
+    ///
+    /// Deliberately not `/tmp`: the workspace target dir is already
+    /// write-guaranteed for a test run, and a stray directory there is visible
+    /// rather than hidden in a system-wide location.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let dir = workspace_root()
+                .join("target/testkit-scratch")
+                .join(format!("{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("create scratch");
+            Self(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A version string no real ORT release will ever carry, so a test can
+    /// say "not the pin" without hard-coding what the pin currently is.
+    const NOT_THE_PIN: &str = "0.0.0-stale";
+
+    fn pin_or_skip() -> String {
+        pinned_ort_version().expect(
+            "the workspace pin must be readable from the testkit; without it \
+             every pin-based check below degrades silently",
+        )
+    }
+
+    fn dirs(names: &[&str]) -> Vec<PathBuf> {
+        names.iter().map(PathBuf::from).collect()
+    }
+
+    fn versions(values: &[Option<&str>]) -> Vec<Option<String>> {
+        values
+            .iter()
+            .map(|v| v.map(std::string::ToString::to_string))
+            .collect()
+    }
+
+    /// Anti-vacuity guard for every pin-based test in this module, and for the
+    /// production rule itself. If the pin stops being readable the selection
+    /// quietly weakens to "candidates must agree", which is exactly the
+    /// property that failed to catch six stale extractions beside one current
+    /// one — they agreed with each other.
+    #[test]
+    fn the_workspace_pin_is_readable_and_looks_like_a_version() {
+        let pin = pin_or_skip();
+        assert!(
+            pin.split('.').count() >= 2 && pin.starts_with(char::is_numeric),
+            "pin {pin:?} does not look like an ORT version"
+        );
+        assert_ne!(pin, NOT_THE_PIN);
+    }
+
+    #[test]
+    fn the_pin_is_parsed_from_the_ort_sys_declaration() {
+        assert_eq!(
+            parse_pinned_version("const ORT_VERSION: &str = \"1.29.0\";").as_deref(),
+            Some("1.29.0")
+        );
+        assert_eq!(
+            parse_pinned_version("    const ORT_VERSION: &str = \"9.9.9\";\n").as_deref(),
+            Some("9.9.9")
+        );
+        assert_eq!(
+            parse_pinned_version("const OTHER: &str = \"1.29.0\";"),
+            None
+        );
+        assert_eq!(
+            parse_pinned_version("const ORT_VERSION: &str = \"\";"),
+            None
+        );
+        assert_eq!(parse_pinned_version(""), None);
+    }
+
+    /// The observed case, and the reason this exists: after a version bump the
+    /// tree held six 1.28.0 extractions beside one 1.29.0. The pinned one is
+    /// eligible and the stale ones are not, so this *resolves* — it does not
+    /// merely refuse.
+    #[test]
+    fn only_the_pinned_version_is_eligible() {
+        let candidates = dirs(&["/b/a/lib", "/b/b/lib", "/b/c/lib", "/b/d/lib"]);
+        let found = versions(&[
+            Some(NOT_THE_PIN),
+            Some(NOT_THE_PIN),
+            Some("1.29.0"),
+            Some(NOT_THE_PIN),
+        ]);
+        assert_eq!(
+            resolve_candidates(&candidates, &found, Some("1.29.0")),
+            Resolved::Chosen(PathBuf::from("/b/c/lib"))
+        );
+    }
+
+    /// A single stale extraction is refused exactly like a mixed set. Accepting
+    /// a lone candidate unchecked was a real hole in the first version of this
+    /// change: it is reachable whenever the pin moves *backwards*, because the
+    /// newer leftover library answers the older API version quite happily and
+    /// nothing looks wrong.
+    #[test]
+    fn a_lone_stale_extraction_is_refused_not_accepted_for_being_alone() {
+        let candidates = dirs(&["/b/only/lib"]);
+        let found = versions(&[Some(NOT_THE_PIN)]);
+        assert_eq!(
+            resolve_candidates(&candidates, &found, Some("1.29.0")),
+            Resolved::Ambiguous
+        );
+        assert_eq!(
+            resolve_candidates(&candidates, &versions(&[Some("1.29.0")]), Some("1.29.0")),
+            Resolved::Chosen(PathBuf::from("/b/only/lib")),
+            "the same lone candidate at the pin must be accepted"
+        );
+    }
+
+    /// Several build hashes are normal — profiles and feature sets each get
+    /// their own — and extractions of the same release are interchangeable, so
+    /// the choice among them only has to be stable.
+    #[test]
+    fn several_pinned_extractions_resolve_to_a_stable_one() {
+        let candidates = dirs(&["/b/a/lib", "/b/b/lib", "/b/c/lib"]);
+        let found = versions(&[Some("1.29.0"), Some("1.29.0"), Some("1.29.0")]);
+        assert_eq!(
+            resolve_candidates(&candidates, &found, Some("1.29.0")),
+            Resolved::Chosen(PathBuf::from("/b/a/lib"))
+        );
+    }
+
+    /// An unreadable marker is not the pin. Treating "unknown" as a match would
+    /// reinstate the guess.
+    #[test]
+    fn a_candidate_with_no_marker_is_never_eligible() {
+        let candidates = dirs(&["/b/a/lib"]);
+        assert_eq!(
+            resolve_candidates(&candidates, &versions(&[None]), Some("1.29.0")),
+            Resolved::Ambiguous
+        );
+    }
+
+    /// Absence must stay distinct from refusal. A first draft collapsed them
+    /// and turned every tree with no ORT into a panic.
+    #[test]
+    fn no_candidates_is_absence_under_either_rule() {
+        assert_eq!(
+            resolve_candidates(&[], &[], Some("1.29.0")),
+            Resolved::Absent
+        );
+        assert_eq!(resolve_candidates(&[], &[], None), Resolved::Absent);
+    }
+
+    /// Without a pin, staleness is undetectable and only self-contradiction
+    /// remains. Weaker on purpose, and `single_candidate` says so on stderr.
+    #[test]
+    fn without_a_pin_the_rule_falls_back_to_agreement() {
+        let two = dirs(&["/b/a/lib", "/b/b/lib"]);
+        assert_eq!(
+            resolve_candidates(&two, &versions(&[Some("1.28.0"), Some("1.29.0")]), None),
+            Resolved::Ambiguous
+        );
+        assert_eq!(
+            resolve_candidates(&two, &versions(&[Some("1.28.0"), Some("1.28.0")]), None),
+            Resolved::Chosen(PathBuf::from("/b/a/lib")),
+            "agreeing candidates are all this rule can accept"
+        );
+        assert_eq!(
+            resolve_candidates(&two, &versions(&[Some("1.28.0"), None]), None),
+            Resolved::Ambiguous,
+            "unknown is not agreement"
+        );
+        assert_eq!(
+            resolve_candidates(&dirs(&["/b/a/lib"]), &versions(&[None]), None),
+            Resolved::Chosen(PathBuf::from("/b/a/lib")),
+            "a lone candidate is all there is to choose; the warning covers it"
+        );
+    }
+
+    /// Mutation control. The pre-fix rule was "first `read_dir` entry whose
+    /// library exists". This shows it does not merely return *something* — on
+    /// the observed layout it returns the **stale** directory, while the fix
+    /// returns the pinned one. Revert the fix and these two agree.
+    #[test]
+    fn first_entry_wins_would_have_chosen_the_stale_directory() {
+        let scratch = Scratch::new("mutation");
+        let pin = pin_or_skip();
+        let build = fake_build_dir(
+            scratch.path(),
+            &[("aaa", Some(NOT_THE_PIN)), ("bbb", Some(&pin))],
+        );
+
+        let candidates = scan_build_dir(&build);
+        assert_eq!(candidates.len(), 2, "both candidates must be found");
+        let first_entry_wins = candidates[0].clone();
+        assert!(
+            first_entry_wins.ends_with("onnx-genai-ort-sys-aaa/out/ort-prebuilt/lib"),
+            "the pre-fix rule would have taken {first_entry_wins:?}"
+        );
+
+        let chosen = single_candidate(&build).expect("the pinned extraction is eligible");
+        assert!(
+            chosen.ends_with("onnx-genai-ort-sys-bbb/out/ort-prebuilt/lib"),
+            "the fix must pick the pinned extraction, got {chosen:?}"
+        );
+        assert_ne!(
+            chosen, first_entry_wins,
+            "if these coincide the control proves nothing"
+        );
+    }
+
+    /// End to end on a real directory tree, with the workspace's real pin.
+    #[test]
+    fn a_build_dir_holding_only_stale_extractions_is_refused() {
+        let scratch = Scratch::new("stale");
+        let build = fake_build_dir(
+            scratch.path(),
+            &[("aaa", Some(NOT_THE_PIN)), ("bbb", Some(NOT_THE_PIN))],
+        );
+        let err = std::panic::catch_unwind(|| single_candidate(&build))
+            .expect_err("a tree with no pinned ORT must refuse");
+        let msg = err
+            .downcast_ref::<String>()
+            .expect("panic payload is the diagnostic");
+        assert!(msg.contains("no usable ONNX Runtime"), "{msg}");
+        assert!(msg.contains(NOT_THE_PIN), "{msg}");
+        assert!(msg.contains(&pin_or_skip()), "{msg}");
+    }
+
+    #[test]
+    fn an_empty_build_dir_is_absence_not_refusal() {
+        let scratch = Scratch::new("empty");
+        let build = scratch.path().join("build");
+        std::fs::create_dir_all(&build).expect("create empty build dir");
+        assert!(single_candidate(&build).is_none());
+        assert!(single_candidate(&scratch.path().join("nonexistent")).is_none());
+    }
+
+    /// The ordering `scan_build_dir` imposes is what makes any of this
+    /// reproducible; `read_dir` alone is filesystem order.
+    #[test]
+    fn candidates_come_back_in_a_stable_order() {
+        let scratch = Scratch::new("order");
+        let pin = pin_or_skip();
+        let build = fake_build_dir(
+            scratch.path(),
+            &[
+                ("ccc", Some(&pin)),
+                ("aaa", Some(&pin)),
+                ("bbb", Some(&pin)),
+            ],
+        );
+        let names: Vec<String> = scan_build_dir(&build)
+            .iter()
+            .map(|p| {
+                p.parent()
+                    .and_then(Path::parent)
+                    .and_then(Path::parent)
+                    .and_then(|d| d.file_name())
+                    .expect("candidate has a build-hash ancestor")
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "onnx-genai-ort-sys-aaa",
+                "onnx-genai-ort-sys-bbb",
+                "onnx-genai-ort-sys-ccc"
+            ],
+            "scan_build_dir must sort its candidates"
+        );
+    }
+
+    /// A directory holding no library is not a candidate, however plausibly it
+    /// is named — an interrupted or failed extraction leaves exactly that.
+    #[test]
+    fn a_directory_without_a_library_is_not_a_candidate() {
+        let scratch = Scratch::new("nolib");
+        let build = scratch.path().join("build");
+        std::fs::create_dir_all(build.join("onnx-genai-ort-sys-aaa/out/ort-prebuilt/lib"))
+            .expect("create libraryless candidate");
+        assert!(scan_build_dir(&build).is_empty());
+    }
+
+    /// Both message forms must carry every version found and a way out; the
+    /// pinned form must also say what it was looking for, or the reader cannot
+    /// tell which directory they need.
+    #[test]
+    fn the_refusal_names_every_version_and_the_way_out() {
+        let candidates = dirs(&["/x/aaa/lib", "/x/bbb/lib"]);
+        let found = versions(&[Some("1.28.0"), None]);
+
+        let pinned = ambiguity_message(Path::new("/x"), &candidates, &found, Some("1.29.0"));
+        assert!(pinned.contains("no usable ONNX Runtime"), "{pinned}");
+        assert!(pinned.contains("1.29.0"), "{pinned}");
+        assert!(pinned.contains("1.28.0"), "{pinned}");
+        assert!(pinned.contains("<no VERSION_NUMBER>"), "{pinned}");
+        assert!(pinned.contains("/x/aaa/lib"), "{pinned}");
+        assert!(pinned.contains("/x/bbb/lib"), "{pinned}");
+        assert!(pinned.contains("NXRT_ORT_LIB_DIR"), "{pinned}");
+
+        let unpinned = ambiguity_message(Path::new("/x"), &candidates, &found, None);
+        assert!(
+            unpinned.contains("ambiguous ONNX Runtime discovery"),
+            "{unpinned}"
+        );
+        assert!(unpinned.contains("1.28.0"), "{unpinned}");
+        assert!(unpinned.contains("NXRT_ORT_LIB_DIR"), "{unpinned}");
+    }
 
     #[test]
     fn cdylib_filename_maps_package_to_platform_name() {

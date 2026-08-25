@@ -1,0 +1,85 @@
+# CUDA runtime libraries for building and testing the native CUDA EP.
+#
+#   python -m pip install -r requirements-cuda-dev.txt
+#
+# These are NVIDIA's redistributable runtime wheels. They are the supported way
+# to get cuBLAS/NVRTC/cudart without installing a full CUDA toolkit, and the
+# CUDA EP's loader already knows how to find them: it recovers a wheel root from
+# any `<root>/nvidia/<component>/{bin,lib}` entry on the loader path, or from
+# `NXRT_CUDA_WHEEL_ROOTS`. See `crates/onnx-runtime-ep-cuda/src/dynamic_library.rs`.
+# They remain separately installed NVIDIA runtime dependencies governed by
+# NVIDIA's license; this repository and its Rust crates do not bundle the
+# binaries.
+#
+# ---------------------------------------------------------------------------
+# The major version here MUST match the crate's selected CUDA feature.
+# ---------------------------------------------------------------------------
+#
+# `onnx-runtime-ep-cuda` defaults to `cuda-13000`, and that feature is forwarded
+# to `cudarc`. cudarc generates the shared-library names it will dlopen from its
+# *build-time* CUDA version, so a `cuda-13000` build searches `nvrtc64_130_0.dll`
+# and never looks for a CUDA 12 file. Installing a CUDA 12 wheel against a
+# CUDA 13 build therefore fails at first kernel compile with
+#
+#     Unable to dynamically load the "nvrtc" shared library
+#
+# even though the file is present and on PATH. That is a version mismatch, not a
+# missing name — our own loader searches both spellings and finds it fine; it is
+# cudarc's separate list that does not. If you change the crate's CUDA feature,
+# change the wheel major version here to match.
+#
+# NVIDIA consolidated these onto unsuffixed names carrying every CUDA line, so
+# the version pin (not the package name) selects the CUDA major. That also
+# changed the on-disk layout, from `nvidia/<component>/{bin,lib}/` to
+# `nvidia/cu13/{bin,lib}/<arch>/`; the loader understands both. The older
+# `-cu12` / `-cu13` spellings still exist, but `-cu13` is a placeholder with no
+# real release, so do not reach for it.
+#
+# ---------------------------------------------------------------------------
+# Pin to the CUDA line your *driver* supports, not to the newest release.
+# ---------------------------------------------------------------------------
+#
+# NVRTC emits PTX for its own toolchain version, and the driver refuses PTX
+# newer than it understands:
+#
+#     CUDA_ERROR_UNSUPPORTED_PTX_VERSION
+#     "the provided PTX was compiled with an unsupported toolchain"
+#
+# It fails at module load, well after the library resolved, so it does not look
+# like a version problem. `nvidia-smi` reports the highest CUDA version the
+# installed driver accepts ("CUDA Version: 13.1" in the header); pin at or below
+# that. These pins target 13.1 — raise them only alongside a driver that
+# advertises the newer line.
+#
+# The kernel cache keys on the NVRTC version, so a downgrade invalidates cached
+# PTX rather than serving artifacts the driver will reject.
+#
+# Nothing here needs to be on PATH. Point the loader at the install root:
+#
+#   NXRT_CUDA_WHEEL_ROOTS=<the --target directory, or your site-packages>
+#
+# or install into the active virtualenv, whose site-packages is already on the
+# loader path.
+
+# NVRTC — runtime compilation of the EP's fused kernels. Required.
+nvidia-cuda-nvrtc==13.1.115
+
+# cuBLAS / cuBLASLt — the GEMM backend. Required.
+nvidia-cublas==13.1.1.3
+
+# cuFFT — batched DFT backend. cuFFT 12.1.0.78 is the release shipped with the
+# CUDA 13.1 wheel line. Its JIT dependency is pinned to the same toolchain so a
+# later rolling nvidia-nvjitlink release cannot emit code newer than the driver.
+nvidia-cufft==12.1.0.78
+nvidia-nvjitlink==13.1.115
+
+# CUDA runtime (cudart) and, importantly, the headers NVRTC #includes
+# (`cuda_fp16.h`, `cuda_bf16.h`). Without these the f16/bf16 kernels fail to
+# compile at runtime with "require cuda_fp16.h and cuda_bf16.h". Required.
+nvidia-cuda-runtime==13.1.80
+
+# cuDNN — only needed for the cuDNN-backed softmax/reduce/conv/pool path. The
+# EP dlopens it lazily and runs without it, so this is optional; uncomment if
+# you are exercising those kernels. Note this one still uses the -cu13 suffix,
+# because the unsuffixed `nvidia-cudnn` is a placeholder with no real release.
+# nvidia-cudnn-cu13==9.24.0.43

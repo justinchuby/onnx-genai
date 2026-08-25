@@ -2,16 +2,18 @@
 
 use crate::config::{GenerateOptions, GenerateResult, GenerateTokenCallback};
 use crate::decode::DecodeBackend;
-use crate::decode_loop::{DecodeLoopBackend, DecodeLoopState, run_decode_loop};
+use crate::decode_loop::{DecodeLoopBackend, DecodeLoopState};
 use crate::logits::{ProcessorChain, TokenId};
+use crate::pipeline::generation::{GenerationRequest, generate_with_decode_core};
 use crate::sampling::sample_greedy;
 use anyhow::{Context, bail};
-use onnx_genai_metadata::{KvOwnership, ModelIoSpec, SequenceInputKind, SharedKvGroup};
+use onnx_genai_metadata::{DecoderAbi, KvOwnership, SequenceInputKind};
 use onnx_genai_ort::Tokenizer;
 use onnx_runtime_ir::{DataType, DeviceType, Dim, SymbolId};
 use onnx_runtime_session::{
     CaptureDeclineReport, DecodePrecision, DeviceAllocationCounts, DeviceBindingTransferStats,
-    DeviceGraphCaptureResult, DeviceIoBinding, DevicePreference, InferenceSession, Tensor,
+    DeviceBuffer, DeviceGraphCaptureResult, DeviceIoBinding, DevicePreference, InferenceSession,
+    Tensor,
 };
 use onnx_runtime_tracer::{Args, TraceContext, capture_rejected};
 use std::collections::{HashMap, HashSet};
@@ -26,14 +28,13 @@ mod io;
 mod kv_commit;
 mod load;
 mod paged_gqa;
-mod proposer;
 mod tensor;
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 pub(crate) use tensor::recurrent_state_bytes_from_graph;
 #[cfg(test)]
 mod tests;
 
-#[cfg(all(test, feature = "cuda"))]
+#[cfg(all(test, feature = "native-cuda"))]
 mod leverb_phase0_probe;
 
 use backend::*;
@@ -43,7 +44,7 @@ use cuda::DecodeCudaState;
 use cuda::*;
 pub use cuda::{CudaGraphDebugStats, CudaKvDebugStats, RaggedLogitsStep};
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "native-cuda")]
 pub(crate) fn configured_cuda_kv_max_len() -> anyhow::Result<Option<usize>> {
     cuda::cuda_kv_max_len_from_env()
 }
@@ -53,7 +54,6 @@ pub use paged_gqa::{
     GQA_PRESENT_ALLOCATIONS, PagedGqaConfig, flat_gqa_decode_step, gqa_present_allocations,
     paged_gqa_decode_step,
 };
-pub(crate) use proposer::NativeProposerSession;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use tensor::*;
 
@@ -174,6 +174,41 @@ impl NativePastSnapshot {
         self.bytes
     }
 }
+
+/// Pre-draft snapshot of the destructive recurrent/conv state used to commit a
+/// speculative verify window to the accepted-prefix length.
+///
+/// Unlike [`NativePastSnapshot`] (which clones the whole host past for prefix
+/// caching), this captures *only* the recurrent/conv bindings and works on both
+/// the host past path and the CUDA fixed-state bindings. Exactly one of `host`
+/// (rank-carrying host tensors keyed by past-input name) or `device_scratch`
+/// (the CUDA fixed-state bindings staged into device scratch) indicates where
+/// the captured state lives, depending on which decode backend produced it.
+/// `len` is the committed length the snapshot was taken at, asserted against the
+/// commit's `base_len`.
+pub(crate) struct RecurrentStateSnapshot {
+    len: usize,
+    host: Option<HashMap<String, Tensor>>,
+    /// True when the CUDA fixed-state bindings were staged into the session's
+    /// device scratch buffers (a stream-ordered device→device snapshot). The
+    /// bytes live in the CUDA decode state rather than in this handle, so a
+    /// restore copies them back from there. Only one such snapshot is live at a
+    /// time (per speculative step), matching the single scratch arena.
+    device_scratch: bool,
+}
+
+impl RecurrentStateSnapshot {
+    #[cfg(test)]
+    pub(crate) fn committed_len(&self) -> usize {
+        self.len
+    }
+}
+
+/// Opaque public handle wrapping a [`RecurrentStateSnapshot`], returned by
+/// [`NativeDecodeSession::snapshot_recurrent_state_public`] so out-of-crate
+/// diagnostics can restore recurrent/conv state around an eager verify forward
+/// without exposing the snapshot internals.
+pub struct NativeRecurrentSnapshot(RecurrentStateSnapshot);
 
 /// State of the Inc-1b PR-2 decode-specialized inlined-body plan for a session.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -456,6 +491,135 @@ impl NativeDecodeSession {
         Ok(())
     }
 
+    /// Snapshot the destructive recurrent/conv state as of the last committed
+    /// token, so a speculative verify window can advance it and later be
+    /// committed to exactly the accepted-prefix length (vLLM's no-rollback rule
+    /// for Gated-DeltaNet SSM + conv1d state). See
+    /// [`Self::commit_recurrent_state_to_accepted`].
+    ///
+    /// The recurrent/conv bindings are identified through the existing structural
+    /// detectors ([`is_recurrent_state_shape`] over the declared present→past
+    /// pairs on the host path; `fixed_state_binding_range` on the CUDA path) —
+    /// never a hardcoded layer or dim count. Attention KV is *not* captured here:
+    /// it is a prefix-sliceable append-only cache the ordinary rewind already
+    /// handles.
+    pub(crate) fn snapshot_recurrent_state(&mut self) -> anyhow::Result<RecurrentStateSnapshot> {
+        if !self.has_recurrent_state() {
+            bail!("snapshot_recurrent_state requires a decoder that carries recurrent state");
+        }
+        let len = self.current_len;
+        if let Some(cuda) = self.cuda.as_mut() {
+            cuda.snapshot_fixed_states_device()?;
+            return Ok(RecurrentStateSnapshot {
+                len,
+                host: None,
+                device_scratch: true,
+            });
+        }
+        if self.cpu_kv.is_some() {
+            bail!(
+                "recurrent-state snapshot is unsupported alongside the dense cpu-kv path; \
+                 recurrent decoders keep their loop-carried state in the host past map"
+            );
+        }
+        let recurrent = self.recurrent_past_names();
+        let mut host = HashMap::with_capacity(recurrent.len());
+        for name in &recurrent {
+            let tensor = self.past.get(name).with_context(|| {
+                format!(
+                    "recurrent state '{name}' is not materialized yet; snapshot it after a step"
+                )
+            })?;
+            host.insert(
+                name.clone(),
+                tensor.try_clone().map_err(anyhow::Error::from)?,
+            );
+        }
+        Ok(RecurrentStateSnapshot {
+            len,
+            host: Some(host),
+            device_scratch: false,
+        })
+    }
+
+    /// Overwrite only the recurrent/conv bindings with a previously captured
+    /// [`RecurrentStateSnapshot`], leaving attention KV and the logical length
+    /// untouched. Used by [`Self::commit_recurrent_state_to_accepted`] between
+    /// the KV rewind and the accepted-token re-advance.
+    pub(crate) fn restore_recurrent_state(
+        &mut self,
+        snapshot: &RecurrentStateSnapshot,
+    ) -> anyhow::Result<()> {
+        if snapshot.device_scratch {
+            let cuda = self.cuda.as_mut().context(
+                "recurrent snapshot targets the CUDA fixed-state bindings but this session has no CUDA state",
+            )?;
+            cuda.restore_fixed_states_device()?;
+            return Ok(());
+        }
+        if let Some(host) = &snapshot.host {
+            for (name, tensor) in host {
+                let slot = self.past.get_mut(name).with_context(|| {
+                    format!("recurrent state '{name}' is not materialized; cannot restore snapshot")
+                })?;
+                *slot = tensor.try_clone().map_err(anyhow::Error::from)?;
+            }
+            return Ok(());
+        }
+        bail!("recurrent snapshot carried neither host nor device state");
+    }
+
+    /// Commit the recurrent/conv state to exactly `accepted_tokens.len()` tokens
+    /// past the snapshot boundary, the destructive-cache counterpart of the
+    /// attention-KV prefix-slice rewind.
+    ///
+    /// A Gated-DeltaNet recurrent (SSM) state and its conv1d rolling window carry
+    /// no per-step history to slice, so a rejected speculative draft cannot be
+    /// partially rewound. Following vLLM, the committed state is instead rebuilt
+    /// from the pre-draft snapshot: the attention KV is prefix-sliced back to
+    /// `base_len` (the ordinary rewind), the recurrent/conv bindings are restored
+    /// to the snapshot, and exactly the accepted tokens are re-run so the state
+    /// equals what feeding only the accepted continuation from the snapshot would
+    /// produce. `accepted_tokens` re-runs `num_accepted` (0..=k) tokens.
+    pub(crate) fn commit_recurrent_state_to_accepted(
+        &mut self,
+        snapshot: &RecurrentStateSnapshot,
+        base_len: usize,
+        accepted_tokens: &[TokenId],
+    ) -> anyhow::Result<()> {
+        if snapshot.len != base_len {
+            bail!(
+                "recurrent snapshot length {} does not match commit base length {base_len}",
+                snapshot.len
+            );
+        }
+        if base_len > self.current_len {
+            bail!(
+                "cannot commit recurrent state forward from base {base_len} to current {}",
+                self.current_len
+            );
+        }
+        // Attention KV keeps the ordinary prefix-slice rewind (this skips the
+        // recurrent/conv states, which have no sliceable history).
+        self.rewind_inner(base_len)?;
+        // Restore the destructive recurrent/conv states to the pre-draft snapshot,
+        // then deterministically re-advance them by exactly the accepted tokens.
+        self.restore_recurrent_state(snapshot)?;
+        // Re-advance ONE token at a time (M=1) rather than a single M=num_accepted
+        // batch. The recurrent/conv state advance is inherently sequential, so a
+        // per-token replay is state-equivalent to a batched forward, but it keeps
+        // the shared `Primary` decode executor pinned at the [1,1] shape: a
+        // batched M=num_accepted forward would resize the Primary interior arena
+        // to [1,num_accepted] and invalidate the captured M=1 decode graph every
+        // spec step (Blocker B). Feeding single tokens matches the M=1 base decode
+        // shape so the Primary graph stays valid and replays.
+        for &token in accepted_tokens {
+            let past_len = self.current_len;
+            self.decode_argmax(&[token], past_len)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn prefill_prefix(&mut self, tokens: &[TokenId]) -> anyhow::Result<()> {
         if tokens.is_empty() {
             return Ok(());
@@ -484,6 +648,7 @@ impl NativeDecodeSession {
     /// against a reused attention prefix and silently emit wrong logits (#695).
     /// Gating the mirror off forces a full recompute for these models — correct,
     /// if slower — until per-prefix recurrent-state restore lands.
+    #[allow(dead_code)]
     pub(crate) fn supports_host_kv_mirror(&self) -> bool {
         if self.cuda.is_some()
             || self.cpu_kv.is_some()
@@ -523,6 +688,7 @@ impl NativeDecodeSession {
     /// while the recurrent/conv state is reconstructed only on a full
     /// `rewind(0)`, so a mirrored continuation runs a fresh-zero recurrent state
     /// against a reused attention prefix and silently emits wrong logits (#695).
+    #[allow(dead_code)]
     pub(crate) fn supports_device_kv_mirror(&self) -> bool {
         if self.kv_inputs.is_empty() || self.has_recurrent_state() {
             return false;
@@ -544,6 +710,7 @@ impl NativeDecodeSession {
     /// caller slices out the freshly-decoded tokens with the same
     /// `extract_present_token` geometry the ORT decoder uses, so all three paths
     /// mirror byte-identical pages.
+    #[allow(dead_code)]
     pub(crate) fn present_kv(
         &mut self,
         past_name: &str,
@@ -560,6 +727,7 @@ impl NativeDecodeSession {
     /// cache the CPU decode path leaves in `self.past` keyed by the past-input
     /// name; the caller slices out the freshly-decoded tokens with the same
     /// `extract_present_token` geometry the ORT decoder uses.
+    #[allow(dead_code)]
     pub(crate) fn host_present_kv(&self, past_name: &str) -> Option<(Vec<f32>, Vec<usize>)> {
         self.past
             .get(past_name)
@@ -574,6 +742,7 @@ impl NativeDecodeSession {
     /// layout the ORT decoder injects (`kv_bridge::past_shape`), so native and
     /// ORT prefix reuse are byte-identical. Only valid on the host-growable path
     /// (`supports_host_kv_mirror`).
+    #[allow(dead_code)]
     pub(crate) fn seed_growable_kv(
         &mut self,
         entries: Vec<(String, Vec<f32>, Vec<usize>)>,
@@ -599,6 +768,7 @@ impl NativeDecodeSession {
     /// (GAP-3 Inc-D) by how the session keeps its KV. `entries` carry the same
     /// compact `[1, num_kv_heads, seq, head_dim]` layout for both paths, so
     /// native (host or device) and ORT prefix reuse stay byte-identical.
+    #[allow(dead_code)]
     pub(crate) fn seed_kv(
         &mut self,
         entries: Vec<(String, Vec<f32>, Vec<usize>)>,
@@ -616,6 +786,7 @@ impl NativeDecodeSession {
     /// (GAP-3 Inc-D). The `&mut self.session` / `&mut self.cuda` split borrow lets
     /// the device seed grow the KV bucket if the prefix exceeds the current
     /// capacity, exactly as a decode step would.
+    #[allow(dead_code)]
     fn seed_device_kv(
         &mut self,
         entries: Vec<(String, Vec<f32>, Vec<usize>)>,
@@ -652,62 +823,6 @@ impl NativeDecodeSession {
     /// Last target hidden-state row produced by the most recent forward.
     pub(crate) fn last_hidden(&self) -> Option<&[f32]> {
         self.last_hidden.as_deref()
-    }
-
-    /// Materialize metadata-declared shared-KV references from the target's
-    /// current host cache. Native CUDA keeps KV device-resident and is not yet
-    /// exposed through this CPU tensor contract.
-    pub(crate) fn shared_kv_inputs(
-        &self,
-        groups: &[SharedKvGroup],
-    ) -> anyhow::Result<Vec<(String, Tensor)>> {
-        if self.cuda.is_some() {
-            bail!(
-                "native shared-KV proposer execution currently requires a CPU target session; CUDA target KV references need device-binding alias support"
-            );
-        }
-        let mut inputs = Vec::with_capacity(groups.len() * 2);
-        for group in groups {
-            let key_target = group.target_key_input.as_deref().with_context(|| {
-                format!(
-                    "shared_kv group '{}' is missing target_key_input; declare the exact target decoder KV input name",
-                    group.name
-                )
-            })?;
-            let value_target = group.target_value_input.as_deref().with_context(|| {
-                format!(
-                    "shared_kv group '{}' is missing target_value_input; declare the exact target decoder KV input name",
-                    group.name
-                )
-            })?;
-            let key_input = group.key_input.as_deref().with_context(|| {
-                format!(
-                    "shared_kv group '{}' is missing key_input; declare the exact proposer input name",
-                    group.name
-                )
-            })?;
-            let value_input = group.value_input.as_deref().with_context(|| {
-                format!(
-                    "shared_kv group '{}' is missing value_input; declare the exact proposer input name",
-                    group.name
-                )
-            })?;
-            let key = self.past.get(key_target).with_context(|| {
-                format!(
-                    "target shared-KV key '{}' for group '{}' is unavailable; run the target decoder before invoking the proposer and ensure io.kv_inputs names this cache",
-                    key_target, group.name
-                )
-            })?;
-            let value = self.past.get(value_target).with_context(|| {
-                format!(
-                    "target shared-KV value '{}' for group '{}' is unavailable; run the target decoder before invoking the proposer and ensure io.kv_inputs names this cache",
-                    value_target, group.name
-                )
-            })?;
-            inputs.push((key_input.to_owned(), key.clone()));
-            inputs.push((value_input.to_owned(), value.clone()));
-        }
-        Ok(inputs)
     }
 
     pub fn cuda_kv_debug_stats(&self) -> Option<CudaKvDebugStats> {
@@ -954,6 +1069,32 @@ impl NativeDecodeSession {
         <Self as DecodeBackend>::decode(self, token_ids, past_len)
     }
 
+    /// Whether this decoder carries destructive recurrent/conv state (a hybrid
+    /// GDN + attention model). Exposed for diagnostics (e.g. `verify_logits_probe`)
+    /// so a caller that rewinds the attention KV can also restore the recurrent
+    /// state to the correct committed boundary before an eager verify forward,
+    /// exactly as the speculative driver does around a draft window.
+    pub fn has_recurrent_state_public(&self) -> bool {
+        self.has_recurrent_state()
+    }
+
+    /// Snapshot the destructive recurrent/conv state at the current committed
+    /// length. See [`Self::snapshot_recurrent_state`]. Public, opaque handle for
+    /// diagnostics that must restore recurrent state around an eager verify.
+    pub fn snapshot_recurrent_state_public(&mut self) -> anyhow::Result<NativeRecurrentSnapshot> {
+        Ok(NativeRecurrentSnapshot(self.snapshot_recurrent_state()?))
+    }
+
+    /// Restore the recurrent/conv bindings from a [`NativeRecurrentSnapshot`],
+    /// leaving attention KV and the logical length untouched (the caller drives
+    /// the KV rewind separately). See [`Self::restore_recurrent_state`].
+    pub fn restore_recurrent_state_public(
+        &mut self,
+        snapshot: &NativeRecurrentSnapshot,
+    ) -> anyhow::Result<()> {
+        self.restore_recurrent_state(&snapshot.0)
+    }
+
     /// Batch-N greedy decode step (stage 2b-impl-4, #750). Steps the pinned
     /// `batch` sequences together — one token per sequence — and returns the
     /// `batch` selected token ids. Requires a CUDA decode session pinned at the
@@ -1079,7 +1220,7 @@ impl NativeDecodeSession {
 
     /// Run one target step with arbitrary named tensors supplied by pipeline
     /// routing. Generated roles (token ids, attention mask, and position ids)
-    /// come from `ModelIoSpec`; every other non-KV graph input is resolved by its
+    /// come from `DecoderAbi`; every other non-KV graph input is resolved by its
     /// exact graph port name from `step_inputs`.
     pub(crate) fn decode_with_step_inputs(
         &mut self,
@@ -1156,8 +1297,20 @@ impl NativeDecodeSession {
     /// decoder never builds a sibling, never retries, and stays byte-identical
     /// on the main path.
     ///
+    /// "Byte-identical" here is the *inline-sibling-vs-main-executor* property,
+    /// verified by the Scan-equivalence tests
+    /// (`decode_inline_sibling_is_byte_exact_with_scan_and_preserves_state` and
+    /// its persistent-state sibling): when a single-trip `Scan` IS lowered, the
+    /// sibling reproduces the main executor's result exactly, including a
+    /// non-zero loop-carried recurrent state. It is NOT a claim that the main
+    /// executor mishandles recurrent state — it does not (confirmed on the real
+    /// Qwen3 GDN hybrid, whose recurrence is expressed as ordinary custom ops
+    /// with top-level `past/present` state I/O and therefore has NO `Scan` at
+    /// all: it latches `Disabled` and runs entirely on the main executor, eager
+    /// multi-token verify forwards included, bit-matching an m=1 greedy step).
+    ///
     /// A build failure is non-fatal: it latches `Disabled` and decode proceeds
-    /// on the byte-identical main (Scan child-session) executor.
+    /// on the main executor.
     fn maybe_enable_decode_inline(&mut self, token_ids: &[TokenId]) {
         if self.decode_inline != DecodeInlineState::Untried {
             return;
@@ -1213,14 +1366,15 @@ impl NativeDecodeSession {
     }
 
     /// Generate through the engine's shared token loop, not a backend-local loop.
-    pub fn generate(
+    pub(crate) fn generate(
         &mut self,
         prompt_tokens: &[TokenId],
         options: &GenerateOptions,
         chain: &ProcessorChain,
         tokenizer: &Tokenizer,
+        runtime: &crate::pipeline::WorkflowRuntime,
     ) -> anyhow::Result<GenerateResult> {
-        self.generate_with_callback(prompt_tokens, options, chain, tokenizer, None)
+        self.generate_with_callback(prompt_tokens, options, chain, tokenizer, runtime, None)
     }
 
     /// Generate through the shared loop and optionally stream generated tokens.
@@ -1230,6 +1384,7 @@ impl NativeDecodeSession {
         options: &GenerateOptions,
         chain: &ProcessorChain,
         tokenizer: &Tokenizer,
+        runtime: &crate::pipeline::WorkflowRuntime,
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
         if prompt_tokens.is_empty() {
@@ -1245,13 +1400,17 @@ impl NativeDecodeSession {
             lookahead: std::collections::VecDeque::new(),
         };
         let mut state = DecodeLoopState::new(0, options.seed, options.top_logprobs);
-        run_decode_loop(
+        generate_with_decode_core(
+            runtime,
             &mut backend,
             &mut state,
-            options,
-            chain,
-            tokenizer,
-            options.max_context,
+            prompt_tokens,
+            GenerationRequest {
+                options,
+                chain,
+                tokenizer,
+                max_context: options.max_context,
+            },
             callback,
         )
     }
@@ -1271,6 +1430,7 @@ impl NativeDecodeSession {
         self.prepare_generation_workspace_inner(prompt_tokens, prompt_tokens.len(), false)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn prepare_generation_workspace_with_step_inputs(
         &mut self,
         tokens: &[TokenId],
@@ -1319,6 +1479,7 @@ impl NativeDecodeSession {
     ///
     /// If `resume_from > current_len`, behaves like full generation from 0.
     /// If `resume_from < current_len`, rewinds the KV cache to `resume_from`.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn generate_incremental_with_callback(
         &mut self,
         prompt_tokens: &[TokenId],
@@ -1326,6 +1487,7 @@ impl NativeDecodeSession {
         options: &GenerateOptions,
         chain: &ProcessorChain,
         tokenizer: &Tokenizer,
+        runtime: &crate::pipeline::WorkflowRuntime,
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
         if prompt_tokens.is_empty() {
@@ -1334,7 +1496,14 @@ impl NativeDecodeSession {
         let resume_from = resume_from.min(prompt_tokens.len());
         if resume_from == 0 || resume_from > self.current_len {
             // Full reset path — no valid KV prefix to reuse.
-            return self.generate_with_callback(prompt_tokens, options, chain, tokenizer, callback);
+            return self.generate_with_callback(
+                prompt_tokens,
+                options,
+                chain,
+                tokenizer,
+                runtime,
+                callback,
+            );
         }
         // Rewind KV to resume_from if we've advanced beyond it (e.g. diverged prefix).
         if self.current_len > resume_from {
@@ -1357,13 +1526,17 @@ impl NativeDecodeSession {
             lookahead: std::collections::VecDeque::new(),
         };
         let mut state = DecodeLoopState::new(resume_from, options.seed, options.top_logprobs);
-        run_decode_loop(
+        generate_with_decode_core(
+            runtime,
             &mut backend,
             &mut state,
-            options,
-            chain,
-            tokenizer,
-            options.max_context,
+            prompt_tokens,
+            GenerationRequest {
+                options,
+                chain,
+                tokenizer,
+                max_context: options.max_context,
+            },
             callback,
         )
     }
@@ -1454,8 +1627,10 @@ mod prefill_chunk_tests {
         assert_eq!(tensor.shape, vec![1, 2, hidden]);
         let taken: Vec<f32> = tensor
             .as_bytes()
-            .chunks_exact(4)
-            .map(|word| f32::from_le_bytes(word.try_into().expect("f32")))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|word| f32::from_le_bytes(*word))
             .collect();
         // Rows 1 and 2 of a [1, 4, 3] tensor numbered 0..12.
         assert_eq!(taken, vec![3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);

@@ -125,11 +125,14 @@ fn unconditional_syncs_are_limited_to_capture_unsupported_paths() {
         "attention.rs::run_attention_phase2a".to_string(),
         "block_quantized_matmul.rs::execute".to_string(),
         "block_quantized_moe.rs::execute_with_workspace".to_string(),
-        "conv.rs::run".to_string(),
         "fused_gemm.rs::run".to_string(),
         "gemm.rs::run".to_string(),
         "matmul_nbits.rs::run".to_string(),
         "mod_op.rs::run".to_string(),
+        // Declares CaptureSupport::unsupported: the Phase-2a workspace path
+        // allocates per-call scratch and drains the trailing transpose before
+        // returning it to the pool. Same shape as packed_varlen_attention below.
+        "multi_head_attention.rs::execute".to_string(),
         "nary.rs::run".to_string(),
         "nonzero.rs::execute".to_string(),
         "packed_varlen_attention.rs::execute".to_string(),

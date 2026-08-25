@@ -1,557 +1,270 @@
-// Copyright (c) Microsoft Corporation.
-//
-//! Native driver that renders a ComfyUI API-format workflow through the
-//! onnx-genai iterative diffusion pipeline.
+//! Convert a ComfyUI workflow, then run it on the generic workflow engine.
 //!
-//! Unlike the (now retired) `scripts/run_comfyui.py`, this binary requires an
-//! already-exported ONNX pipeline package (`denoiser.onnx` / `text_encoder.onnx`
-//! / `vae.onnx` plus `inference_metadata.yaml` and `run.json`). It parses the
-//! workflow with `onnx-genai-comfyui-config`, tokenizes the positive and
-//! negative prompts natively with the Hugging Face `tokenizers` crate loading a
-//! CLIP `tokenizer.json`, draws the seed latent (and, for ancestral schedulers,
-//! the per-step noise) with a seeded RNG, runs the pipeline, and writes PNG(s).
+//! ```text
+//! run_comfyui --package <dir> [options] <workflow.json>
+//! ```
 //!
-//! Usage:
-//!   run_comfyui --workflow workflow.json --pipeline-dir pkg/ --output out.png
-//!
-//! The seed latent is pre-scaled by the scheduler's `init_noise_sigma`, queried
-//! from the engine so the runner never duplicates the sigma math.
+//! This is a thin wrapper and nothing more. It converts the workflow with
+//! [`onnx_genai_comfyui_config`], writes the canonical
+//! `inference_metadata.yaml` into the package, and then hands the package to
+//! [`Engine::from_pipeline_dir`] like any other workflow package. Every step of
+//! the diffusion loop — schedule, guidance, solver, decode — is executed by the
+//! generic workflow runtime from the emitted metadata. There is no diffusion
+//! logic here, and no code path that reads the ComfyUI document at run time.
 
-use anyhow::{Context, Result, bail};
-use clap::Parser;
-use onnx_genai::engine::{
-    Engine, EngineConfig, GeneratePrompt, GenerateRequest, IterativeOverrides,
-    PipelineGenerateRequest,
-};
-use onnx_genai::ort::Value;
-use onnx_genai::text_to_image::{
-    CLIP_CONTEXT_LENGTH, DenoiserInput, RenderedImage, TextToImageRequest, VaeEncoder,
-    generate_image_with_denoiser_inputs, latent_channels, load_clip_tokenizer, load_source_image,
-    save_png, tile_ids, tokenize_clip as tokenize, validate_finite_decode_output,
-};
-use onnx_genai_comfyui_config::{ControlNet, parse_workflow_file};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
-#[derive(Parser, Debug)]
-#[command(about = "Render a ComfyUI workflow through the onnx-genai diffusion pipeline.")]
-struct Arguments {
-    /// ComfyUI API-format workflow JSON.
-    #[arg(long)]
+use onnx_genai::engine::PipelineGenerateRequest;
+use onnx_genai::engine::pipeline::{PipelineOutputs, WorkflowOutputRole};
+use onnx_genai::ort::Value;
+use onnx_genai::{Engine, EngineConfig, GenerateOptions, GeneratePrompt, GenerateRequest};
+use onnx_genai_comfyui_config::{ComponentLayout, ConvertOptions, convert_file, to_yaml};
+
+const USAGE: &str = "usage: run_comfyui --package <dir> [options] <workflow.json>\n\n\
+     Converts a ComfyUI API-format workflow into canonical inference metadata and executes it \
+     on the generic workflow engine.\n\n\
+     --package <dir>       workflow package holding the ONNX components\n\
+     --metadata <path>     where to write the converted metadata \
+     (default: <package>/inference_metadata.yaml)\n\
+     --overwrite           replace an existing metadata document\n\
+     --convert-only        convert and write metadata without executing\n\
+     --adapters <path>     the package's own `adapters` contract, required for LoRA workflows\n\
+     --textproto           reference `*.onnx.textproto` component artifacts\n\
+     --prompt-tokens a,b   positive prompt token ids (default: 1,2)\n\
+     --negative-tokens a,b negative prompt token ids (default: zeros of the same length)\n\
+     --steps <n>           override the converted iteration count\n\
+     --output <path>       write the decoded image as a binary PPM";
+
+fn main() {
+    if let Err(error) = run() {
+        eprintln!("{error}");
+        std::process::exit(1);
+    }
+}
+
+struct Args {
     workflow: PathBuf,
-
-    /// Exported ONNX pipeline package directory (denoiser/text_encoder/vae).
-    #[arg(long)]
-    pipeline_dir: PathBuf,
-
-    /// CLIP `tokenizer.json` (defaults to `<pipeline-dir>/tokenizer.json`).
-    #[arg(long)]
-    tokenizer: Option<PathBuf>,
-
-    /// Output PNG path (for batches: `stem_0.png`, `stem_1.png`, ...).
-    #[arg(long, short, default_value = "comfyui_out.png")]
-    output: PathBuf,
-
-    /// Hidden verification path: instead of generating the fed tensors, load
-    /// `sample.f32` / `ids.i64` / `uncond.f32` / `noise.f32` from this directory
-    /// and assert the resulting `vae.image` is bit-identical to `image.f32`
-    /// there. Proves the native pipeline path independent of the RNG.
-    #[arg(long, hide = true)]
-    replay_inputs: Option<PathBuf>,
+    package: PathBuf,
+    metadata: Option<PathBuf>,
+    adapters: Option<PathBuf>,
+    output: Option<PathBuf>,
+    prompt_tokens: Vec<i64>,
+    negative_tokens: Option<Vec<i64>>,
+    steps: Option<usize>,
+    overwrite: bool,
+    convert_only: bool,
+    textproto: bool,
 }
 
-fn read_f32(path: &Path) -> Result<Vec<f32>> {
-    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-    if bytes.len() % 4 != 0 {
-        bail!(
-            "{}: length {} is not a multiple of 4",
-            path.display(),
-            bytes.len()
-        );
-    }
-    Ok(bytes
-        .chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-        .collect())
-}
-
-fn read_i64(path: &Path) -> Result<Vec<i64>> {
-    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-    if bytes.len() % 8 != 0 {
-        bail!(
-            "{}: length {} is not a multiple of 8",
-            path.display(),
-            bytes.len()
-        );
-    }
-    Ok(bytes
-        .chunks_exact(8)
-        .map(|chunk| i64::from_le_bytes(chunk.try_into().unwrap()))
-        .collect())
-}
-
-fn save_images(images: &[RenderedImage], output: &Path) -> Result<()> {
-    if images.len() == 1 {
-        save_png(&images[0], output)?;
-        eprintln!("saved: {}", output.display());
-        return Ok(());
-    }
-
-    let stem = output
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "out".to_string());
-    let extension = output
-        .extension()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "png".to_string());
-    for (index, image) in images.iter().enumerate() {
-        let path = output.with_file_name(format!("{stem}_{index}.{extension}"));
-        save_png(image, &path)?;
-        eprintln!("saved: {}", path.display());
-    }
-    Ok(())
-}
-
-fn workflow_asset(workflow_path: &Path, asset: &str) -> PathBuf {
-    let path = PathBuf::from(asset);
-    if path.is_absolute() {
-        path
-    } else {
-        workflow_path
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join(path)
-    }
-}
-
-fn vae_scaling_factor(pipeline_dir: &Path) -> f32 {
-    std::fs::read_to_string(pipeline_dir.join("run.json"))
-        .ok()
-        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-        .and_then(|run| {
-            run.get("vae_scaling_factor")
-                .and_then(|value| value.as_f64())
-        })
-        .map(|value| value as f32)
-        .unwrap_or(0.18215)
-}
-
-fn preprocess_control_image(
-    image: &image::DynamicImage,
-    width: usize,
-    height: usize,
-    batch_size: usize,
-) -> Vec<f32> {
-    let image = image
-        .resize_exact(
-            width as u32,
-            height as u32,
-            image::imageops::FilterType::Lanczos3,
-        )
-        .to_rgb8();
-    let plane = width * height;
-    let mut pixels = vec![0.0f32; batch_size * 3 * plane];
-    for batch in 0..batch_size {
-        let batch_offset = batch * 3 * plane;
-        for (index, pixel) in image.pixels().enumerate() {
-            for channel in 0..3 {
-                pixels[batch_offset + channel * plane + index] = pixel[channel] as f32 / 255.0;
+fn run() -> anyhow::Result<()> {
+    let args = parse_args()?;
+    let options = ConvertOptions {
+        layout: if args.textproto {
+            ComponentLayout::textproto()
+        } else {
+            ComponentLayout::default()
+        },
+        adapters: match &args.adapters {
+            Some(path) => {
+                let value: serde_json::Value =
+                    serde_json::from_str(&std::fs::read_to_string(path)?)?;
+                Some(value.get("adapters").cloned().unwrap_or(value))
             }
-        }
-    }
-    pixels
-}
-
-fn adapter_id(name: &str) -> String {
-    Path::new(name)
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or(name)
-        .to_owned()
-}
-
-fn workflow_denoiser_inputs(
-    workflow_path: &Path,
-    controlnets: &[ControlNet],
-    loras: &[(String, f64)],
-    width: usize,
-    height: usize,
-    batch_size: usize,
-) -> Result<Vec<DenoiserInput>> {
-    // Mobius exports a *single* fused ControlNet+UNet denoiser that declares one
-    // unsuffixed `controlnet_cond` image input (`mobius/tasks/_controlnet.py`,
-    // `_find_controlnet -> tuple | None`). There is no multi-ControlNet export
-    // and no per-adapter suffixed ports, so binding `controlnet_cond.{adapter}`
-    // would be silently dropped by the engine. Fail loudly instead of pretending
-    // multi-ControlNet works.
-    if controlnets.len() > 1 {
-        bail!(
-            "workflow declares {} ControlNets, but the exported denoiser supports a single \
-             fused ControlNet (`controlnet_cond`); multi-ControlNet export is unavailable. \
-             Refusing to bind unsupported per-adapter inputs that the model would silently drop.",
-            controlnets.len()
-        );
-    }
-    let mut inputs = Vec::with_capacity(controlnets.len() + loras.len());
-    for controlnet in controlnets {
-        let image_name = controlnet.image.as_deref().with_context(|| {
-            format!(
-                "ControlNet '{}' has no LoadImage-backed hint image",
-                controlnet.name
-            )
-        })?;
-        let path = workflow_asset(workflow_path, image_name);
-        let image = image::open(&path)
-            .with_context(|| format!("loading ControlNet hint image {}", path.display()))?;
-        // The only runtime ControlNet input the exported denoiser declares is the
-        // conditioning image `controlnet_cond`. ControlNet strength is fused at
-        // export time (`checkpoint_export(controlnet=...)`, DIFFUSION.md §9), not a
-        // runtime gate, so we deliberately do NOT feed a `conditioning_scale` input
-        // the model never declares (the engine would silently drop it).
-        inputs.push(DenoiserInput {
-            name: "controlnet_cond".to_owned(),
-            values: preprocess_control_image(&image, width, height, batch_size),
-            shape: vec![batch_size as i64, 3, height as i64, width as i64],
-        });
-    }
-    inputs.extend(loras.iter().map(|(name, strength)| DenoiserInput {
-        name: format!("lora_gate.{}", adapter_id(name)),
-        values: vec![*strength as f32],
-        shape: Vec::new(),
-    }));
-    Ok(inputs)
-}
-
-fn main() -> Result<()> {
-    let arguments = Arguments::parse();
-
-    let workflow = parse_workflow_file(&arguments.workflow)
-        .with_context(|| format!("parsing workflow {}", arguments.workflow.display()))?;
-    let prompt = workflow.prompt.clone().unwrap_or_default();
-    let negative_prompt = workflow.negative_prompt.clone().unwrap_or_default();
-    let source_image = workflow
-        .source_image
-        .as_deref()
-        .map(|source| {
-            let source = workflow_asset(&arguments.workflow, source);
-            let mask = workflow
-                .mask_image
-                .as_deref()
-                .map(|mask| workflow_asset(&arguments.workflow, mask));
-            load_source_image(&source, mask.as_deref())
-        })
-        .transpose()?;
-    let width = source_image
-        .as_ref()
-        .map(|image| image.width)
-        .unwrap_or(workflow.width as usize);
-    let height = source_image
-        .as_ref()
-        .map(|image| image.height)
-        .unwrap_or(workflow.height as usize);
-    let latent_channels = latent_channels(&arguments.pipeline_dir);
-    let latent_height = height / 8;
-    let latent_width = width / 8;
-    let batch_size = workflow.batch_size.max(1) as usize;
-    let num_steps = workflow.steps as usize;
-    let denoiser_inputs = workflow_denoiser_inputs(
-        &arguments.workflow,
-        &workflow.controlnets,
-        &workflow.loras,
-        width,
-        height,
-        batch_size,
-    )?;
-
-    eprintln!(
-        "prompt={prompt:?} negative={negative_prompt:?} {num_steps} steps, cfg {}, {} ({})",
-        workflow.cfg, workflow.sampler_name, workflow.scheduler_kind
-    );
-
-    let tokenizer_path = arguments
-        .tokenizer
-        .clone()
-        .unwrap_or_else(|| arguments.pipeline_dir.join("tokenizer.json"));
-    let tokenizer = load_clip_tokenizer(&tokenizer_path)?;
-    let positive_ids = tokenize(&tokenizer, &prompt)?;
-
-    let mut engine = Engine::from_pipeline_dir(&arguments.pipeline_dir, EngineConfig::default())?;
-    let init_noise_sigma = engine.diffusion_init_noise_sigma().unwrap_or(1.0);
-    eprintln!("init_noise_sigma = {init_noise_sigma}");
-
-    if arguments.replay_inputs.is_none() {
-        let vae_encoder = source_image.as_ref().map(|_| {
-            let filename = engine
-                .spec()
-                .models
-                .values()
-                .find(|component| component.role == "vae_encoder")
-                .map(|component| component.filename.as_str())
-                .unwrap_or("vae_encoder.onnx");
-            VaeEncoder {
-                model_path: arguments.pipeline_dir.join(filename),
-                scaling_factor: vae_scaling_factor(&arguments.pipeline_dir),
-            }
-        });
-        let images = generate_image_with_denoiser_inputs(
-            &arguments.pipeline_dir,
-            &mut engine,
-            &TextToImageRequest {
-                prompt,
-                negative_prompt,
-                steps: Some(num_steps),
-                guidance_scale: Some(workflow.cfg as f32),
-                start_step: source_image.as_ref().map(|_| workflow.start_step as usize),
-                seed: workflow.seed as u64,
-                height,
-                width,
-                batch_size,
-                tokenizer_path: arguments.tokenizer.clone(),
-                text_encoder_path: None,
-                vae_decoder: None,
-                source_image,
-                vae_encoder,
-            },
-            &denoiser_inputs,
-        )?;
-        let pixels: Vec<f32> = images
-            .iter()
-            .flat_map(|image| image.pixels_chw.iter().copied())
-            .collect();
-        let minimum = pixels.iter().copied().fold(f32::INFINITY, f32::min);
-        let maximum = pixels.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let mean = pixels.iter().sum::<f32>() / pixels.len() as f32;
-        let variance = pixels
-            .iter()
-            .map(|value| (value - mean).powi(2))
-            .sum::<f32>()
-            / pixels.len() as f32;
-        eprintln!(
-            "[render] finite=true min={minimum:.4} max={maximum:.4} mean={mean:.4} var={variance:.5}"
-        );
-        save_images(&images, &arguments.output)?;
-        return Ok(());
-    }
-
-    // Hidden verification mode preserves the original SD1.x replay contract.
-    let replay_dir = arguments.replay_inputs.as_ref().unwrap();
-    let positive_ids_tiled = read_i64(&replay_dir.join("ids.i64"))?;
-    let native_ids = tile_ids(&positive_ids, batch_size);
-    if native_ids != positive_ids_tiled {
-        bail!(
-            "native tokenized ids differ from replay ids.i64 \
-                     ({} vs {} elements; first mismatch matters)",
-            native_ids.len(),
-            positive_ids_tiled.len()
-        );
-    }
-    eprintln!(
-        "[verify A] native tokenized ids == ids.i64 ({} ids)",
-        positive_ids_tiled.len()
-    );
-    let sample = read_f32(&replay_dir.join("sample.f32"))?;
-    let uncond = read_f32(&replay_dir.join("uncond.f32"))?;
-    let noise_path = replay_dir.join("noise.f32");
-    let per_step_noise = if noise_path.exists() {
-        Some(read_f32(&noise_path)?)
-    } else {
-        None
+            None => None,
+        },
     };
 
-    let mut request =
-        PipelineGenerateRequest::new(GenerateRequest::new(GeneratePrompt::TokenIds(vec![])));
-    request = request.with_input(
-        "text_encoder.input_ids",
-        Value::from_slice_i64(
-            &positive_ids_tiled,
-            &[batch_size as i64, CLIP_CONTEXT_LENGTH as i64],
-        )?,
-    );
-    request = request.with_input(
-        "denoiser.sample",
-        Value::from_slice_f32(
-            &sample,
-            &[
-                batch_size as i64,
-                latent_channels as i64,
-                latent_height as i64,
-                latent_width as i64,
-            ],
-        )?,
-    );
-    let sequence_length = CLIP_CONTEXT_LENGTH as i64;
-    let hidden_dim = (uncond.len() / (batch_size * CLIP_CONTEXT_LENGTH)) as i64;
-    request = request.with_input(
-        "denoiser.encoder_hidden_states.uncond",
-        Value::from_slice_f32(&uncond, &[batch_size as i64, sequence_length, hidden_dim])?,
-    );
-    if let Some(noise) = &per_step_noise {
-        request = request.with_input(
-            "denoiser.sample.noise",
-            Value::from_slice_f32(
-                noise,
-                &[
-                    num_steps as i64,
-                    batch_size as i64,
-                    latent_channels as i64,
-                    latent_height as i64,
-                    latent_width as i64,
-                ],
-            )?,
+    let (_, document, report) = convert_file(&args.workflow, &options)?;
+    let metadata_path = args
+        .metadata
+        .clone()
+        .unwrap_or_else(|| args.package.join("inference_metadata.yaml"));
+    if metadata_path.exists() && !args.overwrite {
+        anyhow::bail!(
+            "{} already exists. Why: the converted document becomes the package's source of \
+             execution truth, so replacing one silently would change what the package means. \
+             How to fix: pass --overwrite, or point --metadata at a new path",
+            metadata_path.display()
         );
+    }
+    std::fs::write(&metadata_path, to_yaml(&document)?)?;
+    eprintln!(
+        "converted {} -> {} ({} steps, solver={}, spacing={}, guidance={})",
+        args.workflow.display(),
+        metadata_path.display(),
+        report.plan.iterations(),
+        report.plan.solver.as_str(),
+        report.plan.spacing.as_str(),
+        report
+            .plan
+            .guidance
+            .as_ref()
+            .map_or("off".to_owned(), |guidance| guidance.scale.to_string()),
+    );
+    for ignored in &report.ignored_nodes {
+        eprintln!("ignored (cannot reach the saved image): {ignored}");
+    }
+    if args.convert_only {
+        return Ok(());
     }
 
-    let outputs = engine.run_pipeline(request.with_iterative_overrides(IterativeOverrides {
-        num_steps: Some(num_steps),
-        guidance_scale: Some(workflow.cfg as f32),
-        start_step: None,
-    }))?;
-    let image_value = outputs
-        .get("vae.image")
-        .context("pipeline did not produce 'vae.image'")?;
-    let image_data = image_value.to_vec_f32_lossy()?;
-    validate_finite_decode_output(&image_data, "VAE decoder")?;
-    let reference = read_f32(&replay_dir.join("image.f32"))?;
-    if reference.len() != image_data.len() {
-        bail!(
-            "replay image.f32 has {} elements but pipeline produced {}",
-            reference.len(),
-            image_data.len()
-        );
+    let iterations = args.steps.unwrap_or(report.plan.iterations() as usize);
+    let mut engine = Engine::from_dir(&args.package, EngineConfig::default())?;
+
+    let options = GenerateOptions {
+        max_new_tokens: iterations,
+        seed: Some(report.plan.seed.unsigned_abs()),
+        ..GenerateOptions::default()
+    };
+    let width = i64::try_from(args.prompt_tokens.len())?;
+    let negative = args
+        .negative_tokens
+        .clone()
+        .unwrap_or_else(|| vec![0; args.prompt_tokens.len()]);
+    let mut request = PipelineGenerateRequest::new(GenerateRequest {
+        prompt: GeneratePrompt::TokenIds(Vec::new()),
+        options,
+    })
+    .with_input(
+        "request.input_ids",
+        Value::from_slice_i64(&args.prompt_tokens, &[1, width])?,
+    )
+    .with_input(
+        "request.seed",
+        Value::from_slice_i64(&[report.plan.seed], &[1])?,
+    );
+    if report.plan.uses_guidance() {
+        let scale = report.plan.guidance.as_ref().map_or(1.0, |g| g.scale) as f32;
+        request = request
+            .with_input(
+                "request.negative_input_ids",
+                Value::from_slice_i64(&negative, &[1, i64::try_from(negative.len())?])?,
+            )
+            .with_input(
+                "request.guidance_scale",
+                Value::from_slice_f32(&[scale], &[1])?,
+            );
     }
-    let max_abs_diff = reference
-        .iter()
-        .zip(&image_data)
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0f32, f32::max);
-    eprintln!("[verify A] vae.image max|diff| vs image.f32 = {max_abs_diff:.3e}");
-    if max_abs_diff >= 1e-5 {
-        bail!("verification (A) FAILED: max|diff| {max_abs_diff:.3e} >= 1e-5");
+
+    let started = Instant::now();
+    let outputs = engine.run_pipeline_outputs(request)?;
+    let elapsed = started.elapsed();
+
+    let image = image_output(&engine, &outputs)?;
+    let shape = image.shape().to_vec();
+    eprintln!(
+        "executed {iterations} steps in {:.3}s ({:.2} steps/s); image shape {shape:?}",
+        elapsed.as_secs_f64(),
+        iterations as f64 / elapsed.as_secs_f64().max(f64::MIN_POSITIVE),
+    );
+    if let Some(path) = &args.output {
+        write_ppm(path, &image.to_vec_f32()?, &shape)?;
+        eprintln!("wrote {}", path.display());
     }
-    eprintln!("[verify A] PASS: native pipeline is bit-identical to the reference driver");
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use image::{DynamicImage, Rgb, RgbImage};
+/// The workflow's image-role output, which is the only thing this tool reads.
+///
+/// The role is read from the emitted metadata rather than from an output name,
+/// so nothing here depends on how the converter spelled it.
+fn image_output<'a>(
+    engine: &onnx_genai::Engine,
+    outputs: &'a PipelineOutputs,
+) -> anyhow::Result<&'a Value> {
+    engine
+        .structured_output_for_role(outputs, WorkflowOutputRole::Image)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "the converted workflow produced no image-role output. Why: a converted ComfyUI \
+                 workflow always emits one, so this means the package's metadata was replaced \
+                 after conversion"
+            )
+        })
+}
 
-    fn controlnet(name: &str, strength: f64, image: &str) -> ControlNet {
-        ControlNet {
-            name: name.to_owned(),
-            strength,
-            image: Some(image.to_owned()),
+/// Write a `[batch, 3, height, width]` float tensor's first row as binary PPM.
+fn write_ppm(path: &Path, pixels: &[f32], shape: &[i64]) -> anyhow::Result<()> {
+    let [_, channels, height, width] = shape else {
+        anyhow::bail!("expected a rank-4 image output, got shape {shape:?}");
+    };
+    if *channels != 3 {
+        anyhow::bail!("expected a 3-channel image output, got {channels} channels");
+    }
+    let (height, width) = (*height as usize, *width as usize);
+    let plane = height * width;
+    let mut out = format!("P6\n{width} {height}\n255\n").into_bytes();
+    for index in 0..plane {
+        for channel in 0..3 {
+            // Diffusion decoders emit [-1, 1]; clamping keeps a partially
+            // trained or tiny model from wrapping around instead of saturating.
+            let value = pixels[channel * plane + index];
+            out.push((((value + 1.0) * 0.5).clamp(0.0, 1.0) * 255.0).round() as u8);
         }
     }
+    std::fs::write(path, out)?;
+    Ok(())
+}
 
-    #[test]
-    fn control_image_preprocessing_is_batched_chw_rgb_in_zero_to_one() {
-        let image = DynamicImage::ImageRgb8(RgbImage::from_fn(2, 1, |x, _| match x {
-            0 => Rgb([0, 127, 255]),
-            _ => Rgb([255, 64, 0]),
-        }));
-
-        let pixels = preprocess_control_image(&image, 2, 1, 2);
-        let expected_batch = vec![0.0, 1.0, 127.0 / 255.0, 64.0 / 255.0, 1.0, 0.0];
-        assert_eq!(pixels, [expected_batch.clone(), expected_batch].concat());
-        assert!(pixels.iter().all(|value| (0.0..=1.0).contains(value)));
-    }
-
-    #[test]
-    fn plain_workflow_routes_no_additional_denoiser_inputs() {
-        let inputs =
-            workflow_denoiser_inputs(Path::new("workflow.json"), &[], &[], 8, 8, 1).unwrap();
-        assert!(inputs.is_empty());
-    }
-
-    #[test]
-    fn lora_strengths_route_to_named_scalar_gates() {
-        let inputs = workflow_denoiser_inputs(
-            Path::new("workflow.json"),
-            &[],
-            &[
-                ("style.safetensors".to_owned(), 0.25),
-                ("detail.safetensors".to_owned(), -0.5),
-            ],
-            8,
-            8,
-            1,
-        )
-        .unwrap();
-        assert_eq!(
-            inputs,
-            vec![
-                DenoiserInput {
-                    name: "lora_gate.style".to_owned(),
-                    values: vec![0.25],
-                    shape: vec![],
-                },
-                DenoiserInput {
-                    name: "lora_gate.detail".to_owned(),
-                    values: vec![-0.5],
-                    shape: vec![],
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn single_controlnet_binds_the_declared_unsuffixed_cond_input() {
-        // The exported denoiser declares exactly one `controlnet_cond` input
-        // (mobius `tasks/_controlnet.py`). Pin that name so a regression to
-        // suffixed/renamed ports — which the engine would silently drop — fails
-        // here instead of producing a silent no-op.
-        let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/test-fixtures/controlnet-single");
-        std::fs::create_dir_all(&directory).unwrap();
-        RgbImage::from_pixel(2, 1, Rgb([0, 127, 255]))
-            .save(directory.join("canny.png"))
-            .unwrap();
-        let controlnets = vec![controlnet("canny.safetensors", 0.75, "canny.png")];
-
-        let inputs =
-            workflow_denoiser_inputs(&directory.join("workflow.json"), &controlnets, &[], 2, 1, 2)
-                .unwrap();
-
-        // Exactly one input, bound to the real declared name; strength is fused at
-        // export, so NO `conditioning_scale` runtime input is emitted.
-        assert_eq!(inputs.len(), 1);
-        assert_eq!(inputs[0].name, "controlnet_cond");
-        assert_eq!(inputs[0].shape, vec![2, 3, 1, 2]);
-        assert_eq!(inputs[0].values.len(), 12);
-        assert!(
-            !inputs
-                .iter()
-                .any(|input| input.name.contains("conditioning_scale")),
-            "conditioning_scale is not a declared denoiser input and must never be fed"
-        );
-    }
-
-    #[test]
-    fn multiple_controlnets_fail_loudly_instead_of_silently_dropping() {
-        // Mobius exports a single fused ControlNet only. More than one declared
-        // ControlNet has no backing export, so we must error rather than emit
-        // per-adapter ports the engine would silently drop.
-        let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/test-fixtures/controlnet-multi");
-        std::fs::create_dir_all(&directory).unwrap();
-        for name in ["canny.png", "depth.png"] {
-            RgbImage::from_pixel(2, 1, Rgb([0, 127, 255]))
-                .save(directory.join(name))
-                .unwrap();
+fn parse_args() -> anyhow::Result<Args> {
+    let mut workflow = None;
+    let mut package = None;
+    let mut metadata = None;
+    let mut adapters = None;
+    let mut output = None;
+    let mut prompt_tokens = None;
+    let mut negative_tokens = None;
+    let mut steps = None;
+    let mut overwrite = false;
+    let mut convert_only = false;
+    let mut textproto = false;
+    let mut arguments = std::env::args().skip(1);
+    while let Some(argument) = arguments.next() {
+        let mut value = |flag: &str| -> anyhow::Result<String> {
+            arguments
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("{flag} requires a value"))
+        };
+        match argument.as_str() {
+            "--package" => package = Some(PathBuf::from(value("--package")?)),
+            "--metadata" => metadata = Some(PathBuf::from(value("--metadata")?)),
+            "--adapters" => adapters = Some(PathBuf::from(value("--adapters")?)),
+            "--output" => output = Some(PathBuf::from(value("--output")?)),
+            "--prompt-tokens" => prompt_tokens = Some(parse_tokens(&value("--prompt-tokens")?)?),
+            "--negative-tokens" => {
+                negative_tokens = Some(parse_tokens(&value("--negative-tokens")?)?)
+            }
+            "--steps" => steps = Some(value("--steps")?.parse()?),
+            "--overwrite" => overwrite = true,
+            "--convert-only" => convert_only = true,
+            "--textproto" => textproto = true,
+            "-h" | "--help" => {
+                println!("{USAGE}");
+                std::process::exit(0);
+            }
+            other if other.starts_with('-') => anyhow::bail!("unknown option: {other}"),
+            other => workflow = Some(PathBuf::from(other)),
         }
-        let controlnets = vec![
-            controlnet("canny.safetensors", 0.75, "canny.png"),
-            controlnet("depth.safetensors", 0.25, "depth.png"),
-        ];
-
-        let error =
-            workflow_denoiser_inputs(&directory.join("workflow.json"), &controlnets, &[], 2, 1, 2)
-                .unwrap_err();
-        assert!(
-            error.to_string().contains("single"),
-            "unsupported multi-ControlNet must fail loudly: {error}"
-        );
     }
+    Ok(Args {
+        workflow: workflow.ok_or_else(|| anyhow::anyhow!("{USAGE}"))?,
+        package: package.ok_or_else(|| anyhow::anyhow!("--package is required\n\n{USAGE}"))?,
+        metadata,
+        adapters,
+        output,
+        prompt_tokens: prompt_tokens.unwrap_or_else(|| vec![1, 2]),
+        negative_tokens,
+        steps,
+        overwrite,
+        convert_only,
+        textproto,
+    })
+}
+
+fn parse_tokens(value: &str) -> anyhow::Result<Vec<i64>> {
+    value
+        .split(',')
+        .map(|token| token.trim().parse::<i64>().map_err(anyhow::Error::from))
+        .collect()
 }

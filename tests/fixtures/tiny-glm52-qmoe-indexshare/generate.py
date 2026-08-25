@@ -1,9 +1,57 @@
 #!/usr/bin/env python3
-"""Generate the deterministic tiny GLM-5.2 IndexShare + fused-QMoE fixture.
+"""Generate the deterministic tiny GLM-5.2 fixture(s) used by the native
+IndexShare/QMoE regression and the ``--glm-full-attention`` fallback tests.
 
-The generator intentionally imports Mobius's synthetic test configuration so
-the fixture follows the same exporter path as production GLM-5.2. It is pinned
-to Mobius commit 791773b, the current concat/logical IndexShare emission.
+The generator intentionally imports Mobius's synthetic test configuration
+(``tests/_test_configs.py::ALL_CAUSAL_LM_CONFIGS["glm_moe_dsa"]``) so the
+fixture follows the exact same exporter path as production GLM-5.2, just at
+tiny dimensions. It is pinned to Mobius commit MOBIUS_COMMIT (see below).
+
+Two variants share this script:
+
+* Default (``config.use_dsa=True``): DeepSeek Sparse Attention lowered to two
+  ``pkg.nxrt::IndexShare`` nodes per DSA layer, with routed MoE experts fused
+  into one ``com.microsoft::QMoE`` node per MoE layer. Native-CUDA/CPU only
+  (stock ORT has no ``pkg.nxrt::IndexShare`` implementation).
+* ``--full-attention`` (``config.use_dsa=False``, mirroring the Mobius CLI's
+  ``--glm-full-attention`` feature): plain dense MLA with no IndexShare nodes
+  at all, exported to ``../tiny-glm52-full-attention/`` by default. Still uses
+  fused QMoE (a real ``com.microsoft`` contrib op stock ORT does implement),
+  so this variant is loadable by both the native engine and stock ORT.
+
+Both variants are written as a self-contained ``model.onnx.textproto`` (weights
+inlined as ``raw_data``, no external ``model.onnx.data`` sidecar) using the
+same inlining approach as ``scripts/convert_fixture_to_textproto.py``, because
+stock ORT's textproto path (``Session::new``) creates the session from an
+in-memory byte buffer with no model-directory context and therefore cannot
+resolve external data. The binary ``model.onnx`` Mobius writes as an
+intermediate artifact is never committed (see ``.gitignore``'s ``*.onnx``
+rule); only the ``.textproto`` twin is git-tracked.
+
+Regenerating (required two-step recipe -- this script alone is NOT enough,
+for EITHER variant): ``write_onnx_genai_config`` reproduces
+``model.onnx.textproto``/``tokenizer.json`` byte-for-byte, but its
+``inference_metadata.yaml`` is the pre-canonicalization document Mobius
+commit MOBIUS_COMMIT emits -- not the canonical single-``decoder``-component
+shape actually committed in this directory (or in
+``../tiny-glm52-full-attention/``). After running this script, canonicalize
+with:
+
+    cargo run -p onnx-genai-engine --bin migrate_model_io -- --reemit \\
+        <output-dir>
+
+(the same offline step that brought the other converted fixtures forward
+when the emitter gained the decode contract; see
+``docs/architecture/WORKFLOW_RUNTIME_UNIFICATION.md``). This is required for
+the ``--full-attention`` variant especially: skipping it reintroduces the ten
+hand-authored, never-real auxiliary policy components #1883 removed from
+``../tiny-glm52-full-attention/`` (each referencing a ``policies/*.onnx``
+artifact that was never committed), which fails
+``decoder_recognizer_agreement.rs``'s classification matrix and package
+loading itself (`crates/onnx-genai-ort/src/loader.rs` eagerly resolves every
+declared workflow component's artifact at load time). Verified (2026-08-23):
+``generate.py`` [+ ``--full-attention``] + ``migrate_model_io --reemit``
+reproduces both fixtures' ``inference_metadata.yaml`` byte-identically.
 """
 
 from __future__ import annotations
@@ -21,7 +69,10 @@ from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
 
 SEED = 0
-MOBIUS_COMMIT = "791773b"
+# Mobius commit that landed the production glm_moe_dsa exporter (DSA/IndexShare
+# + --glm-full-attention dense fallback) and the ALL_CAUSAL_LM_CONFIGS tiny
+# entry this generator reads. Update when regenerating against a newer commit.
+MOBIUS_COMMIT = "d33c33b347bac987cbeff52dca6c1d595ac7780f"
 
 
 def _configure_mobius_imports(root: Path) -> None:
@@ -57,6 +108,143 @@ def _write_tokenizer(path: Path) -> None:
     tokenizer.save(str(path))
 
 
+def _inline_to_textproto(onnx_path: Path) -> Path:
+    """Convert ``onnx_path`` (with external data) to a self-contained,
+    git-friendly ``.textproto`` twin with weights inlined as ``raw_data``.
+
+    Mirrors ``scripts/convert_fixture_to_textproto.py`` (which uses
+    ``onnxscript.ir``); reimplemented against ``onnx_ir`` here so the whole
+    fixture is produced by a single Mobius-native tool invocation.
+    """
+    model = ir.load(onnx_path)
+    ir.external_data.set_base_dir(model.graph, onnx_path.parent)
+    ir.external_data.load_to_model(model)
+    out_path = onnx_path.with_suffix(onnx_path.suffix + ".textproto")
+    ir.save(model, out_path, format="textproto")
+    reloaded = ir.load(out_path, format="textproto")
+    n_nodes = sum(1 for _ in reloaded.graph)
+    assert n_nodes > 0, f"{out_path} produced an empty graph"
+    return out_path
+
+
+def build(*, mobius_root: Path, output_dir: Path, full_attention: bool) -> dict:
+    _configure_mobius_imports(mobius_root.resolve())
+
+    from _test_configs import ALL_CAUSAL_LM_CONFIGS, _base_config
+    from mobius._builder import build_from_module
+    from mobius._configs import QuantizationConfig
+    from mobius._registry import registry
+    from mobius.integrations.onnx_genai import write_onnx_genai_config
+    from mobius.integrations.transformers._config_resolver import _default_task_for_model
+
+    overrides = dict(
+        next(overrides for model, overrides, _ in ALL_CAUSAL_LM_CONFIGS if model == "glm_moe_dsa")
+    )
+    if full_attention:
+        overrides["use_dsa"] = False
+    config = _base_config(**overrides)
+    config.dtype = ir.DataType.FLOAT
+    # quant_method must be one of the native-QMoE-ABI methods
+    # (mobius._weight_utils.supported_qmoe_quantization: "gptq", "awq",
+    # "olive") for MoELayer to construct the fused com.microsoft::QMoE node
+    # directly -- matching the deepseek_v4_flash_test.py precedent. "gguf"
+    # is not in that set and falls back to a portable dense per-expert
+    # MatMulNBits representation instead (no QMoE node), which does not
+    # match this fixture's advertised emission below.
+    #
+    # group_size=16 (not 32): MatMulNBits requires block_size <= the linear's
+    # in_features (K). This tiny config's smallest quantized Linear is
+    # kv_b_proj with in_features=kv_lora_rank=16; a group_size of 32 would
+    # exceed it, so the standard MatMulNBits block-quant decomposition pads
+    # the (single, undersized) block up to the full block_size before
+    # dequantizing, producing a real K=16 vs reconstructed-K=32 shape
+    # mismatch when combined with the true (unpadded) activation. Real
+    # DeepSeek/GLM-5.2 checkpoints never hit this: their un-shrunk
+    # kv_lora_rank (512+) is always far larger than any block_size in use.
+    # group_size=16 matches deepseek_v4_flash_test.py's precedent and evenly
+    # divides every quantized Linear's in_features in this tiny config
+    # (16, 32, 64), so no block is ever padded.
+    config.quantization = QuantizationConfig(
+        bits=4,
+        group_size=16,
+        quant_method="gptq",
+        sym=True,
+    )
+
+    model_type = "glm_moe_dsa"
+    module = registry.get(model_type)(config)
+    # build_from_module (not the lower-level registry+task.build combo) is the
+    # production path: it also runs optimize_model()'s EP-aware fusion +
+    # shape-inference stage (QMoE fusion, GQA/Attention fusion, and populating
+    # the logits output's dtype/shape -- required by write_onnx_genai_config's
+    # decoder-workflow contract since mobius#554).
+    package = build_from_module(
+        module,
+        config,
+        task=_default_task_for_model(model_type),
+        execution_provider="cpu",
+    )
+    rng = np.random.default_rng(SEED)
+    for model in package.values():
+        _fill_weights(model, rng)
+
+    output = output_dir
+    output.mkdir(parents=True, exist_ok=True)
+    for name in [
+        "model.onnx",
+        "model.onnx.data",
+        "model.onnx.textproto",
+        "inference_metadata.yaml",
+        "tokenizer.json",
+        "manifest.json",
+    ]:
+        (output / name).unlink(missing_ok=True)
+    package.save(output, external_data="onnx", check_weights=False)
+    write_onnx_genai_config(package, output, config=config)
+    _write_tokenizer(output / "tokenizer.json")
+
+    textproto_path = _inline_to_textproto(output / "model.onnx")
+    # The binary model.onnx/.data are intermediate artifacts only: .onnx is
+    # git-ignored repo-wide and the textproto is now self-contained, so keeping
+    # a stale, unreferenced .data sidecar around would be misleading.
+    (output / "model.onnx").unlink()
+    (output / "model.onnx.data").unlink(missing_ok=True)
+
+    files = {}
+    for name in ["model.onnx.textproto", "inference_metadata.yaml", "tokenizer.json"]:
+        files[name] = (output / name).stat().st_size
+    # Compute emission from the actual built graph rather than assuming it --
+    # a hardcoded list here previously went stale silently (see the
+    # quant_method note above: an unsupported quant_method quietly produced
+    # a dense per-expert MatMulNBits loop with zero QMoE nodes while this
+    # list still claimed QMoE was present).
+    node_ops = {f"{node.domain}::{node.op_type}" for model in package.values() for node in model.graph}
+    # Fixed, human-readable order (not the arbitrary alphabetical order of
+    # `node_ops`): IndexShare (DSA-specific) before QMoE (present in both
+    # modes), matching this fixture's documented emission order.
+    _EMISSION_ORDER = ["pkg.nxrt::IndexShare", "com.microsoft::QMoE"]
+    emission = [op for op in _EMISSION_ORDER if op in node_ops]
+    expected = _EMISSION_ORDER if not full_attention else ["com.microsoft::QMoE"]
+    if emission != expected:
+        raise AssertionError(
+            f"built graph emission {emission} != expected {expected} "
+            f"(full_attention={full_attention}); fixture would not match its "
+            "own manifest and test assumptions"
+        )
+    manifest = {
+        "generator": "tests/fixtures/tiny-glm52-qmoe-indexshare/generate.py",
+        "mobius_commit": MOBIUS_COMMIT,
+        "seed": SEED,
+        "architecture": model_type,
+        "use_dsa": not full_attention,
+        "emission": emission,
+        "prompt_ids": [123],
+        "files": files,
+    }
+    (output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    return manifest
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -67,67 +255,32 @@ def main() -> None:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path(__file__).resolve().parent,
+        default=None,
+        help="Defaults to this script's directory (DSA mode) or "
+        "../tiny-glm52-full-attention (--full-attention).",
+    )
+    parser.add_argument(
+        "--full-attention",
+        action="store_true",
+        help="Export config.use_dsa=False (the --glm-full-attention dense MLA "
+        "fallback) instead of the default DSA/IndexShare path.",
     )
     args = parser.parse_args()
-    _configure_mobius_imports(args.mobius_root.resolve())
 
-    from _test_configs import ALL_CAUSAL_LM_CONFIGS, _base_config
-    from mobius._config_resolver import _default_task_for_model
-    from mobius._configs import QuantizationConfig
-    from mobius._registry import registry
-    from mobius.integrations.onnx_genai import write_onnx_genai_config
-    from mobius.tasks import get_task
+    here = Path(__file__).resolve().parent
+    if args.output_dir is not None:
+        output_dir = args.output_dir
+    elif args.full_attention:
+        output_dir = here.parent / "tiny-glm52-full-attention"
+    else:
+        output_dir = here
 
-    overrides = dict(
-        next(overrides for model, overrides, _ in ALL_CAUSAL_LM_CONFIGS if model == "glm_moe_dsa")
+    manifest = build(
+        mobius_root=args.mobius_root,
+        output_dir=output_dir,
+        full_attention=args.full_attention,
     )
-    config = _base_config(**overrides)
-    config.dtype = ir.DataType.FLOAT
-    config.quantization = QuantizationConfig(
-        bits=4,
-        group_size=32,
-        quant_method="gguf",
-        sym=True,
-    )
-    config.fused_quantized_moe = True
-
-    model_type = "glm_moe_dsa"
-    module = registry.get(model_type)(config)
-    task = get_task(_default_task_for_model(model_type))
-    package = task.build(module, config)
-    rng = np.random.default_rng(SEED)
-    for model in package.values():
-        _fill_weights(model, rng)
-
-    output = args.output_dir
-    output.mkdir(parents=True, exist_ok=True)
-    for name in [
-        "model.onnx",
-        "model.onnx.data",
-        "inference_metadata.yaml",
-        "tokenizer.json",
-        "manifest.json",
-    ]:
-        (output / name).unlink(missing_ok=True)
-    package.save(output, external_data="onnx", check_weights=False)
-    write_onnx_genai_config(package, output, config=config)
-    _write_tokenizer(output / "tokenizer.json")
-
-    files = {}
-    for name in ["model.onnx", "model.onnx.data", "inference_metadata.yaml", "tokenizer.json"]:
-        files[name] = (output / name).stat().st_size
-    manifest = {
-        "generator": "tests/fixtures/tiny-glm52-qmoe-indexshare/generate.py",
-        "mobius_commit": MOBIUS_COMMIT,
-        "seed": SEED,
-        "architecture": model_type,
-        "emission": ["pkg.nxrt::IndexShare", "com.microsoft::QMoE"],
-        "prompt_ids": [123],
-        "expected_tokens": [62, 164, 59, 205, 48, 166, 27, 9, 221, 190, 123, 108],
-        "files": files,
-    }
-    (output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    print(json.dumps(manifest, indent=2))
 
 
 if __name__ == "__main__":

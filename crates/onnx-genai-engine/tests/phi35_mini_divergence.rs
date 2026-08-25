@@ -64,11 +64,11 @@
 //!   -- --ignored --nocapture
 //! ```
 
-#![cfg(all(feature = "native-backend", feature = "cuda"))]
+#![cfg(feature = "native-cuda")]
 
 use onnx_genai_engine::{
     Engine, EngineConfig, EngineDecodeBackend, GenerateOptions, GenerateRequest,
-    NativeDecodeDevice, NativeDecodeSession, ProcessorChain,
+    NativeDecodeDevice, ProcessorChain,
 };
 use onnx_genai_ort::Tokenizer;
 
@@ -95,22 +95,6 @@ const DEFAULT_MODEL_DIR: &str =
 
 /// Resolve the decoder ONNX file inside a model directory. Phi-3.5 ships its
 /// graph under a descriptive filename (not `model.onnx`), so fall back to the
-/// single `*.onnx` file present when `model.onnx` is absent.
-fn resolve_model_onnx(dir: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
-    let default = dir.join("model.onnx");
-    if default.is_file() {
-        return Ok(default);
-    }
-    let mut onnx_files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)?
-        .filter_map(|entry| entry.ok().map(|e| e.path()))
-        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("onnx"))
-        .collect();
-    onnx_files.sort();
-    onnx_files
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("no .onnx file found in {}", dir.display()))
-}
 
 #[test]
 #[ignore = "requires the real Phi-3.5-mini int4 model via PHI35_MINI_E2E_DIR (or the default foundry cache path)"]
@@ -127,8 +111,18 @@ fn phi35_mini_int4_token103_teacher_forced_oracle_is_411() -> anyhow::Result<()>
         return Ok(());
     }
 
-    let model = resolve_model_onnx(&dir)?;
-    let mut session = NativeDecodeSession::load(&model, NativeDecodeDevice::Cpu)?;
+    // Loaded through the ordinary entry point rather than by opening the raw
+    // graph: the teacher-forced step still has to run the loop the package
+    // declares, and building the session directly would measure a decode that
+    // no request can reach.
+    let mut engine = Engine::from_dir(
+        &dir,
+        EngineConfig {
+            decode_backend: EngineDecodeBackend::Native,
+            native_device: Some(NativeDecodeDevice::Cpu),
+            ..EngineConfig::default()
+        },
+    )?;
     let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))?;
 
     // Teacher-forced single greedy step: feed the exact agreed 104-token history
@@ -143,7 +137,7 @@ fn phi35_mini_int4_token103_teacher_forced_oracle_is_411() -> anyhow::Result<()>
         top_logprobs: Some(8),
         ..GenerateOptions::default()
     };
-    let result = session.generate(
+    let result = engine.generate_native_from_token_ids(
         &DIVERGENCE_PREFIX,
         &options,
         &ProcessorChain::new(),

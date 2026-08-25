@@ -1,0 +1,1106 @@
+#!/usr/bin/env python3
+"""Tests for `ab.py`'s host-lock admission.
+
+The interesting half is not that a locked run is allowed -- it is that each
+*unprotected* shape is refused, and refused distinguishably. A gate that
+allowed one of them would put load on a host somebody else had declared, and
+the resulting numbers would carry a `host_lock` label saying otherwise.
+
+The end-to-end cells drive the real `hostlock.sh` and a stub arm binary that
+prints a result line and exits. They cost no measurable CPU: nothing is
+benchmarked, which is what lets this run in CI on a shared runner.
+"""
+
+from __future__ import annotations
+
+import csv
+import os
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from ab import (  # noqa: E402
+    ancestry,
+    lock_verdict,
+    lock_columns,
+    parse_provenance,
+    read_provenance,
+    window_label,
+)
+
+AB = Path(__file__).resolve().parent / "ab.py"
+SWEEP = Path(__file__).resolve().parent / "sweep_decode.py"
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import sweep_decode  # noqa: E402
+HOSTLOCK = Path(__file__).resolve().parents[1] / "hostlock.sh"
+
+# A stub arm: prints the line `ab.py` parses and exits. Using a real benchmark
+# here would make the admission test cost minutes and a quiet host, which is
+# the thing the lock exists to ration.
+STUB_ARM = """#!/bin/sh
+echo "native=1.000 ms ort=2.000 ms native/ort=0.500 native_p90=1.1 ort_p90=2.1 \
+native_min=0.9 ort_min=1.9 native_spread=0.2 ort_spread=0.2 parity=PASS"
+"""
+
+
+def prov(state: str, pid: str = "none", owner: str = "none") -> dict[str, str]:
+    return {
+        "hostlock_state": state,
+        "held_by": owner,
+        "held_pid": pid,
+        "runnable": "3",
+        "contended": "no",
+    }
+
+
+class Verdict(unittest.TestCase):
+    """The decision table, as a table."""
+
+    def test_a_declaration_held_by_an_ancestor_admits_the_run(self):
+        label, refusal = lock_verdict(prov("HELD", "4242", "leon"), {1, 99, 4242})
+        self.assertIsNone(refusal)
+        self.assertEqual(label, "mine:leon")
+
+    def test_a_declaration_held_by_a_peer_stops_the_run(self):
+        label, refusal = lock_verdict(prov("HELD", "4242", "roy"), {1, 99})
+        self.assertIsNotNone(refusal)
+        self.assertEqual(label, "foreign:roy")
+
+    def test_a_lock_held_by_a_child_does_not_cover_the_matrix(self):
+        """The incident this gate exists for.
+
+        One `hostlock.sh run` per benchmark child releases the lock between
+        arms, so the host reads idle in the gap and a peer starts a sweep in
+        the middle of somebody's interleaved A/B. A child's pid is not in our
+        ancestry, so the shape is refused even though a lock is genuinely
+        held.
+        """
+        mine = os.getpid()
+        child = mine + 1000000  # not an ancestor of anything we are
+        _, refusal = lock_verdict(prov("HELD", str(child), "leon"), ancestry(mine))
+        self.assertIsNotNone(refusal)
+
+    def test_every_unprotected_state_is_refused_and_labelled_distinctly(self):
+        # The mapping is the specification. Two states share the `unknown`
+        # label on purpose -- an empty reading and a literal UNKNOWN are the
+        # same fact -- and every other one is distinct, because a reader has to
+        # be able to tell a host that had no lock from one whose lock died
+        # under it.
+        expected = {
+            "FREE": "free",
+            "STALE": "stale:roy",
+            "EXPIRED": "expired:roy",
+            "UNUSABLE": "unusable",
+            "UNKNOWN": "unknown",
+            "": "unknown",
+        }
+        for state, want in expected.items():
+            label, refusal = lock_verdict(prov(state, "7", "roy"), {7})
+            self.assertIsNotNone(refusal, f"{state} must not admit a run")
+            self.assertEqual(label, want, state)
+        self.assertEqual(
+            len(set(expected.values())),
+            5,
+            "collapsing any further would hide a distinction the run needs",
+        )
+
+    def test_an_unreadable_lock_is_refused_rather_than_assumed_free(self):
+        label, refusal = lock_verdict({}, {1})
+        self.assertEqual(label, "unknown")
+        self.assertIsNotNone(refusal)
+
+    def test_a_broken_hostlock_reads_as_unreadable_not_as_free(self):
+        def explode(*_a, **_kw):
+            raise OSError("no such tool")
+
+        self.assertEqual(read_provenance(runner=explode), {})
+
+
+class Window(unittest.TestCase):
+    """The label has to describe the whole run, not one end of it."""
+
+    def test_a_steady_holder_keeps_the_label(self):
+        before = prov("HELD", "17", "leon")
+        self.assertEqual(window_label("mine:leon", before, dict(before)), "mine:leon")
+
+    def test_a_failed_second_reading_is_not_a_handoff(self):
+        """`changed` asserts custody moved. An unreadable end says nothing.
+
+        Stamping `changed` for a lock that could not be re-read blames a
+        completed, genuinely protected matrix for a handoff that never
+        happened -- and, worse, makes a real handoff indistinguishable from a
+        60-second timeout on the final read.
+        """
+        before = prov("HELD", "17", "leon")
+        self.assertEqual(window_label("mine:leon", before, {}), "unverified-end")
+
+    def test_a_lock_that_changed_hands_is_not_reported_as_held_throughout(self):
+        before = prov("HELD", "17", "leon")
+        for after in (
+            prov("FREE"),
+            prov("HELD", "17", "roy"),
+            prov("HELD", "18", "leon"),
+        ):
+            self.assertEqual(
+                window_label("mine:leon", before, after),
+                "changed",
+                after,
+            )
+
+
+class Columns(unittest.TestCase):
+    """The provenance-key to column-name mapping, as a table.
+
+    Every value below is distinct on purpose: two columns reading each
+    other's provenance key, or one reading a plausible neighbour, produces a
+    row whose numbers sit under names that do not describe them. A cell that
+    only checked the keys were present could not tell.
+    """
+
+    def test_each_column_carries_the_field_it_is_named_after(self):
+        fields = {
+            "held_by": "leon",
+            "held_pid": "4242",
+            "runnable": "7",
+            "held_secs": "99",
+            "contended": "no",
+            "hostlock_state": "HELD",
+        }
+        self.assertEqual(
+            lock_columns("mine:leon", fields),
+            {
+                "host_lock": "mine:leon",
+                "lock_owner": "leon",
+                "lock_anchor_pid": "4242",
+                "runnable_at_start": "7",
+            },
+        )
+
+    def test_a_missing_reading_stamps_placeholders_rather_than_blanks(self):
+        # An empty cell in a CSV reads as "not applicable". These rows always
+        # have an answer, even when the answer is that there was none.
+        self.assertEqual(
+            lock_columns("unknown", {}),
+            {
+                "host_lock": "unknown",
+                "lock_owner": "none",
+                "lock_anchor_pid": "none",
+                "runnable_at_start": "unknown",
+            },
+        )
+
+
+class Ancestry(unittest.TestCase):
+    def test_the_walk_terminates_on_a_cycle(self):
+        # A reparented or namespaced process can report a parent already in
+        # the chain. Without the seen-set this loops until `limit`, and with a
+        # larger limit it would hang the harness before it ran anything.
+        self.assertEqual(ancestry(5, parent=lambda pid: 5), {5})
+
+    def test_the_walk_stops_at_init(self):
+        chain = {5: 4, 4: 1, 1: 0}
+        self.assertEqual(ancestry(5, parent=lambda pid: chain.get(pid)), {1, 4, 5})
+
+    def test_a_real_chain_contains_this_process_and_its_parent(self):
+        chain = ancestry(os.getpid())
+        self.assertIn(os.getpid(), chain)
+        self.assertIn(os.getppid(), chain)
+
+
+class Parsing(unittest.TestCase):
+    def test_the_oneline_format_round_trips(self):
+        text = "hostlock_state=HELD held_by=leon held_pid=17 runnable=4 reason=x"
+        self.assertEqual(parse_provenance(text)["held_by"], "leon")
+        self.assertEqual(parse_provenance(text)["held_pid"], "17")
+
+    def test_the_real_script_emits_the_keys_this_gate_reads(self):
+        """Against the script, not against my memory of it.
+
+        A key rename in `hostlock.sh` would otherwise leave the gate reading
+        `hostlock_state` forever, finding nothing, and -- because the gate is
+        fail-closed -- refusing every run on a correctly locked host. The
+        failure would be loud, but it would look like a lock bug rather than a
+        parser one.
+        """
+        with tempfile.TemporaryDirectory(dir=str(AB.parent)) as tmp:
+            env = dict(os.environ, HOSTLOCK_DIR=f"{tmp}/hl", HOSTLOCK_PRIVATE_OK="1")
+            out = subprocess.run(
+                ["bash", str(HOSTLOCK), "provenance", "--oneline"],
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=60,
+            )
+            fields = parse_provenance(out.stdout)
+        for key in ("hostlock_state", "held_by", "held_pid", "runnable", "contended"):
+            self.assertIn(key, fields, out.stdout)
+
+
+class EndToEnd(unittest.TestCase):
+    """`ab.py` invoked for real, with a stub arm and a scratch lock."""
+
+    def setUp(self):
+        # Under the repo, never the shared lock and never a temp dir outside
+        # it: a test that used the real lock directory could release a lock a
+        # colleague was relying on.
+        self.tmp = tempfile.mkdtemp(dir=str(AB.parent))
+        self.arm = Path(self.tmp) / "arm.sh"
+        self.arm.write_text(STUB_ARM)
+        self.arm.chmod(0o755)
+        self.csv = Path(self.tmp) / "out.csv"
+        self.env = dict(
+            os.environ,
+            HOSTLOCK_DIR=f"{self.tmp}/hl",
+            HOSTLOCK_PRIVATE_OK="1",
+        )
+
+    def tearDown(self):
+        subprocess.run(["rm", "-rf", self.tmp], check=False)
+
+    def ab_args(self):
+        return [
+            sys.executable,
+            str(AB),
+            "--arms",
+            f"a={self.arm}",
+            "--models",
+            "fixture.onnx",
+            "--threads",
+            "1",
+            "--trials",
+            "1",
+            "--runs",
+            "1",
+            "--warmups",
+            "0",
+            "--csv",
+            str(self.csv),
+        ]
+
+    def test_an_unlocked_matrix_is_refused_before_any_arm_runs(self):
+        out = subprocess.run(
+            self.ab_args(), capture_output=True, text=True, env=self.env, timeout=300
+        )
+        self.assertEqual(out.returncode, 3, out.stdout + out.stderr)
+        self.assertIn("refusing to measure", out.stderr)
+        self.assertIn("hostlock.sh run --owner", out.stderr)
+        self.assertFalse(
+            self.csv.exists(), "a refused run must not leave a result file"
+        )
+
+    def test_the_wrapped_invocation_is_admitted_and_stamps_every_row(self):
+        out = subprocess.run(
+            [
+                "bash",
+                str(HOSTLOCK),
+                "run",
+                "--owner",
+                "leon-selftest",
+                "--reason",
+                "ab-admission-selftest",
+                "--",
+                *self.ab_args(),
+            ],
+            capture_output=True,
+            text=True,
+            env=self.env,
+            timeout=300,
+        )
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        # By column name and value, not by substring: a rename to
+        # `host_lock_unused` leaves the owner in the file and every
+        # `"host_lock" in text` assertion green while nothing downstream can
+        # find the field.
+        rows = list(csv.DictReader(self.csv.read_text().splitlines()))
+        self.assertTrue(rows)
+        for row in rows:
+            self.assertEqual(row["host_lock"], "mine:leon-selftest", row)
+            self.assertEqual(row["lock_owner"], "leon-selftest", row)
+            self.assertNotEqual(row["lock_anchor_pid"], "none", row)
+            self.assertTrue(row["runnable_at_start"].isdigit(), row)
+
+    def test_an_arm_with_env_overrides_still_runs(self):
+        """The gate refactor deleted `import os`, and only this path uses it.
+
+        Every other cell passes an arm with an empty override dict, which is
+        falsy, so the `dict(os.environ)` line is never reached and a missing
+        import is invisible. `--arm-env` is the documented way to A/B a
+        feature flag with one binary in both arms -- the most common use of
+        this harness -- and it raised `NameError` after taking the lock and
+        before writing a single row.
+        """
+        args = [*self.ab_args(), "--arm-env", "a=ONNX_GENAI_TEST_FLAG=1"]
+        out = subprocess.run(
+            [
+                "bash",
+                str(HOSTLOCK),
+                "run",
+                "--owner",
+                "leon",
+                "--reason",
+                "arm-env regression",
+                "--",
+                *args,
+            ],
+            capture_output=True,
+            text=True,
+            env=self.env,
+            timeout=600,
+        )
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertNotIn("NameError", out.stderr)
+        with self.csv.open() as fh:
+            rows = list(csv.DictReader(fh))
+        self.assertTrue(rows)
+        self.assertEqual(rows[0]["host_lock"], "mine:leon", rows[0])
+
+    def test_unlocked_does_not_override_a_peers_declaration(self):
+        """The escape hatch protects our labels, not their run.
+
+        `--unlocked` exists so an unprotected run cannot be quoted later as a
+        protected one. That reasoning is entirely about our own rows, and it
+        does not extend to a box somebody else has declared: the damage there
+        lands on their measurement, where no label of ours can reach it.
+        """
+        anchor = subprocess.Popen(["sleep", "120"])
+        try:
+            taken = subprocess.run(
+                [
+                    "bash",
+                    str(HOSTLOCK),
+                    "acquire",
+                    "--owner",
+                    "someone-else",
+                    "--reason",
+                    "peer-declaration",
+                    "--pid",
+                    str(anchor.pid),
+                ],
+                capture_output=True,
+                text=True,
+                env=self.env,
+                timeout=300,
+            )
+            self.assertEqual(taken.returncode, 0, taken.stdout + taken.stderr)
+            out = subprocess.run(
+                [*self.ab_args(), "--unlocked"],
+                capture_output=True,
+                text=True,
+                env=self.env,
+                timeout=300,
+            )
+            self.assertEqual(out.returncode, 3, out.stdout + out.stderr)
+            self.assertIn("someone-else", out.stderr)
+            self.assertFalse(self.csv.exists())
+        finally:
+            anchor.kill()
+            anchor.wait()
+
+    def test_unlocked_by_request_runs_but_marks_the_rows(self):
+        out = subprocess.run(
+            [*self.ab_args(), "--unlocked"],
+            capture_output=True,
+            text=True,
+            env=self.env,
+            timeout=300,
+        )
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("WARNING: running unlocked", out.stderr)
+        rows = list(csv.DictReader(self.csv.read_text().splitlines()))
+        self.assertTrue(rows)
+        for row in rows:
+            self.assertEqual(
+                row["host_lock"],
+                "unlocked:free",
+                "the escape hatch must leave the rows self-identifying",
+            )
+
+
+# `${WIDTH_FIELDS-...}` so a cell can drop or rewrite the realized-width
+# report without a second stub: an older binary that never emitted them is a
+# case the sweep has to survive, and it is one `env` away from here.
+STUB_BENCH = """#!/bin/sh
+# Emits one line in `bench_generic`'s paired format. The numbers are fixed:
+# nothing here measures anything, it only has to parse.
+W="${WIDTH_FIELDS-native_pool_width=1 native_path=flat native_task_width=1 \\
+native_cpus=32 native_width_as_requested=yes}"
+echo "shape=decode native=1.000 ms ort=2.000 ms native/ort=0.500 \\
+native_p90=1.100 ort_p90=2.200 native_min=0.900 ort_min=1.800 $W"
+"""
+
+
+class EndOfWindow(unittest.TestCase):
+    """A streamed driver cannot relabel printed rows, so the exit code is it."""
+
+    def test_a_handoff_is_a_failure_and_says_to_discard(self):
+        code, msg = sweep_decode.end_of_window_verdict("mine:leon", "changed")
+        self.assertEqual(code, 4)
+        self.assertIn("discard", msg)
+
+    def test_an_unreadable_end_is_reported_without_claiming_a_handoff(self):
+        # The distinction `window_label` exists to preserve: a failed read is
+        # not evidence of a takeover, and telling someone to throw away a
+        # sound matrix on that basis is its own defect.
+        code, msg = sweep_decode.end_of_window_verdict("mine:leon", "unverified-end")
+        self.assertEqual(code, 5)
+        self.assertNotIn("discard", msg)
+        self.assertNotIn("spans the change", msg)
+        self.assertIn("unverified", msg)
+
+    def test_an_unchanged_window_is_silent(self):
+        self.assertEqual(
+            sweep_decode.end_of_window_verdict("mine:leon", "mine:leon"), (0, None)
+        )
+
+
+class WidthVerdict(unittest.TestCase):
+    """Does the row describe the route its `t` column names?
+
+    A thread sweep whose leftmost column takes a serial short-circuit is not
+    a scaling curve, and the harness printed four such rows before anybody
+    noticed -- because `--native-threads 1` was a request the table reported
+    back as though it were a measurement.
+
+    The separation these cells pin: a **reduced** width is the engine's cap
+    working correctly on a shared or cpuset-confined box and must not fail the
+    sweep (#1802 -- a check only an idle 32-core host can pass is an exclusive
+    -host assumption in disguise), while a **different route** is categorical
+    and fails anywhere.
+    """
+
+    def cells(self, *answers, path="pool", pool="4", task="4"):
+        return [
+            {
+                "as_requested": a,
+                "path": path,
+                "pool_width": pool,
+                "task_width": task,
+                "cpus": "32",
+            }
+            for a in answers
+        ]
+
+    def test_a_realized_request_is_silent(self):
+        self.assertEqual(
+            sweep_decode.width_verdict(4, self.cells("yes", "yes")),
+            ("yes", None, False),
+        )
+
+    def test_a_capped_width_is_labelled_and_scoped_but_not_a_failure(self):
+        # The regression this guards: an SMT- or cpuset-capped cell is the
+        # engine obeying policy. Failing it would make the sweep runnable only
+        # on a quiet host, which is the assumption #1802 forbids.
+        # Distinct values throughout, including between the two widths: a
+        # message built from the wrong field reads perfectly well when both
+        # numbers are the same.
+        label, why, fatal = sweep_decode.width_verdict(
+            16, self.cells("no", "no", pool="15", task="8")
+        )
+        self.assertEqual(label, "capped")
+        self.assertFalse(fatal)
+        self.assertIn("pool width 15", why)
+        self.assertIn("task width 8", why)
+        self.assertIn("32 cpus", why)
+        self.assertIn("not a defect", why)
+
+    def test_a_capped_width_fails_only_when_the_caller_asked_it_to(self):
+        label, _, fatal = sweep_decode.width_verdict(
+            16, self.cells("no"), require=True
+        )
+        self.assertEqual(label, "capped")
+        self.assertTrue(fatal)
+
+    def test_a_binary_that_cannot_report_width_is_not_read_as_agreement(self):
+        # `absent` and `capped` are different findings: one says the request
+        # was reduced, the other says nothing here can tell you either way.
+        label, why, fatal = sweep_decode.width_verdict(8, self.cells("absent"))
+        self.assertEqual(label, "absent")
+        self.assertIn("unverified", why)
+        self.assertFalse(fatal)
+        self.assertTrue(sweep_decode.width_verdict(8, self.cells("absent"), True)[2])
+
+    def test_a_request_that_never_reached_the_engine_is_fatal(self):
+        label, why, fatal = sweep_decode.width_verdict(8, self.cells("n/a"))
+        self.assertEqual(label, "not-requested")
+        self.assertIn("did not reach", why)
+        self.assertTrue(fatal)
+
+    def test_the_documented_opt_out_is_not_reported_as_a_lost_request(self):
+        # `--native-threads 0` is bench_generic's documented way to opt out of
+        # the bounded pool, so `n/a` is the honest answer to a question we
+        # chose not to ask. Calling it "the knob did not reach the engine"
+        # would be a false statement about a deliberate input.
+        self.assertEqual(
+            sweep_decode.width_verdict(0, self.cells("n/a")), ("opted-out", None, False)
+        )
+
+    def test_trials_that_disagree_are_not_medianed_silently(self):
+        label, why, fatal = sweep_decode.width_verdict(8, self.cells("yes", "no"))
+        self.assertEqual(label, "varied")
+        self.assertIn("not all on the same route", why)
+        self.assertTrue(fatal)
+
+    def test_trials_on_two_routes_are_varied_even_when_both_say_yes(self):
+        # Both trials got the width they asked for, so `as_requested` agrees
+        # -- and they were still different programs. Only the paths show it.
+        cells = self.cells("yes", path="flat", pool="1", task="1") + self.cells(
+            "yes", path="pool", pool="1", task="1"
+        )
+        label, why, fatal = sweep_decode.width_verdict(1, cells)
+        self.assertEqual(label, "varied")
+        self.assertTrue(fatal)
+        self.assertIn("flat", why)
+        self.assertIn("pool", why)
+
+    def test_a_trial_with_no_route_to_report_does_not_make_a_cell_varied(self):
+        # `unresolved` is the absence of a route, not a second one: a cell
+        # that got the width it asked for should not be branded incomparable
+        # because one trial never built the pool.
+        cells = self.cells("yes", path="unresolved") + self.cells(
+            "yes", path="spmd-pool"
+        )
+        self.assertEqual(sweep_decode.width_verdict(4, cells), ("yes", None, False))
+
+    def test_the_width_fields_are_read_off_a_real_result_line(self):
+        # Every field gets a distinct value on purpose. A fixture whose fields
+        # share a number cannot fail when two of them are swapped, and the
+        # Rust side (bench_generic.rs) keeps the same discipline for the same
+        # reason.
+        line = (
+            "result: native=1.0 ms ort=2.0 ms native/ort=0.5 native_p90=1.1 "
+            "ort_p90=2.1 native_min=0.9 ort_min=1.9 native_threads=4 "
+            "native_pool_width=15 native_path=pool native_task_width=8 "
+            "native_cpus=32 native_width_as_requested=no arm=x parity=PASS"
+        )
+        self.assertEqual(
+            sweep_decode.width_report(line),
+            {
+                "pool_width": "15",
+                "path": "pool",
+                "task_width": "8",
+                "cpus": "32",
+                "as_requested": "no",
+            },
+        )
+
+    def test_a_line_without_the_fields_reports_absent_rather_than_guessing(self):
+        self.assertEqual(
+            sweep_decode.width_report("result: native=1.0 ms ort=2.0 ms")[
+                "as_requested"
+            ],
+            "absent",
+        )
+
+
+class RouteVerdict(unittest.TestCase):
+    """The cross-column check, and the one that catches the original defect.
+
+    `--native-threads 1` takes the dispatcher's `total_workers <= 1` serial
+    short-circuit rather than a one-worker pool. Each cell on its own looks
+    fine -- width 1 was asked for and width 1 came back -- so only a
+    comparison *between* columns can see that the leftmost point is a
+    different program from the rest of the curve.
+    """
+
+    def test_one_route_everywhere_is_silent(self):
+        self.assertIsNone(
+            sweep_decode.route_verdict({1: {"pool"}, 4: {"pool"}, 16: {"pool"}})
+        )
+
+    def test_a_serial_leftmost_column_is_named_with_its_widths(self):
+        why = sweep_decode.route_verdict({1: {"flat"}, 4: {"pool"}, 16: {"pool"}})
+        self.assertIn("flat: t=1", why)
+        self.assertIn("pool: t=4,16", why)
+        self.assertIn("not a scaling curve", why)
+
+    def test_a_model_that_never_decoded_is_not_a_second_route(self):
+        # `unresolved` is what the binary reports when the decode pool was
+        # never built -- normal for a model that does not take this path
+        # (decode_spmd.rs:3338). Counting it as a route would fail a sweep for
+        # including such a model, which is a false report of a route split.
+        self.assertIsNone(
+            sweep_decode.route_verdict({2: {"unresolved"}, 4: {"spmd-pool"}})
+        )
+
+    def test_an_unreportable_route_is_not_counted_as_a_second_one(self):
+        # A binary too old to emit the fields would otherwise read as a route
+        # change, which is a different (and false) claim from "unverified".
+        self.assertIsNone(
+            sweep_decode.route_verdict({1: {"absent"}, 4: {"pool"}, 8: {"?"}})
+        )
+
+    def test_a_route_split_within_one_width_is_reported(self):
+        # Same width, two models, different routes: still not one function of
+        # thread count.
+        why = sweep_decode.route_verdict({4: {"pool", "flat"}})
+        self.assertIn("flat: t=4", why)
+        self.assertIn("pool: t=4", why)
+
+
+class ExitPrecedence(unittest.TestCase):
+    """One number gets out, so which finding it names is a decision.
+
+    Left implicit it becomes "whichever check ran last", which is how a
+    definite structural finding ends up reported as a maybe.
+    """
+
+    def test_a_route_defect_outranks_an_unreadable_end_of_window(self):
+        # 5 is "I could not verify the end of the window"; 6 is "this column
+        # is not the route it claims". The certainty should not be reported
+        # as the doubt.
+        self.assertEqual(sweep_decode.exit_code(5, True), 6)
+
+    def test_custody_outranks_a_route_defect(self):
+        # Every row is discarded either way, so 4 is the instruction the
+        # caller needs and a column finding would only bury it.
+        self.assertEqual(sweep_decode.exit_code(4, True), 4)
+
+    def test_a_clean_window_still_reports_the_route(self):
+        self.assertEqual(sweep_decode.exit_code(0, True), 6)
+
+    def test_nothing_structural_leaves_the_window_code_alone(self):
+        self.assertEqual(
+            [sweep_decode.exit_code(c, False) for c in (0, 4, 5)], [0, 4, 5]
+        )
+
+
+class SweepDecodeGate(unittest.TestCase):
+    """The thread sweep is the most saturating thing we run.
+
+    It is therefore the one driver where "somebody forgot the wrapper" costs
+    the most, both to the run and to whoever else is on the box.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(dir=str(SWEEP.parent))
+        self.bench = Path(self.tmp) / "bench.sh"
+        self.bench.write_text(STUB_BENCH)
+        self.bench.chmod(0o755)
+        self.env = dict(
+            os.environ, HOSTLOCK_DIR=f"{self.tmp}/hl", HOSTLOCK_PRIVATE_OK="1"
+        )
+
+    def tearDown(self):
+        subprocess.run(["rm", "-rf", self.tmp], check=False)
+
+    def args(self):
+        return [
+            sys.executable,
+            str(SWEEP),
+            "--binary",
+            str(self.bench),
+            "--models",
+            "m.onnx",
+            "--threads",
+            "1",
+            "--trials",
+            "1",
+            "--runs",
+            "1",
+            "--warmups",
+            "0",
+        ]
+
+    def test_a_sweep_whose_lock_changed_hands_reports_it_and_fails(self):
+        """The rows are already printed, so the only honest move is to fail.
+
+        A sweep whose custody moved is not half-good data: the thread counts
+        above and below the change were compared across it. The fixture
+        rewrites `owner=` in the scratch lock while the stub bench runs, which
+        is what a real takeover looks like to the end-of-window read.
+        """
+        handoff = Path(self.tmp) / "handoff.sh"
+        handoff.write_text(
+            "#!/bin/sh\n"
+            'sed -i "s/^owner=.*/owner=someone-else/" "$HOSTLOCK_DIR/meta"\n'
+            + STUB_BENCH.split("\n", 1)[1]
+        )
+        handoff.chmod(0o755)
+        args = self.args()
+        args[args.index("--binary") + 1] = str(handoff)
+        out = subprocess.run(
+            [
+                "bash",
+                str(HOSTLOCK),
+                "run",
+                "--owner",
+                "leon",
+                "--reason",
+                "handoff fixture",
+                "--",
+                *args,
+            ],
+            capture_output=True,
+            text=True,
+            env=self.env,
+            timeout=600,
+        )
+        self.assertIn("host_lock=changed", out.stderr)
+        self.assertIn("discard", out.stderr)
+        # 4 exactly. A caller running several matrices has to tell "the lock
+        # changed hands" from "the binary crashed" (1) and from "the host was
+        # not mine" (3), and `!= 0` pins none of that.
+        self.assertEqual(out.returncode, 4, out.stdout + out.stderr)
+
+    def sweep(self, args, env=None, reason="width"):
+        return subprocess.run(
+            [
+                "bash",
+                str(HOSTLOCK),
+                "run",
+                "--owner",
+                "leon",
+                "--reason",
+                reason,
+                "--",
+                *args,
+            ],
+            capture_output=True,
+            text=True,
+            env=env or self.env,
+            timeout=600,
+        )
+
+    def rows(self, out):
+        return [
+            line.split()
+            for line in out.stdout.splitlines()
+            if line.split()[:1] == ["m"]
+        ]
+
+    def test_a_capped_width_is_labelled_and_the_sweep_still_leaves_with_zero(self):
+        """The #1802 case, and the reason this check is not a width demand.
+
+        A cell that asked for 16 lanes and got 8 because the host's SMT cap or
+        a cpuset said so is the engine behaving correctly. Failing the sweep
+        for it would make the whole harness runnable only on a large idle box
+        -- an exclusive-host assumption smuggled in as a correctness check --
+        and it would brand as invalid exactly the capped-scaling rows the
+        sweep exists to surface.
+        """
+        env = dict(
+            self.env,
+            WIDTH_FIELDS=(
+                "native_pool_width=15 native_path=pool native_task_width=8 "
+                "native_cpus=32 native_width_as_requested=no"
+            ),
+        )
+        out = self.sweep(self.args(), env=env)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("not a defect", out.stderr)
+        # Second from the right: the width answer sits beside the lock label,
+        # because a row needs both to be worth anything -- who held the box,
+        # and whether the column describes the route.
+        self.assertEqual(self.rows(out)[0][-2], "capped")
+
+    def test_the_same_capped_cell_fails_only_when_the_caller_asks(self):
+        env = dict(
+            self.env,
+            WIDTH_FIELDS=(
+                "native_pool_width=8 native_path=pool native_task_width=8 "
+                "native_cpus=32 native_width_as_requested=no"
+            ),
+        )
+        out = self.sweep([*self.args(), "--require-width"], env=env)
+        self.assertEqual(out.returncode, 6, out.stdout + out.stderr)
+        self.assertEqual(self.rows(out)[0][-2], "capped")
+
+    def test_a_column_on_a_different_route_fails_the_sweep(self):
+        """The defect this file was written for, end to end.
+
+        Roy published four decode rows at width 1 before learning that
+        `--native-threads 1` takes the dispatcher's serial short-circuit
+        rather than a one-worker pool. Every cell passes its own check --
+        width 1 asked, width 1 delivered -- so only the comparison between
+        columns can see that the leftmost point is a different program. The
+        rows still print; the exit code is what stops them being quoted as a
+        scaling curve.
+        """
+        branching = Path(self.tmp) / "branching.sh"
+        branching.write_text(
+            "#!/bin/sh\n"
+            'if [ "$4" = "1" ]; then\n'
+            "  W='native_pool_width=1 native_path=flat native_task_width=1 "
+            "native_cpus=32 native_width_as_requested=yes'\n"
+            "else\n"
+            "  W='native_pool_width=4 native_path=pool native_task_width=4 "
+            "native_cpus=32 native_width_as_requested=yes'\n"
+            "fi\n"
+            'echo "shape=decode native=1.000 ms ort=2.000 ms native/ort=0.500 '
+            'native_p90=1.100 ort_p90=2.200 native_min=0.900 ort_min=1.800 $W"\n'
+        )
+        branching.chmod(0o755)
+        args = self.args()
+        args[args.index("--binary") + 1] = str(branching)
+        args[args.index("--threads") + 1 : args.index("--threads") + 2] = ["1", "4"]
+        out = self.sweep(args)
+        self.assertEqual(out.returncode, 6, out.stdout + out.stderr)
+        self.assertIn("flat: t=1", out.stderr)
+        self.assertIn("pool: t=4", out.stderr)
+        self.assertIn("not a scaling curve", out.stderr)
+        # Each cell on its own is satisfied: the finding is between them.
+        self.assertEqual([r[-2] for r in self.rows(out)], ["yes", "yes"])
+
+    def test_trials_that_disagree_within_a_cell_are_caught_through_main(self):
+        """Pins the per-trial aggregation, not just the verdict function.
+
+        Every other end-to-end cell runs `--trials 1`, where a bug that reads
+        only the first trial is indistinguishable from one that reads them
+        all. This stub alternates on a counter file, so the second trial of
+        the cell is on a different route from the first.
+        """
+        alternating = Path(self.tmp) / "alternating.sh"
+        alternating.write_text(
+            "#!/bin/sh\n"
+            'n=$(cat "$COUNTER" 2>/dev/null || echo 0)\n'
+            'echo $((n + 1)) > "$COUNTER"\n'
+            'if [ "$n" = "0" ]; then\n'
+            "  W='native_pool_width=1 native_path=flat native_task_width=1 "
+            "native_cpus=32 native_width_as_requested=yes'\n"
+            "else\n"
+            "  W='native_pool_width=1 native_path=pool native_task_width=1 "
+            "native_cpus=32 native_width_as_requested=no'\n"
+            "fi\n"
+            'echo "shape=decode native=1.000 ms ort=2.000 ms native/ort=0.500 '
+            'native_p90=1.100 ort_p90=2.200 native_min=0.900 ort_min=1.800 $W"\n'
+        )
+        alternating.chmod(0o755)
+        args = self.args()
+        args[args.index("--binary") + 1] = str(alternating)
+        args[args.index("--trials") + 1] = "2"
+        env = dict(self.env, COUNTER=f"{self.tmp}/counter")
+        out = self.sweep(args, env=env)
+        self.assertEqual(out.returncode, 6, out.stdout + out.stderr)
+        self.assertEqual(self.rows(out)[0][-2], "varied")
+        self.assertIn("not of one thing", out.stderr)
+        # Both trials' routes reach the cross-column check, not just the
+        # first: dropping the second would lose the only record that this
+        # width ran on two of them.
+        self.assertIn("flat: t=1", out.stderr)
+        self.assertIn("pool: t=1", out.stderr)
+
+    def test_a_handoff_still_outranks_a_route_defect(self):
+        """The other side of the precedence, and it goes the other way.
+
+        Custody changing mid-sweep discards every row regardless of route, so
+        4 is the instruction the caller needs; adding a finding about columns
+        they are about to throw away would bury it.
+        """
+        handoff = Path(self.tmp) / "handoff2.sh"
+        handoff.write_text(
+            "#!/bin/sh\n"
+            'sed -i "s/^owner=.*/owner=someone-else/" "$HOSTLOCK_DIR/meta"\n'
+            + STUB_BENCH.split("\n", 1)[1]
+        )
+        handoff.chmod(0o755)
+        args = self.args()
+        args[args.index("--binary") + 1] = str(handoff)
+        env = dict(
+            self.env,
+            WIDTH_FIELDS=(
+                "native_pool_width=1 native_path=flat native_task_width=1 "
+                "native_cpus=32 native_width_as_requested=n/a"
+            ),
+        )
+        out = self.sweep(args, env=env)
+        self.assertEqual(out.returncode, 4, out.stdout + out.stderr)
+        self.assertIn("discard", out.stderr)
+
+    def test_a_wedged_bench_child_does_not_squat_on_the_host_lock(self):
+        """A hung child holds the whole box, which is the outcome the lock exists to prevent.
+
+        `subprocess.run` without a timeout waits forever, and this wrapper is
+        the lock holder for the whole sweep -- so one wedged bench would park
+        a declaration on a shared machine indefinitely and every other agent
+        would read it as legitimate occupancy.
+        """
+        wedged = Path(self.tmp) / "wedged.sh"
+        wedged.write_text("#!/bin/sh\nsleep 120\n")
+        wedged.chmod(0o755)
+        args = self.args()
+        args[args.index("--binary") + 1] = str(wedged)
+        out = self.sweep([*args, "--cell-timeout", "1"])
+        # 1, and a sentence naming the timeout: a bare TimeoutExpired
+        # traceback is indistinguishable from any other crash to the person
+        # reading a log the next morning.
+        self.assertEqual(out.returncode, 1, out.stdout + out.stderr)
+        self.assertIn("--cell-timeout 1.0s", out.stderr)
+        # And it let go: the next caller finds the box free, not squatted.
+        prov = subprocess.run(
+            ["bash", str(HOSTLOCK), "provenance", "--oneline"],
+            capture_output=True,
+            text=True,
+            env=self.env,
+            timeout=60,
+        ).stdout
+        self.assertIn("state=FREE", prov)
+
+    def test_the_documented_way_to_disable_the_timeout_disables_it(self):
+        # `--cell-timeout 0` is documented as "no limit". Passing 0 straight
+        # through to subprocess would instead time out immediately, and no
+        # other cell would notice.
+        slow = Path(self.tmp) / "slow.sh"
+        slow.write_text("#!/bin/sh\nsleep 1\n" + STUB_BENCH.split("\n", 1)[1])
+        slow.chmod(0o755)
+        args = self.args()
+        args[args.index("--binary") + 1] = str(slow)
+        out = self.sweep([*args, "--cell-timeout", "0"])
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+
+    def test_a_deliberate_route_split_is_still_reported_and_still_labelled(self):
+        """Acknowledging a split is not hiding it.
+
+        Comparing the serial path against pooled widths is a real question, so
+        there is a flag for it -- but the rows keep their route and the split
+        is still printed, because the reader of the table needs to know it is
+        two curves whatever the runner intended.
+        """
+        branching = Path(self.tmp) / "branching2.sh"
+        branching.write_text(
+            "#!/bin/sh\n"
+            'if [ "$4" = "1" ]; then\n'
+            "  W='native_pool_width=1 native_path=flat native_task_width=1 "
+            "native_cpus=32 native_width_as_requested=yes'\n"
+            "else\n"
+            "  W='native_pool_width=4 native_path=pool native_task_width=4 "
+            "native_cpus=32 native_width_as_requested=yes'\n"
+            "fi\n"
+            'echo "shape=decode native=1.000 ms ort=2.000 ms native/ort=0.500 '
+            'native_p90=1.100 ort_p90=2.200 native_min=0.900 ort_min=1.800 $W"\n'
+        )
+        branching.chmod(0o755)
+        args = self.args()
+        args[args.index("--binary") + 1] = str(branching)
+        args[args.index("--threads") + 1 : args.index("--threads") + 2] = ["1", "4"]
+        out = self.sweep([*args, "--allow-route-split"])
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("not a scaling curve", out.stderr)
+        self.assertEqual([r[-3] for r in self.rows(out)], ["flat", "pool"])
+
+    def test_the_route_each_row_took_is_in_the_table(self):
+        """The datum whose absence let four serial rows be published as decode.
+
+        A stderr complaint does not survive being pasted into a document; a
+        column does.
+        """
+        env = dict(
+            self.env,
+            WIDTH_FIELDS=(
+                "native_pool_width=4 native_path=spmd-pool native_task_width=4 "
+                "native_cpus=32 native_width_as_requested=yes"
+            ),
+        )
+        out = self.sweep(self.args(), env=env)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        header = next(
+            line for line in out.stdout.splitlines() if "ratio_min" in line
+        ).split()
+        self.assertEqual(header[-3], "route")
+        self.assertEqual(self.rows(out)[0][-3], "spmd-pool")
+
+    def test_the_default_thread_list_does_not_mix_routes(self):
+        # A default that always exits non-zero trains its readers to ignore
+        # the code. t=1 is a different route by construction, so it is not in
+        # the default list; asking for it is a decision.
+        self.assertNotIn(1, sweep_decode.default_threads())
+
+    def test_a_realized_width_reaches_the_row_and_the_header(self):
+        out = subprocess.run(
+            [
+                "bash",
+                str(HOSTLOCK),
+                "run",
+                "--owner",
+                "leon",
+                "--reason",
+                "width realized",
+                "--",
+                *self.args(),
+            ],
+            capture_output=True,
+            text=True,
+            env=self.env,
+            timeout=600,
+        )
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        header = next(l for l in out.stdout.splitlines() if "ratio_min" in l).split()
+        self.assertEqual(header[-2], "width_ok")
+        row = next(
+            l for l in out.stdout.splitlines() if l.split() and l.split()[0] == "m"
+        )
+        self.assertEqual(row.split()[-2], "yes")
+
+    def test_the_sweeps_escape_hatch_runs_and_stamps_every_row(self):
+        """Otherwise hard-wiring `unlocked=False` would be invisible.
+
+        The flag is what makes an unprotected smoke test *say* it was
+        unprotected, so a suite that never exercises it cannot tell the
+        difference between "refuses correctly" and "refuses always".
+        """
+        out = subprocess.run(
+            [*self.args(), "--unlocked"],
+            capture_output=True,
+            text=True,
+            env=self.env,
+            timeout=300,
+        )
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("WARNING: running unlocked", out.stderr)
+        row = next(
+            l for l in out.stdout.splitlines() if l.split() and l.split()[0] == "m"
+        )
+        self.assertEqual(row.split()[-1], "unlocked:free")
+
+    def test_an_unlocked_sweep_refuses_before_it_starts_any_child(self):
+        out = subprocess.run(
+            self.args(), capture_output=True, text=True, env=self.env, timeout=300
+        )
+        self.assertEqual(out.returncode, 3, out.stdout + out.stderr)
+        self.assertIn("refusing to measure", out.stderr)
+        self.assertIn("sweep_decode.py", out.stderr)
+        # The remedy has to name the driver, not ab.py -- a wrapper someone
+        # pastes for the wrong script is a wrapper that does not span the arms.
+        self.assertNotIn("ab.py", out.stderr)
+        self.assertEqual(out.stdout, "")
+
+    def test_a_locked_sweep_runs_and_every_row_carries_the_label(self):
+        out = subprocess.run(
+            [
+                "bash",
+                str(HOSTLOCK),
+                "run",
+                "--owner",
+                "leon",
+                "--reason",
+                "sweep gate test",
+                "--",
+                *self.args(),
+            ],
+            capture_output=True,
+            text=True,
+            env=self.env,
+            timeout=600,
+        )
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        # `hostlock.sh run` prints its own outcome first, so the driver's
+        # output is found by content rather than by position.
+        lines = [l for l in out.stdout.splitlines() if l.strip()]
+        banner = next(l for l in lines if l.startswith("host_lock="))
+        self.assertIn("host_lock=mine:leon", banner)
+        self.assertIn("lock_owner=leon", banner)
+        header = next(l for l in lines if "ratio_min" in l).split()
+        self.assertEqual(header[-1], "host_lock")
+        # The label is on the DATA row, not only in a banner: a banner is lost
+        # the moment somebody pastes one interesting row into a doc.
+        row = next(l for l in lines if l.split()[0] == "m")
+        self.assertEqual(row.split()[-1], "mine:leon")
+        self.assertEqual(len(row.split()), len(header))
+
+
+if __name__ == "__main__":
+    unittest.main()

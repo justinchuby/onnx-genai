@@ -1,0 +1,51 @@
+{
+  "generator": "tests/fixtures/tiny-deepseek-v4-qmoe/generate.py",
+  "mobius_commit": "cec78d2d17a8bea9e9edf9d1f0aa405120c2ccc3",
+  "seed": 0,
+  "architecture": "deepseek_v4",
+  "compress_ratios": null,
+  "num_nextn_predict_layers": 0,
+  "emission": [
+    "::Add",
+    "::Cast",
+    "::Clip",
+    "::Concat",
+    "::Constant",
+    "::Div",
+    "::Expand",
+    "::Gather",
+    "::GatherElements",
+    "::MatMul",
+    "::Mul",
+    "::Neg",
+    "::RMSNormalization",
+    "::ReduceMean",
+    "::ReduceSum",
+    "::Reshape",
+    "::RotaryEmbedding",
+    "::ScatterElements",
+    "::Shape",
+    "::Sigmoid",
+    "::Slice",
+    "::Softmax",
+    "::Softplus",
+    "::Split",
+    "::Sqrt",
+    "::Sub",
+    "::Swish",
+    "::TopK",
+    "::Transpose",
+    "::Unsqueeze",
+    "com.microsoft::GroupQueryAttention",
+    "com.microsoft::MatMulNBits",
+    "com.microsoft::QMoE"
+  ],
+  "prompt_ids": [
+    123
+  ],
+  "files": {
+    "model.onnx.textproto": 1047333,
+    "inference_metadata.yaml": 14748,
+    "tokenizer.json": 4680
+  }
+}
