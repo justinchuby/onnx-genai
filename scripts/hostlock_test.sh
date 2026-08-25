@@ -2241,13 +2241,124 @@ chmod 700 "$UNUSABLE_PARENT" 2>/dev/null
 rm -rf "$UNUSABLE_PARENT"
 cleanup
 
+# ---------------------------------------------------------------------------
+# METADATA IS A STORE, SO OPERATOR TEXT MUST NOT BE ABLE TO WRITE TO IT.
+#
+# The meta file is one key=value per line and meta_get takes the FIRST match,
+# so a newline inside --reason did not corrupt the file, it APPENDED fields --
+# and any key written after the injection point beat the real one. Measured on
+# the version before meta_value existed:
+#
+#   acquire --ttl 5 --reason $'x\nttl=999999'   ->   status reports ttl=999999
+#
+# That is not a cosmetic field. holder_expired reads ttl, so a reason string
+# could make a lock outlive its declared expiry. takeover, gate and
+# runnable_at_acquire are also written after reason, and those are the fields
+# benchmark harnesses copy into published rows as provenance -- a forged one is
+# a result claiming a quiet host it never had.
+#
+# anchor_pid/start_time/anchor_uid are written BEFORE any operator value, so
+# first-match-wins always protected them and no lock could ever be stolen this
+# way. These assert the fix without asserting more than it fixed.
+cleanup
+"$HL" acquire --owner roy --reason "$(printf 'x\nttl=999999\nowner=root')" --ttl 5 >/dev/null 2>&1
+chk "a newline in --reason cannot forge the ttl the lock was taken with" \
+    "$(st ttl)" "5"
+chk "and the meta file still has exactly one ttl line" \
+    "$(grep -c '^ttl=' "$LOCK/meta")" "1"
+chk "the reason survives, flattened onto one line rather than dropped" \
+    "$(st reason)" "x ttl=999999 owner=root"
+chk "and the owner is not forged by it either" "$(st owner)" "roy"
+"$HL" release >/dev/null 2>&1
+
+# --owner was never exposed: it is validated against a strict charset, because
+# it appears in the SPACE-separated one-line provenance row where free text
+# could overwrite neighbouring fields. `reason` is deliberately excluded from
+# that row -- which is exactly why it escaped the same scrutiny, even though it
+# still lands in the meta file, where the forging actually happened. Asserted
+# so the guard cannot be relaxed to match reason's leniency.
+chk "a newline in --owner is rejected outright rather than flattened" \
+    "$("$HL" acquire --owner "$(printf 'mallory\nreason=laundered')" \
+        --reason real >/dev/null 2>&1; echo $?)" "1"
+chk "and the rejected acquire took no lock" "$(st state)" "FREE"
+
+# ---------------------------------------------------------------------------
+# WHO HOLDS IT IS NOT THE SAME QUESTION AS WHAT IS RUNNING.
+#
+# Several worktrees of this repo share one box and therefore one lock, so
+# `owner=roy` does not say which tree is saturating the cores, and `reason` is
+# prose the operator typed. Both of these are observed instead.
+cleanup
+"$HL" acquire --owner roy --reason "worktree check" >/dev/null 2>&1
+chk "the holder's worktree is recorded, and it is the repo root" \
+    "$(st worktree)" "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+chk "the holder's command is recorded and non-empty" \
+    "$([ -n "$(st cmd)" ] && echo yes || echo no)" "yes"
+"$HL" release >/dev/null 2>&1
+
+cleanup
+"$HL" run --owner runner --reason "cmd check" -- \
+    sh -c "cp '$LOCK/meta' '$LOCK.ran'; : hostlock_cmd_marker" >/dev/null 2>&1
+chk "run records the command it wrapped, not the shell that launched it" \
+    "$(sed -n 's/^cmd=//p' "$LOCK.ran" 2>/dev/null | grep -c 'hostlock_cmd_marker')" "1"
+rm -f "$LOCK.ran"
+
+# A lock published before these fields existed must not claim the holder was
+# in no worktree. Absent reads `unknown`, which is the honest answer.
+cleanup
+mkdir -p "$LOCK"
+printf 'anchor_pid=%s\nowner=old\nreason=r\n' "$$" >"$LOCK/meta"
+chk "a lock from before these fields says unknown, not empty" \
+    "$(st worktree)" "unknown"
+chk "and the same for the command" "$(st cmd)" "unknown"
+cleanup
+
+# ---------------------------------------------------------------------------
+# THE LOCK PATH IS A PROPERTY OF THE BOX, NOT OF THE CHECKOUT.
+#
+# Worktrees differ only by their path, so the whole design fails silently if
+# resolution depends on the working directory: each tree would take its own
+# private lock while every status line still read normally.
+wt_root=$(env -u HOSTLOCK_DIR "$HL" status --porcelain 2>/dev/null | sed -n 's/^lock_dir=//p')
+wt_sub=$(cd scripts && env -u HOSTLOCK_DIR ../scripts/hostlock.sh status --porcelain 2>/dev/null | sed -n 's/^lock_dir=//p')
+chk "the default lock dir does not depend on the working directory" \
+    "$wt_sub" "$wt_root"
+chk "and it is an absolute path" \
+    "$(case "$wt_root" in /*) echo yes ;; *) echo no ;; esac)" "yes"
+chk "and it is outside this checkout, so worktrees cannot each get their own" \
+    "$(case "$wt_root" in "$(pwd)"/*) echo inside ;; *) echo outside ;; esac)" "outside"
+
+# ---------------------------------------------------------------------------
+# A PLATFORM THAT CANNOT SUPPORT THE LIVENESS CLAIM IS REFUSED, NOT DEGRADED.
+#
+# Linux-only used to be a comment. Without /proc every proc_start_time returns
+# empty, so every lock would publish an empty start_time and the file would run
+# permanently in the no-start_time grace mode -- which cannot tell a recycled
+# pid from the original. Failing clearly beats holding a lock nobody can trust.
+shim="$LOCK.shim"
+rm -rf "$shim"; mkdir -p "$shim"
+printf '#!/bin/sh\necho Darwin\n' >"$shim/uname"; chmod +x "$shim/uname"
+plat_out=$(PATH="$shim:$PATH" "$HL" status 2>&1; echo "rc=$?")
+chk "a non-Linux platform exits 8 rather than taking a lock it cannot verify" \
+    "$(printf '%s' "$plat_out" | sed -n 's/.*rc=//p')" "8"
+chk "and the refusal names the platform it refused" \
+    "$(printf '%s' "$plat_out" | grep -c "Darwin")" "1"
+chk "and says plainly that no lock was taken" \
+    "$(printf '%s' "$plat_out" | grep -c 'No lock was taken')" "1"
+chk "acquire is refused on the same platform, and takes nothing" \
+    "$(PATH="$shim:$PATH" "$HL" acquire --owner roy >/dev/null 2>&1; echo $?)" "8"
+chk "and no lock directory was created by the refused acquire" \
+    "$([ -d "$LOCK" ] && echo created || echo none)" "none"
+rm -rf "$shim"
+cleanup
+
 # Finally, pin the assertion count itself. Two of the checks in this file sit
 # behind environment probes, and an assertion that quietly stops running is
 # indistinguishable from one that passes -- which is the same failure mode as
 # the inert R1 block and the vacuous STALE arm that this PR exists to fix.
 # Both probe branches now assert something, so the total is invariant across
 # environments; if a refactor drops a check, this fails and says so.
-chk "every assertion in this file ran" "$((pass + fail + 1))" "341"
+chk "every assertion in this file ran" "$((pass + fail + 1))" "360"
 
 echo
 echo "passed=${pass} failed=${fail}"
