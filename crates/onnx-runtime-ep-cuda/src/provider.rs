@@ -69,7 +69,7 @@ use crate::route_residency::{
     build_route_residency_boundary,
 };
 use crate::runtime::{CudaRuntime, cuptr};
-use crate::weight_paging::{CudaWeightResidency, DeviceOffloadPolicy};
+use crate::weight_paging::{CudaWeightResidency, DeviceOffloadPolicy, PrefillRoute};
 
 /// The provider-owned mapped-attribution zone.
 ///
@@ -1800,6 +1800,17 @@ impl CudaExecutionProvider {
         self.residency.as_ref()
     }
 
+    /// Test-only: install `residency` as this EP's device weight residency so
+    /// the [`onnx_runtime_ep_api::ExecutionProvider`] paging trait methods
+    /// (`prefetch_lazy_weight`/`page_lazy_weight`) route through it. Production
+    /// installs the residency during construction from the offload policy; this
+    /// lets a test traverse the real provider entry points with a residency it
+    /// configured (e.g. prefill double buffer enabled).
+    #[doc(hidden)]
+    pub fn install_residency_for_test(&mut self, residency: CudaWeightResidency) {
+        self.residency = Some(Arc::new(residency));
+    }
+
     /// The resolved device weight-offload policy for this EP.
     pub fn offload_policy(&self) -> &DeviceOffloadPolicy {
         &self.offload_policy
@@ -2277,6 +2288,19 @@ impl ExecutionProvider for CudaExecutionProvider {
         let Some(residency) = self.residency.as_ref() else {
             return Ok(None);
         };
+        // A layer routed through the whole-layer prefill double buffer at
+        // prefetch time is redeemed here; its keep-alive releases the slot when
+        // the kernel binding drops. `Ok(None)` means this key was never routed
+        // through the pipeline (disabled, ineligible, or declined), so the
+        // single-slot residency path below serves it unchanged.
+        if let Some(paged) = residency
+            .prefill_pipeline_page(key, self.device)
+            .map_err(|error| {
+                EpError::KernelFailed(format!("weight offload page-in (double buffer): {error}"))
+            })?
+        {
+            return Ok(Some(paged));
+        }
         let page = residency
             .resident_mapped(key, weight, source)
             .map_err(|error| EpError::KernelFailed(format!("weight offload page-in: {error}")))?;
@@ -2331,6 +2355,16 @@ impl ExecutionProvider for CudaExecutionProvider {
         let Some(residency) = self.residency.as_ref() else {
             return Ok(false);
         };
+        // Prefer the whole-layer prefill double buffer for eligible BQMoE
+        // layers when it is enabled; a `Prefetched` route started an async fill
+        // that a later `page_lazy_weight` for this key redeems, so it needs the
+        // same later page call and reports `true`. Any decline (including the
+        // default-off `Disabled`, which issues no CUDA work) falls through to
+        // the byte-identical single-slot prefetch.
+        match residency.prefill_pipeline_prefetch(key, weight, source) {
+            PrefillRoute::Prefetched => return Ok(true),
+            PrefillRoute::Declined(_reason) => {}
+        }
         residency
             .prefetch_block_quantized_moe(key, weight, source)
             .map_err(|error| EpError::KernelFailed(format!("weight prefetch: {error}")))
@@ -2394,7 +2428,7 @@ impl ExecutionProvider for CudaExecutionProvider {
         opset: u64,
         shapes: &[Shape],
         input_dtypes: &[DataType],
-        _layouts: &[TensorLayout],
+        layouts: &[TensorLayout],
     ) -> KernelMatch {
         // Keyed on (op_type, domain, opset) via the registry, the same single
         // source of truth the CPU EP uses.
@@ -2427,6 +2461,13 @@ impl ExecutionProvider for CudaExecutionProvider {
         if matches!(op.op_type.as_str(), "FusedMatMulBias" | "FusedGemm")
             && op.domain == "com.microsoft"
             && let Some(reason) = crate::kernels::fused_gemm::unsupported_reason(op, shapes)
+        {
+            return KernelMatch::unsupported(reason);
+        }
+        if op.op_type == "DFT"
+            && (op.domain.is_empty() || op.domain == "ai.onnx")
+            && let Some(reason) =
+                crate::kernels::dft::unsupported_reason(op, shapes, input_dtypes, layouts)
         {
             return KernelMatch::unsupported(reason);
         }

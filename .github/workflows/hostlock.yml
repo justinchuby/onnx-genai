@@ -85,10 +85,11 @@ on:
     paths:
       - "scripts/hostlock.sh"
       - "scripts/hostlock_test.sh"
-      - "scripts/ort_ab/ab.py"
-      - "scripts/ort_ab/hostlock_gate.py"
-      - "scripts/ort_ab/sweep_decode.py"
-      - "scripts/ort_ab/test_ab_lock.py"
+      # The whole directory, not the drivers we happen to know about: the
+      # conformance check below exists to catch a *new* harness, and a path
+      # filter listing today's files would skip the job for exactly the file
+      # it was written to catch.
+      - "scripts/ort_ab/**"
       - ".github/workflows/hostlock.yml"
   push:
     branches:
@@ -96,10 +97,11 @@ on:
     paths:
       - "scripts/hostlock.sh"
       - "scripts/hostlock_test.sh"
-      - "scripts/ort_ab/ab.py"
-      - "scripts/ort_ab/hostlock_gate.py"
-      - "scripts/ort_ab/sweep_decode.py"
-      - "scripts/ort_ab/test_ab_lock.py"
+      # The whole directory, not the drivers we happen to know about: the
+      # conformance check below exists to catch a *new* harness, and a path
+      # filter listing today's files would skip the job for exactly the file
+      # it was written to catch.
+      - "scripts/ort_ab/**"
       - ".github/workflows/hostlock.yml"
 
 permissions:
@@ -130,3 +132,10 @@ jobs:
       # line and exits, so they cost no measurable CPU and need no quiet host.
       - name: A/B driver admission
         run: python3 scripts/ort_ab/test_ab_lock.py
+
+      # "Mandatory for saturating runs" has meant "somebody remembered": the
+      # #2043 audit found one driver of fourteen taking the lock. This step
+      # makes every file in the directory declare what it is, and fails when a
+      # driver neither gates nor records why not.
+      - name: Driver gate conformance
+        run: python3 scripts/ort_ab/test_gate_conformance.py

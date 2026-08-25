@@ -1123,9 +1123,14 @@ fn test_decoder_runtime_inner(shape: TestSessionShape) -> anyhow::Result<Workflo
         // runtime behaviour over a document shape `validate_pipeline_spec`
         // refuses. A fixture that cannot be loaded is a weak premise for a
         // test about what happens once it is.
-        onnx_genai_metadata::validate_pipeline_spec(&onnx_genai_metadata::PipelineSpec {
-            workflow: workflow.clone(),
-        })
+        onnx_genai_metadata::validate_pipeline_spec(
+            &onnx_genai_metadata::PipelineSpec {
+                workflow: workflow.clone(),
+            },
+            // A workflow this crate builds today is a document written today, so
+            // it is held to everything the newest schema version asks for.
+            onnx_genai_metadata::SUPPORTED_SCHEMA_VERSION,
+        )
         .map_err(|error| anyhow::anyhow!("the fixture package must validate: {error:?}"))?;
     }
     validate_generation_workflow(&workflow)?;

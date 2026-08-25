@@ -166,6 +166,15 @@ static I32_ONLY: &[DataType] = &[DataType::Int32];
 /// Integer index/length inputs, matching `to_dense_i64`'s acceptance set.
 static INDEX_DTYPES: &[DataType] = &[DataType::Int64, DataType::Int32];
 
+/// STFT edges mix f32-compute signal/output tensors with integer scalar inputs.
+static STFT_DTYPES: &[DataType] = &[
+    DataType::Float32,
+    DataType::Float16,
+    DataType::BFloat16,
+    DataType::Int32,
+    DataType::Int64,
+];
+
 /// Per-input-slot dtype constraints for a mixed-dtype op.
 ///
 /// `supported_dtypes_for_op` returns the *union* of the dtypes on an op's
@@ -252,6 +261,13 @@ pub fn input_dtype_constraints_for_op(
         (12, U8_ONLY),
         (13, U8_ONLY),
     ];
+    // signal, frame_step, window?, frame_length?
+    static STFT_SLOTS: &[(usize, &[DataType])] = &[
+        (0, FLOAT_COMPUTE_DTYPES),
+        (1, INDEX_DTYPES),
+        (2, FLOAT_COMPUTE_DTYPES),
+        (3, INDEX_DTYPES),
+    ];
     match (op_type, domain) {
         ("MatMulNBits", "com.microsoft") => MATMUL_NBITS_SLOTS,
         ("QLinearMatMul", "") => QLINEAR_MATMUL_SLOTS,
@@ -262,6 +278,7 @@ pub fn input_dtype_constraints_for_op(
         ("Attention", "com.microsoft") => MSFT_ATTENTION_SLOTS,
         ("PackedMultiHeadAttention", "com.microsoft") => PACKED_MHA_SLOTS,
         ("QMoE", "com.microsoft") => QMOE_SLOTS,
+        ("STFT", "") => STFT_SLOTS,
         _ => &[],
     }
 }
@@ -431,6 +448,7 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
         ("HannWindow", "") | ("HammingWindow", "") | ("BlackmanWindow", "") | ("DFT", "") => {
             FLOAT_DTYPES
         }
+        ("STFT", "") => STFT_DTYPES,
 
         // com.microsoft contrib ops.
         ("LayerNormalization", "com.microsoft")
@@ -562,6 +580,7 @@ pub mod onehot;
 pub mod packed_multi_head_attention;
 pub mod packed_varlen_attention;
 pub mod pad;
+pub mod planar_block_quant;
 pub(crate) mod qgemm_native;
 pub mod qlinear_matmul;
 pub mod qmoe;
@@ -585,6 +604,7 @@ pub mod slice;
 pub mod softmax;
 pub mod sparse_kv_gather;
 pub mod split;
+pub mod stft;
 pub mod tensor_scatter;
 pub mod transpose;
 pub mod unary_math;
@@ -1543,6 +1563,7 @@ fn build_cpu_registry_recorded_inner(
         Box::new(window::BlackmanWindowFactory),
     );
     rec.register(OpKey::new("DFT", "", 17), Box::new(dft::DftFactory));
+    rec.register(OpKey::new("STFT", "", 17), Box::new(stft::StftFactory));
     rec.register(
         OpKey::new("BitwiseAnd", "", 18),
         Box::new(bitwise::BitwiseAndFactory),
@@ -1950,6 +1971,7 @@ pub(crate) mod testutil {
     use onnx_runtime_ir::{DataType, DeviceId, compute_contiguous_strides};
 
     /// A dense f32 buffer plus the shape/stride metadata a view needs.
+    #[derive(Debug)]
     pub struct Owned {
         pub bytes: Vec<u8>,
         pub shape: Vec<usize>,
@@ -2259,6 +2281,20 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn stft_advertises_only_its_f32_compute_and_scalar_edge_dtypes() {
+        let dtypes = supported_dtypes_for_op("STFT", "");
+        assert_eq!(dtypes, STFT_DTYPES);
+        assert!(!dtypes.contains(&DataType::Float64));
+
+        let slots = input_dtype_constraints_for_op("STFT", "");
+        assert_eq!(slots[0], (0, FLOAT_COMPUTE_DTYPES));
+        assert_eq!(slots[1], (1, INDEX_DTYPES));
+        assert_eq!(slots[2], (2, FLOAT_COMPUTE_DTYPES));
+        assert_eq!(slots[3], (3, INDEX_DTYPES));
+    }
+
     use super::*;
     use crate::strided::view_in_bounds;
     use testutil::Owned;
@@ -2538,8 +2574,9 @@ mod tests {
         // `TensorScatter` (opset-24 KV-cache update) adds one more, and the
         // standard-domain `CausalConvWithState` (opset 27) adds one alongside
         // its `com.microsoft` spelling.
+        // `STFT` adds its opset-17 standard-domain registration.
         let mlas_registrations = if cfg!(feature = "mlas") { 6 } else { 0 };
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 104 + mlas_registrations);
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 105 + mlas_registrations);
         for op in PHASE1_OPS {
             assert!(reg.lookup(op, "", 21).is_some(), "missing factory for {op}");
         }
@@ -2556,6 +2593,7 @@ mod tests {
         assert!(reg.lookup("HammingWindow", "", 17).is_some());
         assert!(reg.lookup("BlackmanWindow", "", 17).is_some());
         assert!(reg.lookup("DFT", "", 17).is_some());
+        assert!(reg.lookup("STFT", "", 17).is_some());
         assert!(reg.lookup("Conv", "", 22).is_some());
         assert!(reg.lookup("LpPool", "", 18).is_some());
         assert!(reg.lookup("GlobalLpPool", "", 2).is_some());

@@ -204,7 +204,7 @@ fn migrate(
     let rendered = format!("{HEADER}{}", serde_yaml::to_string(&document)?);
     // Parse the result back through the real schema before writing. A tool that
     // emits a package the runtime rejects is worse than no tool.
-    let parsed: onnx_genai_metadata::InferenceMetadata = serde_yaml::from_str(&rendered)?;
+    let parsed = onnx_genai_metadata::parse_metadata(&rendered, Some("yaml"))?;
     onnx_genai_metadata::validation::validate_metadata(&parsed)
         .map_err(|errors| format!("converted package does not validate: {errors:#?}"))?;
     std::fs::write(&path, rendered)?;

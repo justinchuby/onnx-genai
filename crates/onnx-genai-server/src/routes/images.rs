@@ -5,7 +5,7 @@ use axum::{Json, extract::State};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use image::{DynamicImage, ImageFormat, Rgb, RgbImage};
 use onnx_genai::{GenerateOptions, GeneratePrompt, GenerateRequest};
-use onnx_genai_metadata::{ImageOutputValueRange, TensorDimension};
+use onnx_genai_metadata::{PixelValueRange, TensorDimension};
 use onnx_genai_ort::DataType;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
@@ -718,10 +718,7 @@ fn parse_application_dtype(dtype: &str) -> Result<DataType, ApiError> {
     }
 }
 
-fn encode_png(
-    image: ProducedImage,
-    value_range: ImageOutputValueRange,
-) -> Result<Vec<u8>, ApiError> {
+fn encode_png(image: ProducedImage, value_range: PixelValueRange) -> Result<Vec<u8>, ApiError> {
     let (minimum, maximum) = image
         .values
         .iter()
@@ -729,9 +726,9 @@ fn encode_png(
             (min.min(*value), max.max(*value))
         });
     let (range_minimum, range_maximum): (f32, f32) = match value_range {
-        ImageOutputValueRange::ZeroToOne => (0.0, 1.0),
-        ImageOutputValueRange::NegativeOneToOne => (-1.0, 1.0),
-        ImageOutputValueRange::ZeroTo255 => (0.0, 255.0),
+        PixelValueRange::ZeroToOne => (0.0, 1.0),
+        PixelValueRange::NegativeOneToOne => (-1.0, 1.0),
+        PixelValueRange::ZeroTo255 => (0.0, 255.0),
     };
     // GPU kernels can overshoot a mathematically bounded activation by a few
     // ulps. Validate against the declared range with a small scale-relative
@@ -791,9 +788,9 @@ fn encode_png(
                 y as u32,
                 Rgb(pixel.map(|value| {
                     let normalized = match value_range {
-                        ImageOutputValueRange::ZeroToOne => value,
-                        ImageOutputValueRange::NegativeOneToOne => (value + 1.0) * 0.5,
-                        ImageOutputValueRange::ZeroTo255 => value / 255.0,
+                        PixelValueRange::ZeroToOne => value,
+                        PixelValueRange::NegativeOneToOne => (value + 1.0) * 0.5,
+                        PixelValueRange::ZeroTo255 => value / 255.0,
                     };
                     (normalized.clamp(0.0, 1.0) * 255.0).round() as u8
                 })),
@@ -1045,7 +1042,7 @@ mod tests {
                 values: vec![1.0, 0.0, 0.0],
                 shape: vec![1, 3, 1, 1],
             },
-            ImageOutputValueRange::ZeroToOne,
+            PixelValueRange::ZeroToOne,
         )
         .unwrap();
         assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
@@ -1058,7 +1055,7 @@ mod tests {
                 values: vec![1.0, 0.0, 0.0],
                 shape: vec![1, 3, 1, 1, 1],
             },
-            ImageOutputValueRange::ZeroToOne,
+            PixelValueRange::ZeroToOne,
         )
         .unwrap();
         assert_eq!(decode_pixel(&png), [255, 0, 0]);
@@ -1070,15 +1067,14 @@ mod tests {
             values: vec![0.0, 0.5, 1.0],
             shape: vec![1, 3, 1, 1],
         };
-        let zero_to_one = encode_png(image(), ImageOutputValueRange::ZeroToOne).unwrap();
-        let negative_one_to_one =
-            encode_png(image(), ImageOutputValueRange::NegativeOneToOne).unwrap();
+        let zero_to_one = encode_png(image(), PixelValueRange::ZeroToOne).unwrap();
+        let negative_one_to_one = encode_png(image(), PixelValueRange::NegativeOneToOne).unwrap();
         let zero_to_255 = encode_png(
             ProducedImage {
                 values: vec![0.0, 127.5, 255.0],
                 shape: vec![1, 3, 1, 1],
             },
-            ImageOutputValueRange::ZeroTo255,
+            PixelValueRange::ZeroTo255,
         )
         .unwrap();
 
@@ -1094,7 +1090,7 @@ mod tests {
                 values: vec![-0.1, 0.0, 1.0],
                 shape: vec![1, 3, 1, 1],
             },
-            ImageOutputValueRange::ZeroToOne,
+            PixelValueRange::ZeroToOne,
         )
         .unwrap_err();
         assert!(error.message.contains("violates declared ZeroToOne"));
@@ -1107,7 +1103,7 @@ mod tests {
                 values: vec![-5.0e-6, 0.5, 1.0 + 5.0e-6],
                 shape: vec![1, 3, 1, 1],
             },
-            ImageOutputValueRange::ZeroToOne,
+            PixelValueRange::ZeroToOne,
         )
         .unwrap();
         let negative_one_to_one = encode_png(
@@ -1115,7 +1111,7 @@ mod tests {
                 values: vec![-1.0 - 5.0e-6, 0.0, 1.0 + 5.0e-6],
                 shape: vec![1, 3, 1, 1],
             },
-            ImageOutputValueRange::NegativeOneToOne,
+            PixelValueRange::NegativeOneToOne,
         )
         .unwrap();
 
@@ -1126,11 +1122,8 @@ mod tests {
     #[test]
     fn material_range_violations_are_not_treated_as_numerical_noise() {
         for (values, value_range) in [
-            (vec![-1.0e-3, 0.0, 1.0], ImageOutputValueRange::ZeroToOne),
-            (
-                vec![-1.001, 0.0, 1.0],
-                ImageOutputValueRange::NegativeOneToOne,
-            ),
+            (vec![-1.0e-3, 0.0, 1.0], PixelValueRange::ZeroToOne),
+            (vec![-1.001, 0.0, 1.0], PixelValueRange::NegativeOneToOne),
         ] {
             let error = encode_png(
                 ProducedImage {
@@ -1160,6 +1153,7 @@ mod tests {
                     shape: None,
                     optional: false,
                     batch_layout: Default::default(),
+                    padding: Vec::new(),
                 }, &mut BTreeMap::new())
                 .unwrap(),
             ImageInputValue::Raw {
@@ -1186,6 +1180,7 @@ mod tests {
                     shape: None,
                     optional: false,
                     batch_layout: Default::default(),
+                    padding: Vec::new(),
                 },
                 &mut BTreeMap::new(),
             )
@@ -1206,6 +1201,7 @@ mod tests {
             ]),
             optional: false,
             batch_layout: Default::default(),
+            padding: Vec::new(),
         };
         let tensor = ApplicationTensor {
             dtype: "float32".to_string(),

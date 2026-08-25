@@ -20379,7 +20379,16 @@ mod tests {
     /// silently halves the pool. Doing it from inside the child keeps the test
     /// free of a `taskset` dependency and makes the mask an observable the
     /// child reports (`allowed`/`cores`) rather than an assumption.
+    ///
+    /// Only Linux can do this. `set_current_thread_affinity` is a documented
+    /// no-op that returns `Err` everywhere else (see `decode_affinity.rs`), so
+    /// on those targets the leader-only cpuset cannot be constructed at all and
+    /// the caller must skip rather than assert. That is a different thing from
+    /// the restriction failing, which stays fatal on Linux.
     fn restrict_self_to_leader_cpus() {
+        if !cfg!(target_os = "linux") {
+            return;
+        }
         let Some(allowed) = crate::decode_affinity::allowed_cpus() else {
             return;
         };
@@ -20713,7 +20722,36 @@ mod tests {
     /// with by every guard, and wrong, because the defect sat upstream of the
     /// report in what "default" resolved to.
     #[test]
+    // Reported as `ignored` rather than silently returning `ok`: libtest
+    // captures a passing test's output, so the `eprintln!` below is invisible
+    // in a default CI log and a skip on this target was indistinguishable from
+    // a pass. `ignored` prints its reason in the default output and, unlike a
+    // pass, is not counted as an executed test.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "process-wide CPU affinity masking is implemented only on Linux, so a \
+                  leader-only cpuset cannot be constructed on this target"
+    )]
     fn a_default_width_pool_on_leader_cpus_uses_every_core_it_was_given() {
+        // Process-wide affinity masking is Linux-only, so on every other target
+        // the leader-only cpuset this test asserts about cannot be built. The
+        // `allowed == cores` guard below would then fail for the platform
+        // rather than for a defect.
+        //
+        // The `#[cfg_attr(..., ignore)]` above is what makes that visible in a
+        // default CI log. This arm is the belt for a run that overrides it with
+        // `--ignored`: it must still not assert on an unrestricted cpuset. Its
+        // `eprintln!` is only rendered under `--nocapture`, which is why it is
+        // not the primary signal.
+        if !cfg!(target_os = "linux") {
+            eprintln!(
+                "SKIP a_default_width_pool_on_leader_cpus_uses_every_core_it_was_given: \
+                 process-wide CPU affinity masking is implemented only on Linux, so a \
+                 leader-only cpuset cannot be constructed on this target"
+            );
+            return;
+        }
+
         let report = realized_default_width_report();
 
         if !report.pool_built {

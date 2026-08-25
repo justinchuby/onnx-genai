@@ -44,6 +44,7 @@ pub mod cumsum;
 pub mod data_transform;
 pub(crate) mod device_argmax;
 pub(crate) mod device_token_writer;
+pub mod dft;
 pub mod dropout;
 pub mod elementwise;
 pub mod expert_route_telemetry;
@@ -192,6 +193,7 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "FusedMatMulBias",
     "FusedGemm",
     "Conv",
+    "DFT",
     "MaxPool",
     "AveragePool",
     "LpPool",
@@ -382,6 +384,9 @@ pub struct CudaOpDescriptor {
 /// Float compute types the CUDA kernels handle (cuBLASLt + custom kernels).
 static CUDA_FLOAT_DTYPES: &[DataType] = &[DataType::Float32, DataType::Float16, DataType::BFloat16];
 
+/// DFT data/output are f32; its optional length and axis inputs are i64.
+static CUDA_DFT_DTYPES: &[DataType] = &[DataType::Float32, DataType::Int64];
+
 /// Every element type the CUDA EP can move byte-for-byte through a structural
 /// op (Reshape, Transpose, Gather, Concat, Cast, Shape, …). These kernels do
 /// not compute on the values, so they accept the full dtype set. Matches the
@@ -483,6 +488,8 @@ static CUDA_ATTENTION_DTYPES: &[DataType] = &[
 /// kernels. Fail closed to the float compute set for unrecognised ops.
 pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataType] {
     match (op_type, domain) {
+        ("DFT", "") => CUDA_DFT_DTYPES,
+
         // Block-quantized GEMM / MoE: f16/f32 activation + Uint8 packed weight.
         ("MatMulNBits", "com.microsoft")
         | ("QMoE", "com.microsoft")
@@ -650,6 +657,15 @@ pub fn build_cuda_registry_with_metrics(
     csa_metrics: Arc<csa_checkpoint::CsaMetrics>,
 ) -> OpRegistry {
     let mut reg = OpRegistry::new();
+
+    let dft_plans = Arc::new(crate::cufft::CufftPlanCache::default());
+    reg.register(
+        OpKey::new("DFT", "", 17),
+        Box::new(dft::DftFactory {
+            runtime: runtime.clone(),
+            plans: dft_plans,
+        }),
+    );
 
     // GEMM family (cuBLASLt).
     reg.register(
@@ -1644,7 +1660,9 @@ pub fn build_cuda_registry_with_metrics(
 
 #[cfg(test)]
 mod tests {
-    use super::{CUDA_COVERED_OPS, CUDA_FLOAT_DTYPES, cuda_supported_dtypes_for_op};
+    use super::{
+        CUDA_COVERED_OPS, CUDA_DFT_DTYPES, CUDA_FLOAT_DTYPES, cuda_supported_dtypes_for_op,
+    };
 
     /// Every operator the CPU EP registers but CUDA does not must be named in
     /// the coverage document.
@@ -1825,44 +1843,13 @@ mod tests {
         );
     }
 
-    /// `ai.onnx::DFT` (opset 17) is a *documented non-gap*, not an oversight —
-    /// this test pins that decision so nobody re-opens it.
-    ///
-    /// No in-scope CUDA target model computes a Fourier transform inside its
-    /// graph. Whisper does its STFT / log-mel feature extraction on the **host**
-    /// (`crates/onnx-genai-preprocess/src/audio.rs`, `rustfft`) and feeds the
-    /// model a precomputed `[1, n_mels, n_frames]` tensor, so no `DFT`/`STFT`
-    /// node ever reaches the EP. The only in-graph `DFT` producer in the repo is
-    /// the CPU-EP Perch bioacoustics model (`tests/perch_dft.rs`), which is not a
-    /// CUDA decode target. `DFT` also has a complete CPU kernel in both this repo
-    /// (`onnx-runtime-ep-cpu/src/kernels/dft.rs`) and upstream ORT (which ships
-    /// **no** CUDA DFT kernel — ORT issue #21164), so a CUDA decline degrades to
-    /// an always-present CPU DFT rather than failing. See the non-gap write-up in
-    /// `docs/execution/CUDA_COVERAGE.md`, which records the exact condition that
-    /// would flip this decision.
-    ///
-    /// This checks both halves of the registration state, because half-wiring is
-    /// the failure this file is prone to: an op present in one of the five
-    /// registration places and absent from the others is silently declined at
-    /// runtime rather than reported.
-    ///
-    /// If an in-scope model ever emits `DFT` in-graph on a CUDA-placed workload,
-    /// implement a cuFFT-backed kernel mirroring `dft.rs`'s parameter surface,
-    /// wire it through the five-place registration contract, and delete this test.
     #[test]
-    fn dft_is_a_documented_non_gap() {
-        assert!(
-            !CUDA_COVERED_OPS.contains(&"DFT"),
-            "DFT was added to CUDA_COVERED_OPS: if this is a real implementation, \
-             remove this non-gap test and update docs/execution/CUDA_COVERAGE.md; \
-             if it is accidental, revert it"
-        );
+    fn dft_registration_advertises_only_implemented_input_types() {
+        assert!(CUDA_COVERED_OPS.contains(&"DFT"));
         assert_eq!(
             cuda_supported_dtypes_for_op("DFT", ""),
-            CUDA_FLOAT_DTYPES,
-            "DFT gained a dedicated dtype arm without a kernel: that is the \
-             registration contract half-wired, and it makes an unregistered op \
-             look registered"
+            CUDA_DFT_DTYPES,
+            "DFT must advertise f32 data plus its Int64 scalar inputs"
         );
     }
 

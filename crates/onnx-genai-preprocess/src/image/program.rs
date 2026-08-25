@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, path::Path};
 use anyhow::Context;
 use image::DynamicImage;
 use onnx_genai_metadata::{
-    ImageOutputBinding, ImagePreprocessingProgram, ImageSizeSpec, ImageTransform,
+    VisionOutputBinding, VisionPreprocessingProgram, VisionSizeSpec, VisionTransform,
 };
 use serde::Deserialize;
 
@@ -222,7 +222,7 @@ impl ImagePreprocessor {
     /// Resolves preprocessing directly from a typed metadata program.
     pub fn from_input_and_program(
         shape: &[i64],
-        program: &ImagePreprocessingProgram,
+        program: &VisionPreprocessingProgram,
     ) -> anyhow::Result<Self> {
         Self::from_metadata_document(
             shape,
@@ -251,7 +251,7 @@ impl ImagePreprocessor {
         Self::from_metadata_document(shape, document)
     }
 
-    fn image_metadata_from_program(program: &ImagePreprocessingProgram) -> ImageMetadata {
+    fn image_metadata_from_program(program: &VisionPreprocessingProgram) -> ImageMetadata {
         ImageMetadata {
             resize: None,
             tiling: None,
@@ -269,14 +269,14 @@ impl ImagePreprocessor {
         }
     }
 
-    fn image_transform_metadata(transform: &ImageTransform) -> ImageTransformMetadata {
+    fn image_transform_metadata(transform: &VisionTransform) -> ImageTransformMetadata {
         ImageTransformMetadata {
             op: transform.op.clone(),
             inputs: transform.inputs.clone(),
             outputs: transform.outputs.clone(),
             size: transform.size.as_ref().map(|size| match size {
-                ImageSizeSpec::Square(edge) => ImageSize::Square(*edge),
-                ImageSizeSpec::Dimensions { width, height } => ImageSize::Dimensions {
+                VisionSizeSpec::Square(edge) => ImageSize::Square(*edge),
+                VisionSizeSpec::Dimensions { width, height } => ImageSize::Dimensions {
                     width: *width,
                     height: *height,
                 },
@@ -311,7 +311,7 @@ impl ImagePreprocessor {
         }
     }
 
-    fn image_output_metadata(output: &ImageOutputBinding) -> ImageOutputMetadata {
+    fn image_output_metadata(output: &VisionOutputBinding) -> ImageOutputMetadata {
         ImageOutputMetadata {
             source: Some(output.source.clone()),
             name: output.name.clone(),

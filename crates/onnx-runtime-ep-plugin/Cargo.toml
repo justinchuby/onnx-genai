@@ -14,10 +14,13 @@ categories = ["science", "hardware-support"]
 # calls are empty, so production builds carry none of it. Timing is gated a
 # second time at runtime by ONNX_GENAI_PROFILE_DISPATCH=1.
 dispatch_probe = []
+# Cross-crate shape-table agreement hooks. Shipped artifacts do not enable this.
+testutil = []
 
 [dependencies]
 onnx-runtime-ep-api = { workspace = true }
 onnx-runtime-ir = { workspace = true }
+onnx-runtime-shape-inference = { workspace = true }
 onnx-genai-ort-sys = { workspace = true }
 
 # `pin.rs` takes one never-released reference to this library's own module so

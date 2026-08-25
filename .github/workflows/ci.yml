@@ -420,13 +420,20 @@ jobs:
           -p onnx-std-python
           -- -D warnings
 
+      # Wrapped in `run_test_step` because the selector is a bare test NAME,
+      # which libtest does not police: an exact-name filter that matches nothing
+      # prints `ok. 0 passed` and exits 0. This step selects exactly one test,
+      # so a rename retires it silently. #2055.
       - name: Check CPU EP MLAS-only feature configuration
-        run: >-
-          cargo test --locked
-          -p onnx-runtime-ep-cpu
-          --no-default-features
-          --features mlas
-          optimization_registry_excludes_nchwc_without_cnn_ops
+        run: |
+          # shellcheck source=scripts/test_step.sh
+          . ./scripts/test_step.sh
+          run_test_step "MLAS-only feature configuration" \
+            cargo test --locked \
+            -p onnx-runtime-ep-cpu \
+            --no-default-features \
+            --features mlas \
+            optimization_registry_excludes_nchwc_without_cnn_ops
 
       # The MoE grouped driver hands several `*mut f32` out of one `&mut [f32]`
       # to `MlasGemmBatch`, and its bit-exactness falsifiers are the only thing
@@ -434,26 +441,38 @@ jobs:
       # the default feature set those tests compile the non-MLAS fallback, so
       # the path that actually ships was going untested.  This runs them against
       # the real MLAS batched GEMM.
+      # Guarded for the same reason (#2055), and this one matters most: the
+      # filter is a MODULE PATH, so moving or renaming the module -- not just a
+      # test -- empties it. Measured on this repo, `kernels::moe_renamed::`
+      # reports `ok. 0 passed` and exits 0.
       - name: CPU EP MoE tests against real MLAS
-        run: >-
-          cargo test --locked
-          -p onnx-runtime-ep-cpu
-          --no-default-features
-          --features mlas
-          kernels::moe::
+        run: |
+          # shellcheck source=scripts/test_step.sh
+          . ./scripts/test_step.sh
+          run_test_step "CPU EP MoE against real MLAS" \
+            cargo test --locked \
+            -p onnx-runtime-ep-cpu \
+            --no-default-features \
+            --features mlas \
+            kernels::moe::
 
       # QLinearMatMul requantizes inside MLAS through the same output processor
       # ORT uses, and the tests that pin that fused path bit-for-bit against the
       # scalar loop only exist under `--features mlas`.  Nothing else in the
       # pipeline runs them: the coverage lane builds this crate without MLAS and
       # the ORT lane tests the plugin crate, not these unit tests.
+      # Guarded for the same reason (#2055): module-path filter, and this is
+      # the only place the fused MLAS requantize path is tested at all.
       - name: CPU EP QLinearMatMul tests against real MLAS
-        run: >-
-          cargo test --locked
-          -p onnx-runtime-ep-cpu
-          --no-default-features
-          --features mlas
-          kernels::qlinear_matmul::
+        run: |
+          # shellcheck source=scripts/test_step.sh
+          . ./scripts/test_step.sh
+          run_test_step "CPU EP QLinearMatMul against real MLAS" \
+            cargo test --locked \
+            -p onnx-runtime-ep-cpu \
+            --no-default-features \
+            --features mlas \
+            kernels::qlinear_matmul::
 
       # x86_64-apple-darwin changes target_arch but leaves target_os="macos",
       # so cfg(target_os) errors are invisible.  This step uses a genuine Linux
@@ -494,17 +513,18 @@ jobs:
           shellcheck scripts/merge_when_green.sh scripts/merge_when_green_test.sh
           bash scripts/merge_when_green_test.sh
 
-      # The Miri lane selects most of its tests by name, and libtest exits 0 on
-      # a filter that matches nothing -- so a renamed test turns its step into a
-      # no-op that reports `ok`. `run_miri` refuses that, and this suite is what
-      # proves it still refuses, including a negative control that reproduces
-      # the pre-guard behaviour. Hermetic (no cargo, no Miri), well under a
-      # second. Runs here rather than in miri.yml so it is covered by a required
-      # lane instead of by the lane it guards.
-      - name: Miri step wrapper still refuses an empty filter (self-test)
+      # The Miri lane and the three MLAS steps above select tests by name, and
+      # libtest exits 0 on a filter that matches nothing -- so a renamed test
+      # turns its step into a no-op that reports `ok`. `run_miri` and
+      # `run_test_step` refuse that, and this suite is what proves they still
+      # refuse, including a negative control that reproduces the pre-guard
+      # behaviour. Hermetic (no cargo, no Miri), well under a second. Runs here
+      # rather than in miri.yml so it is covered by a required lane instead of
+      # by the lane it guards.
+      - name: Test step wrapper still refuses an empty filter (self-test)
         run: |
-          shellcheck scripts/miri_step.sh scripts/miri_step_test.sh
-          bash scripts/miri_step_test.sh
+          shellcheck scripts/test_step.sh scripts/test_step_test.sh
+          bash scripts/test_step_test.sh
 
       # onnx-genai-engine's native decode path only compiles when this feature
       # is on. Without this step a refactor can leave it uncompilable while

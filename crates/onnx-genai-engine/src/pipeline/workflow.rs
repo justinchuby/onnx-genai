@@ -5706,6 +5706,7 @@ mod workflow_sampling_binding_tests {
             shape: None,
             optional: false,
             batch_layout: BatchLayout::default(),
+            padding: Vec::new(),
         };
 
         let value = workflow_request_value(&RuntimeInputRole::PromptTokens, &request, &contract)
@@ -5728,6 +5729,7 @@ mod workflow_sampling_binding_tests {
             shape: None,
             optional: false,
             batch_layout: BatchLayout::default(),
+            padding: Vec::new(),
         };
 
         let error =
@@ -5750,6 +5752,7 @@ mod workflow_sampling_binding_tests {
             shape: Some(vec![TensorDimension::Fixed(1)]),
             optional: false,
             batch_layout: BatchLayout::default(),
+            padding: Vec::new(),
         };
 
         let top_k = workflow_request_value(&RuntimeInputRole::SamplingTopK, &request, &contract)
@@ -5936,7 +5939,7 @@ pub(crate) struct WorkflowLoopPlan<'n> {
     pub(crate) continue_when: &'n str,
     pub(crate) max_iterations: &'n str,
     pub(crate) termination: &'n onnx_genai_metadata::WorkflowLoopTermination,
-    pub(crate) iteration: &'n Option<onnx_genai_metadata::WorkflowLoopIteration>,
+    pub(crate) iteration: &'n Option<Box<onnx_genai_metadata::WorkflowLoopIteration>>,
     pub(crate) carried: &'n [onnx_genai_metadata::WorkflowLoopCarry],
 }
 

@@ -2,9 +2,9 @@
 //!
 //! The CUDA execution provider for the ORT 2.0 runtime (`docs/architecture/ORT2.md` §15 and
 //! §56 Phase 2). It implements [`onnx_runtime_ep_api::ExecutionProvider`] on top
-//! of [`cudarc`] (driver + cuBLASLt), mirroring the structure of the CPU EP.
+//! of [`cudarc`] plus dynamically loaded NVIDIA libraries, mirroring the CPU EP.
 //!
-//! ## Scope — cuBLASLt GEMM family + NVRTC elementwise + SDPA/GQA attention
+//! ## Scope — cuBLASLt GEMM + cuFFT DFT + NVRTC elementwise + attention
 //!
 //! This EP wires the foundation (device context, stream, allocator, H2D/D2H/
 //! D2D copies) and covers, keyed on `(op_type, domain)` via the shared
@@ -21,6 +21,8 @@
 //! * **Attention** — tiled online-softmax prefill (`Attention` and
 //!   `GroupQueryAttention`, `com.microsoft`) compiled by NVRTC, with an f16
 //!   tensor-core specialization and retained decode/unsupported-shape baselines.
+//! * **Signal** — f32 `DFT` through cuFFT with governed execution workspace and
+//!   arbitrary-axis NVRTC pack/unpack kernels.
 //!
 //! The full op → backend mapping matrix, remaining coverage, and the
 //! prioritised custom-kernel candidate list live in `docs/execution/CUDA_COVERAGE.md`.
@@ -30,7 +32,7 @@
 //!
 //! No `.cu` sources and no `nvcc`/`build.rs` compile step exist in this crate:
 //! `cudarc` is used in its **dynamic-loading** configuration, so `cargo build`
-//! needs no CUDA toolkit — the driver, cuBLASLt, and NVRTC are `dlopen`'d at
+//! needs no CUDA toolkit — the driver, cuBLASLt, cuFFT, and NVRTC are `dlopen`'d at
 //! runtime (the attention softmax is compiled from a CUDA-C string at runtime).
 //!
 //! ## Model-agnostic hard rule (§15.1)
@@ -81,6 +83,7 @@ pub mod arch;
 pub mod blas;
 pub mod capture;
 pub mod cudnn;
+pub mod cufft;
 pub mod deferred_release;
 mod dynamic_library;
 pub mod error;
@@ -107,6 +110,7 @@ pub mod route_residency;
 pub mod weight_paging;
 
 pub use capture::{require_subgraph_graph_capturable, subgraph_graph_capturable};
+pub use cufft::{CufftPlanCacheStats, cufft_plan_cache_stats};
 pub use dynamic_library::set_wheel_search_paths;
 pub use kernels::attention::AttentionKernel;
 pub use kernels::csa_checkpoint::{

@@ -719,10 +719,12 @@ pipeline:
         value: denoiser.estimate
         output: noise_estimate
         mode: append
+        axis: 3
       - kind: emit
         value: latent.body
         output: latent_trajectory
         mode: append
+        axis: 3
       - kind: invoke
         component: continue_predicate
         inputs:
