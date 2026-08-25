@@ -27,13 +27,12 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::{
     driver::{
-        DriverEvent, DriverFailure, DriverFailureKind, DriverGeneration, EngineDriver,
-        GenerateSubmitError,
+        DriverEvent, DriverFailure, DriverFailureKind, DriverGeneration, GenerateSubmitError,
     },
-    lease::SessionLeaseGuard,
+    lease::{ModelSessionPlacement, SessionLeaseGuard},
     multimodal::MultimodalInput,
-    registry::ModelHandle,
-    session::SessionRegistry,
+    registry::{ModelHandle, ModelRegistry},
+    session::{SessionCloseError, SessionRegistry, SessionRegistryError},
     sse::{
         StopBoundaryBuffer, completion_chunk, completion_done_chunk, content_chunk, done_chunk,
         reasoning_chunk, role_chunk, send_completion_stream_chunk, send_stream_chunk,
@@ -698,23 +697,82 @@ fn audio_decoder_prompt(
         .map_err(|error| ApiError::bad_request(format!("{error:#}")))
 }
 
-/// Close a session the registry let go of, under the lease it was handed back
-/// holding.
+/// Close a session the registry let go of, on the model that owns it, under the
+/// lease it was handed back holding.
+///
+/// The engine is resolved from the guard rather than passed in. That is the
+/// whole point of the guard carrying a model: the registry spans every loaded
+/// model, so the conversation an eviction hands back is routinely *not* the one
+/// the evicting request is working on. Closing it on the caller's engine would
+/// have destroyed whatever conversation happened to share its placement there —
+/// and two engines sharing a placement is the normal case, since every engine
+/// numbers its sessions from its own counter.
 ///
 /// The guard is consumed here, so the lease is released exactly when the engine
 /// has answered — never earlier, which would let a turn start on a session that
 /// is being closed, and never later, which would strand the id.
+async fn close_leased_session(
+    registry: &ModelRegistry,
+    lease: SessionLeaseGuard,
+) -> Result<(), ApiError> {
+    let model = lease.model().as_str().to_string();
+    let Some(handle) = registry.resolve(&model).map_err(map_registry_error)? else {
+        // The model was unloaded while this conversation was bound to it. Its
+        // engine — and therefore the session — is already gone, so there is
+        // nothing left to close; dropping the guard frees the lease.
+        tracing::warn!(
+            model = %model,
+            "session's model is no longer loaded; its engine session went with it",
+        );
+        return Ok(());
+    };
+    handle
+        .engine
+        .close_session(lease)
+        .await
+        .map_err(|err| ApiError::internal(format!("session close failed: {err}")))
+}
+
+/// Close an evicted binding, if the registry handed one back.
 async fn close_evicted_session(
-    engine: &EngineDriver,
+    registry: &ModelRegistry,
     evicted: Option<SessionLeaseGuard>,
 ) -> Result<(), ApiError> {
-    if let Some(evicted) = evicted {
-        engine
-            .close_session(evicted)
-            .await
-            .map_err(|err| ApiError::internal(format!("evicted session close failed: {err}")))?;
+    match evicted {
+        Some(evicted) => close_leased_session(registry, evicted).await,
+        None => Ok(()),
     }
-    Ok(())
+}
+
+/// The status a session-registry refusal actually is.
+///
+/// A full registry whose every conversation has a turn in flight is a resource
+/// limit, not a fault and not a bad request: the same call succeeds as soon as
+/// any turn ends, which is exactly what the overload 429 already means here,
+/// `Retry-After` included. Reusing that mapping keeps "the server is at
+/// capacity" one answer rather than two.
+pub(crate) fn session_registry_failure(error: SessionRegistryError) -> ApiError {
+    match error {
+        SessionRegistryError::AtCapacity { .. } => ApiError::too_many_requests(error.to_string()),
+        SessionRegistryError::Poisoned | SessionRegistryError::AlreadyBound => {
+            ApiError::internal(format!("session registry failed: {error}"))
+        }
+    }
+}
+
+/// The status a refused close actually is.
+///
+/// A close that races a live turn is the same conflict an overlapping turn is,
+/// and is reported through the same typed mapping so both answer 409 with the
+/// same shape.
+pub(crate) fn session_close_failure(client_id: &str, error: SessionCloseError) -> ApiError {
+    match error {
+        SessionCloseError::NotFound => {
+            ApiError::not_found(format!("session {client_id} not found"))
+        }
+        SessionCloseError::Busy(capability) => package_capability_failure(capability),
+        SessionCloseError::Registry(error) => session_registry_failure(error),
+    }
 }
 
 fn now_unix() -> u64 {

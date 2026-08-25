@@ -22,35 +22,118 @@
 use std::{
     collections::HashSet,
     fmt,
+    hash::{DefaultHasher, Hash, Hasher},
     sync::{Arc, Mutex, MutexGuard, PoisonError},
 };
 
 use onnx_genai_engine::PackageCapabilityError;
 
-use crate::worker::{SessionPlacement, WorkerPool};
+use crate::worker::SessionPlacement;
 
-/// Which sessions currently have a turn in flight.
+/// One lock per shard is plenty for a lease map whose critical section is a
+/// single set insert or removal; the count is fixed because the map spans every
+/// loaded model rather than one model's worker pool.
+const DEFAULT_SHARDS: usize = 8;
+
+/// Which model owns an engine, as a lease-key component and as the id the
+/// registry resolves that engine back from.
 ///
-/// Keyed by [`SessionPlacement`] rather than by a bare engine session id: an
-/// engine session id is only meaningful on the worker that issued it, so two
-/// workers could hand out the same number for two different conversations. The
-/// pair is the only thing that names a conversation without ambiguity, which is
-/// exactly what a lease key has to do.
+/// A newtype rather than a bare `String` so a model id cannot be passed where a
+/// client session id is expected, and `Arc<str>` so it is cheap to carry inside
+/// every lease key and every registry entry.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ModelKey(Arc<str>);
+
+impl ModelKey {
+    pub(crate) fn new(id: &str) -> Self {
+        Self(Arc::from(id))
+    }
+
+    /// The registry id this key names, for resolving the engine that owns a
+    /// leased conversation.
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for ModelKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.0, formatter)
+    }
+}
+
+impl fmt::Display for ModelKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+/// The globally unique identity of one conversation: which model's engine owns
+/// it, and where inside that engine it lives.
 ///
-/// Sharded by worker so the critical section stays short and two workers'
-/// request tasks never contend for one lock. With a pool of one there is one
-/// shard, and the sharding is the shape rather than the optimization.
+/// [`SessionPlacement`] alone is *not* unique. It names a worker and an engine
+/// session id, and both are per-engine: every model's pool starts at worker 0
+/// and every model's engine hands out session ids from its own counter, so two
+/// loaded models routinely produce the identical placement for two entirely
+/// different conversations. A lease map spanning models — and the session
+/// registry is one map spanning models — must therefore be keyed by the model
+/// as well, or a turn on one model's session would refuse, evict, or close
+/// another model's.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ModelSessionPlacement {
+    model: ModelKey,
+    placement: SessionPlacement,
+}
+
+impl ModelSessionPlacement {
+    pub(crate) fn new(model: ModelKey, placement: SessionPlacement) -> Self {
+        Self { model, placement }
+    }
+
+    /// The model whose engine owns this conversation.
+    pub(crate) fn model(&self) -> &ModelKey {
+        &self.model
+    }
+
+    /// Where the conversation lives inside that model's engine.
+    pub(crate) fn placement(&self) -> SessionPlacement {
+        self.placement
+    }
+}
+
+impl fmt::Debug for ModelSessionPlacement {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ModelSessionPlacement")
+            .field("model", &self.model)
+            .field("placement", &self.placement)
+            .finish()
+    }
+}
+
+/// Which sessions currently have a turn in flight, across every loaded model.
+///
+/// One map, owned by the session registry, because the session registry is
+/// itself one map across models: a decision the registry makes about a binding
+/// — evict it, close it, refuse a turn on it — has to consult the same lease
+/// the turn on that binding took. Per-engine maps would have made "the lease
+/// for this session" depend on which engine the caller happened to be holding,
+/// which is exactly the question a routing conflict cannot afford to get wrong.
+///
+/// Sharded so the critical section stays short and unrelated sessions' request
+/// tasks rarely contend for one lock.
 pub(crate) struct SessionLeases {
-    shards: Vec<Mutex<HashSet<SessionPlacement>>>,
+    shards: Vec<Mutex<HashSet<ModelSessionPlacement>>>,
 }
 
 impl SessionLeases {
-    /// One shard per worker in the pool that will serve these sessions.
-    pub(crate) fn for_pool(workers: &WorkerPool) -> Arc<Self> {
-        Self::with_shards(workers.len())
+    /// The lease map for one server: every model loaded into one registry.
+    pub(crate) fn new() -> Arc<Self> {
+        Self::with_shards(DEFAULT_SHARDS)
     }
 
-    /// A lease map with an explicit shard count, for tests that hold no pool.
+    /// A lease map with an explicit shard count, for tests that want every key
+    /// to land in one shard.
     pub(crate) fn with_shards(shards: usize) -> Arc<Self> {
         Arc::new(Self {
             shards: (0..shards.max(1))
@@ -59,30 +142,32 @@ impl SessionLeases {
         })
     }
 
-    /// The shard a placement's lease lives in.
+    /// The shard a binding's lease lives in.
     ///
-    /// Modulo rather than a direct index so the mapping is total: a placement
-    /// naming a worker this pool does not have still resolves to a shard, and
-    /// is refused later — by [`WorkerPool::worker`](crate::worker::WorkerPool)
-    /// — for the reason it is actually wrong, rather than panicking here.
-    fn shard(&self, placement: SessionPlacement) -> &Mutex<HashSet<SessionPlacement>> {
-        &self.shards[placement.worker.index() % self.shards.len()]
+    /// Hashed over the whole key rather than indexed by worker: the map spans
+    /// models, so the worker index is neither unique nor well distributed
+    /// across it.
+    fn shard(&self, binding: &ModelSessionPlacement) -> &Mutex<HashSet<ModelSessionPlacement>> {
+        let mut hasher = DefaultHasher::new();
+        binding.hash(&mut hasher);
+        let index = (hasher.finish() % self.shards.len() as u64) as usize;
+        &self.shards[index]
     }
 
     /// Take the exclusive turn lease for a session, or refuse by name.
     ///
     /// `session` is the identity the caller used — the client's session id —
     /// and appears in the refusal so the answer names something the caller can
-    /// act on. It is not the key: the key is the placement.
+    /// act on. It is not the key: the key is the model-qualified placement.
     pub(crate) fn acquire(
         self: &Arc<Self>,
-        placement: SessionPlacement,
+        binding: ModelSessionPlacement,
         session: &str,
     ) -> Result<SessionLeaseGuard, PackageCapabilityError> {
-        if lock(self.shard(placement)).insert(placement) {
+        if lock(self.shard(&binding)).insert(binding.clone()) {
             Ok(SessionLeaseGuard {
                 leases: Arc::clone(self),
-                placement,
+                binding,
             })
         } else {
             Err(PackageCapabilityError::ExclusiveLeaseConflict {
@@ -100,12 +185,12 @@ impl SessionLeases {
     /// taking it is the only check that cannot go stale. Tests assert with it
     /// that a lease is held while a turn runs and released when it ends.
     #[cfg(test)]
-    pub(crate) fn is_held(&self, placement: SessionPlacement) -> bool {
-        lock(self.shard(placement)).contains(&placement)
+    pub(crate) fn is_held(&self, binding: &ModelSessionPlacement) -> bool {
+        lock(self.shard(binding)).contains(binding)
     }
 
-    fn release(&self, placement: SessionPlacement) {
-        lock(self.shard(placement)).remove(&placement);
+    fn release(&self, binding: &ModelSessionPlacement) {
+        lock(self.shard(binding)).remove(binding);
     }
 
     /// How many sessions hold a lease right now. Tests assert nothing leaked.
@@ -136,22 +221,36 @@ impl fmt::Debug for SessionLeases {
 /// [`DriverCommand`](crate::driver::DriverCommand) that carries the turn, so a
 /// failed send returns it to the sending task and drops it there, and into the
 /// worker's per-row state once the command is accepted.
+///
+/// It also carries the identity of what it leased, model included, so a caller
+/// holding one never has to ask a second source which engine to act on — the
+/// answer that produced the lease is the answer it acts with.
 #[must_use = "dropping the guard releases the lease and admits a second turn on this session"]
 pub(crate) struct SessionLeaseGuard {
     leases: Arc<SessionLeases>,
-    placement: SessionPlacement,
+    binding: ModelSessionPlacement,
 }
 
 impl SessionLeaseGuard {
-    /// Where the leased conversation lives.
+    /// The leased conversation, model and placement together.
+    pub(crate) fn binding(&self) -> &ModelSessionPlacement {
+        &self.binding
+    }
+
+    /// The model whose engine owns the leased conversation.
+    pub(crate) fn model(&self) -> &ModelKey {
+        self.binding.model()
+    }
+
+    /// Where the leased conversation lives inside that model's engine.
     pub(crate) fn placement(&self) -> SessionPlacement {
-        self.placement
+        self.binding.placement()
     }
 }
 
 impl Drop for SessionLeaseGuard {
     fn drop(&mut self) {
-        self.leases.release(self.placement);
+        self.leases.release(&self.binding);
     }
 }
 
@@ -159,7 +258,7 @@ impl fmt::Debug for SessionLeaseGuard {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("SessionLeaseGuard")
-            .field("placement", &self.placement)
+            .field("binding", &self.binding)
             .finish()
     }
 }
@@ -183,17 +282,27 @@ mod tests {
     use super::*;
     use crate::worker::WorkerId;
 
-    fn placement(engine_session_id: onnx_genai::SessionId) -> SessionPlacement {
-        SessionPlacement::new(WorkerId::PRIMARY, engine_session_id)
+    fn binding(engine_session_id: onnx_genai::SessionId) -> ModelSessionPlacement {
+        model_binding("model-a", engine_session_id)
+    }
+
+    fn model_binding(
+        model: &str,
+        engine_session_id: onnx_genai::SessionId,
+    ) -> ModelSessionPlacement {
+        ModelSessionPlacement::new(
+            ModelKey::new(model),
+            SessionPlacement::new(WorkerId::PRIMARY, engine_session_id),
+        )
     }
 
     #[test]
     fn a_lease_is_exclusive_and_names_the_session_it_refuses() {
         let leases = SessionLeases::with_shards(1);
-        let held = leases.acquire(placement(7), "sess-a").expect("first turn");
+        let held = leases.acquire(binding(7), "sess-a").expect("first turn");
 
         let conflict = leases
-            .acquire(placement(7), "sess-a")
+            .acquire(binding(7), "sess-a")
             .expect_err("a second turn on a live session is refused");
         assert_eq!(
             conflict,
@@ -204,15 +313,13 @@ mod tests {
         assert!(conflict.is_retryable(), "a busy session is retryable");
 
         // A different conversation is unaffected, even on the same worker.
-        let other = leases
-            .acquire(placement(8), "sess-b")
-            .expect("other session");
-        assert_eq!(other.placement(), placement(8));
+        let other = leases.acquire(binding(8), "sess-b").expect("other session");
+        assert_eq!(other.binding(), &binding(8));
 
         drop(held);
-        assert!(!leases.is_held(placement(7)));
-        assert!(leases.is_held(placement(8)));
-        drop(leases.acquire(placement(7), "sess-a").expect("released"));
+        assert!(!leases.is_held(&binding(7)));
+        assert!(leases.is_held(&binding(8)));
+        drop(leases.acquire(binding(7), "sess-a").expect("released"));
     }
 
     /// The same engine session id on two workers is two conversations.
@@ -220,12 +327,59 @@ mod tests {
     fn a_lease_is_keyed_by_placement_not_by_engine_session_id() {
         let leases = SessionLeases::with_shards(2);
         let _first = leases
-            .acquire(SessionPlacement::new(WorkerId::PRIMARY, 3), "sess-a")
+            .acquire(
+                ModelSessionPlacement::new(
+                    ModelKey::new("model-a"),
+                    SessionPlacement::new(WorkerId::PRIMARY, 3),
+                ),
+                "sess-a",
+            )
             .expect("worker 0");
         let _second = leases
-            .acquire(SessionPlacement::new(WorkerId::new(1), 3), "sess-b")
+            .acquire(
+                ModelSessionPlacement::new(
+                    ModelKey::new("model-a"),
+                    SessionPlacement::new(WorkerId::new(1), 3),
+                ),
+                "sess-b",
+            )
             .expect("worker 1 holds a different conversation with the same id");
         assert_eq!(leases.held(), 2);
+    }
+
+    /// The same placement on two models is two conversations.
+    ///
+    /// Every engine numbers its own sessions from its own counter and every
+    /// pool starts at worker 0, so this collision is the common case rather
+    /// than a contrived one: load two models, open one session in each, and
+    /// both are worker 0 / session 0. Keyed by placement alone, the second
+    /// model's first turn would have been refused as a conflict with the
+    /// first model's.
+    #[test]
+    fn a_lease_is_keyed_by_model_as_well_as_placement() {
+        let leases = SessionLeases::with_shards(1);
+        let first = leases
+            .acquire(model_binding("model-a", 0), "sess-a")
+            .expect("model-a's first session");
+        let second = leases
+            .acquire(model_binding("model-b", 0), "sess-b")
+            .expect("model-b's identical placement is a different conversation");
+        assert_eq!(leases.held(), 2);
+
+        // And each still refuses its own second turn.
+        assert!(
+            leases
+                .acquire(model_binding("model-b", 0), "sess-b")
+                .is_err()
+        );
+        drop(first);
+        assert!(!leases.is_held(&model_binding("model-a", 0)));
+        assert!(
+            leases.is_held(&model_binding("model-b", 0)),
+            "releasing one model's lease does not release the other's",
+        );
+        drop(second);
+        assert_eq!(leases.held(), 0);
     }
 
     /// Real threads, one barrier, one session: exactly one turn may start.
@@ -249,7 +403,7 @@ mod tests {
                 let conflicts = Arc::clone(&conflicts);
                 scope.spawn(move || {
                     barrier.wait();
-                    match leases.acquire(placement(1), "sess-race") {
+                    match leases.acquire(binding(1), "sess-race") {
                         Ok(guard) => {
                             winners.fetch_add(1, Ordering::SeqCst);
                             // Hold it past every other thread's attempt, so a
@@ -288,8 +442,38 @@ mod tests {
                 scope.spawn(move || {
                     barrier.wait();
                     let guard = leases
-                        .acquire(placement(index as u64), "sess-distinct")
+                        .acquire(binding(index as u64), "sess-distinct")
                         .expect("a session of its own");
+                    winners.fetch_add(1, Ordering::SeqCst);
+                    drop(guard);
+                });
+            }
+        });
+
+        assert_eq!(winners.load(Ordering::SeqCst), THREADS);
+        assert_eq!(leases.held(), 0);
+    }
+
+    /// Two models' identically placed sessions never contend, even when every
+    /// thread asks at the same instant.
+    #[test]
+    fn racing_threads_on_two_models_identical_placement_both_take_their_lease() {
+        const THREADS: usize = 8;
+        let leases = SessionLeases::with_shards(1);
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let winners = Arc::new(AtomicUsize::new(0));
+
+        thread::scope(|scope| {
+            for index in 0..THREADS {
+                let leases = Arc::clone(&leases);
+                let barrier = Arc::clone(&barrier);
+                let winners = Arc::clone(&winners);
+                scope.spawn(move || {
+                    let model = format!("model-{index}");
+                    barrier.wait();
+                    let guard = leases
+                        .acquire(model_binding(&model, 0), "sess-shared-placement")
+                        .expect("each model's worker 0 / session 0 is its own conversation");
                     winners.fetch_add(1, Ordering::SeqCst);
                     drop(guard);
                 });
@@ -308,18 +492,15 @@ mod tests {
         let panicking = {
             let leases = Arc::clone(&leases);
             thread::spawn(move || {
-                let _guard = leases.acquire(placement(5), "sess-panic").expect("held");
+                let _guard = leases.acquire(binding(5), "sess-panic").expect("held");
                 panic!("the turn panicked");
             })
         };
         assert!(panicking.join().is_err(), "the thread panicked");
-        assert!(
-            !leases.is_held(placement(5)),
-            "an unwind releases the lease"
-        );
+        assert!(!leases.is_held(&binding(5)), "an unwind releases the lease");
         drop(
             leases
-                .acquire(placement(5), "sess-panic")
+                .acquire(binding(5), "sess-panic")
                 .expect("the session is leasable again"),
         );
     }

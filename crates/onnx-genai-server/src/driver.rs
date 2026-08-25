@@ -17,7 +17,7 @@ use onnx_genai_engine::{
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 
 use crate::image_generation::{ImageExecutionRequest, ProducedImage};
-use crate::lease::{SessionLeaseGuard, SessionLeases};
+use crate::lease::{ModelKey, ModelSessionPlacement, SessionLeaseGuard};
 use crate::metrics::GenerationMetrics;
 use crate::multimodal::MultimodalInput;
 use crate::worker::{SessionPlacement, WorkerHandle, WorkerId, WorkerPool, WorkerUnavailable};
@@ -33,11 +33,15 @@ pub(crate) struct EngineDriver {
     /// The worker threads that own the engine. Exactly one today; every command
     /// names the worker it must reach rather than assuming there is only one.
     pub(crate) workers: WorkerPool,
-    /// Which sessions have a turn in flight. Held here, in the routing façade,
-    /// because it has to be consulted *before* a command is built — a map on
-    /// the worker could only be read once the turn was already queued behind
-    /// the one it conflicts with.
-    pub(crate) session_leases: Arc<SessionLeases>,
+    /// Which model this engine was loaded as, bound once by
+    /// [`ModelHandle::new`](crate::registry::ModelHandle::new).
+    ///
+    /// The routing layer's lease and session maps span every loaded model, and
+    /// a placement is only unique within one engine, so every key they build
+    /// has to name the model too. Reading that name off the driver — rather
+    /// than off whatever id the caller was carrying — is what makes the key a
+    /// caller cannot get wrong.
+    pub(crate) model: ModelKey,
     pub(crate) generation_capacity: Arc<Semaphore>,
     pub(crate) generation_capacity_size: u32,
     /// Lock-free mirror of the KV page pool, readable during a generation.
@@ -361,7 +365,9 @@ impl EngineDriver {
             "engine worker pool started (one worker owns the engine)",
         );
         Self {
-            session_leases: SessionLeases::for_pool(&workers),
+            // Rebound by `ModelHandle::new`, which is the first thing that
+            // knows the id this engine was loaded as.
+            model: ModelKey::new(""),
             workers,
             generation_capacity,
             generation_capacity_size: u32::try_from(max_queue_depth).unwrap_or(u32::MAX),
@@ -419,24 +425,26 @@ impl EngineDriver {
         &self.batching
     }
 
-    /// Take the exclusive turn lease for a session, or refuse by name.
+    /// Bind this engine to the id it was loaded as.
     ///
-    /// Called by the routing layer *before* a command is built, before the
-    /// admission permit is charged, and before anything is enqueued: a turn
-    /// that cannot take the lease never becomes work. `session` is the identity
-    /// the caller used, and appears in the refusal.
-    pub(crate) fn acquire_session_lease(
-        &self,
-        session: SessionPlacement,
-        client_id: &str,
-    ) -> Result<SessionLeaseGuard, onnx_genai_engine::PackageCapabilityError> {
-        self.session_leases.acquire(session, client_id)
+    /// Called once, by [`ModelHandle::new`](crate::registry::ModelHandle::new),
+    /// which is the only constructor of a routable model. Everything that keys
+    /// a session or a lease reads the model from here, so the handle's id and
+    /// the driver's are the same string by construction rather than by
+    /// convention.
+    pub(crate) fn bind_model(&mut self, id: &str) {
+        self.model = ModelKey::new(id);
     }
 
-    /// The lease map, for the registry decisions that must not disturb a live
-    /// conversation (LRU eviction picks an unleased victim).
-    pub(crate) fn session_leases(&self) -> &Arc<SessionLeases> {
-        &self.session_leases
+    /// The model whose sessions this engine owns.
+    pub(crate) fn model_key(&self) -> &ModelKey {
+        &self.model
+    }
+
+    /// A conversation in *this* engine, as the globally unique key the routing
+    /// layer's maps use.
+    pub(crate) fn binding(&self, placement: SessionPlacement) -> ModelSessionPlacement {
+        ModelSessionPlacement::new(self.model.clone(), placement)
     }
 
     /// Open an engine session and report where it lives.
@@ -465,6 +473,12 @@ impl EngineDriver {
     /// destroy the state that turn is mid-way through writing. The lease is
     /// released when this returns, and never before the engine has answered.
     pub(crate) async fn close_session(&self, lease: SessionLeaseGuard) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            lease.model() == &self.model,
+            "session lease for model '{}' cannot be closed on model '{}'",
+            lease.model(),
+            self.model,
+        );
         let session = lease.placement();
         let (response, rx) = tokio::sync::oneshot::channel();
         self.session_commands(session)
@@ -543,6 +557,12 @@ impl EngineDriver {
     ) -> Result<DriverGeneration, GenerateSubmitError> {
         // A session-bound generation goes to the worker holding its KV state;
         // a stateless one goes to the worker that serves unbound work.
+        debug_assert!(
+            session
+                .as_ref()
+                .is_none_or(|lease| lease.model() == &self.model),
+            "a turn's lease names the engine it runs on",
+        );
         let placement = session.as_ref().map(SessionLeaseGuard::placement);
         let permit = self
             .generation_capacity
@@ -2058,7 +2078,7 @@ mod admission_tests {
                 declares_generation_loop: false,
             },
             workers: WorkerPool::single(WorkerHandle::detached(WorkerId::PRIMARY, commands)),
-            session_leases: SessionLeases::with_shards(1),
+            model: ModelKey::new("stub"),
             generation_capacity: Arc::new(Semaphore::new(1)),
             generation_capacity_size: 1,
             kv_telemetry: Arc::new(KvTelemetry::default()),
@@ -2197,8 +2217,9 @@ mod admission_tests {
         // A session is opened on, and named by, the pool's only worker.
         let session = driver.create_session().await.expect("open session");
         assert_eq!(session.worker, WorkerId::PRIMARY);
-        let lease = driver
-            .acquire_session_lease(session, "sess-shutdown")
+        let leases = crate::lease::SessionLeases::with_shards(1);
+        let lease = leases
+            .acquire(driver.binding(session), "sess-shutdown")
             .expect("an idle session is leasable");
         driver.close_session(lease).await.expect("close session");
 
@@ -2238,7 +2259,7 @@ mod admission_tests {
                 declares_generation_loop: false,
             },
             workers: WorkerPool::single(WorkerHandle::detached(WorkerId::PRIMARY, commands)),
-            session_leases: SessionLeases::with_shards(1),
+            model: ModelKey::new("stub"),
             generation_capacity: Arc::new(Semaphore::new(1)),
             generation_capacity_size: 1,
             kv_telemetry: Arc::new(KvTelemetry::default()),
@@ -2253,8 +2274,9 @@ mod admission_tests {
         };
         let elsewhere = SessionPlacement::new(WorkerId::new(4), 1);
 
-        let lease = driver
-            .acquire_session_lease(elsewhere, "sess-elsewhere")
+        let leases = crate::lease::SessionLeases::with_shards(1);
+        let lease = leases
+            .acquire(driver.binding(elsewhere), "sess-elsewhere")
             .expect("a lease is taken before the worker is even consulted");
         let error = driver
             .close_session(lease)
@@ -2265,7 +2287,7 @@ mod admission_tests {
             "engine worker 4 is not in this pool (1 worker(s) loaded)"
         );
         assert!(
-            !driver.session_leases().is_held(elsewhere),
+            !leases.is_held(&driver.binding(elsewhere)),
             "a close that failed still gave the lease back"
         );
     }
@@ -2288,7 +2310,7 @@ mod admission_tests {
                 declares_generation_loop: false,
             },
             workers: WorkerPool::single(WorkerHandle::detached(WorkerId::PRIMARY, commands)),
-            session_leases: SessionLeases::with_shards(1),
+            model: ModelKey::new("stub"),
             // One permit, so the second acquisition below finds the gate shut.
             generation_capacity: Arc::new(Semaphore::new(1)),
             generation_capacity_size: 1,
@@ -2303,44 +2325,45 @@ mod admission_tests {
             batching: Arc::new(BatchingReport::single_sequence_stub()),
         };
         let session = SessionPlacement::new(WorkerId::PRIMARY, 7);
+        let leases = crate::lease::SessionLeases::with_shards(1);
 
         // 1. Refused by the admission gate, before a command is ever built.
         let hog = Arc::clone(&driver.generation_capacity)
             .try_acquire_owned()
             .expect("the only permit");
-        let lease = driver
-            .acquire_session_lease(session, "sess-overloaded")
+        let lease = leases
+            .acquire(driver.binding(session), "sess-overloaded")
             .expect("an idle session is leasable");
-        assert!(driver.session_leases().is_held(session));
+        assert!(leases.is_held(&driver.binding(session)));
         assert!(matches!(
             driver.generate(Some(lease), warmup_request(), None).await,
             Err(GenerateSubmitError::Overloaded)
         ));
         assert!(
-            !driver.session_leases().is_held(session),
+            !leases.is_held(&driver.binding(session)),
             "a turn refused admission is not a turn in flight"
         );
         drop(hog);
 
         // 2. Accepted by the gate, then handed to a worker that is gone.
         drop(rx);
-        let lease = driver
-            .acquire_session_lease(session, "sess-stopped")
+        let lease = leases
+            .acquire(driver.binding(session), "sess-stopped")
             .expect("still leasable");
         assert!(matches!(
             driver.generate(Some(lease), warmup_request(), None).await,
             Err(GenerateSubmitError::DriverStopped)
         ));
         assert_eq!(
-            driver.session_leases().held(),
+            leases.held(),
             0,
             "a stopped driver leaves no session leased forever"
         );
 
         // And the session is ordinary again: the refusals cost it nothing.
         drop(
-            driver
-                .acquire_session_lease(session, "sess-after")
+            leases
+                .acquire(driver.binding(session), "sess-after")
                 .expect("leasable after both refusals"),
         );
     }
