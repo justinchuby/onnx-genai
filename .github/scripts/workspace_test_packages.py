@@ -127,6 +127,44 @@ _CARGO_AGAIN = re.compile(r"(?:^|[\s;&|])cargo\s+(?:\+\S+\s+)?(?!clippy\b)\S+")
 _GENERATOR = re.compile(
     r"\$\(\s*python3?\s+\.github/scripts/workspace_test_packages\.py\s+cargo-args\s+([a-z-]+)\s*\)"
 )
+# The same call, bound to a shell variable. The guarded form these workflows use
+# moves the lane name off the `cargo clippy` line, so the block below has to
+# read backwards to find it.
+_GENERATOR_ASSIGN = re.compile(
+    r"^([A-Za-z_][A-Za-z0-9_]*)=\"?\$\(\s*python3?\s+"
+    r"\.github/scripts/workspace_test_packages\.py\s+cargo-args\s+[a-z-]+\s*\)"
+)
+
+
+def _generator_vars_before(lines: list[str], index: int, base: int) -> dict[str, str]:
+    """Generator assignments earlier in the same `run:` block, nearest first.
+
+    A step that wants to refuse an empty expansion has to bind the generator to
+    a variable first, because `cargo clippy $(...)` runs happily on nothing:
+    the substitution fails, the outer command still exits 0, and the step lints
+    the default members instead of the lane. Binding it moves the lane name off
+    the invocation line and out of the text `clippy_blocks` returns.
+
+    The read is deliberately narrow in both directions. It stops at the first
+    line indented less than the invocation, so it cannot walk out of the step
+    into the one above; and `clippy_blocks` appends what it finds only when the
+    invocation actually references the variable. Crediting every assignment in
+    scope would be a join rather than a dataflow read, and this scanner's whole
+    documented risk is over-reading.
+    """
+    assigned: dict[str, str] = {}
+    for position in range(index - 1, -1, -1):
+        line = lines[position]
+        if not line.strip():
+            break
+        stripped = line.lstrip()
+        if len(line) - len(stripped) < base:
+            break
+        match = _GENERATOR_ASSIGN.match(stripped)
+        if match:
+            # Nearest assignment wins: a later one replaces an earlier one.
+            assigned.setdefault(match.group(1), line)
+    return assigned
 
 
 def clippy_blocks(lines: list[str]) -> list[str]:
@@ -179,6 +217,11 @@ def clippy_blocks(lines: list[str]) -> list[str]:
         after = _CARGO_AGAIN.search(text, match.end())
         if after:
             text = text[: after.start()]
+        # Recover a package list the invocation reads from a variable, but only
+        # the ones it actually names. See `_generator_vars_before`.
+        for variable, source in _generator_vars_before(lines, index, base).items():
+            if re.search(r"\$\{?" + re.escape(variable) + r"\}?", text):
+                text = f"{text}\n{source}"
         found.append(text)
     return found
 
@@ -1268,6 +1311,50 @@ def _probe_guarded_assignment(used: bool = True) -> int:
     return 0
 
 
+def _probe_clippy_generator_var(referenced: bool = True) -> int:
+    """Attribution probe for a clippy step whose package list is in a variable.
+
+    `referenced=True` is the form the workflow ships. `referenced=False` is the
+    mutation that matters: the assignment is still in the step, and the
+    invocation never mentions it. Crediting the lane there would turn the
+    backwards read into a join, which is the over-read `clippy_blocks` exists
+    to prevent -- and it fails quietly, because an over-credited package looks
+    linted and nothing says otherwise.
+    """
+    resolver = "python .github/scripts/workspace_test_packages.py cargo-args linux-only"
+    invocation = (
+        "          cargo clippy --locked --all-targets $packages -- -D warnings"
+        if referenced
+        else "          cargo clippy --locked --all-targets -p onnx-genai-cli -- -D warnings"
+    )
+    text = "\n".join(
+        [
+            "      - name: Clippy offline crates",
+            "        shell: bash",
+            "        run: |",
+            f'          packages="$({resolver})"',
+            '          test -n "$packages" || { echo "::error::empty"; exit 1; }',
+            invocation,
+        ]
+    )
+    credited: set[str] = set()
+    for block in clippy_blocks(text.splitlines()):
+        for lane in _GENERATOR.findall(block):
+            if lane in LANES:
+                credited.update(lane_packages(lane))
+        credited.update(re.findall(r"-p\s+([A-Za-z0-9_-]+)", block))
+    want = set(lane_packages("linux-only")) if referenced else {"onnx-genai-cli"}
+    if credited != want:
+        print(
+            "clippy attribution mismatch: "
+            f"unexpected={sorted(credited - want)} absent={sorted(want - credited)}",
+            file=sys.stderr,
+        )
+        return 1
+    print("clippy attribution as stated: " + ", ".join(sorted(credited)))
+    return 0
+
+
 def self_test() -> int:
     """Prove both gates still refuse, on content and not merely on exit code.
 
@@ -1312,6 +1399,20 @@ def self_test() -> int:
             "packages_tested_by refuses a lane the cargo call never uses",
             _probe_guarded_assignment,
             {"used": False},
+            0,
+            ["onnx-genai-cli"],
+        ),
+        (
+            "linted_packages credits a lane the clippy call reads from a variable",
+            _probe_clippy_generator_var,
+            {"referenced": True},
+            0,
+            sorted(lane_packages("linux-only")),
+        ),
+        (
+            "linted_packages refuses a lane the clippy call never references",
+            _probe_clippy_generator_var,
+            {"referenced": False},
             0,
             ["onnx-genai-cli"],
         ),

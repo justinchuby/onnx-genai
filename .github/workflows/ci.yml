@@ -334,10 +334,11 @@ jobs:
           test -n "$packages" || { echo "::error::lane 'offline-linux' resolved to an empty package set"; exit 1; }
           cargo test --locked $packages
       - name: Clippy Linux offline crates
-        run: >-
-          cargo clippy --locked --all-targets
-          $(python .github/scripts/workspace_test_packages.py cargo-args lint)
-          -- -D warnings
+        shell: bash
+        run: |
+          packages="$(python .github/scripts/workspace_test_packages.py cargo-args lint)"
+          test -n "$packages" || { echo "::error::lane 'lint' resolved to an empty package set"; exit 1; }
+          cargo clippy --locked --all-targets $packages -- -D warnings
 
   rust-quality:
     name: Rust quality
@@ -493,10 +494,11 @@ jobs:
       # mlas-sys is also checked by the Windows ARM64 job so MSVC/native
       # build-script regressions do not hide behind the Linux quality lane.
       - name: Run clippy on all offline crates
-        run: >-
-          cargo clippy --locked --all-targets
-          $(python .github/scripts/workspace_test_packages.py cargo-args lint)
-          -- -D warnings
+        shell: bash
+        run: |
+          packages="$(python .github/scripts/workspace_test_packages.py cargo-args lint)"
+          test -n "$packages" || { echo "::error::lane 'lint' resolved to an empty package set"; exit 1; }
+          cargo clippy --locked --all-targets $packages -- -D warnings
 
       # Wrapped in `run_test_step` because the selector is a bare test NAME,
       # which libtest does not police: an exact-name filter that matches nothing
@@ -888,11 +890,11 @@ jobs:
           test -n "$packages" || { echo "::error::lane 'offline-cross-platform' resolved to an empty package set"; exit 1; }
           cargo test --locked $packages
       - name: Clippy Windows ARM64 offline crates
-        run: >-
-          cargo clippy --locked --all-targets
-          --target aarch64-pc-windows-msvc
-          $(python .github/scripts/workspace_test_packages.py cargo-args offline-linux)
-          -- -D warnings
+        shell: bash
+        run: |
+          packages="$(python .github/scripts/workspace_test_packages.py cargo-args offline-linux)"
+          test -n "$packages" || { echo "::error::lane 'offline-linux' resolved to an empty package set"; exit 1; }
+          cargo clippy --locked --all-targets --target aarch64-pc-windows-msvc $packages -- -D warnings
 
   ep-conformance:
     name: EP conformance (Linux x86_64)
