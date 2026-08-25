@@ -158,19 +158,66 @@ run-time index-validation step here — that lives in the consuming `IndexShare`
   single `DsaIndexSelect` node is a Mobius export change gated behind runtime
   approval and is **not** part of this runtime slice.
 
-## CUDA slice contract (next, not in this commit)
+## CUDA slice — landed (native NVRTC kernel)
 
-The CUDA NVRTC kernel must reproduce the frozen semantics above bit-for-bit
-against the CPU oracle, with:
+The CUDA NVRTC kernel `dsa_index_select_row` reproduces the frozen semantics
+above **bit-for-bit** against the CPU oracle (integer `selected_indices`, so
+parity is byte-exact, not tolerance-based). Design as landed:
 
-- fused scoring (`H·D` reduction) + streaming/stable-width top-`k` + ascending
-  sort + `-1` padding in one launch;
-- stable device buffers, kernel compiled at warm-up (first eager run), **no host
-  alloc / sync / NVRTC compile during capture**;
-- `supports_op` delegating to the shared `unsupported_reason`;
-- GPU tests: CPU-oracle parity at tiny and real GLM dims (`H=2, D=8, top_k=4`),
-  first-token/prefill/≥16-decode, query-dependent top-k, tie/sentinel, capture ≥3
-  replays with `fallbacks == 0`, eager parity, multi-request/device isolation,
-  teardown/accounting;
-- A100 measurement (n ≥ 3, CUDA events + host enqueue, clock ramp) versus the
-  decomposed DSA path — **no full-size tok/s claim**; tiny correctness is the gate.
+- **One launch, one block per `(b, s)` row.** Phase 1 computes the head-weighted
+  ReLU'd scaled score for every allowed key in parallel (threads widen f16/bf16
+  storage to f32 with `__half2float` / `__bfloat162float`, matching the CPU
+  oracle's `half::to_f32`, so scores are identical). Phase 2 runs the
+  deterministic keep-round argmax on the lead thread using an integer
+  `total_order_key` transform that reproduces Rust `f32::total_cmp` exactly
+  (score desc, index asc), then emits the kept indices ascending and right-pads
+  with the `-1` sentinel.
+- **Fixed scratch, no page allocation.** The only device memory the op adds is a
+  `B·S·T` f32 `scores` buffer plus a `B·S·T` u8 `state` buffer in the
+  executor-owned **SessionPersistent** workspace (256-aligned, overwritten fresh
+  each call). `onnx-genai-kv` remains the sole page/slot/lifetime authority — the
+  op allocates and owns no pages.
+- **Capture-safe.** The kernel produces indices (no index *input* to validate),
+  so there is **no capture-error latch, no D2H, and no host sync on any path**.
+  `warmed` flips true only after a non-capturing eager pass has NVRTC-compiled
+  the kernel and sized the workspace; `capture_support()` reports `Supported`
+  only once warmed, so a captured region performs no host alloc / sync / compile.
+- **Claim gate.** `supports_op` delegates to the shared CPU
+  `unsupported_reason`, first projecting the query/key/weights float dtypes to f32
+  (CUDA supports f16/bf16 storage) while leaving `attention_bias` untouched, so
+  the oracle's strict f32-only bias reject still fires. Quantized cache modes,
+  head_sink, and q/k norm are out of this subset and typed-reject.
+
+### Consumer-boundary decision (why no extra glue op)
+
+`DsaIndexSelect` fuses the **index-selection** half of DSA (the scoring MatMul +
+top-k). Its `[B,1,S,top_k]` int64 output is consumed directly by the existing
+native CUDA `pkg.nxrt::IndexShare` kernel, which already owns the sparse KV
+gather + attention and the run-time index validation. Real GLM-5.2 DSA is
+therefore fully covered by **`DsaIndexSelect` (CUDA) + `IndexShare` (CUDA)** with
+no additional boundary op: the "smallest sparse gather/attention consumer" the
+slice asked about already exists and is unchanged. This keeps the one-authority
+invariant intact (indices are data flowing between two ops; neither allocates KV
+pages).
+
+### A100 measurement (tiny + real GLM indexer dims)
+
+Idle A100-80GB, pinned device, 8 s clock ramp (device 210 MHz → 1410 MHz across
+the run), CUDA events over batched captured-graph launches for device time and a
+drained small-batch wall-clock for pure host-enqueue, medians of n = 7 with
+first-vs-last drift re-measure. **No full-size tok/s claim — tiny correctness is
+the gate; this is a per-launch kernel-cost witness only.**
+
+| Geometry (B,S,H,D,T,top_k) | device (µs) | host-enqueue (µs) | scratch (B) |
+| --- | --- | --- | --- |
+| tiny-decode (1,1,2,8,16,4)   | 7.6  | 2.2 | 512   |
+| glm-prefill (1,64,2,8,64,4)  | 18.4 | 2.2 | 20480 |
+| glm-decode  (1,1,2,8,512,4)  | 119  | 2.2 | 2560  |
+
+Host-enqueue for a captured-graph launch is a flat ~2.2 µs independent of kernel
+size (device time and submit cost are cleanly separated). First-vs-last drift on
+the tiny geometry was **0.5 %**, and the min/max spread within each config was
+under 0.5 %, so the device held still. Scratch VRAM is exactly `B·S·T·5` bytes,
+confirming no page allocation. The wide-`T` decode row (T=512) is dominated by
+the single-threaded Phase-2 selection (`O(keep·T)`); parallelizing it is future
+perf work and is out of scope for this correctness slice (no full-size claim).

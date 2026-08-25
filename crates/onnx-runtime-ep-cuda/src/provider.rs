@@ -2726,6 +2726,13 @@ impl ExecutionProvider for CudaExecutionProvider {
         {
             return KernelMatch::unsupported(reason);
         }
+        if op.op_type == "DsaIndexSelect"
+            && op.domain == "pkg.nxrt"
+            && let Some(reason) =
+                crate::kernels::dsa_index_select::unsupported_reason(op, shapes, input_dtypes)
+        {
+            return KernelMatch::unsupported(reason);
+        }
         if op.op_type == "PackedVarlenAttention"
             && op.domain == "pkg.nxrt"
             && let Some(reason) =
