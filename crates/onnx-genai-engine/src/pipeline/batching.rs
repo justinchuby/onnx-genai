@@ -861,26 +861,49 @@ fn companion_values(
     companion: &str,
     tensor: &Value,
 ) -> Result<Vec<i64>, BatchContractError> {
+    let invalid = |reason: String| BatchContractError::InvalidCompanion {
+        component: component.into(),
+        value: value.into(),
+        level,
+        kind,
+        companion: companion.into(),
+        reason,
+    };
     if tensor.dtype() != DataType::Int64 || tensor.shape().len() != 1 {
-        return Err(BatchContractError::InvalidCompanion {
-            component: component.into(),
-            value: value.into(),
-            level,
-            kind,
-            companion: companion.into(),
-            reason: format!("got {:?} shape {:?}", tensor.dtype(), tensor.shape()),
-        });
+        return Err(invalid(format!(
+            "got {:?} shape {:?}",
+            tensor.dtype(),
+            tensor.shape()
+        )));
     }
-    tensor
-        .to_vec_i64()
-        .map_err(|error| BatchContractError::InvalidCompanion {
-            component: component.into(),
-            value: value.into(),
-            level,
-            kind,
-            companion: companion.into(),
-            reason: error.to_string(),
+    let host_resident = tensor
+        .is_host_resident()
+        .map_err(|error| invalid(error.to_string()))?;
+    snapshot_companion_i64(tensor, host_resident, |tensor| {
+        let device_id = tensor.device_id().map_err(|error| error.to_string())?;
+        tensor.to_host_from_cuda(device_id).map_err(|error| {
+            format!(
+                "failed to stage device-resident ownership metadata from CUDA device \
+                 {device_id}: {error}"
+            )
         })
+    })
+    .map_err(invalid)
+}
+
+fn snapshot_companion_i64(
+    tensor: &Value,
+    host_resident: bool,
+    stage_to_host: impl FnOnce(&Value) -> Result<Value, String>,
+) -> Result<Vec<i64>, String> {
+    let staged = (!host_resident)
+        .then(|| stage_to_host(tensor))
+        .transpose()?;
+    staged
+        .as_ref()
+        .unwrap_or(tensor)
+        .to_vec_i64()
+        .map_err(|error| error.to_string())
 }
 
 fn axis_zero_extent(value: &Value) -> Result<usize, String> {
@@ -1018,16 +1041,32 @@ pub(crate) fn validate_component_batch_before_enqueue(
     inputs: &[(&str, &Value)],
     symbols: &HashMap<String, i64>,
 ) -> Result<usize, BatchContractError> {
-    validate_component_batch_before_enqueue_impl(component, declaration, inputs, symbols, false)
+    validate_component_batch_before_enqueue_impl(
+        component,
+        declaration,
+        inputs,
+        symbols,
+        false,
+        None,
+    )
 }
 
-pub(crate) fn validate_available_component_batch_before_enqueue(
+pub(crate) fn validate_workflow_component_batch_before_enqueue(
     component: &str,
     declaration: &WorkflowComponent,
     inputs: &[(&str, &Value)],
     symbols: &HashMap<String, i64>,
+    expected_requests: usize,
+    allow_runtime_owned_inputs: bool,
 ) -> Result<usize, BatchContractError> {
-    validate_component_batch_before_enqueue_impl(component, declaration, inputs, symbols, true)
+    validate_component_batch_before_enqueue_impl(
+        component,
+        declaration,
+        inputs,
+        symbols,
+        allow_runtime_owned_inputs,
+        Some(expected_requests),
+    )
 }
 
 fn validate_component_batch_before_enqueue_impl(
@@ -1036,6 +1075,7 @@ fn validate_component_batch_before_enqueue_impl(
     inputs: &[(&str, &Value)],
     symbols: &HashMap<String, i64>,
     allow_runtime_owned_inputs: bool,
+    expected_requests: Option<usize>,
 ) -> Result<usize, BatchContractError> {
     let by_port = inputs.iter().copied().collect::<HashMap<_, _>>();
     let mut request_count: Option<(String, usize)> = None;
@@ -1074,8 +1114,16 @@ fn validate_component_batch_before_enqueue_impl(
         };
         merge_request_count(component, &mut request_count, port, count)?;
     }
+    if let Some(expected_requests) = expected_requests {
+        merge_request_count(
+            component,
+            &mut request_count,
+            "<workflow>",
+            expected_requests,
+        )?;
+    }
     let count = request_count.as_ref().map_or(1, |(_, count)| *count);
-    if !allow_runtime_owned_inputs && declaration.batch_capacity.is_none() && count > 1 {
+    if declaration.batch_capacity.is_none() && count > 1 {
         return Err(BatchContractError::UndeclaredCapacity {
             component: component.into(),
             request_count: count,
@@ -1236,6 +1284,26 @@ fn merge_request_count(
             Ok(())
         }
     }
+}
+
+pub(crate) fn component_ownership_companions(declaration: &WorkflowComponent) -> BTreeSet<String> {
+    declaration
+        .ports
+        .inputs
+        .values()
+        .chain(declaration.ports.outputs.values())
+        .flat_map(|contract| contract.batch_layout.companions())
+        .map(|(_, _, companion)| companion.to_string())
+        .collect()
+}
+
+pub(crate) fn component_output_ownership_companions(
+    declaration: &WorkflowComponent,
+) -> BTreeSet<String> {
+    component_ownership_companions(declaration)
+        .into_iter()
+        .filter(|companion| declaration.ports.outputs.contains_key(companion))
+        .collect()
 }
 
 fn component_batch_policy(
@@ -1609,6 +1677,22 @@ ports:
     }
 
     #[test]
+    fn device_companion_path_stages_only_the_metadata_snapshot() {
+        let source = Value::from_slice_i64(&[0, 2, 5], &[3]).unwrap();
+        let staged = std::cell::Cell::new(false);
+        let snapshot = snapshot_companion_i64(&source, false, |value| {
+            staged.set(true);
+            Value::from_vec_i64(value.to_vec_i64().map_err(|error| error.to_string())?, &[3])
+                .map_err(|error| error.to_string())
+        })
+        .unwrap();
+
+        assert!(staged.get());
+        assert_eq!(snapshot, [0, 2, 5]);
+        assert_eq!(source.to_vec_i64().unwrap(), [0, 2, 5]);
+    }
+
+    #[test]
     fn malformed_offsets_and_terminal_extents_fail_closed() {
         let non_monotonic =
             ownership_error(PackedOwnership::new(2, vec![level(&[0, 2, 1], &[0, 0])], 2));
@@ -1796,6 +1880,42 @@ ports:
             error,
             BatchContractError::UndeclaredCapacity {
                 component: "encoder".into(),
+                request_count: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn hosted_admission_cannot_hide_a_known_request_count() {
+        let declaration: WorkflowComponent = serde_yaml::from_str(
+            r#"
+implementation: { kind: binding }
+ports:
+  inputs:
+    rows:
+      dtype: float32
+      rank: 2
+      shape: [batch, hidden]
+      batch_layout: { kind: request_aligned, axis: 0 }
+  outputs: {}
+"#,
+        )
+        .unwrap();
+        let rows = Value::from_slice_f32(&[0.0; 2 * 3], &[2, 3]).unwrap();
+        let symbols = HashMap::from([("batch".into(), 2), ("hidden".into(), 3)]);
+        let error = validate_workflow_component_batch_before_enqueue(
+            "hosted",
+            &declaration,
+            &[("rows", &rows)],
+            &symbols,
+            2,
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            BatchContractError::UndeclaredCapacity {
+                component: "hosted".into(),
                 request_count: 2,
             }
         );
