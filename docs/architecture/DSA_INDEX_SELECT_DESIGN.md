@@ -172,6 +172,15 @@ parity is byte-exact, not tolerance-based). Design as landed:
   `total_order_key` transform that reproduces Rust `f32::total_cmp` exactly
   (score desc, index asc), then emits the kept indices ascending and right-pads
   with the `-1` sentinel.
+- **Un-fused reduction for exact rounding parity.** The score reduction uses
+  `__fmul_rn` / `__fadd_rn` for the `dot += q·k` and `weighted += scored·wprod`
+  accumulations so every multiply-add stays separately rounded. NVRTC compiles
+  with the NVCC default `--fmad=true`, which would otherwise contract those
+  `a + b·c` patterns into single-rounding `fma.rn.f32` and diverge from the
+  CPU oracle's non-FMA order by a few ULPs — enough to flip an integer top-k
+  selection at a cutoff tie. This matches the sibling `CompressedSparseAttention`
+  kernel's convention. Single-operand sites (`scale·dot`, `weights·weights_scale`,
+  `weighted + bias`) have no fusible partner and already match CPU rounding.
 - **Fixed scratch, no page allocation.** The only device memory the op adds is a
   `B·S·T` f32 `scores` buffer plus a `B·S·T` u8 `state` buffer in the
   executor-owned **SessionPersistent** workspace (256-aligned, overwritten fresh

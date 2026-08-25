@@ -357,6 +357,10 @@ fn dsa_index_select_capability_rejects_wrong_opset() {
     spec.version = 2;
     let cap = evaluate(&spec);
     assert!(
+        cap.trait_supported,
+        "CPU registry follows ONNX since-version semantics, so it still claims DsaIndexSelect at opset 2 — the shape half is the gate here"
+    );
+    assert!(
         cap.shape_declined,
         "plugin shape rule dispatches only pkg.nxrt v1, so opset 2 must decline"
     );

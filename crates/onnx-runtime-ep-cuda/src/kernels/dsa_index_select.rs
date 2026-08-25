@@ -157,12 +157,17 @@ extern "C" __global__ void dsa_index_select_row(
       const unsigned long long k_base = (b * key_seq + t) * head_dim;
       float dot = 0.0f;
       for (unsigned long long d = 0; d < head_dim; ++d) {
-        dot += load_float(query, q_base + d, dtype) *
-               load_float(key, k_base + d, dtype);
+        // __fadd_rn / __fmul_rn keep every multiply-add un-fused so the device
+        // reduction matches the CPU oracle's non-FMA rounding order bit-for-bit
+        // (NVRTC compiles with the NVCC default --fmad=true, which would
+        // otherwise contract dot += q*k into a single-rounding fma.rn.f32 and
+        // perturb the score enough to flip an integer top-k selection).
+        dot = __fadd_rn(dot, __fmul_rn(load_float(query, q_base + d, dtype),
+                                       load_float(key, k_base + d, dtype)));
       }
       const float scored = fmaxf(scale * dot, 0.0f);  // Relu(scale * dot)
       const float wprod = load_float(weights, weights_base + h, dtype) * weights_scale;
-      weighted += scored * wprod;
+      weighted = __fadd_rn(weighted, __fmul_rn(scored, wprod));
     }
     scores[score_base + t] = weighted + bias_bt;
     state[score_base + t] = 0;            // allowed, unselected
