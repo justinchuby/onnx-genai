@@ -20722,13 +20722,27 @@ mod tests {
     /// with by every guard, and wrong, because the defect sat upstream of the
     /// report in what "default" resolved to.
     #[test]
+    // Reported as `ignored` rather than silently returning `ok`: libtest
+    // captures a passing test's output, so the `eprintln!` below is invisible
+    // in a default CI log and a skip on this target was indistinguishable from
+    // a pass. `ignored` prints its reason in the default output and, unlike a
+    // pass, is not counted as an executed test.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "process-wide CPU affinity masking is implemented only on Linux, so a \
+                  leader-only cpuset cannot be constructed on this target"
+    )]
     fn a_default_width_pool_on_leader_cpus_uses_every_core_it_was_given() {
         // Process-wide affinity masking is Linux-only, so on every other target
         // the leader-only cpuset this test asserts about cannot be built. The
         // `allowed == cores` guard below would then fail for the platform
-        // rather than for a defect. Skipping is loud rather than silent: an
-        // unexplained green here is exactly the vacuity the sweep exists to
-        // avoid, and the reason belongs in the log, not only in this comment.
+        // rather than for a defect.
+        //
+        // The `#[cfg_attr(..., ignore)]` above is what makes that visible in a
+        // default CI log. This arm is the belt for a run that overrides it with
+        // `--ignored`: it must still not assert on an unrestricted cpuset. Its
+        // `eprintln!` is only rendered under `--nocapture`, which is why it is
+        // not the primary signal.
         if !cfg!(target_os = "linux") {
             eprintln!(
                 "SKIP a_default_width_pool_on_leader_cpus_uses_every_core_it_was_given: \
