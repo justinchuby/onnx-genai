@@ -1,5 +1,7 @@
 mod common;
 
+use std::sync::{Mutex, MutexGuard};
+
 use common::{Tensor, absent_input, build_graph, input, prepare_workspace, require_cuda};
 use onnx_runtime_ep_api::{
     DevicePtr, DevicePtrMut, ExecutionProvider, KernelMatch, TensorMetadata, TensorMut, TensorView,
@@ -10,9 +12,18 @@ use onnx_runtime_ep_cuda::{
     CUDA_COVERED_OPS, CudaExecutionProvider, nms_execution_stats, reset_nms_execution_stats,
 };
 use onnx_runtime_ir::{
-    Attribute, DataType, TensorLayout, compute_contiguous_strides, static_shape,
+    Attribute, DataType, Dim, Shape, SymbolId, TensorLayout, compute_contiguous_strides,
+    static_shape,
 };
 use onnx_runtime_loader::Model;
+
+static NMS_GPU_LOCK: Mutex<()> = Mutex::new(());
+
+fn lock_nms_gpu() -> MutexGuard<'static, ()> {
+    NMS_GPU_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 fn f32_tensor(shape: &[usize], values: &[f32]) -> Tensor {
     input(DataType::Float32, shape, values)
@@ -176,6 +187,7 @@ fn run_nms(ep: &CudaExecutionProvider, inputs: &[Tensor], attrs: &[(&str, Attrib
 )]
 #[test]
 fn multi_batch_multi_class_rows_match_cpu_exactly() {
+    let _lock = lock_nms_gpu();
     let ep = require_cuda();
     let boxes = vec![
         0., 0., 1., 1., 0., 0., 0.9, 0.9, 2., 2., 3., 3., // batch 0
@@ -207,6 +219,7 @@ fn multi_batch_multi_class_rows_match_cpu_exactly() {
 )]
 #[test]
 fn center_mode_thresholds_and_ties_match_cpu() {
+    let _lock = lock_nms_gpu();
     let ep = require_cuda();
     let boxes = vec![
         0., 0., 4., 2., //
@@ -239,6 +252,7 @@ fn center_mode_thresholds_and_ties_match_cpu() {
 )]
 #[test]
 fn equal_score_ties_keep_lower_indices() {
+    let _lock = lock_nms_gpu();
     let ep = require_cuda();
     let boxes = vec![
         0., 0., 1., 1., //
@@ -266,6 +280,7 @@ fn equal_score_ties_keep_lower_indices() {
 )]
 #[test]
 fn zero_default_and_no_selection_outputs_are_empty() {
+    let _lock = lock_nms_gpu();
     let ep = require_cuda();
     let boxes = f32_tensor(&[1, 1, 4], &[0., 0., 1., 1.]);
     let scores = f32_tensor(&[1, 1, 1], &[0.9]);
@@ -315,6 +330,7 @@ fn zero_default_and_no_selection_outputs_are_empty() {
 )]
 #[test]
 fn policy_moves_only_count_and_runs_prepare_once() {
+    let _lock = lock_nms_gpu();
     let ep = require_cuda();
     reset_nms_execution_stats();
     let boxes = (0..32)
@@ -353,6 +369,7 @@ fn policy_moves_only_count_and_runs_prepare_once() {
 )]
 #[test]
 fn unsupported_dtype_strided_oversize_and_capture_decline() {
+    let _lock = lock_nms_gpu();
     let ep = require_cuda();
     assert!(CUDA_COVERED_OPS.contains(&"NonMaxSuppression"));
     let inputs = nms_inputs(
@@ -415,4 +432,169 @@ fn unsupported_dtype_strided_oversize_and_capture_decline() {
             .unwrap()
             .contains("8-byte")
     );
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable gpu-tests on a CUDA runner"
+)]
+#[test]
+fn omitted_score_threshold_matches_negative_infinity_cpu_default() {
+    let _lock = lock_nms_gpu();
+    let ep = require_cuda();
+    let boxes = vec![
+        0., 0., 1., 1., //
+        2., 2., 3., 3.,
+    ];
+    let scores = vec![f32::MIN, f32::NEG_INFINITY];
+    let omitted_inputs = nms_inputs(
+        f32_tensor(&[1, 2, 4], &boxes),
+        f32_tensor(&[1, 1, 2], &scores),
+        Some(2),
+        Some(0.5),
+        None,
+    );
+    let explicit_inputs = nms_inputs(
+        f32_tensor(&[1, 2, 4], &boxes),
+        f32_tensor(&[1, 1, 2], &scores),
+        Some(2),
+        Some(0.5),
+        Some(f32::NEG_INFINITY),
+    );
+    let omitted = run_nms(&ep, &omitted_inputs, &[]);
+    let explicit = run_nms(&ep, &explicit_inputs, &[]);
+    let expected = non_max_suppression(
+        &boxes,
+        &[1, 2, 4],
+        &scores,
+        &[1, 1, 2],
+        2,
+        0.5,
+        f32::NEG_INFINITY,
+        0,
+    )
+    .unwrap()
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    assert_eq!(omitted, expected);
+    assert_eq!(explicit, expected);
+    assert_eq!(
+        omitted,
+        [0, 0, 0],
+        "f32::MIN must pass an omitted -infinity threshold, while -infinity itself must not"
+    );
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable gpu-tests on a CUDA runner"
+)]
+#[test]
+fn signed_zero_scores_follow_cpu_total_order() {
+    let _lock = lock_nms_gpu();
+    let ep = require_cuda();
+    let boxes = vec![
+        0., 0., 1., 1., //
+        0., 0., 1., 1.,
+    ];
+    let scores = vec![-0.0, 0.0];
+    let actual = run_nms(
+        &ep,
+        &nms_inputs(
+            f32_tensor(&[1, 2, 4], &boxes),
+            f32_tensor(&[1, 1, 2], &scores),
+            Some(2),
+            Some(0.5),
+            None,
+        ),
+        &[],
+    );
+    let expected = non_max_suppression(
+        &boxes,
+        &[1, 2, 4],
+        &scores,
+        &[1, 1, 2],
+        2,
+        0.5,
+        f32::NEG_INFINITY,
+        0,
+    )
+    .unwrap()
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    assert_eq!(actual, expected);
+    assert_eq!(
+        actual,
+        [0, 0, 1],
+        "+0 at the higher index must sort before -0 at the lower index"
+    );
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable gpu-tests on a CUDA runner"
+)]
+#[test]
+fn optional_scalar_shapes_decline_before_kernel_creation() {
+    let _lock = lock_nms_gpu();
+    let ep = require_cuda();
+    let inputs = nms_inputs(
+        f32_tensor(&[1, 4, 4], &[0.; 16]),
+        f32_tensor(&[1, 1, 4], &[0.; 4]),
+        Some(2),
+        Some(0.5),
+        Some(0.0),
+    );
+    let (graph, id) = build_graph(
+        "NonMaxSuppression",
+        "",
+        10,
+        &inputs,
+        &[(DataType::Int64, vec![0, 3])],
+        &[],
+    );
+    let model = Model::new(&graph);
+    let dtypes = [
+        DataType::Float32,
+        DataType::Float32,
+        DataType::Int64,
+        DataType::Float32,
+        DataType::Float32,
+    ];
+    let valid = vec![
+        static_shape([1, 4, 4]),
+        static_shape([1, 1, 4]),
+        static_shape([]),
+        static_shape([]),
+        static_shape([]),
+    ];
+    assert!(
+        ep.supports_op(model.graph.node(id), 10, &valid, &dtypes, &[])
+            .is_supported(),
+        "known rank-0 optional scalars must remain claimable"
+    );
+
+    let symbolic: Shape = vec![Dim::Symbolic(SymbolId(77))];
+    for (slot, invalid_shape) in [
+        (2usize, static_shape([1])),
+        (3usize, static_shape([0])),
+        (4usize, symbolic),
+        (4usize, static_shape([1, 1])),
+    ] {
+        let mut shapes = valid.clone();
+        shapes[slot] = invalid_shape;
+        let claim = ep.supports_op(model.graph.node(id), 10, &shapes, &dtypes, &[]);
+        assert!(
+            matches!(claim, KernelMatch::Unsupported { .. }),
+            "optional input {slot} shape {:?} must decline at claim time",
+            shapes[slot]
+        );
+        let reason = claim.reason().unwrap();
+        assert!(
+            reason.contains("rank-0") || reason.contains("scalar"),
+            "claim reason must name the scalar-shape contract: {reason}"
+        );
+    }
 }

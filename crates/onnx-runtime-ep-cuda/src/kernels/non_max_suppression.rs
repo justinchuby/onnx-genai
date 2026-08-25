@@ -24,8 +24,11 @@ __device__ __forceinline__ bool nms_before(
     float a, unsigned int ia, float b, unsigned int ib) {
   if (ia == 0xffffffffu) return false;
   if (ib == 0xffffffffu) return true;
-  if (a > b) return true;
-  if (b > a) return false;
+  int ka = __float_as_int(a);
+  int kb = __float_as_int(b);
+  ka ^= (int)(((unsigned int)(ka >> 31)) >> 1);
+  kb ^= (int)(((unsigned int)(kb >> 31)) >> 1);
+  if (ka != kb) return ka > kb;
   return ia < ib;
 }
 
@@ -68,7 +71,8 @@ extern "C" __global__ void nms_prepare_f32(
   const unsigned int batch = group / classes;
   const unsigned int cls = group % classes;
   const float threshold =
-      score_threshold_ptr ? *score_threshold_ptr : -3.402823466e+38F;
+      score_threshold_ptr ? *score_threshold_ptr
+                          : __int_as_float((int)0xff800000u);
   const unsigned int score_offset =
       (batch * classes + cls) * boxes_count;
   if (tid < boxes_count && scores[score_offset + tid] > threshold) {
@@ -649,6 +653,25 @@ pub(crate) fn unsupported_reason(
                  batch×class groups; got {} and {groups}",
                 boxes[1]
             ));
+        }
+        for (slot, name) in [
+            (2usize, "max_output_boxes_per_class"),
+            (3usize, "iou_threshold"),
+            (4usize, "score_threshold"),
+        ] {
+            if node.inputs.get(slot).is_some_and(Option::is_some) {
+                let shape = input_shapes
+                    .get(slot)
+                    .and_then(|shape| onnx_runtime_ir::as_static_shape(shape))
+                    .ok_or_else(|| {
+                        format!("input {slot} ('{name}') shape must be known static rank-0")
+                    })?;
+                if !shape.is_empty() {
+                    return Err(format!(
+                        "input {slot} ('{name}') must be a scalar with shape [], got {shape:?}"
+                    ));
+                }
+            }
         }
         for (slot, dtype) in [
             (0, DataType::Float32),
