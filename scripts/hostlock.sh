@@ -651,7 +651,14 @@ meta_value() {
 # rather than an observed fact. This is observed.
 holder_worktree() {
     local top
-    top=$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null) || top=""
+    # Bounded, because this runs inside publish_lock's stage-and-rename
+    # critical section. `git rev-parse` is local and fast normally, but it
+    # walks parent directories looking for .git, and on a stalled NFS/FUSE
+    # mount that walk blocks without ever returning an exit code -- leaving a
+    # staging directory created and never published, by a process that cannot
+    # be reaped because the lock does not exist yet. A descriptive field is
+    # never worth that, so it gets two seconds and then we fall back.
+    top=$(timeout 2 git -C "$PWD" rev-parse --show-toplevel 2>/dev/null) || top=""
     [ -n "$top" ] || top="$PWD"
     printf '%s' "$top"
 }

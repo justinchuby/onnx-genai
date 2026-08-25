@@ -2296,6 +2296,28 @@ chk "the holder's command is recorded and non-empty" \
     "$([ -n "$(st cmd)" ] && echo yes || echo no)" "yes"
 "$HL" release >/dev/null 2>&1
 
+# The worktree lookup runs inside publish_lock's stage-and-rename critical
+# section, and `git rev-parse` walks parent directories looking for .git -- on
+# a stalled NFS/FUSE mount that walk blocks without returning, which would
+# leave a staging dir created and never published by a process nothing can
+# reap, because the lock does not exist yet. A descriptive field is never worth
+# that. A `git` that hangs stands in for the stalled mount.
+cleanup
+githang="$LOCK.githang"
+rm -rf "$githang"; mkdir -p "$githang"
+printf '#!/bin/sh\nsleep 30\n' >"$githang/git"; chmod +x "$githang/git"
+gh_t0=$(date +%s)
+PATH="$githang:$PATH" "$HL" acquire --owner roy --reason "hung git" >/dev/null 2>&1
+gh_el=$(( $(date +%s) - gh_t0 ))
+chk "a hanging git does not stall the acquire past its bound" \
+    "$([ "$gh_el" -lt 10 ] && echo bounded || echo "stalled ${gh_el}s")" "bounded"
+chk "and the lock is taken anyway rather than abandoned mid-publish" \
+    "$(st state)" "HELD"
+chk "with the worktree falling back to the working directory" \
+    "$(st worktree)" "$(pwd)"
+"$HL" release >/dev/null 2>&1
+rm -rf "$githang"
+
 cleanup
 "$HL" run --owner runner --reason "cmd check" -- \
     sh -c "cp '$LOCK/meta' '$LOCK.ran'; : hostlock_cmd_marker" >/dev/null 2>&1
@@ -2358,7 +2380,7 @@ cleanup
 # the inert R1 block and the vacuous STALE arm that this PR exists to fix.
 # Both probe branches now assert something, so the total is invariant across
 # environments; if a refactor drops a check, this fails and says so.
-chk "every assertion in this file ran" "$((pass + fail + 1))" "360"
+chk "every assertion in this file ran" "$((pass + fail + 1))" "363"
 
 echo
 echo "passed=${pass} failed=${fail}"
