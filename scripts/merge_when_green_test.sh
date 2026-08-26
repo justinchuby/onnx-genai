@@ -74,23 +74,55 @@ make_shim() {
     cat >"$WORK/bin/gh" <<'SHIM'
 #!/usr/bin/env bash
 FIX=$MWG_FIX
-printf '%s\n' "$*" >>"$FIX/argv.log"
+
+read_optional_uint() {
+    local path=$1 default=$2 value
+    if [ ! -e "$path" ]; then
+        printf '%s\n' "$default"
+        return
+    fi
+    [ -f "$path" ] && [ -r "$path" ] || return 90
+    IFS= read -r value <"$path" || return 90
+    case "$value" in
+        0 | [1-9] | [1-9][0-9]*) ;;
+        *) return 90 ;;
+    esac
+    [ "${#value}" -le 10 ] || return 90
+    [ "$((10#$value))" -le 2147483647 ] || return 90
+    printf '%s\n' "$value"
+}
+
+read_exit_code() {
+    local path=$1 value
+    [ -f "$path" ] && [ -r "$path" ] || return 90
+    IFS= read -r value <"$path" || return 90
+    case "$value" in
+        0 | [1-9] | [1-9][0-9]*) ;;
+        *) return 90 ;;
+    esac
+    [ "${#value}" -le 3 ] || return 90
+    [ "$((10#$value))" -le 255 ] || return 90
+    printf '%s\n' "$value"
+}
+
+printf '%s\n' "$*" >>"$FIX/argv.log" || exit 90
 
 args="$*"
 case "$args" in
     *"pr merge"*)
-        printf '%s\n' "$*" >>"$FIX/merge.log"
-        exit "$(cat "$FIX/merge_rc" 2>/dev/null || echo 0)"
+        merge_rc=$(read_exit_code "$FIX/merge_rc") || exit 90
+        printf '%s\n' "$*" >>"$FIX/merge.log" || exit 90
+        exit "$merge_rc"
         ;;
     *"pr view"*)
-        n=$(cat "$FIX/poll" 2>/dev/null || echo 1)
-        echo $((n + 1)) >"$FIX/poll"
+        n=$(read_optional_uint "$FIX/poll" 1) || exit 90
+        printf '%s\n' "$((n + 1))" >"$FIX/poll" || exit 90
         if [ -f "$FIX/pr_view.fail" ]; then exit 1; fi
         # Fail a WINDOW of reads rather than all of them, so a cell can let the
         # opening snapshot succeed and break the connection afterwards -- which
         # is the only way to reach the in-loop retry counter.
-        from=$(cat "$FIX/fail_from" 2>/dev/null || echo 0)
-        to=$(cat "$FIX/fail_to" 2>/dev/null || echo 0)
+        from=$(read_optional_uint "$FIX/fail_from" 0) || exit 90
+        to=$(read_optional_uint "$FIX/fail_to" 0) || exit 90
         if [ "$from" -gt 0 ] && [ "$n" -ge "$from" ] && { [ "$to" = 0 ] || [ "$n" -le "$to" ]; }; then
             exit 1
         fi
@@ -171,19 +203,54 @@ PY
 }
 
 require_fixture() {
-    local root=$1 file missing=0
+    local root=$1 file failed=0 merge_rc
     for file in ruleset_ids contexts bypass merge_rc argv.log pr.json; do
-        if [ ! -f "$root/$file" ]; then
+        if [ ! -e "$root/$file" ]; then
             echo "merge_when_green_test.sh: HARNESS ERROR: fixture '$root' is missing $file" >&2
-            missing=1
+            failed=1
+        elif [ ! -f "$root/$file" ] || [ ! -r "$root/$file" ]; then
+            echo "merge_when_green_test.sh: HARNESS ERROR: fixture '$root/$file' is not a regular readable file" >&2
+            failed=1
         fi
     done
-    [ "$missing" -eq 0 ]
+    if [ -f "$root/argv.log" ] && [ ! -w "$root/argv.log" ]; then
+        echo "merge_when_green_test.sh: HARNESS ERROR: fixture '$root/argv.log' is not writable" >&2
+        failed=1
+    fi
+    if [ -f "$root/merge_rc" ] && [ -r "$root/merge_rc" ]; then
+        if ! IFS= read -r merge_rc <"$root/merge_rc"; then
+            echo "merge_when_green_test.sh: HARNESS ERROR: merge_rc is empty or unreadable" >&2
+            failed=1
+        else
+            case "$merge_rc" in
+                0 | [1-9] | [1-9][0-9]*)
+                    if [ "${#merge_rc}" -gt 3 ] || [ "$((10#$merge_rc))" -gt 255 ]; then
+                        echo "merge_when_green_test.sh: HARNESS ERROR: merge_rc is outside exit range 0..255: $merge_rc" >&2
+                        failed=1
+                    fi
+                    ;;
+                *)
+                    echo "merge_when_green_test.sh: HARNESS ERROR: merge_rc must be an integer in exit range 0..255, got '$merge_rc'" >&2
+                    failed=1
+                    ;;
+            esac
+        fi
+    fi
+    [ "$failed" -eq 0 ]
 }
 
 # `wc -l <missing` prints a shell error that looks like a suite fault; the
 # absence of the file IS the assertion here, so name it.
-merges() { [ -f "$FIX/merge.log" ] && wc -l <"$FIX/merge.log" || echo 0; }
+merges() {
+    if [ ! -e "$FIX/merge.log" ]; then
+        echo 0
+    elif [ ! -f "$FIX/merge.log" ] || [ ! -r "$FIX/merge.log" ]; then
+        echo "merge_when_green_test.sh: HARNESS ERROR: merge.log is not a regular readable file" >&2
+        return 1
+    else
+        wc -l <"$FIX/merge.log"
+    fi
+}
 
 run_mw() {
     if ! require_fixture "$FIX" >"$FIX/out" 2>&1; then
@@ -198,7 +265,51 @@ run_mw() {
 
 make_shim
 
+fixture_contract_refuses() {
+    local label=$1 pattern=$2 rc merge_count
+    rc=$(run_mw)
+    merge_count=$(merges) || exit 1
+    if [ "$rc" != 99 ] || [ "$merge_count" != 0 ] || ! grep -q "$pattern" "$FIX/out"; then
+        echo "  FAIL  $label"
+        echo "          rc=$rc merges=$merge_count pattern=$pattern"
+        cat "$FIX/out" >&2 || exit 1
+        exit 1
+    fi
+    echo "  PASS  $label (harness refusal; not part of the 75 gate-verdict assertions)"
+}
+
 echo "== harness integrity =="
+fixture missing_merge_rc
+rm "$FIX/merge_rc"
+fixture_contract_refuses "a missing merge_rc fails before the production gate" \
+    "HARNESS ERROR:.*missing merge_rc"
+
+fixture unreadable_merge_rc
+rm "$FIX/merge_rc"
+mkdir "$FIX/merge_rc"
+fixture_contract_refuses "a merge_rc read failure fails before the production gate" \
+    "HARNESS ERROR:.*merge_rc.*not a regular readable file"
+
+fixture empty_merge_rc
+: >"$FIX/merge_rc"
+fixture_contract_refuses "an empty merge_rc fails before the production gate" \
+    "HARNESS ERROR: merge_rc is empty or unreadable"
+
+fixture noninteger_merge_rc
+printf 'success\n' >"$FIX/merge_rc"
+fixture_contract_refuses "a non-integer merge_rc fails before the production gate" \
+    "HARNESS ERROR: merge_rc must be an integer"
+
+fixture negative_merge_rc
+printf '%s\n' '-1' >"$FIX/merge_rc"
+fixture_contract_refuses "a negative merge_rc fails before the production gate" \
+    "HARNESS ERROR: merge_rc must be an integer"
+
+fixture out_of_range_merge_rc
+printf '256\n' >"$FIX/merge_rc"
+fixture_contract_refuses "an out-of-range merge_rc fails before the production gate" \
+    "HARNESS ERROR: merge_rc is outside exit range 0..255"
+
 fixture missing_pr_json
 rm "$FIX/pr.json"
 chk "a missing pr.json is a harness error, never a gate verdict" "$(run_mw)" "99"
@@ -587,10 +698,10 @@ chk "a CLEAN pull request with a skipped required check merges" \
     "$(run_mw --allow-skipped)" "0"
 
 echo
-# An assertion that quietly stops running is indistinguishable from one that
-# passes. Both branches of the probe above assert, so this total is invariant
-# across environments.
-chk "every assertion in this file ran" "$((pass + fail + 1))" "75"
+# A `chk` assertion that quietly stops running is indistinguishable from one
+# that passes. The fail-fast fixture-contract mutations above deliberately do
+# not change this established 75-cell gate-verdict census.
+chk "all 75 gate-verdict assertions ran" "$((pass + fail + 1))" "75"
 
 echo
 echo "passed=${pass} failed=${fail}"
