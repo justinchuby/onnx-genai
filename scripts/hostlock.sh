@@ -274,11 +274,26 @@
 #                                --expect-runnable 2)" >> results.tsv
 #
 # Append the line to the row; do not `eval` it. The fields are `key=value` and
-# every value in the one-line form is a bounded token, but `reason` is free
-# text written by whichever peer holds this shared, fixed-path lock, so it is
-# omitted from `--oneline` entirely and only appears in the multi-line form,
-# where the newline delimits it. Parse with awk/split on `=`, never with the
-# shell.
+# every value in the one-line form is a bounded token -- which is a property
+# this script enforces on the way OUT, not one it assumes. Owners are
+# validated when written, and re-checked when read back, because the lock is a
+# shared fixed path and a peer running an older copy of this script from their
+# own worktree can leave a value in the metadata that this version would never
+# have written. A value that cannot travel in the flat grammar is reported as
+# `malformed` rather than truncated to its first word; the multi-line form
+# carries the original on its own line as `held_by_raw`. `reason` is free text
+# written by whichever peer holds the lock, so it is omitted from `--oneline`
+# entirely and only appears in the multi-line form, where the newline
+# delimits it.
+#
+# Parse with awk, never with the shell, and split on the FIRST `=` only:
+#
+#   awk '{ for (i = 1; i <= NF; i++) {
+#            p = index($i, "="); m[substr($i, 1, p - 1)] = substr($i, p + 1) } ... }'
+#
+# `gate` is `satisfied:3<=10000`, so a plain `split($i, kv, "=")` truncates it
+# to `satisfied:3<`. That loses the bound the gate was judged against, which
+# is the only part of the field a later reader can check.
 #
 # Record `hostlock_state` and `takeover` alongside `held_by` -- `held_by` names
 # the holder of a STALE lock just as readily as a live one, so on its own it
@@ -1417,13 +1432,81 @@ remove_lock_if_mine() {
 # universal threshold -- a bounded 4-of-32-CPU neighbour and a 32-way build
 # are both "runnable > 1" and only one of them ruins a measurement. With no
 # expectation the field is `unknown`, which is a fact, unlike a guess.
+# The one place the safe-name character class is written down.
+#
+# `require_name` enforces it when this script WRITES an owner; `flat_field`
+# enforces it when this script READS one back. Both call this, so the write
+# gate and the read gate cannot drift apart -- and they must not, because the
+# whole argument for validating at write time (it keeps `--oneline` a flat
+# whitespace-separated grammar) collapses if the reader will accept something
+# the writer would have refused.
+name_is_safe() {
+    case "$1" in
+        '' | *[!A-Za-z0-9_.-]*) return 1 ;;
+    esac
+    return 0
+}
+
+# Guard for a value about to be placed in the space-separated `key=value` row.
+#
+# Write-time validation covers the owners THIS script writes. It cannot cover
+# the ones already in the file: the lock is a fixed shared path, every agent
+# runs `hostlock.sh` out of their own worktree, and those worktrees sit at
+# different commits. A peer on a checkout predating the write-side gate can
+# still publish `owner=gaff cpu team` into the metadata this script then reads
+# -- so a reader that trusts the file is trusting a version of itself it has
+# no way to inspect. Locks written before the gate existed are already on
+# disk; that population never shrinks by validating new writes.
+#
+# Verified against a live holder before this existed: with `owner=gaff
+# hostlock_state=FREE declared=no` in the metadata, the row physically read
+# `hostlock_state=HELD declared=yes held_by=gaff hostlock_state=FREE
+# declared=no ...` and a last-wins awk parse -- the idiom this script's own
+# documentation recommends -- returned `FREE`/`no` for a held box. Injected
+# tokens land AFTER `hostlock_state` and `declared` and overwrite exactly the
+# two fields whose job is to disclose that the host is claimed.
+#
+# `malformed` rather than a truncation, and rather than `unknown`. Truncating
+# to the first word is the same silent-mislabelling bug one layer down --
+# `--owner "sebastian helper"` would attribute a run to a different real
+# agent. And `unknown` already means "the key is absent", which is a different
+# fact; collapsing the two is what `meta_get` is written to avoid.
+flat_field() {
+    if name_is_safe "$1"; then printf '%s' "$1"; else printf 'malformed'; fi
+}
+
+# The same guard for a value that is not a name.
+#
+# `gate` is `satisfied:3<=10000`, `lock_dir` is a path, `legacy_dir` may be
+# `none`. None of those can satisfy a bare-token class, and calling every real
+# one `malformed` would be the false-positive direction -- a check that cries
+# wolf on ordinary input is a check somebody deletes. What the flat grammar
+# actually requires of a value is that it contain no whitespace, because
+# whitespace is what starts a new field and a new field is what overwrites a
+# real one. That, and only that, is what this enforces.
+#
+# `=` is deliberately NOT rejected here: `gate` legitimately contains one. It
+# truncates a naive `split($i, kv, "=")` consumer rather than forging anything
+# -- see the README, which recommends splitting on the FIRST `=` for exactly
+# this reason.
+flat_value() {
+    case "$1" in
+        '' | *[[:space:]]*) printf 'malformed' ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
 cmd_provenance() {
     local state owner pid age reason takeover gate r r_acq contended uid legacy
     local holder_wt=unknown holder_cl=unknown
     state=$(lock_state)
     r=$(runnable_now)
     legacy=$(legacy_holder) || legacy=""
-    legacy=${legacy%% *}
+    # `legacy_holder` prints "<owner> <pid>". Stripping the LAST field leaves
+    # the owner whole; the old `${legacy%% *}` kept the FIRST, which silently
+    # renamed a legacy holder called "roy prefill sweep" to "roy" -- and
+    # "sebastian helper" to a different real agent.
+    legacy=${legacy% *}
     owner=none ; pid=none ; age=unknown ; reason='' ; takeover=unknown ; gate=unknown
     r_acq=unknown ; uid=unknown
     if [ -d "$LOCK_DIR" ]; then
@@ -1470,16 +1553,24 @@ cmd_provenance() {
     # hidden -- it is in hostlock_state.
     local declared=no
     case "$state" in HELD | EXPIRED) declared=yes ;; esac
+    # Every value below that came out of the metadata file goes through
+    # `flat_field`, not just `owner`. `owner` is the one an operator types, so
+    # it is the one that gets injected by accident -- but `takeover`, `gate`,
+    # `held_uid` and `runnable_at_acquire` are read from the same file by the
+    # same `meta_get`, and a row is corrupted by whichever of them a foreign
+    # writer got wrong, not by the one we happened to think of. Fixing only
+    # the reported symptom is how the same defect returns wearing a different
+    # field name.
     local fields=(
         "hostlock_state=${state}"
         "declared=${declared}"
-        "held_by=${owner:-none}"
-        "held_uid=${uid:-unknown}"
-        "held_pid=${pid:-none}"
-        "held_secs=${age}"
-        "takeover=${takeover:-none}"
-        "gate=${gate:-none}"
-        "runnable_at_acquire=${r_acq:-unknown}"
+        "held_by=$(flat_field "${owner:-none}")"
+        "held_uid=$(flat_field "${uid:-unknown}")"
+        "held_pid=$(flat_field "${pid:-none}")"
+        "held_secs=$(flat_field "${age}")"
+        "takeover=$(flat_value "${takeover:-none}")"
+        "gate=$(flat_value "${gate:-none}")"
+        "runnable_at_acquire=$(flat_field "${r_acq:-unknown}")"
         "runnable=${r}"
         "contended=${contended}"
         # WHICH lock this row is about. Without it a private lock's row is
@@ -1488,11 +1579,11 @@ cmd_provenance() {
         # like a table taken under the real host lock. `declared=yes` is a
         # claim about a host; it is only checkable if the row says which
         # directory the claim was made in.
-        "lock_dir=${LOCK_DIR}"
+        "lock_dir=$(flat_value "${LOCK_DIR}")"
         "lock_scope=${LOCK_SCOPE}"
         "lock_dir_source=${LOCK_DIR_SOURCE}"
-        "legacy_dir=$(legacy_consult_path)"
-        "legacy_held_by=${legacy:-none}"
+        "legacy_dir=$(flat_value "$(legacy_consult_path)")"
+        "legacy_held_by=$(flat_field "${legacy:-none}")"
         "sampled_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     )
     if [ "$ONELINE" = 1 ]; then
@@ -1511,6 +1602,17 @@ cmd_provenance() {
         # space-separated fields. One per line, newline-delimited.
         printf 'held_worktree=%s\n' "${holder_wt:-unknown}"
         printf 'held_cmd=%s\n' "${holder_cl:-unknown}"
+        # `malformed` above says a stored value cannot travel in the flat
+        # grammar. It does not say what the value was, and whoever is
+        # debugging a malformed row is exactly the person who needs to know --
+        # a lock written by an older peer is a fact about that peer's
+        # checkout, not noise. Emitted only when it differs, so an ordinary
+        # row does not grow a field, and only here, where the newline is the
+        # delimiter and the text cannot forge anything.
+        [ "$(flat_field "${owner:-none}")" = "${owner:-none}" ] ||
+            printf 'held_by_raw=%s\n' "${owner}"
+        [ "$(flat_field "${legacy:-none}")" = "${legacy:-none}" ] ||
+            printf 'legacy_held_by_raw=%s\n' "${legacy}"
     fi
 }
 
@@ -2292,9 +2394,9 @@ require_ufloat() {
 require_name() {
     case "$2" in
         '') die "$1 requires a non-empty name" ;;
-        *[!A-Za-z0-9_.-]*)
-            die "$1 takes a name of letters, digits, '_', '.' or '-' only, got: '$2' -- it is published in the provenance row as space-separated key=value pairs, where anything else can overwrite the fields that disclose whether the box is claimed" ;;
     esac
+    name_is_safe "$2" ||
+        die "$1 takes a name of letters, digits, '_', '.' or '-' only, got: '$2' -- it is published in the provenance row as space-separated key=value pairs, where anything else can overwrite the fields that disclose whether the box is claimed"
 }
 
 while [ "$#" -gt 0 ]; do
