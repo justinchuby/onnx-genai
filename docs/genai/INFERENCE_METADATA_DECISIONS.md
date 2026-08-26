@@ -218,6 +218,34 @@ The core is strict. Every core structure uses `deny_unknown_fields`; an unknown
 core field **MUST** fail validation. There is no "ignore what you do not know"
 mode for the core.
 
+### 4.2a Reserved fields, local names, and extension identifiers
+
+Metadata has five different naming classes. They are not interchangeable:
+
+| Naming class | Who defines it | Examples | Reader behavior |
+| --- | --- | --- | --- |
+| **Reserved schema field** | This specification and generated JSON Schema. | `pipeline`, `workflow`, `inputs`, `contract`, `dtype`, `state`, `recurrence`, `special_tokens`. | Unknown keys fail because typed core objects deny unknown fields. A producer cannot add `workflow.my_option` or `contract.vendor_hint`. |
+| **Package-local identifier/reference** | The package author, within the map or scope that owns it. | Keys under `workflow.inputs`, `outputs`, `components`, `state`, `effects`, `serving.state_service.groups`, `profiles`, adapter artifacts, and branch cases; SSA value names; component and state-group references. | The spelling is author-defined, but every reference must resolve, names must be unique in their scope, and the runtime must not infer semantics from the spelling. |
+| **Artifact-defined name** | The referenced artifact. | ONNX input/output and initializer names used by component ports, invoke bindings, optional inputs, state aliases, and adapter targets. | Must match the artifact exactly. It is not a portable semantic vocabulary and must never be guessed from a model family. |
+| **Extensible semantic identifier** | A registered producer/runtime extension, normally owner-qualified and versioned. | Capability strings, adapter ABI keys, component contract IDs, adapter application/loader IDs, checkpoint adapter IDs, constraint dialects, profile kinds, and extensible operation/vocabulary strings. | Built-ins have normative semantics. Unknown extensions may parse where the schema declares an extension branch, but execution must fail closed unless the runtime implements that exact identifier/version. |
+| **Ordinary data value** | Package contents or request contract. | Artifact locations, source URIs, revisions, symbolic dimension labels, provenance labels, and numeric bounds. | Treated as data under the surrounding reserved field; it does not create a new schema field or runtime capability. |
+
+Two rules prevent ambiguity:
+
+1. A `BTreeMap<String, ...>` does **not** automatically mean arbitrary schema
+   extension. Its keys are customizable only for the purpose documented by that
+   map. For example, `workflow.components.decoder` may use a different local
+   component name, while `ComponentContract.bindings.logits` is a semantic role
+   defined by that contract.
+2. A free-form `String` does **not** automatically mean the runtime may ignore
+   an unfamiliar value. Known vocabularies are reserved; extension branches are
+   explicit. An owner-defined identifier should use an owner-qualified name
+   such as `com.example.audio-preprocess` and a separate version, and a runtime
+   that has not registered it must reject the package.
+
+Comments are unrestricted review prose and have no parsed semantics. Adding a
+comment never creates an extension point or changes the canonical YAML object.
+
 ### 4.3 Versioning and evolution
 
 The document carries `schema_version`. Each entry in `profiles` additionally
