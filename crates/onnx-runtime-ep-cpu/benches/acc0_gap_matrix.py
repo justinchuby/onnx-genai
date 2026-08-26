@@ -211,7 +211,7 @@ class HostLock:
                   f"{'waiting' if self.wait else 'refusing'}",
                   file=sys.stderr, flush=True)
         cmd = ["bash", HOSTLOCK, "acquire", "--owner", self.owner,
-               "--reason", self.reason, "--timeout", str(self.timeout),
+               "--reason", self.reason,
                # `acquire` defaults to --ttl 3600. A TTL is not "release this
                # if I abandon it", it is "release this on the clock, whether
                # or not I am still running" -- so on a sweep longer than an
@@ -228,9 +228,12 @@ class HostLock:
                # and the next acquirer reaps it out from under a live sweep.
                "--pid", str(os.getpid())]
         if self.wait:
-            # --timeout is only honoured with --wait; without it the flag is
-            # accepted and silently does nothing.
-            cmd.append("--wait")
+            # --timeout bounds the wait loop, so it is only meaningful
+            # alongside --wait. A no-wait acquire returns BUSY immediately and
+            # never consults it, so passing it there would be asking for a
+            # bound on a loop that does not exist; hostlock.sh refuses that
+            # combination (#2109) rather than accepting a flag it will ignore.
+            cmd += ["--wait", "--timeout", str(self.timeout)]
         r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode != 0:
             why = self.WHY.get(r.returncode, "unknown failure")

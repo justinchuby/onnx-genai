@@ -2632,6 +2632,56 @@ chk "the help interception precedes the platform gate" \
 chk "the help interception precedes the lock_dir config gate" \
     "$([ -n "$help_at" ] && [ -n "$conf_die_at" ] && [ "$help_at" -lt "$conf_die_at" ] && echo yes || echo no)" "yes"
 rm -rf "$LOCK.helpconf" "$LOCK.helppoison"
+echo "== --timeout is refused where it could only be ignored (#2109) =="
+# `--timeout` is read from exactly two wait loops. `cmd_acquire`'s deadline
+# check sits *after* the `DO_WAIT != 1` early return, so without `--wait` the
+# bound is parsed, range-checked by require_uint, and never compared: the
+# caller gets an instant BUSY and believes it waited. Refusing beats ignoring,
+# for the reason this script already gives for --expect-cores/--min-efficiency.
+cleanup
+$HL acquire --owner leon --ttl 600 >/dev/null 2>&1
+out=$($HL acquire --owner roy --timeout 10 2>&1)
+rc=$?
+chk "acquire --timeout without --wait is refused, not silently ignored" "$rc" "1"
+chk "and the refusal says the bound would be ignored" \
+    "$(echo "$out" | grep -c 'inert here')" "1"
+chk "and it names a form that does wait" \
+    "$(echo "$out" | grep -c -- '--wait --timeout')" "1"
+# CONTROLS. A blanket ban on --timeout passes all three checks above and is
+# still wrong, so every form that genuinely consults the bound is pinned here.
+# Without these, the guard could tighten into a refusal of the working paths
+# and this file would still be green -- the mutation that matters most.
+t0=$SECONDS
+$HL acquire --owner roy --wait --timeout 1 >/dev/null 2>&1
+rc=$?
+chk "acquire --wait --timeout still waits, then times out" "$rc" "3"
+chk "and it spent the bound rather than returning instantly" \
+    "$([ "$((SECONDS - t0))" -ge 1 ] && echo waited || echo instant)" "waited"
+t0=$SECONDS
+$HL wait --timeout 1 >/dev/null 2>&1
+rc=$?
+chk "wait --timeout is untouched by the guard" "$rc" "3"
+chk "and it too spent the bound" \
+    "$([ "$((SECONDS - t0))" -ge 1 ] && echo waited || echo instant)" "waited"
+chk "acquire without --timeout still fails fast rather than being refused" \
+    "$($HL acquire --owner roy >/dev/null 2>&1; echo $?)" "2"
+# A subcommand that never loops at all is refused too, but must NOT be told to
+# add --wait: that flag is equally inert on `status`, so the advice would
+# reproduce the defect one flag further along.
+out=$($HL status --timeout 10 2>&1)
+chk "status --timeout is refused as well" "$?" "1"
+chk "and it does not advise adding --wait, which would also be inert" \
+    "$(echo "$out" | grep -c -- '--wait --timeout')" "0"
+chk "and it names the three forms that do consult the bound" \
+    "$(echo "$out" | grep -c 'Only .wait., .run., and .acquire --wait.')" "1"
+chk "status without --timeout is unaffected" \
+    "$($HL status >/dev/null 2>&1; echo $?)" "0"
+cleanup
+# `run` sets DO_WAIT itself rather than taking --wait, so its bound is live and
+# must not be swept up by a guard aimed at the subcommands that never wait.
+$HL run --owner leon --reason "timeout ok" --timeout 5 -- true >/dev/null 2>&1
+chk "run --timeout is not refused, because run always waits" "$?" "0"
+cleanup
 
 # ---------------------------------------------------------------------------
 # A `run` NESTED INSIDE ITS OWN `run` IS A CYCLE, NOT CONTENTION (#1977).
@@ -2762,7 +2812,7 @@ cleanup
 # the inert R1 block and the vacuous STALE arm that this PR exists to fix.
 # Every probe branch asserts something, so the total is invariant across
 # environments; if a refactor drops a check, this fails and says so.
-chk "every assertion in this file ran" "$((pass + fail + 1))" "422"
+chk "every assertion in this file ran" "$((pass + fail + 1))" "435"
 
 echo
 echo "passed=${pass} failed=${fail}"
