@@ -166,10 +166,27 @@ mod mock_kernel_ctx {
         (ptr as usize) - 1
     }
 
+    /// Stand in for the host's `CreateStatus`, and **say what went wrong**.
+    ///
+    /// The sentinel alone tells a failing assertion only that `Compute`
+    /// returned an error, never which of its many fail-closed branches
+    /// produced it. When #2200 made residency mandatory and this table did not
+    /// yet supply `GetTensorMemoryInfo`, all seven `Compute` tests reported
+    /// `Compute failed` and nothing else — while the plugin was saying
+    /// `Compute: OrtApi.GetTensorMemoryInfo is null` the whole time. The cause
+    /// had to be recovered by reading the diff instead of the failure.
+    /// libtest captures this stream per test and prints it only for tests that
+    /// fail, so the message costs nothing on a green run.
     pub unsafe extern "C" fn mock_create_status(
         _code: ort::OrtErrorCode,
-        _msg: *const std::ffi::c_char,
+        msg: *const std::ffi::c_char,
     ) -> *mut ort::OrtStatus {
+        if !msg.is_null() {
+            // SAFETY: the plugin passes a live `CString` for the duration of
+            // this call, so the pointer is a valid NUL-terminated string here.
+            let text = unsafe { std::ffi::CStr::from_ptr(msg) }.to_string_lossy();
+            eprintln!("mock host CreateStatus: {text}");
+        }
         // For test: return a non-null sentinel to signal error.
         std::ptr::dangling_mut::<ort::OrtStatus>()
     }
@@ -272,6 +289,12 @@ mod mock_kernel_ctx {
         // API 27 provides. This mock models a CPU allocator; omitting the hooks
         // is not an older supported plugin ABI, it is an incomplete OrtApi
         // fixture that correctly makes Compute fail closed.
+        //
+        // What this does *not* cover: reporting a CUDA allocator here instead
+        // (device type GPU, name `Cuda`) leaves all twelve tests green, so
+        // nothing in this file asserts that residency reaches the kernel.
+        // `kernel_ctx.rs`'s own tests do assert it; the exported-ABI layer does
+        // not. Measured, not assumed. #2224.
         unsafe { *out = ptr::dangling::<ort::OrtMemoryInfo>() };
         ptr::null_mut()
     }
