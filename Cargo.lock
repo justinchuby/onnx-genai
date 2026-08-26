@@ -2674,6 +2674,7 @@ dependencies = [
  "cudarc",
  "half",
  "onnx-genai-runtime-config",
+ "onnx-runtime-cuda-memory",
  "onnx-runtime-ep-api",
  "onnx-runtime-ep-cpu",
  "onnx-runtime-ep-cuda",

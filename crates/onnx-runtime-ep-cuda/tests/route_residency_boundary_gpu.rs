@@ -59,7 +59,7 @@ use onnx_runtime_ep_cuda::kernels::expert_route_telemetry::{
 };
 use onnx_runtime_ep_cuda::route_residency::{
     RouteResidencyBoundary, RouteResidencyInstallOutcome, RouteTelemetrySource,
-    build_route_residency_boundary,
+    build_route_residency_boundaries,
 };
 use onnx_runtime_ep_cuda::weight_paging::{CudaWeightResidency, DeviceOffloadPolicy};
 use onnx_runtime_ir::{DataType, Graph, NodeId, TensorData, ValueId, WeightRef, static_shape};
@@ -1028,7 +1028,7 @@ fn boundary_injected_fault_rolls_back_through_caller() {
 // (`CudaExecutionProvider::try_install_route_residency_binding`), so the merged
 // live caller has a production binding when the feature is enabled.
 //
-// These tests never call `build_route_residency_boundary`'s inner helper
+// These tests never call `build_route_residency_boundaries`' inner helper
 // directly for the reachability proof: they build a shape-faithful QMoE graph,
 // let discovery find the bank identities, install through the EP, then drive
 // the same trait method the executor calls — asserting the binding is actually
@@ -1156,7 +1156,7 @@ fn wire_two_bank_artifacts(
 // Slice 7D Test 1: the production builder assembles a *firing* binding purely
 // from graph-property discovery. Build a shape-faithful two-bank QMoE graph,
 // let `expert_weight_groups` discover the bank identities, construct the
-// binding with `build_route_residency_boundary`, install it through the EP, and
+// binding with `build_route_residency_boundaries`, install it through the EP, and
 // drive the executor's trait method: the routed union transitions both
 // discovered members atomically, the window advances once, the next boundary is
 // empty, and draining removes the binding so no further boundary work occurs.
@@ -1209,12 +1209,12 @@ fn builder_assembles_firing_binding_from_graph_banks() {
 
     // The production builder: no op/name allowlist — it consumes the discovered
     // group and the EP's existing catalog/allocator/pool authorities.
-    let binding = build_route_residency_boundary(
+    let mut bindings = build_route_residency_boundaries(
         &graph,
         Arc::clone(&residency),
         &sources,
-        catalogs,
-        allocators,
+        &catalogs,
+        &allocators,
         Arc::clone(&pools.device_pool),
         Arc::clone(&pools.host_pool),
         1,
@@ -1224,6 +1224,8 @@ fn builder_assembles_firing_binding_from_graph_banks() {
         1,
     )
     .expect("builder must assemble a binding from a valid two-bank graph");
+    assert_eq!(bindings.len(), 1);
+    let binding = bindings.remove(0);
     assert_eq!(
         binding.bank_value_count(),
         2,
@@ -1522,12 +1524,12 @@ fn boundary_host_overhead_on_vs_off() {
         Some(p) => p,
         None => return,
     };
-    let binding = build_route_residency_boundary(
+    let mut bindings = build_route_residency_boundaries(
         &graph,
         residency,
         &sources,
-        catalogs,
-        allocators,
+        &catalogs,
+        &allocators,
         Arc::clone(&pools.device_pool),
         Arc::clone(&pools.host_pool),
         1,
@@ -1537,6 +1539,8 @@ fn boundary_host_overhead_on_vs_off() {
         1,
     )
     .expect("binding");
+    assert_eq!(bindings.len(), 1);
+    let binding = bindings.remove(0);
     provider.install_route_residency_boundary(Arc::new(binding));
 
     let sample = |gate_enabled: bool| -> f64 {

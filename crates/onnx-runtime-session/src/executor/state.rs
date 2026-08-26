@@ -112,6 +112,10 @@ pub(crate) struct Executor {
     /// today; production consumers land in a follow-up slice per issue #82.
     #[allow(dead_code)]
     pub(super) expert_region_candidates: HashMap<ValueId, onnx_runtime_loader::WeightRegionCatalog>,
+    /// Exact loader-finalized routed banks supplied to the provider only by
+    /// the authoritative post-kernel finalization transition. Empty unless the
+    /// provider opted in during build.
+    pub(super) finalized_expert_banks: Vec<FinalizedExpertBank>,
     /// The validated [`onnx_runtime_ep_api::ResidencyPlan`] derived from
     /// `expert_region_candidates` using [`onnx_runtime_ep_api::WholeBankResidentPolicy`]
     /// (the only shipped policy today). Pure bookkeeping: it does not own

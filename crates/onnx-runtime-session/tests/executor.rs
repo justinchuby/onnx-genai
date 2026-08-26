@@ -218,6 +218,7 @@ impl ExecutionProvider for HostDownloadCountingEp {
         &self,
         executor: ExecutorInstanceId,
         graph: &Graph,
+        _finalized_banks: &[onnx_runtime_ep_api::FinalizedExpertBank],
     ) -> ExecutorArtifactFinalization {
         assert!(
             self.kernel_compiles

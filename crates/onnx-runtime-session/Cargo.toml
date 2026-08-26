@@ -39,6 +39,7 @@ half = { workspace = true }
 
 [dev-dependencies]
 prost = { workspace = true }
+onnx-runtime-cuda-memory = { path = "../onnx-runtime-cuda-memory", version = "=0.1.0-dev.5", default-features = false }
 # Test-only: the CUDA driver-path WAR regression test (cuda feature) launches a
 # custom slow-read consumer kernel on the compute stream to open a write-after-
 # read window across double-buffer reuse. Same dynamic-loading spec as

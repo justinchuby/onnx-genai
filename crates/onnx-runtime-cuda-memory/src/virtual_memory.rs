@@ -1796,6 +1796,78 @@ impl PhysicalHandlePool {
         Ok(pool)
     }
 
+    /// Create a location-typed pool outside the compatibility registry.
+    ///
+    /// Executor-owned expert-bank reservations need zero-retention pools whose
+    /// lifetime ends with that executor even when the provider's general arena
+    /// already owns a compatible retained pool. This remains under the same
+    /// governor authority and operation gate; it creates no private ledger.
+    pub fn new_isolated_at_location(
+        context: Arc<CudaContext>,
+        device_ordinal: i32,
+        location: PhysicalLocation,
+        max_retained_bytes: usize,
+        governor: &dyn MemoryGovernor,
+        holder: HolderId,
+        role: MemoryRole,
+    ) -> Result<Arc<Self>, MemoryError> {
+        if device_ordinal < 0
+            || matches!(
+                location,
+                PhysicalLocation::Device { ordinal } if ordinal != device_ordinal
+            )
+        {
+            return Err(MemoryError::InvalidRequest {
+                tier: Tier::Device.name(),
+                requested: 0,
+                reason: "the isolated physical-pool location does not match its CUDA device",
+            });
+        }
+        let authority = governor.authority_id();
+        if authority.device()
+            != onnx_runtime_memory_governor::DeviceKey::device(device_ordinal as u32)
+        {
+            return Err(MemoryError::InvalidRequest {
+                tier: Tier::Device.name(),
+                requested: 0,
+                reason: "the physical-handle pool governor authority names a different device",
+            });
+        }
+        let granularity = allocation_granularity_for_location(location);
+        let context_identity = physical_pool_context_identity(&context).map_err(|reason| {
+            MemoryError::AllocationFailed {
+                tier: Tier::Device.name(),
+                requested: 0,
+                reason,
+            }
+        })?;
+        let tier = match location {
+            PhysicalLocation::Device { .. } => Tier::Device,
+            PhysicalLocation::HostNuma { .. } => Tier::Host,
+        };
+        let lease = governor.reserve(tier, 0, role, holder)?;
+        Ok(Arc::new(Self {
+            context,
+            context_identity,
+            device_ordinal,
+            location,
+            granularity,
+            authority,
+            max_retained_bytes: (max_retained_bytes / granularity) * granularity,
+            authority_gate: physical_pool_authority_gate(authority),
+            state: Mutex::new(PoolState {
+                available: Vec::new(),
+                quarantined: Vec::new(),
+                lease: Some(lease),
+                pending_lease_shrink: 0,
+                shared: HashMap::new(),
+            }),
+            lease_checkout: Mutex::new(()),
+            counters: Arc::new(PoolCounters::default()),
+            context_terminated: AtomicBool::new(false),
+        }))
+    }
+
     /// Discharge pool accounting after external proof that the CUDA context no
     /// longer exists.
     ///

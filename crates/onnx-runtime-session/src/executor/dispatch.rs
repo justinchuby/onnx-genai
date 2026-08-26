@@ -267,7 +267,8 @@ impl Executor {
                 .weight_handles
                 .get(vid)
                 .and_then(|handle| handle.as_lazy())
-                && self.ep.prefetch_lazy_weight(
+                && self.ep.prefetch_lazy_weight_for_executor(
+                    self.instance_id,
                     vid.0 as u64,
                     lazy,
                     &WeightStoreRegionSource(self.weights.as_ref()),
@@ -513,6 +514,7 @@ impl Executor {
         let kernel_bindings = &mut self.kernel_bindings;
         let capture_growing = &self.capture_growing_symbols;
         let mut ctx = KernelDispatchContext {
+            executor: self.instance_id,
             ep: &ep,
             graph: &self.graph,
             weight_handles: &self.weight_handles,
@@ -1103,7 +1105,8 @@ impl Executor {
                 // lifetime via `paged`. On `None` (EP can't page) the input stays
                 // absent and is routed to the kernel as a lazy `KernelInput::Weight`.
                 let issued_at = self.prefetch_issue_nodes.lock().unwrap().remove(&vid);
-                let paged = self.ep.page_lazy_weight(
+                let paged = self.ep.page_lazy_weight_for_executor(
+                    self.instance_id,
                     vid.0 as u64,
                     lazy,
                     &WeightStoreRegionSource(self.weights.as_ref()),
@@ -1378,6 +1381,7 @@ fn materialize_strided_inputs(
 /// order without ever borrowing `self` whole (which would collide with the
 /// resolved kernel's borrow of `self.cache`). No field is cloned.
 struct KernelDispatchContext<'a> {
+    executor: ExecutorInstanceId,
     ep: &'a Arc<dyn ExecutionProvider>,
     graph: &'a Graph,
     weight_handles: &'a HashMap<ValueId, WeightHandle>,
@@ -1700,7 +1704,8 @@ impl KernelDispatchContext<'_> {
                 let value = (*value)?;
                 let catalog = self.expert_region_candidates.get(&value)?;
                 self.ep
-                    .acquire_routed_residency(
+                    .acquire_routed_residency_for_executor(
+                        self.executor,
                         value.0 as u64,
                         onnx_runtime_ep_api::RoutedResidencyRequirement::FusedRoutingUnknown,
                         catalog,
