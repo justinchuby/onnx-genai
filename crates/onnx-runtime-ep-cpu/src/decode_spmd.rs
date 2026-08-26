@@ -2762,10 +2762,22 @@ impl SpmdDecodePools {
     /// by global worker index, so running all of them on one thread is exactly
     /// the same computation as broadcasting them -- only serial. This is the
     /// fallback when the pool's single publish/wait slot is already claimed.
+    ///
+    /// Releases the dispatcher pin first, and that is not a detail: the
+    /// reserved CPU is one CPU, sized for a thread that publishes and then
+    /// *waits*. A thread on this path computes the whole op instead, so
+    /// leaving it pinned confines an entire op's arithmetic to a single CPU
+    /// that another session's dispatcher is also sitting on. Measured at
+    /// `PROBE_SESSIONS=2`: 0.551x against the unpinned arm, 0/10 paired runs,
+    /// and 0.321x at 4 sessions -- the loss tracks 1/sessions, which is what
+    /// serializing every loser onto one CPU predicts. A thread-placement
+    /// census showed both session threads reading `cpu=30` in every sample
+    /// with the knob on, and distinct CPUs with it off.
     fn dispatch_inline<F>(&self, job: &F)
     where
         F: Fn(usize) + Sync,
     {
+        release_dispatcher_pin();
         for global_index in 0..self.total_workers {
             job(global_index);
         }
@@ -2813,7 +2825,10 @@ impl SpmdDecodePools {
         // First dispatcher wins the identity slot: it is the one whose
         // placement is sampled from here on. Later dispatching threads still
         // take the reserved CPU below -- the point of the reserve is that
-        // whoever is dispatching sits there -- they just do not report.
+        // whoever is dispatching sits there -- they just do not report. They
+        // hand it back the moment one of them has to run an op inline, which is
+        // when "whoever is dispatching" stops being true of all of them; see
+        // `dispatch_inline`.
         let recorded = match current_thread_os_id() {
             Some(tid) => self
                 .dispatcher_tid
@@ -2841,15 +2856,7 @@ impl SpmdDecodePools {
         if cfg!(miri) {
             return;
         }
-        match crate::decode_affinity::pin_current_thread_to_cpu(cpu) {
-            Ok(()) => report_dispatcher_pin(&format!(
-                "{DISPATCHER_PIN_ENV} on: dispatcher pinned to reserved cpu {cpu}"
-            )),
-            Err(message) => report_dispatcher_pin(&format!(
-                "{DISPATCHER_PIN_ENV} on, but pinning the dispatcher to reserved cpu \
-                 {cpu} failed: {message}; dispatcher left unpinned"
-            )),
-        }
+        acquire_dispatcher_pin(cpu);
         // After the pin, never before: the first sample is the baseline every
         // later one is compared against, so taking it pre-pin would score the
         // pin itself as a migration and a successfully pinned dispatcher could
@@ -4495,6 +4502,22 @@ const DISPATCHER_RESERVED_CPUS: usize = 1;
 /// one-CPU-wide. Turning this into a default needs evidence that covers prefill
 /// as well as decode, and that evidence does not exist yet. The knob is here so
 /// the decode half can be measured at all.
+///
+/// The third was measured after the first two were written, and it is the
+/// reason [`SpmdDecodePools::dispatch_inline`] gives the CPU back. The reserve
+/// frees **one** CPU and every dispatching thread pins to it, while the pool
+/// serves one dispatcher at a time -- so with the knob on, a second session's
+/// dispatcher used to compute an entire op's shards inline while confined to
+/// the CPU the first one was already sitting on. At width 16 on a 32-CPU host,
+/// paired and order-alternated: **0.551x** of the unpinned arm at 2 sessions
+/// (0/10) and **0.321x** at 4 (0/10), a loss that tracks `1/sessions`. With the
+/// release in place the same cells read 1.027 and 1.019 and the single-session
+/// gain is unchanged (1.074 against 1.078).
+///
+/// The release is Linux-only, because
+/// [`crate::decode_affinity::set_current_thread_affinity`] is: on Windows the
+/// pin is taken and reported but cannot be handed back, so the multi-session
+/// cost above still applies there. That is one more reason this stays opt-in.
 pub const DISPATCHER_PIN_ENV: &str = "ONNX_GENAI_CPU_DECODE_DISPATCHER_PIN";
 
 /// Whether [`DISPATCHER_PIN_ENV`] asks for the dispatcher to be pinned.
@@ -4539,6 +4562,20 @@ thread_local! {
     /// retry loop would put a failing syscall on the hot path forever on any
     /// host that refuses the pin.
     static DISPATCHER_TICK: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// Whether this thread currently holds the reserved CPU.
+    ///
+    /// Set by [`acquire_dispatcher_pin`], cleared by [`release_dispatcher_pin`].
+    /// It gates the restore so that the common path -- a thread that never runs
+    /// inline -- pays one `Cell` read per inline dispatch and no syscall ever.
+    static DISPATCHER_PIN_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The affinity mask this thread had before it took the reserved CPU.
+    ///
+    /// Captured *before* pinning, because that is the only moment it still
+    /// exists: after `sched_setaffinity` the old mask is unrecoverable, and
+    /// "restore" would have to mean "guess", which on a cpuset-confined process
+    /// would hand the thread CPUs it was never allowed to use.
+    static DISPATCHER_PREPIN_CPUS: std::cell::RefCell<Option<Vec<usize>>> =
+        const { std::cell::RefCell::new(None) };
     /// Whether this thread is the one whose id the pool recorded.
     ///
     /// A process can dispatch from more than one thread over its life -- a
@@ -4550,6 +4587,76 @@ thread_local! {
     /// could only ever have made one -- the samples were coming from different
     /// threads.
     static DISPATCHER_IS_RECORDED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Take the reserved CPU for this thread, remembering the mask it replaces.
+///
+/// Fails closed when the pre-pin mask cannot be read: the pin is only safe to
+/// take if it can be given back (see [`release_dispatcher_pin`]), and a thread
+/// that pinned without a saved mask would be stuck on one CPU for the rest of
+/// its life the first time it had to compute an op inline. A host that cannot
+/// report a thread's affinity is exactly a host where that would go unnoticed.
+fn acquire_dispatcher_pin(cpu: usize) {
+    let saved = match crate::decode_affinity::observe_current_thread_cpus() {
+        crate::decode_affinity::ObservedAffinity::Cpus(cpus) if !cpus.is_empty() => cpus,
+        other => {
+            report_dispatcher_pin(&format!(
+                "{DISPATCHER_PIN_ENV} on, but this thread's affinity mask could not be read \
+                 ({other:?}), so the reserved cpu {cpu} could not be given back later; \
+                 dispatcher left unpinned"
+            ));
+            return;
+        }
+    };
+    match crate::decode_affinity::pin_current_thread_to_cpu(cpu) {
+        Ok(()) => {
+            DISPATCHER_PREPIN_CPUS.with(|slot| *slot.borrow_mut() = Some(saved));
+            DISPATCHER_PIN_HELD.with(|held| held.set(true));
+            report_dispatcher_pin(&format!(
+                "{DISPATCHER_PIN_ENV} on: dispatcher pinned to reserved cpu {cpu}"
+            ));
+        }
+        Err(message) => report_dispatcher_pin(&format!(
+            "{DISPATCHER_PIN_ENV} on, but pinning the dispatcher to reserved cpu \
+             {cpu} failed: {message}; dispatcher left unpinned"
+        )),
+    }
+}
+
+/// Give the reserved CPU back, restoring the mask this thread had before it was
+/// pinned. No-op unless this thread is holding the pin.
+///
+/// Once given back it is not taken again: the pin is attempted at a thread's
+/// first dispatch and nowhere else, so a thread that has run inline stays
+/// unpinned for the rest of its life. That is deliberate. Re-pinning on the
+/// next win would put a `sched_setaffinity` pair on the hot path of exactly the
+/// contended case -- two sessions trading the claim would pay two syscalls per
+/// op against a ~7us op -- and the case where a thread runs inline at all is
+/// the case where the pin is harmful.
+fn release_dispatcher_pin() {
+    if !DISPATCHER_PIN_HELD.with(std::cell::Cell::get) {
+        return;
+    }
+    let saved = DISPATCHER_PREPIN_CPUS.with(|slot| slot.borrow_mut().take());
+    let Some(saved) = saved else {
+        // Unreachable by construction -- `acquire_dispatcher_pin` only sets the
+        // held flag after storing the mask -- but restoring nothing is the safe
+        // reading, and leaving the flag set would retry it every inline op.
+        DISPATCHER_PIN_HELD.with(|held| held.set(false));
+        return;
+    };
+    match crate::decode_affinity::set_current_thread_affinity(&saved) {
+        Ok(()) => report_dispatcher_unpin(&format!(
+            "{DISPATCHER_PIN_ENV} on, but this dispatch runs every shard inline: reserved cpu \
+             released back to {} cpus for the life of this thread",
+            saved.len()
+        )),
+        Err(message) => report_dispatcher_unpin(&format!(
+            "{DISPATCHER_PIN_ENV} on, but restoring this thread's affinity before an inline \
+             dispatch failed: {message}; it stays on the reserved cpu"
+        )),
+    }
+    DISPATCHER_PIN_HELD.with(|held| held.set(false));
 }
 
 /// The number of CPUs this process can actually keep busy: the affinity mask,
@@ -4708,6 +4815,25 @@ fn report_dispatcher_pin(message: &str) {
     if REPORTED.set(()).is_ok() {
         #[cfg(feature = "tracing")]
         tracing_crate::debug!(dispatcher_pin = %message, "cpu decode dispatcher pin");
+        #[cfg(not(feature = "tracing"))]
+        if std::env::var("NXRT_CALIB_DEBUG").is_ok() {
+            eprintln!("onnx-genai: {message}");
+        }
+    }
+}
+
+/// Report, once, that the dispatcher gave the reserved CPU back.
+///
+/// Its own static rather than [`report_dispatcher_pin`]'s, for the reason that
+/// function already gives for not sharing one: the pin message fires first by
+/// construction, so a shared one-shot would mean the release -- the interesting
+/// half, because it says the pool is contended and the knob has stopped
+/// applying -- could never be printed.
+fn report_dispatcher_unpin(message: &str) {
+    static REPORTED: OnceLock<()> = OnceLock::new();
+    if REPORTED.set(()).is_ok() {
+        #[cfg(feature = "tracing")]
+        tracing_crate::debug!(dispatcher_pin = %message, "cpu decode dispatcher pin released");
         #[cfg(not(feature = "tracing"))]
         if std::env::var("NXRT_CALIB_DEBUG").is_ok() {
             eprintln!("onnx-genai: {message}");
@@ -9289,6 +9415,92 @@ mod tests {
             "an inline dispatch still runs every shard, on the caller"
         );
         pool.shutdown();
+    }
+
+    /// A dispatch that runs every shard inline gives the reserved CPU back.
+    ///
+    /// This is the multi-session defect in the pin knob, and it is a
+    /// *measured* one rather than a theoretical one: with the knob on, two
+    /// concurrent sessions both pin their dispatcher to the same reserved CPU,
+    /// and the one that loses the claim then computes the entire op there.
+    /// Measured on a 32-CPU host at width 16, paired and order-alternated:
+    /// 0.551x of the unpinned arm at 2 sessions (0/10 wins) and 0.321x at 4,
+    /// i.e. the loss tracks 1/sessions. A thread census read both session
+    /// threads on `cpu=30` in every sample with the knob on and on distinct
+    /// CPUs with it off.
+    ///
+    /// The post-shutdown path is used to reach `dispatch_inline`
+    /// deterministically *on this thread*: the contended path reaches it too,
+    /// but only from whichever thread loses a race, which is not a thing a test
+    /// can assert on. Both paths run the same shards on the caller, and both
+    /// are the case this releases for.
+    #[test]
+    fn an_inline_dispatch_releases_the_reserved_cpu_it_was_pinned_to() {
+        if !crate::decode_affinity::AFFINITY_MASKING_SUPPORTED {
+            return;
+        }
+        let crate::decode_affinity::ObservedAffinity::Cpus(before) =
+            crate::decode_affinity::observe_current_thread_cpus()
+        else {
+            return;
+        };
+        if before.len() < 2 {
+            // With one allowed CPU a pin cannot narrow anything, so the restore
+            // has nothing to prove and the test would pass vacuously.
+            return;
+        }
+        let target = before[0];
+        let pool = single_group_pool(2);
+        pool.shutdown();
+
+        acquire_dispatcher_pin(target);
+        let pinned = crate::decode_affinity::observe_current_thread_cpus();
+        assert_eq!(
+            pinned,
+            crate::decode_affinity::ObservedAffinity::Cpus(vec![target]),
+            "the test's own precondition failed: the dispatcher pin did not narrow this \
+             thread to the reserved cpu, so the release has nothing to undo"
+        );
+
+        pool.dispatch_index_tasks(2, &|_| {});
+
+        let after = crate::decode_affinity::observe_current_thread_cpus();
+        assert_eq!(
+            after,
+            crate::decode_affinity::ObservedAffinity::Cpus(before),
+            "a dispatch that computes every shard on this thread must hand the reserved cpu \
+             back first; left pinned, two sessions serialize onto one cpu"
+        );
+        assert!(
+            !DISPATCHER_PIN_HELD.with(std::cell::Cell::get),
+            "the release must clear the held flag, or every later inline dispatch retries \
+             the restore syscall"
+        );
+    }
+
+    /// Releasing a pin nobody took is a no-op, not a widening.
+    ///
+    /// The release runs on every inline dispatch, including in the overwhelming
+    /// majority of processes where the knob is off and no pin was ever taken.
+    /// If it restored a *remembered* mask unconditionally it would hand a
+    /// cpuset-confined thread CPUs it was never allowed to use, and it would do
+    /// so on the hot path.
+    #[test]
+    fn releasing_a_pin_that_was_never_taken_leaves_the_mask_alone() {
+        if !crate::decode_affinity::AFFINITY_MASKING_SUPPORTED {
+            return;
+        }
+        let before = crate::decode_affinity::observe_current_thread_cpus();
+        assert!(
+            !DISPATCHER_PIN_HELD.with(std::cell::Cell::get),
+            "this thread must not already hold the pin for the control to mean anything"
+        );
+        release_dispatcher_pin();
+        assert_eq!(
+            crate::decode_affinity::observe_current_thread_cpus(),
+            before,
+            "releasing an unheld pin must not touch this thread's affinity"
+        );
     }
 
     /// An idle gap far longer than the blocktime window must park the workers.
