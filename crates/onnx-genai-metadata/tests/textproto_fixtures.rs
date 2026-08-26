@@ -13,14 +13,27 @@ const SENTINEL_FIXTURES: &[&str] = &[
     "tests/fixtures/tiny-llm/model.onnx.textproto",
 ];
 
+fn lowercase_extension_path(path: &str) -> String {
+    path.replace('\\', "/").to_ascii_lowercase()
+}
+
+fn is_textproto(path: &str) -> bool {
+    lowercase_extension_path(path).ends_with(".textproto")
+}
+
+fn is_binary_onnx(path: &str) -> bool {
+    lowercase_extension_path(path).ends_with(".onnx")
+}
+
 fn fixture_inventory_errors(paths: &[String]) -> Vec<String> {
-    let textproto_count = paths
-        .iter()
-        .filter(|path| path.ends_with(".textproto"))
-        .count();
+    // Extension policy is case-insensitive. Mixed-case textproto remains
+    // reviewable text and is allowed, but it counts toward (and therefore must
+    // pass through) this census. Every casing of a terminal `.onnx` is binary
+    // and forbidden.
+    let textproto_count = paths.iter().filter(|path| is_textproto(path)).count();
     let binaries = paths
         .iter()
-        .filter(|path| path.ends_with(".onnx"))
+        .filter(|path| is_binary_onnx(path))
         .cloned()
         .collect::<Vec<_>>();
     let missing_sentinels = SENTINEL_FIXTURES
@@ -54,7 +67,10 @@ fn fixture_inventory_errors(paths: &[String]) -> Vec<String> {
 
 fn tracked_graph_fixtures(root: &Path) -> Vec<String> {
     let output = Command::new("git")
-        .args(["ls-files", "*.textproto", "*.onnx"])
+        // Enumerate first, classify second. Git pathspec case behavior differs
+        // across filesystems; a lowercase pathspec can miss `model.ONNX` on a
+        // case-sensitive runner and make the binary prohibition vacuous.
+        .args(["ls-files", "-z"])
         .current_dir(root)
         .output()
         .expect("git must be available to audit checked-in fixtures");
@@ -66,7 +82,9 @@ fn tracked_graph_fixtures(root: &Path) -> Vec<String> {
 
     String::from_utf8(output.stdout)
         .expect("git paths are UTF-8")
-        .lines()
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .filter(|path| is_textproto(path) || is_binary_onnx(path))
         .filter(|path| root.join(path).is_file())
         .map(str::to_owned)
         .collect()
@@ -107,23 +125,39 @@ fn fixture_census_rejects_empty_enumeration() {
 #[test]
 fn fast_fixture_census_rejects_docs_binary_onnx() {
     let mut fixtures = healthy_fixture_inventory();
-    fixtures.push("docs/example/model.onnx".to_owned());
-    assert!(
-        fixture_inventory_errors(&fixtures)
-            .iter()
-            .any(|error| error.contains("binary fixture")),
-        "a tracked binary .onnx fixture must be rejected"
-    );
+    for path in [
+        "docs/foo/model.onnx",
+        "docs/foo/model.ONNX",
+        "docs/foo/model.OnNx",
+        r"docs\foo\model.ONNX",
+    ] {
+        fixtures.push(path.to_owned());
+        assert!(
+            fixture_inventory_errors(&fixtures)
+                .iter()
+                .any(|error| error.contains(path)),
+            "tracked binary ONNX must be rejected case-insensitively: {path}"
+        );
+        fixtures.pop();
+    }
 }
 
 #[test]
 fn change_scope_keeps_docs_textproto_in_fast_census() {
     let mut fixtures = healthy_fixture_inventory();
-    fixtures.push("docs/example/model.onnx.textproto".to_owned());
-    assert!(
-        fixture_inventory_errors(&fixtures).is_empty(),
-        "a docs-located textproto is allowed, but change-scope must still run this census"
-    );
+    for path in [
+        "docs/foo/model.onnx.textproto",
+        "docs/foo/model.ONNX.TEXTPROTO",
+        "docs/foo/model.OnNx.TeXtPrOtO",
+        r"docs\foo\model.ONNX.TEXTPROTO",
+    ] {
+        fixtures.push(path.to_owned());
+        assert!(
+            fixture_inventory_errors(&fixtures).is_empty(),
+            "textproto casing is allowed, but change-scope must still run this census: {path}"
+        );
+        fixtures.pop();
+    }
 }
 
 #[test]
@@ -132,10 +166,7 @@ fn fixture_census_rejects_sentinel_path_drift() {
     fixtures.retain(|path| path != SENTINEL_FIXTURES[0]);
     fixtures.push("tests/fixtures/renamed/model.onnx.textproto".to_owned());
     assert_eq!(
-        fixtures
-            .iter()
-            .filter(|path| path.ends_with(".textproto"))
-            .count(),
+        fixtures.iter().filter(|path| is_textproto(path)).count(),
         MIN_TEXTPROTO_FIXTURES,
         "the mutation must preserve the count so only the sentinel detects it"
     );
