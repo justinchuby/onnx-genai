@@ -1238,7 +1238,22 @@ jobs:
           -p onnx-runtime-python
           --features onnx-runtime-python/cuda
 
+      # Every step from here down is guarded with `!cancelled()` rather than the
+      # implicit `success()`, because none of them depends on the step above for
+      # anything but a warm build cache -- and each is, per its own comment, the
+      # *only* place its gate runs. Under the implicit `success()` a compile
+      # error in one crate silently switches all seven off: `2d380b722` broke
+      # `onnx-runtime-python` (#2158), which is checked in the step above, and
+      # steps 7-13 of this job reported `skipped` for the next 26 hours. The lane
+      # is named "CUDA compile", so its red tick reads as one compile failure and
+      # gives no hint that seven checks stopped being performed -- there is no
+      # signal to miss. A check ordered behind a failing step is not a weak
+      # check, it is an absent one. Same reasoning as `cli-ort` above.
+      #
+      # The job still fails if any of them fails; this only stops one step's
+      # failure from silencing gates that have nothing to do with it.
       - name: Verify CUDA test inventory and skip honesty
+        if: ${{ !cancelled() }}
         run: python .github/scripts/verify_cuda_test_honesty.py
 
       # The capture-sync source audit is a static check (it reads kernel sources,
@@ -1246,6 +1261,7 @@ jobs:
       # as a GPU test. Run it explicitly here so a capture-unsafe synchronize()
       # still fails the CPU lane at PR time.
       - name: Audit CUDA kernel capture-sync contract
+        if: ${{ !cancelled() }}
         run: cargo test --locked -p onnx-runtime-ep-cuda --features cuda --test capture_sync_contract
 
       # The int4 MatMulNBits parity oracle self-checks are pure-CPU (no device):
@@ -1254,6 +1270,7 @@ jobs:
       # deliberately does not police this target (it is in ALWAYS_RUN), so run it
       # explicitly here to keep the oracle math exercised on the CPU lane (#1177).
       - name: Verify int4 MatMulNBits numerics oracle
+        if: ${{ !cancelled() }}
         run: cargo test --locked -p onnx-runtime-ep-cuda --features cuda --test matmul_nbits_marlin_oracle
 
       # The safe-point rejection rules are pure predicate logic over
@@ -1263,6 +1280,7 @@ jobs:
       # lane, so without this step the target would be compiled and never run
       # (#1875).
       - name: Verify granule transition safe-point rules
+        if: ${{ !cancelled() }}
         run: cargo test --locked -p onnx-runtime-ep-cuda --features cuda --test content_preserving_transition
 
       # Non-`_gpu` targets in this crate run in no other lane: the honesty
@@ -1271,6 +1289,7 @@ jobs:
       # would compile and never execute, which is the failure they were moved
       # out of `_gpu` targets to avoid.
       - name: Verify expert route telemetry CPU oracle
+        if: ${{ !cancelled() }}
         run: cargo test --locked -p onnx-runtime-ep-cuda --features cuda --test expert_route_telemetry_probe
 
       # `--all-targets` and `gpu-tests` are both load-bearing. Without them
@@ -1287,6 +1306,7 @@ jobs:
       # the gpu-tests binaries at all, so the same change there would be a
       # full extra build for lints this Linux step already covers.
       - name: Clippy CUDA execution provider
+        if: ${{ !cancelled() }}
         run: >-
           cargo clippy -p onnx-runtime-ep-cuda
           --all-targets --features cuda,gpu-tests -- -D warnings
@@ -1302,6 +1322,7 @@ jobs:
       # this caught is invisible to `--lib` alone, because the accessor's only
       # caller lives in a `#[cfg(test)]` module.
       - name: Clippy engine native-CUDA integration
+        if: ${{ !cancelled() }}
         run: >-
           cargo clippy --locked
           -p onnx-genai-engine
@@ -1374,5 +1395,10 @@ jobs:
           -p onnx-runtime-python
           --features onnx-runtime-python/cuda
 
+      # Same isolation as the Linux CUDA lane: this lint has no dependency on
+      # the check above beyond a warm cache, so `onnx-runtime-python` failing to
+      # compile (#2158) must not silently stop `onnx-runtime-ep-cuda` being
+      # linted on Windows as well.
       - name: Clippy CUDA execution provider
+        if: ${{ !cancelled() }}
         run: cargo clippy -p onnx-runtime-ep-cuda --features cuda -- -D warnings
