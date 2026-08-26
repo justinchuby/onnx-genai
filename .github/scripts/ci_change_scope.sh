@@ -21,11 +21,16 @@ ci_is_docs_path() {
   # Git paths are case-sensitive data, so keep `path` unchanged for embedded
   # source equality. Strip only the six documented trailing ASCII-whitespace
   # bytes from the extension-classification copy.
+  #
+  # `${extension_path%?}` rather than `${extension_path::-1}`: a negative *length*
+  # in substring expansion needs bash >= 4.2, and macOS ships bash 3.2, where it
+  # aborts the shell with `substring expression < 0`. The `${extension_path: -1}`
+  # below is a negative *offset*, which 3.2 accepts.
   extension_path="$path"
   while [[ -n "$extension_path" ]]; do
     case "${extension_path: -1}" in
       ' '|$'\t'|$'\r'|$'\n'|$'\v'|$'\f')
-        extension_path="${extension_path::-1}"
+        extension_path="${extension_path%?}"
         ;;
       *)
         break
