@@ -500,6 +500,78 @@ _RUNS_TESTS = re.compile(r"cargo\s+(?:\+\S+\s+)?(?:test|llvm-cov)\b")
 # xargs' `--no-run-if-empty`, which `ci.yml` really does use -- matching that
 # would drop a genuine lane's credit and turn this fix into a regression.
 _NO_RUN = re.compile(r"(?:^|\s)--no-run(?=\s|$)")
+
+# Matching `_RUNS_TESTS` anywhere in a fragment credits text that merely
+# *mentions* the invocation. `echo "cargo test -p foo"` executes no test, and
+# neither does a `cargo test` line sitting in a heredoc body that is written to
+# a file. Both keep the gate green while the required lane runs nothing, which
+# is the one direction this gate calls fatal, so an invocation now counts only
+# when the fragment *begins* with it. A bounded prefix chain is allowed --
+# environment assignments and the launchers a runner legitimately wraps a test
+# command in -- because those still execute the tests. Anything else (a quote, a
+# redirect, `echo`) is refused. All six fragments the real workflow credits
+# today begin with a bare `cargo`, so this preserves every honest reading; an
+# unanticipated-but-honest prefix loses its credit and fails loudly, which is
+# the direction the module's docstring already accepts.
+_TEST_PREFIX = re.compile(
+    r"^(?:"
+    r"[A-Za-z_][A-Za-z0-9_]*=(?:\"[^\"]*\"|'[^']*'|\S*)"
+    r"|sudo|env|nice|time|timeout\s+\S+|taskset\s+\S+\s+\S+|retry\s+\S+|xvfb-run"
+    r"|xargs(?:\s+-{1,2}[A-Za-z0-9-]+)*"
+    r")\s+"
+)
+# `<<WORD`, `<<'WORD'`, `<<"WORD"`, and the `<<-` indent-stripping variant.
+_HEREDOC_START = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+_QUOTED = re.compile(r"\"[^\"]*\"|'[^']*'")
+
+
+def _runs_tests(fragment: str) -> bool:
+    """True when the fragment's own command is a test invocation.
+
+    Quoted spans are removed first, so `echo "cargo test -p foo"` carries no
+    invocation at all -- that also disarms a `|` hidden inside a string, which
+    would otherwise survive the stage split below. Each pipeline stage is then
+    anchored separately, because `find . | xargs cargo test -p foo` genuinely
+    runs the tests while `echo cargo test -p foo` does not, and only the
+    position of the invocation within its stage tells the two apart.
+    """
+    for stage in _QUOTED.sub("", fragment).split("|"):
+        text = stage.strip()
+        while True:
+            match = _TEST_PREFIX.match(text)
+            if not match:
+                break
+            text = text[match.end() :].lstrip()
+        if _RUNS_TESTS.match(text):
+            return True
+    return False
+
+
+def _strip_heredocs(command: str) -> str:
+    """Drop heredoc bodies, which are data written somewhere -- not commands.
+
+    A heredoc body is indistinguishable from a command list once the block is
+    split on newlines, so `cat <<'SH' > run.sh` wrapping a `cargo test` line
+    would otherwise credit a required lane with a script it only ever writes.
+    An unterminated heredoc swallows the rest of the block: that is the
+    conservative reading, and it can only remove credit.
+    """
+    kept: list[str] = []
+    delimiter: str | None = None
+    for line in command.split("\n"):
+        if delimiter is not None:
+            if line.strip() == delimiter:
+                delimiter = None
+            continue
+        if match := _HEREDOC_START.search(line):
+            delimiter = match.group(2)
+            # The line that opens the heredoc is still a real command, but its
+            # operands are the heredoc marker; keep it so `cat`/`python` are
+            # visible without crediting what follows.
+            kept.append(_HEREDOC_START.sub("", line))
+            continue
+        kept.append(line)
+    return "\n".join(kept)
 _LANE_CALL = re.compile(r"workspace_test_packages\.py\s+cargo-args\s+([a-z-]+)")
 _PACKAGE_FLAG = re.compile(r"(?:^|\s)(?:-p|--package)[\s=]+([A-Za-z0-9_-]+)")
 _VAR_ASSIGN = re.compile(
@@ -920,12 +992,12 @@ def packages_tested_by(commands: Iterable[str]) -> set[str]:
     tested: set[str] = set()
     for command in commands:
         lanes_by_var: dict[str, set[str]] = {}
-        for fragment in re.split(r"&&|\|\||;|\n", command):
+        for fragment in re.split(r"&&|\|\||;|\n", _strip_heredocs(command)):
             for assignment in _VAR_ASSIGN.finditer(fragment):
                 lanes_by_var[assignment.group("var")] = set(
                     _LANE_CALL.findall(assignment.group("value"))
                 )
-            if not _RUNS_TESTS.search(fragment):
+            if not _runs_tests(fragment):
                 continue
             if _NO_RUN.search(fragment):
                 continue
@@ -1382,6 +1454,53 @@ _CONDITIONAL_ARMS: tuple[tuple[str, str | None, list[str], list[str]], ...] = (
         "`if:` inside shell text is not a step condition",
         "      - name: x\n        run: |\n          if: not-a-condition\n          cargo test -p pkg-alpha\n",
         ["pkg-alpha"],
+        [],
+    ),
+    # Reviewer finding (Pris): matching the invocation *anywhere* in a fragment
+    # credited text that is never executed as a command. Both arms below scored
+    # a full-coverage `rc=0` against the real `ci.yml` -- with output byte-
+    # identical to the clean baseline -- while the required lane ran no test at
+    # all. That is the false-green direction, so each is pinned here.
+    (
+        "a quoted test invocation is not credited",
+        '      - name: x\n        run: echo "cargo test -p pkg-alpha"\n',
+        [],
+        [],
+    ),
+    (
+        "a heredoc body is written, not run, so it is not credited",
+        "      - name: x\n        run: |\n          cat <<'SH' > run.sh\n"
+        "          cargo test -p pkg-alpha\n          SH\n",
+        [],
+        [],
+    ),
+    # The matched pair for the two above: without these, their refusal is
+    # equally explicable as "the anchor refuses everything".
+    (
+        "a launcher prefix still executes the tests, so it is credited",
+        "      - name: x\n        run: taskset -c 0-3 cargo test -p pkg-alpha\n",
+        ["pkg-alpha"],
+        [],
+    ),
+    (
+        "an env-assignment prefix is credited",
+        "      - name: x\n        run: RUST_LOG=debug cargo test -p pkg-alpha\n",
+        ["pkg-alpha"],
+        [],
+    ),
+    # A downstream pipeline stage still executes: `find . | xargs cargo test`
+    # runs the tests. Anchoring the whole fragment rather than each stage
+    # dropped this lane's credit, which the `--no-run-if-empty` arm caught.
+    (
+        "a test invocation in a later pipeline stage is credited",
+        "      - name: x\n        run: find . -print0 | xargs -0 cargo test -p pkg-alpha\n",
+        ["pkg-alpha"],
+        [],
+    ),
+    (
+        "a quoted invocation containing a pipe is still not credited",
+        '      - name: x\n        run: echo "x | cargo test -p pkg-alpha"\n',
+        [],
         [],
     ),
 )
