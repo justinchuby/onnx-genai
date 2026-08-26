@@ -224,6 +224,39 @@ DENYLIST: dict[str, str] = {
     "onnx-runtime-python": "PyO3 extension crate requires wheel packaging/runtime DLL staging",
 }
 
+# Crates the lint lane must skip, and the only kind of reason that qualifies.
+#
+# `DENYLIST` above is about *running* tests: a GPU, a wheel-staged extension
+# module, a perf harness. #2058 established that such reasons have no force
+# over clippy, which only ever *checks* -- it never links and never runs a test
+# binary -- and restored lint coverage to 21 tested crates that had lost it for
+# a reason that did not apply. That argument was never extended to the denied
+# crates themselves, so `lint` stayed `packages - DENYLIST` and four members
+# ended up linted by nothing at all: onnx-genai-bench, onnx-genai-ort-sys,
+# onnx-genai-python, onnx-runtime-python.
+#
+# That gap is not theoretical. #2132 left `onnx-runtime-python` uncompilable on
+# every platform for 22 commits. The only job that builds it is `CUDA compile`,
+# which is not a required check: it went red on the breaking merge and did not
+# block it. Lint coverage puts that same breakage in front of `Rust quality`,
+# which is required.
+#
+# An entry here must therefore name a reason clippy itself cannot get past.
+# "needs a GPU at runtime", "isn't a unit-test target" and "needs wheel
+# staging" are not such reasons -- that is the #2058 mistake with new nouns.
+LINT_EXEMPT: dict[str, str] = {
+    # Its build script shells out to the CUDA toolchain, which the Linux
+    # `Rust quality` runner does not install. Linted by the CUDA compile job,
+    # which does. Verified locally only on a box that has `nvcc`, so a local
+    # pass here is not evidence about the required runner.
+    "onnx-runtime-ep-cuda": "build script requires a CUDA toolchain absent from the quality runner",
+    # Not a toolchain limit: 28 dead-code findings in `src/bin/compare.rs`
+    # (a whole `Direct*` reporting path that nothing constructs). Tracked in
+    # #2242. Remove this entry when they are resolved -- it is debt, not an
+    # exemption on the merits.
+    "onnx-genai-bench": "not yet clippy-clean: dead-code backlog in src/bin/compare.rs (#2242)",
+}
+
 # Packages that need the ORT-backed lane because they directly or transitively
 # load ONNX Runtime. They are still tested by default; they are only kept out of
 # the offline lanes to preserve the ort-sys download constraint above.
@@ -281,10 +314,12 @@ def lane_packages(lane: str) -> list[str]:
         case "linux-only":
             selected = LINUX_ONLY & packages
         case "lint":
-            # Every package any test lane compiles. `cargo clippy` only ever
-            # *checks*, so the ort-sys/CUDA constraint that splits the test
-            # lanes does not apply to it: nothing here is linked or run.
-            selected = packages - denied
+            # Every package clippy can compile -- which, since it only ever
+            # *checks* and never links or runs a test binary, is every member
+            # except those `LINT_EXEMPT` names a toolchain reason for. The
+            # test-lane denials deliberately do not apply here; that was the
+            # whole point of #2058 and it holds for denied crates too.
+            selected = packages - set(LINT_EXEMPT)
         case _:
             raise SystemExit(f"unknown lane '{lane}'")
     return sorted(selected)
@@ -475,15 +510,21 @@ def verify(simulate_missing: str | None = None, simulate_unlinted: str | None = 
     uncovered = sorted(packages - tested - denied)
     stale_tested = sorted(tested - packages)
     stale_denied = sorted(denied - packages)
+    stale_lint_exempt = sorted(set(LINT_EXEMPT) - packages)
 
     commands = clippy_commands()
     linted = linted_packages() & packages
     if simulate_unlinted:
         linted.discard(simulate_unlinted)
-    unlinted = sorted(tested - linted)
+    # The domain is every package clippy can compile, not just the tested ones.
+    # It used to be `tested - linted`, which by construction could never see a
+    # denied crate -- so the four members linted by nothing were invisible to
+    # the very guard whose job is to notice that. A crate excused from running
+    # its tests is not thereby excused from compiling.
+    unlinted = sorted((packages - set(LINT_EXEMPT)) - linted)
 
     failed = False
-    if uncovered or stale_tested or stale_denied:
+    if uncovered or stale_tested or stale_denied or stale_lint_exempt:
         failed = True
         print("Workspace test package coverage check failed.", file=sys.stderr)
         if uncovered:
@@ -501,6 +542,8 @@ def verify(simulate_missing: str | None = None, simulate_unlinted: str | None = 
             print(f"Non-workspace package(s) in tested lanes: {stale_tested}", file=sys.stderr)
         if stale_denied:
             print(f"Non-workspace package(s) in deny-list: {stale_denied}", file=sys.stderr)
+        if stale_lint_exempt:
+            print(f"Non-workspace package(s) in LINT_EXEMPT: {stale_lint_exempt}", file=sys.stderr)
 
     # Positive control: the lint half is computed by scanning workflow text, so
     # a scanner that silently matches nothing would report full coverage of an
@@ -517,16 +560,18 @@ def verify(simulate_missing: str | None = None, simulate_unlinted: str | None = 
         failed = True
         print("Workspace lint coverage check failed.", file=sys.stderr)
         print(
-            "Package(s) are compiled and tested by CI and linted by nothing:",
+            "Package(s) are workspace members that clippy can compile and nothing lints:",
             file=sys.stderr,
         )
         for package in unlinted:
             print(f"  - {package}", file=sys.stderr)
         print(
-            "Every tested package must be reached by some `cargo clippy` step. The Linux\n"
-            "offline clippy steps select `cargo-args lint`, so a package added to a test\n"
-            "lane is linted automatically -- this failing means a clippy step went back to\n"
-            "a hand-written -p list, or a new lane is tested but not linted.",
+            "Every package clippy can compile must be reached by some `cargo clippy` step.\n"
+            "The Linux offline clippy steps select `cargo-args lint`, so a new member is\n"
+            "linted automatically -- this failing means a clippy step went back to a\n"
+            "hand-written -p list, or a member needs a LINT_EXEMPT entry naming the\n"
+            "toolchain reason clippy cannot get past. Not running a crate's tests is not\n"
+            "such a reason.",
             file=sys.stderr,
         )
     if failed:
@@ -535,8 +580,8 @@ def verify(simulate_missing: str | None = None, simulate_unlinted: str | None = 
         f"workspace test package coverage ok: {len(tested)} tested, {len(denied)} denied"
     )
     print(
-        f"workspace lint coverage ok: {len(tested)} tested, all linted by "
-        f"{len(commands)} clippy invocation(s)"
+        f"workspace lint coverage ok: {len(packages) - len(LINT_EXEMPT)} linted by "
+        f"{len(commands)} clippy invocation(s), {len(LINT_EXEMPT)} lint-exempt"
     )
     return 0
 
@@ -2431,6 +2476,30 @@ def _self_test_arms() -> tuple[int, int]:
             {"simulate_unlinted": "onnx-runtime-ep-cpu"},
             1,
             ["onnx-runtime-ep-cpu"],
+        ),
+        # The discriminator for #2158's shape. `onnx-runtime-python` is on the
+        # DENYLIST, so under the previous `unlinted = tested - linted` domain a
+        # denied crate could not appear in that set no matter what: this arm
+        # returned 0 and named nobody. It is the only arm here whose verdict
+        # flips on the domain rather than on the scanner, so if it ever passes
+        # a `verify` that no longer subtracts LINT_EXEMPT, the widening has
+        # been reverted and four crates are silently unlinted again.
+        (
+            "verify --simulate-unlinted onnx-runtime-python (a denied crate)",
+            verify,
+            {"simulate_unlinted": "onnx-runtime-python"},
+            1,
+            ["onnx-runtime-python"],
+        ),
+        # A LINT_EXEMPT crate must *not* be demanded: exempting it is the whole
+        # point, and without this arm the widened domain could quietly grow to
+        # include crates the quality runner cannot build.
+        (
+            "verify --simulate-unlinted onnx-genai-bench (lint-exempt)",
+            verify,
+            {"simulate_unlinted": "onnx-genai-bench"},
+            0,
+            [],
         ),
         ("verify-required-tier (control)", verify_required_tier, {}, 0, []),
         # Driven through the real entry point, not the helper: the defect this
