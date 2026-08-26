@@ -29,10 +29,18 @@ Three corrections come out of filling it in.
    both sweeps taken here, with opposite signs** (+0.63% at 21 launches, −0.28%
    at 41). Its real floor is about ±0.6%.
 3. **A source-level A/B on this codebase carries a per-build code-layout
-   component that reaches ~2%, and no same-binary A/A can see it.** Found by a
-   control that was supposed to be boring. Detailed below, because it bears on
-   every A/B in this directory and not just this one — and because it is the
-   reason a single build pair is not enough to establish a sub-2% result.
+   component, and no same-binary A/A can see it.** Found by a control that was
+   supposed to be boring. Detailed below, because it bears on every A/B in this
+   directory and not just this one — and because it is the reason a single build
+   pair is not enough to establish a small result. **Its magnitude is no longer
+   settled:** the ~2% originally claimed here rests on three build pairs all
+   measured through a gate blind to SMT-sibling contention, and the one cell
+   since re-taken through the fixed gate (#2216) shrank from 1.93% to 0.28%.
+   The *existence* of the component is unaffected — it is established by
+   readings that differ across builds on a row proven bit-identical, not by
+   their size — but anyone using this document to set a credibility bar for a
+   sub-2% result should treat 2% as an upper bound contaminated by contention,
+   and re-take pairs A and C through the SMT gate before relying on it.
 
 ## Matrix
 
@@ -59,7 +67,7 @@ above 1.000 means the elimination is faster.
 
 | m | before ms | after ms | speedup | 95% CI | verdict | A/A | A/A 95% CI |
 |---:|---:|---:|---:|---|---|---:|---|
-| 1 | 0.713 | 0.727 | **0.9807** | [0.9794, 0.9835] | **loss — see below** | 1.0000 | [0.9973, 1.0014] |
+| 1 | 0.713 | 0.727 | **0.9807** | [0.9794, 0.9835] | **loss — superseded, see below** | 1.0000 | [0.9973, 1.0014] |
 | 8 | 2.424 | 2.401 | **1.0096** | [1.0067, 1.0113] | **gain** | 1.0012 | [0.9979, 1.0037] |
 | 16 | 3.006 | 2.988 | **1.0060** | [1.0037, 1.0087] | **gain** | 0.9983 | [0.9967, 1.0010] |
 | 32 | 4.748 | 4.727 | **1.0044** | [1.0015, 1.0076] | **gain** | 0.9998 | [0.9979, 1.0023] |
@@ -168,8 +176,10 @@ interval in both pair-C sweeps brackets 1.000; 0 launches discarded.
 Three readings of the same experiment, and they separate cleanly:
 
 * **The row the change provably never executes swings.** +0.28%, −1.93%,
-  +0.28%. A 2.2-point range on a row where the two binaries differ only in code
-  that does not run.
+  +0.28% — and −0.28% in a fourth build re-taken later through the SMT-aware
+  gate (see the caveat section). A 2.2-point range on a row where the two
+  binaries differ only in code that does not run, and where the widest reading
+  is the one taken through the weakest gate.
 * **Every row the change does execute keeps its sign in all three pairs**, at
   the same absolute magnitude to within a factor of two: `m = 8` is
   +0.017/+0.023/+0.033 ms, `m = 16` is +0.019/+0.018/+0.027 ms. Deliberately
@@ -229,11 +239,43 @@ It reads **0.9807, CI [0.9794, 0.9835]** — a 1.9% *loss*, reproduced at
 A/A sitting at 1.0000 [0.9973, 1.0014]. Both readings are of a row whose bytes
 are provably identical in both arms, so neither is a cost of the change.
 
+**Most of that 1.9% was the SMT hole, and re-measuring through it shrinks the
+row by 7x.** The Method section below discloses that every number in the tables
+above was taken under a gate blind to hyperthread-sibling contention. #2216
+closed that hole after this document was written, so the row has now been
+re-taken through a gate that can see it — arms rebuilt from scratch on
+`533546095`, 61 launches per arm, same cell, same pin:
+
+| taking | gate | m = 1, block 32 | A/A | discards |
+|---|---|---|---|---|
+| original (above) | rusage only, SMT-blind | 0.9807 [0.9794, 0.9835] | 1.0000 [0.9973, 1.0014] | 0 / 183 |
+| re-take, `533546095` | rusage **+ SMT sibling** | **0.9972 [0.9930, 0.9993]** | 1.0000 [0.9958, 1.0021] | 4 / 183 |
+
+The intervals do not overlap. A 1.9% loss became a 0.28% one against an A/A that
+brackets unity in both takings, which is what a contended-sibling artifact looks
+like when the contention finally becomes visible to the gate: the A/A cannot
+reveal it, because both A/A arms inherit the same sibling. Four launches were
+discarded here against zero originally — not because this host was busier, but
+because the instrument could finally see the thing it was discarding for. The
+artifact records which gate fired: **`smt_total` 4, CPU-efficiency discards 0.**
+Every one of the 183 launches passed the rusage floor, exactly as all 183 did in
+the original taking, and the four that were thrown out were caught only by the
+sibling-jiffy gate. Per-arm admission spread 0.016 (before 1, after 2, aa 1), so
+the gate did not select one arm over another.
+
+This does not rescue the row as a result, and it is not meant to. 0.9972's
+interval still excludes 1.000, and the route proof was re-run on these same
+rebuilt arms and still reports `before == after == poison == 4cb1dcffe7454cff`
+at that cell — so whatever remains is still measured on a row where the two
+binaries are bit-identical. The correction is to the *magnitude of the artifact*,
+not to its attribution, which the poison settled independently of any timing.
+
 **Two other pairs of binaries, built from the same source change — one against
 a `main` three commits earlier, one against current `main` with every function
 32-byte aligned — read 1.0000 / 1.0028 [0.9986, 1.0042] and 1.0028
 [0.9986, 1.0070] on that same row.** Same change, same row, same
-route-not-taken: +0.3%, −1.9%, +0.3%.
+route-not-taken: with the SMT-gated re-take above as a fourth independent
+build, the four readings are +0.3%, −1.9%, +0.3%, −0.3%.
 
 So this is code layout, not a property of the change — and that is the finding,
 because:
@@ -415,10 +457,12 @@ incomplete was its account of where the change pays. Corrected scope:
   those rows, so bounded rather than shown to be zero
 * **block-16 decode: ≈1.010x**, against an instrument floor of ~0.6% — real,
   but smaller than the 1.015x #1809 reported
-* **an incidental ~1.9% layout loss on the block-32 `m = 1` decode route in one
-  of the three builds**, not attributable to the change, absent from the other
-  two, and the reason the claim above rests on three build pairs rather than
-  one
+* **an incidental layout loss on the block-32 `m = 1` row** (which takes the
+  decode route, and is measured in the prefill sweep), **read at ~1.9% in one
+  of the three original builds and at 0.28% when that cell was re-taken through
+  the SMT-aware gate** — not attributable to the change in either case, since
+  the arms are bit-identical there; near-absent from the other two builds, and
+  the reason the claim above rests on multiple build pairs rather than one
 
 Shipped here: the per-row `fnv` route fingerprint in `int4_prefill_route_ab`,
 the bootstrap and A/A self-check in the harness, and the two scripts that make
