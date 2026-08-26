@@ -16,7 +16,11 @@ set -uo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 GUARD="$HERE/squad_promote_guard.sh"
-WORK="$HERE/../.squad-promote-guard-test"
+# Scratch lives outside the repo on a runner. A hard kill skips the EXIT trap,
+# and a leaked directory at the repo root would not be caught by the guard this
+# file tests: the forbidden set is directory-prefixed, so `.squad-…` is allowed
+# where `.squad/…` is not.
+WORK="${RUNNER_TEMP:-$HERE/..}/.squad-promote-guard-test"
 
 pass=0
 fail=0
@@ -219,9 +223,11 @@ WF="$HERE/../.github/workflows/squad-promote.yml"
 lint_workflow() { # file -> 0 clean, 1 hazard (reason on stdout)
   local f="$1"
   awk '
-    /^  [a-z][a-z0-9_-]*:$/ { if (job != "") check(); job = $1; sub(/:$/, "", job); calls = 0; stages = 0; relative = 0 }
+    /^jobs:$/            { injobs = 1; next }
+    /^[^ #]/             { injobs = 0 }
+    /^  [a-z][a-z0-9_-]*:$/ { if (injobs) { if (job != "") check(); job = $1; sub(/:$/, "", job); calls = 0; stages = 0; relative = 0 } }
     /bash +"?\$(RUNNER_TEMP|\{RUNNER_TEMP\})"?\/squad_promote_guard\.sh/ { calls++ }
-    /bash +scripts\/squad_promote_guard\.sh/ { relative++ }
+    /(^|[ \t;&|(])(bash|sh|source|\.) +[^ ]*scripts\/squad_promote_guard\.sh/ { relative++ }
     /install +-m +0755 +scripts\/squad_promote_guard\.sh/ { stages++ }
     END { check() }
     function check() {
@@ -249,6 +255,21 @@ else
   else
     out=$(lint_workflow "$mutant")
     check_output "lint catches a working-tree invocation" "working-tree path" "$out" present
+  fi
+
+  # Independent review evaded the first version of this lint by *quoting* the
+  # relative path -- the matcher required a bare one, so `bash "scripts/..."`
+  # read as clean. The contract is "no working-tree invocation", so the control
+  # has to be the shape that beat it, not the shape that motivated it.
+  mutant="$WORK/wf_mutant_quoted.yml"
+  # `$RUNNER_TEMP` must stay literal here: it is the text being replaced.
+  # shellcheck disable=SC2016
+  sed 's#bash "\$RUNNER_TEMP/squad_promote_guard.sh"#sh "scripts/squad_promote_guard.sh"#' "$WF" > "$mutant"
+  if ! grep -qF 'sh "scripts/squad_promote_guard.sh"' "$mutant"; then
+    bad "arm 9 quoted-control anchor missed -- the mutation did not apply, so the lint is unproven"
+  else
+    out=$(lint_workflow "$mutant")
+    check_output "lint catches a quoted working-tree invocation" "working-tree path" "$out" present
   fi
 
   # And on a job that calls the staged guard without staging it.
