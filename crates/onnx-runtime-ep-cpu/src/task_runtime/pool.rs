@@ -1316,52 +1316,85 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore = "spin-vs-window ratio is wall-clock, not emulated")]
     fn the_yield_phase_rate_limits_its_yields_against_the_wall_clock() {
-        /// Absolute. See above: deliberately not `MAX_SPIN / YIELD_MIN_INTERVAL`.
+        /// Absolute, for one `MAX_SPIN` window. See above: deliberately not
+        /// `MAX_SPIN / YIELD_MIN_INTERVAL`.
         const CEILING: u64 = 64;
+        /// Widest window the escalation will try, in `MAX_SPIN` units.
+        const MAX_SCALE: u32 = 32;
 
+        // The window is escalated rather than fixed, because `MAX_SPIN` buys a
+        // fixed amount of *time* and the pure-spin phase costs a fixed number
+        // of *iterations*: on a host where an instrumented `spin_loop` costs
+        // more than MAX_SPIN / SPIN_LOOP_BUDGET (~122ns), the window expires
+        // before the yield phase is ever entered and there is no rate to bound.
+        // Observed on `Rust coverage (Windows x86_64)`, where the run is both
+        // llvm-cov-instrumented and sharing four vCPUs with the rest of the
+        // suite. Widening keeps the assertion rather than trading it for a
+        // skip: the rate limit is a rate, so it is just as falsifiable in a
+        // 16ms window as in a 500us one, and the ceiling scales with it.
         let pool = TaskPool::new(1);
-        let last_epoch = pool.shared.epoch.0.load(Ordering::Acquire);
-        SLOW_YIELD_US.with(|c| c.set(0));
-        SPIN_COUNT.with(|c| c.set(0));
-        YIELD_COUNT.with(|c| c.set(0));
+        let mut scale = 1u32;
+        loop {
+            let window = MAX_SPIN * scale;
+            let last_epoch = pool.shared.epoch.0.load(Ordering::Acquire);
+            SLOW_YIELD_US.with(|c| c.set(0));
+            SPIN_COUNT.with(|c| c.set(0));
+            YIELD_COUNT.with(|c| c.set(0));
 
-        let outcome = pool.shared.spin_for_dispatch(last_epoch, MAX_SPIN);
-        let spins = SPIN_COUNT.with(std::cell::Cell::get);
-        let yields = YIELD_COUNT.with(std::cell::Cell::get);
-        YIELD_COUNT.with(|c| c.set(0));
+            let outcome = pool.shared.spin_for_dispatch(last_epoch, window);
+            let spins = SPIN_COUNT.with(std::cell::Cell::get);
+            let yields = YIELD_COUNT.with(std::cell::Cell::get);
+            YIELD_COUNT.with(|c| c.set(0));
 
-        assert_eq!(
-            outcome,
-            SpinOutcome::Expired,
-            "no dispatch was published, so the window must have expired"
-        );
-        // Non-vacuity: on a host slow enough that the window expires inside the
-        // pure-spin phase, or on the yield phase's very first pass before its
-        // yield gate is reached, no yield happens at all and a ceiling is
-        // satisfied by a phase that never ran. `spins` separates those from a
-        // real run exactly: one more than the budget means the first pass got
-        // past the deadline and yielded.
-        assert!(
-            spins > u64::from(SPIN_LOOP_BUDGET),
-            "inconclusive: the {MAX_SPIN:?} window ended after {spins} spins against \
-             a {SPIN_LOOP_BUDGET}-iteration budget, so the yield phase either was \
-             never entered or expired on its first pass, and this test bounded a \
-             rate nothing produced -- it is not a pass"
-        );
-        assert!(
-            yields >= 1,
-            "the yield phase ran past its first pass ({spins} spins) but never \
-             yielded: the rate limit must delay yields, never eliminate them, or a \
-             worker spinning on an oversubscribed core stops offering it to the \
-             sibling holding the work"
-        );
-        assert!(
-            yields <= CEILING,
-            "a {MAX_SPIN:?} window performed {yields} yields, above the {CEILING} \
-             ceiling. At the ~1.05us of kernel time #2075 measured per yield, an \
-             unlimited phase spends its window in `sched_yield`; the limit is not \
-             holding"
-        );
+            assert_eq!(
+                outcome,
+                SpinOutcome::Expired,
+                "no dispatch was published, so the window must have expired"
+            );
+
+            // Non-vacuity: on a host slow enough that the window expires inside
+            // the pure-spin phase, or on the yield phase's very first pass
+            // before its yield gate is reached, no yield happens at all and a
+            // ceiling is satisfied by a phase that never ran. `spins` separates
+            // those from a real run exactly: one more than the budget means the
+            // first pass got past the deadline and yielded. That is a reason to
+            // give the host a wider window, not to accept the pass.
+            if spins <= u64::from(SPIN_LOOP_BUDGET) {
+                assert!(
+                    scale < MAX_SCALE,
+                    "inconclusive at every window up to {MAX_SCALE}x {MAX_SPIN:?}: the \
+                     last attempt ended after {spins} spins against a \
+                     {SPIN_LOOP_BUDGET}-iteration budget, so the yield phase was never \
+                     entered and this test bounded a rate nothing produced -- it is not \
+                     a pass. A host this slow cannot run the phase at all; suspect the \
+                     spin loop, not the schedule"
+                );
+                scale *= 2;
+                continue;
+            }
+
+            assert!(
+                yields >= 1,
+                "the yield phase ran past its first pass ({spins} spins) but never \
+                 yielded: the rate limit must delay yields, never eliminate them, or a \
+                 worker spinning on an oversubscribed core stops offering it to the \
+                 sibling holding the work"
+            );
+            // Linear in the window, because that is what a rate limit means: the
+            // phase yields at most once per `YIELD_MIN_INTERVAL`, so twice the
+            // window buys at most twice the yields. The anchor stays the
+            // hand-picked 64 for one `MAX_SPIN`, never a quantity derived from
+            // the interval it is meant to police.
+            let ceiling = CEILING * u64::from(scale);
+            assert!(
+                yields <= ceiling,
+                "a {window:?} window ({scale}x {MAX_SPIN:?}) performed {yields} yields, \
+                 above the {ceiling} ceiling. At the ~1.05us of kernel time #2075 \
+                 measured per yield, an unlimited phase spends its window in \
+                 `sched_yield`; the limit is not holding"
+            );
+            break;
+        }
     }
 
     /// The spin window's deadline must be re-read on every yield.
