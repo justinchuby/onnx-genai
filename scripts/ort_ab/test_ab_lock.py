@@ -208,9 +208,12 @@ class Occupancy(unittest.TestCase):
 
     def test_the_definition_matches_the_one_hostlock_sh_uses(self):
         # `runnable_now()` is `cut -d' ' -f4 /proc/loadavg | cut -d/ -f1`.
-        # If these disagree, `runnable_at_start` (from the script) and
-        # `runnable_max` (from here) are two different measurements sharing a
-        # name -- worse than not reporting it.
+        # This pins that the two read the same FIELD. It does not, and cannot,
+        # make them the same measurement: the shell reads ~1 higher because
+        # its own pipeline is runnable while it samples (see `read_runnable`).
+        # Parse-parity is worth holding on its own -- a drift to field 3 would
+        # publish a load average as a task count -- but nothing here licenses
+        # comparing `runnable_at_start` against the window's columns.
         with tempfile.TemporaryDirectory() as d:
             p = Path(d) / "loadavg"
             p.write_text("4.41 4.06 4.19 7/1223 97531\n")
@@ -402,6 +405,11 @@ class EndToEnd(unittest.TestCase):
         )
 
     def test_the_wrapped_invocation_is_admitted_and_stamps_every_row(self):
+        # Two thread counts, so the matrix emits more than one row: the window
+        # assertions below are about what is shared ACROSS rows, and a
+        # single-row matrix would pass them without testing anything.
+        args = self.ab_args()
+        args[args.index("--threads") + 1 : args.index("--threads") + 2] = ["1", "2"]
         out = subprocess.run(
             [
                 "bash",
@@ -412,7 +420,7 @@ class EndToEnd(unittest.TestCase):
                 "--reason",
                 "ab-admission-selftest",
                 "--",
-                *self.ab_args(),
+                *args,
             ],
             capture_output=True,
             text=True,
@@ -437,17 +445,17 @@ class EndToEnd(unittest.TestCase):
             self.assertTrue(row["runnable_max"].isdigit(), row)
             self.assertTrue(row["runnable_at_end"].isdigit(), row)
             self.assertTrue(row["runnable_window_start"].isdigit(), row)
-            # Like against like. Comparing the peak to `runnable_at_start`
-            # would cross instruments -- the script reads ~1 high because its
-            # own pipeline is runnable while it samples -- and would fail on a
-            # QUIET host, in the reassuring direction, roughly half the time.
-            self.assertGreaterEqual(
-                int(row["runnable_max"]), int(row["runnable_window_start"]), row
+            # The window is seeded ONCE, before the matrix, then sampled once
+            # per cell -- so the count is exactly `cells + 1`, and the start
+            # is one reading stamped identically onto every row. Asserting the
+            # identity rather than `>= 2` is what makes this bite: dropping
+            # the per-cell sample gives 1, and re-seeding inside the loop
+            # gives 2, which a `>= 2` bound would wave through while the
+            # window silently narrowed to a single cell.
+            self.assertEqual(int(row["runnable_samples"]), len(rows) + 1, row)
+            self.assertEqual(
+                row["runnable_window_start"], rows[0]["runnable_window_start"], row
             )
-            # Seeded at admission plus one per cell, so a matrix that emitted
-            # rows cannot have sampled fewer than twice. A `1` here means the
-            # per-cell sample was dropped and the window is a point again.
-            self.assertGreaterEqual(int(row["runnable_samples"]), 2, row)
 
     def test_an_arm_with_env_overrides_still_runs(self):
         """The gate refactor deleted `import os`, and only this path uses it.
