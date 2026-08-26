@@ -334,34 +334,61 @@ enumerates matches without running them, so the precheck is separable from the
 result:
 
 ```sh
-n=$(cargo test -q --lib "$FILTER" -- --exact --list 2>/dev/null | grep -c ': test$')
+# -p scopes the count to one test binary: without it a workspace-root run
+# enumerates every member's lib target and a correct filter reports n = 2.
+list=$(cargo test -q -p "$PKG" --lib "$FILTER" -- --exact --list 2>&1) || {
+  # The header is echoed separately: piping it through the same `tail` that
+  # truncates the compiler output silently ate it whenever the error ran long.
+  echo "BUILD-FAILED: could not enumerate tests for '$FILTER'"
+  printf '%s\n' "$list" | tail -5
+  exit 3
+}
+n=$(printf '%s\n' "$list" | grep -c ': test$')
 [ "$n" -eq 1 ] || { echo "FILTER-DRIFT: '$FILTER' selected $n, expected 1"; exit 2; }
 ```
 
+Both guards in that snippet were added after measurement. An earlier form sent
+stderr to `/dev/null` and read only the count, which gave the **right verdict for
+the wrong reason** when the crate did not build: `cargo … --list` exits 101,
+prints nothing on stdout, `grep -c` returns 0, and the guard reported
+`FILTER-DRIFT: 'root_level_probe' selected 0, expected 1` — naming the filter as
+the cause of a syntax error four files away. Checking cargo's status first
+separates *the tree does not build* from *the name does not resolve*; they are
+different bugs with different fixes, and only one of them is about your filter.
+
 Asserting `1 passed` in the run output is the same idea and is what
 `agrees_with_hostlock_sh.rs` does, but on its own it is a substring match on a
-*result*, and it fails in the direction this whole section is about. Measured:
+*result*. Measured — note both arms use **substring** filters, with no `--exact`:
 
 ```
 filter selects 11 passing tests -> "11 passed; 0 failed"   contains "1 passed" -> accepted
 filter selects 2, one failing   -> "1 passed; 1 failed"    contains "1 passed" -> accepted
 ```
 
-Both are false greens: the first accepts a filter that resolved to eleven tests
-instead of one, the second accepts a run containing a genuine failure. It is
-sound in `agrees_with_hostlock_sh.rs` only because that child selects exactly one
-test by construction — `window_probe_child` is a `#[test]` at the integration
-crate's root.
+Both are false greens against a substring filter. Against `--exact` they are
+**unreachable**, and that is worth stating precisely, because it inverts which
+half of the composed check is load-bearing. A test binary's full test paths are
+unique and `--exact` demands equality, so **one `--exact` filter selects at most
+one test per binary** — `11 passed` cannot occur. `agrees_with_hostlock_sh.rs` is
+therefore sound structurally, not merely by construction of `window_probe_child`:
+no rename or re-nesting of that test can make its check over-count.
 
-So the two checks **compose**, and neither is sufficient alone: the listing pins
-the selection to exactly one, which is what makes the substring reading of the
-run output trustworthy afterwards. Pin the count first, then read the result.
+What survives is narrower, and it belongs to the count rather than the string.
+Measured per binary under `--exact`:
 
-One residual gap in the count, also measured: `--list` prints an `#[ignore]`d
-test with the same `: test` suffix, so a test that gets ignored still resolves to
-`n = 1` while the run executes nothing (`0 passed; 0 failed; 1 ignored`). The
-listing proves the *name* resolves, never that the arm *ran* — which is why the
-run-output half is not optional.
+| situation | `--list` count | `1 passed` / `1 failed` in run output |
+| --- | --- | --- |
+| name resolves and the test runs | `n = 1`, accepts | accepts |
+| bare-name drift, nothing selected | `n = 0`, refuses | refuses |
+| the test gained `#[ignore]` | **`n = 1`, accepts** | refuses |
+
+The last row is the one to keep in mind: `--list` prints an `#[ignore]`d test
+with the same `: test` suffix, so the count accepts a run that executed nothing
+(`0 passed; 0 failed; 1 ignored`) and the result string refuses it. **The listing
+proves the name resolves, never that the arm ran.** So compose the two for their
+diagnostics — the count distinguishes *the name is gone* from *the test failed*,
+which one exit code cannot — but do not describe the count as the half that makes
+the string trustworthy. Under `--exact` it is the half with the false green.
 
 **All of the above is about cardinality, and cardinality is the weaker half.** A
 count answers *how many tests ran*; it never answers *whether they were the ones
