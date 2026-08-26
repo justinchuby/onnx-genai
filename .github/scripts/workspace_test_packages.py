@@ -85,6 +85,8 @@ def package_args(packages: list[str]) -> str:
     # One argument per line makes command substitution work in both bash and
     # PowerShell. A single space-separated line becomes one native argument in
     # PowerShell, so `cargo` sees an invalid package name containing spaces.
+    # Callers must receive LF-only separators; see the newline handling in
+    # `main`, which bash depends on and PowerShell hides.
     return "\n".join(arg for package in packages for arg in ("-p", package))
 
 
@@ -125,6 +127,78 @@ _CARGO_AGAIN = re.compile(r"(?:^|[\s;&|])cargo\s+(?:\+\S+\s+)?(?!clippy\b)\S+")
 _GENERATOR = re.compile(
     r"\$\(\s*python3?\s+\.github/scripts/workspace_test_packages\.py\s+cargo-args\s+([a-z-]+)\s*\)"
 )
+# The same call, bound to a shell variable. The guarded form these workflows use
+# moves the lane name off the `cargo clippy` line, so the block below has to
+# read backwards to find it.
+_GENERATOR_ASSIGN = re.compile(
+    r"^([A-Za-z_][A-Za-z0-9_]*)=\"?\$\(\s*python3?\s+"
+    r"\.github/scripts/workspace_test_packages\.py\s+cargo-args\s+[a-z-]+\s*\)"
+)
+# Any assignment to a shell name. Needed so a later non-generator assignment
+# shadows an earlier generator one, which is the property `packages_tested_by`
+# already documents; recording only generator assignments would let
+# `packages="$(... lint)"` followed by `packages="-p one-crate"` keep crediting
+# the whole lint lane.
+_ANY_ASSIGN = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=")
+# A YAML key or list item, at the indentation that ends a step. The forward
+# scan in `clippy_blocks` already refuses to cross one of these; the backwards
+# walk has to refuse the same boundary or it reads into the step above.
+_STEP_BOUNDARY = re.compile(r"\s*(-\s+\w+:|\w[\w-]*:)")
+
+
+def _generator_vars_before(lines: list[str], index: int, base: int) -> dict[str, str]:
+    """Generator assignments earlier in the same `run:` block, nearest first.
+
+    A step that wants to refuse an empty expansion has to bind the generator to
+    a variable first, because `cargo clippy $(...)` runs happily on nothing:
+    the substitution fails, the outer command still exits 0, and the step lints
+    the default members instead of the lane. Binding it moves the lane name off
+    the invocation line and out of the text `clippy_blocks` returns.
+
+    The read is deliberately narrow in both directions. It stops at a blank
+    line, at a line indented less than the invocation, and at a YAML key or
+    list item at or below that indentation -- the same boundary the forward
+    scan refuses to cross, because a `- run:` step carrying no `name:` sits at
+    the invocation's own indentation and `indent < base` alone would walk
+    straight through it into the step above. `clippy_blocks` then appends what
+    it finds only when the invocation actually references the variable.
+    Crediting every assignment in scope would be a join rather than a dataflow
+    read, and this scanner's whole documented risk is over-reading.
+    """
+    assigned: dict[str, str] = {}
+    shadowed: set[str] = set()
+    # If the invocation line is itself the list item or carries the `run:` key,
+    # its block starts there and has no earlier lines. Walking anyway would
+    # cross into the step above, whose body is indented *deeper* than a `- run:`
+    # line -- so the indent and boundary tests below never fire and the whole
+    # previous step is read as if it were this one's.
+    opening = lines[index].lstrip()
+    if opening.startswith("- ") or re.match(r"(-\s+)?[\w-]+:", opening):
+        return assigned
+    for position in range(index - 1, -1, -1):
+        line = lines[position]
+        if not line.strip():
+            break
+        stripped = line.lstrip()
+        indent = len(line) - len(stripped)
+        if indent < base:
+            break
+        if indent <= base and _STEP_BOUNDARY.match(stripped):
+            break
+        assignment = _ANY_ASSIGN.match(stripped)
+        if not assignment:
+            continue
+        # Walking backwards, the first assignment seen is the last one that
+        # ran, so a plain assignment here shadows a generator assignment above
+        # it and the lane must not be credited.
+        name = assignment.group(1)
+        if name in assigned or name in shadowed:
+            continue
+        if _GENERATOR_ASSIGN.match(stripped):
+            assigned[name] = line
+        else:
+            shadowed.add(name)
+    return assigned
 
 
 def clippy_blocks(lines: list[str]) -> list[str]:
@@ -177,6 +251,13 @@ def clippy_blocks(lines: list[str]) -> list[str]:
         after = _CARGO_AGAIN.search(text, match.end())
         if after:
             text = text[: after.start()]
+        # Recover a package list the invocation reads from a variable, but only
+        # the ones it actually names. The trailing boundary matters: without it
+        # `$packages` matches inside `$packages_extra` and credits a lane the
+        # invocation never used. See `_generator_vars_before`.
+        for variable, source in _generator_vars_before(lines, index, base).items():
+            if re.search(r"\$\{?" + re.escape(variable) + r"\}?(?![A-Za-z0-9_])", text):
+                text = f"{text}\n{source}"
         found.append(text)
     return found
 
@@ -293,6 +374,10 @@ def verify(simulate_missing: str | None = None, simulate_unlinted: str | None = 
 _RUNS_TESTS = re.compile(r"cargo\s+(?:\+\S+\s+)?(?:test|llvm-cov)\b")
 _LANE_CALL = re.compile(r"workspace_test_packages\.py\s+cargo-args\s+([a-z-]+)")
 _PACKAGE_FLAG = re.compile(r"(?:^|\s)(?:-p|--package)[\s=]+([A-Za-z0-9_-]+)")
+_VAR_ASSIGN = re.compile(
+    r"(?:^|\s)(?P<var>[A-Za-z_][A-Za-z0-9_]*)=(?P<value>\"[^\"]*\"|'[^']*'|\S*)"
+)
+_VAR_REF = re.compile(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?")
 
 
 # `ubuntu-latest` does not ship PyYAML in the interpreter `python` resolves to,
@@ -677,14 +762,30 @@ def packages_tested_by(commands: Iterable[str]) -> set[str]:
     an under-read merely fails loudly. If a package's only required-lane
     execution is ever written this way, this gate will refuse it rather than
     credit it, and the fix is to put the invocation on one line.
+    Bounded exception, added when the guarded two-line form landed: a lane
+    resolved into a shell variable is credited to a later `cargo test` in the
+    same block *only if that command references the variable*. The reference is
+    what does the crediting, so this stays a dataflow read rather than a join --
+    an assignment the cargo invocation never uses is still worth nothing, and
+    the self-test arms below fail if it is ever worth something. Reassignment
+    replaces a variable's lanes rather than adding to them, so shadowing the
+    name with a non-lane value drops the credit instead of keeping it.
     """
     tested: set[str] = set()
     for command in commands:
+        lanes_by_var: dict[str, set[str]] = {}
         for fragment in re.split(r"&&|\|\||;|\n", command):
+            for assignment in _VAR_ASSIGN.finditer(fragment):
+                lanes_by_var[assignment.group("var")] = set(
+                    _LANE_CALL.findall(assignment.group("value"))
+                )
             if not _RUNS_TESTS.search(fragment):
                 continue
             for lane in _LANE_CALL.findall(fragment):
                 tested.update(lane_packages(lane))
+            for name in _VAR_REF.findall(fragment):
+                for lane in lanes_by_var.get(name, ()):
+                    tested.update(lane_packages(lane))
             tested.update(_PACKAGE_FLAG.findall(fragment))
     return tested
 
@@ -1212,6 +1313,115 @@ def _job_condition_arms() -> int:
             print(f"  ok    {label} -> exit {code}{named}")
     return failures
 
+def _probe_guarded_assignment(used: bool = True) -> int:
+    """Attribution probe for the guarded two-line form.
+
+    `used=True` is the form the workflow ships. `used=False` is the mutation
+    that matters: the same assignment, with a `cargo test` that never mentions
+    the variable. If that arm ever credits the lane, the dataflow read has
+    become a join and the gate has moved in the permissive direction.
+    """
+    resolver = "python .github/scripts/workspace_test_packages.py cargo-args ort-backed"
+    invocation = (
+        "cargo test --locked $packages -- --test-threads=1"
+        if used
+        else "cargo test --locked -p onnx-genai-cli"
+    )
+    block = "\n".join(
+        [
+            f'packages="$({resolver})"',
+            'test -n "$packages" || { echo "::error::empty"; exit 1; }',
+            invocation,
+        ]
+    )
+    tested = packages_tested_by([block])
+    want = set(ORT_BACKED) if used else {"onnx-genai-cli"}
+    if tested != want:
+        print(
+            "attribution mismatch: "
+            f"unexpected={sorted(tested - want)} absent={sorted(want - tested)}",
+            file=sys.stderr,
+        )
+        return 1
+    print("attribution as stated: " + ", ".join(sorted(tested)))
+    return 0
+
+
+def _probe_clippy_generator_var(shape: str = "referenced") -> int:
+    """Attribution probe for a clippy step whose package list is in a variable.
+
+    `referenced` is the form the workflow ships. Every other shape is a way the
+    backwards read could become a join, and each one fails quietly if it
+    regresses: an over-credited package looks linted and nothing says
+    otherwise, so `verify` stays green while the coverage claim is false.
+
+    * `unreferenced` -- the assignment is in the step and the invocation never
+      mentions it.
+    * `prefix` -- the invocation names `$packages_extra`, which contains the
+      assigned name as a prefix.
+    * `shadowed` -- a plain assignment replaces the generator before the
+      invocation runs, which is the property `packages_tested_by` documents.
+    * `neighbour` -- the assignment belongs to the *previous* step, and the
+      clippy step carries no `name:` so it sits at the invocation's own
+      indentation.
+    """
+    lane = "python .github/scripts/workspace_test_packages.py cargo-args linux-only"
+    step = [
+        "      - name: Clippy offline crates",
+        "        shell: bash",
+        "        run: |",
+        f'          packages="$({lane})"',
+        '          test -n "$packages" || { echo "::error::empty"; exit 1; }',
+    ]
+    if shape == "referenced":
+        lines = step + ["          cargo clippy --locked --all-targets $packages -- -D warnings"]
+        want = set(lane_packages("linux-only"))
+    elif shape == "unreferenced":
+        lines = step + [
+            "          cargo clippy --locked --all-targets -p onnx-genai-cli -- -D warnings"
+        ]
+        want = {"onnx-genai-cli"}
+    elif shape == "prefix":
+        lines = step + [
+            '          packages_extra="-p onnx-genai-cli"',
+            "          cargo clippy --locked --all-targets $packages_extra"
+            " -p onnx-genai-cli -- -D warnings",
+        ]
+        want = {"onnx-genai-cli"}
+    elif shape == "shadowed":
+        lines = step + [
+            '          packages="-p onnx-genai-cli"',
+            "          cargo clippy --locked --all-targets $packages"
+            " -p onnx-genai-cli -- -D warnings",
+        ]
+        want = {"onnx-genai-cli"}
+    elif shape == "neighbour":
+        lines = step + [
+            "          cargo test --locked $packages",
+            "      - run: cargo clippy --locked --all-targets $packages -- -D warnings",
+        ]
+        want = set()
+    else:  # pragma: no cover - a typo in an arm must not read as a pass
+        print(f"unknown probe shape {shape!r}", file=sys.stderr)
+        return 1
+
+    credited: set[str] = set()
+    for block in clippy_blocks(lines):
+        for found in _GENERATOR.findall(block):
+            if found in LANES:
+                credited.update(lane_packages(found))
+        credited.update(re.findall(r"-p\s+([A-Za-z0-9_-]+)", block))
+    if credited != want:
+        print(
+            "clippy attribution mismatch: "
+            f"unexpected={sorted(credited - want)} absent={sorted(want - credited)}",
+            file=sys.stderr,
+        )
+        return 1
+    print("clippy attribution as stated: " + (", ".join(sorted(credited)) or "credited nothing"))
+    return 0
+
+
 def self_test() -> int:
     """Prove both gates still refuse, on content and not merely on exit code.
 
@@ -1244,6 +1454,55 @@ def self_test() -> int:
             {"simulate_dropped_lane": "ort-backed"},
             1,
             sorted(ORT_BACKED),
+        ),
+        (
+            "packages_tested_by credits a lane the cargo call uses",
+            _probe_guarded_assignment,
+            {"used": True},
+            0,
+            sorted(ORT_BACKED),
+        ),
+        (
+            "packages_tested_by refuses a lane the cargo call never uses",
+            _probe_guarded_assignment,
+            {"used": False},
+            0,
+            ["onnx-genai-cli"],
+        ),
+        (
+            "linted_packages credits a lane the clippy call reads from a variable",
+            _probe_clippy_generator_var,
+            {"shape": "referenced"},
+            0,
+            sorted(lane_packages("linux-only")),
+        ),
+        (
+            "linted_packages refuses a lane the clippy call never references",
+            _probe_clippy_generator_var,
+            {"shape": "unreferenced"},
+            0,
+            ["onnx-genai-cli"],
+        ),
+        (
+            "linted_packages refuses a variable whose name is only a prefix",
+            _probe_clippy_generator_var,
+            {"shape": "prefix"},
+            0,
+            ["onnx-genai-cli"],
+        ),
+        (
+            "linted_packages refuses a generator a plain assignment shadowed",
+            _probe_clippy_generator_var,
+            {"shape": "shadowed"},
+            0,
+            ["onnx-genai-cli"],
+        ),
+        (
+            "linted_packages refuses a variable assigned by the previous step",
+            _probe_clippy_generator_var,
+            {"shape": "neighbour"},
+            0,
+            ["credited nothing"],
         ),
     ]
     failures = 0
@@ -1317,6 +1576,13 @@ def main() -> int:
         return self_test()
     if args.command == "verify-required-tier":
         return verify_required_tier(args.simulate_dropped_lane)
+    # Windows Python writes stdout in text mode and translates "\n" into
+    # "\r\n". bash splits command substitution on IFS, which contains newline
+    # but not carriage return, so each token would keep a trailing "\r" and
+    # cargo would reject the package name. PowerShell strips CRLF when it
+    # splits native output into an array, which is why this stayed invisible
+    # while the Windows lanes ran pwsh.
+    sys.stdout.reconfigure(newline="\n")
     print(package_args(lane_packages(args.lane)))
     return 0
 

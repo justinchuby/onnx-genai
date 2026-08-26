@@ -321,15 +321,36 @@ jobs:
         run: >-
           cargo build --locked
           -p onnx-genai-bench --features bench-native --bin profile_native
+      # The package set is resolved into a variable before use, never
+      # substituted inline. As `cargo test $(resolver ...)` a resolver failure
+      # expands to nothing and leaves a bare `cargo test`, which exits 0 having
+      # tested cargo's `default-members` instead of this lane's set -- for this
+      # lane that silently drops 14 crates (the whole plugin/ABI surface) and
+      # pulls in `onnx-genai-ort-sys`, which the DENYLIST exists to keep out.
+      # The assignment makes a non-zero resolver exit fail the step under
+      # `set -e`; the `test -n` covers a resolver that succeeds but prints
+      # nothing. `verify` cannot catch this: it never reads this file, so a
+      # lane name here that the resolver does not know stays invisible to it.
+      # `shell: bash` is required, not cosmetic: these steps also run on the
+      # Windows lanes, where the default shell is pwsh, and `set -e` plus
+      # `test -n` are bash semantics. The inline form happened to work under
+      # both shells only because the resolver prints one token per line, which
+      # pwsh splats as an argument array -- an accident, not a contract. The
+      # resolver forces LF separators for the same reason: pwsh strips CRLF
+      # when it splits native output, bash does not, and a trailing "\r" on
+      # each token reaches cargo as part of the package name.
       - name: Test Linux offline crates
-        run: >-
-          cargo test --locked
-          $(python .github/scripts/workspace_test_packages.py cargo-args offline-linux)
+        shell: bash
+        run: |
+          packages="$(python .github/scripts/workspace_test_packages.py cargo-args offline-linux)"
+          test -n "$packages" || { echo "::error::lane 'offline-linux' resolved to an empty package set"; exit 1; }
+          cargo test --locked $packages
       - name: Clippy Linux offline crates
-        run: >-
-          cargo clippy --locked --all-targets
-          $(python .github/scripts/workspace_test_packages.py cargo-args lint)
-          -- -D warnings
+        shell: bash
+        run: |
+          packages="$(python .github/scripts/workspace_test_packages.py cargo-args lint)"
+          test -n "$packages" || { echo "::error::lane 'lint' resolved to an empty package set"; exit 1; }
+          cargo clippy --locked --all-targets $packages -- -D warnings
 
   rust-quality:
     name: Rust quality
@@ -491,10 +512,11 @@ jobs:
       # mlas-sys is also checked by the Windows ARM64 job so MSVC/native
       # build-script regressions do not hide behind the Linux quality lane.
       - name: Run clippy on all offline crates
-        run: >-
-          cargo clippy --locked --all-targets
-          $(python .github/scripts/workspace_test_packages.py cargo-args lint)
-          -- -D warnings
+        shell: bash
+        run: |
+          packages="$(python .github/scripts/workspace_test_packages.py cargo-args lint)"
+          test -n "$packages" || { echo "::error::lane 'lint' resolved to an empty package set"; exit 1; }
+          cargo clippy --locked --all-targets $packages -- -D warnings
 
       # Wrapped in `run_test_step` because the selector is a bare test NAME,
       # which libtest does not police: an exact-name filter that matches nothing
@@ -675,10 +697,11 @@ jobs:
       - name: Test ORT-backed workspace crates
         env:
           NXRT_REQUIRE_ORT_TESTS: "1"
-        run: >-
-          cargo test --locked
-          $(python .github/scripts/workspace_test_packages.py cargo-args ort-backed)
-          -- --test-threads=1
+        shell: bash
+        run: |
+          packages="$(python .github/scripts/workspace_test_packages.py cargo-args ort-backed)"
+          test -n "$packages" || { echo "::error::lane 'ort-backed' resolved to an empty package set"; exit 1; }
+          cargo test --locked $packages -- --test-threads=1
 
       # No shipped artifact links MLAS: the wheel builds it only when someone
       # opts in with NXRT_EP_CPU_RESEARCH_MLAS=1 on one of the platforms in
@@ -793,9 +816,11 @@ jobs:
         run: cargo build --locked -p onnx-runtime-ep-cpu-plugin --features mlas
 
       - name: Test cross-platform offline crates with coverage
-        run: >-
-          cargo llvm-cov --locked --codecov --output-path codecov-offline.json
-          $(python .github/scripts/workspace_test_packages.py cargo-args offline-cross-platform)
+        shell: bash
+        run: |
+          packages="$(python .github/scripts/workspace_test_packages.py cargo-args offline-cross-platform)"
+          test -n "$packages" || { echo "::error::lane 'offline-cross-platform' resolved to an empty package set"; exit 1; }
+          cargo llvm-cov --locked --codecov --output-path codecov-offline.json $packages
       - name: Upload offline coverage to Codecov
         if: always()
         uses: codecov/codecov-action@v4
@@ -808,9 +833,11 @@ jobs:
       # validates that the native build script stays MSVC-compatible.
       - name: Test Linux-only offline crates with coverage
         if: runner.os == 'Linux'
-        run: >-
-          cargo llvm-cov --locked --codecov --output-path codecov-mlas.json
-          $(python .github/scripts/workspace_test_packages.py cargo-args linux-only)
+        shell: bash
+        run: |
+          packages="$(python .github/scripts/workspace_test_packages.py cargo-args linux-only)"
+          test -n "$packages" || { echo "::error::lane 'linux-only' resolved to an empty package set"; exit 1; }
+          cargo llvm-cov --locked --codecov --output-path codecov-mlas.json $packages
       - name: Upload MLAS coverage to Codecov
         if: always() && runner.os == 'Linux'
         uses: codecov/codecov-action@v4
@@ -887,15 +914,17 @@ jobs:
       # offline crates is already reported by x64/macOS lanes, and ARM64
       # instrumentation owned the critical path.
       - name: Test cross-platform offline crates
-        run: >-
-          cargo test --locked
-          $(python .github/scripts/workspace_test_packages.py cargo-args offline-cross-platform)
+        shell: bash
+        run: |
+          packages="$(python .github/scripts/workspace_test_packages.py cargo-args offline-cross-platform)"
+          test -n "$packages" || { echo "::error::lane 'offline-cross-platform' resolved to an empty package set"; exit 1; }
+          cargo test --locked $packages
       - name: Clippy Windows ARM64 offline crates
-        run: >-
-          cargo clippy --locked --all-targets
-          --target aarch64-pc-windows-msvc
-          $(python .github/scripts/workspace_test_packages.py cargo-args offline-linux)
-          -- -D warnings
+        shell: bash
+        run: |
+          packages="$(python .github/scripts/workspace_test_packages.py cargo-args offline-linux)"
+          test -n "$packages" || { echo "::error::lane 'offline-linux' resolved to an empty package set"; exit 1; }
+          cargo clippy --locked --all-targets --target aarch64-pc-windows-msvc $packages -- -D warnings
 
   ep-conformance:
     name: EP conformance (Linux x86_64)
@@ -1094,10 +1123,11 @@ jobs:
       # remains the only place these tests run on Windows and stays here.
       - name: Test ORT-backed workspace crates
         if: runner.os == 'Windows'
-        run: >-
-          cargo test --locked
-          $(python .github/scripts/workspace_test_packages.py cargo-args ort-backed)
-          -- --test-threads=1
+        shell: bash
+        run: |
+          packages="$(python .github/scripts/workspace_test_packages.py cargo-args ort-backed)"
+          test -n "$packages" || { echo "::error::lane 'ort-backed' resolved to an empty package set"; exit 1; }
+          cargo test --locked $packages -- --test-threads=1
       - name: Execute checked-in Mobius workflow packages
         env:
           MOBIUS_WORKFLOW_CONFORMANCE_DIR: ${{ github.workspace }}/tests/fixtures/onnx_genai_workflows
@@ -1238,7 +1268,22 @@ jobs:
           -p onnx-runtime-python
           --features onnx-runtime-python/cuda
 
+      # Every step from here down is guarded with `!cancelled()` rather than the
+      # implicit `success()`, because none of them depends on the step above for
+      # anything but a warm build cache -- and each is, per its own comment, the
+      # *only* place its gate runs. Under the implicit `success()` a compile
+      # error in one crate silently switches all seven off: `2d380b722` broke
+      # `onnx-runtime-python` (#2158), which is checked in the step above, and
+      # steps 7-13 of this job reported `skipped` for the next 26 hours. The lane
+      # is named "CUDA compile", so its red tick reads as one compile failure and
+      # gives no hint that seven checks stopped being performed -- there is no
+      # signal to miss. A check ordered behind a failing step is not a weak
+      # check, it is an absent one. Same reasoning as `cli-ort` above.
+      #
+      # The job still fails if any of them fails; this only stops one step's
+      # failure from silencing gates that have nothing to do with it.
       - name: Verify CUDA test inventory and skip honesty
+        if: ${{ !cancelled() }}
         run: python .github/scripts/verify_cuda_test_honesty.py
 
       # The capture-sync source audit is a static check (it reads kernel sources,
@@ -1246,6 +1291,7 @@ jobs:
       # as a GPU test. Run it explicitly here so a capture-unsafe synchronize()
       # still fails the CPU lane at PR time.
       - name: Audit CUDA kernel capture-sync contract
+        if: ${{ !cancelled() }}
         run: cargo test --locked -p onnx-runtime-ep-cuda --features cuda --test capture_sync_contract
 
       # The int4 MatMulNBits parity oracle self-checks are pure-CPU (no device):
@@ -1254,6 +1300,7 @@ jobs:
       # deliberately does not police this target (it is in ALWAYS_RUN), so run it
       # explicitly here to keep the oracle math exercised on the CPU lane (#1177).
       - name: Verify int4 MatMulNBits numerics oracle
+        if: ${{ !cancelled() }}
         run: cargo test --locked -p onnx-runtime-ep-cuda --features cuda --test matmul_nbits_marlin_oracle
 
       # The safe-point rejection rules are pure predicate logic over
@@ -1263,6 +1310,7 @@ jobs:
       # lane, so without this step the target would be compiled and never run
       # (#1875).
       - name: Verify granule transition safe-point rules
+        if: ${{ !cancelled() }}
         run: cargo test --locked -p onnx-runtime-ep-cuda --features cuda --test content_preserving_transition
 
       # Non-`_gpu` targets in this crate run in no other lane: the honesty
@@ -1271,6 +1319,7 @@ jobs:
       # would compile and never execute, which is the failure they were moved
       # out of `_gpu` targets to avoid.
       - name: Verify expert route telemetry CPU oracle
+        if: ${{ !cancelled() }}
         run: cargo test --locked -p onnx-runtime-ep-cuda --features cuda --test expert_route_telemetry_probe
 
       # `--all-targets` and `gpu-tests` are both load-bearing. Without them
@@ -1287,6 +1336,7 @@ jobs:
       # the gpu-tests binaries at all, so the same change there would be a
       # full extra build for lints this Linux step already covers.
       - name: Clippy CUDA execution provider
+        if: ${{ !cancelled() }}
         run: >-
           cargo clippy -p onnx-runtime-ep-cuda
           --all-targets --features cuda,gpu-tests -- -D warnings
@@ -1302,6 +1352,7 @@ jobs:
       # this caught is invisible to `--lib` alone, because the accessor's only
       # caller lives in a `#[cfg(test)]` module.
       - name: Clippy engine native-CUDA integration
+        if: ${{ !cancelled() }}
         run: >-
           cargo clippy --locked
           -p onnx-genai-engine
@@ -1374,5 +1425,10 @@ jobs:
           -p onnx-runtime-python
           --features onnx-runtime-python/cuda
 
+      # Same isolation as the Linux CUDA lane: this lint has no dependency on
+      # the check above beyond a warm cache, so `onnx-runtime-python` failing to
+      # compile (#2158) must not silently stop `onnx-runtime-ep-cuda` being
+      # linted on Windows as well.
       - name: Clippy CUDA execution provider
+        if: ${{ !cancelled() }}
         run: cargo clippy -p onnx-runtime-ep-cuda --features cuda -- -D warnings
