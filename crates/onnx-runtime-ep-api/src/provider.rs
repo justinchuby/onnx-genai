@@ -2,6 +2,7 @@
 
 use std::ffi::c_void;
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use onnx_runtime_ir::{
     DataType, DeviceId, DeviceType, Graph, GraphView, Node, NodeId, NodeIndex, Shape, TensorLayout,
@@ -16,6 +17,53 @@ use crate::weight::ExecutionProviderCapabilities;
 /// Index of an EP within an [`crate::registry::EpRegistry`].
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct EpId(pub u32);
+
+/// Process-unique identity of one executor instance sharing an execution
+/// provider.
+///
+/// A session may own several executors (base decode, decode-inline, MTP verify)
+/// over the same `Arc<dyn ExecutionProvider>`. Provider-owned artifacts whose
+/// lifetime follows an executor use this identity instead of graph-local
+/// [`NodeId`]s, which collide across sibling executors.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct ExecutorInstanceId(u64);
+
+impl ExecutorInstanceId {
+    /// Reserved identity for direct provider tests and callers that do not own a
+    /// session executor.
+    pub const UNSCOPED: Self = Self(0);
+
+    /// Allocate a process-unique executor identity.
+    pub fn fresh() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let id = NEXT.fetch_add(1, Ordering::Relaxed);
+        assert_ne!(id, u64::MAX, "executor instance id space exhausted");
+        Self(id)
+    }
+
+    /// Stable numeric representation for provider-owned maps and diagnostics.
+    pub fn get(self) -> u64 {
+        self.0
+    }
+
+    /// Reconstitute an identity stored in provider-owned atomic state.
+    #[doc(hidden)]
+    pub const fn from_raw(id: u64) -> Self {
+        Self(id)
+    }
+}
+
+/// Result of the authoritative executor-artifact finalization transition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExecutorArtifactFinalization {
+    /// Every provider artifact required by this executor is finalized. The
+    /// executor must not invoke the transition again.
+    Complete,
+    /// A readiness-dependent producer is not available yet. Nothing terminal
+    /// was latched; the executor may invoke the same transition after a later
+    /// resolved compilation epoch.
+    Pending,
+}
 
 /// Tie-break policy for [`ExecutionProvider::device_argmax`] when two or more
 /// logits share the maximum value.
@@ -856,6 +904,22 @@ pub trait ExecutionProvider: Send + Sync {
     /// opset-13 per-axis vs. the legacy opset-<13 2D-coercion `Softmax`).
     fn get_kernel(&self, op: &Node, shapes: &[Vec<usize>], opset: u64) -> Result<Box<dyn Kernel>>;
 
+    /// Executor-scoped kernel creation.
+    ///
+    /// The default preserves providers that own no executor-scoped artifacts.
+    /// Providers whose factories publish producer handles override this method
+    /// so compilation is attributed to the owning executor rather than to a
+    /// graph-local node id shared by sibling sessions.
+    fn get_kernel_for_executor(
+        &self,
+        _executor: ExecutorInstanceId,
+        op: &Node,
+        shapes: &[Vec<usize>],
+        opset: u64,
+    ) -> Result<Box<dyn Kernel>> {
+        self.get_kernel(op, shapes, opset)
+    }
+
     /// Apply EP-owned structural policy to one prospective capture-region node.
     ///
     /// The executor supplies only graph structure and resolved-shape presence.
@@ -1379,34 +1443,42 @@ pub trait ExecutionProvider: Send + Sync {
     /// diagnostics rather than failing silently.
     fn consume_route_residency_at_boundary(&self) -> Result<()>;
 
-    /// Install a route-residency boundary from the fully-loaded model `graph`,
-    /// after the model's weights/catalog are finalized and **before** decode
-    /// capture (issue #1810 Slice 7E). This is the production model-build seam
-    /// the coarse route-residency consumer
-    /// ([`Self::consume_route_residency_at_boundary`]) was waiting for: it lets
-    /// a participating EP bind its live route-telemetry producer sources to the
-    /// boundary once, so the consumer has a real binding to drive when the
-    /// default-off feature is enabled.
+    /// Executor-scoped form of
+    /// [`Self::consume_route_residency_at_boundary`].
     ///
-    /// The default is a no-op: every stock EP, and the CUDA EP whenever weight
-    /// offload or the coarse-residency profile is disabled (the shipped
-    /// default), installs nothing, retains nothing, and creates no telemetry or
-    /// policy overhead here. A participating EP must remain fail-closed, must
-    /// perform no mapping change (it only *binds* existing authorities, it maps
-    /// nothing), and must surface a typed outcome to its own diagnostics rather
-    /// than failing silently. Called exactly once per model build, on the
-    /// concrete EP (never per token or per request).
-    fn install_route_residency_boundary_after_build(&self, _graph: &Graph) {}
+    /// The default delegates to the historical unscoped hook. A provider that
+    /// can be shared by sibling executors overrides this method so one
+    /// executor's request boundary cannot consume another executor's producer.
+    fn consume_route_residency_at_boundary_for_executor(
+        &self,
+        _executor: ExecutorInstanceId,
+    ) -> Result<()> {
+        self.consume_route_residency_at_boundary()
+    }
 
-    /// Drain any route-residency boundary and EP-owned producer sources this EP
-    /// installed for the current model, at request/model teardown (issue #1810
-    /// Slice 7E). Mirrors [`Self::install_route_residency_boundary_after_build`]
-    /// and is idempotent: the default and every never-installed EP do nothing.
-    /// Called through `&self` from executor teardown (the shared `Arc<dyn
-    /// ExecutionProvider>` cannot take the `&mut self` `shutdown` path), so the
-    /// producer/boundary handles are released deterministically rather than only
-    /// when the last `Arc` drops.
-    fn drain_route_residency_boundary_on_teardown(&self) {}
+    /// Authoritative transition for "all provider artifacts required by this
+    /// executor's resolved compilation are finalized."
+    ///
+    /// Static build and the first fully resolved symbolic compilation invoke
+    /// this same idempotent path after kernel factories have published their
+    /// producer handles and before capture. Structural failures may latch;
+    /// readiness-dependent absence returns
+    /// [`ExecutorArtifactFinalization::Pending`] and must not poison a later
+    /// resolved compilation. The default completes without side effects.
+    fn finalize_executor_artifacts(
+        &self,
+        _executor: ExecutorInstanceId,
+        _graph: &Graph,
+    ) -> ExecutorArtifactFinalization {
+        ExecutorArtifactFinalization::Complete
+    }
+
+    /// Drain exactly the artifacts owned by `executor`.
+    ///
+    /// The default is a no-op. Participating providers must make this
+    /// idempotent and must not clear producer/boundary state owned by sibling
+    /// executors sharing the same provider.
+    fn drain_executor_artifacts(&self, _executor: ExecutorInstanceId) {}
 
     /// Explicit device allocation/free counters, when the EP exposes them.
     fn device_allocation_counts(&self) -> Option<(u64, u64)> {

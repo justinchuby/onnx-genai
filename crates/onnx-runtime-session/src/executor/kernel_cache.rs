@@ -883,6 +883,7 @@ impl KernelCache {
         constant_inputs: &[bool],
         opset: u64,
         capture_seq_independent: bool,
+        executor: ExecutorInstanceId,
         ep: &dyn ExecutionProvider,
     ) -> Result<(&dyn onnx_runtime_ep_api::Kernel, KernelKey)> {
         let key = KernelKey {
@@ -910,7 +911,7 @@ impl KernelCache {
                     reason,
                 ));
             }
-            let mut kernel = match ep.get_kernel(node, input_shapes, opset) {
+            let mut kernel = match ep.get_kernel_for_executor(executor, node, input_shapes, opset) {
                 Ok(kernel) => kernel,
                 Err(EpError::NoEpForOp {
                     domain,

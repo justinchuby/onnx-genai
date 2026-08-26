@@ -83,6 +83,12 @@ impl Executor {
         let decode_memo_eligible = self.decode_memo_eligible(mode, nested);
         let mut resolved =
             self.prepare_resolved_shapes(&bindings, external, mode, nested, decode_memo_eligible);
+        // Static build and symbolic first-run compilation converge on the same
+        // provider-artifact transition. For an ordinary symbolic decoder every
+        // leaf input is resolved here, so all kernels (including QMoE producers)
+        // are compiled and finalized before eager/capture execution begins.
+        let artifacts_ready_before_execution =
+            self.finalize_provider_artifacts_if_ready(&resolved)?;
         let stage2 = self.restore_stage2_plan(&mut resolved, decode_memo_eligible);
         let measure_activation_plan = !nested
             && mode == RunMode::Eager
@@ -104,17 +110,29 @@ impl Executor {
             stage2,
             measure_activation_plan,
         );
+        // A graph with genuinely data-dependent interior extents may not have
+        // been fully compilable before its first eager execution. That run has
+        // now populated the authoritative resolved map; invoke the same
+        // transition once more only when readiness was previously unavailable.
+        // No capture/replay can be installed from that un-warmed first pass.
+        let finalization = if outcome.is_ok() && !artifacts_ready_before_execution {
+            self.finalize_provider_artifacts_if_ready(&resolved)
+                .map(|_| ())
+        } else {
+            Ok(())
+        };
         let validation = if nested {
             Ok(())
         } else {
             self.finish_device_validation()
         };
         let unbound = self.unbind_borrowed_inputs();
-        match (outcome, validation, unbound) {
-            (_, Err(e), _) => Err(e),
-            (Err(e), _, _) => Err(e),
-            (Ok(_), _, Err(e)) => Err(e),
-            (Ok(result), Ok(()), Ok(())) => Ok(result),
+        match (outcome, finalization, validation, unbound) {
+            (_, _, Err(e), _) => Err(e),
+            (Err(e), _, _, _) => Err(e),
+            (Ok(_), Err(e), _, _) => Err(e),
+            (Ok(_), Ok(()), _, Err(e)) => Err(e),
+            (Ok(result), Ok(()), Ok(()), Ok(())) => Ok(result),
         }
     }
 
@@ -137,7 +155,8 @@ impl Executor {
                 // else (issue #1810 Slice 7C). Every EP declares this explicitly;
                 // non-residency EPs return Ok(()) and the CUDA EP is gated off by
                 // default, so this is byte-identical unless a provider opts in.
-                self.ep.consume_route_residency_at_boundary()?;
+                self.ep
+                    .consume_route_residency_at_boundary_for_executor(self.instance_id)?;
                 Ok(())
             }
             (Ok(flags), Ok(())) => Err(EpError::KernelFailed(format!(

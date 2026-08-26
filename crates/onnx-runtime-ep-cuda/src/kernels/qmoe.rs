@@ -14,7 +14,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use cudarc::driver::sys::CUdeviceptr;
 use cudarc::driver::{LaunchConfig, PushKernelArg};
-use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
+use onnx_runtime_ep_api::{
+    EpError, ExecutorInstanceId, Kernel, KernelFactory, Result, TensorMut, TensorView,
+};
 use onnx_runtime_ep_cpu::kernels::moe::{
     Activation, DEFAULT_SWIGLU_LIMIT, validate_moe_activation_attributes,
 };
@@ -1184,69 +1186,115 @@ impl FloatDtype {
     }
 }
 
-/// EP-owned registry of live route-telemetry producer sources, keyed by the
-/// graph `NodeId` of the `QMoE` call site that owns each source (issue #1810
-/// Slice 7E). Populated as the session's `KernelCache` creates the *executing*
-/// [`QMoEKernel`] for a node — including the eager `compile_all` pre-warm that
-/// runs before decode capture — so the route-residency boundary install seam
-/// can bind the real producer instance instead of a controllable test double.
+/// EP-owned route-telemetry producer registry, scoped by executor and graph
+/// node.
 ///
-/// Default-off: registration only clones an `Arc`; nothing here arms telemetry,
-/// allocates device memory, or reads a window until the coarse-residency gate
-/// installs a binding. Drained at request/model teardown via [`Self::clear`].
+/// Every shape specialization of one executor/node shares a stable
+/// [`QMoERouteTelemetry`] source. A later specialization therefore cannot
+/// overwrite a sibling executor's producer or invalidate a boundary's source
+/// identity.
 #[derive(Default)]
 pub struct RouteTelemetrySourceRegistry {
-    sources: Mutex<HashMap<NodeId, Arc<QMoEKernel>>>,
+    compile_scope: Mutex<()>,
+    active_executor: AtomicU64,
+    sources: Mutex<HashMap<ExecutorInstanceId, HashMap<NodeId, Arc<QMoERouteTelemetry>>>>,
 }
 
 impl RouteTelemetrySourceRegistry {
-    /// Register (or replace) the executing producer for `node_id`. The cache and
-    /// this registry then share one `Arc<QMoEKernel>`, so arming/snapshotting
-    /// through the registry observes exactly the routes the cache's dispatch of
-    /// that instance accumulated.
-    pub(crate) fn register(&self, node_id: NodeId, kernel: Arc<QMoEKernel>) {
-        self.sources
+    /// Run one factory lookup under an executor ownership scope.
+    pub(crate) fn with_executor_scope<T>(
+        &self,
+        executor: ExecutorInstanceId,
+        f: impl FnOnce() -> T,
+    ) -> T {
+        let _gate = self
+            .compile_scope
             .lock()
-            .expect("cuda_ep route-telemetry registry poisoned")
-            .insert(node_id, kernel);
+            .expect("cuda_ep route-telemetry compile scope poisoned");
+        self.active_executor
+            .store(executor.get(), Ordering::Release);
+        struct Reset<'a>(&'a AtomicU64);
+        impl Drop for Reset<'_> {
+            fn drop(&mut self) {
+                self.0.store(0, Ordering::Release);
+            }
+        }
+        let _reset = Reset(&self.active_executor);
+        f()
     }
 
-    /// Snapshot of every registered producer as a trait-object source map for
-    /// the route-residency binding builder. Clones `Arc`s only; no device work.
-    pub fn sources(&self) -> HashMap<NodeId, Arc<dyn RouteTelemetrySource>> {
+    fn source_for_current(
+        &self,
+        node_id: NodeId,
+        runtime: Arc<CudaRuntime>,
+    ) -> Arc<QMoERouteTelemetry> {
+        let executor = ExecutorInstanceId::from_raw(self.active_executor.load(Ordering::Acquire));
+        if executor == ExecutorInstanceId::UNSCOPED {
+            return Arc::new(QMoERouteTelemetry::new(runtime));
+        }
+        let mut sources = self
+            .sources
+            .lock()
+            .expect("cuda_ep route-telemetry registry poisoned");
+        Arc::clone(
+            sources
+                .entry(executor)
+                .or_default()
+                .entry(node_id)
+                .or_insert_with(|| Arc::new(QMoERouteTelemetry::new(runtime))),
+        )
+    }
+
+    /// Snapshot one executor's producer sources.
+    pub fn sources(
+        &self,
+        executor: ExecutorInstanceId,
+    ) -> HashMap<NodeId, Arc<dyn RouteTelemetrySource>> {
         self.sources
             .lock()
             .expect("cuda_ep route-telemetry registry poisoned")
-            .iter()
-            .map(|(id, kernel)| (*id, Arc::clone(kernel) as Arc<dyn RouteTelemetrySource>))
+            .get(&executor)
+            .into_iter()
+            .flat_map(HashMap::iter)
+            .map(|(id, source)| (*id, Arc::clone(source) as Arc<dyn RouteTelemetrySource>))
             .collect()
     }
 
-    /// The concrete producer registered for `node_id`, if any. Test/arming
-    /// access: the coarse install seam arms these before the first boundary.
-    pub fn kernel(&self, node_id: NodeId) -> Option<Arc<QMoEKernel>> {
+    /// Stable concrete producer for one executor/node, if compiled.
+    pub fn source(
+        &self,
+        executor: ExecutorInstanceId,
+        node_id: NodeId,
+    ) -> Option<Arc<QMoERouteTelemetry>> {
         self.sources
             .lock()
             .expect("cuda_ep route-telemetry registry poisoned")
-            .get(&node_id)
+            .get(&executor)
+            .and_then(|sources| sources.get(&node_id))
             .map(Arc::clone)
     }
 
-    /// Number of registered producers.
-    pub fn len(&self) -> usize {
+    pub fn len(&self, executor: ExecutorInstanceId) -> usize {
         self.sources
             .lock()
             .expect("cuda_ep route-telemetry registry poisoned")
-            .len()
+            .get(&executor)
+            .map_or(0, HashMap::len)
     }
 
-    /// Whether no producer is registered (the default-off / no-QMoE case).
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
+    pub fn is_empty(&self, executor: ExecutorInstanceId) -> bool {
+        self.len(executor) == 0
     }
 
-    /// Drop every registered producer source (request/model teardown). After
-    /// this the registry is inert again until new kernels are created.
+    /// Drop only one executor's registry ownership. Live cached kernels keep
+    /// the stable source alive until that executor's cache is dropped.
+    pub(crate) fn remove(&self, executor: ExecutorInstanceId) {
+        self.sources
+            .lock()
+            .expect("cuda_ep route-telemetry registry poisoned")
+            .remove(&executor);
+    }
+
     pub(crate) fn clear(&self) {
         self.sources
             .lock()
@@ -1255,18 +1303,7 @@ impl RouteTelemetrySourceRegistry {
     }
 }
 
-/// Trait-object kernel that shares one `Arc<QMoEKernel>` between the session's
-/// `KernelCache` (which executes it) and the EP's
-/// [`RouteTelemetrySourceRegistry`] (which reads its route window at the coarse
-/// boundary) — issue #1810 Slice 7E.
-///
-/// `QMoEKernel`'s route telemetry uses interior mutability and its `Kernel`
-/// impl is `&self`, so the executing instance and the registered producer are
-/// the *same object*: a dispatch through the cache accumulates into the very
-/// record the registry later snapshots. This wrapper forwards exactly the three
-/// methods `QMoEKernel` overrides; every other `Kernel` method resolves to the
-/// same trait default `QMoEKernel` itself uses, so behaviour is byte-identical
-/// to boxing the kernel directly.
+/// Trait-object wrapper retaining the concrete QMoE kernel in an `Arc`.
 struct SharedQMoEKernel(Arc<QMoEKernel>);
 
 impl Kernel for SharedQMoEKernel {
@@ -1285,27 +1322,17 @@ impl Kernel for SharedQMoEKernel {
 
 pub struct QMoEFactory {
     pub runtime: Arc<CudaRuntime>,
-    /// EP-owned registry of live route-telemetry producer sources (issue #1810
-    /// Slice 7E). Every `QMoEKernel` this factory creates is registered here,
-    /// keyed by its call-site `NodeId`, so the coarse route-residency boundary
-    /// install seam can bind the *actual executing* producer instance rather
-    /// than a controllable test double. The session's `KernelCache` and this
-    /// registry share the same `Arc<QMoEKernel>`; the cache executes it and the
-    /// registry reads its route window at the safe boundary. Default-off:
-    /// registration allocates nothing and arms no telemetry.
+    /// Executor/node-scoped stable telemetry sources shared by every dynamic
+    /// specialization of the same QMoE call site.
     pub telemetry_registry: Arc<RouteTelemetrySourceRegistry>,
 }
 
 impl KernelFactory for QMoEFactory {
     fn create(&self, node: &Node, input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        let kernel = Arc::new(self.create_kernel(node, input_shapes)?);
-        // Register the *executing* instance (the same `Arc` the cache will run)
-        // so the EP owns a real producer source for this call site. This runs
-        // during the eager `compile_all` pre-warm as well as any later cache
-        // miss; the last writer for a `NodeId` wins, which is the instance the
-        // static-shape decode graph actually dispatches.
-        self.telemetry_registry
-            .register(node.id, Arc::clone(&kernel));
+        let telemetry = self
+            .telemetry_registry
+            .source_for_current(node.id, Arc::clone(&self.runtime));
+        let kernel = Arc::new(self.create_kernel_with_telemetry(node, input_shapes, telemetry)?);
         Ok(Box::new(SharedQMoEKernel(kernel)))
     }
 }
@@ -1318,6 +1345,19 @@ impl QMoEFactory {
     /// test seam only.
     #[doc(hidden)]
     pub fn create_kernel(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<QMoEKernel> {
+        self.create_kernel_with_telemetry(
+            node,
+            _input_shapes,
+            Arc::new(QMoERouteTelemetry::new(Arc::clone(&self.runtime))),
+        )
+    }
+
+    fn create_kernel_with_telemetry(
+        &self,
+        node: &Node,
+        _input_shapes: &[Vec<usize>],
+        telemetry: Arc<QMoERouteTelemetry>,
+    ) -> Result<QMoEKernel> {
         let attributes = MoeAttributes::from_node(node)?;
         let bits = int_attr(node, "expert_weight_bits", 4)?;
         if !matches!(bits, 1 | 2 | 4 | 8) {
@@ -1352,7 +1392,7 @@ impl QMoEFactory {
             block_size: block_size as usize,
             scratch: Mutex::new(ScratchPool::default()),
             warmed: AtomicBool::new(false),
-            telemetry: Mutex::new(None),
+            telemetry,
         })
     }
 }
@@ -1416,51 +1456,28 @@ pub(crate) fn unsupported_reason(node: &Node) -> Option<Cow<'static, str>> {
     None
 }
 
-pub struct QMoEKernel {
+/// Stable telemetry authority shared by every shape specialization of one
+/// executor/node QMoE producer.
+pub struct QMoERouteTelemetry {
     runtime: Arc<CudaRuntime>,
-    attributes: MoeAttributes,
-    bits: usize,
-    block_size: usize,
-    scratch: Mutex<ScratchPool>,
-    warmed: AtomicBool,
-    /// Inert, default-disabled route telemetry (issue #1810 Slice 7A). `None`
-    /// unless explicitly armed via [`QMoEKernel::arm_route_telemetry`]; while
-    /// `None` the route kernel receives null telemetry pointers and produces
-    /// byte-identical outputs.
-    telemetry: Mutex<Option<ArmedTelemetry>>,
+    state: Mutex<Option<ArmedTelemetry>>,
 }
 
-impl QMoEKernel {
-    /// Arm inert route telemetry (issue #1810 Slice 7A). Allocates the
-    /// persistent stable-VA record through the existing runtime allocator, stamps
-    /// request/device identity, and opens the first accumulation window
-    /// (`epoch = 1`). Subsequent [`execute`](Self::execute) calls whose expert
-    /// count matches `config.num_experts` accumulate their routes into the
-    /// current window via the fused route-kernel marks; the window advances only
-    /// at [`reset_route_telemetry_boundary`](Self::reset_route_telemetry_boundary).
-    /// Returns a typed [`TelemetryUnsupported`] on a device mismatch or
-    /// unsupported property, in which case telemetry stays disabled and ordinary
-    /// inference is unaffected. Session/kernel-scoped and crate-internal/test
-    /// only — there is no public typed-config seam to wire this to yet, so it is
-    /// `#[doc(hidden)]` and default-off. Re-arming replaces any prior record.
-    ///
-    /// Caveat: re-arming (or [`disarm_route_telemetry`](Self::disarm_route_telemetry))
-    /// frees the previous record's device buffers. An instantiated CUDA graph
-    /// bakes those pointers into its route nodes, so the caller MUST tear down
-    /// any capture that referenced the old record (`reset_graph`) before
-    /// re-arming or disarming; otherwise a later `replay_graph` would touch
-    /// freed memory. Every current caller does so, and there is no production
-    /// caller.
+impl QMoERouteTelemetry {
+    fn new(runtime: Arc<CudaRuntime>) -> Self {
+        Self {
+            runtime,
+            state: Mutex::new(None),
+        }
+    }
+
     #[doc(hidden)]
     pub fn arm_route_telemetry(
         &self,
         config: RouteTelemetryConfig,
     ) -> std::result::Result<(), TelemetryUnsupported> {
         let armed = ArmedTelemetry::arm(&self.runtime, config)?;
-        let mut telemetry = self
-            .telemetry
-            .lock()
-            .expect("cuda_ep QMoE telemetry poisoned");
+        let mut telemetry = self.state.lock().expect("cuda_ep QMoE telemetry poisoned");
         if let Some(previous) = telemetry.take() {
             previous.free(&self.runtime);
         }
@@ -1468,83 +1485,113 @@ impl QMoEKernel {
         Ok(())
     }
 
-    /// Disarm and release any armed route-telemetry record. Idempotent. The
-    /// caller must first `reset_graph` any capture that referenced the record
-    /// (its device pointers are baked into captured graph nodes) — see
-    /// [`arm_route_telemetry`](Self::arm_route_telemetry).
     #[doc(hidden)]
     pub fn disarm_route_telemetry(&self) {
-        let mut telemetry = self
-            .telemetry
-            .lock()
-            .expect("cuda_ep QMoE telemetry poisoned");
+        let mut telemetry = self.state.lock().expect("cuda_ep QMoE telemetry poisoned");
         if let Some(previous) = telemetry.take() {
             previous.free(&self.runtime);
         }
     }
 
-    /// Advance route telemetry to the next accumulation window at an explicit
-    /// **coarse safe boundary** (issue #1810 Slice 7A; design §2.3/§3). This is
-    /// the *only* place the epoch advances and the record is re-zeroed — nothing
-    /// on the [`execute`](Self::execute)/replay path resets it, so every eager
-    /// call and captured replay in a window accumulates the routed-expert union
-    /// and in-range count into the stable record with a fixed epoch. A window is
-    /// consumed (snapshot/validate) and then this is called before new work, so
-    /// the next window starts empty with no stale carryover.
-    ///
-    /// It reuses existing runtime authorities only: it is **rejected while the
-    /// EP stream is capturing/replaying** (returns `Err`; a drain is illegal
-    /// mid-capture), and otherwise drains prior stream work through
-    /// `drain_for_unmap` before re-stamping the header on the host. No-op (`Ok`)
-    /// when disarmed. Allocates nothing and moves no pointer. Crate-internal /
-    /// test-only; there is no production boundary-policy caller yet.
     #[doc(hidden)]
     pub fn reset_route_telemetry_boundary(&self) -> Result<()> {
-        let mut telemetry = self
-            .telemetry
-            .lock()
-            .expect("cuda_ep QMoE telemetry poisoned");
+        let mut telemetry = self.state.lock().expect("cuda_ep QMoE telemetry poisoned");
         match telemetry.as_mut() {
             Some(armed) => armed.reset_boundary(&self.runtime),
             None => Ok(()),
         }
     }
 
-    /// Copy the current telemetry record to the host (test/observability only —
-    /// this is not the production CONSUME path and self-synchronizes). Returns
-    /// `None` when telemetry is not armed.
     #[doc(hidden)]
     pub fn route_telemetry_snapshot(&self) -> Result<Option<TelemetrySnapshot>> {
-        let telemetry = self
-            .telemetry
-            .lock()
-            .expect("cuda_ep QMoE telemetry poisoned");
+        let telemetry = self.state.lock().expect("cuda_ep QMoE telemetry poisoned");
         match telemetry.as_ref() {
             Some(armed) => Ok(Some(armed.snapshot(&self.runtime)?)),
             None => Ok(None),
         }
     }
 
-    /// Total device bytes held by the armed telemetry record (teardown /
-    /// accounting tests); `0` when disarmed.
     #[doc(hidden)]
     pub fn route_telemetry_footprint_bytes(&self) -> usize {
-        self.telemetry
+        self.state
             .lock()
             .expect("cuda_ep QMoE telemetry poisoned")
             .as_ref()
             .map_or(0, ArmedTelemetry::footprint_bytes)
     }
 
-    /// Stable device VA of the armed telemetry bitmap (capture/replay stable-
-    /// pointer tests); `None` when disarmed.
     #[doc(hidden)]
     pub fn route_telemetry_bitmap_addr(&self) -> Option<u64> {
-        self.telemetry
+        self.state
             .lock()
             .expect("cuda_ep QMoE telemetry poisoned")
             .as_ref()
             .map(ArmedTelemetry::bitmap_addr)
+    }
+
+    fn launch_ptrs(&self, experts: usize) -> (CUdeviceptr, CUdeviceptr) {
+        let telemetry = self.state.lock().expect("cuda_ep QMoE telemetry poisoned");
+        match telemetry.as_ref() {
+            Some(armed) if armed.matches_experts(experts) => {
+                (armed.bitmap_ptr(), armed.header_ptr())
+            }
+            _ => (0, 0),
+        }
+    }
+}
+
+impl Drop for QMoERouteTelemetry {
+    fn drop(&mut self) {
+        if let Ok(telemetry) = self.state.get_mut()
+            && let Some(armed) = telemetry.take()
+        {
+            armed.free(&self.runtime);
+        }
+    }
+}
+
+pub struct QMoEKernel {
+    runtime: Arc<CudaRuntime>,
+    attributes: MoeAttributes,
+    bits: usize,
+    block_size: usize,
+    scratch: Mutex<ScratchPool>,
+    warmed: AtomicBool,
+    telemetry: Arc<QMoERouteTelemetry>,
+}
+
+impl QMoEKernel {
+    #[doc(hidden)]
+    pub fn arm_route_telemetry(
+        &self,
+        config: RouteTelemetryConfig,
+    ) -> std::result::Result<(), TelemetryUnsupported> {
+        self.telemetry.arm_route_telemetry(config)
+    }
+
+    #[doc(hidden)]
+    pub fn disarm_route_telemetry(&self) {
+        self.telemetry.disarm_route_telemetry();
+    }
+
+    #[doc(hidden)]
+    pub fn reset_route_telemetry_boundary(&self) -> Result<()> {
+        self.telemetry.reset_route_telemetry_boundary()
+    }
+
+    #[doc(hidden)]
+    pub fn route_telemetry_snapshot(&self) -> Result<Option<TelemetrySnapshot>> {
+        self.telemetry.route_telemetry_snapshot()
+    }
+
+    #[doc(hidden)]
+    pub fn route_telemetry_footprint_bytes(&self) -> usize {
+        self.telemetry.route_telemetry_footprint_bytes()
+    }
+
+    #[doc(hidden)]
+    pub fn route_telemetry_bitmap_addr(&self) -> Option<u64> {
+        self.telemetry.route_telemetry_bitmap_addr()
     }
 }
 
@@ -2102,18 +2149,7 @@ impl Kernel for QMoEKernel {
         // capacity — the pointers are null and the route kernel is
         // byte-identical; a capacity mismatch leaves telemetry inert for this
         // call and never fails inference.
-        let (telemetry_bitmap, telemetry_header) = {
-            let telemetry = self
-                .telemetry
-                .lock()
-                .expect("cuda_ep QMoE telemetry poisoned");
-            match telemetry.as_ref() {
-                Some(armed) if armed.matches_experts(experts) => {
-                    (armed.bitmap_ptr(), armed.header_ptr())
-                }
-                _ => (0u64, 0u64),
-            }
-        };
+        let (telemetry_bitmap, telemetry_header) = self.telemetry.launch_ptrs(experts);
 
         self.launch_route(
             router_probs_ptr,
@@ -3135,13 +3171,6 @@ impl Drop for QMoEKernel {
                 slot.capacity = 0;
             }
         }
-        // Release any armed route-telemetry record (issue #1810 Slice 7A).
-        // `free` drains in-flight launches before returning the buffers.
-        if let Ok(telemetry) = self.telemetry.get_mut()
-            && let Some(armed) = telemetry.take()
-        {
-            armed.free(&self.runtime);
-        }
     }
 }
 
@@ -3284,11 +3313,16 @@ fn error(message: impl Into<String>) -> EpError {
     EpError::KernelFailed(format!("cuda_ep com.microsoft::QMoE: {}", message.into()))
 }
 
-/// The armed `QMoEKernel` is the production [`RouteTelemetrySource`]: the
-/// boundary consumer drives a live kernel through exactly the two existing,
-/// already-tested window primitives (snapshot self-synchronizes; reset is
-/// rejected under capture). No new mechanism — this only names the ordered pair
-/// for the Slice-7C boundary caller.
+impl RouteTelemetrySource for QMoERouteTelemetry {
+    fn route_telemetry_snapshot(&self) -> Result<Option<TelemetrySnapshot>> {
+        QMoERouteTelemetry::route_telemetry_snapshot(self)
+    }
+
+    fn reset_route_telemetry_boundary(&self) -> Result<()> {
+        QMoERouteTelemetry::reset_route_telemetry_boundary(self)
+    }
+}
+
 impl RouteTelemetrySource for QMoEKernel {
     fn route_telemetry_snapshot(&self) -> Result<Option<TelemetrySnapshot>> {
         QMoEKernel::route_telemetry_snapshot(self)

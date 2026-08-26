@@ -940,6 +940,7 @@ impl Executor {
         let plan_len = plan.len();
         let capture_growing_symbols = compute_capture_disqualifying_symbols(&graph);
         let mut exec = Self {
+            instance_id: ExecutorInstanceId::fresh(),
             graph,
             weights,
             ep,
@@ -1001,6 +1002,7 @@ impl Executor {
             scan_inline_single_trip_enabled: scan_inline_single_trip_env_enabled(),
             scan_inline_single_trip_count: 0,
             kernel_bindings: vec![None; plan_len],
+            provider_artifacts_finalized: false,
             persistent_workspace: None,
             step_workspace: None,
             pin_step_workspace: false,
@@ -1016,7 +1018,11 @@ impl Executor {
             let mut span = trace_span("session.static_materialize", "session");
             let empty = HashMap::new();
             let resolved = exec.resolve_all(&empty)?;
-            exec.compile_all(&resolved)?;
+            let finalized = exec.finalize_provider_artifacts_if_ready(&resolved)?;
+            debug_assert!(
+                finalized,
+                "fully static executor must finalize provider artifacts during build"
+            );
             exec.size_buffers(&resolved)?;
             if let Some(span) = span.as_mut() {
                 span.set_args(
@@ -1028,17 +1034,6 @@ impl Executor {
                 );
             }
         }
-
-        // Install the route-residency boundary now that the model's weights and
-        // per-expert catalog are finalized and — for static-shape graphs — the
-        // executing kernels are compiled and their route-telemetry producer
-        // sources registered EP-side, but before any decode capture (issue #1810
-        // Slice 7E goal 3). Default-off: the EP installs and retains nothing
-        // unless the coarse-residency profile is enabled; the typed outcome is
-        // recorded in the EP's route-residency diagnostics. Runs once per model
-        // build on the concrete EP.
-        exec.ep
-            .install_route_residency_boundary_after_build(&exec.graph);
 
         // Pre-compute weight transposes for the GEMV decode path on Apple
         // Silicon. Model load is 15× faster than ORT (105 ms vs 1596 ms), so
@@ -2200,6 +2195,47 @@ impl Executor {
             .collect()
     }
 
+    /// Compile every leaf kernel whose inputs are fully resolved, then invoke
+    /// the single provider-artifact finalization transition.
+    ///
+    /// Static build and symbolic first-run compilation both use this path. A
+    /// genuinely data-dependent graph may not have every input shape before its
+    /// first eager execution; in that case this returns `false` without
+    /// invoking the provider and the post-execution resolved epoch retries the
+    /// same transition. Once the provider reports `Complete`, later shape
+    /// specializations compile normally but do not reinstall executor-scoped
+    /// artifacts.
+    pub(super) fn finalize_provider_artifacts_if_ready(
+        &mut self,
+        resolved: &HashMap<ValueId, Vec<usize>>,
+    ) -> Result<bool> {
+        if self.provider_artifacts_finalized {
+            return Ok(true);
+        }
+        let all_leaf_inputs_resolved = self.plan.iter().all(|plan| {
+            let node = self.graph.node(plan.node_id);
+            is_control_flow_op(&node.op_type, &node.domain)
+                || is_sequence_op(&node.op_type, &node.domain)
+                || plan
+                    .inputs
+                    .iter()
+                    .all(|input| input.is_none_or(|value| resolved.contains_key(&value)))
+        });
+        if !all_leaf_inputs_resolved {
+            return Ok(false);
+        }
+
+        self.compile_all(resolved)?;
+        if self
+            .ep
+            .finalize_executor_artifacts(self.instance_id, &self.graph)
+            == ExecutorArtifactFinalization::Complete
+        {
+            self.provider_artifacts_finalized = true;
+        }
+        Ok(self.provider_artifacts_finalized)
+    }
+
     /// Populate the kernel cache for the compiled plan against `resolved` shapes.
     pub(super) fn compile_all(&mut self, resolved: &HashMap<ValueId, Vec<usize>>) -> Result<()> {
         let mut span = trace_span("session.kernel_compile_plan", "session");
@@ -2250,6 +2286,7 @@ impl Executor {
                 &constant_inputs,
                 opset,
                 seq_independent,
+                self.instance_id,
                 self.ep.as_ref(),
             )?;
             // Pre-populate the kernel binding so the first decode step already
@@ -2638,6 +2675,10 @@ impl Executor {
         &self.weights
     }
 
+    pub(crate) fn instance_id(&self) -> ExecutorInstanceId {
+        self.instance_id
+    }
+
     /// Warmup: re-touch the shape-keyed cache for the compiled plan so the first
     /// real `run` sees only cache hits (§11.3). Only meaningful for fully-static
     /// graphs, whose plan shapes are known at build; symbolic graphs cannot be
@@ -2648,6 +2689,7 @@ impl Executor {
         }
         let empty = HashMap::new();
         let resolved = self.resolve_all(&empty)?;
-        self.compile_all(&resolved)
+        self.finalize_provider_artifacts_if_ready(&resolved)
+            .map(|_| ())
     }
 }
