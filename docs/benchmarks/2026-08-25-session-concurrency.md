@@ -95,7 +95,8 @@ it measures ownership/queue serialization, not multi-turn KV continuation.
 
 Absolute timings remain shared-host observations. CPU affinity reduced scheduler variance.
 Each corrected ORT cell lasted approximately 0.9-7.6 seconds, so process CPU accounting is
-useful but approximate.
+useful but approximate. On hosts without Linux `/proc` CPU accounting, `cpu_time_ms` and
+`process_cpu_percent` remain `null`; absence is never reported as zero work.
 
 Peak RSS was 7.6 MiB for synthetic and 411.1 MiB for the sequential ORT process. The ORT
 high-water mark includes allocator retention and cells that created 10,000 sessions; it is not
@@ -130,14 +131,15 @@ The CLI writes the JSON report before returning a nonzero status for any
 contract observable instead of discarding the report on the first failed
 invariant.
 
-Typed conflict and distinct overlap require a W>1/C>1 cell. A W=1/C=1-only regression test
+Typed conflict and distinct client-stream overlap require a W>1/C>1 cell. A W=1/C=1-only regression test
 therefore serializes both as `null`, rather than vacuously reporting success. Both full
-artifacts report all five gates `true`: W1 output parity, typed conflict, distinct overlap,
+schema-v4 artifacts report all five gates `true`: W1 output parity, typed conflict,
+distinct client-stream overlap,
 exact counts, and zero counter drift.
 
 At C=8, every ORT conflict row completed 10,000 owners and rejected exactly 70,000 contenders.
 Conflict p99 was 0.279/0.273/0.286 microseconds for W=1/2/4. Stateless W4/C8 completions were
-2488/2512/2491/2509. `max_steady_state_overlap` measures client-observed first-token-to-finish
+2488/2512/2491/2509. `max_client_stream_overlap` measures client-observed first-token-to-finish
 windows and can briefly exceed W; it is not simultaneous-kernel count.
 
 ## Overhead attribution

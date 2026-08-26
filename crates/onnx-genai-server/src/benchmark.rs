@@ -93,8 +93,8 @@ fn failed_gate_names(invariants: &InvariantReport) -> Vec<&'static str> {
             invariants.typed_same_session_conflict,
         ),
         (
-            "distinct_session_execution_overlap",
-            invariants.distinct_session_execution_overlap,
+            "distinct_session_stream_overlap",
+            invariants.distinct_session_stream_overlap,
         ),
         (
             "exact_completion_counts",
@@ -164,7 +164,7 @@ pub struct ConfigurationReport {
 pub struct InvariantReport {
     pub w1_output_parity: Option<bool>,
     pub typed_same_session_conflict: Option<bool>,
-    pub distinct_session_execution_overlap: Option<bool>,
+    pub distinct_session_stream_overlap: Option<bool>,
     pub exact_completion_counts: Option<bool>,
     pub no_counter_drift: Option<bool>,
 }
@@ -210,7 +210,7 @@ pub struct BenchmarkRow {
     pub steady_state_latency_ms: LatencySummary,
     pub total_latency_ms: LatencySummary,
     pub conflict_latency_ms: LatencySummary,
-    pub max_steady_state_overlap: usize,
+    pub max_client_stream_overlap: usize,
     pub worker_completions: BTreeMap<usize, usize>,
     pub rss_bytes_after: Option<u64>,
     pub peak_rss_bytes_after: Option<u64>,
@@ -277,6 +277,12 @@ struct Measurement {
     governed_resources: Option<GovernedResourcesReport>,
 }
 
+#[derive(Debug, Default)]
+struct JobResults {
+    samples: Vec<TimedSample>,
+    errors: usize,
+}
+
 #[derive(Clone, Copy)]
 struct SyntheticSession {
     placement: SessionPlacement,
@@ -303,7 +309,7 @@ pub async fn run(options: BenchmarkOptions) -> Result<BenchmarkReport> {
         }
     }
     Ok(BenchmarkReport {
-        schema_version: 3,
+        schema_version: 4,
         environment,
         configuration,
         invariants,
@@ -463,7 +469,7 @@ async fn run_synthetic_matrix(
     let mut invariants = InvariantReport {
         w1_output_parity: Some(true),
         typed_same_session_conflict: None,
-        distinct_session_execution_overlap: None,
+        distinct_session_stream_overlap: None,
         exact_completion_counts: Some(true),
         no_counter_drift: Some(true),
     };
@@ -549,12 +555,9 @@ async fn run_synthetic_matrix(
                 &mut invariants.exact_completion_counts,
                 verify_measurement(&distinct, options.iterations, 0),
             );
-            let overlap = max_steady_overlap(&distinct.samples);
+            let overlap = max_client_stream_overlap(&distinct.samples);
             if workers > 1 && concurrency > 1 && options.iterations > 1 {
-                record_gate(
-                    &mut invariants.distinct_session_execution_overlap,
-                    overlap > 1,
-                );
+                record_gate(&mut invariants.distinct_session_stream_overlap, overlap > 1);
             }
             rows.push(row_from_measurement(
                 "synthetic",
@@ -696,7 +699,7 @@ async fn run_ort_matrix(
     let mut invariants = InvariantReport {
         w1_output_parity: Some(true),
         typed_same_session_conflict: None,
-        distinct_session_execution_overlap: None,
+        distinct_session_stream_overlap: None,
         exact_completion_counts: Some(true),
         no_counter_drift: Some(true),
     };
@@ -818,12 +821,9 @@ async fn run_ort_matrix(
                 verify_measurement(&distinct, options.iterations, 0),
             );
             verify_zero_prefix_cache_hits(&distinct, "distinct ORT sessions")?;
-            let overlap = max_steady_overlap(&distinct.samples);
+            let overlap = max_client_stream_overlap(&distinct.samples);
             if workers > 1 && concurrency > 1 && options.iterations > 1 {
-                record_gate(
-                    &mut invariants.distinct_session_execution_overlap,
-                    overlap > 1,
-                );
+                record_gate(&mut invariants.distinct_session_stream_overlap, overlap > 1);
             }
             rows.push(row_from_measurement(
                 "ort",
@@ -1135,7 +1135,7 @@ async fn measure_driver_stateless(
     let driver_for_jobs = Arc::clone(&driver);
     let before_cpu = process_cpu_ticks();
     let started = Instant::now();
-    let samples = run_jobs(iterations, concurrency, move |index| {
+    let jobs = run_jobs(iterations, concurrency, move |index| {
         let driver = Arc::clone(&driver_for_jobs);
         async move {
             run_driver_request(
@@ -1151,7 +1151,8 @@ async fn measure_driver_stateless(
     let wall = started.elapsed();
     let governed_resources = governed_resources(&driver).await;
     Ok(Measurement {
-        samples,
+        samples: jobs.samples,
+        errors: jobs.errors,
         wall,
         cpu_time: cpu_duration(before_cpu, process_cpu_ticks()),
         governed_resources,
@@ -1177,7 +1178,7 @@ async fn measure_driver_distinct(
     let driver_for_jobs = Arc::clone(&driver);
     let before_cpu = process_cpu_ticks();
     let started = Instant::now();
-    let samples = run_jobs(iterations, concurrency, move |index| {
+    let jobs = run_jobs(iterations, concurrency, move |index| {
         let driver = Arc::clone(&driver_for_jobs);
         let leases = Arc::clone(&leases_for_jobs);
         let placement = sessions_for_jobs[index];
@@ -1209,7 +1210,8 @@ async fn measure_driver_distinct(
     }
     let governed_resources = governed_resources(&driver).await;
     Ok(Measurement {
-        samples,
+        samples: jobs.samples,
+        errors: jobs.errors,
         wall,
         cpu_time,
         governed_resources,
@@ -1225,7 +1227,8 @@ async fn measure_driver_serialized(
 ) -> Result<Measurement> {
     let mut samples = Vec::with_capacity(iterations);
     let mut wall = Duration::ZERO;
-    let mut cpu_time = Duration::ZERO;
+    let mut cpu_time = None;
+    let mut errors = 0;
     let mut completed = 0;
     while completed < iterations {
         let turns = SERIAL_TURNS_PER_SESSION.min(iterations - completed);
@@ -1258,9 +1261,10 @@ async fn measure_driver_serialized(
         .await?;
         wall += trial_started.elapsed();
         if let Some(duration) = cpu_duration(before_cpu, process_cpu_ticks()) {
-            cpu_time += duration;
+            cpu_time = Some(cpu_time.unwrap_or_default() + duration);
         }
-        samples.append(&mut trial);
+        samples.append(&mut trial.samples);
+        errors += trial.errors;
         let lease = leases
             .acquire(driver.binding(placement), "serialized")
             .context("serialized close lease")?;
@@ -1270,8 +1274,9 @@ async fn measure_driver_serialized(
     let governed_resources = governed_resources(&driver).await;
     Ok(Measurement {
         samples,
+        errors,
         wall,
-        cpu_time: Some(cpu_time),
+        cpu_time,
         governed_resources,
         ..Measurement::default()
     })
@@ -1290,19 +1295,33 @@ async fn measure_driver_conflicts(
     let mut samples = Vec::with_capacity(iterations);
     let mut conflict_ns = Vec::with_capacity(iterations * concurrency.saturating_sub(1));
     let mut typed_conflicts = 0;
+    let mut errors = 0;
     for index in 0..iterations {
         let placement = driver.create_session().await?;
         let binding = driver.binding(placement);
         let owner_lease = leases
             .acquire(binding.clone(), "conflict")
             .context("owner conflict lease")?;
-        let pending = submit_driver_request(
+        let pending = match submit_driver_request(
             Arc::clone(&driver),
             Some(owner_lease),
             request(prompt_start + index, max_new_tokens),
             Instant::now(),
         )
-        .await?;
+        .await
+        {
+            Ok(pending) => pending,
+            Err(_) => {
+                errors += 1;
+                let close = leases
+                    .acquire(binding, "conflict")
+                    .context("conflict close lease after submit failure")?;
+                if driver.close_session(close).await.is_err() {
+                    errors += 1;
+                }
+                continue;
+            }
+        };
         for _ in 1..concurrency {
             let started = Instant::now();
             match leases.acquire(binding.clone(), "conflict") {
@@ -1310,29 +1329,34 @@ async fn measure_driver_conflicts(
                     conflict_ns.push(duration_ns(started.elapsed()));
                     typed_conflicts += 1;
                 }
-                Err(error) => bail!("unexpected same-session refusal: {error}"),
+                Err(_) => errors += 1,
                 Ok(lease) => {
                     drop(lease);
-                    bail!("same-session overlap was admitted instead of refused")
+                    errors += 1;
                 }
             }
         }
-        samples.push(finish_driver_request(pending).await?);
+        match finish_driver_request(pending).await {
+            Ok(sample) => samples.push(sample),
+            Err(_) => errors += 1,
+        }
         let close = leases
             .acquire(binding, "conflict")
             .context("conflict close lease")?;
-        driver.close_session(close).await?;
+        if driver.close_session(close).await.is_err() {
+            errors += 1;
+        }
     }
     let wall = wall_started.elapsed();
     let governed_resources = governed_resources(&driver).await;
     Ok(Measurement {
         samples,
         conflict_ns,
+        errors,
         typed_conflicts,
         wall,
         cpu_time: cpu_duration(before_cpu, process_cpu_ticks()),
         governed_resources,
-        ..Measurement::default()
     })
 }
 
@@ -1601,14 +1625,15 @@ async fn measure_synthetic_stateless(
     let pool_for_jobs = Arc::clone(pool);
     let before_cpu = process_cpu_ticks();
     let started = Instant::now();
-    let samples = run_jobs(iterations, concurrency, move |_| {
+    let jobs = run_jobs(iterations, concurrency, move |_| {
         let pool = Arc::clone(&pool_for_jobs);
         async move { run_synthetic_request(&pool, None, work_units, Instant::now()).await }
     })
     .await?;
     let wall = started.elapsed();
     Ok(Measurement {
-        samples,
+        samples: jobs.samples,
+        errors: jobs.errors,
         wall,
         cpu_time: cpu_duration(before_cpu, process_cpu_ticks()),
         ..Measurement::default()
@@ -1631,7 +1656,7 @@ async fn measure_synthetic_distinct(
     let leases_for_jobs = Arc::clone(leases);
     let before_cpu = process_cpu_ticks();
     let started = Instant::now();
-    let samples = run_jobs(iterations, concurrency, move |index| {
+    let jobs = run_jobs(iterations, concurrency, move |index| {
         let pool = Arc::clone(&pool_for_jobs);
         let leases = Arc::clone(&leases_for_jobs);
         let session = sessions_for_jobs[index];
@@ -1651,7 +1676,8 @@ async fn measure_synthetic_distinct(
         close_synthetic_session(pool, session)?;
     }
     Ok(Measurement {
-        samples,
+        samples: jobs.samples,
+        errors: jobs.errors,
         wall,
         cpu_time,
         ..Measurement::default()
@@ -1671,7 +1697,7 @@ async fn measure_synthetic_serialized(
     let leases_for_jobs = Arc::clone(leases);
     let before_cpu = process_cpu_ticks();
     let started = Instant::now();
-    let samples = run_jobs(iterations, concurrency, move |_| {
+    let jobs = run_jobs(iterations, concurrency, move |_| {
         let pool = Arc::clone(&pool_for_jobs);
         let leases = Arc::clone(&leases_for_jobs);
         let serialization = Arc::clone(&serialization);
@@ -1689,7 +1715,8 @@ async fn measure_synthetic_serialized(
     let cpu_time = cpu_duration(before_cpu, process_cpu_ticks());
     close_synthetic_session(pool, session)?;
     Ok(Measurement {
-        samples,
+        samples: jobs.samples,
+        errors: jobs.errors,
         wall,
         cpu_time,
         ..Measurement::default()
@@ -1708,6 +1735,7 @@ async fn measure_synthetic_conflicts(
     let mut samples = Vec::with_capacity(iterations);
     let mut conflict_ns = Vec::with_capacity(iterations * concurrency.saturating_sub(1));
     let mut typed_conflicts = 0;
+    let mut errors = 0;
     for index in 0..iterations {
         let session = create_synthetic_session(pool, index as u64)?;
         let binding = synthetic_binding(session);
@@ -1731,20 +1759,26 @@ async fn measure_synthetic_conflicts(
                     conflict_ns.push(duration_ns(started.elapsed()));
                     typed_conflicts += 1;
                 }
-                Err(error) => bail!("unexpected synthetic conflict error: {error}"),
+                Err(_) => errors += 1,
                 Ok(lease) => {
                     drop(lease);
-                    bail!("synthetic same-session overlap was admitted")
+                    errors += 1;
                 }
             }
         }
-        samples.push(pending.await.context("synthetic owner task panicked")??);
-        close_synthetic_session(pool, session)?;
+        match pending.await {
+            Ok(Ok(sample)) => samples.push(sample),
+            Ok(Err(_)) | Err(_) => errors += 1,
+        }
+        if close_synthetic_session(pool, session).is_err() {
+            errors += 1;
+        }
     }
     let wall = wall_started.elapsed();
     Ok(Measurement {
         samples,
         conflict_ns,
+        errors,
         typed_conflicts,
         wall,
         cpu_time: cpu_duration(before_cpu, process_cpu_ticks()),
@@ -1752,7 +1786,7 @@ async fn measure_synthetic_conflicts(
     })
 }
 
-async fn run_jobs<F, Fut>(jobs: usize, concurrency: usize, operation: F) -> Result<Vec<TimedSample>>
+async fn run_jobs<F, Fut>(jobs: usize, concurrency: usize, operation: F) -> Result<JobResults>
 where
     F: Fn(usize) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<TimedSample>> + Send + 'static,
@@ -1765,22 +1799,33 @@ where
         let operation = Arc::clone(&operation);
         tasks.push(tokio::spawn(async move {
             let mut samples = Vec::new();
+            let mut errors = 0;
             loop {
                 let index = next.fetch_add(1, Ordering::Relaxed);
                 if index >= jobs {
                     break;
                 }
-                samples.push(operation(index).await?);
+                match operation(index).await {
+                    Ok(sample) => samples.push(sample),
+                    Err(_) => errors += 1,
+                }
             }
-            Ok::<_, anyhow::Error>(samples)
+            JobResults { samples, errors }
         }));
     }
     let mut samples = Vec::with_capacity(jobs);
+    let mut errors = 0;
     for task in tasks {
-        samples.extend(task.await.context("benchmark job task panicked")??);
+        match task.await {
+            Ok(mut results) => {
+                samples.append(&mut results.samples);
+                errors += results.errors;
+            }
+            Err(_) => errors += 1,
+        }
     }
     samples.sort_by_key(|sample| sample.started);
-    Ok(samples)
+    Ok(JobResults { samples, errors })
 }
 
 fn verify_measurement(
@@ -2026,7 +2071,7 @@ fn row_from_measurement(
         steady_state_latency_ms: summarize_us(&steady_us),
         total_latency_ms: summarize_us(&total_us),
         conflict_latency_ms: summarize_ns(&measurement.conflict_ns),
-        max_steady_state_overlap: max_steady_overlap(&measurement.samples),
+        max_client_stream_overlap: max_client_stream_overlap(&measurement.samples),
         worker_completions,
         rss_bytes_after: memory.rss,
         peak_rss_bytes_after: memory.peak_rss,
@@ -2099,7 +2144,7 @@ fn nearest_rank(sorted: &[u64], quantile: f64) -> u64 {
     sorted[rank.saturating_sub(1).min(sorted.len() - 1)]
 }
 
-fn max_steady_overlap(samples: &[TimedSample]) -> usize {
+fn max_client_stream_overlap(samples: &[TimedSample]) -> usize {
     let mut events = Vec::with_capacity(samples.len() * 2);
     for sample in samples {
         events.push((sample.first, true));
@@ -2241,7 +2286,7 @@ mod tests {
         let invariants = InvariantReport {
             w1_output_parity: Some(false),
             typed_same_session_conflict: None,
-            distinct_session_execution_overlap: Some(true),
+            distinct_session_stream_overlap: Some(true),
             exact_completion_counts: Some(false),
             no_counter_drift: Some(true),
         };
@@ -2254,6 +2299,38 @@ mod tests {
         assert_eq!(json["w1_output_parity"], false);
         assert_eq!(json["typed_same_session_conflict"], serde_json::Value::Null);
         assert_eq!(json["exact_completion_counts"], false);
+    }
+
+    #[tokio::test]
+    async fn job_failures_are_counted_instead_of_aborting_the_report() {
+        let jobs = run_jobs(4, 2, |index| async move {
+            if index % 2 == 1 {
+                anyhow::bail!("injected job failure");
+            }
+            let now = Instant::now();
+            Ok(TimedSample {
+                started: now,
+                first: now,
+                finished: now,
+                prompt_tokens: 1,
+                prefix_cache_hit_len: 0,
+                units: 1,
+                worker: 0,
+                checksum: index as u64,
+                token_ids: vec![index as u32],
+            })
+        })
+        .await
+        .expect("job runner");
+
+        let measurement = Measurement {
+            samples: jobs.samples,
+            errors: jobs.errors,
+            ..Measurement::default()
+        };
+        assert_eq!(measurement.samples.len(), 2);
+        assert_eq!(measurement.errors, 2);
+        assert!(verify_measurement(&measurement, 4, 0).is_err());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2270,11 +2347,11 @@ mod tests {
         .await
         .expect("synthetic benchmark");
 
-        assert_eq!(report.schema_version, 3);
+        assert_eq!(report.schema_version, 4);
         assert_eq!(report.invariants.w1_output_parity, Some(true));
         assert_eq!(report.invariants.typed_same_session_conflict, Some(true));
         assert_eq!(
-            report.invariants.distinct_session_execution_overlap,
+            report.invariants.distinct_session_stream_overlap,
             Some(true)
         );
         assert_eq!(report.invariants.exact_completion_counts, Some(true));
@@ -2313,7 +2390,7 @@ mod tests {
                 row.scenario == "distinct_sessions" && row.worker_count == 2 && row.concurrency == 2
             })
             .expect("distinct row");
-        assert!(distinct.max_steady_state_overlap > 1);
+        assert!(distinct.max_client_stream_overlap > 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2331,10 +2408,10 @@ mod tests {
         .expect("synthetic benchmark");
 
         assert_eq!(report.invariants.typed_same_session_conflict, None);
-        assert_eq!(report.invariants.distinct_session_execution_overlap, None);
+        assert_eq!(report.invariants.distinct_session_stream_overlap, None);
         let json = serde_json::to_value(&report.invariants).expect("serialize invariants");
         assert!(json["typed_same_session_conflict"].is_null());
-        assert!(json["distinct_session_execution_overlap"].is_null());
+        assert!(json["distinct_session_stream_overlap"].is_null());
         assert_eq!(json["w1_output_parity"], true);
     }
 
@@ -2407,6 +2484,6 @@ mod tests {
         }
         assert_eq!(report.invariants.w1_output_parity, Some(true));
         assert_eq!(report.invariants.typed_same_session_conflict, None);
-        assert_eq!(report.invariants.distinct_session_execution_overlap, None);
+        assert_eq!(report.invariants.distinct_session_stream_overlap, None);
     }
 }

@@ -1266,10 +1266,6 @@ impl Engine {
         if !self.sessions.contains_key(&session_id) {
             anyhow::bail!("session {session_id} not found");
         }
-        if options.cold_start {
-            self.reset_session(session_id)?;
-        }
-
         let max_context = self.max_context_for_request(&options);
         let chain = build_processor_chain(
             &options,
@@ -1285,6 +1281,12 @@ impl Engine {
         )?;
         let budget_cap = scheduled.budget_cap.map(generation_budget_cap);
         options.max_new_tokens = scheduled.max_tokens;
+        if options.cold_start
+            && let Err(error) = self.reset_session(session_id)
+        {
+            self.scheduler.complete(session_id);
+            return Err(error);
+        }
         if let Some(callback) = admission_callback.as_mut() {
             callback();
         }
@@ -2228,9 +2230,6 @@ impl Engine {
         if !self.sessions.contains_key(&request.session_id) {
             anyhow::bail!("session {} not found", request.session_id);
         }
-        if options.cold_start {
-            self.reset_session(request.session_id)?;
-        }
         if self.should_use_speculative(&options) {
             anyhow::bail!(
                 "prioritized drive API currently supports the single-sequence non-speculative path; batched/speculative drive is future work"
@@ -2251,6 +2250,9 @@ impl Engine {
             crate::pipeline::generation::DECODE_CORE_CONTRACTS,
             &mut None,
         )?;
+        if options.cold_start {
+            self.reset_session(request.session_id)?;
+        }
         let mut state = self
             .sessions
             .remove(&request.session_id)

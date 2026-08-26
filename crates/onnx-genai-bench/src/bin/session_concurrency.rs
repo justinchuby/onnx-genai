@@ -118,7 +118,7 @@ fn default_fixture() -> PathBuf {
 
 fn print_summary(report: &BenchmarkReport) {
     println!(
-        "| scenario | W | C | wall ms | speedup | TTFT p50/p95/p99 ms | total p50/p95/p99 ms | req/s | prefix hits req/tok | conflicts | overlap |"
+        "| scenario | W | C | wall ms | speedup | TTFT p50/p95/p99 ms | total p50/p95/p99 ms | req/s | prefix hits req/tok | conflicts | client stream overlap |"
     );
     println!("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
     for row in &report.rows {
@@ -135,7 +135,7 @@ fn print_summary(report: &BenchmarkReport) {
             row.prefix_cache_hit_requests,
             row.prefix_cache_hit_tokens,
             row.conflicts,
-            row.max_steady_state_overlap,
+            row.max_client_stream_overlap,
         );
     }
 }
