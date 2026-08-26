@@ -60,7 +60,7 @@ HL=scripts/hostlock.sh
 pass=0
 fail=0
 
-cleanup() { rm -rf "$LOCK" "$LOCK".cpuself "$LOCK".reaper "$LOCK".reaper.stage.* "$LOCK".reaper.dead.* "$LOCK".reaper.rel.* "$LOCK".dead.* "$LOCK".stage.* "$LOCK".gate "$LOCK".warn "$LOCK".zombie.* "$LOCK".zpid "$LOCK".ttlmarker "$LOCK".ran "$LOCK".conf "$LOCK".legacy "$LOCK".box "$LOCK".sourced "$LOCK".legacyran "$LOCK".owner "$LOCK".nested "$LOCK".ro "$LOCK".deep "$LOCK".file "$LOCK".nox "$LOCK".conf2 "$LOCK".helpconf "$LOCK".helppoison "$LOCK".wait 2>/dev/null; }
+cleanup() { rm -rf "$LOCK" "$LOCK".cpuself "$LOCK".reaper "$LOCK".reaper.stage.* "$LOCK".reaper.dead.* "$LOCK".reaper.rel.* "$LOCK".dead.* "$LOCK".stage.* "$LOCK".gate "$LOCK".warn "$LOCK".zombie.* "$LOCK".zpid "$LOCK".ttlmarker "$LOCK".ran "$LOCK".conf "$LOCK".legacy "$LOCK".box "$LOCK".sourced "$LOCK".legacyran "$LOCK".owner "$LOCK".nested "$LOCK".ro "$LOCK".deep "$LOCK".file "$LOCK".nox "$LOCK".conf2 "$LOCK".helpconf "$LOCK".helppoison "$LOCK".wait "$LOCK".grandchild 2>/dev/null; }
 trap cleanup EXIT
 
 chk() {
@@ -360,6 +360,38 @@ chk "released after SIGTERM" "$(st state)" "FREE"
 # legitimate kill and the wrapped benchmark is now an orphan on the cores.
 chk "the wrapped command is really stopped, not left orphaned" \
     "$(alive "$wrapped_kid" && echo orphaned || echo stopped)" "stopped"
+
+# ...and so is everything that command started. The assertion above stops at
+# the DIRECT child, which is the one depth this defect was never at. A harness
+# runs `cargo`; cargo runs the test binary; a teardown that signals cargo alone
+# leaves that binary spinning, reparented to init, while the line above prints
+# "released" and `status` reports the box FREE. Three such orphans were found
+# on this host at 36-91% CPU, forty to sixty-four minutes after the runs that
+# started them had been torn down, and the suite was green throughout.
+#
+# So the wrapped command backgrounds a grandchild and waits, which is the shape
+# of every real harness here. Its pid is captured BEFORE the signal for exactly
+# the reason the direct child's is: once the runner is gone an orphan is
+# reparented to pid 1, and asking afterwards answers the same either way.
+rm -f "$LOCK".grandchild
+$HL run --owner leon --reason "tree teardown" -- \
+    bash -c "sleep 300 & echo \$! > '$LOCK.grandchild'; wait" >/dev/null 2>&1 &
+runner=$!
+sleep 3
+grandchild=$(cat "$LOCK".grandchild 2>/dev/null)
+chk "the wrapped command really started a grandchild" \
+    "$([ -n "$grandchild" ] && alive "$grandchild" && echo yes || echo no)" "yes"
+sig "$runner" 15
+chk "the runner still terminates when a tree is under it" \
+    "$(wait_bounded "$runner" && echo yes || echo no)" "yes"
+sleep 2
+chk "the whole wrapped tree is stopped, not just its direct child" \
+    "$(alive "$grandchild" && echo orphaned || echo stopped)" "stopped"
+if [ -n "$grandchild" ] && alive "$grandchild"; then
+    sig "$grandchild" 9
+    wait "$grandchild" 2>/dev/null
+fi
+rm -f "$LOCK".grandchild
 
 # SIGKILL cannot be trapped, so the lock survives; the anchor is the runner's
 # own pid, so the next acquirer must reap it. This is the case the pid anchor
@@ -1777,10 +1809,36 @@ cleanup
 # not, because --timeout/GATE_TIMEOUT would swamp it.
 kills=$(sed -E '/^[[:space:]]*#/d' "$HL" \
     | grep -oEi '(p?kill(all)?|killpg|pthread_kill|fuser)|timeout[[:space:]]+(-[sk]|--signal|--kill-after)|\bxargs\b' | wc -l)
-chk "exactly one call in the kill family anywhere in the script" "$kills" "1"
+# Four OCCURRENCES on three lines, and the difference is worth stating because
+# this number is meant to be audited by eye: `kill -TERM "$child"` (the
+# not-a-group-leader fallback), `kill -TERM "-$pgid"`, and `kill -KILL
+# "-$pgid"` -- the last matching twice, once for the verb and once for the
+# signal name. Three calls, one per escalation step, all in stop_wrapped_tree.
+#
+# It was one call until the teardown was found to stop only its DIRECT child,
+# leaving a wrapped `cargo`'s test binaries spinning while this lock reported
+# the host free. Raising an exact count is precisely the kind of change this
+# assertion exists to force someone to justify, which is why it is raised here
+# rather than relaxed to a threshold -- a threshold would have absorbed the
+# same three lines in silence.
+chk "exactly four calls in the kill family anywhere in the script" "$kills" "4"
+# ...and every one of them targets the command this script started, or the
+# process group that command LEADS -- never a pid or a group from anywhere else.
+#
+# A ratio (targeted == total) rather than a fixed count, so a legitimate change
+# to the escalation is not blocked by arithmetic while a kill aimed at an
+# unrelated pid still fails. The floor below is what stops the ratio passing
+# vacuously: rename the variables and both counts fall to zero, and 0 == 0
+# would otherwise be green with every signal in the file pointing anywhere.
 # shellcheck disable=SC2016  # matching source text literally, not expanding it
-chk "and it targets the command the script itself started" \
-    "$(grep -c 'kill -TERM "\$child"' "$HL")" "1"
+kill_lines=$(sed -E '/^[[:space:]]*#/d' "$HL" | grep -cE '^[[:space:]]*kill[[:space:]]')
+# shellcheck disable=SC2016  # matching source text literally, not expanding it
+kill_targeted=$(sed -E '/^[[:space:]]*#/d' "$HL" \
+    | grep -cE '^[[:space:]]*kill[[:space:]]+-[A-Z0-9]+[[:space:]]+"(\$child|-\$pgid)"')
+chk "every kill targets the started command or the group it leads" \
+    "$kill_targeted" "$kill_lines"
+chk "and there was at least one to check, so the ratio is not vacuous" \
+    "$([ "${kill_lines:-0}" -ge 3 ] && echo yes || echo no)" "yes"
 # ...and it verifies that pid before signalling. Pids on this box cycle at
 # ~1.5M in four days, so signalling on "the pid still exists" would let the
 # one place this script signals anything hit a process it never started.
@@ -1797,7 +1855,65 @@ teardown_body=$(awk '/^run_teardown\(\) \{/,/^\}/' "$HL" \
     | sed -E '/^[[:space:]]*#/d; s/^[[:space:]]+//; s/[[:space:]]+$//; /^$/d' | tr '\n' '|')
 # shellcheck disable=SC2016  # matching source text literally, not expanding it
 chk "and the teardown guard is exactly a start-time comparison" "$teardown_body" \
-'run_teardown() {|local child=$1 name=$2 code=$3|if [ -n "$child" ] && [ -n "$RUN_CHILD_START" ]; then|local now|now=$(proc_start_time "$child" 2>/dev/null || echo "")|if [ "$now" = "$RUN_CHILD_START" ]; then|kill -TERM "$child" 2>/dev/null|wait "$child" 2>/dev/null|fi|fi|remove_lock_if_mine|echo "hostlock: released (${name})" >&2|exit "$code"|}|'
+'run_teardown() {|local child=$1 name=$2 code=$3|if [ -n "$child" ] && [ -n "$RUN_CHILD_START" ]; then|local now|now=$(proc_start_time "$child" 2>/dev/null || echo "")|if [ "$now" = "$RUN_CHILD_START" ]; then|stop_wrapped_tree "$child"|fi|fi|remove_lock_if_mine|echo "hostlock: released (${name})" >&2|exit "$code"|}|'
+
+# The signalling itself now lives in stop_wrapped_tree, so the golden body that
+# used to cover it has to follow it there: without this, the teardown golden
+# above stays green while every actual `kill` sits in a function nothing pins.
+#
+# Compared line-by-line against a quoted heredoc rather than joined with `|`,
+# because this body contains both `'` and `"` and the joined form would need
+# them escaped into unreadability -- a golden nobody can read is a golden
+# nobody will correctly update.
+#
+# Two properties in here cannot be reached behaviourally, which is the whole
+# reason for a golden. The `[ "$pgid" != "$child" ]` bail-out is the difference
+# between signalling the wrapped tree and signalling THIS SCRIPT'S OWN GROUP:
+# with setsid missing the child leads no group, and `-$pgid` then names the
+# runner, its caller and the agent's shell. Reproducing that means removing
+# setsid from the box. And the `wait` before the first liveness poll is what
+# keeps a not-yet-reaped child -- a zombie is still a group member -- from
+# reading as surviving load, which would fire the escalation and the warning
+# on every clean teardown.
+stop_body=$(awk '/^stop_wrapped_tree\(\) \{/,/^\}/' "$HL" \
+    | sed -E '/^[[:space:]]*#/d; s/^[[:space:]]+//; s/[[:space:]]+$//; /^$/d')
+stop_expected=$(cat <<'GOLDEN'
+stop_wrapped_tree() {
+local child=$1 pgid tries survivors
+pgid=$(proc_pgid "$child" 2>/dev/null || echo "")
+if [ -z "$pgid" ] || [ "$pgid" != "$child" ]; then
+kill -TERM "$child" 2>/dev/null
+wait "$child" 2>/dev/null
+return
+fi
+kill -TERM "-$pgid" 2>/dev/null
+wait "$child" 2>/dev/null
+tries=0
+while [ "$tries" -lt 20 ]; do
+group_alive "$pgid" || return 0
+sleep 0.5
+tries=$((tries + 1))
+done
+kill -KILL "-$pgid" 2>/dev/null
+sleep 0.5
+if group_alive "$pgid"; then
+survivors=$(pgrep -g "$pgid" 2>/dev/null | tr '\n' ' ')
+echo "hostlock: WARNING the wrapped command's process group (${pgid}) survived both signals: ${survivors:-unknown}. The lock is being released, but this load is still on the cores -- the host is NOT free." >&2
+fi
+}
+GOLDEN
+)
+chk "the tree stop is exactly verify-leadership, TERM, reap, poll, KILL, warn" \
+    "$stop_body" "$stop_expected"
+
+# ...and the group is only ever recorded when the child genuinely leads it.
+# Dropping this one line leaves every golden above byte-identical while
+# `-$RUN_CHILD_PGID` on the normal-exit path silently becomes this script's own
+# group. It is only asked a question there today, but it is one edit from being
+# sent a signal.
+# shellcheck disable=SC2016  # matching source text literally, not expanding it
+chk "the recorded pgid is discarded unless the child leads that group" \
+    "$(grep -cF '[ "$RUN_CHILD_PGID" = "$child" ] || RUN_CHILD_PGID=""' "$HL")" "1"
 
 # ...and the ORDER of that teardown's inputs is load-bearing, which the golden
 # body above cannot see: it is a body, not a position. Moving
@@ -2820,7 +2936,7 @@ cleanup
 # the inert R1 block and the vacuous STALE arm that this PR exists to fix.
 # Every probe branch asserts something, so the total is invariant across
 # environments; if a refactor drops a check, this fails and says so.
-chk "every assertion in this file ran" "$((pass + fail + 1))" "437"
+chk "every assertion in this file ran" "$((pass + fail + 1))" "443"
 
 echo
 echo "passed=${pass} failed=${fail}"
