@@ -1,5 +1,7 @@
 mod common;
 
+use std::sync::{Mutex, MutexGuard};
+
 use common::{
     Tensor, absent_input, build_graph, decode_floats, float_input, input, require_cuda, run_cpu,
     run_cuda,
@@ -8,6 +10,18 @@ use onnx_runtime_ep_api::{ExecutionProvider, KernelMatch};
 use onnx_runtime_ep_cuda::{CUDA_COVERED_OPS, cufft_plan_cache_stats, stft_last_execution_stats};
 use onnx_runtime_ir::{Attribute, DataType, TensorLayout, static_shape};
 use onnx_runtime_loader::Model;
+
+static STFT_GPU_LOCK: Mutex<()> = Mutex::new(());
+
+fn lock_stft_gpu() -> MutexGuard<'static, ()> {
+    STFT_GPU_LOCK.lock().unwrap_or_else(|poisoned| {
+        eprintln!(
+            "WARNING: STFT_GPU_LOCK was poisoned by a prior test panic — recovering. \
+             Investigate the original failure above."
+        );
+        poisoned.into_inner()
+    })
+}
 
 fn assert_close(actual: &[f32], expected: &[f32], tolerance: f32) {
     assert_eq!(actual.len(), expected.len());
@@ -87,6 +101,7 @@ fn panic_message(panic: Box<dyn std::any::Any + Send>) -> String {
 )]
 #[test]
 fn nontrivial_window_is_applied_and_matches_cpu() {
+    let _suite_lock = lock_stft_gpu();
     let ep = require_cuda();
     let inputs = stft_inputs(
         float_input(DataType::Float32, &[1, 8, 1], &sequence(8)),
@@ -108,6 +123,7 @@ fn nontrivial_window_is_applied_and_matches_cpu() {
 )]
 #[test]
 fn overlapping_step_selects_the_middle_frame() {
+    let _suite_lock = lock_stft_gpu();
     let ep = require_cuda();
     let inputs = stft_inputs(
         float_input(DataType::Float32, &[1, 8, 1], &sequence(8)),
@@ -131,6 +147,7 @@ fn overlapping_step_selects_the_middle_frame() {
 )]
 #[test]
 fn final_complete_frame_is_not_dropped() {
+    let _suite_lock = lock_stft_gpu();
     let ep = require_cuda();
     let inputs = stft_inputs(
         float_input(DataType::Float32, &[1, 8, 1], &sequence(8)),
@@ -153,6 +170,7 @@ fn final_complete_frame_is_not_dropped() {
 )]
 #[test]
 fn complex_exact_frame_produces_full_spectrum() {
+    let _suite_lock = lock_stft_gpu();
     let ep = require_cuda();
     let inputs = stft_inputs(
         float_input(
@@ -175,6 +193,7 @@ fn complex_exact_frame_produces_full_spectrum() {
 )]
 #[test]
 fn onesided_keeps_n_over_two_plus_one_and_matches_full_prefix() {
+    let _suite_lock = lock_stft_gpu();
     let ep = require_cuda();
     let inputs = stft_inputs(
         float_input(
@@ -203,6 +222,7 @@ fn onesided_keeps_n_over_two_plus_one_and_matches_full_prefix() {
 )]
 #[test]
 fn non_power_of_two_dynamic_lengths_and_batched_signals_match_cpu() {
+    let _suite_lock = lock_stft_gpu();
     let ep = require_cuda();
     let values = (0..12)
         .map(|index| (index as f32 - 3.0) * 0.2)
@@ -224,6 +244,7 @@ fn non_power_of_two_dynamic_lengths_and_batched_signals_match_cpu() {
 )]
 #[test]
 fn zero_step_and_short_signal_fail_with_cpu_consistent_errors() {
+    let _suite_lock = lock_stft_gpu();
     let ep = require_cuda();
     let zero_step_inputs = stft_inputs(
         float_input(DataType::Float32, &[1, 4, 1], &sequence(4)),
@@ -256,6 +277,7 @@ fn zero_step_and_short_signal_fail_with_cpu_consistent_errors() {
 )]
 #[test]
 fn claim_gates_decline_unsupported_dtype_layout_and_complex_onesided() {
+    let _suite_lock = lock_stft_gpu();
     let ep = require_cuda();
     assert!(CUDA_COVERED_OPS.contains(&"STFT"));
 
@@ -438,6 +460,7 @@ fn claim_gates_decline_unsupported_dtype_layout_and_complex_onesided() {
 )]
 #[test]
 fn shared_plan_cache_reuses_exact_key_and_capture_fails_closed() {
+    let _suite_lock = lock_stft_gpu();
     let ep = require_cuda();
     let values = (0..32)
         .map(|index| (index as f32 - 8.0) * 0.125)
