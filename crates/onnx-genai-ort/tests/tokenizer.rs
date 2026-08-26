@@ -7,6 +7,7 @@ fn tiny_tokenizer_round_trip() {
     let ids = tokenizer.encode("hello world").unwrap();
     assert_eq!(ids, vec![2, 3]);
     assert_eq!(tokenizer.decode(&ids).unwrap(), "hello world");
+    assert_eq!(tokenizer.legacy_eos_token_ids(), [1]);
     assert_eq!(tokenizer.encode_i64("hello world").unwrap(), vec![2_i64, 3]);
     assert_eq!(tokenizer.decode_i64(&[2, 3]).unwrap(), "hello world");
 }

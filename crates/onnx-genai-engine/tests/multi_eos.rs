@@ -64,6 +64,21 @@ fn package_declaring_eos_from(source: &Path, ids: &[i64]) -> anyhow::Result<temp
     Ok(staged)
 }
 
+fn legacy_package_declaring_eos(id: u32) -> anyhow::Result<tempfile::TempDir> {
+    let staged = tempfile::tempdir()?;
+    for entry in std::fs::read_dir(decoder_package())? {
+        let entry = entry?;
+        if entry.file_type()?.is_file() {
+            std::fs::copy(entry.path(), staged.path().join(entry.file_name()))?;
+        }
+    }
+
+    let path = staged.path().join("generation_config.json");
+    let document = serde_json::json!({ "eos_token_id": id });
+    std::fs::write(&path, serde_json::to_vec_pretty(&document)?)?;
+    Ok(staged)
+}
+
 fn request(tokens: usize) -> GenerateRequest {
     GenerateRequest {
         prompt: GeneratePrompt::Text("hello world".to_string()),
@@ -106,6 +121,19 @@ fn a_package_may_declare_several_end_tokens() -> anyhow::Result<()> {
         [11, 22, 33],
         "all three ids survive the round trip"
     );
+    Ok(())
+}
+
+/// Packages written before token authority was added retain their tokenizer
+/// fallback until they are migrated to v1.2.
+#[test]
+fn legacy_packages_keep_their_existing_eos_behavior() -> anyhow::Result<()> {
+    let stop = greedy_prefix(1)?[0];
+    let staged = legacy_package_declaring_eos(stop)?;
+    let mut engine = Engine::from_dir(staged.path(), EngineConfig::default())?;
+    let result = engine.generate(request(32))?;
+    assert_eq!(result.finish_reason, FinishReason::EosToken, "{result:?}");
+    assert_eq!(result.token_ids, [stop], "{result:?}");
     Ok(())
 }
 
