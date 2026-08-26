@@ -1697,7 +1697,7 @@ pub fn build_cuda_registry_with_metrics(
 mod tests {
     use super::{
         CUDA_COVERED_OPS, CUDA_DFT_DTYPES, CUDA_FLOAT_DTYPES, CUDA_NMS_DTYPES, CUDA_STFT_DTYPES,
-        cuda_supported_dtypes_for_op,
+        build_cuda_registry_descriptors, cuda_supported_dtypes_for_op,
     };
 
     /// Every operator the CPU EP registers but CUDA does not must be named in
@@ -1730,11 +1730,9 @@ mod tests {
     ///
     /// Deliberately GPU-free: it reads `CUDA_COVERED_OPS`, which is a const, and
     /// builds only the CPU registry, so it runs on every lane rather than the
-    /// CUDA ones alone. Note the limit of that choice — no test anywhere
-    /// compares `CUDA_COVERED_OPS` against the real factory table built by
-    /// `build_cuda_registry`, so if the const ever *overstated* coverage, this
-    /// test would treat the named op as covered and never demand it be
-    /// documented. Closing that needs a GPU-lane test and is left for one.
+    /// CUDA ones alone. The GPU-lane
+    /// `cuda_registry_census_is_bidirectional` test separately compares that
+    /// const with the real factory table built by `build_cuda_registry`.
     #[test]
     fn every_cpu_only_op_is_named_in_the_coverage_doc() {
         const DOC: &str = include_str!("../../../../docs/execution/CUDA_COVERAGE.md");
@@ -1772,6 +1770,128 @@ mod tests {
              Either implement them on CUDA, or document why the gap is deliberate \
              (see the MoE and PackedMultiHeadAttention entries for the shape of \
              that write-up). A gap is fine; an undocumented one is not."
+        );
+    }
+
+    /// Every advertised CUDA name must appear in the current matrix, not only
+    /// in a historical wave note elsewhere in the document.
+    #[test]
+    fn every_cuda_covered_op_is_named_in_current_coverage_matrix() {
+        const DOC: &str = include_str!("../../../../docs/execution/CUDA_COVERAGE.md");
+        const START: &str = "<!-- CUDA_COVERAGE_MATRIX_START -->";
+        const END: &str = "<!-- CUDA_COVERAGE_MATRIX_END -->";
+
+        let (_, after_start) = DOC
+            .split_once(START)
+            .expect("CUDA coverage document must retain the matrix start marker");
+        let (matrix, _) = after_start
+            .split_once(END)
+            .expect("CUDA coverage document must retain the matrix end marker");
+        assert!(
+            !CUDA_COVERED_OPS.is_empty(),
+            "CUDA_COVERED_OPS unexpectedly empty; matrix check would be vacuous"
+        );
+
+        let missing: Vec<&str> = CUDA_COVERED_OPS
+            .iter()
+            .copied()
+            .filter(|op| {
+                !matrix.contains(&format!("`{op}`")) && !matrix.contains(&format!("::{op}`"))
+            })
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "these CUDA_COVERED_OPS names are missing from the current coverage matrix: \
+             {missing:?}"
+        );
+    }
+
+    /// Source-derived CUDA registration census and bidirectional list check.
+    ///
+    /// No expected count is stored here: the command is the source of a fresh
+    /// count, while the set equality catches either side drifting.
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+    )]
+    #[test]
+    fn cuda_registry_census_is_bidirectional() {
+        use std::collections::{BTreeMap, BTreeSet};
+        use std::sync::Arc;
+
+        let runtime = Arc::new(
+            crate::runtime::CudaRuntime::new(0)
+                .expect("CUDA registry census requires a usable CUDA device 0"),
+        );
+        let descriptors = build_cuda_registry_descriptors(runtime);
+        let pairs: BTreeSet<(String, String)> = descriptors
+            .into_iter()
+            .map(|descriptor| (descriptor.domain, descriptor.op_type))
+            .collect();
+        assert!(
+            !pairs.is_empty(),
+            "CUDA registry unexpectedly empty; census would be vacuous"
+        );
+
+        let registry_names: BTreeSet<&str> = pairs.iter().map(|(_, op)| op.as_str()).collect();
+        let covered_names: BTreeSet<&str> = CUDA_COVERED_OPS.iter().copied().collect();
+        assert_eq!(
+            registry_names, covered_names,
+            "CUDA_COVERED_OPS and the actual CUDA registry name set diverged"
+        );
+
+        let cpu_pairs: BTreeSet<(String, String)> =
+            onnx_runtime_ep_cpu::kernels::build_cpu_registry()
+                .keys()
+                .map(|key| (key.domain.clone(), key.op_type.clone()))
+                .collect();
+        let cpu_only: BTreeSet<(String, String)> = cpu_pairs.difference(&pairs).cloned().collect();
+
+        const DOC: &str = include_str!("../../../../docs/execution/CUDA_COVERAGE.md");
+        const GAP_START: &str = "<!-- CUDA_CPU_ONLY_GAPS_START -->";
+        const GAP_END: &str = "<!-- CUDA_CPU_ONLY_GAPS_END -->";
+        let (_, after_gap_start) = DOC
+            .split_once(GAP_START)
+            .expect("CUDA coverage document must retain the CPU-only gap start marker");
+        let (gap_section, _) = after_gap_start
+            .split_once(GAP_END)
+            .expect("CUDA coverage document must retain the CPU-only gap end marker");
+        let documented_cpu_only: BTreeSet<(String, String)> = gap_section
+            .split('`')
+            .filter_map(|span| span.split_once("::"))
+            .map(|(domain, op)| {
+                (
+                    if domain == "ai.onnx" { "" } else { domain }.to_string(),
+                    op.to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            cpu_only, documented_cpu_only,
+            "the source-derived CPU-only (domain, op) set and the documented gap set diverged"
+        );
+
+        let mut domains_by_name: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+        for (domain, op) in &pairs {
+            domains_by_name
+                .entry(op)
+                .or_default()
+                .insert(if domain.is_empty() { "ai.onnx" } else { domain });
+        }
+        let dual_domain: Vec<(&str, Vec<&str>)> = domains_by_name
+            .into_iter()
+            .filter_map(|(op, domains)| {
+                (domains.len() > 1).then(|| (op, domains.into_iter().collect()))
+            })
+            .collect();
+
+        println!(
+            "CUDA registry census: names={} pairs={} dual_domain={} {:?}; cpu_only={:?}",
+            covered_names.len(),
+            pairs.len(),
+            dual_domain.len(),
+            dual_domain,
+            cpu_only
         );
     }
 
