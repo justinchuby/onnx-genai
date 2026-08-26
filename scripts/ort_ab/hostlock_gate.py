@@ -261,6 +261,69 @@ def lock_columns(label: str, prov: dict[str, str]) -> dict[str, str]:
     }
 
 
+def read_runnable(path: str = "/proc/loadavg") -> int | None:
+    """The runnable-task count, by the same definition `hostlock.sh` uses.
+
+    `runnable_now()` in the script is `cut -d' ' -f4 /proc/loadavg | cut -d/
+    -f1`, and this has to agree with it exactly or `runnable_at_start` (which
+    comes from the script, via provenance) and the samples taken here would be
+    two different measurements sharing a name -- the failure `lock_columns`
+    exists to prevent, reintroduced one column along.
+
+    A file read, not a subprocess: this is called between cells of a live
+    matrix, and forking `hostlock.sh` there would put the measurement's own
+    instrument on the host it is measuring.
+
+    `None`, never a guess, when the file is absent or malformed. A host
+    without `/proc` cannot answer this and must not appear to.
+    """
+    try:
+        with open(path) as fh:
+            field = fh.read().split()[3]
+    except (OSError, IndexError):
+        return None
+    try:
+        return int(field.split("/")[0])
+    except ValueError:
+        return None
+
+
+def occupancy_columns(samples: list[int | None]) -> dict[str, str]:
+    """What the host looked like across the window, not at one instant.
+
+    The lock guarantees **custody, not quiet.** It stops a cooperating peer,
+    which is the only thing it can do; it says nothing about a process that
+    never took it -- a stray build, a test matrix, an agent outside the
+    protocol. So a matrix can hold the lock legitimately end to end, have
+    `window_label` report no handoff, and still have run half its reps against
+    a competitor. Every column would read clean and the contention would be
+    invisible downstream. That is the same "number that was never measured"
+    shape as the gate that expires and proceeds.
+
+    `runnable_at_start` already says what the host looked like at the first
+    instant, and its docstring is careful that it "says nothing about what
+    happened afterwards". These are the afterwards.
+
+    Facts, deliberately not a verdict. `lock_columns` refuses a `contended`
+    column because this host is shared by design (#1802) and there is no
+    honest threshold; that reasoning applies here unchanged. A reader compares
+    `runnable_max` against `runnable_at_start` and decides. A driver that
+    shipped a boolean would be inventing the threshold that was refused.
+    """
+    seen = [s for s in samples if s is not None]
+    if not seen:
+        return {
+            "runnable_at_end": "unknown",
+            "runnable_max": "unknown",
+            "runnable_samples": "0",
+        }
+    return {
+        "runnable_at_end": str(seen[-1]),
+        "runnable_max": str(max(seen)),
+        "runnable_samples": str(len(seen)),
+    }
+
+
 def remedy(command: str) -> str:
     """The message someone reads at the moment they are stopped.
 

@@ -264,6 +264,21 @@ is not evidence of a handoff and is not evidence against one either.
 `runnable_at_start` is a single sample taken before the first arm — a note
 about the conditions at the start, not a property of the interval; see the
 `--gate` paragraph above for why no threshold on it is honest here.
+
+Because that sample is a point, every row also carries `runnable_at_end`,
+`runnable_max` and `runnable_samples`, taken between cells across the whole
+matrix. **The lock covers custody, not quiet.** It stops a cooperating peer,
+which is all it can do; it says nothing about a process that never took it —
+a stray build, someone else's test matrix, an agent outside the protocol. So
+a run can hold the lock legitimately end to end, have the label report no
+handoff, and still have spent half its reps against a competitor, with every
+column reading clean. `runnable_max` is what records that. Compare it against
+`runnable_at_start`: a peak well above the start means something arrived that
+the lock could not exclude. Deliberately no verdict column and no threshold —
+same reason `contended` is absent, this host is shared by design (#1802).
+`runnable_samples` counts the readings that *answered*, so a row cannot
+overstate its own evidence on a host where `/proc/loadavg` is unreadable.
+
 `--unlocked` runs anyway and stamps every row `unlocked:<state>` — for smoke
 tests, never for anything publishable — but it will **not** run over a lock
 somebody else declared, because that damage lands on their measurement, where
@@ -440,7 +455,14 @@ label, prov = hostlock_gate.require(
 ...
 label = hostlock_gate.window_label(label, prov, hostlock_gate.read_provenance())
 row.update(hostlock_gate.lock_columns(label, prov))
+row.update(hostlock_gate.occupancy_columns(samples))
 ```
+
+`samples` is a list built with `hostlock_gate.read_runnable()` — seed it
+before the first arm and append between cells, never inside one. It is a
+single `/proc/loadavg` read rather than a `hostlock.sh` call precisely
+because it runs inside a live matrix: forking the lock script there would put
+the instrument's own load on the host it is measuring.
 
 The walk up is there instead of a `parents[3]` because that constant holds
 only for a file sitting directly in the benches root — every one of the

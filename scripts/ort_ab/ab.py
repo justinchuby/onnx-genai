@@ -41,9 +41,11 @@ from hostlock_gate import (  # noqa: F401
     ancestry,
     lock_columns,
     lock_verdict,
+    occupancy_columns,
     parent_of,
     parse_provenance,
     read_provenance,
+    read_runnable,
     remedy,
     require,
     window_label,
@@ -182,6 +184,11 @@ def main() -> None:
         arm_env["null"] = dict(arm_env.get(baseline, {}))
 
     rows = []
+    # Occupancy across the window. The lock covers custody; nothing covers a
+    # process that never took it, so sample between cells and let the row
+    # carry what was seen. Seeded with the start reading so `runnable_max`
+    # cannot miss a host that was already busy when we were admitted.
+    occupancy = [read_runnable()]
     for model in args.models:
         model_path = Path(model)
         for threads in args.threads:
@@ -203,6 +210,9 @@ def main() -> None:
                         model=model_path.stem, threads=threads, trial=trial, arm=name
                     )
                     rows.append(r)
+                    # Between cells, never inside one: a file read is cheap
+                    # but the arm that just finished is the thing being timed.
+                    occupancy.append(read_runnable())
                     tail = (
                         f"parity={r['parity']}"
                         if args.native_only
@@ -219,6 +229,7 @@ def main() -> None:
     # rather than its first instant.
     lock_label = window_label(lock_label, prov, read_provenance())
     columns = lock_columns(lock_label, prov)
+    columns.update(occupancy_columns(occupancy))
     for r in rows:
         r.update(columns)
 
@@ -231,6 +242,13 @@ def main() -> None:
     metric = "native ms" if args.native_only else "native/ort ratio"
     print(f"\n=== medians ({metric}, lower is better) ===")
     print(f"host_lock={lock_label} (whole window)")
+    print(
+        f"runnable: start={columns['runnable_at_start']} "
+        f"max={columns['runnable_max']} end={columns['runnable_at_end']} "
+        f"({columns['runnable_samples']} samples). The lock covers custody, "
+        f"not quiet -- max above start means something that never took it "
+        f"was running."
+    )
     keys = sorted({(r["model"], r["threads"]) for r in rows})
     for model, threads in keys:
         line = [f"{model:28s} t={threads:<3d}"]
