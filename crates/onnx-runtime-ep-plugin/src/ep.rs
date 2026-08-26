@@ -1811,10 +1811,10 @@ mod tests {
             vec![Some(ValueId(0)), Some(ValueId(1))],
             vec![ValueId(100)],
         );
-        reduction.version = Some(18);
+        reduction.version = Some(13);
         let strategy = crate::compute::ShapeInference::for_node(
             &reduction,
-            &[vec![Some(2), Some(3)], vec![Some(1)]],
+            &[vec![Some(2), Some(3), Some(4)], vec![Some(1)]],
             1,
         );
         assert!(matches!(
@@ -1825,7 +1825,7 @@ mod tests {
         reduction.inputs[1] = None;
         let strategy = crate::compute::ShapeInference::for_node(
             &reduction,
-            &[vec![Some(2), Some(3)], vec![]],
+            &[vec![Some(2), Some(3), Some(4)], vec![]],
             1,
         );
         assert!(matches!(

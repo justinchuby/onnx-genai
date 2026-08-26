@@ -126,7 +126,10 @@ pub enum ShapeInference {
         axes: Option<Vec<i64>>,
         noop_with_empty_axes: bool,
     },
-    /// Opset-18+ reduction where axes come from input[1].
+    /// Reduction whose schema carries axes in optional input[1].
+    ///
+    /// This starts at opset 13 for ReduceSum and opset 18 for the other
+    /// reduction-family operators.
     ReductionFromInput {
         keepdims: bool,
         noop_with_empty_axes: bool,
@@ -559,10 +562,10 @@ impl ShapeInference {
             "Slice" => Self::SliceData,
 
             // ── Reductions ────────────────────────────────────────────────
-            op_name if is_reduction(op_name) => {
+            op_name if reduction_axes_input_since(op_name).is_some() => {
                 let keepdims = int_attr("keepdims").unwrap_or(1) != 0;
                 let noop_with_empty_axes = int_attr("noop_with_empty_axes").unwrap_or(0) != 0;
-                if opset >= 18 {
+                if reduction_axes_are_input(op_name, opset) {
                     Self::ReductionFromInput {
                         keepdims,
                         noop_with_empty_axes,
@@ -689,20 +692,21 @@ impl ShapeInference {
     }
 }
 
-fn is_reduction(op: &str) -> bool {
-    matches!(
-        op,
-        "ReduceMean"
-            | "ReduceSum"
-            | "ReduceProd"
-            | "ReduceMax"
-            | "ReduceMin"
-            | "ReduceL1"
-            | "ReduceL2"
-            | "ReduceLogSum"
-            | "ReduceLogSumExp"
-            | "ReduceSumSquare"
-    )
+fn reduction_axes_input_since(op: &str) -> Option<i64> {
+    // ONNX moved ReduceSum.axes to optional input[1] in schema 13. The rest of
+    // this reduction family retained the attribute through schema 17 and moved
+    // at schema 18. This is also the reduction-family census: a newly supported
+    // operator must choose its own boundary rather than inherit a blanket one.
+    match op {
+        "ReduceSum" => Some(13),
+        "ReduceMean" | "ReduceProd" | "ReduceMax" | "ReduceMin" | "ReduceL1" | "ReduceL2"
+        | "ReduceLogSum" | "ReduceLogSumExp" | "ReduceSumSquare" => Some(18),
+        _ => None,
+    }
+}
+
+fn reduction_axes_are_input(op: &str, opset: i64) -> bool {
+    reduction_axes_input_since(op).is_some_and(|since| opset >= since)
 }
 
 fn build_conv(node: &Node, input_shapes: &[Vec<Option<usize>>]) -> Option<ShapeInference> {
@@ -7946,6 +7950,148 @@ fn after() {}
     }
 
     // ── Reduction ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn reduction_axes_input_boundaries_match_each_operator_schema() {
+        assert_eq!(reduction_axes_input_since("NotAReduction"), None);
+        assert!(!reduction_axes_are_input("ReduceSum", 12));
+        assert!(reduction_axes_are_input("ReduceSum", 13));
+        assert!(reduction_axes_are_input("ReduceSum", 17));
+
+        for op in [
+            "ReduceMean",
+            "ReduceProd",
+            "ReduceMax",
+            "ReduceMin",
+            "ReduceL1",
+            "ReduceL2",
+            "ReduceLogSum",
+            "ReduceLogSumExp",
+            "ReduceSumSquare",
+        ] {
+            assert!(
+                !reduction_axes_are_input(op, 17),
+                "{op} must retain attribute axes through opset 17"
+            );
+            assert!(
+                reduction_axes_are_input(op, 18),
+                "{op} must read optional input[1] starting at opset 18"
+            );
+        }
+    }
+
+    #[test]
+    fn reduce_sum_opset_13_and_17_read_present_host_axes() {
+        let shape = [2usize, 3, 4];
+        let strides = [12i64, 4, 1];
+        let axes = [1i64];
+        let axis_shape = [1usize];
+        let axis_strides = [1i64];
+
+        for opset in [13, 17] {
+            let mut node = onnx_runtime_ir::Node::new(
+                onnx_runtime_ir::NodeId(0),
+                "ReduceSum",
+                vec![
+                    Some(onnx_runtime_ir::ValueId(0)),
+                    Some(onnx_runtime_ir::ValueId(1)),
+                ],
+                vec![onnx_runtime_ir::ValueId(2)],
+            );
+            node.version = Some(opset);
+            node.attributes
+                .insert("keepdims".into(), onnx_runtime_ir::Attribute::Int(0));
+            let strategy = ShapeInference::for_node(
+                &node,
+                &[vec![Some(2), Some(3), Some(4)], vec![Some(1)]],
+                1,
+            );
+            assert!(
+                matches!(strategy, ShapeInference::ReductionFromInput { .. }),
+                "ReduceSum opset {opset} must read axes from input[1]"
+            );
+            let result = infer(
+                &strategy,
+                &[
+                    view(&shape, &strides),
+                    i64_view(&axes, &axis_shape, &axis_strides),
+                ],
+            )
+            .unwrap();
+            assert_eq!(result, vec![vec![2, 4]]);
+        }
+    }
+
+    #[test]
+    fn reduce_sum_opset_12_keeps_attribute_axes() {
+        let mut node = onnx_runtime_ir::Node::new(
+            onnx_runtime_ir::NodeId(0),
+            "ReduceSum",
+            vec![Some(onnx_runtime_ir::ValueId(0))],
+            vec![onnx_runtime_ir::ValueId(1)],
+        );
+        node.version = Some(12);
+        node.attributes
+            .insert("axes".into(), onnx_runtime_ir::Attribute::Ints(vec![1]));
+        node.attributes
+            .insert("keepdims".into(), onnx_runtime_ir::Attribute::Int(0));
+        let strategy = ShapeInference::for_node(&node, &[vec![Some(2), Some(3), Some(4)]], 1);
+        assert!(matches!(strategy, ShapeInference::Reduction { .. }));
+
+        let shape = [2usize, 3, 4];
+        let strides = [12i64, 4, 1];
+        assert_eq!(
+            infer(&strategy, &[view(&shape, &strides)]).unwrap(),
+            vec![vec![2, 4]]
+        );
+    }
+
+    #[test]
+    fn reduce_sum_opset_13_absent_and_empty_axes_keep_schema_defaults() {
+        let mut node = onnx_runtime_ir::Node::new(
+            onnx_runtime_ir::NodeId(0),
+            "ReduceSum",
+            vec![Some(onnx_runtime_ir::ValueId(0)), None],
+            vec![onnx_runtime_ir::ValueId(2)],
+        );
+        node.version = Some(13);
+        node.attributes
+            .insert("keepdims".into(), onnx_runtime_ir::Attribute::Int(0));
+        node.attributes.insert(
+            "noop_with_empty_axes".into(),
+            onnx_runtime_ir::Attribute::Int(1),
+        );
+        let strategy =
+            ShapeInference::for_node(&node, &[vec![Some(2), Some(3), Some(4)], vec![]], 1);
+        assert!(matches!(
+            strategy,
+            ShapeInference::ReductionFromInput { .. }
+        ));
+
+        let shape = [2usize, 3, 4];
+        let strides = [12i64, 4, 1];
+        assert_eq!(
+            infer(&strategy, &[view(&shape, &strides)]).unwrap(),
+            vec![Vec::<usize>::new()],
+            "absent optional axes means reduce all regardless of noop_with_empty_axes"
+        );
+
+        let axes: [i64; 0] = [];
+        let axis_shape = [0usize];
+        let axis_strides = [1i64];
+        assert_eq!(
+            infer(
+                &strategy,
+                &[
+                    view(&shape, &strides),
+                    i64_view(&axes, &axis_shape, &axis_strides),
+                ],
+            )
+            .unwrap(),
+            vec![shape.to_vec()],
+            "present empty axes honours noop_with_empty_axes=1"
+        );
+    }
 
     #[test]
     fn reduction_keepdims_single_axis() {
