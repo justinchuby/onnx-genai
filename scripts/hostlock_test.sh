@@ -442,6 +442,16 @@ chk "job control does not make the run release while its command is still going"
     "$(awk -v w="${mon_wall:-0}" 'BEGIN { print (w + 0 >= 1.5) ? "waited" : "released-early" }')" \
     "waited"
 
+# ...and none of that machinery cries wolf on an ordinary run. The liveness
+# check has to exclude ZOMBIES -- a reaped-but-not-yet-collected child is
+# still a member of its own process group -- and getting that wrong is silent
+# in the other direction: every clean teardown would escalate to KILL and
+# print "the host is NOT free" while the host was, in fact, free. A warning
+# that fires on success is a warning that gets ignored when it is real.
+clean_out=$($HL run --owner leon --reason "clean run" -- sh -c 'sleep 1' 2>&1)
+chk "a clean run warns about nothing" \
+    "$(printf '%s\n' "$clean_out" | grep -c WARNING)" "0"
+
 # SIGKILL cannot be trapped, so the lock survives; the anchor is the runner's
 # own pid, so the next acquirer must reap it. This is the case the pid anchor
 # exists for.
@@ -1927,6 +1937,12 @@ chk "and the teardown guard is exactly a start-time comparison" "$teardown_body"
 # on a mutation harness whose `trap ... TERM` restored a file and carried on.
 # A bound that can itself block is not a bound, and that is the whole subject
 # of this fix.
+#
+# Note the scope: those two lines are the JUSTIFICATION, but the assertion is
+# the whole body, so a semantics-preserving refactor of any other line in the
+# function fails here too. That is a false FAIL, and deliberately the safe
+# direction for the one function in this file that sends signals -- but it
+# means the fix for such a failure is to update this golden, not to weaken it.
 stop_body=$(awk '/^stop_wrapped_tree\(\) \{/,/^\}/' "$HL" \
     | sed -E '/^[[:space:]]*#/d; s/^[[:space:]]+//; s/[[:space:]]+$//; /^$/d')
 stop_expected=$(cat <<'GOLDEN'
@@ -1971,8 +1987,11 @@ chk "the signal target is the led group or the child pid, and nothing else" \
 
 # ...and no wait in that function is unbounded. `wait` with no guard is how
 # the first draft of this fix hung, and it reads as harmless.
+# `wait\b`, not `wait `: a BARE `wait` -- wait for every child, the broadest
+# possible block -- has no trailing argument and would slip past a pattern
+# that requires a space.
 chk "the only wait in the tree stop is the guarded one" \
-    "$(awk '/^stop_wrapped_tree\(\) \{/,/^\}/' "$HL" | grep -cE '^[[:space:]]*wait ')" "1"
+    "$(awk '/^stop_wrapped_tree\(\) \{/,/^\}/' "$HL" | grep -cE '^[[:space:]]*wait\b')" "1"
 
 # ...and the group is only ever recorded when the child genuinely leads it.
 # Dropping this one line leaves every golden above byte-identical while
@@ -3004,7 +3023,7 @@ cleanup
 # the inert R1 block and the vacuous STALE arm that this PR exists to fix.
 # Every probe branch asserts something, so the total is invariant across
 # environments; if a refactor drops a check, this fails and says so.
-chk "every assertion in this file ran" "$((pass + fail + 1))" "451"
+chk "every assertion in this file ran" "$((pass + fail + 1))" "452"
 
 echo
 echo "passed=${pass} failed=${fail}"

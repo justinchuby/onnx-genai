@@ -1792,50 +1792,65 @@ cmd_wait() {
 # than assumed away: stop_wrapped_tree verifies leadership before signalling.
 SETSID_BIN=$(command -v setsid 2>/dev/null || true)
 
-# Is anything under this target still RUNNING? `target` is a pid, or "-PGID"
-# for a whole process group -- the same spelling the signals below use, so the
-# thing verified is exactly the thing signalled.
+# The pids still RUNNING under a target: a pid, or "-PGID" for a whole process
+# group -- the same spelling the signals below use, so the thing verified is
+# exactly the thing signalled.
 #
 # ZOMBIES DO NOT COUNT. An unreaped child is a zombie, a zombie is still a
 # member of its process group, and one that read as live would fire the
 # escalation and the warning on every clean teardown. A zombie holds no cores,
 # and cores are the only thing this lock is about.
 #
-# Deliberately `pgrep`/`/proc` rather than `kill -0`. This is a liveness
-# QUESTION, not a signal, and the suite pins the number of calls in the kill
-# family to an exact count so that this script's signalling surface stays
-# countable by eye -- the property that keeps a host lock structurally
-# incapable of stopping anything it did not start. A probe spelled as a kill
-# would inflate that count and blunt the guard for no gain.
-target_alive() {
-    local t=$1 pids p st
-    [ -n "$t" ] || return 1
+# Read from /proc directly rather than `pgrep -g`, which is shorter and wrong
+# in the one way this file cannot afford. If pgrep were missing its failure is
+# an EMPTY result, which reads as "nothing is alive": the poll would exit on
+# its first pass, the escalation to KILL and the survivor warning would both be
+# skipped, and a stubborn group would leak in silence. A missing dependency
+# would have turned a loud failure into a quiet one, which is the exact defect
+# class this script exists to close. /proc is already its source of truth for
+# every other pid question here, and the loop is a bash builtin read -- no fork
+# per pid, so scanning it twenty times over a ten-second poll is free.
+#
+# Deliberately not `kill -0` either. This is a liveness QUESTION, not a signal,
+# and the suite pins the number of calls in the kill family to an exact count
+# so that this script's signalling surface stays countable by eye -- the
+# property that keeps a host lock structurally incapable of stopping anything
+# it did not start. A probe spelled as a kill would inflate that count and
+# blunt the guard for no gain.
+live_pids() {
+    local t=$1 pgid d p line rest out=""
+    [ -n "$t" ] || { printf ''; return 0; }
     if [ "${t#-}" != "$t" ]; then
-        pids=$(pgrep -g "${t#-}" 2>/dev/null)
+        pgid=${t#-}
+        for d in /proc/[0-9]*; do
+            p=${d#/proc/}
+            read -r line <"$d/stat" 2>/dev/null || continue
+            # Longest match, as everywhere else here: the comm field is the
+            # only parenthesised one, so this lands on state ($1) and pgrp
+            # ($3) even for a command name containing a bracket.
+            rest=${line##*") "}
+            # shellcheck disable=SC2086  # deliberate splitting of stat fields
+            set -- $rest
+            [ "${3:-}" = "$pgid" ] && [ "${1:-Z}" != Z ] && out="${out}${p} "
+        done
     else
-        pids=$t
+        read -r line <"/proc/${t}/stat" 2>/dev/null || { printf ''; return 0; }
+        rest=${line##*") "}
+        # shellcheck disable=SC2086  # deliberate splitting of stat fields
+        set -- $rest
+        [ "${1:-Z}" != Z ] && out="${t} "
     fi
-    for p in $pids; do
-        st=$(proc_state_and_start "$p" 2>/dev/null | awk '{print $1}')
-        [ -n "$st" ] || continue
-        [ "$st" = Z ] || return 0
-    done
-    return 1
+    printf '%s' "$out"
+    return 0
+}
+
+target_alive() {
+    [ -n "$(live_pids "$1")" ]
 }
 
 # The pids still running under a target, for the warning below.
 live_under() {
-    local t=$1 pids p st out=""
-    if [ "${t#-}" != "$t" ]; then
-        pids=$(pgrep -g "${t#-}" 2>/dev/null)
-    else
-        pids=$t
-    fi
-    for p in $pids; do
-        st=$(proc_state_and_start "$p" 2>/dev/null | awk '{print $1}')
-        [ -n "$st" ] && [ "$st" != Z ] && out="${out}${p} "
-    done
-    printf '%s' "$out"
+    live_pids "$1"
 }
 
 # Stop the wrapped command AND everything it started.
@@ -1861,6 +1876,13 @@ live_under() {
 # payloads that leak are exactly the ones that do not die on TERM. Then VERIFY
 # rather than assume: "a signal was sent" and "the cores are free" are
 # different claims, and the whole purpose of this script is to make the second.
+#
+# The grace between the two is TEN SECONDS (20 polls of 0.5s), and it is a
+# ceiling, not a suggestion: a wrapped command that traps TERM to flush more
+# than ten seconds of partial results will be KILLed mid-flush. Stated here
+# because a wrapper cannot discover it by reading its own code, and a longer
+# window is not obviously right -- these signals are sent when a run is being
+# aborted, usually because somebody needs the box back.
 #
 # Every wait here is BOUNDED. The first draft of this function reaped the child
 # with a plain `wait` before polling, which is correct for a child that dies
@@ -1996,6 +2018,14 @@ cmd_run() {
     # than one pid (see stop_wrapped_tree). `$!` is then the new group leader
     # and its pgid equals its own pid -- verified before any group signal,
     # never assumed.
+    #
+    # Two consequences of the new session, neither of which affects a
+    # benchmark: the command loses the controlling terminal, so a payload that
+    # opens /dev/tty or checks isatty sees a difference and a Ctrl-C reaches it
+    # only through the trap above (which is the whole point -- that path stops
+    # the tree, the terminal's would not); and `run -- <shell builtin>` is now
+    # a not-found error rather than silently doing nothing useful, because
+    # setsid execs a program.
     if [ -n "$SETSID_BIN" ]; then
         "$SETSID_BIN" "$@" &
     else
@@ -2035,9 +2065,10 @@ cmd_run() {
     # A command that returned is not the same as a host that is quiet: it can
     # leave a background grandchild behind, and the next line declares the box
     # free. Report that rather than releasing over it in silence. Deliberately
-    # a warning and not a kill -- on this path the command chose to detach
-    # something and exited successfully, so stopping it would be this script
-    # overruling a deliberate act. On the SIGNAL path the run is being aborted
+    # a warning and not a kill -- on this path the command RETURNED rather
+    # than being signalled (at any exit status; this is not gated on rc), so
+    # whatever it left behind it left deliberately, and stopping it would be
+    # this script overruling that. On the SIGNAL path the run is being aborted
     # and stop_wrapped_tree does kill, which is the opposite situation.
     if [ -n "$RUN_CHILD_PGID" ] && target_alive "-$RUN_CHILD_PGID"; then
         echo "hostlock: WARNING the command exited but left its process group (${RUN_CHILD_PGID}) running: $(live_under "-$RUN_CHILD_PGID"). Releasing anyway; the host is not necessarily idle." >&2
