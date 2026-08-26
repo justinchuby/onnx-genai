@@ -320,64 +320,27 @@ impl Engine {
 
     /// Every token id this model ends generation on.
     ///
-    /// A model may end a turn with one token and a message with another; both
-    /// stop it. The package's own declaration comes first because it is the
-    /// package speaking about itself — a package that ships no tokenizer
-    /// side-files still states its EOS — and the tokenizer's ids extend it
-    /// rather than replacing it, so neither source can silently drop the
-    /// other's.
+    /// Numeric package defaults have one authority: top-level `tokens`. The
+    /// tokenizer supplies spellings and chat templates, never an additional
+    /// numeric stop set.
     pub(crate) fn default_eos_token_ids(&self) -> anyhow::Result<Vec<TokenId>> {
-        let mut ids = self.declared_eos_token_ids()?;
-        for id in self
-            .tokenizer
-            .as_deref()
-            .map(Tokenizer::eos_token_ids)
-            .unwrap_or_default()
-        {
-            if !ids.contains(&id) {
-                ids.push(id);
-            }
-        }
-        Ok(ids)
-    }
-
-    /// EOS ids the package's workflow declares, via the `eos_token_ids` role.
-    ///
-    /// Read from the workflow's own literal default, so a package states its
-    /// stop condition in the one place it states everything else. Without this
-    /// the declaration is inert: it would be materialized into the graph's
-    /// inputs and never reach the runtime's stop policy, which is what "declared
-    /// but dead" meant.
-    fn declared_eos_token_ids(&self) -> anyhow::Result<Vec<TokenId>> {
-        let workflow = self.workflow.workflow_spec();
-        workflow
-            .inputs
-            .values()
-            .filter(|input| {
-                matches!(
-                    &input.role,
-                    onnx_genai_metadata::SemanticInputRole::Runtime { role, .. }
-                        if *role == onnx_genai_metadata::RuntimeInputRole::EosTokenIds
-                )
-            })
-            .filter_map(|input| input.default.as_ref())
-            .map(literal_token_ids)
-            .collect::<anyhow::Result<Vec<_>>>()
-            .map(|groups| groups.concat())
+        self.metadata
+            .tokens
+            .as_ref()
+            .map(|tokens| tokens.eos_token_id.clone())
+            .map_or_else(|| Ok(Vec::new()), Ok)
     }
 
     /// Apply the model's stop condition to a request.
     ///
-    /// Every declared EOS id becomes a stop sequence, not just the first. A
+    /// Every effective EOS id becomes a stop sequence, not just the first. A
     /// model with two end tokens is stopped by either, which a single
     /// `eos_token_id` field cannot express — and silently dropping the rest
     /// means generation runs past its end and emits control tokens as text.
     ///
-    /// A caller's explicit `eos_token_id` selects which id is *reported* as the
-    /// EOS, and does not suppress the others: the model's end tokens are facts
-    /// about the model, and a request narrowing them would make the runtime emit
-    /// tokens the model meant as terminal.
-    fn apply_eos_defaults(&self, options: &mut GenerateOptions) -> anyhow::Result<()> {
+    /// A caller's explicit EOS set is a request override. When absent, the
+    /// package defaults come from top-level `tokens.eos_token_id`.
+    pub(super) fn apply_eos_defaults(&self, options: &mut GenerateOptions) -> anyhow::Result<()> {
         apply_eos_policy(options, &self.default_eos_token_ids()?);
         Ok(())
     }
@@ -2871,36 +2834,6 @@ impl Engine {
     }
 }
 
-/// Token ids carried by a workflow literal, scalar or list.
-///
-/// A package may declare one end token or several with the same field; reading
-/// both shapes here is what keeps "declare your EOS" from having two spellings.
-fn literal_token_ids(literal: &onnx_genai_metadata::LiteralValue) -> anyhow::Result<Vec<TokenId>> {
-    use onnx_genai_metadata::{LiteralValue, ScalarValue};
-    let scalars = match literal {
-        LiteralValue::Scalar(scalar) => std::slice::from_ref(scalar),
-        LiteralValue::Elements(elements) => elements.as_slice(),
-    };
-    scalars
-        .iter()
-        .map(|scalar| match scalar {
-            // Dropping a malformed id would be the worst outcome: the package
-            // says "these tokens end me", the runtime silently keeps a subset,
-            // and generation runs past an end token the author declared. A
-            // package that cannot state its stop condition must fail to load,
-            // not load with a quietly smaller one.
-            ScalarValue::Integer(value) => TokenId::try_from(*value).map_err(|_| {
-                anyhow::anyhow!(
-                    "declared end-of-generation token id {value} is not a valid token id"
-                )
-            }),
-            other => anyhow::bail!(
-                "declared end-of-generation token ids must be integers; found {other:?}"
-            ),
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3631,19 +3564,18 @@ mod tests {
 /// correctly on one route and runs past its end on another — which is
 /// unobservable from the API and shows up as a serving-only bug.
 pub(crate) fn apply_eos_policy(options: &mut GenerateOptions, ids: &[TokenId]) {
-    if !options.stop_on_eos {
-        return;
-    }
-    if options.eos_token_id.is_none()
-        && let Some(&id) = ids.first()
-    {
-        options.eos_token_id = Some(id);
-    }
-    for &id in ids {
+    if let Some(id) = options.eos_token_id {
         if !options.eos_token_ids.contains(&id) {
             options.eos_token_ids.push(id);
         }
+        return;
     }
+    if !options.eos_token_ids.is_empty() {
+        options.eos_token_id = options.eos_token_ids.first().copied();
+        return;
+    }
+    options.eos_token_ids.extend_from_slice(ids);
+    options.eos_token_id = options.eos_token_ids.first().copied();
 }
 
 /// The legacy direct decode path cannot be selected.
@@ -3715,33 +3647,5 @@ mod canonical_refusal_tests {
             );
         }
         Ok(())
-    }
-
-    /// A package whose declared end tokens are malformed fails loudly.
-    ///
-    /// Filtering them out would mean the package says "these tokens end me" and
-    /// the runtime silently keeps a subset — generation then runs past an end
-    /// token its author declared, which is invisible from the API.
-    #[test]
-    fn a_malformed_end_token_declaration_is_an_error() {
-        use onnx_genai_metadata::{LiteralValue, ScalarValue};
-        let error = super::literal_token_ids(&LiteralValue::Elements(vec![
-            ScalarValue::Integer(2),
-            ScalarValue::Integer(-1),
-        ]))
-        .expect_err("a negative token id is not a token id");
-        assert!(
-            format!("{error:#}").contains("not a valid token id"),
-            "{error:#}"
-        );
-
-        let error = super::literal_token_ids(&LiteralValue::Scalar(ScalarValue::String(
-            "eos".to_string(),
-        )))
-        .expect_err("a string is not a token id");
-        assert!(
-            format!("{error:#}").contains("must be integers"),
-            "{error:#}"
-        );
     }
 }

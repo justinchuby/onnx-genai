@@ -149,6 +149,29 @@ fn migrate(
     }
 
     let artifact = decoder_artifact(package)?;
+    let eos_token_ids = document
+        .get("tokens")
+        .and_then(|tokens| tokens.get("eos_token_id"))
+        .and_then(serde_yaml::Value::as_sequence)
+        .map(|ids| ids.iter().filter_map(serde_yaml::Value::as_i64).collect())
+        .or_else(|| {
+            document
+                .get("generation")
+                .and_then(|generation| generation.get("defaults"))
+                .and_then(|defaults| defaults.get("eos_token_ids"))
+                .and_then(serde_yaml::Value::as_sequence)
+                .map(|ids| ids.iter().filter_map(serde_yaml::Value::as_i64).collect())
+        })
+        .or_else(|| declared_eos_token_ids(&document))
+        .unwrap_or_default();
+    if eos_token_ids.is_empty() {
+        return Err(
+            "this autoregressive package declares no EOS token ids. Add its authoritative model \
+             defaults before conversion; the migrator will not guess numeric ids from tokenizer \
+             assets."
+                .into(),
+        );
+    }
     let facts = DecoderFacts {
         max_sequence_length: document
             .get("model")
@@ -159,17 +182,6 @@ fn migrate(
         // cache discipline, and a contract that disagrees with the graph is
         // rejected at load — so the conversion asks the artifact rather than
         // assuming.
-        // Carried across from the package's own generation defaults, so a
-        // model with several end tokens keeps all of them. Losing every id but
-        // the first is silent: generation simply runs past its end.
-        eos_token_ids: document
-            .get("generation")
-            .and_then(|generation| generation.get("defaults"))
-            .and_then(|defaults| defaults.get("eos_token_ids"))
-            .and_then(serde_yaml::Value::as_sequence)
-            .map(|ids| ids.iter().filter_map(serde_yaml::Value::as_i64).collect())
-            .or_else(|| declared_eos_token_ids(&document))
-            .unwrap_or_default(),
         port_contracts: onnx_genai_engine::graph_port_contracts(
             &package_directory(package).join(&artifact),
         )
@@ -200,6 +212,37 @@ fn migrate(
         .as_mapping_mut()
         .expect("a metadata document is a mapping")
         .insert(serde_yaml::Value::String("pipeline".to_string()), pipeline);
+    document.as_mapping_mut().expect("metadata mapping").insert(
+        serde_yaml::Value::String("schema_version".to_string()),
+        serde_yaml::Value::String(
+            onnx_genai_metadata::version::TOKEN_AUTHORITY_SCHEMA_VERSION.to_string(),
+        ),
+    );
+    let mut tokens = document
+        .get("tokens")
+        .and_then(serde_yaml::Value::as_mapping)
+        .cloned()
+        .unwrap_or_default();
+    tokens.insert(
+        serde_yaml::Value::String("eos_token_id".to_string()),
+        serde_yaml::to_value(
+            eos_token_ids
+                .iter()
+                .map(|id| u32::try_from(*id))
+                .collect::<Result<Vec<_>, _>>()?,
+        )?,
+    );
+    document.as_mapping_mut().expect("metadata mapping").insert(
+        serde_yaml::Value::String("tokens".to_string()),
+        serde_yaml::Value::Mapping(tokens),
+    );
+    if let Some(defaults) = document
+        .get_mut("generation")
+        .and_then(|generation| generation.get_mut("defaults"))
+        .and_then(serde_yaml::Value::as_mapping_mut)
+    {
+        defaults.remove(serde_yaml::Value::String("eos_token_ids".to_string()));
+    }
 
     let rendered = format!("{HEADER}{}", serde_yaml::to_string(&document)?);
     // Parse the result back through the real schema before writing. A tool that
@@ -211,18 +254,18 @@ fn migrate(
     Ok(Outcome::Converted)
 }
 
-/// End tokens an already-converted package states in its workflow.
+/// End tokens an old already-converted package states in its workflow.
 ///
 /// A re-emit must not lose them: the ids live on the workflow's own
-/// `eos_token_ids` literal input once a package has been converted, and reading
-/// them back is what keeps a rebuild a rebuild rather than a quiet reset to
+/// `eos_token_ids` literal input. Reading it is a one-time migration fallback
+/// that keeps a rebuild a rebuild rather than a quiet reset to
 /// "this model has no end token".
 fn declared_eos_token_ids(document: &serde_yaml::Value) -> Option<Vec<i64>> {
     let elements = document
         .get("pipeline")?
         .get("workflow")?
         .get("inputs")?
-        .get(onnx_genai_metadata::decoder_workflow::PACKAGE_EOS_TOKEN_IDS)?
+        .get("package.eos_token_ids")?
         .get("default")?
         .as_sequence()?;
     Some(

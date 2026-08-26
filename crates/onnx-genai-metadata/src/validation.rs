@@ -378,6 +378,7 @@ pub fn validate_metadata(metadata: &InferenceMetadata) -> Result<(), Vec<String>
     validate_schema_version(metadata, &mut errors);
     validate_retired_batching_capability(metadata, &mut errors);
     validate_preprocessing_workflow(metadata, &mut errors);
+    validate_token_authority(metadata, version, &mut errors);
     validate_generation_contract(metadata, &mut errors);
     validate_profiles(metadata, &mut errors);
     validate_profile_decoding(metadata, &mut errors);
@@ -420,6 +421,17 @@ fn validate_schema_version(metadata: &InferenceMetadata, errors: &mut Vec<String
         ));
         return;
     }
+    if metadata.tokens.is_some() && declared < crate::version::TOKEN_AUTHORITY_SCHEMA_VERSION {
+        let spelled = metadata.schema_version.as_deref().unwrap_or("<absent>");
+        errors.push(format!(
+            "this package declares top-level `tokens`, which schema version {} introduced, but \
+             declares schema_version '{spelled}' ({declared}); declare schema_version '{}' so an \
+             older reader refuses the package as a newer contract rather than reporting \
+             `tokens` as an unknown field",
+            crate::version::TOKEN_AUTHORITY_SCHEMA_VERSION,
+            crate::version::TOKEN_AUTHORITY_SCHEMA_VERSION
+        ));
+    }
     let Some(feature) = batching_schema_feature(metadata) else {
         return;
     };
@@ -434,6 +446,195 @@ fn validate_schema_version(metadata: &InferenceMetadata, errors: &mut Vec<String
              refused for the reason that is true"
         ));
     }
+}
+
+/// Enforce one authority for numeric token facts and one executable stop policy.
+fn validate_token_authority(
+    metadata: &InferenceMetadata,
+    version: crate::version::SchemaVersion,
+    errors: &mut Vec<String>,
+) {
+    if let Some(tokens) = &metadata.tokens {
+        let mut unique = BTreeSet::new();
+        for id in &tokens.eos_token_id {
+            if !unique.insert(id) {
+                errors.push(format!(
+                    "tokens.eos_token_id repeats id {id}; EOS ids are an ordered set"
+                ));
+            }
+        }
+    }
+
+    let Some(workflow) = metadata
+        .pipeline
+        .as_ref()
+        .map(|pipeline| &pipeline.workflow)
+    else {
+        return;
+    };
+
+    for (name, input) in &workflow.inputs {
+        if matches!(name.as_str(), "package.eos_ids" | "package.eos_token_ids") {
+            errors.push(format!(
+                "workflow input '{name}' is a retired duplicate of package token facts; move its \
+                     numeric ids to top-level `tokens.eos_token_id` and let an optional request \
+                     `eos_token_ids` role override them"
+            ));
+        }
+        if matches!(
+            &input.role,
+            crate::schema::SemanticInputRole::Runtime {
+                role: crate::schema::RuntimeInputRole::EosTokenIds
+                    | crate::schema::RuntimeInputRole::EosTokenLengths,
+                ..
+            }
+        ) && input.default.is_some()
+        {
+            errors.push(format!(
+                "workflow input '{name}' is a request EOS override but declares a literal \
+                     default; remove the default because package defaults derive from \
+                     top-level `tokens.eos_token_id`"
+            ));
+        }
+    }
+
+    if version < crate::version::TOKEN_AUTHORITY_SCHEMA_VERSION {
+        return;
+    }
+
+    let has_eos = metadata
+        .tokens
+        .as_ref()
+        .is_some_and(|tokens| !tokens.eos_token_id.is_empty());
+    validate_generation_eos_steps(&workflow.steps, workflow, has_eos, errors);
+
+    if metadata.speculative.is_some() {
+        if !has_eos {
+            errors.push(
+                "a speculative autoregressive package must declare non-empty \
+                     `tokens.eos_token_id`"
+                    .to_string(),
+            );
+        }
+        if !workflow.components.values().any(|component| {
+            component
+                .contract
+                .as_ref()
+                .is_some_and(is_termination_contract)
+        }) {
+            errors.push(
+                "a speculative autoregressive package must declare a component \
+                     implementing `onnx-genai.termination-predicate` or `onnx-genai.token-policy`; \
+                     this may be a portable ONNX policy graph or an explicit runtime binding, but the \
+                     speculative descriptor alone does not state stop semantics"
+                        .to_string(),
+            );
+        }
+    }
+}
+
+fn validate_generation_eos_steps(
+    steps: &[WorkflowStep],
+    workflow: &WorkflowSpec,
+    has_eos: bool,
+    errors: &mut Vec<String>,
+) {
+    for step in steps {
+        match step {
+            WorkflowStep::Sequence { steps } => {
+                validate_generation_eos_steps(steps, workflow, has_eos, errors);
+            }
+            WorkflowStep::Loop {
+                setup,
+                steps,
+                termination,
+                ..
+            } => {
+                if *termination == crate::schema::WorkflowLoopTermination::GenerationEos {
+                    if !has_eos {
+                        errors.push(
+                            "a `generation_eos` workflow loop must declare non-empty \
+                                 top-level `tokens.eos_token_id`"
+                                .to_string(),
+                        );
+                    }
+                    let mut invoked = BTreeSet::new();
+                    collect_token_policy_invocations(setup, &mut invoked);
+                    collect_token_policy_invocations(steps, &mut invoked);
+                    let has_policy = invoked.iter().any(|name| {
+                        workflow
+                            .components
+                            .get(*name)
+                            .and_then(|component| component.contract.as_ref())
+                            .is_some_and(is_termination_contract)
+                    });
+                    if !has_policy {
+                        errors.push(
+                                "a `generation_eos` workflow loop must invoke a component declaring \
+                                 `onnx-genai.termination-predicate` or `onnx-genai.token-policy`; EOS \
+                                 is executable semantics, not an implicit model-family behavior"
+                                    .to_string(),
+                            );
+                    }
+                }
+                validate_generation_eos_steps(setup, workflow, has_eos, errors);
+                validate_generation_eos_steps(steps, workflow, has_eos, errors);
+            }
+            WorkflowStep::Branch { cases, default, .. } => {
+                for case in cases.values() {
+                    validate_generation_eos_steps(
+                        std::slice::from_ref(case),
+                        workflow,
+                        has_eos,
+                        errors,
+                    );
+                }
+                if let Some(default) = default {
+                    validate_generation_eos_steps(
+                        std::slice::from_ref(default),
+                        workflow,
+                        has_eos,
+                        errors,
+                    );
+                }
+            }
+            WorkflowStep::Invoke { .. } | WorkflowStep::Emit { .. } => {}
+        }
+    }
+}
+
+fn collect_token_policy_invocations<'a>(
+    steps: &'a [WorkflowStep],
+    invoked: &mut BTreeSet<&'a str>,
+) {
+    for step in steps {
+        match step {
+            WorkflowStep::Invoke { component, .. } => {
+                invoked.insert(component);
+            }
+            WorkflowStep::Sequence { steps } => collect_token_policy_invocations(steps, invoked),
+            WorkflowStep::Loop { setup, steps, .. } => {
+                collect_token_policy_invocations(setup, invoked);
+                collect_token_policy_invocations(steps, invoked);
+            }
+            WorkflowStep::Branch { cases, default, .. } => {
+                for case in cases.values() {
+                    collect_token_policy_invocations(std::slice::from_ref(case), invoked);
+                }
+                if let Some(default) = default {
+                    collect_token_policy_invocations(std::slice::from_ref(default), invoked);
+                }
+            }
+            WorkflowStep::Emit { .. } => {}
+        }
+    }
+}
+
+fn is_termination_contract(contract: &crate::schema::ComponentContract) -> bool {
+    matches!(
+        contract.id.as_str(),
+        "onnx-genai.termination-predicate" | "onnx-genai.token-policy"
+    )
 }
 
 /// Reject the old opt-in spelling for an optimization the runtime derives.

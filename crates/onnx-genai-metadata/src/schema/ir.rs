@@ -746,11 +746,11 @@ pub enum RuntimeInputRole {
     MaxOutputTokens,
     /// Token ids that end generation.
     ///
-    /// A set, not a single id: a model may end a turn with one token and a
-    /// message with another, and both must stop. Declaring it here is what lets
-    /// the runtime's stop policy read a package's EOS from the package instead
-    /// of rediscovering it from tokenizer side-files it may not ship.
+    /// The request value overrides `tokens.eos_token_id`. It never carries an
+    /// authored package default.
     EosTokenIds,
+    /// Number of valid entries in each row of a padded EOS-id tensor.
+    EosTokenLengths,
     Seed,
     GuidanceScale,
     Width,

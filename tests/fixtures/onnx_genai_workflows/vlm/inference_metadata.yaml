@@ -1,4 +1,7 @@
-schema_version: v1
+schema_version: v1.2
+tokens:
+  eos_token_id:
+  - 2
 preprocessing:
   image:
     transforms:
@@ -155,12 +158,12 @@ pipeline:
             kind: request_aligned
             axis: 0
         role:
-          kind: opaque
+          kind: runtime
+          version: '1.0'
+          role: eos_token_ids
         source:
-          kind: application
-          name: eos_ids
-        required: false
-        default: 2
+          kind: request
+        required: true
       request.eos_lengths:
         contract:
           dtype: int64
@@ -171,12 +174,12 @@ pipeline:
             kind: request_aligned
             axis: 0
         role:
-          kind: opaque
+          kind: runtime
+          version: '1.0'
+          role: eos_token_lengths
         source:
-          kind: application
-          name: eos_lengths
-        required: false
-        default: 1
+          kind: request
+        required: true
       request.row_max_iterations:
         contract:
           dtype: int64
@@ -193,18 +196,6 @@ pipeline:
           name: row_max_iterations
         required: false
         default: -1
-      package.eos_ids:
-        contract:
-          dtype: int64
-          rank: 1
-          shape:
-          - 1
-        role:
-          kind: opaque
-        source:
-          kind: literal
-        required: false
-        default: 2
       package.max_context:
         contract:
           dtype: int64
@@ -1632,13 +1623,6 @@ package:
     algorithm: bpe
     vocab_size: 32000
     byte_level: true
-    special_tokens:
-      bos:
-        id: 1
-        content: <s>
-      eos:
-        id: 2
-        content: </s>
   constraint_languages:
   - dialect: gbnf
     version: '1'

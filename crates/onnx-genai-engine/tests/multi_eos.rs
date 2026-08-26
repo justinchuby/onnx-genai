@@ -31,7 +31,6 @@ use std::path::{Path, PathBuf};
 use onnx_genai_engine::{
     Engine, EngineConfig, FinishReason, GenerateOptions, GeneratePrompt, GenerateRequest,
 };
-use onnx_genai_metadata::decoder_workflow::PACKAGE_EOS_TOKEN_IDS;
 
 fn decoder_package() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm")
@@ -52,25 +51,15 @@ fn package_declaring_eos_from(source: &Path, ids: &[i64]) -> anyhow::Result<temp
 
     let path = staged.path().join("inference_metadata.yaml");
     let mut document: serde_yaml::Value = serde_yaml::from_str(&std::fs::read_to_string(&path)?)?;
-    let declaration: serde_yaml::Value = serde_yaml::from_str(&format!(
-        "contract: {{dtype: int64, rank: 1, shape: [eos_count]}}\n\
-         role: {{kind: runtime, version: '1.0', role: eos_token_ids}}\n\
-         source: {{kind: literal}}\n\
-         required: false\n\
-         externally_suppliable: true\n\
-         default: [{}]\n",
-        ids.iter()
-            .map(i64::to_string)
-            .collect::<Vec<_>>()
-            .join(", ")
-    ))?;
-    document["pipeline"]["workflow"]["inputs"]
-        .as_mapping_mut()
-        .expect("workflow inputs")
-        .insert(
-            serde_yaml::Value::String(PACKAGE_EOS_TOKEN_IDS.to_string()),
-            declaration,
-        );
+    document["schema_version"] = serde_yaml::Value::String("v1.2".to_string());
+    document["tokens"] = serde_yaml::to_value(serde_yaml::Mapping::from_iter([(
+        serde_yaml::Value::String("eos_token_id".to_string()),
+        serde_yaml::to_value(
+            ids.iter()
+                .map(|id| u32::try_from(*id))
+                .collect::<Result<Vec<_>, _>>()?,
+        )?,
+    )]))?;
     std::fs::write(&path, serde_yaml::to_string(&document)?)?;
     Ok(staged)
 }
@@ -107,19 +96,16 @@ fn greedy_prefix(length: usize) -> anyhow::Result<Vec<u32>> {
 fn a_package_may_declare_several_end_tokens() -> anyhow::Result<()> {
     let staged = package_declaring_eos(&[11, 22, 33])?;
     let engine = Engine::from_dir(staged.path(), EngineConfig::default())?;
-    let workflow = engine
-        .package_workflow()
-        .expect("a loaded package declares a workflow");
-    let declared = workflow
-        .inputs
-        .get(PACKAGE_EOS_TOKEN_IDS)
-        .expect("the staged package declares its end tokens");
-    match declared.default.as_ref().expect("a literal default") {
-        onnx_genai_metadata::LiteralValue::Elements(elements) => {
-            assert_eq!(elements.len(), 3, "all three ids survive the round trip");
-        }
-        other => panic!("expected an element list, got {other:?}"),
-    }
+    assert_eq!(
+        engine
+            .metadata()
+            .tokens
+            .as_ref()
+            .expect("the staged package declares token facts")
+            .eos_token_id,
+        [11, 22, 33],
+        "all three ids survive the round trip"
+    );
     Ok(())
 }
 
@@ -165,30 +151,29 @@ fn every_declared_end_token_stops_generation() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A second declared end token stops even when the request names the first.
-///
-/// This is the Muse-Glimmer shape: `<|eot|>` and `<|eom|>` are both terminal,
-/// and a caller naming one must not resurrect the other as ordinary text.
+/// An explicit request EOS set replaces the package default for that request.
 #[test]
-fn a_request_naming_one_end_token_does_not_disarm_the_others() -> anyhow::Result<()> {
+fn a_request_eos_set_overrides_the_package_default() -> anyhow::Result<()> {
     let prefix = greedy_prefix(6)?;
-    let unreachable = i64::from(u16::MAX);
-    let real_stop = i64::from(prefix[1]);
-    assert_ne!(real_stop, unreachable);
+    let package_stop = i64::from(prefix[0]);
+    let request_stop = prefix[2];
+    assert_ne!(package_stop, i64::from(request_stop));
 
-    let staged = package_declaring_eos(&[unreachable, real_stop])?;
+    let staged = package_declaring_eos(&[package_stop])?;
     let mut engine = Engine::from_dir(staged.path(), EngineConfig::default())?;
     let mut probe = request(32);
-    // The request names the id the model never emits. The *other* declared id
-    // must still stop it.
-    probe.options.eos_token_id = Some(unreachable as u32);
+    probe.options.eos_token_ids = vec![request_stop];
     let result = engine.generate(probe)?;
     assert_eq!(
         result.finish_reason,
         FinishReason::EosToken,
-        "the model's other end token must still stop generation: {result:?}"
+        "the request's end token must stop generation: {result:?}"
     );
-    assert_eq!(result.token_ids.len(), 2, "{result:?}");
+    assert_eq!(
+        result.token_ids.len(),
+        3,
+        "the package default must not stop the overridden request: {result:?}"
+    );
     Ok(())
 }
 

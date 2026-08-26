@@ -2266,13 +2266,6 @@ package:
     algorithm: bpe
     vocab_size: 32000
     byte_level: true
-    special_tokens:
-      bos:
-        id: 1
-        content: <s>
-      eos:
-        id: 2
-        content: </s>
   constraint_languages:
   - dialect: gbnf
     version: '1'
