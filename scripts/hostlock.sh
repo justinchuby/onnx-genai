@@ -1792,16 +1792,50 @@ cmd_wait() {
 # than assumed away: stop_wrapped_tree verifies leadership before signalling.
 SETSID_BIN=$(command -v setsid 2>/dev/null || true)
 
-# Is anything still running in this process group?
+# Is anything under this target still RUNNING? `target` is a pid, or "-PGID"
+# for a whole process group -- the same spelling the signals below use, so the
+# thing verified is exactly the thing signalled.
 #
-# Deliberately `pgrep` rather than `kill -0`. This is a liveness QUESTION, not
-# a signal, and the suite pins the number of calls in the kill family to an
-# exact count so that this script's signalling surface stays countable by eye
-# -- the property that keeps a host lock structurally incapable of stopping
-# anything it did not start. A probe spelled as a kill would inflate that
-# count and blunt the guard for no gain.
-group_alive() {
-    [ -n "$1" ] && [ -n "$(pgrep -g "$1" 2>/dev/null)" ]
+# ZOMBIES DO NOT COUNT. An unreaped child is a zombie, a zombie is still a
+# member of its process group, and one that read as live would fire the
+# escalation and the warning on every clean teardown. A zombie holds no cores,
+# and cores are the only thing this lock is about.
+#
+# Deliberately `pgrep`/`/proc` rather than `kill -0`. This is a liveness
+# QUESTION, not a signal, and the suite pins the number of calls in the kill
+# family to an exact count so that this script's signalling surface stays
+# countable by eye -- the property that keeps a host lock structurally
+# incapable of stopping anything it did not start. A probe spelled as a kill
+# would inflate that count and blunt the guard for no gain.
+target_alive() {
+    local t=$1 pids p st
+    [ -n "$t" ] || return 1
+    if [ "${t#-}" != "$t" ]; then
+        pids=$(pgrep -g "${t#-}" 2>/dev/null)
+    else
+        pids=$t
+    fi
+    for p in $pids; do
+        st=$(proc_state_and_start "$p" 2>/dev/null | awk '{print $1}')
+        [ -n "$st" ] || continue
+        [ "$st" = Z ] || return 0
+    done
+    return 1
+}
+
+# The pids still running under a target, for the warning below.
+live_under() {
+    local t=$1 pids p st out=""
+    if [ "${t#-}" != "$t" ]; then
+        pids=$(pgrep -g "${t#-}" 2>/dev/null)
+    else
+        pids=$t
+    fi
+    for p in $pids; do
+        st=$(proc_state_and_start "$p" 2>/dev/null | awk '{print $1}')
+        [ -n "$st" ] && [ "$st" != Z ] && out="${out}${p} "
+    done
+    printf '%s' "$out"
 }
 
 # Stop the wrapped command AND everything it started.
@@ -1827,40 +1861,55 @@ group_alive() {
 # payloads that leak are exactly the ones that do not die on TERM. Then VERIFY
 # rather than assume: "a signal was sent" and "the cores are free" are
 # different claims, and the whole purpose of this script is to make the second.
+#
+# Every wait here is BOUNDED. The first draft of this function reaped the child
+# with a plain `wait` before polling, which is correct for a child that dies
+# and an unbounded hang for one that does not: a `mut_hl.sh` run with
+# `trap ... TERM` that returns instead of exiting held teardown in `wait`
+# forever, so the escalation below was never reached and the lock was never
+# released. That is the same defect as the one being fixed -- a bound that can
+# itself block is not a bound -- so the child is reaped only once it is known
+# to be dead or a zombie, and never blocked on.
 stop_wrapped_tree() {
-    local child=$1 pgid tries survivors
-    pgid=$(proc_pgid "$child" 2>/dev/null || echo "")
+    local child=$1 pgid target tries survivors state
 
-    if [ -z "$pgid" ] || [ "$pgid" != "$child" ]; then
+    pgid=$(proc_pgid "$child" 2>/dev/null || echo "")
+    if [ -n "$pgid" ] && [ "$pgid" = "$child" ]; then
+        target="-$pgid"
+    else
         # Not a group leader -- setsid missing, or it forked instead of
         # exec'ing. Signalling "-$pgid" here would hit OUR OWN group, taking
         # down this script and its caller along with the benchmark. Falling
-        # back to the single pid keeps the old, narrower behaviour rather than
+        # back to the single pid keeps the old, narrower reach rather than
         # trading a leak for a much worse failure.
-        kill -TERM "$child" 2>/dev/null
-        wait "$child" 2>/dev/null
-        return
+        target="$child"
     fi
 
-    kill -TERM "-$pgid" 2>/dev/null
-    # Reap the direct child before polling the group: an unwaited child is a
-    # zombie, a zombie is still a group member, and the liveness probe below
-    # would report it as surviving load. Without this the escalation below
-    # always fires and the warning is emitted for every clean teardown.
-    wait "$child" 2>/dev/null
+    kill -TERM "$target" 2>/dev/null
 
     tries=0
-    while [ "$tries" -lt 20 ]; do
-        group_alive "$pgid" || return 0
+    while [ "$tries" -lt 20 ] && target_alive "$target"; do
         sleep 0.5
         tries=$((tries + 1))
     done
 
-    kill -KILL "-$pgid" 2>/dev/null
-    sleep 0.5
-    if group_alive "$pgid"; then
-        survivors=$(pgrep -g "$pgid" 2>/dev/null | tr '\n' ' ')
-        echo "hostlock: WARNING the wrapped command's process group (${pgid}) survived both signals: ${survivors:-unknown}. The lock is being released, but this load is still on the cores -- the host is NOT free." >&2
+    if target_alive "$target"; then
+        kill -KILL "$target" 2>/dev/null
+        sleep 0.5
+        if target_alive "$target"; then
+            survivors=$(live_under "$target")
+            echo "hostlock: WARNING the wrapped command (${target}) survived both signals: ${survivors:-unknown}. The lock is being released, but this load is still on the cores -- the host is NOT free." >&2
+        fi
+    fi
+
+    # Reap, but never BLOCK on it: `wait` on something that outlived KILL
+    # (uninterruptible sleep, a stopped process) would hang here, which is
+    # exactly what this function exists to stop happening. If it is still
+    # alive the warning above already said so; leaving a zombie for init to
+    # collect is strictly better than a silent hang.
+    state=$(proc_state_and_start "$child" 2>/dev/null | awk '{print $1}')
+    if [ -z "$state" ] || [ "$state" = Z ]; then
+        wait "$child" 2>/dev/null
     fi
 }
 
@@ -1923,19 +1972,39 @@ cmd_run() {
     # failing in precisely the case it exists for. `wait` is interruptible,
     # so this makes the signal handlers actually prompt. It also lets us stop
     # the wrapped command, which the inline form left running.
-    local child rc wall0 wall1 cpu0 cpu1
+    local child rc wall0 wall1 cpu0 cpu1 monitor_was_on
     wall0=$(wall_now)
+    # Job control OFF across the spawn, and restored immediately after.
+    #
+    # `setsid` execs IN PLACE when its caller is not a process-group leader,
+    # and FORKS when it is. A bash background job is not a leader -- unless
+    # monitor mode is on, which puts every background job in a group of its
+    # own. Then `$!` is the short-lived setsid parent: `wait` returns at once,
+    # this script prints "released", frees the lock, and the benchmark runs on
+    # an unlocked host. Measured, not feared: with `SHELLOPTS=monitor` in the
+    # environment (bash imports it, so no edit to this file is needed to reach
+    # this), `run -- sh -c 'sleep 3'` reported `wall=0.010s` and released while
+    # the sleep was still running.
+    #
+    # Restored rather than left off, because `-m` is the caller's setting and
+    # this script is not entitled to keep it; by then the child is already in
+    # its own session and cannot be moved back.
+    monitor_was_on=0
+    case "$-" in *m*) monitor_was_on=1 ;; esac
+    set +m
     # Spawn into its OWN process group so teardown can stop the tree rather
-    # than one pid (see stop_wrapped_tree). `setsid` execs in place when its
-    # caller is not a process-group leader, which a bash background job never
-    # is, so `$!` is the new leader and its pgid equals its own pid. That is
-    # verified before any group signal, never assumed.
+    # than one pid (see stop_wrapped_tree). `$!` is then the new group leader
+    # and its pgid equals its own pid -- verified before any group signal,
+    # never assumed.
     if [ -n "$SETSID_BIN" ]; then
         "$SETSID_BIN" "$@" &
     else
         "$@" &
     fi
     child=$!
+    if [ "$monitor_was_on" = 1 ]; then
+        set -m
+    fi
 
     # Traps first. Reading the child's start time forks, and a signal arriving
     # in that window would take the script's default action -- leaking the
@@ -1970,8 +2039,8 @@ cmd_run() {
     # something and exited successfully, so stopping it would be this script
     # overruling a deliberate act. On the SIGNAL path the run is being aborted
     # and stop_wrapped_tree does kill, which is the opposite situation.
-    if group_alive "$RUN_CHILD_PGID"; then
-        echo "hostlock: WARNING the command exited but left its process group (${RUN_CHILD_PGID}) running: $(pgrep -g "$RUN_CHILD_PGID" 2>/dev/null | tr '\n' ' '). Releasing anyway; the host is not necessarily idle." >&2
+    if [ -n "$RUN_CHILD_PGID" ] && target_alive "-$RUN_CHILD_PGID"; then
+        echo "hostlock: WARNING the command exited but left its process group (${RUN_CHILD_PGID}) running: $(live_under "-$RUN_CHILD_PGID"). Releasing anyway; the host is not necessarily idle." >&2
     fi
     remove_lock_if_mine
     echo "hostlock: released (command exit ${rc})"

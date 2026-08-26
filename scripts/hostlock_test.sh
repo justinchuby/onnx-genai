@@ -60,7 +60,7 @@ HL=scripts/hostlock.sh
 pass=0
 fail=0
 
-cleanup() { rm -rf "$LOCK" "$LOCK".cpuself "$LOCK".reaper "$LOCK".reaper.stage.* "$LOCK".reaper.dead.* "$LOCK".reaper.rel.* "$LOCK".dead.* "$LOCK".stage.* "$LOCK".gate "$LOCK".warn "$LOCK".zombie.* "$LOCK".zpid "$LOCK".ttlmarker "$LOCK".ran "$LOCK".conf "$LOCK".legacy "$LOCK".box "$LOCK".sourced "$LOCK".legacyran "$LOCK".owner "$LOCK".nested "$LOCK".ro "$LOCK".deep "$LOCK".file "$LOCK".nox "$LOCK".conf2 "$LOCK".helpconf "$LOCK".helppoison "$LOCK".wait "$LOCK".grandchild 2>/dev/null; }
+cleanup() { rm -rf "$LOCK" "$LOCK".cpuself "$LOCK".reaper "$LOCK".reaper.stage.* "$LOCK".reaper.dead.* "$LOCK".reaper.rel.* "$LOCK".dead.* "$LOCK".stage.* "$LOCK".gate "$LOCK".warn "$LOCK".zombie.* "$LOCK".zpid "$LOCK".ttlmarker "$LOCK".ran "$LOCK".conf "$LOCK".legacy "$LOCK".box "$LOCK".sourced "$LOCK".legacyran "$LOCK".owner "$LOCK".nested "$LOCK".ro "$LOCK".deep "$LOCK".file "$LOCK".nox "$LOCK".conf2 "$LOCK".helpconf "$LOCK".helppoison "$LOCK".wait "$LOCK".grandchild "$LOCK".stubborn 2>/dev/null; }
 trap cleanup EXIT
 
 chk() {
@@ -392,6 +392,55 @@ if [ -n "$grandchild" ] && alive "$grandchild"; then
     wait "$grandchild" 2>/dev/null
 fi
 rm -f "$LOCK".grandchild
+
+# ...and a command that IGNORES SIGTERM is still stopped, within a bound.
+#
+# TERM alone is not a teardown: the payloads that leak are precisely the ones
+# that do not die on it. So the escalation is TERM, a bounded poll, then KILL
+# -- and the poll must never be a blocking `wait`. The first draft of this fix
+# reaped the child with a plain `wait` before polling, which hangs teardown
+# forever on a child that handles TERM and returns; that was not a thought
+# experiment, it happened here, to a mutation harness whose `trap ... TERM`
+# restored a file and carried on, and it held the lock indefinitely.
+rm -f "$LOCK".stubborn
+$HL run --owner leon --reason "ignores TERM" -- \
+    bash -c "trap '' TERM; echo \$\$ > '$LOCK.stubborn'; while :; do sleep 1; done" \
+    >/dev/null 2>&1 &
+runner=$!
+sleep 3
+stubborn=$(cat "$LOCK".stubborn 2>/dev/null)
+chk "the wrapped command that ignores SIGTERM is running" \
+    "$([ -n "$stubborn" ] && alive "$stubborn" && echo yes || echo no)" "yes"
+sig "$runner" 15
+chk "the runner terminates even though its command ignores SIGTERM" \
+    "$(wait_bounded "$runner" && echo yes || echo no)" "yes"
+sleep 1
+chk "and the escalation to a signal it cannot ignore actually stopped it" \
+    "$(alive "$stubborn" && echo surviving || echo stopped)" "stopped"
+chk "and the lock was released rather than held by a blocked teardown" "$(st state)" "FREE"
+if [ -n "$stubborn" ] && alive "$stubborn"; then sig "$stubborn" 9; fi
+rm -f "$LOCK".stubborn
+
+# ...and job control does not turn the spawn into a fire-and-forget.
+#
+# `setsid` execs in place when its caller is not a process-group leader and
+# FORKS when it is. Monitor mode puts every background job in a group of its
+# own, making it a leader -- so with `-m` on, `$!` is the short-lived setsid
+# parent, `wait` returns immediately, and the lock is released while the
+# command runs on. Measured before this guard existed: this exact invocation
+# reported `wall=0.010s` and released, with the sleep still on the box.
+#
+# `SHELLOPTS` is imported by bash from the environment, so this reaches the
+# defect without editing the script -- which is also why the guard is needed:
+# no caller has to opt in for it to happen.
+mon_out=$(env SHELLOPTS=monitor "$HL" run --owner leon --reason "monitor mode" -- \
+    sh -c 'sleep 2' 2>&1)
+mon_wall=$(printf '%s\n' "$mon_out" | sed -n 's/.*wall=\([0-9.]*\)s.*/\1/p' | head -1)
+chk "the run reported a wall time at all" \
+    "$([ -n "$mon_wall" ] && echo yes || echo no)" "yes"
+chk "job control does not make the run release while its command is still going" \
+    "$(awk -v w="${mon_wall:-0}" 'BEGIN { print (w + 0 >= 1.5) ? "waited" : "released-early" }')" \
+    "waited"
 
 # SIGKILL cannot be trapped, so the lock survives; the anchor is the runner's
 # own pid, so the next acquirer must reap it. This is the case the pid anchor
@@ -1809,19 +1858,20 @@ cleanup
 # not, because --timeout/GATE_TIMEOUT would swamp it.
 kills=$(sed -E '/^[[:space:]]*#/d' "$HL" \
     | grep -oEi '(p?kill(all)?|killpg|pthread_kill|fuser)|timeout[[:space:]]+(-[sk]|--signal|--kill-after)|\bxargs\b' | wc -l)
-# Four OCCURRENCES on three lines, and the difference is worth stating because
-# this number is meant to be audited by eye: `kill -TERM "$child"` (the
-# not-a-group-leader fallback), `kill -TERM "-$pgid"`, and `kill -KILL
-# "-$pgid"` -- the last matching twice, once for the verb and once for the
-# signal name. Three calls, one per escalation step, all in stop_wrapped_tree.
+# Three OCCURRENCES on two lines, and the difference is worth stating because
+# this number is meant to be audited by eye: `kill -TERM "$target"` and
+# `kill -KILL "$target"` -- the second matching twice, once for the verb and
+# once for the signal name. Two calls, one per escalation step, both in
+# stop_wrapped_tree, and `target` is pinned by its own assertion below to hold
+# either the group the child leads or the child pid.
 #
 # It was one call until the teardown was found to stop only its DIRECT child,
 # leaving a wrapped `cargo`'s test binaries spinning while this lock reported
 # the host free. Raising an exact count is precisely the kind of change this
 # assertion exists to force someone to justify, which is why it is raised here
 # rather than relaxed to a threshold -- a threshold would have absorbed the
-# same three lines in silence.
-chk "exactly four calls in the kill family anywhere in the script" "$kills" "4"
+# same lines in silence.
+chk "exactly three calls in the kill family anywhere in the script" "$kills" "3"
 # ...and every one of them targets the command this script started, or the
 # process group that command LEADS -- never a pid or a group from anywhere else.
 #
@@ -1834,11 +1884,11 @@ chk "exactly four calls in the kill family anywhere in the script" "$kills" "4"
 kill_lines=$(sed -E '/^[[:space:]]*#/d' "$HL" | grep -cE '^[[:space:]]*kill[[:space:]]')
 # shellcheck disable=SC2016  # matching source text literally, not expanding it
 kill_targeted=$(sed -E '/^[[:space:]]*#/d' "$HL" \
-    | grep -cE '^[[:space:]]*kill[[:space:]]+-[A-Z0-9]+[[:space:]]+"(\$child|-\$pgid)"')
+    | grep -cE '^[[:space:]]*kill[[:space:]]+-[A-Z0-9]+[[:space:]]+"\$target"')
 chk "every kill targets the started command or the group it leads" \
     "$kill_targeted" "$kill_lines"
 chk "and there was at least one to check, so the ratio is not vacuous" \
-    "$([ "${kill_lines:-0}" -ge 3 ] && echo yes || echo no)" "yes"
+    "$([ "${kill_lines:-0}" -ge 2 ] && echo yes || echo no)" "yes"
 # ...and it verifies that pid before signalling. Pids on this box cycle at
 # ~1.5M in four days, so signalling on "the pid still exists" would let the
 # one place this script signals anything hit a process it never started.
@@ -1867,44 +1917,62 @@ chk "and the teardown guard is exactly a start-time comparison" "$teardown_body"
 # nobody will correctly update.
 #
 # Two properties in here cannot be reached behaviourally, which is the whole
-# reason for a golden. The `[ "$pgid" != "$child" ]` bail-out is the difference
-# between signalling the wrapped tree and signalling THIS SCRIPT'S OWN GROUP:
-# with setsid missing the child leads no group, and `-$pgid` then names the
-# runner, its caller and the agent's shell. Reproducing that means removing
-# setsid from the box. And the `wait` before the first liveness poll is what
-# keeps a not-yet-reaped child -- a zombie is still a group member -- from
-# reading as surviving load, which would fire the escalation and the warning
-# on every clean teardown.
+# reason for a golden. The `[ "$pgid" = "$child" ]` leadership check is the
+# difference between signalling the wrapped tree and signalling THIS SCRIPT'S
+# OWN GROUP: with setsid missing the child leads no group, and `-$pgid` then
+# names the runner, its caller and the agent's shell. Reproducing that means
+# removing setsid from the box. And the reap at the end is guarded on the
+# child being gone or a zombie because a plain `wait` there hangs teardown
+# forever on a child that handles TERM and returns -- observed, on this box,
+# on a mutation harness whose `trap ... TERM` restored a file and carried on.
+# A bound that can itself block is not a bound, and that is the whole subject
+# of this fix.
 stop_body=$(awk '/^stop_wrapped_tree\(\) \{/,/^\}/' "$HL" \
     | sed -E '/^[[:space:]]*#/d; s/^[[:space:]]+//; s/[[:space:]]+$//; /^$/d')
 stop_expected=$(cat <<'GOLDEN'
 stop_wrapped_tree() {
-local child=$1 pgid tries survivors
+local child=$1 pgid target tries survivors state
 pgid=$(proc_pgid "$child" 2>/dev/null || echo "")
-if [ -z "$pgid" ] || [ "$pgid" != "$child" ]; then
-kill -TERM "$child" 2>/dev/null
-wait "$child" 2>/dev/null
-return
+if [ -n "$pgid" ] && [ "$pgid" = "$child" ]; then
+target="-$pgid"
+else
+target="$child"
 fi
-kill -TERM "-$pgid" 2>/dev/null
-wait "$child" 2>/dev/null
+kill -TERM "$target" 2>/dev/null
 tries=0
-while [ "$tries" -lt 20 ]; do
-group_alive "$pgid" || return 0
+while [ "$tries" -lt 20 ] && target_alive "$target"; do
 sleep 0.5
 tries=$((tries + 1))
 done
-kill -KILL "-$pgid" 2>/dev/null
+if target_alive "$target"; then
+kill -KILL "$target" 2>/dev/null
 sleep 0.5
-if group_alive "$pgid"; then
-survivors=$(pgrep -g "$pgid" 2>/dev/null | tr '\n' ' ')
-echo "hostlock: WARNING the wrapped command's process group (${pgid}) survived both signals: ${survivors:-unknown}. The lock is being released, but this load is still on the cores -- the host is NOT free." >&2
+if target_alive "$target"; then
+survivors=$(live_under "$target")
+echo "hostlock: WARNING the wrapped command (${target}) survived both signals: ${survivors:-unknown}. The lock is being released, but this load is still on the cores -- the host is NOT free." >&2
+fi
+fi
+state=$(proc_state_and_start "$child" 2>/dev/null | awk '{print $1}')
+if [ -z "$state" ] || [ "$state" = Z ]; then
+wait "$child" 2>/dev/null
 fi
 }
 GOLDEN
 )
-chk "the tree stop is exactly verify-leadership, TERM, reap, poll, KILL, warn" \
+chk "the tree stop is exactly verify-leadership, TERM, bounded poll, KILL, warn, guarded reap" \
     "$stop_body" "$stop_expected"
+
+# The two targets that golden can name are the only two it may name. The kill
+# ratio below matches `"$target"`, so what `target` is ALLOWED to hold is the
+# assertion that keeps that ratio meaningful.
+# shellcheck disable=SC2016  # matching source text literally, not expanding it
+chk "the signal target is the led group or the child pid, and nothing else" \
+    "$(grep -cE '^[[:space:]]*target="(-\$pgid|\$child)"$' "$HL")" "2"
+
+# ...and no wait in that function is unbounded. `wait` with no guard is how
+# the first draft of this fix hung, and it reads as harmless.
+chk "the only wait in the tree stop is the guarded one" \
+    "$(awk '/^stop_wrapped_tree\(\) \{/,/^\}/' "$HL" | grep -cE '^[[:space:]]*wait ')" "1"
 
 # ...and the group is only ever recorded when the child genuinely leads it.
 # Dropping this one line leaves every golden above byte-identical while
@@ -2936,7 +3004,7 @@ cleanup
 # the inert R1 block and the vacuous STALE arm that this PR exists to fix.
 # Every probe branch asserts something, so the total is invariant across
 # environments; if a refactor drops a check, this fails and says so.
-chk "every assertion in this file ran" "$((pass + fail + 1))" "443"
+chk "every assertion in this file ran" "$((pass + fail + 1))" "451"
 
 echo
 echo "passed=${pass} failed=${fail}"
