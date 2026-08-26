@@ -70,6 +70,13 @@ holder_of_the_host_lock() {
   # claim nobody is honouring. Yielding nothing there means we re-exec and
   # take the lock properly -- including, in the expired case, from an
   # ancestor of our own, which is a beat of double custody and correct.
+  #
+  # It is not free, and the cost belongs written down rather than glossed:
+  # an ancestor whose lock expired while it is still benchmarking has lost
+  # custody but not the CPU, so re-acquiring here starts three pools on top
+  # of a live run. That is the lock's own expiry contract and not something
+  # this script can second-guess -- the fix is a longer `--timeout` on the
+  # outer holder, not a census that honours claims nobody is keeping.
   ./scripts/hostlock.sh status 2>/dev/null |
     sed -n 's/^HELD by [^ ]* pid=\([0-9][0-9]*\) .*/\1/p'
 }

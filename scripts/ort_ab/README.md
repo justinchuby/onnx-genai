@@ -542,12 +542,14 @@ false positive is a silent pass with no ledger line:
   `echo "run this under: scripts/hostlock.sh run -- $0"` certified a file that
   called nothing. `${x#-}`, `$#` and `a#b` survive, because a `#` only opens a
   comment at the start of a word. A heredoc terminator has to be the delimiter
-  *alone* on its line (`<<-` allows leading tabs, nothing allows spaces), and
-  a delimiter that never arrives consumes the rest of the file — which is what
-  `sh` itself does with it. That last rule is only safe because `$(( 1 << k ))`,
-  `(( n = 1 << k ))`, a `<<` inside a string and a `<<<` herestring are
-  excluded *before* the heredoc scan rather than after: each one would
-  otherwise open a phantom body and blank a real acquisition below it.
+  *alone* on its line (`<<-` allows leading tabs, nothing allows spaces) and
+  is quote-removed first, as the shell does it — `<<'EOF'`, `<<"EOF"`,
+  `<<\EOF` and `<<E"O"F` all name `EOF` — and a delimiter that never arrives
+  consumes the rest of the file, which is what `sh` itself does with it. That
+  last rule is only safe because `$(( 1 << k ))`, `(( n = 1 << k ))`, a `<<`
+  inside a string and a `<<<` herestring are excluded *before* the heredoc
+  scan rather than after: each one would otherwise open a phantom body and
+  blank a real acquisition below it.
 - The match must be in **command position** — start of line or after
   `;`, `|`, `&`, `(`, `)`, `{`, `}`, past any `VAR=` assignments and any of
   `exec`, `env`, `sudo`, `then`, `do`. Single-line quoted regions are kept
@@ -573,7 +575,15 @@ whitespace before a quoted delimiter to defeat a fixed-width lookback; and an
 earlier version of this paragraph's own claim that an unterminated heredoc
 "blanks nothing", which was both fail-open and untrue of `sh` — `bash` warns
 and exits 0, `dash` says nothing at all, and in neither case does the body
-run. All five are cells now rather than caveats.
+run. Two more went the other way and were caught by mutation rather than by
+review: `<<\EOF` and `<<E"O"F` were matched as `\EOF` and `E`, and a delimiter
+class wide enough to swallow the `;` in `cat <<EOF; echo hi` would do the
+same. Those fail *closed*, which is the safer direction and still the wrong
+answer — `<<\EOF` is an ordinary way to write `<<'EOF'`, and a check that
+demands a lock from a file already taking one gets deleted rather than obeyed.
+All of them are cells now rather than caveats, and the last three are
+**positive** cells: an over-blanking bug cannot be seen by a "this usage text
+is not custody" case, because that passes either way.
 
 Both properties came from real files. `decode_placement_census.sh` now **takes
 the lock** once for the whole census, by re-executing under `hostlock.sh run`,
