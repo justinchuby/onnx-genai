@@ -81,6 +81,19 @@ jobs:
           # Only an explicit, fully-classified all-docs diff flips it to true.
           docs_only=false
 
+          # Use and test the same predicate that classifies the real diff. A
+          # broken/missing classifier cannot abort this job and make dependent
+          # required checks skip: it marks the instrument unhealthy below,
+          # which forces full CI.
+          scope_classifier_ok=false
+          if [ -r .github/scripts/ci_change_scope.sh ] \
+            && . .github/scripts/ci_change_scope.sh \
+            && ci_change_scope_self_test; then
+            scope_classifier_ok=true
+          else
+            echo "change-scope classifier missing or failed its self-test"
+          fi
+
           # A file whose bytes are compiled into an artifact is source, whatever
           # its extension. `include_str!`/`include_bytes!` make a markdown file
           # part of the build, so a docs-only edit to one can break `cargo test`
@@ -128,7 +141,7 @@ jobs:
 
           # A scan that found nothing and a scan that cannot find anything are
           # the same two lines of log. If the regex, the pathspec or perl ever
-          # stops matching, `embedded` is empty, is_docs_path never blocks, and
+          # stops matching, `embedded` is empty, ci_is_docs_path never blocks, and
           # this guard is inert -- reopening #2077 behind a green run. So report
           # the count, and treat zero as a broken instrument rather than as an
           # answer: this repo has 149 such targets and cannot legitimately
@@ -143,20 +156,6 @@ jobs:
             echo "embed scan resolved no targets; the scan itself is broken"
             embed_scan_ok=false
           fi
-
-          is_docs_path() {
-            case "$1" in
-              docs/*|wiki/*|*.md|*.mdx|*.markdown|LICENSE|NOTICE)
-                ;;
-              *)
-                return 1 ;;
-            esac
-            # Compiled into an artifact => source, not docs.
-            if [ -n "$embedded" ] && printf '%s\n' "$embedded" | grep -qxF -- "$1"; then
-              return 1
-            fi
-            return 0
-          }
 
           files=""
           case "$EVENT_NAME" in
@@ -184,14 +183,14 @@ jobs:
               ;;
           esac
 
-          if [ "$embed_scan_ok" != true ]; then
-            echo "embedded-file scan failed; classifying as code (fail closed)"
+          if [ "$embed_scan_ok" != true ] || [ "$scope_classifier_ok" != true ]; then
+            echo "change-scope instrument failed; classifying as code (fail closed)"
             docs_only=false
           elif [ -n "$files" ]; then
             docs_only=true
             while IFS= read -r f; do
               [ -z "$f" ] && continue
-              if ! is_docs_path "$f"; then
+              if ! ci_is_docs_path "$f" "$embedded"; then
                 docs_only=false
                 break
               fi

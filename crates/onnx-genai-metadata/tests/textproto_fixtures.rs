@@ -105,14 +105,24 @@ fn fixture_census_rejects_empty_enumeration() {
 }
 
 #[test]
-fn fixture_census_rejects_binary_onnx() {
+fn fast_fixture_census_rejects_docs_binary_onnx() {
     let mut fixtures = healthy_fixture_inventory();
-    fixtures.push("tests/fixtures/accidental/model.onnx".to_owned());
+    fixtures.push("docs/example/model.onnx".to_owned());
     assert!(
         fixture_inventory_errors(&fixtures)
             .iter()
             .any(|error| error.contains("binary fixture")),
         "a tracked binary .onnx fixture must be rejected"
+    );
+}
+
+#[test]
+fn change_scope_keeps_docs_textproto_in_fast_census() {
+    let mut fixtures = healthy_fixture_inventory();
+    fixtures.push("docs/example/model.onnx.textproto".to_owned());
+    assert!(
+        fixture_inventory_errors(&fixtures).is_empty(),
+        "a docs-located textproto is allowed, but change-scope must still run this census"
     );
 }
 
