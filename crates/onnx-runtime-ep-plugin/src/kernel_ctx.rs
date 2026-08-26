@@ -186,6 +186,22 @@ unsafe fn value_device(
     unsafe { device_from_memory_info(api, memory_info, format_args!("input {input_index}")) }
 }
 
+fn raw_device_type_code<T>(
+    raw_device_type: T,
+    context: impl std::fmt::Display,
+) -> Result<u32, String>
+where
+    T: Copy + std::fmt::Display,
+    u32: TryFrom<T>,
+{
+    u32::try_from(raw_device_type).map_err(|_| {
+        format!(
+            "MemoryInfoGetDeviceType returned invalid raw device type {raw_device_type} for \
+             {context}"
+        )
+    })
+}
+
 pub(crate) unsafe fn device_from_memory_info(
     api: &ort::OrtApi,
     memory_info: *const ort::OrtMemoryInfo,
@@ -234,7 +250,7 @@ pub(crate) unsafe fn device_from_memory_info(
         "qnn" => DeviceType::Qnn,
         "openvino" => DeviceType::OpenVino,
         _ if raw_device_type == ort::OrtMemoryInfoDeviceType_CPU => DeviceType::Cpu,
-        _ => DeviceType::Custom(raw_device_type as u32),
+        _ => DeviceType::Custom(raw_device_type_code(raw_device_type, context)?),
     };
     Ok(DeviceId::new(device_type, index))
 }
@@ -982,6 +998,14 @@ mod tests {
             !inputs[0].view().device.is_host_accessible(),
             "a non-null CUDA pointer must never be inferred to be host memory"
         );
+    }
+
+    #[test]
+    fn raw_memory_device_type_conversion_covers_linux_and_windows_bindings() {
+        assert_eq!(raw_device_type_code(7u32, "linux typedef").unwrap(), 7);
+        assert_eq!(raw_device_type_code(7i32, "Windows typedef").unwrap(), 7);
+        let error = raw_device_type_code(-1i32, "Windows typedef").unwrap_err();
+        assert!(error.contains("invalid raw device type -1"), "{error}");
     }
 
     /// The route test above proves *which* family runs; these pin what it
