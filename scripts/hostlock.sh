@@ -322,6 +322,53 @@ die() {
     exit 1
 }
 
+# The options are already documented, exhaustively, in this file's header --
+# but only to someone who opens a 2000-line shell script. Four agents spent a
+# night arguing to build this tool while it sat in scripts/ with a test suite,
+# and `--help` answering "unknown subcommand" is a large part of why. So print
+# the header rather than a second copy of it: a curated duplicate would drift,
+# and the drift would land on exactly the flags people get wrong (`--wait` is
+# a bare flag, `--reason` is mandatory for `run`).
+#
+# The end anchor is `# (end of usage summary)`, the same one the no-argument
+# path uses -- deliberately not a second boundary of my own. That marker exists
+# because an earlier `sed -n '3,50p'` here silently stopped covering the header
+# as it grew, so flags added by a change were absent from that change's own
+# help. A private anchor would reintroduce exactly that drift, one copy along.
+# Both anchor lines are load-bearing; renaming either breaks help, loudly, in
+# the conformance suite.
+#
+# Defined here, next to `die`, rather than beside its `cmd_*` siblings, for one
+# reason: everything below refuses, and help must outrank every refusal. See
+# the interception directly beneath this function.
+cmd_help() {
+    sed -n '/^# Usage:/,/^# (end of usage summary)/p' "$0" | sed '$d' | sed 's/^#\{1\} \{0,1\}//'
+    echo "Full notes, including how to read a gated row: $0"
+}
+
+# Answer help before anything is validated -- and "anything" is meant
+# literally, which is why this sits at the top of the file and not at the
+# dispatch `case` where a subcommand would naturally be handled.
+#
+# Four separate gates below can refuse, and every one of them refuses in
+# exactly the situation that sends someone to `--help`:
+#
+#   * `require_supported_platform` (below) exits 8 on a host without /proc --
+#     macOS, native Windows, a stripped container. "What does this tool need?"
+#     is the question those users have, and the answer is in the header.
+#   * the lock_dir config resolution dies on a relative or empty `lock_dir` --
+#     the mistake made by someone following the header's own instructions for
+#     moving the lock, who then cannot read those instructions to see it.
+#   * `require_name` rejects a $HOSTLOCK_OWNER or $USER containing a space.
+#   * the anchor-pid check rejects a stale `--pid`.
+#
+# Asking how the tool works must never depend on holding it correctly, so the
+# only thing allowed to run first is the thing that prints the answer.
+# `cmd_help` needs no state: `$0` and `sed`, both available at this point.
+case "${1:-}" in
+    help|-h|--help) cmd_help; exit 0 ;;
+esac
+
 # Refuse a platform this script cannot make its liveness claims on.
 #
 # The PORTABILITY note above says Linux only. Until now that was a comment,
