@@ -143,6 +143,7 @@ package:
       pad_token_id: 0
       image_token_id: 255036
       video_token_id: 255037
+      audio_token_id: 255038
 ```
 
 Token strings, added-token maps, and chat templates remain in tokenizer assets.

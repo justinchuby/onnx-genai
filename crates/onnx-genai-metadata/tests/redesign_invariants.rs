@@ -776,6 +776,7 @@ package:
       pad_token_id: 0
       bos_token_id: 1
       eos_token_id: [2]
+      audio_token_id: 32001
     artifacts:
       - location: tokenizer.json
   constraint_languages:
@@ -810,6 +811,14 @@ pipeline:
             .expect("numeric token facts")
             .eos_token_id,
         vec![2]
+    );
+    assert_eq!(
+        tokenizer
+            .special_tokens
+            .as_ref()
+            .expect("numeric token facts")
+            .audio_token_id,
+        Some(32001)
     );
     assert_eq!(package.constraint_languages[0].dialect, "gbnf");
 

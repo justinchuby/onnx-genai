@@ -3980,6 +3980,15 @@
       "additionalProperties": false,
       "description": "Numeric model and control-token facts.\n\nThese ids are model/package facts. Token spellings, added-token maps, and\nchat templates remain in tokenizer assets and are not repeated here.",
       "properties": {
+        "audio_token_id": {
+          "description": "Prompt placeholder replaced by audio features.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "bos_token_id": {
           "description": "Beginning-of-sequence token.",
           "format": "uint32",
