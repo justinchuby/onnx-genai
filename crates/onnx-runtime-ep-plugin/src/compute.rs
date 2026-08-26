@@ -8264,26 +8264,54 @@ fn after() {}
     /// algorithm in a crate this change did not touch, so it is a genuine
     /// oracle rather than a restatement: this walks ranks either side of the
     /// spill boundary and demands agreement on every one.
+    ///
+    /// The sweep must include extents of **1 and 0**, not just the distinct
+    /// extents that make a transposition obvious. A stride *on* a size-1 axis
+    /// is inert — its index is always 0 — which makes it tempting to leave out.
+    /// But that axis is still a *multiplicand* for every axis outside it, so an
+    /// error there propagates into strides that are very much live. An earlier
+    /// version of this test used `i + 2` throughout and waved through a mutant
+    /// that read `(shape[i + 1] as i64).max(2)`.
     #[test]
     fn contiguous_strides_matches_the_ir_oracle_across_the_inline_boundary() {
-        let mut saw_inline = false;
-        let mut saw_spilled = false;
+        let mut shapes: Vec<Vec<usize>> = Vec::new();
         for rank in 0..=(crate::dim_vec::INLINE_RANK + 3) {
             // Distinct, non-uniform extents so a transposed or off-by-one
             // stride cannot coincide with the right answer.
-            let shape: Vec<usize> = (0..rank).map(|i| i + 2).collect();
-            let got = super::contiguous_strides(&shape);
-            let want = onnx_runtime_ir::compute_contiguous_strides(&shape);
+            shapes.push((0..rank).map(|i| i + 2).collect());
+        }
+        // Interior and trailing unit axes, on both sides of the spill boundary,
+        // and a zero extent.
+        shapes.extend([
+            vec![2, 1, 3],
+            vec![1, 1, 5],
+            vec![2, 1, 3, 1, 4],
+            vec![4, 1],
+            vec![1],
+            vec![2, 0, 3],
+            vec![3, 1, 4, 1, 5, 1, 9, 1, 2, 1, 6],
+            vec![1; crate::dim_vec::INLINE_RANK + 2],
+        ]);
+
+        let mut saw_inline = false;
+        let mut saw_spilled = false;
+        let mut saw_interior_unit = false;
+        for shape in &shapes {
+            let got = super::contiguous_strides(shape);
+            let want = onnx_runtime_ir::compute_contiguous_strides(shape);
             assert_eq!(
                 got.as_slice(),
                 want.as_slice(),
-                "rank {rank} disagrees with the IR oracle"
+                "shape {shape:?} disagrees with the IR oracle"
             );
-            assert_eq!(got.len(), rank, "rank {rank} changed length");
-            if rank > crate::dim_vec::INLINE_RANK {
+            assert_eq!(got.len(), shape.len(), "shape {shape:?} changed length");
+            if shape.len() > crate::dim_vec::INLINE_RANK {
                 saw_spilled = true;
-            } else if rank > 0 {
+            } else if !shape.is_empty() {
                 saw_inline = true;
+            }
+            if shape.len() >= 3 && shape[1..shape.len() - 1].contains(&1) {
+                saw_interior_unit = true;
             }
         }
         assert!(
@@ -8291,12 +8319,21 @@ fn after() {}
             "the sweep must cover both representations or it proves nothing \
              about the boundary"
         );
+        assert!(
+            saw_interior_unit,
+            "the sweep must exercise a size-1 interior axis, or an error \
+             confined to one propagates outward unnoticed"
+        );
     }
 
     /// A shape that spills must keep every dimension. Truncating at
     /// `INLINE_RANK` would still produce a plausible-looking stride vector for
-    /// the leading dimensions, so this pins the length and the last element
-    /// separately from the oracle comparison above.
+    /// the leading dimensions, so this pins the length and the last element.
+    ///
+    /// Kept alongside the oracle sweep rather than folded into it because it
+    /// states the answer in **closed form**. The oracle is the same algorithm
+    /// by construction — that is what makes it a good check on representation
+    /// and initialisation, and a poor one on the algorithm itself.
     #[test]
     fn contiguous_strides_spills_rather_than_truncating() {
         let rank = crate::dim_vec::INLINE_RANK + 2;
@@ -8307,34 +8344,35 @@ fn after() {}
         assert_eq!(got[0], 1i64 << (rank - 1), "outermost stride is wrong");
     }
 
-    /// `IntermediateBuf` must own its shape: the caller's copy is a slot in the
-    /// reusable scratch that the next node overwrites. For a rank that spills,
-    /// owning means a deep copy of the heap vector, not a shared one — so this
-    /// mutates the source after the buf is built and demands the buf is
-    /// unaffected.
+    /// `view()` hands the kernel `&self.shape` and `&self.strides`. For a rank
+    /// that spilled out of line, both must arrive whole.
+    ///
+    /// This deliberately does **not** claim to prove that the routed path's
+    /// `shape: (*shape).clone()` copies rather than aliases. That property is a
+    /// compiler guarantee — `DimVec` derives `Clone`, and there is no safe
+    /// `Clone` that shares a `Vec`'s buffer — so no mutation can violate it and
+    /// a test asserting it could not fail. What is mutable, and what this pins,
+    /// is whether `view()` passes the whole slice or a truncated one.
     #[test]
-    fn an_intermediate_buf_owns_its_shape_past_the_inline_rank() {
+    fn a_spilled_intermediate_buf_view_reports_every_dimension() {
         let rank = crate::dim_vec::INLINE_RANK + 2;
-        let original: Vec<usize> = (0..rank).map(|i| i + 2).collect();
-        let mut source = crate::dim_vec::DimVec::<usize>::from_slice(&original);
-        let strides = super::contiguous_strides(&source);
-        let numel: usize = original.iter().product();
+        let dims: Vec<usize> = (0..rank).map(|i| i + 2).collect();
+        let strides = super::contiguous_strides(&dims);
+        let numel: usize = dims.iter().product();
         let buf = IntermediateBuf {
             data: vec![0u8; numel * 4],
             scratch_ptr: std::ptr::null_mut(),
-            shape: source.clone(),
+            shape: crate::dim_vec::DimVec::from_slice(&dims),
             strides,
             dtype: DataType::Float32,
         };
 
-        for d in source.iter_mut() {
-            *d = 999;
-        }
-
+        let v = buf.view();
+        assert_eq!(v.shape, &dims[..], "view truncated the spilled shape");
         assert_eq!(
-            buf.view().shape,
-            &original[..],
-            "the buf's shape moved when the scratch slot it was copied from did"
+            v.strides,
+            onnx_runtime_ir::compute_contiguous_strides(&dims).as_slice(),
+            "view truncated the spilled strides"
         );
     }
 
