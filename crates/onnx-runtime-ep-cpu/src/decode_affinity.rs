@@ -309,6 +309,12 @@ impl NumaTopology {
 
     #[cfg(target_os = "linux")]
     fn detect_linux() -> Option<Self> {
+        let nodes = Self::detect_linux_nodes()?;
+        (nodes.len() > 1).then_some(Self { nodes })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn detect_linux_nodes() -> Option<BTreeMap<usize, Vec<usize>>> {
         let mut nodes = BTreeMap::new();
         let entries = std::fs::read_dir("/sys/devices/system/node").ok()?;
         for entry in entries.flatten() {
@@ -329,7 +335,7 @@ impl NumaTopology {
                 nodes.insert(index, cpus);
             }
         }
-        (nodes.len() > 1).then_some(Self { nodes })
+        Some(nodes)
     }
 
     /// Detect NUMA topology on Windows via `GetLogicalProcessorInformationEx`
@@ -780,6 +786,70 @@ pub fn select_budget_cpus(count: usize) -> Option<Vec<usize>> {
         count,
         crate::core_topology::host(),
     )
+}
+
+/// Positively confirm that every CPU this process may run on lies on a single
+/// NUMA node.
+///
+/// [`NumaTopology::detect`] cannot answer this: it folds "exactly one node" and
+/// "no discoverable topology" into the same `None`, because pinning treats both
+/// the same way. A caller that needs to know memory is uniformly local cannot
+/// reuse that, since the `None` branch is also what a container takes when
+/// `/sys/devices/system/node` is not mounted while its cpuset still spans two
+/// sockets — the one case where assuming locality is wrong.
+///
+/// So this reads the topology itself and requires an affirmative answer:
+/// exactly one node with a CPU the process is allowed to run on. Every
+/// uncertain case — unreadable topology, no nodes, an unsupported platform —
+/// returns `false`. The caller is expected to choose the conservative,
+/// node-local behaviour on `false`.
+pub fn host_is_single_numa_node() -> bool {
+    single_numa_node_with_allowed(
+        host_numa_node_cpu_lists().as_ref(),
+        allowed_cpus().as_deref(),
+    )
+}
+
+/// Every NUMA node the host reports with its CPU list, *unfiltered* -- unlike
+/// [`NumaTopology::detect`], a single-node host is reported as one node rather
+/// than as `None`. `None` here means only "could not be read".
+fn host_numa_node_cpu_lists() -> Option<BTreeMap<usize, Vec<usize>>> {
+    #[cfg(target_os = "linux")]
+    {
+        NumaTopology::detect_linux_nodes()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        windows_imp::numa_nodes().map(|nodes| nodes.into_iter().collect())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    {
+        None
+    }
+}
+
+/// Pure core of [`host_is_single_numa_node`]: count the nodes that retain a CPU
+/// the process is allowed to use and require exactly one.
+///
+/// When the allowed set is unknown we count every node rather than guessing a
+/// restriction, which keeps the predicate conservative: a two-node host with an
+/// unknown cpuset still answers `false`. Split out from the host reads so the
+/// decision is testable without a two-socket machine.
+fn single_numa_node_with_allowed(
+    nodes: Option<&BTreeMap<usize, Vec<usize>>>,
+    allowed: Option<&[usize]>,
+) -> bool {
+    let Some(nodes) = nodes else {
+        return false;
+    };
+    let live = nodes
+        .values()
+        .filter(|cpus| match allowed {
+            Some(allowed) => cpus.iter().any(|cpu| allowed.contains(cpu)),
+            None => !cpus.is_empty(),
+        })
+        .count();
+    live == 1
 }
 
 /// The CPUs the current process is actually permitted to run on, or `None` when
@@ -2544,6 +2614,62 @@ mod tests {
                 placement.as_str()
             );
         }
+    }
+
+    fn node_map(nodes: &[(usize, &[usize])]) -> BTreeMap<usize, Vec<usize>> {
+        nodes
+            .iter()
+            .map(|(index, cpus)| (*index, cpus.to_vec()))
+            .collect()
+    }
+
+    /// The predicate exists because `NumaTopology::detect` returns `None` for
+    /// both "one node" and "cannot tell", and a caller reasoning about memory
+    /// locality must not treat those the same. So the only `true` is an
+    /// affirmative single-node read.
+    #[test]
+    fn only_an_affirmative_single_node_read_confirms_locality() {
+        let one = node_map(&[(0, &[0, 1, 2, 3])]);
+        let two = node_map(&[(0, &[0, 1]), (1, &[2, 3])]);
+
+        assert!(single_numa_node_with_allowed(Some(&one), None));
+        assert!(single_numa_node_with_allowed(
+            Some(&one),
+            Some(&[0, 1, 2, 3])
+        ));
+
+        assert!(
+            !single_numa_node_with_allowed(Some(&two), None),
+            "two nodes and an unknown cpuset must not be assumed local"
+        );
+        assert!(
+            !single_numa_node_with_allowed(None, Some(&[0, 1])),
+            "an unreadable topology is the container case this guard is for"
+        );
+        assert!(
+            !single_numa_node_with_allowed(Some(&BTreeMap::new()), None),
+            "no nodes at all is not an affirmative answer"
+        );
+    }
+
+    /// A cpuset confined to one node of a multi-node host *is* uniformly local,
+    /// and a cpuset that reaches two nodes is not -- which is why the count is
+    /// taken after intersecting with the allowed set rather than before.
+    #[test]
+    fn the_node_count_is_taken_over_the_cpus_the_process_may_use() {
+        let two = node_map(&[(0, &[0, 1]), (1, &[2, 3])]);
+
+        assert!(single_numa_node_with_allowed(Some(&two), Some(&[0, 1])));
+        assert!(single_numa_node_with_allowed(Some(&two), Some(&[3])));
+        assert!(!single_numa_node_with_allowed(Some(&two), Some(&[1, 2])));
+        assert!(
+            !single_numa_node_with_allowed(Some(&two), Some(&[])),
+            "an empty allowed set leaves no node live, which is not a single node"
+        );
+        assert!(
+            !single_numa_node_with_allowed(Some(&two), Some(&[9])),
+            "a cpuset the topology does not know about confirms nothing"
+        );
     }
 
     #[test]
