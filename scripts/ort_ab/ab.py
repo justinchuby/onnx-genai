@@ -243,11 +243,13 @@ def main() -> None:
     print(f"\n=== medians ({metric}, lower is better) ===")
     print(f"host_lock={lock_label} (whole window)")
     print(
-        f"runnable: start={columns['runnable_at_start']} "
+        f"runnable: window_start={columns['runnable_window_start']} "
         f"max={columns['runnable_max']} end={columns['runnable_at_end']} "
         f"({columns['runnable_samples']} samples). The lock covers custody, "
-        f"not quiet -- max above start means something that never took it "
-        f"was running."
+        f"not quiet -- max above window_start means something that never took "
+        f"it was running. Compare against window_start, not runnable_at_start"
+        f"={columns['runnable_at_start']}: that one is the script's reading "
+        f"and runs ~1 high (its own pipeline is runnable while it samples)."
     )
     keys = sorted({(r["model"], r["threads"]) for r in rows})
     for model, threads in keys:

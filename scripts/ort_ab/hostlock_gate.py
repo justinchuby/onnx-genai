@@ -262,20 +262,33 @@ def lock_columns(label: str, prov: dict[str, str]) -> dict[str, str]:
 
 
 def read_runnable(path: str = "/proc/loadavg") -> int | None:
-    """The runnable-task count, by the same definition `hostlock.sh` uses.
+    """The runnable-task count, parsed as `hostlock.sh`'s `runnable_now()` does.
 
-    `runnable_now()` in the script is `cut -d' ' -f4 /proc/loadavg | cut -d/
-    -f1`, and this has to agree with it exactly or `runnable_at_start` (which
-    comes from the script, via provenance) and the samples taken here would be
-    two different measurements sharing a name -- the failure `lock_columns`
-    exists to prevent, reintroduced one column along.
+    **Parses the same, does not measure the same.** `runnable_now()` is a
+    two-process pipeline, `cut -d' ' -f4 /proc/loadavg | cut -d/ -f1`, run
+    from a `bash -c`. Field 4's numerator is `nr_running` *at the instant of
+    the read*, and it counts the reader: a shell pipeline has its own
+    processes runnable while it samples, so it reports systematically higher
+    than a lone in-process `open()`. Measured on this box, 80 interleaved
+    pairs: mean `shell - python` = **+1.24**, shell strictly higher in
+    **92.5%** of samples, modal delta exactly +1.
 
-    A file read, not a subprocess: this is called between cells of a live
-    matrix, and forking `hostlock.sh` there would put the measurement's own
-    instrument on the host it is measuring.
+    That is why `runnable_at_start` (which comes from the script, via
+    provenance) is **not comparable** to the samples taken here, and why
+    `occupancy_columns` publishes its own `runnable_window_start` read through
+    this function instead of reusing it. Comparing across the two would put a
+    ~1-runnable instrument offset into the middle of the comparison the
+    occupancy columns exist to support -- absorbing exactly the small-arrival
+    signal they are meant to surface.
+
+    A file read, not a subprocess, for two reasons: it is called between cells
+    of a live matrix, where forking would put the instrument's own load on the
+    host being measured -- which is the very effect described above.
 
     `None`, never a guess, when the file is absent or malformed. A host
-    without `/proc` cannot answer this and must not appear to.
+    without `/proc` cannot answer this and must not appear to, and `0` would
+    read as "perfectly quiet" -- the most reassuring possible answer to a
+    question that was never answered.
     """
     try:
         with open(path) as fh:
@@ -300,24 +313,32 @@ def occupancy_columns(samples: list[int | None]) -> dict[str, str]:
     invisible downstream. That is the same "number that was never measured"
     shape as the gate that expires and proceeds.
 
-    `runnable_at_start` already says what the host looked like at the first
-    instant, and its docstring is careful that it "says nothing about what
-    happened afterwards". These are the afterwards.
+    All four columns are read through `read_runnable`, including the window's
+    own start. `runnable_at_start` from `lock_columns` is the *script's*
+    reading at admission and carries a ~1-runnable instrument offset relative
+    to these (see `read_runnable`), so the honest comparison is
+    `runnable_max` against `runnable_window_start` -- like against like.
 
     Facts, deliberately not a verdict. `lock_columns` refuses a `contended`
     column because this host is shared by design (#1802) and there is no
     honest threshold; that reasoning applies here unchanged. A reader compares
-    `runnable_max` against `runnable_at_start` and decides. A driver that
-    shipped a boolean would be inventing the threshold that was refused.
+    the peak against the window start and decides. A driver that shipped a
+    boolean would be inventing the threshold that was refused.
+
+    Sampling is once per cell, so a competitor that both arrives and departs
+    inside a single cell is not seen. These columns bound what was observed,
+    not what occurred.
     """
     seen = [s for s in samples if s is not None]
     if not seen:
         return {
+            "runnable_window_start": "unknown",
             "runnable_at_end": "unknown",
             "runnable_max": "unknown",
             "runnable_samples": "0",
         }
     return {
+        "runnable_window_start": str(seen[0]),
         "runnable_at_end": str(seen[-1]),
         "runnable_max": str(max(seen)),
         "runnable_samples": str(len(seen)),

@@ -236,6 +236,7 @@ class Occupancy(unittest.TestCase):
         # arrives mid-sweep, leaves before the final read. Start and end both
         # say 2. Only the peak records that anything happened.
         cols = occupancy_columns([2, 2, 9, 8, 2])
+        self.assertEqual(cols["runnable_window_start"], "2")
         self.assertEqual(cols["runnable_max"], "9")
         self.assertEqual(cols["runnable_at_end"], "2")
         self.assertEqual(cols["runnable_samples"], "5")
@@ -243,8 +244,10 @@ class Occupancy(unittest.TestCase):
     def test_failed_samples_are_dropped_without_dragging_the_peak_down(self):
         cols = occupancy_columns([None, 3, None, 11, None])
         self.assertEqual(cols["runnable_max"], "11")
-        # The last sample that ANSWERED, not the last attempt -- a trailing
-        # unreadable read must not blank a window that was measured.
+        # The first and last samples that ANSWERED, not the first and last
+        # attempts -- a leading or trailing unreadable read must not blank a
+        # window that was measured.
+        self.assertEqual(cols["runnable_window_start"], "3")
         self.assertEqual(cols["runnable_at_end"], "11")
         # The count is samples that ANSWERED, not attempts. A row claiming
         # five readings when two were unreadable overstates its own evidence.
@@ -257,11 +260,31 @@ class Occupancy(unittest.TestCase):
         self.assertEqual(
             occupancy_columns([None, None]),
             {
+                "runnable_window_start": "unknown",
                 "runnable_at_end": "unknown",
                 "runnable_max": "unknown",
                 "runnable_samples": "0",
             },
         )
+
+    def test_the_window_carries_its_own_start_read_by_its_own_instrument(self):
+        """`runnable_at_start` is the script's reading and is NOT comparable.
+
+        `runnable_now()` is a two-process shell pipeline and counts itself in
+        `nr_running`; this module's read is a lone in-process `open()`. On
+        this box, 80 interleaved pairs gave mean `shell - python` = +1.24 with
+        the shell strictly higher 92.5% of the time, modal delta exactly +1.
+
+        So the window has to publish its own start, or the headline comparison
+        `runnable_max` vs the start would carry a ~1-runnable instrument
+        offset -- absorbing exactly the small-arrival signal these columns
+        exist to surface, and reporting a quiet host as contended-free in the
+        reassuring direction. This pins that the window's start comes from the
+        samples, not from provenance.
+        """
+        cols = occupancy_columns([4, 5, 6])
+        self.assertEqual(cols["runnable_window_start"], "4")
+        self.assertNotIn("runnable_at_start", cols)
 
     def test_no_verdict_column_is_invented(self):
         # `lock_columns` refuses a `contended` column because this host is
@@ -271,7 +294,12 @@ class Occupancy(unittest.TestCase):
         cols = occupancy_columns([1, 40])
         self.assertEqual(
             set(cols),
-            {"runnable_at_end", "runnable_max", "runnable_samples"},
+            {
+                "runnable_window_start",
+                "runnable_at_end",
+                "runnable_max",
+                "runnable_samples",
+            },
         )
 
 
@@ -408,8 +436,13 @@ class EndToEnd(unittest.TestCase):
             # this proves the driver actually stamps it.
             self.assertTrue(row["runnable_max"].isdigit(), row)
             self.assertTrue(row["runnable_at_end"].isdigit(), row)
+            self.assertTrue(row["runnable_window_start"].isdigit(), row)
+            # Like against like. Comparing the peak to `runnable_at_start`
+            # would cross instruments -- the script reads ~1 high because its
+            # own pipeline is runnable while it samples -- and would fail on a
+            # QUIET host, in the reassuring direction, roughly half the time.
             self.assertGreaterEqual(
-                int(row["runnable_max"]), int(row["runnable_at_start"]), row
+                int(row["runnable_max"]), int(row["runnable_window_start"]), row
             )
             # Seeded at admission plus one per cell, so a matrix that emitted
             # rows cannot have sampled fewer than twice. A `1` here means the

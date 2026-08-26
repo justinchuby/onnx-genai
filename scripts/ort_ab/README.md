@@ -265,19 +265,35 @@ is not evidence of a handoff and is not evidence against one either.
 about the conditions at the start, not a property of the interval; see the
 `--gate` paragraph above for why no threshold on it is honest here.
 
-Because that sample is a point, every row also carries `runnable_at_end`,
-`runnable_max` and `runnable_samples`, taken between cells across the whole
-matrix. **The lock covers custody, not quiet.** It stops a cooperating peer,
-which is all it can do; it says nothing about a process that never took it —
-a stray build, someone else's test matrix, an agent outside the protocol. So
-a run can hold the lock legitimately end to end, have the label report no
-handoff, and still have spent half its reps against a competitor, with every
-column reading clean. `runnable_max` is what records that. Compare it against
-`runnable_at_start`: a peak well above the start means something arrived that
-the lock could not exclude. Deliberately no verdict column and no threshold —
-same reason `contended` is absent, this host is shared by design (#1802).
-`runnable_samples` counts the readings that *answered*, so a row cannot
-overstate its own evidence on a host where `/proc/loadavg` is unreadable.
+Because that sample is a point, every row also carries `runnable_window_start`,
+`runnable_at_end`, `runnable_max` and `runnable_samples`, taken between cells
+across the whole matrix. **The lock covers custody, not quiet.** It stops a
+cooperating peer, which is all it can do; it says nothing about a process that
+never took it — a stray build, someone else's test matrix, an agent outside
+the protocol. So a run can hold the lock legitimately end to end, have the
+label report no handoff, and still have spent half its reps against a
+competitor, with every column reading clean. `runnable_max` is what records
+that.
+
+**Compare `runnable_max` against `runnable_window_start`, never against
+`runnable_at_start`.** The two starts are read by different instruments and
+are not interchangeable: `runnable_at_start` comes from the script, whose
+`runnable_now()` is a two-process shell pipeline that is itself runnable while
+it samples, so it reads high. Measured here over 80 interleaved pairs, mean
+`shell − python` = **+1.24**, shell strictly higher in **92.5%** of samples,
+modal delta exactly +1; on the real admission path, `runnable_at_start −
+runnable_window_start` was +1 or more in **80%** of 25 runs. Since the whole
+point of the column is to surface arrivals of roughly one runnable task on a
+shared box, comparing across the two would let the instrument offset absorb
+exactly the signal being looked for. `runnable_window_start` exists so the
+comparison is like against like.
+
+Deliberately no verdict column and no threshold — same reason `contended` is
+absent, this host is shared by design (#1802). `runnable_samples` counts the
+readings that *answered*, so a row cannot overstate its own evidence on a host
+where `/proc/loadavg` is unreadable. Sampling is once per cell, so a
+competitor that both arrives and departs inside a single cell is not seen:
+these columns bound what was **observed**, not what occurred.
 
 `--unlocked` runs anyway and stamps every row `unlocked:<state>` — for smoke
 tests, never for anything publishable — but it will **not** run over a lock
