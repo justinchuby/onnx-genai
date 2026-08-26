@@ -92,6 +92,77 @@ def _provenance_status(
     }
 
 
+def _walk_steps(steps: Any) -> list[dict[str, Any]]:
+    found: list[dict[str, Any]] = []
+    if not isinstance(steps, list):
+        return found
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        found.append(step)
+        for key in ("setup", "steps", "then", "else", "body", "default"):
+            found.extend(_walk_steps(step.get(key)))
+        cases = step.get("cases")
+        if isinstance(cases, list):
+            for case in cases:
+                if isinstance(case, dict):
+                    found.extend(_walk_steps(case.get("steps")))
+    return found
+
+
+def _generation_contract(metadata: dict[str, Any]) -> dict[str, Any]:
+    workflow = metadata.get("pipeline", {}).get("workflow", {})
+    steps = _walk_steps(workflow.get("steps"))
+    has_generation_loop = any(
+        step.get("kind") == "loop" and step.get("termination") == "generation_eos"
+        for step in steps
+    )
+    contracts = {
+        component.get("contract", {}).get("id")
+        for component in workflow.get("components", {}).values()
+        if isinstance(component, dict)
+        and isinstance(component.get("contract"), dict)
+    }
+    has_termination = bool(
+        contracts
+        & {
+            "onnx-genai.termination-predicate",
+            "onnx-genai.token-policy",
+        }
+    )
+    special_tokens = (
+        metadata.get("package", {})
+        .get("tokenizer", {})
+        .get("special_tokens", {})
+    )
+    eos_ids = special_tokens.get("eos_token_id", [])
+    if has_generation_loop and not eos_ids:
+        raise ValueError(
+            "complete-generation workflow is missing "
+            "package.tokenizer.special_tokens.eos_token_id"
+        )
+    if has_generation_loop and not has_termination:
+        raise ValueError(
+            "complete-generation workflow is missing an executable termination contract"
+        )
+
+    serialized = json.dumps(workflow, sort_keys=True)
+    logits_only = not has_generation_loop and '"logits"' in serialized
+    scope = (
+        "complete_generation"
+        if has_generation_loop
+        else "logits_only"
+        if logits_only
+        else "non_autoregressive_or_other"
+    )
+    return {
+        "scope": scope,
+        "has_generation_loop": has_generation_loop,
+        "has_termination_contract": has_termination,
+        "eos_token_ids": eos_ids,
+    }
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--collection", default=DEFAULT_COLLECTION)
@@ -168,9 +239,8 @@ def main() -> None:
         )
 
         canonical = yaml.safe_load(files["inference_metadata.yaml"].read_text())
-        annotated = yaml.safe_load(
-            files["inference_metadata.annotated.yaml"].read_text()
-        )
+        annotated_text = files["inference_metadata.annotated.yaml"].read_text()
+        annotated = yaml.safe_load(annotated_text)
         if canonical != annotated:
             raise ValueError(
                 f"{repo_id}@{revision}: canonical and annotated metadata differ after parsing"
@@ -179,6 +249,8 @@ def main() -> None:
             raise ValueError(
                 f"{repo_id}@{revision}: README does not link the annotation"
             )
+        if not any(line.lstrip().startswith("#") for line in annotated_text.splitlines()):
+            raise ValueError(f"{repo_id}@{revision}: annotated metadata has no comments")
 
         validation_paths.extend(
             [
@@ -192,6 +264,11 @@ def main() -> None:
                 "repo": repo_id,
                 "revision": revision,
                 "semantic_equivalence": True,
+                "generation_contract": _generation_contract(canonical),
+                "annotation_comment_lines": sum(
+                    line.lstrip().startswith("#")
+                    for line in annotated_text.splitlines()
+                ),
                 "provenance": _provenance_status(provenance_path, files),
             }
         )

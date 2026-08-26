@@ -52,14 +52,15 @@ fn package_declaring_eos_from(source: &Path, ids: &[i64]) -> anyhow::Result<temp
     let path = staged.path().join("inference_metadata.yaml");
     let mut document: serde_yaml::Value = serde_yaml::from_str(&std::fs::read_to_string(&path)?)?;
     document["schema_version"] = serde_yaml::Value::String("v1.2".to_string());
-    document["tokens"] = serde_yaml::to_value(serde_yaml::Mapping::from_iter([(
-        serde_yaml::Value::String("eos_token_id".to_string()),
-        serde_yaml::to_value(
-            ids.iter()
-                .map(|id| u32::try_from(*id))
-                .collect::<Result<Vec<_>, _>>()?,
-        )?,
-    )]))?;
+    document["package"]["tokenizer"]["special_tokens"] =
+        serde_yaml::to_value(serde_yaml::Mapping::from_iter([(
+            serde_yaml::Value::String("eos_token_id".to_string()),
+            serde_yaml::to_value(
+                ids.iter()
+                    .map(|id| u32::try_from(*id))
+                    .collect::<Result<Vec<_>, _>>()?,
+            )?,
+        )]))?;
     std::fs::write(&path, serde_yaml::to_string(&document)?)?;
     Ok(staged)
 }
@@ -114,9 +115,11 @@ fn a_package_may_declare_several_end_tokens() -> anyhow::Result<()> {
     assert_eq!(
         engine
             .metadata()
-            .tokens
+            .package
             .as_ref()
-            .expect("the staged package declares token facts")
+            .and_then(|package| package.tokenizer.as_ref())
+            .and_then(|tokenizer| tokenizer.special_tokens.as_ref())
+            .expect("the staged package declares special token facts")
             .eos_token_id,
         [11, 22, 33],
         "all three ids survive the round trip"

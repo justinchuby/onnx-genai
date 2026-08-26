@@ -1,9 +1,8 @@
 # Metadata capability model
 
-Status: **normative proposal**. This document audits the current tree at
-`edc42d2cbcd5a43805d232250d39779d46839539` and proposes a simplification. It
-does not change the metadata schema, parser, validator, generated schema, or
-runtime.
+Status: **normative proposal and implementation reader guide**. This document
+audits the current tree and explains the schema, validation, runtime, examples,
+and evidence changes carried by this proposal.
 
 The central rule is:
 
@@ -125,6 +124,48 @@ metadata; they must not claim comments survive generation. A backend may fuse
 the `decoder` and `sampler` invocations into an ORT `IoBinding`/CUDA-graph
 execution island. That island is derived optimizer output: it changes neither
 the package-authored sampling equation nor the operator's deployment policy.
+
+### 1.5 Token authority and the generation boundary
+
+Numeric token ids belong to the tokenizer vocabulary namespace. Their sole
+package authority is therefore `package.tokenizer.special_tokens`:
+
+```yaml
+package:
+  tokenizer:
+    algorithm: bpe       # Optional fact: how tokenizer.json segments text.
+    vocab_size: 256000   # Optional fact: the id namespace used by model tensors.
+    artifacts:
+      - location: tokenizer.json
+    special_tokens:      # Numeric package defaults, not token spellings.
+      bos_token_id: 2
+      eos_token_id: [1, 106]  # Ordered set: either id ends default generation.
+      pad_token_id: 0
+      image_token_id: 255036
+      video_token_id: 255037
+```
+
+Token strings, added-token maps, and chat templates remain in tokenizer assets.
+Repeating their ids in workflow literals, components, or generation defaults
+would create conflicting authorities. A request EOS tensor is an explicit
+override: when present it replaces the package EOS set for that request.
+
+A termination component consumes the resolved EOS set and computes active/done
+state; it does not own the ids. Consequently:
+
+- a **complete-generation package** declares a generation loop, non-empty
+  package EOS facts, and an invoked `onnx-genai.termination-predicate` or
+  `onnx-genai.token-policy` implementation;
+- a **logits-only decoder package** may declare tokenizer facts and a decoder
+  output without sampling or termination, but must not claim complete
+  generation;
+- encoder, embedding, diffusion, and other non-autoregressive packages need no
+  EOS declaration merely because a tokenizer artifact is present.
+
+This explains the apparent difference among hosted examples. Gemma decoder-only
+examples intentionally stop at logits and therefore have no sampler or EOS
+termination component. Examples that claim end-to-end text generation include
+those components and the package token facts they consume.
 
 ## 2. Current inventory
 

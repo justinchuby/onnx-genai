@@ -219,8 +219,14 @@ fn a_document_that_uses_nothing_new_is_free_to_say_nothing() {
 }
 
 #[test]
-fn top_level_tokens_require_the_version_that_introduced_them() {
-    let document = "schema_version: v1.1\ntokens:\n  eos_token_id: [2]\n";
+fn tokenizer_special_tokens_require_the_version_that_introduced_them() {
+    let document = r#"
+schema_version: v1.1
+package:
+  tokenizer:
+    special_tokens:
+      eos_token_id: [2]
+"#;
     let metadata = parse_metadata(document, Some("yaml")).expect("the document parses");
     let errors = validate_metadata(&metadata).expect_err("the declared version is not true");
     assert!(
@@ -230,7 +236,13 @@ fn top_level_tokens_require_the_version_that_introduced_them() {
         "{errors:?}"
     );
 
-    let document = "schema_version: v1.2\ntokens:\n  eos_token_id: [2]\n";
+    let document = r#"
+schema_version: v1.2
+package:
+  tokenizer:
+    special_tokens:
+      eos_token_id: [2]
+"#;
     let metadata = parse_metadata(document, Some("yaml")).expect("the document parses");
     validate_metadata(&metadata).expect("v1.2 truthfully declares token facts");
 }

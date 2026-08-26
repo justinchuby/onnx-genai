@@ -505,7 +505,7 @@ mod tests {
     }
 
     #[test]
-    fn numeric_token_facts_reach_the_top_level_authority() {
+    fn numeric_token_facts_reach_the_tokenizer_package_authority() {
         let mut raw = minimal();
         raw["model"]["pad_token_id"] = serde_json::json!(0);
         raw["model"]["bos_token_id"] = serde_json::json!(1);
@@ -519,7 +519,13 @@ mod tests {
         let (metadata, report) =
             import(&config, &raw, None, None, ImportOptions::default()).expect("import");
         assert!(!report.is_lossy());
-        let tokens = metadata.tokens.expect("top-level token facts");
+        let tokens = metadata
+            .package
+            .expect("package facts")
+            .tokenizer
+            .expect("tokenizer facts")
+            .special_tokens
+            .expect("special token facts");
         assert_eq!(tokens.pad_token_id, Some(0));
         assert_eq!(tokens.bos_token_id, Some(1));
         assert_eq!(tokens.eos_token_id, [2, 3]);

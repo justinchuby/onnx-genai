@@ -1,7 +1,4 @@
 schema_version: v1.2
-tokens:
-  eos_token_id:
-  - 127
 pipeline:
   workflow:
     manifest:
@@ -1437,6 +1434,9 @@ package:
     algorithm: bpe
     vocab_size: 32000
     byte_level: true
+    special_tokens:
+      eos_token_id:
+      - 127
 generation:
   overrides:
     max_output_tokens:

@@ -746,7 +746,8 @@ pub enum RuntimeInputRole {
     MaxOutputTokens,
     /// Token ids that end generation.
     ///
-    /// The request value overrides `tokens.eos_token_id`. It never carries an
+    /// The request value overrides
+    /// `package.tokenizer.special_tokens.eos_token_id`. It never carries an
     /// authored package default.
     EosTokenIds,
     /// Number of valid entries in each row of a padded EOS-id tensor.

@@ -1809,15 +1809,15 @@ that request data correctly:
 
 ```yaml
 schema_version: v1.2
-tokens:
-  pad_token_id: 0
-  bos_token_id: 1
-  eos_token_id: [2]
 package:
   tokenizer:
     algorithm: bpe
     vocab_size: 32000
     byte_level: true
+    special_tokens:
+      pad_token_id: 0
+      bos_token_id: 1
+      eos_token_id: [2]
     artifacts:
       - location: tokenizer.json
   constraint_languages:
@@ -1826,9 +1826,11 @@ package:
       component: grammar
 ```
 
-Numeric model/control ids have one package authority: top-level `tokens`.
-Their text spellings, added-token mappings, and chat templates remain in the
-declared tokenizer assets and are not repeated in metadata.
+Numeric model/control ids have one package authority:
+`package.tokenizer.special_tokens`. Co-locating the ids with the vocabulary
+contract makes their namespace explicit. Their text spellings, added-token
+mappings, and chat templates remain in the declared tokenizer assets and are
+not repeated in metadata.
 
 The numeric fields are `pad_token_id`, `bos_token_id`, the ordered
 `eos_token_id` list, `sep_token_id`, `decoder_start_token_id`,
@@ -1842,8 +1844,8 @@ leaving the runtime to repeat this precedence.
 
 `request.eos_ids`/`request.eos_lengths` are optional request overrides. Their
 runtime roles receive the effective request set: the explicit request set when
-present, otherwise `tokens.eos_token_id`. They carry no authored literal
-default and do not become a second package authority.
+present, otherwise `package.tokenizer.special_tokens.eos_token_id`. They carry
+no authored literal default and do not become a second package authority.
 
 EOS values and EOS execution are separate contracts. A portable
 `onnx-genai.termination-predicate` graph computes done/active state from the

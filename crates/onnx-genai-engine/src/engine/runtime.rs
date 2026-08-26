@@ -320,11 +320,17 @@ impl Engine {
 
     /// Every token id this model ends generation on.
     ///
-    /// Numeric package defaults have one authority: top-level `tokens`. The
-    /// tokenizer supplies spellings and chat templates, never an additional
-    /// numeric stop set.
+    /// Numeric package defaults have one authority:
+    /// `package.tokenizer.special_tokens`. Tokenizer assets supply spellings
+    /// and chat templates, never an additional numeric stop set.
     pub(crate) fn default_eos_token_ids(&self) -> anyhow::Result<Vec<TokenId>> {
-        if let Some(tokens) = &self.metadata.tokens {
+        if let Some(tokens) = self
+            .metadata
+            .package
+            .as_ref()
+            .and_then(|package| package.tokenizer.as_ref())
+            .and_then(|tokenizer| tokenizer.special_tokens.as_ref())
+        {
             return Ok(tokens.eos_token_id.clone());
         }
 
@@ -350,7 +356,8 @@ impl Engine {
     /// means generation runs past its end and emits control tokens as text.
     ///
     /// A caller's explicit EOS set is a request override. When absent, the
-    /// package defaults come from top-level `tokens.eos_token_id`.
+    /// package defaults come from
+    /// `package.tokenizer.special_tokens.eos_token_id`.
     pub(super) fn apply_eos_defaults(&self, options: &mut GenerateOptions) -> anyhow::Result<()> {
         apply_eos_policy(options, &self.default_eos_token_ids()?);
         Ok(())

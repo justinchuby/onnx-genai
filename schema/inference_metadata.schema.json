@@ -2621,7 +2621,7 @@
         },
         {
           "const": "eos_token_ids",
-          "description": "Token ids that end generation.\n\nThe request value overrides `tokens.eos_token_id`. It never carries an\nauthored package default.",
+          "description": "Token ids that end generation.\n\nThe request value overrides\n`package.tokenizer.special_tokens.eos_token_id`. It never carries an\nauthored package default.",
           "type": "string"
         },
         {
@@ -4077,7 +4077,10 @@
         "algorithm": {
           "description": "Tokenizer algorithm identifier, e.g. `bpe`, `unigram`, `wordpiece`.",
           "minLength": 1,
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "artifacts": {
           "description": "Package-relative tokenizer artifacts.",
@@ -4092,17 +4095,27 @@
           "description": "Whether the tokenizer operates on raw bytes rather than Unicode scalars.",
           "type": "boolean"
         },
+        "special_tokens": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TokenFacts"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Numeric model and control-token facts for this tokenizer vocabulary.\n\nToken strings, added-token mappings, and chat templates remain in the\ntokenizer assets. Request EOS inputs may override these defaults, but\nworkflow literals and termination components do not own another copy."
+        },
         "vocab_size": {
           "description": "Number of entries in the vocabulary, including added tokens.",
           "format": "uint",
           "minimum": 1,
-          "type": "integer"
+          "type": [
+            "integer",
+            "null"
+          ]
         }
       },
-      "required": [
-        "algorithm",
-        "vocab_size"
-      ],
       "type": "object"
     },
     "VisionOutputBinding": {
@@ -5445,17 +5458,6 @@
         }
       ],
       "description": "Portable speculative-decoding compatibility facts."
-    },
-    "tokens": {
-      "anyOf": [
-        {
-          "$ref": "#/$defs/TokenFacts"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "description": "Numeric model and control-token facts.\n\nToken strings and chat templates remain in tokenizer assets. Request\nEOS inputs may override these defaults, but must not repeat them as\nauthored workflow literals."
     }
   },
   "title": "ONNX Inference Metadata",
