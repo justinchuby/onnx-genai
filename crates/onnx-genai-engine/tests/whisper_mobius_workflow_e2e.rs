@@ -93,7 +93,6 @@ fn batched_features_request(
         "request.max_iterations",
         Value::from_slice_i64(&[i64::try_from(max_new_tokens)?], &[1])?,
     )
-    .with_input("package.eos_ids", Value::from_slice_i64(&[EOS], &[1])?)
     .with_input(
         "package.slot_ids",
         Value::from_slice_i64(&slot_ids, &[rows])?,
@@ -193,7 +192,6 @@ fn transcribe_request(
         "request.max_iterations",
         Value::from_slice_i64(&[i64::try_from(max_new_tokens)?], &[1])?,
     )
-    .with_input("package.eos_ids", Value::from_slice_i64(&[EOS], &[1])?)
     .with_input("package.slot_ids", Value::from_slice_i64(&[0], &[1])?)
     .with_input(
         "request.prompt_lengths",

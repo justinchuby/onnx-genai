@@ -1027,6 +1027,18 @@ pub trait ExecutionProvider: Send + Sync {
     /// Free device memory.
     fn deallocate(&self, buffer: DeviceBuffer) -> Result<()>;
 
+    /// Wait until releases previously accepted by [`Self::deallocate`] have
+    /// reached a terminal state.
+    ///
+    /// Synchronous providers need no work here. Providers whose `deallocate`
+    /// queues ownership behind device fences override this method and wait on
+    /// their structured release queue. This is a lifecycle boundary for owners
+    /// such as an ORT allocator; it is not a per-operation synchronization
+    /// primitive.
+    fn wait_for_deferred_releases(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Release an executor workspace and then its compatibility lease.
     ///
     /// The default is only for providers whose `deallocate` settles synchronously.

@@ -565,8 +565,8 @@ impl Kernel for NonMaxSuppressionKernel {
 
     fn capture_support(&self) -> CaptureSupport {
         CaptureSupport::unsupported(
-            "NonMaxSuppression performs one 8-byte count D2H synchronization before dynamic ORT \
-             output allocation",
+            "NonMaxSuppression uses the DeviceWorkspace two-phase path: \
+             an 8-byte count D2H synchronization must precede dynamic ORT output allocation",
         )
     }
 }

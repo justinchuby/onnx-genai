@@ -245,6 +245,45 @@ impl GenAiConfig {
         if let Some(generation) = self.generation_json() {
             root.insert("generation".into(), generation);
         }
+        let eos_token_ids = eos_token_ids(self)
+            .into_iter()
+            .map(|id| checked_token_id("eos_token_id", id))
+            .collect::<Result<Vec<_>, _>>()?;
+        if eos_token_ids.is_empty() {
+            return Err(incomplete(
+                "an autoregressive package must declare at least one EOS token id in \
+                 genai_config.json; inference metadata does not infer numeric token facts from \
+                 tokenizer assets",
+            ));
+        }
+        root.insert(
+            "schema_version".into(),
+            json!(onnx_genai_metadata::version::TOKEN_AUTHORITY_SCHEMA_VERSION.to_string()),
+        );
+        let mut special_tokens = Map::new();
+        for (name, id) in [
+            ("pad_token_id", self.model.pad_token_id),
+            ("bos_token_id", self.model.bos_token_id),
+            ("sep_token_id", self.model.sep_token_id),
+            ("decoder_start_token_id", self.model.decoder_start_token_id),
+            ("image_token_id", self.model.image_token_id),
+            ("video_token_id", self.model.video_token_id),
+            ("vision_start_token_id", self.model.vision_start_token_id),
+        ] {
+            if let Some(id) = id {
+                special_tokens.insert(name.to_string(), json!(checked_token_id(name, id)?));
+            }
+        }
+        special_tokens.insert("eos_token_id".to_string(), json!(eos_token_ids));
+        root.insert(
+            "package".into(),
+            json!({
+                "tokenizer": {
+                    "vocab_size": self.model.vocab_size,
+                    "special_tokens": special_tokens,
+                }
+            }),
+        );
 
         // `genai_config.json` is a *foreign* producer's format, so importing it
         // is a conversion, not a fallback: the result is stated in this project's
@@ -264,11 +303,6 @@ impl GenAiConfig {
                     .unwrap_or("model.onnx"),
                 &onnx_genai_metadata::decoder_workflow::DecoderFacts {
                     max_sequence_length: self.max_sequence_length(),
-                    // `genai_config.json` already normalizes a scalar or an
-                    // array here, so a model with several end tokens carries
-                    // all of them across instead of losing every id but the
-                    // first at the boundary.
-                    eos_token_ids: eos_token_ids(self),
                     // When the caller supplied the decoder's graph, state the
                     // ports it actually has. Guessing a state tensor's rank
                     // produces a contract the session validator rejects for
@@ -863,4 +897,12 @@ fn eos_token_ids(config: &GenAiConfig) -> Vec<i64> {
         Some(crate::wire_types::EosTokenId::Many(ids)) => ids.clone(),
         None => Vec::new(),
     }
+}
+
+fn checked_token_id(name: &str, id: i64) -> Result<u32, GenAiConfigError> {
+    u32::try_from(id).map_err(|_| {
+        incomplete(format!(
+            "genai_config.json declares invalid negative or out-of-range {name} {id}"
+        ))
+    })
 }

@@ -545,6 +545,23 @@ fn i64s(bytes: &[u8]) -> Vec<i64> {
 #[test]
 fn cuda_unique_is_claimed_and_materialized_through_real_ort_plugin() {
     let _lock = lock_ort();
+    let Some(plugin_path) = onnx_runtime_ort_testkit::find_plugin_cdylib_with_features(
+        "onnx-runtime-ep-cuda-plugin",
+        &["cuda"],
+    ) else {
+        if std::env::var("NXRT_REQUIRE_ORT_TESTS").as_deref() == Ok("1") {
+            panic!("CUDA plugin unavailable");
+        }
+        return;
+    };
+    let observer = unsafe { libloading::Library::new(plugin_path) }.unwrap();
+    let reset_teardown: libloading::Symbol<'_, unsafe extern "C" fn()> = unsafe {
+        observer
+            .get(b"nxrt_ep_reset_allocator_teardown_stats")
+            .unwrap()
+    };
+    unsafe { reset_teardown() };
+
     let Some(session) = (unsafe { session("unique_all_outputs", "cuda_unique_all") }) else {
         if std::env::var("NXRT_REQUIRE_ORT_TESTS").as_deref() == Ok("1") {
             panic!("CUDA plugin or ORT unavailable");
@@ -639,6 +656,37 @@ fn cuda_unique_is_claimed_and_materialized_through_real_ort_plugin() {
             ((*session.api).ReleaseValue.unwrap())(output);
         }
         ((*session.api).ReleaseValue.unwrap())(input);
+    }
+
+    // ReleaseSession -> ReleaseAllocator -> UnregisterExecutionProviderLibrary
+    // is the production teardown order. Keep a second module handle open so
+    // the post-unregister counters remain callable without depending on unload
+    // timing.
+    drop(session);
+    unsafe {
+        let committed: libloading::Symbol<'_, unsafe extern "C" fn() -> u64> =
+            observer.get(b"nxrt_ep_cuda_committed_bytes").unwrap();
+        let quarantined: libloading::Symbol<'_, unsafe extern "C" fn() -> u64> = observer
+            .get(b"nxrt_ep_cuda_allocator_quarantined_releases")
+            .unwrap();
+        let retained: libloading::Symbol<'_, unsafe extern "C" fn() -> u64> = observer
+            .get(b"nxrt_ep_cuda_allocator_retained_releases")
+            .unwrap();
+        assert_eq!(
+            committed(),
+            0,
+            "allocator teardown left CUDA memory committed"
+        );
+        assert_eq!(
+            quarantined(),
+            0,
+            "allocator teardown quarantined a deferred release"
+        );
+        assert_eq!(
+            retained(),
+            0,
+            "allocator teardown retained device ownership"
+        );
     }
 }
 

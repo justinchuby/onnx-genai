@@ -505,6 +505,38 @@ mod tests {
     }
 
     #[test]
+    fn numeric_token_facts_reach_the_tokenizer_package_authority() {
+        let mut raw = minimal();
+        raw["model"]["pad_token_id"] = serde_json::json!(0);
+        raw["model"]["bos_token_id"] = serde_json::json!(1);
+        raw["model"]["eos_token_id"] = serde_json::json!([2, 3]);
+        raw["model"]["sep_token_id"] = serde_json::json!(4);
+        raw["model"]["decoder_start_token_id"] = serde_json::json!(5);
+        raw["model"]["image_token_id"] = serde_json::json!(6);
+        raw["model"]["video_token_id"] = serde_json::json!(7);
+        raw["model"]["vision_start_token_id"] = serde_json::json!(8);
+        let config: GenAiConfig = serde_json::from_value(raw.clone()).expect("config");
+        let (metadata, report) =
+            import(&config, &raw, None, None, ImportOptions::default()).expect("import");
+        assert!(!report.is_lossy());
+        let tokens = metadata
+            .package
+            .expect("package facts")
+            .tokenizer
+            .expect("tokenizer facts")
+            .special_tokens
+            .expect("special token facts");
+        assert_eq!(tokens.pad_token_id, Some(0));
+        assert_eq!(tokens.bos_token_id, Some(1));
+        assert_eq!(tokens.eos_token_id, [2, 3]);
+        assert_eq!(tokens.sep_token_id, Some(4));
+        assert_eq!(tokens.decoder_start_token_id, Some(5));
+        assert_eq!(tokens.image_token_id, Some(6));
+        assert_eq!(tokens.video_token_id, Some(7));
+        assert_eq!(tokens.vision_start_token_id, Some(8));
+    }
+
+    #[test]
     fn undeclared_sampling_policy_is_not_invented() {
         // Absence must stay absent. `max_length` is carried because the author
         // wrote it, but every field they did NOT write stays `None` rather than

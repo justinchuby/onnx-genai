@@ -3,6 +3,7 @@
 //! Owns an EP constructor and fills the `OrtEpFactory` vtable so ORT can
 //! discover devices, create EPs, and release them.
 
+use std::collections::HashMap;
 use std::ffi::{CString, c_char};
 use std::panic::AssertUnwindSafe;
 use std::ptr;
@@ -38,6 +39,11 @@ pub struct ExportedFactory {
     pub kernel_registry_entries: Vec<crate::ep::KernelRegistryEntry>,
     /// Device support configuration for generalized enumeration.
     pub device_support: DeviceSupport,
+    /// Device allocators remain factory-owned after ORT releases them. The
+    /// release callback closes their allocation tables, while retaining the
+    /// adapter allocation makes duplicate release and late defensive Free
+    /// calls harmless until the factory itself is released.
+    pub device_allocators: Mutex<HashMap<usize, Box<DeviceAllocator>>>,
     /// Optional shared EP instance for device EPs that require a single
     /// runtime/context shared across allocator, stream, and data transfer.
     /// When set, factory callbacks use this instead of calling `constructor`
@@ -177,6 +183,7 @@ fn build_factory(
         constructor,
         kernel_registry_entries: Vec::new(),
         device_support: DeviceSupport::cpu_only(),
+        device_allocators: Mutex::new(HashMap::new()),
         shared_ep: None,
         stream_handle: ptr::null_mut(),
     })
@@ -463,6 +470,19 @@ pub unsafe fn release_ep_factory_with_teardown(
     }
     // SAFETY: The pointer was created by Box::into_raw in create_ep_factories.
     let mut exported = unsafe { Box::from_raw(factory.cast::<ExportedFactory>()) };
+
+    // Allocators are the authority for every DeviceBuffer ORT obtained through
+    // them. Close and drop them before taking the shared EP, so each remaining
+    // owner is returned through `ExecutionProvider::deallocate` while its
+    // context and deferred-release queue are still alive.
+    let allocators = {
+        let mut registered = exported
+            .device_allocators
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::take(&mut *registered)
+    };
+    drop(allocators);
 
     let outcome = match exported.shared_ep.take() {
         None => SharedEpTeardown::NotShared,
@@ -878,6 +898,9 @@ unsafe extern "C" fn factory_create_allocator(
         if allocator.is_null() {
             return fail_status("CreateAllocator: allocator output pointer is null");
         }
+        // Every failure leaves a deterministic null output. This also makes a
+        // constructor panic unable to expose stale caller memory as an allocator.
+        unsafe { *allocator = ptr::null_mut() };
         if factory.is_null() {
             return fail_status("CreateAllocator: factory is null");
         }
@@ -905,9 +928,15 @@ unsafe extern "C" fn factory_create_allocator(
         // Device path: create a DeviceAllocator.
         if let Some(ref shared) = exported.shared_ep {
             // Clone the Arc — the allocator holds a strong reference.
-            let dev_alloc = unsafe { DeviceAllocator::new_shared(Arc::clone(shared), memory_info) };
-            let alloc_ptr = Box::into_raw(dev_alloc);
-            unsafe { *allocator = alloc_ptr.cast::<ort::OrtAllocator>() };
+            let mut dev_alloc =
+                unsafe { DeviceAllocator::new_shared(Arc::clone(shared), memory_info) };
+            let alloc_ptr = (&mut *dev_alloc as *mut DeviceAllocator).cast::<ort::OrtAllocator>();
+            exported
+                .device_allocators
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(alloc_ptr as usize, dev_alloc);
+            unsafe { *allocator = alloc_ptr };
             ok_status()
         } else {
             // No shared EP and not host-accessible — construct a fresh EP.
@@ -917,9 +946,14 @@ unsafe extern "C" fn factory_create_allocator(
                 return fail_status(&format!("CreateAllocator: EP init failed: {e}"));
             }
             let ep_ptr = Box::into_raw(ep) as *const dyn ExecutionProvider;
-            let dev_alloc = unsafe { DeviceAllocator::new_owned(ep_ptr, memory_info) };
-            let alloc_ptr = Box::into_raw(dev_alloc);
-            unsafe { *allocator = alloc_ptr.cast::<ort::OrtAllocator>() };
+            let mut dev_alloc = unsafe { DeviceAllocator::new_owned(ep_ptr, memory_info) };
+            let alloc_ptr = (&mut *dev_alloc as *mut DeviceAllocator).cast::<ort::OrtAllocator>();
+            exported
+                .device_allocators
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(alloc_ptr as usize, dev_alloc);
+            unsafe { *allocator = alloc_ptr };
             ok_status()
         }
     }));
@@ -927,7 +961,8 @@ unsafe extern "C" fn factory_create_allocator(
 }
 
 /// Release an allocator. For default ORT allocators (CPU path), this is a no-op.
-/// For DeviceAllocator instances, drops the allocator (and its backing EP if owned).
+/// For device allocators, closes and drains the allocation table. The factory
+/// retains the closed adapter until factory teardown for duplicate-call safety.
 unsafe extern "C" fn factory_release_allocator(
     factory: *mut ort::OrtEpFactory,
     allocator: *mut ort::OrtAllocator,
@@ -937,15 +972,24 @@ unsafe extern "C" fn factory_release_allocator(
             return;
         }
         let exported = unsafe { &*(factory.cast::<ExportedFactory>()) };
-        if !exported.device_support.host_accessible {
-            // This is a DeviceAllocator we created — drop it.
-            // Dropping the DeviceAllocator releases its Arc (shared) or
-            // raw EP pointer (owned). No manual cleanup needed.
-            unsafe {
-                drop(Box::from_raw(allocator.cast::<DeviceAllocator>()));
-            }
+        if exported.device_support.host_accessible {
+            return; // ORT's default CPU allocator; the plugin does not own it.
         }
-        // CPU path: allocator is ORT's default — we don't own it.
+
+        let registered = exported
+            .device_allocators
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(device_allocator) = registered.get(&(allocator as usize)) else {
+            eprintln!(
+                "onnx-runtime-ep-plugin: ignoring ReleaseAllocator for an unknown device \
+                 allocator {allocator:p}; it was not created by this factory"
+            );
+            return;
+        };
+        if let Err(error) = device_allocator.release_tracked() {
+            eprintln!("onnx-runtime-ep-plugin: ERROR: ReleaseAllocator failed: {error}");
+        }
     }));
 }
 
@@ -1189,6 +1233,9 @@ mod tests {
         shutdowns: Arc<AtomicUsize>,
         drops: Arc<AtomicUsize>,
         shutdown_result: Result<(), &'static str>,
+        initialize_result: Result<(), &'static str>,
+        deallocations: Arc<AtomicUsize>,
+        drains: Arc<AtomicUsize>,
     }
 
     impl Drop for CountingEp {
@@ -1212,7 +1259,8 @@ mod tests {
             DeviceId::cuda(0)
         }
         fn initialize(&mut self, _config: &EpConfig) -> EpResult<()> {
-            Ok(())
+            self.initialize_result
+                .map_err(|message| EpError::KernelFailed(message.into()))
         }
         fn shutdown(&mut self) -> EpResult<()> {
             self.shutdowns.fetch_add(1, Ordering::SeqCst);
@@ -1239,13 +1287,32 @@ mod tests {
         ) -> EpResult<Box<dyn Kernel>> {
             Err(EpError::KernelFailed("mock".into()))
         }
-        fn allocate(&self, _size: usize, _alignment: usize) -> EpResult<DeviceBuffer> {
-            Err(EpError::OutOfMemory {
-                requested: 0,
-                available: 0,
+        fn allocate(&self, size: usize, alignment: usize) -> EpResult<DeviceBuffer> {
+            let layout = std::alloc::Layout::from_size_align(size.max(1), alignment)
+                .map_err(|error| EpError::KernelFailed(error.to_string()))?;
+            let pointer = unsafe { std::alloc::alloc(layout) };
+            if pointer.is_null() {
+                return Err(EpError::OutOfMemory {
+                    requested: size,
+                    available: 0,
+                });
+            }
+            Ok(unsafe {
+                DeviceBuffer::from_raw_parts(pointer.cast(), DeviceId::cuda(0), size, alignment)
             })
         }
-        fn deallocate(&self, _buffer: DeviceBuffer) -> EpResult<()> {
+        fn deallocate(&self, buffer: DeviceBuffer) -> EpResult<()> {
+            self.deallocations.fetch_add(1, Ordering::SeqCst);
+            let size = buffer.len();
+            let alignment = buffer.alignment();
+            let pointer = buffer.into_raw();
+            let layout = std::alloc::Layout::from_size_align(size.max(1), alignment)
+                .map_err(|error| EpError::KernelFailed(error.to_string()))?;
+            unsafe { std::alloc::dealloc(pointer.cast(), layout) };
+            Ok(())
+        }
+        fn wait_for_deferred_releases(&self) -> EpResult<()> {
+            self.drains.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
         fn copy(&self, _s: &DeviceBuffer, _d: &mut DeviceBuffer, _n: usize) -> EpResult<()> {
@@ -1275,6 +1342,9 @@ mod tests {
             shutdowns: Arc::clone(shutdowns),
             drops: Arc::clone(drops),
             shutdown_result,
+            initialize_result: Ok(()),
+            deallocations: Arc::new(AtomicUsize::new(0)),
+            drains: Arc::new(AtomicUsize::new(0)),
         });
         Arc::new(Mutex::new(ep))
     }
@@ -1289,6 +1359,90 @@ mod tests {
         );
         factory.shared_ep = shared;
         Box::into_raw(factory).cast::<ort::OrtEpFactory>()
+    }
+
+    fn counting_allocator_ep(
+        deallocations: &Arc<AtomicUsize>,
+        drains: &Arc<AtomicUsize>,
+        drops: &Arc<AtomicUsize>,
+        initialize_result: Result<(), &'static str>,
+    ) -> Box<dyn ExecutionProvider + Send> {
+        Box::new(CountingEp {
+            shutdowns: Arc::new(AtomicUsize::new(0)),
+            drops: Arc::clone(drops),
+            shutdown_result: Ok(()),
+            initialize_result,
+            deallocations: Arc::clone(deallocations),
+            drains: Arc::clone(drains),
+        })
+    }
+
+    #[test]
+    fn release_allocator_callback_is_idempotent_and_retains_closed_adapter() {
+        let deallocations = Arc::new(AtomicUsize::new(0));
+        let drains = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let shared = Arc::new(Mutex::new(counting_allocator_ep(
+            &deallocations,
+            &drains,
+            &drops,
+            Ok(()),
+        )));
+        let raw = raw_shared_factory(Some(shared));
+        unsafe { &mut *raw.cast::<ExportedFactory>() }.device_support =
+            DeviceSupport::gpu("Test", 0);
+
+        let mut allocator = ptr::null_mut();
+        let status =
+            unsafe { factory_create_allocator(raw, ptr::null(), ptr::null(), &mut allocator) };
+        assert!(status.is_null());
+        assert!(!allocator.is_null());
+        let allocation = unsafe { ((*allocator).Alloc.unwrap())(allocator, 128) };
+        assert!(!allocation.is_null());
+
+        unsafe { factory_release_allocator(raw, allocator) };
+        unsafe { factory_release_allocator(raw, allocator) };
+        assert_eq!(deallocations.load(Ordering::SeqCst), 1);
+        assert_eq!(drains.load(Ordering::SeqCst), 1);
+
+        // The factory retains the closed adapter until its own teardown, so a
+        // late defensive Free cannot use freed callback state or double-free.
+        unsafe { ((*allocator).Free.unwrap())(allocator, allocation) };
+        assert_eq!(deallocations.load(Ordering::SeqCst), 1);
+        unsafe { release_ep_factory_with_teardown(raw) };
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn failed_allocator_initialization_drops_ep_and_nulls_output() {
+        let deallocations = Arc::new(AtomicUsize::new(0));
+        let drains = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let constructor_deallocations = Arc::clone(&deallocations);
+        let constructor_drains = Arc::clone(&drains);
+        let constructor_drops = Arc::clone(&drops);
+        let mut factory = build_factory(
+            CString::new("failing_allocator").unwrap(),
+            Box::new(move || {
+                counting_allocator_ep(
+                    &constructor_deallocations,
+                    &constructor_drains,
+                    &constructor_drops,
+                    Err("injected allocator initialization failure"),
+                )
+            }),
+        );
+        factory.device_support = DeviceSupport::gpu("Test", 0);
+        let raw = Box::into_raw(factory).cast::<ort::OrtEpFactory>();
+        let mut output = std::ptr::dangling_mut::<ort::OrtAllocator>();
+
+        let _status =
+            unsafe { factory_create_allocator(raw, ptr::null(), ptr::null(), &mut output) };
+        assert!(output.is_null(), "failure must always null the output");
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(deallocations.load(Ordering::SeqCst), 0);
+        assert_eq!(drains.load(Ordering::SeqCst), 0);
+        unsafe { release_ep_factory_with_teardown(raw) };
     }
 
     /// Normal teardown: ORT releases every other surface first, so the factory

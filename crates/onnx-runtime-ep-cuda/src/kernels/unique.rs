@@ -583,8 +583,8 @@ impl Kernel for UniqueKernel {
 
     fn capture_support(&self) -> CaptureSupport {
         CaptureSupport::unsupported(
-            "Unique performs an 8-byte count D2H synchronization before dynamic ORT output \
-             allocation",
+            "Unique uses the DeviceWorkspace two-phase path: an 8-byte count D2H synchronization \
+             must precede dynamic ORT output allocation",
         )
     }
 }
@@ -933,6 +933,18 @@ mod tests {
         let capture = registered_kernel.capture_support();
         assert!(!capture.is_supported());
         assert!(capture.reason().unwrap().contains("8-byte count D2H"));
+        reset_unique_execution_stats();
+        let capture_error = runtime
+            .begin_graph_capture(&[registered_kernel.as_ref()])
+            .expect_err("Unique capture must be rejected before either DeviceWorkspace phase");
+        assert!(
+            capture_error
+                .to_string()
+                .contains("rejected before begin_capture")
+        );
+        assert!(capture_error.to_string().contains("DeviceWorkspace"));
+        assert_eq!(unique_execution_stats(), UniqueExecutionStats::default());
+        assert!(!runtime.is_capturing().unwrap());
         assert!(crate::kernels::CUDA_COVERED_OPS.contains(&"Unique"));
         assert_eq!(
             crate::kernels::cuda_supported_dtypes_for_op("Unique", ""),

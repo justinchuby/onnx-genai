@@ -171,7 +171,24 @@ pub struct DeviceAllocator {
     /// preserves binding identity and allocation generation for providers whose
     /// release path is generation-checked. The pointer is only the lookup key;
     /// it is never treated as release authority.
-    pub allocations: Mutex<HashMap<usize, DeviceBuffer>>,
+    pub(crate) allocations: Mutex<DeviceAllocatorState>,
+}
+
+/// Allocation ownership and allocator lifecycle share one lock so an
+/// allocation cannot be inserted after teardown has drained the table.
+#[derive(Default)]
+pub(crate) struct DeviceAllocatorState {
+    released: bool,
+    buffers: HashMap<usize, DeviceBuffer>,
+}
+
+/// Result of closing one allocator ownership table.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct DeviceAllocatorRelease {
+    /// Buffers returned to the owning EP by this call.
+    pub deallocated: usize,
+    /// `true` when an earlier release already closed this allocator.
+    pub already_released: bool,
 }
 
 // SAFETY: The EP behind the raw pointer is Send+Sync per ExecutionProvider trait bound.
@@ -205,7 +222,7 @@ impl DeviceAllocator {
             vtable: Self::vtable(),
             ep_ref: EpRef::Shared(shared),
             memory_info,
-            allocations: Mutex::new(HashMap::new()),
+            allocations: Mutex::new(DeviceAllocatorState::default()),
         })
     }
 
@@ -223,8 +240,93 @@ impl DeviceAllocator {
             vtable: Self::vtable(),
             ep_ref: EpRef::Owned(ep),
             memory_info,
-            allocations: Mutex::new(HashMap::new()),
+            allocations: Mutex::new(DeviceAllocatorState::default()),
         })
+    }
+
+    /// Close the allocator, return every still-tracked owner to its EP exactly
+    /// once, and wait for asynchronous releases to settle.
+    ///
+    /// ORT's `ReleaseAllocator` is the allocator lifetime boundary: after it,
+    /// ORT must not allocate from the object and any allocation for which it
+    /// has not called `Free` is relinquished with the allocator. The factory
+    /// keeps the closed adapter allocation alive until factory teardown so a
+    /// duplicate `ReleaseAllocator` or a late defensive `Free` cannot
+    /// dereference freed adapter memory.
+    pub(crate) fn release_tracked(&self) -> Result<DeviceAllocatorRelease, String> {
+        let buffers = {
+            let mut state = self
+                .allocations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.released {
+                return Ok(DeviceAllocatorRelease {
+                    deallocated: 0,
+                    already_released: true,
+                });
+            }
+            state.released = true;
+            std::mem::take(&mut state.buffers)
+        };
+
+        let deallocated = buffers.len();
+        let mut errors = Vec::new();
+        for (address, buffer) in buffers {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.ep_ref.with_ep(|ep| ep.deallocate(buffer))
+            }));
+            match result {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(error))) => errors.push(format!(
+                    "deallocate rejected tracked device buffer at {address:#x}: {error}"
+                )),
+                Ok(Err(error)) => errors.push(format!(
+                    "could not reach the owning EP for tracked device buffer at \
+                     {address:#x}: {error}"
+                )),
+                Err(_) => errors.push(format!(
+                    "owning EP panicked while deallocating tracked device buffer at {address:#x}"
+                )),
+            }
+        }
+
+        let drain = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.ep_ref.with_ep(|ep| ep.wait_for_deferred_releases())
+        }));
+        match drain {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(error))) => {
+                errors.push(format!("deferred device releases did not settle: {error}"))
+            }
+            Ok(Err(error)) => errors.push(format!(
+                "could not reach the owning EP to settle deferred device releases: {error}"
+            )),
+            Err(_) => {
+                errors.push("owning EP panicked while settling deferred device releases".into())
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(DeviceAllocatorRelease {
+                deallocated,
+                already_released: false,
+            })
+        } else {
+            Err(format!(
+                "device allocator teardown attempted {deallocated} tracked deallocation(s), but \
+                 {} lifecycle operation(s) failed: {}",
+                errors.len(),
+                errors.join("; ")
+            ))
+        }
+    }
+}
+
+impl Drop for DeviceAllocator {
+    fn drop(&mut self) {
+        if let Err(error) = self.release_tracked() {
+            eprintln!("onnx-runtime-ep-plugin: ERROR: {error}");
+        }
     }
 }
 
@@ -265,6 +367,14 @@ unsafe extern "C" fn device_alloc(
             return ptr::null_mut();
         }
         let alloc = unsafe { &*(this.cast::<DeviceAllocator>()) };
+        if alloc
+            .allocations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .released
+        {
+            return ptr::null_mut();
+        }
         // Normalise at the adapter boundary — see `ZERO_SIZE_ALLOC_BYTES`.
         let request = normalize_alloc_size(size);
         match alloc
@@ -283,12 +393,22 @@ unsafe extern "C" fn device_alloc(
                 // leak. The guarded data is a plain `HashMap` whose only
                 // mutations here are `insert`/`remove`, so it cannot be left
                 // logically inconsistent by a panic elsewhere.
-                let mut allocations = alloc
+                let mut state = alloc
                     .allocations
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                allocations.insert(p as usize, buf);
-                p
+                if state.released {
+                    drop(state);
+                    let _ = alloc.ep_ref.with_ep(|ep| {
+                        let result = ep.deallocate(buf);
+                        let drain = ep.wait_for_deferred_releases();
+                        result.and(drain)
+                    });
+                    ptr::null_mut()
+                } else {
+                    state.buffers.insert(p as usize, buf);
+                    p
+                }
             }
             _ => ptr::null_mut(),
         }
@@ -307,11 +427,13 @@ unsafe extern "C" fn device_free(this: *mut ort::OrtAllocator, p: *mut std::os::
         // fabricating release authority from a raw address.
         // Poison recovery (see `device_alloc`): a poisoned lock must not turn
         // every subsequent free into a no-op.
-        let buffer = alloc
-            .allocations
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&(p as usize));
+        let buffer = {
+            let mut state = alloc
+                .allocations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.buffers.remove(&(p as usize))
+        };
         let buffer = match buffer {
             Some(buffer) => buffer,
             None => return, // unknown pointer — no-op (S1)
@@ -1135,6 +1257,7 @@ mod tests {
                 .allocations
                 .lock()
                 .unwrap()
+                .buffers
                 .get(&(ptr as usize))
                 .is_some_and(DeviceBuffer::is_bound),
             "the adapter must retain the exact binding-issued owner"
@@ -1166,6 +1289,190 @@ mod tests {
     fn device_allocator_null_this_returns_null() {
         let ptr = unsafe { device_alloc(ptr::null_mut(), 64) };
         assert!(ptr.is_null());
+    }
+
+    #[derive(Default)]
+    struct AllocatorLifecycleCounts {
+        deallocations: std::sync::atomic::AtomicUsize,
+        drains: std::sync::atomic::AtomicUsize,
+    }
+
+    struct AllocatorLifecycleEp {
+        counts: Arc<AllocatorLifecycleCounts>,
+        fail_deallocate: bool,
+    }
+
+    impl ExecutionProvider for AllocatorLifecycleEp {
+        fn consume_route_residency_at_boundary(&self) -> EpResult<()> {
+            Ok(())
+        }
+
+        fn name(&self) -> &str {
+            "allocator_lifecycle_ep"
+        }
+
+        fn device_type(&self) -> DeviceType {
+            DeviceType::Cuda
+        }
+
+        fn device_id(&self) -> DeviceId {
+            DeviceId::cuda(0)
+        }
+
+        fn initialize(&mut self, config: &onnx_runtime_ep_api::provider::EpConfig) -> EpResult<()> {
+            MockGpuEp.initialize(config)
+        }
+
+        fn shutdown(&mut self) -> EpResult<()> {
+            Ok(())
+        }
+
+        fn supports_op(
+            &self,
+            op: &Node,
+            opset: u64,
+            shapes: &[Shape],
+            input_dtypes: &[DataType],
+            layouts: &[TensorLayout],
+        ) -> KernelMatch {
+            MockGpuEp.supports_op(op, opset, shapes, input_dtypes, layouts)
+        }
+
+        fn get_kernel(
+            &self,
+            op: &Node,
+            shapes: &[Vec<usize>],
+            opset: u64,
+        ) -> EpResult<Box<dyn Kernel>> {
+            MockGpuEp.get_kernel(op, shapes, opset)
+        }
+
+        fn allocate(&self, size: usize, alignment: usize) -> EpResult<DeviceBuffer> {
+            MockGpuEp.allocate(size, alignment)
+        }
+
+        fn deallocate(&self, buffer: DeviceBuffer) -> EpResult<()> {
+            self.counts
+                .deallocations
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            MockGpuEp.deallocate(buffer)?;
+            if self.fail_deallocate {
+                Err(EpError::KernelFailed(
+                    "injected failure after ownership settlement".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn wait_for_deferred_releases(&self) -> EpResult<()> {
+            self.counts
+                .drains
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn copy(&self, src: &DeviceBuffer, dst: &mut DeviceBuffer, size: usize) -> EpResult<()> {
+            MockGpuEp.copy(src, dst, size)
+        }
+
+        fn copy_async(
+            &self,
+            src: &DeviceBuffer,
+            dst: &mut DeviceBuffer,
+            size: usize,
+        ) -> EpResult<onnx_runtime_ep_api::provider::Fence> {
+            MockGpuEp.copy_async(src, dst, size)
+        }
+
+        fn sync(&self) -> EpResult<()> {
+            Ok(())
+        }
+    }
+
+    fn lifecycle_allocator(
+        fail_deallocate: bool,
+    ) -> (*mut DeviceAllocator, Arc<AllocatorLifecycleCounts>) {
+        let counts = Arc::new(AllocatorLifecycleCounts::default());
+        let ep: Box<dyn ExecutionProvider> = Box::new(AllocatorLifecycleEp {
+            counts: Arc::clone(&counts),
+            fail_deallocate,
+        });
+        let ep_ptr = Box::into_raw(ep);
+        let allocator = unsafe { DeviceAllocator::new_owned(ep_ptr, ptr::null()) };
+        (Box::into_raw(allocator), counts)
+    }
+
+    #[test]
+    fn allocator_release_drains_multiple_allocations_after_partial_frees() {
+        use std::sync::atomic::Ordering;
+
+        let (allocator, counts) = lifecycle_allocator(false);
+        let first = unsafe { device_alloc(allocator.cast(), 64) };
+        let second = unsafe { device_alloc(allocator.cast(), 128) };
+        let third = unsafe { device_alloc(allocator.cast(), 256) };
+        assert!(!first.is_null() && !second.is_null() && !third.is_null());
+
+        unsafe { device_free(allocator.cast(), second) };
+        let release = unsafe { &*allocator }.release_tracked().unwrap();
+        assert_eq!(release.deallocated, 2);
+        assert!(!release.already_released);
+        assert_eq!(counts.deallocations.load(Ordering::SeqCst), 3);
+        assert_eq!(counts.drains.load(Ordering::SeqCst), 1);
+
+        let repeated = unsafe { &*allocator }.release_tracked().unwrap();
+        assert!(repeated.already_released);
+        assert_eq!(counts.deallocations.load(Ordering::SeqCst), 3);
+        assert_eq!(counts.drains.load(Ordering::SeqCst), 1);
+        unsafe { drop(Box::from_raw(allocator)) };
+    }
+
+    #[test]
+    fn allocator_release_before_or_after_value_free_settles_each_owner_once() {
+        use std::sync::atomic::Ordering;
+
+        let (release_first, first_counts) = lifecycle_allocator(false);
+        let value = unsafe { device_alloc(release_first.cast(), 64) };
+        assert!(!value.is_null());
+        unsafe { &*release_first }.release_tracked().unwrap();
+        // ORT must not use the value after releasing its allocator. A late
+        // defensive Free is nevertheless harmless while the factory retains
+        // the closed adapter.
+        unsafe { device_free(release_first.cast(), value) };
+        assert_eq!(first_counts.deallocations.load(Ordering::SeqCst), 1);
+        assert!(unsafe { device_alloc(release_first.cast(), 64) }.is_null());
+        unsafe { drop(Box::from_raw(release_first)) };
+
+        let (free_first, second_counts) = lifecycle_allocator(false);
+        let value = unsafe { device_alloc(free_first.cast(), 64) };
+        unsafe { device_free(free_first.cast(), value) };
+        let release = unsafe { &*free_first }.release_tracked().unwrap();
+        assert_eq!(release.deallocated, 0);
+        assert_eq!(second_counts.deallocations.load(Ordering::SeqCst), 1);
+        assert_eq!(second_counts.drains.load(Ordering::SeqCst), 1);
+        unsafe { drop(Box::from_raw(free_first)) };
+    }
+
+    #[test]
+    fn allocator_error_path_attempts_every_owner_and_drains_once() {
+        use std::sync::atomic::Ordering;
+
+        let (allocator, counts) = lifecycle_allocator(true);
+        assert!(!unsafe { device_alloc(allocator.cast(), 64) }.is_null());
+        assert!(!unsafe { device_alloc(allocator.cast(), 128) }.is_null());
+
+        let error = unsafe { &*allocator }
+            .release_tracked()
+            .expect_err("injected deallocation failures must be reported");
+        assert!(error.contains("attempted 2 tracked deallocation(s)"));
+        assert_eq!(counts.deallocations.load(Ordering::SeqCst), 2);
+        assert_eq!(counts.drains.load(Ordering::SeqCst), 1);
+
+        let repeated = unsafe { &*allocator }.release_tracked().unwrap();
+        assert!(repeated.already_released);
+        assert_eq!(counts.deallocations.load(Ordering::SeqCst), 2);
+        assert_eq!(counts.drains.load(Ordering::SeqCst), 1);
+        unsafe { drop(Box::from_raw(allocator)) };
     }
 
     // ─── Stream adapter tests ────────────────────────────────────────────────
@@ -1595,6 +1902,7 @@ mod tests {
             a.allocations
                 .lock()
                 .unwrap()
+                .buffers
                 .get(&(p as usize))
                 .unwrap()
                 .len()
@@ -1636,6 +1944,7 @@ mod tests {
             a.allocations
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .buffers
                 .get(&(p as usize))
                 .map(DeviceBuffer::len)
         };
@@ -1655,6 +1964,7 @@ mod tests {
             a.allocations
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .buffers
                 .contains_key(&(p as usize))
         };
         assert!(
