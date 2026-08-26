@@ -1450,7 +1450,7 @@ pub(crate) fn prepare_completion(
     request: &CompletionRequest,
     handle: &ModelHandle,
 ) -> Result<PreparedCompletion, ApiError> {
-    let mut options = build_completion_options(request, &handle.tokenizer);
+    let mut options = build_completion_options(request);
     options.max_context = handle.model_max_context;
     // Honor the model's declared sampling regime (e.g. a reasoning model that
     // ships do_sample=true); explicit request fields still win.
@@ -1525,7 +1525,7 @@ fn tokenize_prompt(tokenizer: &Tokenizer, prompt: &str) -> Result<usize, ApiErro
         .map_err(|err| ApiError::internal(format!("prompt tokenization failed: {err}")))
 }
 
-fn build_completion_options(request: &CompletionRequest, tokenizer: &Tokenizer) -> GenerateOptions {
+fn build_completion_options(request: &CompletionRequest) -> GenerateOptions {
     let mut options = GenerateOptions {
         max_new_tokens: request.max_tokens,
         temperature: request.temperature.unwrap_or(NEUTRAL_SAMPLING),
@@ -1539,7 +1539,6 @@ fn build_completion_options(request: &CompletionRequest, tokenizer: &Tokenizer) 
     if let Some(stop) = request.stop.clone() {
         options.stop_sequences = stop.into_sequences();
     }
-    add_tokenizer_stop_sequences(&mut options, tokenizer);
     options
 }
 
@@ -1841,31 +1840,10 @@ fn tool_call_schema_for_tool(tool: &ChatTool) -> serde_json::Value {
 
 fn build_generate_options_with_tokenizer(
     request: &ChatCompletionRequest,
-    tokenizer: &Tokenizer,
+    _tokenizer: &Tokenizer,
     output_budget: usize,
 ) -> GenerateOptions {
-    let mut options = build_generate_options(request, output_budget);
-    add_tokenizer_stop_sequences(&mut options, tokenizer);
-    options
-}
-
-fn add_tokenizer_stop_sequences(options: &mut GenerateOptions, tokenizer: &Tokenizer) {
-    let eos_token_ids = tokenizer.eos_token_ids();
-    if let Some(first) = eos_token_ids.first().copied() {
-        options.eos_token_id = Some(first);
-    }
-    for eos_token_id in eos_token_ids {
-        let eos_sequence = StopSequence::Tokens(vec![eos_token_id]);
-        if !options.stop_sequences.contains(&eos_sequence) {
-            options.stop_sequences.push(eos_sequence);
-        }
-    }
-    if let Some(im_end_id) = tokenizer.token_id("<|im_end|>") {
-        let im_end_sequence = StopSequence::Tokens(vec![im_end_id]);
-        if !options.stop_sequences.contains(&im_end_sequence) {
-            options.stop_sequences.push(im_end_sequence);
-        }
-    }
+    build_generate_options(request, output_budget)
 }
 
 fn json_constraint_stopped_incomplete_message(message: &str) -> bool {

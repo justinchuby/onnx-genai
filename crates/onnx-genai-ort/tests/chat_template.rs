@@ -55,11 +55,9 @@ fn renders_tools_for_qwen_template() {
 }
 
 #[test]
-fn tokenizer_surfaces_all_eos_token_ids() {
+fn tokenizer_surfaces_string_to_id_mappings_without_owning_eos_policy() {
     let tokenizer = Tokenizer::from_file("tests/fixtures/chatml/tokenizer.json").unwrap();
 
-    assert_eq!(tokenizer.eos_token_id(), Some(151645));
-    assert_eq!(tokenizer.eos_token_ids(), vec![151645, 151643]);
     assert_eq!(tokenizer.token_id("<|im_start|>"), Some(151644));
     assert_eq!(tokenizer.token_id("<|im_end|>"), Some(151645));
     assert!(

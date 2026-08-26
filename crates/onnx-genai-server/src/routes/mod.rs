@@ -11,9 +11,7 @@ use axum::{
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response, Sse, sse::Event},
 };
-use onnx_genai::{
-    FinishReason, GenerateOptions, GeneratePrompt, GenerateRequest, GenerateResult, StopSequence,
-};
+use onnx_genai::{FinishReason, GenerateOptions, GeneratePrompt, GenerateRequest, GenerateResult};
 use onnx_genai_engine::{
     DryConfig, EmbeddingOptions, EngineGovernorError, GenerateConstraint, GovernorSnapshot,
     MirostatConfig, MirostatVersion, PackageCapabilityError, ResourceLimit, SamplingOverrides,
