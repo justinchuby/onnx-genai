@@ -1205,7 +1205,19 @@ def windows_ort_executors(jobs: dict[str, str] | None = None) -> dict[str, set[s
 # A job-level `if:` that still leaves the job running whenever it is scheduled.
 # `_ALLOWED_JOB_IF` is reused deliberately: a docs-only PR is entitled to skip
 # these tests, and the required tier already treats that guard as acceptable.
-_JOB_IF_RUNS_ANYWAY = _ALLOWED_JOB_IF | frozenset({"true", "${{ true }}", "success()"})
+_JOB_IF_RUNS_ANYWAY = _ALLOWED_JOB_IF | frozenset({"true", "success()", "always()"})
+
+# `if: X` and `if: ${{ X }}` are the same expression to Actions. Comparing the
+# raw text would refuse a pure reformat of a guard this gate already credits,
+# turning the required lane red for an edit that changed no behaviour.
+_EXPRESSION_WRAPPER = re.compile(r"^\$\{\{\s*(.*?)\s*\}\}$")
+
+
+def _job_if_runs_anyway(condition: str) -> bool:
+    """Whether a job-level `if:` still leaves the job running when scheduled."""
+    if match := _EXPRESSION_WRAPPER.match(condition):
+        condition = match.group(1)
+    return condition in _JOB_IF_RUNS_ANYWAY
 
 
 def _windows_ort_coverage(
@@ -1232,7 +1244,7 @@ def _windows_ort_coverage(
         if not tested:
             continue
         condition = job_condition(body)
-        if condition is not None and condition not in _JOB_IF_RUNS_ANYWAY:
+        if condition is not None and not _job_if_runs_anyway(condition):
             refused[name] = condition
             continue
         found[name] = tested
@@ -1814,7 +1826,7 @@ def _conditional_arms() -> int:
 # Hand-maintained because `_parser_arms` is inline code rather than a table.
 # `self_test` recounts the arms it actually observed and refuses if this number
 # disagrees, so a stale value here fails loudly instead of under-reporting.
-_PARSER_ARM_COUNT = 22
+_PARSER_ARM_COUNT = 24
 
 
 # Each arm is (label, workflow text, the packages the scanner must credit).
@@ -2219,6 +2231,25 @@ def _parser_arms() -> int:
     failures += _coverage_arm(
         "the repo's docs-only guard still counts as Windows coverage",
         _ort_job_with_if("windows-latest", "needs.changes.outputs.docs_only != 'true'"),
+        0,
+    )
+    # Review found the credited set was an exact-string match, so wrapping the
+    # very guard above in `${{ }}` -- a reformat changing no behaviour -- turned
+    # the required lane red. These two arms also close a battery gap review
+    # measured: dropping the always-true literals from the credited set left all
+    # the arms above passing, because none of them asked for a literal to be
+    # credited. Over-refusal is the loud direction, but a suite that cannot see
+    # it is not asserting the boundary, only one side of it.
+    failures += _coverage_arm(
+        "the same guard wrapped in ${{ }} is the same guard",
+        _ort_job_with_if(
+            "windows-latest", "${{ needs.changes.outputs.docs_only != 'true' }}"
+        ),
+        0,
+    )
+    failures += _coverage_arm(
+        "an always-true job condition is still Windows coverage",
+        _ort_job_with_if("windows-latest", "true"),
         0,
     )
     # The failure has to name the job, or it reports a live job as an absent one
