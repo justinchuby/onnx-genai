@@ -1,7 +1,7 @@
 # Metadata capability model
 
 Status: **normative proposal**. This document audits the current tree at
-`66ca26a5d5d1597e471c6a58c12e4913b97da56a` and proposes a simplification. It
+`edc42d2cbcd5a43805d232250d39779d46839539` and proposes a simplification. It
 does not change the metadata schema, parser, validator, generated schema, or
 runtime.
 
@@ -179,7 +179,7 @@ Upstream Hugging Face sources that contain no inference metadata are provenance,
 not hosted metadata examples. The resulting fleet is 28 packages.
 
 Every revision below was downloaded by immutable SHA and checked with the
-`66ca26a5d` `validate_metadata --metadata-only --shape` binary. **Valid** means
+`edc42d2cb` `validate_metadata --metadata-only --shape` binary. **Valid** means
 the metadata parses and passes semantic validation. Direct ORT evidence means a
 model card or evidence file exercises graphs directly; workflow ORT evidence
 means the generic workflow engine executed the package. Neither is native
@@ -187,7 +187,7 @@ readiness or performance proof unless stated separately. A card-reported run is
 accepted here only when it names the artifact/runtime/result; a maintained test
 that can silently skip does not independently upgrade that claim.
 
-| Hosted package and exact metadata revision | Model form | Schema | Validation and evidence status |
+| Hosted package and exact metadata revision | Model form | Normalized schema | Validation and evidence status |
 | --- | --- | --- | --- |
 | [`qwen2.5-0.5b-instruct-onnx-genai`](https://huggingface.co/justinchuby/qwen2.5-0.5b-instruct-onnx-genai/blob/a61ca2e7e7a41db4c310b6a24479d768d6ab20ae/inference_metadata.yaml) `a61ca2e7e7a41db4c310b6a24479d768d6ab20ae` | Decoder plus ten semantic policy graphs | v1.0 | Valid; card records generic workflow CPU output. No accepted performance record. |
 | [`qwen3-0.6b-onnx-genai`](https://huggingface.co/justinchuby/qwen3-0.6b-onnx-genai/blob/38714511f57e01df01808b930168459a8e7aa9a3/inference_metadata.yaml) `38714511f57e01df01808b930168459a8e7aa9a3` | Decoder plus policy graphs and session conversation state | v1.0 | Valid; card records generic workflow CPU output and multi-turn use. |
@@ -199,8 +199,8 @@ that can silently skip does not independently upgrade that claim.
 | [`pangu-weather-1h-onnx-catalogue`](https://huggingface.co/justinchuby/pangu-weather-1h-onnx-catalogue/blob/82beb24f24169b88bb0f108e40fc35840d4a8d57/inference_metadata.yaml) `82beb24f24169b88bb0f108e40fc35840d4a8d57` | Stateless weather forecast graph | v1.0 | Valid; card records a direct ORT CUDA deterministic request. Generic workflow and native execution are not recorded. |
 | [`onnx-genai-example-whisper-tiny`](https://huggingface.co/justinchuby/onnx-genai-example-whisper-tiny/blob/a37efd017b049d697d690824618c0cded5cffa78/inference_metadata.yaml) `a37efd017b049d697d690824618c0cded5cffa78` | Audio encoder-decoder with cross-attention state and policy graphs | v1.0 | Valid; direct ORT load/output evidence. General profile-driven or native execution is not established. |
 | [`onnx-genai-example-wav2vec2-base-960h-ctc`](https://huggingface.co/justinchuby/onnx-genai-example-wav2vec2-base-960h-ctc/blob/28480e393ad1b8fa2e0bb6939e5daded02f24014/inference_metadata.yaml) `28480e393ad1b8fa2e0bb6939e5daded02f24014` | Audio preprocessing plus encoder-only CTC | v1.0 | **Refreshed and valid**; direct ORT evidence. No `batch_capacity`, so grouped execution is not claimed; no engine CTC-profile dispatcher is proved. |
-| [`onnx-genai-example-esm2-t6-8m`](https://huggingface.co/justinchuby/onnx-genai-example-esm2-t6-8m/blob/d9f1947f4973056fe287e498b0b0e9b675f1bb92/inference_metadata.yaml) `d9f1947f4973056fe287e498b0b0e9b675f1bb92` | Protein encoder with embedding profile | v1.0 | **Refreshed and valid**; direct ORT evidence. The retired profile batching hint was removed; profile execution and grouping remain unproved. |
-| [`onnx-genai-example-prot-bert`](https://huggingface.co/justinchuby/onnx-genai-example-prot-bert/blob/916d8290b9108a3a6487ff4381ea9a66c32588c0/inference_metadata.yaml) `916d8290b9108a3a6487ff4381ea9a66c32588c0` | Protein encoder with embedding profile | v1.0 | **Refreshed and valid**; direct ORT evidence. The retired profile batching hint was removed; profile execution and grouping remain unproved. |
+| [`onnx-genai-example-esm2-t6-8m`](https://huggingface.co/justinchuby/onnx-genai-example-esm2-t6-8m/blob/d1e2ada5086f6ef0d1bfffb4099a5292104dbc1b/inference_metadata.yaml) `d1e2ada5086f6ef0d1bfffb4099a5292104dbc1b` | Protein encoder with embedding profile | v1.0 | **Canonical-producer parity restored and valid.** [`provenance.json`](https://huggingface.co/justinchuby/onnx-genai-example-esm2-t6-8m/blob/d1e2ada5086f6ef0d1bfffb4099a5292104dbc1b/provenance.json) pins `onnxruntime/mobius@8e3ab921a`; request-aligned layouts are preserved and `batch_capacity` is correctly absent. Direct ORT evidence remains; profile-driven execution and cross-request grouping remain unproved. |
+| [`onnx-genai-example-prot-bert`](https://huggingface.co/justinchuby/onnx-genai-example-prot-bert/blob/17942612a34372dc4191251455ebcb9f854a9db3/inference_metadata.yaml) `17942612a34372dc4191251455ebcb9f854a9db3` | Protein encoder with embedding profile | v1.0 | **Canonical-producer parity restored and valid.** [`provenance.json`](https://huggingface.co/justinchuby/onnx-genai-example-prot-bert/blob/17942612a34372dc4191251455ebcb9f854a9db3/provenance.json) pins `onnxruntime/mobius@8e3ab921a`; request-aligned layouts are preserved and `batch_capacity` is correctly absent. Direct ORT evidence remains; profile-driven execution and cross-request grouping remain unproved. |
 | [`onnx-genai-example-qwen2-5-0-5b-portable-f32`](https://huggingface.co/justinchuby/onnx-genai-example-qwen2-5-0-5b-portable-f32/blob/65ef8d35466d402f5bfa5330bb48477e0b330415/inference_metadata.yaml) `65ef8d35466d402f5bfa5330bb48477e0b330415` | Portable f32 decoder plus policy graphs | v1.0 | Valid; direct ORT smoke/output records. Exact native readiness is not recorded. |
 | [`onnx-genai-example-qwen2-5-0-5b-cuda-gqa-f16`](https://huggingface.co/justinchuby/onnx-genai-example-qwen2-5-0-5b-cuda-gqa-f16/blob/ec8046b051a8f11e6d339a7d9d85dd1235053989/inference_metadata.yaml) `ec8046b051a8f11e6d339a7d9d85dd1235053989` | CUDA GQA f16 decoder plus policy graphs | v1.0 | Valid; direct ORT CUDA smoke/output records. Provider-specific execution is not interchangeability evidence. |
 | [`onnx-genai-example-qwen2-5-0-5b-static-cache-f32`](https://huggingface.co/justinchuby/onnx-genai-example-qwen2-5-0-5b-static-cache-f32/blob/bc6b427cbba8db42a1ec3616002a5efab87f6fd0/inference_metadata.yaml) `bc6b427cbba8db42a1ec3616002a5efab87f6fd0` | Fixed-capacity indexed-scatter decoder plus policy graphs | v1.0 | Valid; direct ORT static-cache records. No portable performance claim follows. |
@@ -222,12 +222,16 @@ Fleet-wide findings:
 
 - all 28 packages are workflow-only documents; none relies on retired
   `model.io`;
-- all normalize to schema v1.0, which is correct because none authors a v1.1
-  `batch_capacity`, padding provenance, or packed ownership contract;
+- all normalize to schema v1.0 (18 declare `v1`; 10 declare `1.0`), which is
+  correct because none authors a v1.1 `batch_capacity`, padding provenance, or
+  packed ownership contract;
 - none uses top-level `required_capabilities`, but every workflow repeats
   derived strings in `manifest.capabilities`;
 - none claims encoder/component grouping. Request-aligned tensor layouts alone
   do not permit coalescing;
+- ESM-2 and ProtBERT now carry exact producer provenance to the merged Mobius
+  source, so their hosted metadata is a generated deployment instance rather
+  than an independently maintained correction;
 - cache semantics are represented where applicable, including append,
   replacement, sliding/full attention, and one indexed-scatter static-cache
   package; physical paging/tiering remains runtime-owned;
@@ -237,10 +241,21 @@ Fleet-wide findings:
 
 The first audit found exactly three files rejected by merged main:
 Wav2Vec2 CTC, ESM-2, and ProtBERT still authored the retired
-`profiles.*.batch_invariance`. They were republished metadata-only at the
-revisions in the table. Their YAML now contains inline review comments and
-conservatively omits `batch_capacity`; graphs, weights, and unrelated files
-were not changed.
+`profiles.*.batch_invariance`. Wav2Vec2 remains the metadata-only,
+inline-commented correction in the table. ESM-2 and ProtBERT were subsequently
+regenerated after
+[Mobius PR #636](https://github.com/onnxruntime/mobius/pull/636) merged as
+[`8e3ab921a`](https://github.com/onnxruntime/mobius/commit/8e3ab921a48c0f57eb0b6d24782335c32da3ea4f).
+Their canonical republish changed exactly `inference_metadata.yaml` and
+`provenance.json`. The provenance records the producer repository/commit and
+file hashes, removing the prior divergence between corrected deployed metadata
+and its canonical source. The generated YAML is intentionally described as
+comment-free: it preserves request-aligned layouts, contains no retired
+batching fields, and omits `batch_capacity`, so current fail-closed behavior is
+per item. The cited Mobius fixtures are deliberately tiny contract examples
+(hidden widths 64 rather than the hosted models' 320 and 1024), so producer
+parity does not mean those fixture bytes equal the real-model hosted bytes;
+provenance instead hashes the exact generated deployment files.
 
 #### Hosted-example governance
 
@@ -249,24 +264,123 @@ were not changed.
    second schema or capability catalogue.
 2. Repository tests, evidence, and documentation **MUST** pin immutable Hub
    revisions. `main` or an unpinned `resolve` URL is not review evidence.
-3. Publication **MUST** run metadata-only validation against the intended
+3. A generated hosted example **MUST** carry adjacent provenance that pins the
+   canonical producer repository/commit and identifies the exact metadata
+   bytes. Hand-edited deployed metadata without a corresponding producer change
+   is a source/deployment divergence to remove, not a new source of truth.
+4. Publication **MUST** run metadata-only validation against the intended
    runtime revision; artifact-backed execution evidence is a separate gate.
-4. A metadata revision change invalidates prior readiness evidence unless the
+5. A metadata revision change invalidates prior readiness evidence unless the
    evidence key proves the semantic identity is unchanged. Model-card prose
    alone is not such a key.
-5. Schema upgrades are need-driven. A v1.0 package does not become stale merely
+6. Schema upgrades are need-driven. A v1.0 package does not become stale merely
    because v1.1 exists; it becomes stale when it uses a retired field or needs a
    v1.1 contract it cannot express.
-6. A publisher **MUST NOT** add `batch_capacity` merely to replace a removed
+7. A publisher **MUST NOT** add `batch_capacity` merely to replace a removed
    boolean. It must author exact component ports, padding/length provenance,
    ownership, uniform dimensions, and budgets needed for safe grouping.
-7. Human review examples SHOULD retain explanatory YAML comments. When a
+8. Human review examples SHOULD retain explanatory YAML comments. When a
    production serializer strips them, publish an adjacent annotated reference
    and validate typed semantic equality instead of claiming comments survived.
-8. When generic capability lists are removed, the hosted fleet should be
+9. When generic capability lists are removed, the hosted fleet should be
    regenerated from the canonical workflow source in one migration, validated,
    and repinned here; hosted copies must not preserve obsolete fields as a
    compatibility authority.
+
+#### Annotated generated encoder companion
+
+The following review-only companion annotates the common ESM-2/ProtBERT
+contract. The production serializer does not retain these comments; the pinned
+metadata plus `provenance.json` are the deployed bytes, while this snippet is
+the human-readable reference:
+
+```yaml
+# v1 is sufficient because this package deliberately makes no grouping claim.
+schema_version: v1
+
+# The profile tells API consumers how to interpret the emitted hidden states.
+profiles:
+  embedding:
+    kind: embedding
+    version: "1.0"
+    requirement: required
+    outputs:
+      last_hidden_state: last_hidden_state
+    pooling:
+      kind: mean  # Pool tokens along the sequence axis after execution.
+      axis: 1
+      normalize: false
+
+pipeline:
+  workflow:
+    # These legacy manifest strings mirror structure today; they are not
+    # backend-readiness or performance evidence.
+    manifest:
+      capabilities: [workflow_ssa, linear_effects, typed_emit]
+
+    # Encoding is pure, so retrying it cannot duplicate an external effect.
+    effects:
+      encode:
+        retry: pure
+        speculation_safety: {kind: clonable}
+
+    inputs:
+      request.input_ids:
+        contract:
+          dtype: int64
+          rank: 2
+          shape: [batch, sequence_len]
+          # Row identity follows the request. This does not authorize grouping.
+          batch_layout: {kind: request_aligned, axis: 0}
+        role: {kind: runtime, version: "1.0", role: prompt_tokens}
+        source: {kind: request}
+        required: true
+      request.attention_mask:
+        contract:
+          dtype: int64
+          rank: 2
+          shape: [batch, sequence_len]
+          batch_layout: {kind: request_aligned, axis: 0}
+        # The application supplies authored mask values; the runtime must not
+        # infer them from a model-family name.
+        role: {kind: opaque}
+        source: {kind: application, name: request.attention_mask}
+        required: true
+
+    outputs:
+      last_hidden_state:
+        contract:
+          dtype: float32
+          rank: 3
+          shape: [batch, sequence_len, hidden]
+          batch_layout: {kind: request_aligned, axis: 0}
+        role: tensor
+        stage: post_adapter
+
+    components:
+      encoder:
+        implementation: {kind: onnx, artifact: model.onnx}
+        # batch_capacity is intentionally absent: execute each request alone.
+        ports:
+          roles:
+            input_ids: token_ids
+            attention_mask: attention_mask
+            last_hidden_state: hidden_states
+
+    # The workflow invokes the authored encoder and publishes its semantic output.
+    steps:
+      - kind: invoke
+        component: encoder
+        inputs:
+          input_ids: request.input_ids
+          attention_mask: request.attention_mask
+        outputs:
+          last_hidden_state: encoder.last_hidden_state
+      - kind: emit
+        value: encoder.last_hidden_state
+        output: last_hidden_state
+        mode: replace
+```
 
 Ordered annotated references:
 
@@ -278,10 +392,17 @@ Ordered annotated references:
    encoder/task examples 4–5 and 12–13;
 3. the refreshed, inline-annotated
    [Wav2Vec2](https://huggingface.co/justinchuby/onnx-genai-example-wav2vec2-base-960h-ctc/blob/28480e393ad1b8fa2e0bb6939e5daded02f24014/inference_metadata.yaml),
-   [ESM-2](https://huggingface.co/justinchuby/onnx-genai-example-esm2-t6-8m/blob/d9f1947f4973056fe287e498b0b0e9b675f1bb92/inference_metadata.yaml),
+   production file;
+4. the generated, comment-free
+   [ESM-2](https://huggingface.co/justinchuby/onnx-genai-example-esm2-t6-8m/blob/d1e2ada5086f6ef0d1bfffb4099a5292104dbc1b/inference_metadata.yaml)
    and
-   [ProtBERT](https://huggingface.co/justinchuby/onnx-genai-example-prot-bert/blob/916d8290b9108a3a6487ff4381ea9a66c32588c0/inference_metadata.yaml)
-   production files.
+   [ProtBERT](https://huggingface.co/justinchuby/onnx-genai-example-prot-bert/blob/17942612a34372dc4191251455ebcb9f854a9db3/inference_metadata.yaml)
+   production files, their adjacent provenance, the annotated companion above,
+   and the canonical Mobius
+   [ESM-2](https://github.com/onnxruntime/mobius/blob/8e3ab921a48c0f57eb0b6d24782335c32da3ea4f/tests/fixtures/onnx_genai_workflows/esm2_protein_embeddings/inference_metadata.yaml)
+   and
+   [ProtBERT](https://github.com/onnxruntime/mobius/blob/8e3ab921a48c0f57eb0b6d24782335c32da3ea4f/tests/fixtures/onnx_genai_workflows/protbert_protein_embeddings/inference_metadata.yaml)
+   producer fixtures.
 
 ## 3. Classification rules
 
@@ -475,9 +596,14 @@ and
 ### 4.14 Functional workflow execution is not a performance claim
 
 The universal interpreter has recorded functional execution for named
-fixtures/artifacts. Execution-island code and CUDA-gated tests establish
-implementation, but the tests may return without executing when CUDA is
-unavailable; this audit therefore does not treat them as a recorded island run.
+fixtures/artifacts.
+[`pure_policy_chain_lowers_to_one_execution_island`](../../crates/onnx-genai-engine/tests/workflow_policy_e2e.rs)
+records two CPU ORT island runs and their diagnostics. That does not establish
+CUDA island readiness: the CUDA allocator test may return without executing
+when CUDA is unavailable. Merged #2137 additionally records that inferred
+dynamic batch axes fail before island or backend execution when
+`batch_capacity` is absent; see
+[`inferred_dynamic_axis_zero_fails_before_island_or_backend_execution`](../../crates/onnx-genai-engine/src/pipeline/islands.rs).
 The current published CUDA synthetic measurements fail at least one acceptance
 criterion: decoder-policy throughput is `0.903` of the direct composite and
 min-p warm TTFT regresses. The record explicitly does not cover production KV,
@@ -693,7 +819,7 @@ than the implementation column.
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Single-item decoder | Yes | Yes | Yes | Recorded artifact | Yes | Recorded artifact | Pass (named decoder/hardware) | Baseline evidence is the same exact decoder record cited in §7.1. |
 | Continuous/dynamic decoder batching | Yes | Yes | Yes | Recorded fixture | Yes | Recorded artifact | Pass (named native batches) | [`a_continuous_batch_row_stops_on_a_non_first_declared_end_token`](../../crates/onnx-genai-engine/tests/authored_iteration_e2e.rs) executes ORT width 2. Native grouping/capture measurements are recorded in [batch decode segmentation](../benchmarks/2026-08-19-batch-decode-mge2-capture-segmentation.md). `batch_capacity` permits grouping; it does not mandate it. |
-| Component/encoder grouping capacity | Yes | Yes | Partial | No record | Partial | No record | No accepted record | `ComponentBatchCapacity` is the only authored grouping-equivalence authority. Planner/validator tests are not backend execution evidence. |
+| Component/encoder grouping capacity | Yes | Yes | Partial | Recorded fixture (request-aligned component only) | Partial | No record | No accepted record | `ComponentBatchCapacity` is the only authored grouping-equivalence authority. Merged #2137 adds packed/request-aligned admission and [`group_workflow_component_inputs`](../../crates/onnx-genai-engine/src/engine/workflow_api.rs), but that API explicitly leaves grouped-payload materialization to a backend packer. [`workflow_executes_masked_and_speculative_policy_artifacts`](../../crates/onnx-genai-engine/tests/workflow_policy_e2e.rs) records a width-2 request-aligned ONNX component; no packed encoder artifact, cross-request scheduler, or generalized solo-versus-grouped parity record was found. |
 | Dynamic append KV | Yes | Yes | Yes | Recorded artifact | Yes | Recorded artifact | Pass (named decoder/hardware) | Exact standard-decoder records exercise dynamic KV for their named packages only. |
 | Static indexed KV | Yes | Yes | Yes | Recorded artifact | Yes | Recorded fixture | No accepted record | Exact static hosted packages are listed in [§2.3](#23-hosted-hugging-face-examples); [`native_runs_static_cache_ar_package`](../../crates/onnx-genai-engine/tests/native_workflow_smoke.rs) records the hermetic native path. |
 | Physical paged KV | N/A | N/A | Partial | No record | Partial | No record | No accepted record | Physical paging is policy. [`GQA_KV_MATERIALIZATION_DESIGN.md`](../memory/GQA_KV_MATERIALIZATION_DESIGN.md) explicitly defers live-session wiring and CUDA GQA Tier B; page-pool primitives/unit tests are not live decoder execution. |
@@ -714,7 +840,7 @@ than the implementation column.
 | ORT/native interchangeability | Partial | Yes | Partial | No paired record | Partial | No paired record | No accepted record | The backend domains overlap but are unequal. Readiness requires a paired certificate for the exact artifact, not two optimistic implementation flags. |
 | ORT CUDA graph capture | N/A | N/A | Yes | Recorded artifact | N/A | N/A | Pass (named Qwen/CUDA) | [The ORT/native CUDA record](../benchmarks/2026-07-23-ort-vs-native-cuda.md) names capture success and rejection by artifact. Eligibility is provider/shape/allocation specific. |
 | Native graph capture / single-flight | N/A | N/A | N/A | N/A | Yes | Recorded artifact | Pass (named native decoders) | The same record measures native capture; mutable captured buffers require one in-flight owner. |
-| Backend-derived execution islands | N/A | N/A | Yes | No record | No | No record | No accepted record | [`plan_execution_islands`](../../crates/onnx-genai-engine/src/pipeline/islands.rs) is automatic optimizer planning. CUDA tests may return without executing when CUDA is unavailable, so code/tests alone do not establish a record. |
+| Backend-derived execution islands | N/A | N/A | Yes | Recorded fixture (CPU ORT) | No | No record | No accepted record | [`pure_policy_chain_lowers_to_one_execution_island`](../../crates/onnx-genai-engine/tests/workflow_policy_e2e.rs) records two CPU ORT island runs. [`inferred_dynamic_axis_zero_fails_before_island_or_backend_execution`](../../crates/onnx-genai-engine/src/pipeline/islands.rs) records fail-closed batched admission before island/backend execution. CUDA tests may still return without executing, so no CUDA island record is claimed. |
 | Concurrent ORT `Session::Run` | N/A | N/A | Yes | Recorded fixture | N/A | N/A | No accepted performance record | [`a_concurrently_runnable_session_can_actually_be_run_from_two_threads`](../../crates/onnx-genai-ort/tests/session_thread_contract.rs) is non-skipped and executes one admitted session from two threads. |
 | Same-session overlapping turns | Yes | Yes | N/A | N/A | N/A | N/A | N/A | Shared routing-layer [`SessionLeases`](../../crates/onnx-genai-server/src/lease.rs) serialize or reject overlap before backend execution unless isolated state is proven; a backend concurrency flag cannot override this. |
 | Worker placement / cross-session parallelism | N/A | N/A | Yes | Recorded fixture (W=2 CPU ORT) | No | Recorded refusal | No accepted performance record | Worker count is deployment policy and defaults to one. [`two_ort_workers_run_distinct_sessions_concurrently_with_colliding_local_ids`](../../crates/onnx-genai-server/src/driver.rs) records deterministic placement and simultaneous execution; [`multiple_ort_workers_fail_closed_for_native_decode`](../../crates/onnx-genai-server/src/tests.rs) records native refusal. Sessions never migrate and same-session turns remain single-flight. |
@@ -928,9 +1054,12 @@ Read in this order:
    — what the interpreter and both component backends implement, and which ORT
    execution-island plan is derived automatically.
 8. [`batched.rs`](../../crates/onnx-genai-engine/src/batched.rs),
+   [`pipeline/batching.rs`](../../crates/onnx-genai-engine/src/pipeline/batching.rs),
+   [`engine/workflow_api.rs`](../../crates/onnx-genai-engine/src/engine/workflow_api.rs),
    [`connector_bridge.rs`](../../crates/onnx-genai-engine/src/connector_bridge.rs),
    and [`onnx-genai-kv`](../../crates/onnx-genai-kv/src/lib.rs) — batching and
-   cache reality.
+   cache reality, including the boundary between admission/grouping plans and
+   backend payload materialization.
 9. [`onnx-genai-ort/session/mod.rs`](../../crates/onnx-genai-ort/src/session/mod.rs)
    — provider resolution, capture, concurrent-run evidence, and thread safety.
 10. [`server/worker.rs`](../../crates/onnx-genai-server/src/worker.rs),
@@ -945,9 +1074,10 @@ Read in this order:
     [the dated workflow evidence](../benchmarks/2026-08-21-mobius-workflow-conformance.md)
     — represented versus executed versus measured status.
 12. The pinned [hosted-example inventory](#23-hosted-hugging-face-examples),
-    followed by the compact annotated policy graph and the three refreshed
-    annotated production files — deployed instances versus their authoritative
-    schema and evidence.
+    followed by the compact annotated policy graph, inline-commented Wav2Vec2
+    example, generated ESM-2/ProtBERT files and provenance records, their Mobius
+    source fixtures, and the annotated encoder companion above — deployed
+    instances versus their authoritative producer, schema, and evidence.
 
 ### Invariants to scrutinize
 
@@ -963,6 +1093,8 @@ Read in this order:
 - Is `batch_capacity` the only grouping-permission/equivalence authority, with
   absence forcing per-item execution?
 - Does a batching claim name the exact artifact/backend/component combination?
+- Is direct execution of an already grouped request distinguished from
+  automatic cross-request scheduling and backend payload packing?
 - Is an execution island treated as backend-derived optimizer output rather
   than package semantics or deployment policy?
 - Can any ignored, environment-gated, or early-returning test be mistaken for
@@ -983,4 +1115,4 @@ Read in this order:
 - [ ] Cache, position, batching, adapter, speculation, and session forms are all covered.
 - [ ] Migration deletions have one replacement authority and no compatibility alias.
 - [ ] Acceptance tests include negative and decline paths, not only successful execution.
-- [ ] Hosted revisions, comments/annotated references, and evidence labels match exact bytes.
+- [ ] Hosted revisions, producer provenance, comments/annotated references, and evidence labels match exact bytes.
