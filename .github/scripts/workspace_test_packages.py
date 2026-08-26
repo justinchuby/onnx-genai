@@ -494,6 +494,12 @@ def verify(simulate_missing: str | None = None, simulate_unlinted: str | None = 
 # compile the same test targets but never run an assertion, so they must not
 # satisfy this gate.
 _RUNS_TESTS = re.compile(r"cargo\s+(?:\+\S+\s+)?(?:test|llvm-cov)\b")
+# `cargo test --no-run` builds the test binaries and executes none of them, so a
+# lane written that way proves the package compiles and proves nothing about its
+# tests. Anchored on a following space or end of fragment so it does not match
+# xargs' `--no-run-if-empty`, which `ci.yml` really does use -- matching that
+# would drop a genuine lane's credit and turn this fix into a regression.
+_NO_RUN = re.compile(r"(?:^|\s)--no-run(?=\s|$)")
 _LANE_CALL = re.compile(r"workspace_test_packages\.py\s+cargo-args\s+([a-z-]+)")
 _PACKAGE_FLAG = re.compile(r"(?:^|\s)(?:-p|--package)[\s=]+([A-Za-z0-9_-]+)")
 _VAR_ASSIGN = re.compile(
@@ -528,12 +534,30 @@ def _at_job_depth(line: str) -> bool:
 
 # Every key GitHub accepts directly under a job. A four-space key outside this
 # set is the signature of a job whose own key was indented one level too far:
-# still valid YAML, so no parser complains, but the job ceases to exist and its
-# checks stop *appearing* on a PR instead of going red. @holden hit exactly this
-# and `gh pr checks` reported fourteen green with zero failures while two checks
-# had silently ceased to be produced. Enumerating what is legal and rejecting
-# the rest is the same choice as `_at_job_depth`: a new job attribute breaks
-# this loudly, which is the direction that can be noticed.
+# still valid YAML, so PyYAML parses it happily and the job silently becomes a
+# key of the job above it.
+#
+# CORRECTION, measured 2026-08-26 against GitHub's own published parser
+# (`@actions/workflow-parser` 0.3.61, the actions/languageservices
+# implementation): GitHub does NOT accept this. Feeding it a `ci.yml` with
+# `cli-ort:` indented one level too far yields `Unexpected value 'cli-ort'`,
+# and the same edit to `diff-guard.yml` yields `Unexpected value 'root-files'`.
+# GitHub enumerates legal job keys exactly as this gate does. The earlier
+# comment here -- that the misindented job is accepted and its checks merely
+# stop appearing -- was inferred from PyYAML's behaviour and generalised to the
+# service without being tested there; it is wrong, and this gate's value is that
+# it refuses locally and by name rather than that it catches something GitHub
+# would miss. Stated as a parser result, not a service result: it is GitHub's
+# published implementation, but it was not confirmed against the live service.
+#
+# What GitHub *does* accept silently is deleting a job block outright: the same
+# measurement returns zero errors for a `diff-guard.yml` with `root-files:`
+# removed. That is the case no key-shaped rule can see, and it is why
+# `WORKFLOW_JOB_INVENTORY` exists alongside this one.
+#
+# Enumerating what is legal and rejecting the rest is the same choice as
+# `_at_job_depth`: a new job attribute breaks this loudly, which is the
+# direction that can be noticed.
 _JOB_ATTRIBUTES = frozenset(
     {
         "concurrency",
@@ -903,6 +927,8 @@ def packages_tested_by(commands: Iterable[str]) -> set[str]:
                 )
             if not _RUNS_TESTS.search(fragment):
                 continue
+            if _NO_RUN.search(fragment):
+                continue
             for lane in _LANE_CALL.findall(fragment):
                 tested.update(lane_packages(lane))
             for name in _VAR_REF.findall(fragment):
@@ -943,7 +969,96 @@ def required_lane_commands(skip_lane: str | None = None) -> tuple[list[str], set
 # existed. Measured, on the real workflow, before writing it: all three of
 # `verify`, `verify-required-tier` and `self-test` exited 0 with the sole
 # Windows executor of the ORT-backed tests removed.
-_WINDOWS_RUNNER = re.compile(r"windows-[A-Za-z0-9_.-]+")
+_WINDOWS_RUNNER = re.compile(r"windows-(?!msvc\b|gnu)[A-Za-z0-9_.-]+")
+_RUNS_ON = re.compile(r"^\ {4}runs-on:\s*(.+?)\s*$", re.MULTILINE)
+_STRATEGY_BLOCK = re.compile(
+    r"^\ {4}strategy:\s*$\n(?P<body>(?:^(?:\ {5,}.*)?$\n?)*)", re.MULTILINE
+)
+_MATRIX_REF = re.compile(r"matrix\.([A-Za-z_][A-Za-z0-9_-]*)")
+_MATRIX_KEY = re.compile(
+    r"^(?P<indent>\s*)(?P<dash>-\s+)?(?P<key>[A-Za-z_][A-Za-z0-9_-]*):\s*(?P<inline>.*)$"
+)
+
+
+def _matrix_values(body: str, keys: set[str]) -> str:
+    """Values of the named matrix keys only, never the whole `strategy:` block.
+
+    Reading the entire block reopens the hole this function exists to close: a
+    matrix that carries `target: x86_64-pc-windows-msvc` beside
+    `os: ubuntu-latest` puts `windows-msvc` in the searched text, and a job that
+    only ever cross-compiles is credited as a Windows runner again. Caught in
+    review of this change, in the fix for that very over-read -- the matrix arm
+    added here exercised `os:` alone, so re-running it could never have found it.
+    """
+    match = _STRATEGY_BLOCK.search(body)
+    if match is None:
+        return ""
+    lines = match.group("body").splitlines()
+    collected: list[str] = []
+    index = 0
+    while index < len(lines):
+        entry = _MATRIX_KEY.match(lines[index])
+        # The key's own column, not the list dash's: in `- os: ubuntu-latest`
+        # the sibling `name:` sits at the same column as `os`, and measuring
+        # from the dash would swallow it as if it were `os`'s value.
+        column = (
+            len(entry.group("indent")) + len(entry.group("dash") or "") if entry else 0
+        )
+        wanted = bool(entry) and entry.group("key") in keys
+        index += 1
+        if not wanted:
+            continue
+        collected.append(_TRAILING_COMMENT.sub("", entry.group("inline")))
+        # A key written as a block list owns the deeper-indented lines below it.
+        while index < len(lines):
+            following = lines[index]
+            if not following.strip():
+                index += 1
+                continue
+            if len(following) - len(following.lstrip()) <= column:
+                break
+            collected.append(_TRAILING_COMMENT.sub("", following))
+            index += 1
+    return "\n".join(collected)
+
+
+def job_runner_labels(body: str) -> str:
+    """The text of a job that can name the runner it executes on.
+
+    Deliberately not the whole body. `_WINDOWS_RUNNER` matched anywhere in the
+    job credited a *target triple* as a runner: `x86_64-pc-windows-msvc` in a
+    `run:` line contains `windows-msvc`. Measured on this file before the fix --
+    a synthetic job with `runs-on: ubuntu-latest` whose only step was
+    `cargo test -p ... --target x86_64-pc-windows-msvc` was reported as
+    `windows ORT coverage ok: 6 package(s) via ['EP conformance (Linux
+    x86_64)']`. A Linux job standing as the sole certified Windows executor is
+    the same over-read @gaff's first draft of `verify_windows_ort_coverage`
+    produced, reached by a different route, and the parser repair did not close
+    it. `Rust (Windows ARM64)` really does carry `windows-msvc` in its body
+    today, so this is one edit away from being live rather than hypothetical.
+
+    `runs-on:` alone is not enough: two jobs here say `runs-on: ${{ matrix.os }}`
+    and get their real labels from the matrix. So the matrix counts too -- but
+    only the keys the `runs-on:` expression actually names, and only their
+    values. Trailing comments are stripped, since `parse_jobs` removes whole
+    comment lines and leaves these: `runs-on: ubuntu-latest  # was
+    windows-latest` otherwise credits a Linux job on the strength of its own
+    changelog.
+
+    Under-reads on purpose. A `runs-on:` that resolves through anything other
+    than the matrix, or a flow-style `strategy: {matrix: ...}`, yields no labels
+    and the job goes uncredited; if it was the only Windows executor the gate
+    refuses by name. That direction is loud and fixable, while crediting a job
+    that never touches Windows is silent -- the same trade this file's
+    `packages_tested_by` docstring already states.
+    """
+    values = [_TRAILING_COMMENT.sub("", value).strip() for value in _RUNS_ON.findall(body)]
+    text = "\n".join(values)
+    if keys := {
+        key for value in values if "${{" in value for key in _MATRIX_REF.findall(value)
+    }:
+        text += "\n" + _matrix_values(body, keys)
+    return text
 
 # Refusal reasons that are discharged *on a Windows runner only*. `job_steps`
 # formats a refused condition as `if: <expr>`, so these match its output.
@@ -961,7 +1076,7 @@ def windows_ort_executors(jobs: dict[str, str] | None = None) -> dict[str, set[s
     jobs = workflow_jobs() if jobs is None else jobs
     found: dict[str, set[str]] = {}
     for name, body in jobs.items():
-        if not _WINDOWS_RUNNER.search(body):
+        if not _WINDOWS_RUNNER.search(job_runner_labels(body)):
             continue
         blocks, _ = unconditional_run_blocks(body, also_credit=_WINDOWS_STEP_IF)
         if tested := packages_tested_by(blocks) & set(ORT_BACKED):
@@ -971,6 +1086,17 @@ def windows_ort_executors(jobs: dict[str, str] | None = None) -> dict[str, set[s
 
 def verify_windows_ort_coverage(jobs: dict[str, str] | None = None) -> int:
     """Fail if no job still runs the ORT-backed tests on a Windows runner."""
+    if not ORT_BACKED:
+        print(
+            "Windows ORT coverage check failed.\n"
+            "ORT_BACKED is empty, so this gate has nothing to look for and would "
+            "report success having checked no package. `ok: 0 package(s) via []` "
+            "is the same output an entirely broken gate produces, and a check "
+            "that cannot tell 'nothing is wrong' from 'I cannot see' is not a "
+            "check. Refusing instead.",
+            file=sys.stderr,
+        )
+        return 1
     executors = windows_ort_executors(jobs)
     covered: set[str] = set()
     for tested in executors.values():
@@ -1283,7 +1409,10 @@ def _conditional_arms() -> int:
     return failures
 
 
-_PARSER_ARM_COUNT = 8
+# Hand-maintained because `_parser_arms` is inline code rather than a table.
+# `self_test` recounts the arms it actually observed and refuses if this number
+# disagrees, so a stale value here fails loudly instead of under-reporting.
+_PARSER_ARM_COUNT = 18
 
 
 # Each arm is (label, workflow text, the packages the scanner must credit).
@@ -1554,6 +1683,137 @@ def _parser_arms() -> int:
     else:
         failures += 1
         print(f"  FAIL  {label}: rc={code}, named={text!r}", file=sys.stderr)
+
+    # Every arm above this point refuses. A suite made only of refusals is
+    # passed perfectly by a gate that refuses everything, so each arm below
+    # carries its acceptance control beside it.
+    ort_flags = " ".join(f"-p {package}" for package in sorted(ORT_BACKED))
+
+    def _ort_job(runs_on: str, extra: str = "") -> dict[str, str]:
+        return {
+            "EP conformance (Linux x86_64)": (
+                f"    runs-on: {runs_on}\n    steps:\n      - name: s\n"
+                f"        run: cargo test {ort_flags}{extra}\n"
+            )
+        }
+
+    def _coverage_arm(label: str, jobs: dict[str, str] | None, expected: int) -> int:
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = verify_windows_ort_coverage(jobs=jobs)
+        if code == expected:
+            print(f"  ok    {label} -> rc={code}")
+            return 0
+        print(f"  FAIL  {label}: rc={code}, expected {expected}", file=sys.stderr)
+        return 1
+
+    # A target triple is not a runner. `x86_64-pc-windows-msvc` contains
+    # `windows-msvc`, so before `job_runner_labels` this job -- on ubuntu, and
+    # with `--target` doing the only Windows-related work -- was reported as the
+    # sole executor giving Windows coverage to all six packages.
+    failures += _coverage_arm(
+        "a Linux job cross-compiling to a Windows triple is not Windows coverage",
+        _ort_job("ubuntu-latest", " --target x86_64-pc-windows-msvc"),
+        1,
+    )
+    failures += _coverage_arm(
+        "a job whose runs-on really is a Windows runner is still credited",
+        _ort_job("windows-latest"),
+        0,
+    )
+    failures += _coverage_arm(
+        "a Windows runner reached through the matrix is still credited",
+        {
+            "Matrix Job": (
+                "    runs-on: ${{ matrix.os }}\n"
+                "    strategy:\n      matrix:\n        include:\n"
+                "          - os: windows-latest\n"
+                "    steps:\n      - name: s\n"
+                f"        run: cargo test {ort_flags}\n"
+            )
+        },
+        0,
+    )
+
+    # Every route review found back into the over-read this change is named for.
+    # The matrix arm above exercises `os:` only, so it could not have caught any
+    # of these -- which is the point: a battery only refutes what it varies.
+    failures += _coverage_arm(
+        "a Windows target triple in the matrix is not a Windows runner",
+        {
+            "Cross Job": (
+                "    runs-on: ${{ matrix.os }}\n"
+                "    strategy:\n      matrix:\n        include:\n"
+                "          - os: ubuntu-latest\n"
+                "            target: x86_64-pc-windows-msvc\n"
+                "    steps:\n      - name: s\n"
+                f"        run: cargo test {ort_flags} --target ${{{{ matrix.target }}}}\n"
+            )
+        },
+        1,
+    )
+    failures += _coverage_arm(
+        "a matrix key the runs-on expression never names is not read",
+        {
+            "Unrelated Key Job": (
+                "    runs-on: ${{ matrix.os }}\n"
+                "    strategy:\n      matrix:\n        include:\n"
+                "          - os: ubuntu-latest\n"
+                "            name: windows-parity-check\n"
+                "    steps:\n      - name: s\n"
+                f"        run: cargo test {ort_flags}\n"
+            )
+        },
+        1,
+    )
+    failures += _coverage_arm(
+        "a trailing comment on runs-on does not make a Linux job Windows",
+        _ort_job("ubuntu-latest  # was windows-latest until #1234"),
+        1,
+    )
+    failures += _coverage_arm(
+        "a Windows runner in a block-list matrix is still credited",
+        {
+            "Matrix List Job": (
+                "    runs-on: ${{ matrix.os }}\n"
+                "    strategy:\n      matrix:\n        os:\n"
+                "          - ubuntu-latest\n"
+                "          - windows-latest\n"
+                "    steps:\n      - name: s\n"
+                f"        run: cargo test {ort_flags}\n"
+            )
+        },
+        0,
+    )
+
+    # `ok: 0 package(s) via []` was reachable, and it is the same string a
+    # completely blind gate prints.
+    label = "an empty ORT_BACKED is fatal rather than vacuously ok"
+    real_ort_backed = globals()["ORT_BACKED"]
+    globals()["ORT_BACKED"] = frozenset()
+    try:
+        failures += _coverage_arm(label, None, 1)
+    finally:
+        globals()["ORT_BACKED"] = real_ort_backed
+
+    # `cargo test --no-run` compiles the test binaries and runs nothing.
+    label = "--no-run is not credited as running tests"
+    if packages_tested_by(["cargo test -p pkg-alpha --no-run"]) == set():
+        print(f"  ok    {label} -> not credited")
+    else:
+        failures += 1
+        print(f"  FAIL  {label}: credited a build-only invocation", file=sys.stderr)
+
+    # ...but xargs' `--no-run-if-empty` is a different flag, and `ci.yml` uses
+    # it. Reading it as cargo's would drop a genuine lane's credit.
+    label = "xargs --no-run-if-empty does not suppress a real lane"
+    if packages_tested_by(
+        ["find . -print0 | xargs -0 --no-run-if-empty cargo test -p pkg-alpha"]
+    ) == {"pkg-alpha"}:
+        print(f"  ok    {label} -> credited")
+    else:
+        failures += 1
+        print(f"  FAIL  {label}: dropped a lane over an xargs flag", file=sys.stderr)
     return failures
 
 
@@ -1735,6 +1995,54 @@ def _probe_clippy_generator_var(shape: str = "referenced") -> int:
 
 
 def self_test() -> int:
+    """Run every arm, then check that the count reported is the count that ran.
+
+    `total` used to be a sum of five hand-maintained lengths, one of which
+    (`_PARSER_ARM_COUNT`) is a literal. Six arms were added to `_parser_arms`
+    below and the suite still announced `59/59` while running sixty-five: the
+    arms passed, the number was wrong, and nothing failed. A count nobody checks
+    is the same defect this whole file exists to catch -- a self-report that
+    stays plausible while the thing it reports on has moved -- so the arm output
+    is captured, re-emitted unchanged, and recounted from the `ok`/`FAIL` lines
+    actually printed. A miscount is now a failure rather than a cosmetic slip.
+    """
+    out_buffer, err_buffer = io.StringIO(), io.StringIO()
+    try:
+        with redirect_stdout(out_buffer), redirect_stderr(err_buffer):
+            failures, claimed = _self_test_arms()
+    finally:
+        # On the crash path the arms that already ran are the only evidence of
+        # where it crashed, and they exist solely in these buffers. Emitting
+        # them in `finally` keeps this function's promise to re-emit unchanged
+        # even when an arm raises something the loops do not catch.
+        sys.stdout.write(out_buffer.getvalue())
+        sys.stderr.write(err_buffer.getvalue())
+    captured_out, captured_err = out_buffer.getvalue(), err_buffer.getvalue()
+
+    observed = sum(
+        1
+        for line in (captured_out + captured_err).splitlines()
+        if line.startswith("  ok    ") or line.startswith("  FAIL  ")
+    )
+    if observed != claimed:
+        print(
+            f"workspace test package self-test: reported {claimed} arm(s) but "
+            f"{observed} actually ran. The totals in `_self_test_arms` no longer "
+            "match the arms; update them rather than the count in this message.",
+            file=sys.stderr,
+        )
+        return 1
+    if failures:
+        print(
+            f"workspace test package self-test: {failures} arm(s) failed",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"workspace test package self-test: {claimed}/{claimed} arms behaved as stated")
+    return 0
+
+
+def _self_test_arms() -> tuple[int, int]:
     """Prove both gates still refuse, on content and not merely on exit code.
 
     An exit status is not enough to tell a refusal from a crash: `python` not
@@ -1863,11 +2171,7 @@ def self_test() -> int:
         + len(_CLIPPY_BLOCK_ARMS)
         + len(_WORKFLOW_INTEGRITY_ARMS)
     )
-    if failures:
-        print(f"workspace test package self-test: {failures} arm(s) failed", file=sys.stderr)
-        return 1
-    print(f"workspace test package self-test: {total}/{total} arms behaved as stated")
-    return 0
+    return failures, total
 
 
 def main() -> int:

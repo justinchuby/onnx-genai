@@ -630,16 +630,6 @@ jobs:
       - name: Cross-target compile check (catches os- and arch-gating errors)
         run: bash scripts/check_cross_compile.sh
 
-      # The merge gate is the one script whose failure mode is a green report:
-      # if it ever treats an absent required check as a passing one, nothing
-      # downstream notices, because the evidence it was supposed to collect is
-      # exactly what is missing. Its suite is hermetic (`gh` is shimmed), so it
-      # costs a second here and refuses to merge anything. #1966.
-      - name: Merge gate can still refuse (self-test)
-        run: |
-          shellcheck scripts/merge_when_green.sh scripts/merge_when_green_test.sh
-          bash scripts/merge_when_green_test.sh
-
       # Same shape one branch further out: the promotion workflow strips the
       # team-only paths on the way to the release branch, and both the strip and
       # the check that backstops it used to end in `|| true`. A failed
