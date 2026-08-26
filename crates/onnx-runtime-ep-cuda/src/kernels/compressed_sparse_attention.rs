@@ -253,6 +253,17 @@ extern "C" __global__ void csa_ratio128_compress(
             }
         } else {
             float* dst = (float*)cache + (b * cache_row_records + out) * dim;
+            // The f32 cache is the logical dequantized view of the frozen
+            // FP8/BF16 record format, not the pre-quantization RMSNorm row.
+            // Preserve the same block quantize/dequantize step as the CPU
+            // oracle before exposing the non-RoPE values.
+            for (int block = 0; block < 7; ++block) {
+                unsigned char scale, packed[64];
+                quantize_fp8_e4m3_block(record + block * 64, &scale, packed);
+                const float scale_value = e8m0_scale(scale);
+                for (int d = 0; d < 64; ++d)
+                    record[block * 64 + d] = decode_e4m3fn(packed[d]) * scale_value;
+            }
             for (int d = 0; d < dim; ++d) dst[d] = record[d];
         }
         for (int reset_slot = 0; reset_slot < 128; ++reset_slot)

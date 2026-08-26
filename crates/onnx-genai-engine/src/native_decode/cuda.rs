@@ -106,10 +106,57 @@ impl CsaRecordLayout {
     }
 }
 
+struct OwnedSnapshotBuffer {
+    allocator: std::sync::Arc<dyn onnx_runtime_ep_api::ExecutionProvider>,
+    buffer: Option<DeviceBuffer>,
+}
+
+impl OwnedSnapshotBuffer {
+    fn allocate(
+        allocator: std::sync::Arc<dyn onnx_runtime_ep_api::ExecutionProvider>,
+        bytes: usize,
+        alignment: usize,
+    ) -> onnx_runtime_ep_api::Result<Self> {
+        let buffer = allocator.allocate(bytes, alignment)?;
+        Ok(Self {
+            allocator,
+            buffer: Some(buffer),
+        })
+    }
+
+    fn buffer(&self) -> &DeviceBuffer {
+        self.buffer
+            .as_ref()
+            .expect("snapshot buffer is taken only during drop")
+    }
+
+    fn buffer_mut(&mut self) -> &mut DeviceBuffer {
+        self.buffer
+            .as_mut()
+            .expect("snapshot buffer is taken only during drop")
+    }
+}
+
+impl Drop for OwnedSnapshotBuffer {
+    fn drop(&mut self) {
+        if let Some(buffer) = self.buffer.take() {
+            let _ = self.allocator.deallocate(buffer);
+        }
+    }
+}
+
 #[cfg(test)]
 mod csa_record_layout_tests {
-    use super::CsaRecordLayout;
+    use super::{CsaRecordLayout, OwnedSnapshotBuffer};
     use onnx_genai_metadata::CsaStateRole;
+    use onnx_runtime_ep_api::{
+        DeviceBuffer, EpConfig, EpError, ExecutionProvider, Fence, Kernel, KernelMatch,
+    };
+    use onnx_runtime_ir::{DataType, DeviceId, DeviceType, Node, Shape, TensorLayout};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     fn layout(batch: usize, ratio: usize, capacity: usize, width: usize) -> CsaRecordLayout {
         CsaRecordLayout {
@@ -162,6 +209,171 @@ mod csa_record_layout_tests {
         assert!(bounded.record_offset_bytes(0, 8).is_err());
         let overflowing = layout(2, 4, usize::MAX, 2);
         assert!(overflowing.row_stride_bytes().is_err());
+    }
+
+    struct TrackingProvider {
+        attempts: AtomicUsize,
+        live: AtomicUsize,
+        fail_at: usize,
+    }
+
+    impl TrackingProvider {
+        fn new(fail_at: usize) -> Self {
+            Self {
+                attempts: AtomicUsize::new(0),
+                live: AtomicUsize::new(0),
+                fail_at,
+            }
+        }
+    }
+
+    impl ExecutionProvider for TrackingProvider {
+        fn name(&self) -> &str {
+            "snapshot_test"
+        }
+
+        fn device_type(&self) -> DeviceType {
+            DeviceType::Cpu
+        }
+
+        fn device_id(&self) -> DeviceId {
+            DeviceId::cpu()
+        }
+
+        fn initialize(&mut self, _config: &EpConfig) -> onnx_runtime_ep_api::Result<()> {
+            Ok(())
+        }
+
+        fn shutdown(&mut self) -> onnx_runtime_ep_api::Result<()> {
+            Ok(())
+        }
+
+        fn supports_op(
+            &self,
+            _op: &Node,
+            _opset: u64,
+            _shapes: &[Shape],
+            _input_dtypes: &[DataType],
+            _layouts: &[TensorLayout],
+        ) -> KernelMatch {
+            KernelMatch::unsupported("snapshot owner test provider has no kernels")
+        }
+
+        fn get_kernel(
+            &self,
+            _op: &Node,
+            _shapes: &[Vec<usize>],
+            _opset: u64,
+        ) -> onnx_runtime_ep_api::Result<Box<dyn Kernel>> {
+            Err(EpError::KernelFailed("snapshot owner test provider".into()))
+        }
+
+        fn allocate(
+            &self,
+            size: usize,
+            alignment: usize,
+        ) -> onnx_runtime_ep_api::Result<DeviceBuffer> {
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+            if attempt == self.fail_at {
+                return Err(EpError::KernelFailed(
+                    "injected snapshot allocation failure".into(),
+                ));
+            }
+            let layout = std::alloc::Layout::from_size_align(size, alignment)
+                .map_err(|_| EpError::AlignmentError)?;
+            // SAFETY: `layout` is non-zero and valid; `deallocate` reconstructs it.
+            let ptr = unsafe { std::alloc::alloc(layout) };
+            if ptr.is_null() {
+                return Err(EpError::KernelFailed(
+                    "snapshot owner test allocation failed".into(),
+                ));
+            }
+            self.live.fetch_add(1, Ordering::SeqCst);
+            // SAFETY: this provider owns the fresh allocation until deallocation.
+            Ok(unsafe {
+                DeviceBuffer::from_raw_parts(ptr.cast(), DeviceId::cpu(), size, alignment)
+            })
+        }
+
+        fn deallocate(&self, buffer: DeviceBuffer) -> onnx_runtime_ep_api::Result<()> {
+            let layout = std::alloc::Layout::from_size_align(buffer.len(), buffer.alignment())
+                .map_err(|_| EpError::AlignmentError)?;
+            let ptr = buffer.into_raw().cast::<u8>();
+            // SAFETY: `ptr` and `layout` are the exact values produced by `allocate`.
+            unsafe { std::alloc::dealloc(ptr, layout) };
+            self.live.fetch_sub(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn copy(
+            &self,
+            src: &DeviceBuffer,
+            dst: &mut DeviceBuffer,
+            size: usize,
+        ) -> onnx_runtime_ep_api::Result<()> {
+            // SAFETY: test buffers are host allocations and the caller supplies
+            // non-overlapping buffers with at least `size` bytes.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    src.as_ptr().cast::<u8>(),
+                    dst.as_mut_ptr().cast::<u8>(),
+                    size,
+                );
+            }
+            Ok(())
+        }
+
+        fn copy_async(
+            &self,
+            src: &DeviceBuffer,
+            dst: &mut DeviceBuffer,
+            size: usize,
+        ) -> onnx_runtime_ep_api::Result<Fence> {
+            self.copy(src, dst, size)?;
+            Ok(Fence::default())
+        }
+
+        fn consume_route_residency_at_boundary(&self) -> onnx_runtime_ep_api::Result<()> {
+            Ok(())
+        }
+
+        fn sync(&self) -> onnx_runtime_ep_api::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn snapshot_owner_deallocates_on_drop() {
+        let provider = Arc::new(TrackingProvider::new(usize::MAX));
+        let allocator: Arc<dyn ExecutionProvider> = provider.clone();
+        let scratch = OwnedSnapshotBuffer::allocate(allocator, 64, 16).unwrap();
+        assert_eq!(provider.live.load(Ordering::SeqCst), 1);
+        drop(scratch);
+        assert_eq!(provider.live.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn snapshot_partial_allocation_rolls_back_prior_buffers() {
+        let provider = Arc::new(TrackingProvider::new(2));
+        let allocator: Arc<dyn ExecutionProvider> = provider.clone();
+        let result = (|| -> onnx_runtime_ep_api::Result<Vec<OwnedSnapshotBuffer>> {
+            let mut scratch = Vec::new();
+            for _ in 0..4 {
+                scratch.push(OwnedSnapshotBuffer::allocate(
+                    Arc::clone(&allocator),
+                    64,
+                    16,
+                )?);
+            }
+            Ok(scratch)
+        })();
+        assert!(result.is_err());
+        assert_eq!(provider.attempts.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            provider.live.load(Ordering::SeqCst),
+            0,
+            "the two successful allocations before the injected failure must be released"
+        );
     }
 }
 
@@ -836,7 +1048,7 @@ pub(crate) struct DecodeCudaState {
     /// snapshotting the destructive GDN/conv state costs one device→device copy
     /// per binding instead of a PCIe round-trip through host memory. Empty until
     /// the CUDA device-snapshot path first runs; inert for greedy decode.
-    fixed_state_snapshot_scratch: Vec<(usize, DeviceBuffer)>,
+    fixed_state_snapshot_scratch: Vec<(usize, OwnedSnapshotBuffer)>,
     pub(crate) auxiliary_binding_range: std::ops::Range<usize>,
     pub(crate) input_ids_binding: usize,
     pub(crate) position_ids_binding: Option<usize>,
@@ -5838,10 +6050,12 @@ impl DecodeCudaState {
                         binding.physical_shape()
                     )
                 })?;
-            let buffer = binding
-                .allocator()
-                .allocate(bytes.max(1), SCRATCH_ALIGN)
-                .with_context(|| format!("allocate device snapshot scratch for binding {index}"))?;
+            let buffer = OwnedSnapshotBuffer::allocate(
+                std::sync::Arc::clone(binding.allocator()),
+                bytes.max(1),
+                SCRATCH_ALIGN,
+            )
+            .with_context(|| format!("allocate device snapshot scratch for binding {index}"))?;
             scratch.push((index, buffer));
         }
         self.fixed_state_snapshot_scratch = scratch;
@@ -5867,7 +6081,7 @@ impl DecodeCudaState {
                     )
                 })?;
             binding
-                .snapshot_device_into(scratch, bytes)
+                .snapshot_device_into(scratch.buffer_mut(), bytes)
                 .with_context(|| {
                     format!("device snapshot of recurrent/conv state for binding {index}")
                 })?;
@@ -5901,7 +6115,7 @@ impl DecodeCudaState {
                     )
                 })?;
             binding
-                .restore_device_from(scratch, bytes)
+                .restore_device_from(scratch.buffer(), bytes)
                 .with_context(|| {
                     format!("device restore of recurrent/conv state for binding {index}")
                 })?;
