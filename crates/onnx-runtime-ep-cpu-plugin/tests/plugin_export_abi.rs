@@ -328,9 +328,57 @@ mod mock_kernel_ctx {
         unsafe { onnx_runtime_ep_plugin::status::set_host_api(api as *const ort::OrtApi) };
     }
 
+    /// A non-null sentinel. The mocks below never dereference it -- they answer
+    /// from constants -- so it only has to be a stable, non-null address.
+    static MOCK_MEMORY_INFO: u8 = 0;
+    /// Falls through `device_from_memory_info`'s allocator-name census to the
+    /// `raw_device_type == CPU` arm, which is what a CPU plugin should resolve.
+    const MOCK_ALLOCATOR_NAME: &[u8] = b"Cpu\0";
+
+    pub unsafe extern "C" fn mock_get_tensor_memory_info(
+        _value: *const ort::OrtValue,
+        mem_info: *mut *const ort::OrtMemoryInfo,
+    ) -> ort::OrtStatusPtr {
+        unsafe {
+            *mem_info = std::ptr::addr_of!(MOCK_MEMORY_INFO).cast::<ort::OrtMemoryInfo>()
+        };
+        ptr::null_mut()
+    }
+
+    pub unsafe extern "C" fn mock_memory_info_get_device_type(
+        _ptr: *const ort::OrtMemoryInfo,
+        out: *mut ort::OrtMemoryInfoDeviceType,
+    ) {
+        unsafe { *out = ort::OrtMemoryInfoDeviceType_CPU };
+    }
+
+    pub unsafe extern "C" fn mock_memory_info_get_name(
+        _ptr: *const ort::OrtMemoryInfo,
+        out: *mut *const std::os::raw::c_char,
+    ) -> ort::OrtStatusPtr {
+        unsafe { *out = MOCK_ALLOCATOR_NAME.as_ptr().cast::<std::os::raw::c_char>() };
+        ptr::null_mut()
+    }
+
+    pub unsafe extern "C" fn mock_memory_info_get_id(
+        _ptr: *const ort::OrtMemoryInfo,
+        out: *mut std::os::raw::c_int,
+    ) -> ort::OrtStatusPtr {
+        unsafe { *out = 0 };
+        ptr::null_mut()
+    }
+
     pub fn mock_ort_api() -> ort::OrtApi {
         ort::OrtApi {
             CreateStatus: Some(mock_create_status),
+            // Required since #2200: Compute resolves each input's actual
+            // allocator residency instead of assuming CPU, and fails closed
+            // when it cannot. Without these four the whole Compute path
+            // returns an error status.
+            GetTensorMemoryInfo: Some(mock_get_tensor_memory_info),
+            MemoryInfoGetDeviceType: Some(mock_memory_info_get_device_type),
+            MemoryInfoGetName: Some(mock_memory_info_get_name),
+            MemoryInfoGetId: Some(mock_memory_info_get_id),
             KernelContext_GetInputCount: Some(mock_get_input_count),
             KernelContext_GetInput: Some(mock_get_input),
             KernelContext_GetOutput: Some(mock_get_output),

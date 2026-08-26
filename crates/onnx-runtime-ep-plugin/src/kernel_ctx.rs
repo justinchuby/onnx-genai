@@ -234,7 +234,7 @@ pub(crate) unsafe fn device_from_memory_info(
         "qnn" => DeviceType::Qnn,
         "openvino" => DeviceType::OpenVino,
         _ if raw_device_type == ort::OrtMemoryInfoDeviceType_CPU => DeviceType::Cpu,
-        _ => DeviceType::Custom(raw_device_type as u32),
+        _ => DeviceType::Custom(raw_device_type),
     };
     Ok(DeviceId::new(device_type, index))
 }
