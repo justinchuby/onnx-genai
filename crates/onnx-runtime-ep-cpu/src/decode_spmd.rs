@@ -4591,12 +4591,32 @@ thread_local! {
 
 /// Take the reserved CPU for this thread, remembering the mask it replaces.
 ///
-/// Fails closed when the pre-pin mask cannot be read: the pin is only safe to
-/// take if it can be given back (see [`release_dispatcher_pin`]), and a thread
-/// that pinned without a saved mask would be stuck on one CPU for the rest of
-/// its life the first time it had to compute an op inline. A host that cannot
-/// report a thread's affinity is exactly a host where that would go unnoticed.
+/// Refuses when the pre-pin mask cannot be read, because a thread that pinned
+/// without a saved mask would be stuck on one CPU for the rest of its life the
+/// first time it had to compute an op inline, and a host that cannot report a
+/// thread's affinity is exactly a host where that would go unnoticed.
+///
+/// **Readable is not the same as restorable, and only Linux is both.**
+/// [`crate::decode_affinity::set_current_thread_affinity`] is a documented
+/// no-op off Linux while `observe_current_thread_cpus` answers on Windows too,
+/// so on Windows this check passes and the pin is still unrecoverable. The
+/// release says so when it fails; see [`DISPATCHER_PIN_ENV`] for why that is
+/// left as a platform limitation of an opt-in knob rather than papered over by
+/// refusing to pin at all -- there is no Windows measurement either way, and
+/// silently disabling a knob on one platform is its own kind of dishonesty.
+///
+/// Never re-pins a thread that already holds the reserve. That is not
+/// defensive: [`DISPATCHER_TICK`] is a `u32` incremented with `wrapping_add`,
+/// so a long-lived dispatcher re-enters the first-dispatch branch every 2^32
+/// dispatches -- about 8 hours of continuous decode at ~140k dispatches a
+/// second, which is a server uptime, not a hypothetical. Without this guard
+/// that re-entry would re-read the mask *while pinned*, save the reserved CPU
+/// itself as the "previous" mask, and turn every later release into a no-op
+/// that leaves the thread confined for life.
 fn acquire_dispatcher_pin(cpu: usize) {
+    if DISPATCHER_PIN_HELD.with(std::cell::Cell::get) {
+        return;
+    }
     let saved = match crate::decode_affinity::observe_current_thread_cpus() {
         crate::decode_affinity::ObservedAffinity::Cpus(cpus) if !cpus.is_empty() => cpus,
         other => {
@@ -9475,6 +9495,49 @@ mod tests {
             !DISPATCHER_PIN_HELD.with(std::cell::Cell::get),
             "the release must clear the held flag, or every later inline dispatch retries \
              the restore syscall"
+        );
+    }
+
+    /// Taking the pin twice must not overwrite the mask it is holding for us.
+    ///
+    /// `DISPATCHER_TICK` is a `u32` incremented with `wrapping_add`, so the
+    /// "first dispatch" branch that takes the pin comes back around every 2^32
+    /// dispatches -- roughly 8 hours of continuous decode at this pool's rate,
+    /// i.e. an ordinary server uptime. A second acquire that re-read the mask
+    /// while pinned would remember the *reserved CPU* as the mask to restore,
+    /// and every later release would then be a no-op that left the thread on
+    /// one CPU for life: the exact failure this whole change exists to remove,
+    /// reintroduced by a counter wrap.
+    #[test]
+    fn taking_the_pin_a_second_time_keeps_the_mask_it_first_saved() {
+        if !crate::decode_affinity::AFFINITY_MASKING_SUPPORTED {
+            return;
+        }
+        let crate::decode_affinity::ObservedAffinity::Cpus(before) =
+            crate::decode_affinity::observe_current_thread_cpus()
+        else {
+            return;
+        };
+        if before.len() < 2 {
+            return;
+        }
+        let target = before[0];
+
+        acquire_dispatcher_pin(target);
+        assert_eq!(
+            crate::decode_affinity::observe_current_thread_cpus(),
+            crate::decode_affinity::ObservedAffinity::Cpus(vec![target]),
+            "precondition: the first acquire must narrow this thread to the reserved cpu"
+        );
+        // The wrap: same thread, same reserved cpu, still pinned.
+        acquire_dispatcher_pin(target);
+        release_dispatcher_pin();
+
+        assert_eq!(
+            crate::decode_affinity::observe_current_thread_cpus(),
+            crate::decode_affinity::ObservedAffinity::Cpus(before),
+            "a second acquire must not overwrite the saved mask with the reserved cpu; the \
+             release then restores nothing and the thread is confined for life"
         );
     }
 
