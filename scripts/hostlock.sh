@@ -76,7 +76,9 @@
 #                     runs as the same unix user, so that would make every
 #                     lock read as ours. See #1929.
 #   --wait            block until free instead of failing immediately
-#   --timeout S       give up after S seconds (default 3600 with --wait)
+#   --timeout S       give up after S seconds (default 3600). Only `wait`,
+#                     `run`, and `acquire --wait` ever enter a wait loop, so
+#                     passing it anywhere else is refused rather than ignored.
 #   --gate N          after taking the lock, also wait until the instantaneous
 #                     runnable count is <= N, so non-participating load (other
 #                     agents' builds, a stray editor) is drained too.
@@ -1892,6 +1894,10 @@ OWNER="${HOSTLOCK_OWNER:-${USER:-unknown}}"
 REASON="${HOSTLOCK_REASON:-}"
 DO_WAIT=0
 TIMEOUT=3600
+# Distinguishes "the caller asked for this bound" from the default, so the
+# guard below can refuse an inert `--timeout` without also refusing every
+# subcommand that merely inherits 3600.
+TIMEOUT_GIVEN=""
 GATE=""
 GATE_TIMEOUT=900
 TTL=""
@@ -2001,6 +2007,7 @@ while [ "$#" -gt 0 ]; do
         --timeout)
             TIMEOUT=$2
             require_uint "$1" "$TIMEOUT"
+            TIMEOUT_GIVEN=1
             shift 2
             ;;
         --gate)
@@ -2118,6 +2125,34 @@ else
     # environment variable, where every setting produced identical placement.
     if [ -n "$EXPECT_CORES" ] || [ -n "$MIN_EFFICIENCY" ]; then
         die "--expect-cores/--min-efficiency apply to \`run\` only; ${SUB} has no command to measure"
+    fi
+    # `--timeout` is read from exactly two places, and both are wait loops:
+    # `cmd_wait`'s own, and `cmd_acquire`'s deadline check, which sits *after*
+    # the `DO_WAIT != 1` early return and so is unreachable without `--wait`
+    # (`run` needs no flag -- it sets DO_WAIT itself). For every other form the
+    # value is parsed, range-checked by require_uint, and never compared:
+    # `acquire --timeout 1800` returns BUSY immediately while its caller
+    # believes it waited half an hour. Refused for the same reason as the two
+    # knobs above, and stated by the same comment -- accepting it silently is
+    # how a knob comes to be believed in while being inert (#2109).
+    #
+    # The exemption is `acquire --wait`, not `--wait`. `--wait` sets DO_WAIT for
+    # whatever subcommand it is passed to, but only `cmd_acquire` reads it, so
+    # `status --wait` is itself inert. Keying off DO_WAIT alone would let
+    # `status --wait --timeout 10` launder an inert bound past the guard by
+    # pairing it with a second inert flag -- catching the bare form and missing
+    # that one would leave the defect exactly where it started.
+    if [ -n "$TIMEOUT_GIVEN" ] && [ "$SUB" != wait ] &&
+       ! { [ "$SUB" = acquire ] && [ "$DO_WAIT" = 1 ]; }; then
+        if [ "$SUB" = acquire ]; then
+            die "--timeout is inert here: acquire without --wait never enters a wait loop, so the bound would be parsed and ignored.
+       Use \`acquire --wait --timeout ${TIMEOUT}\` to actually wait, \`wait --timeout ${TIMEOUT}\` to block without taking the lock, or drop --timeout to fail fast."
+        fi
+        # Every other subcommand returns without looping at all, so there is no
+        # form of it that would honour the bound -- naming `--wait` here would
+        # just be advice to pass a second flag that is equally inert.
+        die "--timeout is inert here: \`${SUB}\` never enters a wait loop, so the bound would be parsed and ignored.
+       Only \`wait\`, \`run\`, and \`acquire --wait\` consult it; drop --timeout from this invocation."
     fi
     : "${ANCHOR_PID:=$PPID}"
     : "${TTL:=3600}"
