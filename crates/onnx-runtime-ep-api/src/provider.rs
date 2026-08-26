@@ -53,16 +53,61 @@ impl ExecutorInstanceId {
     }
 }
 
+/// Monotonic executor-local epoch for concrete kernel/producer readiness.
+///
+/// The session advances this only when pre-execution compilation creates at
+/// least one new kernel specialization. A provider that returns
+/// [`ExecutorArtifactFinalization::Pending`] is not called again for the same
+/// epoch: another attempt requires a concrete compilation transition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ExecutorArtifactReadinessEpoch(u64);
+
+impl ExecutorArtifactReadinessEpoch {
+    pub const INITIAL: Self = Self(0);
+
+    pub const fn new(epoch: u64) -> Self {
+        Self(epoch)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Typed reason provider-artifact finalization cannot yet reach a terminal
+/// outcome.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExecutorArtifactPending {
+    /// A graph node that requires an execution-time producer has not published
+    /// it for this executor yet.
+    ProducerUnavailable { node: NodeId },
+    /// Provider-specific readiness which is not represented by a graph node.
+    ProviderReadiness { reason: String },
+}
+
+impl ExecutorArtifactPending {
+    pub fn reason(&self) -> String {
+        match self {
+            Self::ProducerUnavailable { node } => {
+                format!("producer for graph node {node:?} is not registered")
+            }
+            Self::ProviderReadiness { reason } => reason.clone(),
+        }
+    }
+}
+
 /// Result of the authoritative executor-artifact finalization transition.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ExecutorArtifactFinalization {
-    /// Every provider artifact required by this executor is finalized. The
-    /// executor must not invoke the transition again.
+    /// Every provider artifact required by this executor reached an honest
+    /// terminal outcome: installed, disabled, or structurally declined. Later
+    /// kernel specializations may reuse the executor-owned producer identity
+    /// without reinstalling.
     Complete,
     /// A readiness-dependent producer is not available yet. Nothing terminal
-    /// was latched; the executor may invoke the same transition after a later
-    /// resolved compilation epoch.
-    Pending,
+    /// was latched. Execution and capture remain forbidden, and the executor
+    /// may invoke the transition again only after its readiness epoch advances.
+    Pending(ExecutorArtifactPending),
 }
 
 /// Tie-break policy for [`ExecutionProvider::device_argmax`] when two or more
@@ -1459,18 +1504,23 @@ pub trait ExecutionProvider: Send + Sync {
     /// Authoritative transition for "all provider artifacts required by this
     /// executor's resolved compilation are finalized."
     ///
-    /// Static build and the first fully resolved symbolic compilation invoke
-    /// this same idempotent path after kernel factories have published their
-    /// producer handles and before capture. Structural failures may latch;
+    /// Static build and every newly compiled symbolic/dynamic specialization
+    /// invoke this same idempotent path after kernel factories have published
+    /// their producer handles and before any execution or capture. `readiness`
+    /// advances only when concrete compilation does; the executor never calls a
+    /// provider twice for the same pending/failed epoch. Structural declines
+    /// may latch as [`ExecutorArtifactFinalization::Complete`];
     /// readiness-dependent absence returns
-    /// [`ExecutorArtifactFinalization::Pending`] and must not poison a later
-    /// resolved compilation. The default completes without side effects.
+    /// [`ExecutorArtifactFinalization::Pending`] without poisoning a later
+    /// epoch. An `Err` is also fail-closed and may be retried only after a later
+    /// compilation epoch. The default completes without side effects.
     fn finalize_executor_artifacts(
         &self,
         _executor: ExecutorInstanceId,
         _graph: &Graph,
-    ) -> ExecutorArtifactFinalization {
-        ExecutorArtifactFinalization::Complete
+        _readiness: ExecutorArtifactReadinessEpoch,
+    ) -> Result<ExecutorArtifactFinalization> {
+        Ok(ExecutorArtifactFinalization::Complete)
     }
 
     /// Drain exactly the artifacts owned by `executor`.

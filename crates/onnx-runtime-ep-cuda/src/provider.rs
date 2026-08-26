@@ -44,8 +44,9 @@ use std::sync::{Arc, Mutex, Weak};
 use onnx_runtime_ep_api::{
     BoundBufferOwnership, Cost, DeviceBuffer, DeviceGraphSlot, EpConfig, EpError,
     ExecutionProvider, ExecutionProviderCapabilities, ExecutorArtifactFinalization,
-    ExecutorInstanceId, ExpertWeightGroup, Fence, HostToDeviceCopier, Kernel, KernelMatch,
-    LazyWeight, OpRegistry, PagedWeight, Result, WorkspaceAllocation, deny, structural_input_bytes,
+    ExecutorArtifactPending, ExecutorArtifactReadinessEpoch, ExecutorInstanceId, ExpertWeightGroup,
+    Fence, HostToDeviceCopier, Kernel, KernelMatch, LazyWeight, OpRegistry, PagedWeight, Result,
+    WorkspaceAllocation, deny, structural_input_bytes,
 };
 use onnx_runtime_ir::{
     DataType, DeviceId, DeviceType, Graph, Node, NodeId, Shape, TensorLayout, ValueId,
@@ -75,6 +76,8 @@ use crate::weight_paging::{CudaWeightResidency, DeviceOffloadPolicy, PrefillRout
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RouteResidencyExecutorStatus {
     pub finalization_attempts: u64,
+    pub readiness_epoch: Option<ExecutorArtifactReadinessEpoch>,
+    pub pending: Option<ExecutorArtifactPending>,
     pub drain_calls: u64,
     pub drained: bool,
     pub outcome: Option<RouteResidencyInstallOutcome>,
@@ -85,6 +88,8 @@ pub struct RouteResidencyExecutorStatus {
 #[derive(Default)]
 struct ExecutorRouteResidencyState {
     finalization_attempts: u64,
+    readiness_epoch: Option<ExecutorArtifactReadinessEpoch>,
+    pending: Option<ExecutorArtifactPending>,
     drain_calls: u64,
     drained: bool,
     outcome: Option<RouteResidencyInstallOutcome>,
@@ -1892,6 +1897,8 @@ impl CudaExecutionProvider {
         let state = states.get(&executor);
         RouteResidencyExecutorStatus {
             finalization_attempts: state.map_or(0, |state| state.finalization_attempts),
+            readiness_epoch: state.and_then(|state| state.readiness_epoch),
+            pending: state.and_then(|state| state.pending.clone()),
             drain_calls: state.map_or(0, |state| state.drain_calls),
             drained: state.is_some_and(|state| state.drained),
             outcome: state.and_then(|state| state.outcome.clone()),
@@ -1912,9 +1919,10 @@ impl CudaExecutionProvider {
         &self,
         executor: ExecutorInstanceId,
         graph: &Graph,
-    ) -> ExecutorArtifactFinalization {
+        readiness: ExecutorArtifactReadinessEpoch,
+    ) -> Result<ExecutorArtifactFinalization> {
         if !crate::coarse_residency::coarse_residency_profile_enabled() {
-            return ExecutorArtifactFinalization::Complete;
+            return Ok(ExecutorArtifactFinalization::Complete);
         }
 
         let mut states = self
@@ -1923,15 +1931,25 @@ impl CudaExecutionProvider {
             .expect("cuda_ep route-residency executors poisoned");
         let state = states.entry(executor).or_default();
         if state.outcome.is_some() {
-            return ExecutorArtifactFinalization::Complete;
+            state.readiness_epoch = Some(readiness);
+            return Ok(ExecutorArtifactFinalization::Complete);
         }
+        if state
+            .readiness_epoch
+            .is_some_and(|attempted| attempted >= readiness)
+            && let Some(pending) = &state.pending
+        {
+            return Ok(ExecutorArtifactFinalization::Pending(pending.clone()));
+        }
+        state.readiness_epoch = Some(readiness);
+        state.pending = None;
         state.finalization_attempts += 1;
 
         let Some(residency) = self.residency.as_ref() else {
             self.route_diag
                 .record_decline("weight offload/coarse residency disabled");
             state.outcome = Some(RouteResidencyInstallOutcome::OffloadDisabled);
-            return ExecutorArtifactFinalization::Complete;
+            return Ok(ExecutorArtifactFinalization::Complete);
         };
 
         let sources = self.route_telemetry_sources(executor);
@@ -1943,13 +1961,15 @@ impl CudaExecutionProvider {
             |_value| true,
         ) {
             Ok(group) => group,
-            Err(RouteResidencyBindingReject::NoTelemetrySource { .. }) => {
-                return ExecutorArtifactFinalization::Pending;
+            Err(RouteResidencyBindingReject::NoTelemetrySource { node }) => {
+                let pending = ExecutorArtifactPending::ProducerUnavailable { node };
+                state.pending = Some(pending.clone());
+                return Ok(ExecutorArtifactFinalization::Pending(pending));
             }
             Err(reject) => {
                 self.route_diag.record_decline(&reject.reason());
                 state.outcome = Some(RouteResidencyInstallOutcome::Rejected(reject));
-                return ExecutorArtifactFinalization::Complete;
+                return Ok(ExecutorArtifactFinalization::Complete);
             }
         };
 
@@ -1960,7 +1980,7 @@ impl CudaExecutionProvider {
                 let reject = RouteResidencyBindingReject::NoPerBankReservation { value: *member };
                 self.route_diag.record_decline(&reject.reason());
                 state.outcome = Some(RouteResidencyInstallOutcome::Rejected(reject));
-                return ExecutorArtifactFinalization::Complete;
+                return Ok(ExecutorArtifactFinalization::Complete);
             }
         }
 
@@ -1969,7 +1989,7 @@ impl CudaExecutionProvider {
         };
         self.route_diag.record_decline(&reject.reason());
         state.outcome = Some(RouteResidencyInstallOutcome::Rejected(reject));
-        ExecutorArtifactFinalization::Complete
+        Ok(ExecutorArtifactFinalization::Complete)
     }
 
     /// Construct and install a production [`RouteResidencyBoundary`] from a
@@ -2086,6 +2106,7 @@ impl CudaExecutionProvider {
             } else {
                 state.drain_calls += 1;
                 state.drained = true;
+                state.pending = None;
                 state.boundary = None;
                 state.retained_artifacts = None;
                 true
@@ -2106,6 +2127,7 @@ impl CudaExecutionProvider {
                 state.drain_calls += 1;
                 state.drained = true;
             }
+            state.pending = None;
             state.boundary = None;
             state.retained_artifacts = None;
         }
@@ -4070,8 +4092,9 @@ impl ExecutionProvider for CudaExecutionProvider {
         &self,
         executor: ExecutorInstanceId,
         graph: &Graph,
-    ) -> ExecutorArtifactFinalization {
-        self.finalize_route_residency_for_executor(executor, graph)
+        readiness: ExecutorArtifactReadinessEpoch,
+    ) -> Result<ExecutorArtifactFinalization> {
+        self.finalize_route_residency_for_executor(executor, graph, readiness)
     }
 
     fn drain_executor_artifacts(&self, executor: ExecutorInstanceId) {

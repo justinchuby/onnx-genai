@@ -38,7 +38,10 @@
 
 use std::sync::{Arc, Mutex};
 
-use onnx_runtime_ep_api::{ExecutionProvider, ExecutorArtifactFinalization, ExecutorInstanceId};
+use onnx_runtime_ep_api::{
+    ExecutionProvider, ExecutorArtifactFinalization, ExecutorArtifactPending,
+    ExecutorArtifactReadinessEpoch, ExecutorInstanceId,
+};
 use onnx_runtime_ep_cuda::CudaExecutionProvider;
 use onnx_runtime_ep_cuda::coarse_residency::COARSE_RESIDENCY_ENABLE_ENV;
 use onnx_runtime_ep_cuda::weight_paging::DeviceOffloadPolicy;
@@ -223,7 +226,9 @@ fn enabled_build_binds_real_producer_and_declines_without_per_bank_reservation()
     // compilation.
     gate_on();
     assert_eq!(
-        provider.finalize_executor_artifacts(executor, &graph),
+        provider
+            .finalize_executor_artifacts(executor, &graph, ExecutorArtifactReadinessEpoch::new(1),)
+            .expect("finalize compiled executor"),
         ExecutorArtifactFinalization::Complete
     );
     let status = provider.route_residency_executor_status(executor);
@@ -241,7 +246,9 @@ fn enabled_build_binds_real_producer_and_declines_without_per_bank_reservation()
             .expect("specialization retains the source")
     ));
     assert_eq!(
-        provider.finalize_executor_artifacts(executor, &graph),
+        provider
+            .finalize_executor_artifacts(executor, &graph, ExecutorArtifactReadinessEpoch::new(2),)
+            .expect("finalize specialized executor"),
         ExecutorArtifactFinalization::Complete
     );
     assert_eq!(
@@ -303,11 +310,38 @@ fn readiness_absence_does_not_latch_and_concurrent_finalize_is_idempotent() {
 
     let declines_before = provider.route_residency_diagnostics().declines();
     assert_eq!(
-        provider.finalize_executor_artifacts(executor, &graph),
-        ExecutorArtifactFinalization::Pending
+        provider
+            .finalize_executor_artifacts(executor, &graph, ExecutorArtifactReadinessEpoch::new(1),)
+            .expect("pending finalization is not an EP error"),
+        ExecutorArtifactFinalization::Pending(ExecutorArtifactPending::ProducerUnavailable {
+            node: node_id
+        })
     );
     let pending = provider.route_residency_executor_status(executor);
     assert_eq!(pending.finalization_attempts, 1);
+    assert_eq!(
+        pending.readiness_epoch,
+        Some(ExecutorArtifactReadinessEpoch::new(1))
+    );
+    assert_eq!(
+        pending.pending,
+        Some(ExecutorArtifactPending::ProducerUnavailable { node: node_id })
+    );
+    assert_eq!(
+        provider
+            .finalize_executor_artifacts(executor, &graph, ExecutorArtifactReadinessEpoch::new(1),)
+            .expect("same pending epoch is cached"),
+        ExecutorArtifactFinalization::Pending(ExecutorArtifactPending::ProducerUnavailable {
+            node: node_id
+        })
+    );
+    assert_eq!(
+        provider
+            .route_residency_executor_status(executor)
+            .finalization_attempts,
+        1,
+        "same readiness epoch must not busy-retry provider finalization"
+    );
     assert!(pending.outcome.is_none());
     assert_eq!(
         provider.route_residency_diagnostics().declines(),
@@ -322,7 +356,13 @@ fn readiness_absence_does_not_latch_and_concurrent_finalize_is_idempotent() {
             let graph = Arc::clone(&graph);
             scope.spawn(move || {
                 assert_eq!(
-                    provider.finalize_executor_artifacts(executor, &graph),
+                    provider
+                        .finalize_executor_artifacts(
+                            executor,
+                            &graph,
+                            ExecutorArtifactReadinessEpoch::new(2),
+                        )
+                        .expect("concurrent finalization"),
                     ExecutorArtifactFinalization::Complete
                 );
             });
@@ -382,7 +422,9 @@ fn disabled_build_installs_and_retains_nothing() {
 
     gate_off();
     assert_eq!(
-        provider.finalize_executor_artifacts(executor, &graph),
+        provider
+            .finalize_executor_artifacts(executor, &graph, ExecutorArtifactReadinessEpoch::new(1),)
+            .expect("default-off finalization"),
         ExecutorArtifactFinalization::Complete
     );
 

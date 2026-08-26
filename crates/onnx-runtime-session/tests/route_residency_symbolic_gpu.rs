@@ -3,7 +3,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use onnx_runtime_ep_api::ExecutionProvider;
+use onnx_runtime_ep_api::{
+    ExecutionProvider, ExecutorArtifactFinalization, ExecutorArtifactPending,
+    ExecutorArtifactReadinessEpoch,
+};
 use onnx_runtime_ep_cuda::CudaExecutionProvider;
 use onnx_runtime_ep_cuda::coarse_residency::COARSE_RESIDENCY_ENABLE_ENV;
 use onnx_runtime_ep_cuda::route_residency::{
@@ -253,10 +256,30 @@ fn symbolic_qmoe_finalizes_after_real_compile_and_shared_ep_state_is_isolated() 
             .retained_route_residency_artifacts(first_id)
             .is_none()
     );
+    assert_eq!(
+        provider
+            .finalize_executor_artifacts(
+                first_id,
+                first.graph(),
+                ExecutorArtifactReadinessEpoch::INITIAL,
+            )
+            .expect("uncompiled symbolic readiness is pending, not an EP error"),
+        ExecutorArtifactFinalization::Pending(ExecutorArtifactPending::ProducerUnavailable {
+            node: qmoe_node
+        })
+    );
+    let pending = provider.route_residency_executor_status(first_id);
+    assert_eq!(pending.finalization_attempts, 1);
+    assert_eq!(pending.producer_nodes, 0);
+    assert!(pending.outcome.is_none());
 
     run_symbolic_qmoe(&mut first, 1, 2, &[3, 4]);
     let first_run = provider.route_residency_executor_status(first_id);
-    assert_eq!(first_run.finalization_attempts, 1);
+    assert_eq!(
+        first_run.finalization_attempts, 2,
+        "real QMoEFactory compilation advances readiness before execution"
+    );
+    assert!(first_run.pending.is_none());
     assert_eq!(first_run.producer_nodes, 1);
     assert_eq!(first_run.retained_banks, 1);
     assert!(matches!(
@@ -272,7 +295,7 @@ fn symbolic_qmoe_finalizes_after_real_compile_and_shared_ep_state_is_isolated() 
     run_symbolic_qmoe(&mut first, 2, 2, &[3, 4, 3, 4]);
     let specialized = provider.route_residency_executor_status(first_id);
     assert_eq!(
-        specialized.finalization_attempts, 1,
+        specialized.finalization_attempts, 2,
         "dynamic specialization must not reinstall"
     );
     assert!(Arc::ptr_eq(

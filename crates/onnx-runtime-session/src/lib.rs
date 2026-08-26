@@ -225,6 +225,28 @@ mod error {
         #[error("no inferred shape for value {value} produced by op {op}")]
         UnresolvedShape { value: String, op: String },
 
+        #[error(
+            "{provider} executor {executor} provider artifacts are pending at readiness epoch \
+             {readiness_epoch}: {reason}; no kernel execution or capture was started"
+        )]
+        ExecutionProviderArtifactsPending {
+            provider: String,
+            executor: u64,
+            readiness_epoch: u64,
+            reason: String,
+        },
+
+        #[error(
+            "{provider} executor {executor} provider-artifact finalization failed at readiness \
+             epoch {readiness_epoch}: {reason}; no kernel execution or capture was started"
+        )]
+        ExecutionProviderArtifactFinalizationFailed {
+            provider: String,
+            executor: u64,
+            readiness_epoch: u64,
+            reason: String,
+        },
+
         #[error("shape element count overflows usize for value {value} (dims {dims:?})")]
         ShapeOverflow { value: String, dims: Vec<usize> },
 
