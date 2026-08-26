@@ -317,15 +317,15 @@ extern "C" __global__ void NAME(                                               \
     const int h = (int)(x % heads); const int b = (int)(x / heads);            \
     float v;                                                                    \
     if (s < past_seq) {                                                        \
-      v = LOAD(past[(((long long)(b * heads + h)) * past_seq + s) * dim + d]);  \
+      v = LOAD(past[(((long long)b * heads + h) * past_seq + s) * dim + d]);    \
     } else {                                                                    \
       const long long sc = s - past_seq;                                       \
       if (cur_is_bnsh) {                                                       \
-        v = LOAD(cur[(((long long)(b * heads + h)) * cur_seq + sc) * dim + d]); \
+        v = LOAD(cur[(((long long)b * heads + h) * cur_seq + sc) * dim + d]);   \
       } else {                                                                  \
-        v = LOAD(cur[(((long long)(b * cur_seq + sc)) * heads + h) * dim + d]); \
+        v = LOAD(cur[(((long long)b * cur_seq + sc) * heads + h) * dim + d]);   \
       }                                                                         \
-      if (has_bias) v += LOAD(bias[h * dim + d]);                               \
+      if (has_bias) v += LOAD(bias[(long long)h * dim + d]);                    \
     }                                                                           \
     dst[idx] = STORE(v);                                                        \
   }                                                                             \
@@ -342,7 +342,7 @@ extern "C" __global__ void NAME(                                               \
     const int d = (int)(x % dim); x /= dim;                                     \
     const int s = (int)(x % seq); x /= seq;                                     \
     const int h = (int)(x % heads); const int b = (int)(x / heads);            \
-    dst[(((long long)(b * seq + s)) * heads + h) * dim + d] = src[idx];         \
+    dst[(((long long)b * seq + s) * heads + h) * dim + d] = src[idx];           \
   }                                                                             \
 }
 
@@ -363,9 +363,9 @@ extern "C" __global__ void NAME(                                               \
     if (has_abias) {                                                           \
       const int b0 = (abias_d0 == 1) ? 0 : b;                                  \
       const int b1 = (abias_d1 == 1) ? 0 : h;                                  \
-      v += LOAD(abias[(((long long)(b0 * abias_d1 + b1)) * sq + i) * total + j]);\
+      v += LOAD(abias[(((long long)b0 * abias_d1 + b1) * sq + i) * total + j]); \
     }                                                                           \
-    if (has_pad) v += pad[((long long)(b * sq + i)) * total + j];               \
+    if (has_pad) v += pad[((long long)b * sq + i) * total + j];                 \
     out[idx] = STORE(v);                                                        \
   }                                                                             \
 }
@@ -1967,6 +1967,56 @@ mod tests {
         assert!(product.to_string().contains("query elements product"));
         let bytes = checked_bytes(usize::MAX, 2, "mask").unwrap_err();
         assert!(bytes.to_string().contains("mask byte size"));
+    }
+
+    #[test]
+    fn nvrtc_linear_indices_promote_before_every_int_product() {
+        // Every pointer/linear-index product rooted in CUDA `int` geometry must
+        // promote its first operand, not cast the already-overflowed product.
+        // This list is the complete index audit of SOURCE (counts/loop strides
+        // already start with long long and are deliberately not repeated).
+        for required in [
+            "((long long)b * heads + h) * past_seq",
+            "((long long)b * heads + h) * cur_seq",
+            "((long long)b * cur_seq + sc) * heads",
+            "bias[(long long)h * dim + d]",
+            "((long long)b * seq + s) * heads",
+            "((long long)b0 * abias_d1 + b1) * sq",
+            "((long long)b * sq + i) * total",
+        ] {
+            assert!(
+                SOURCE.contains(required),
+                "MHA NVRTC source must promote before multiplication: {required}"
+            );
+        }
+        for forbidden in [
+            "(long long)(b * heads + h)",
+            "(long long)(b * cur_seq + sc)",
+            "(long long)(b * seq + s)",
+            "(long long)(b0 * abias_d1 + b1)",
+            "(long long)(b * sq + i)",
+            "bias[h * dim + d]",
+        ] {
+            assert!(
+                !SOURCE.contains(forbidden),
+                "MHA NVRTC source casts after an overflowing int expression: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn host_geometry_allows_products_above_i32_when_offsets_fit_usize() {
+        let batch = 65_536usize;
+        let sequence = 65_536usize;
+        assert!(checked_i32(batch, "batch").is_ok());
+        assert!(checked_i32(sequence, "sequence").is_ok());
+        let elements = checked_product(&[batch, sequence, 2, 4], "large MHA elements").unwrap();
+        assert_eq!(elements, 34_359_738_368);
+        assert!(elements > i32::MAX as usize);
+        assert_eq!(
+            checked_bytes(elements, std::mem::size_of::<f32>(), "large MHA").unwrap(),
+            137_438_953_472
+        );
     }
 
     #[test]
