@@ -883,7 +883,9 @@ def _swallow_reason(block: str, pipefail: bool) -> str | None:
     if not pipefail and _PIPE_AFTER_TEST.search(block):
         return "cargo test piped without pipefail; its failure is masked"
     return None
-_RUNS_IN_A_PASSING_JOB = {"success()", "always()", "true", "${{ true }}", "${{ success() }}"}
+_RUNS_IN_A_PASSING_JOB = frozenset(
+    {"success()", "always()", "true", "${{ true }}", "${{ success() }}"}
+)
 
 
 def job_steps(job_body: str) -> list[tuple[str | None, str, str | None]]:
@@ -1197,15 +1199,44 @@ _WINDOWS_STEP_IF = frozenset(
 
 def windows_ort_executors(jobs: dict[str, str] | None = None) -> dict[str, set[str]]:
     """Jobs that can run on Windows and execute ORT-backed packages there."""
+    return _windows_ort_coverage(jobs)[0]
+
+
+# A job-level `if:` that still leaves the job running whenever it is scheduled.
+# `_ALLOWED_JOB_IF` is reused deliberately: a docs-only PR is entitled to skip
+# these tests, and the required tier already treats that guard as acceptable.
+_JOB_IF_RUNS_ANYWAY = _ALLOWED_JOB_IF | frozenset({"true", "${{ true }}", "success()"})
+
+
+def _windows_ort_coverage(
+    jobs: dict[str, str] | None = None,
+) -> tuple[dict[str, set[str]], dict[str, str]]:
+    """Windows ORT executors, and those refused for a job-level `if:`.
+
+    `unconditional_run_blocks` models step-level `if:` only, and
+    `verify_required_job_conditions` refuses a job-level one on a *required*
+    job. The Windows executor is deliberately not required, so it inherited
+    neither guard: `if: false` on it left every step creditable and this gate
+    reported full coverage via a job that can never run. Refused jobs are
+    returned rather than dropped, so the failure can name them instead of
+    reporting the packages as merely uncovered.
+    """
     jobs = workflow_jobs() if jobs is None else jobs
     found: dict[str, set[str]] = {}
+    refused: dict[str, str] = {}
     for name, body in jobs.items():
         if not _WINDOWS_RUNNER.search(job_runner_labels(body)):
             continue
         blocks, _ = unconditional_run_blocks(body, also_credit=_WINDOWS_STEP_IF)
-        if tested := packages_tested_by(blocks) & set(ORT_BACKED):
-            found[name] = tested
-    return found
+        tested = packages_tested_by(blocks) & set(ORT_BACKED)
+        if not tested:
+            continue
+        condition = job_condition(body)
+        if condition is not None and condition not in _JOB_IF_RUNS_ANYWAY:
+            refused[name] = condition
+            continue
+        found[name] = tested
+    return found, refused
 
 
 def verify_windows_ort_coverage(jobs: dict[str, str] | None = None) -> int:
@@ -1221,7 +1252,7 @@ def verify_windows_ort_coverage(jobs: dict[str, str] | None = None) -> int:
             file=sys.stderr,
         )
         return 1
-    executors = windows_ort_executors(jobs)
+    executors, refused = _windows_ort_coverage(jobs)
     covered: set[str] = set()
     for tested in executors.values():
         covered |= tested
@@ -1232,6 +1263,12 @@ def verify_windows_ort_coverage(jobs: dict[str, str] | None = None) -> int:
         )
         for package in missing:
             print(f"  - {package}", file=sys.stderr)
+        for name, condition in sorted(refused.items()):
+            print(
+                f"  {name!r} would have covered them, but carries a job-level "
+                f"`if: {condition}` -- a skipped job runs no steps.",
+                file=sys.stderr,
+            )
         print(
             "No required check builds the ORT graph on Windows, so this coverage "
             "exists only here. A job that stops running them does not go red -- "
@@ -1777,7 +1814,7 @@ def _conditional_arms() -> int:
 # Hand-maintained because `_parser_arms` is inline code rather than a table.
 # `self_test` recounts the arms it actually observed and refuses if this number
 # disagrees, so a stale value here fails loudly instead of under-reporting.
-_PARSER_ARM_COUNT = 18
+_PARSER_ARM_COUNT = 22
 
 
 # Each arm is (label, workflow text, the packages the scanner must credit).
@@ -2062,6 +2099,15 @@ def _parser_arms() -> int:
             )
         }
 
+    def _ort_job_with_if(runs_on: str, condition: str) -> dict[str, str]:
+        return {
+            "EP conformance (Linux x86_64)": (
+                f"    runs-on: {runs_on}\n    if: {condition}\n"
+                f"    steps:\n      - name: s\n"
+                f"        run: cargo test {ort_flags}\n"
+            )
+        }
+
     def _coverage_arm(label: str, jobs: dict[str, str] | None, expected: int) -> int:
         out, err = io.StringIO(), io.StringIO()
         with redirect_stdout(out), redirect_stderr(err):
@@ -2150,6 +2196,43 @@ def _parser_arms() -> int:
         },
         0,
     )
+
+    # A job-level `if:` is invisible to `unconditional_run_blocks`, which models
+    # step-level conditions only. `verify_required_job_conditions` refuses one on
+    # a required job; the Windows executor is deliberately *not* required, so it
+    # inherited no such refusal. Measured on the real `ci.yml` before the fix:
+    # `if: false` on `cli-ort` still printed `windows ORT coverage ok: 6
+    # package(s)` with rc=0 for a job that can never run.
+    failures += _coverage_arm(
+        "a Windows executor that can never run is not coverage",
+        _ort_job_with_if("windows-latest", "false"),
+        1,
+    )
+    failures += _coverage_arm(
+        "a Windows executor gated on anything unrecognised is refused",
+        _ort_job_with_if("windows-latest", "github.event_name == 'schedule'"),
+        1,
+    )
+    # Control: the refusal must be about the condition, not about job-level
+    # `if:` as such, or the arm above is passed by a gate that refuses every
+    # conditional job -- including the repo's own docs-only guard.
+    failures += _coverage_arm(
+        "the repo's docs-only guard still counts as Windows coverage",
+        _ort_job_with_if("windows-latest", "needs.changes.outputs.docs_only != 'true'"),
+        0,
+    )
+    # The failure has to name the job, or it reports a live job as an absent one
+    # and sends the reader looking for a deletion that never happened.
+    label = "a job refused for its condition is named, not silently uncovered"
+    out, err = io.StringIO(), io.StringIO()
+    with redirect_stdout(out), redirect_stderr(err):
+        verify_windows_ort_coverage(jobs=_ort_job_with_if("windows-latest", "false"))
+    text = out.getvalue() + err.getvalue()
+    if "if: false" in text and "EP conformance (Linux x86_64)" in text:
+        print(f"  ok    {label} -> named with its condition")
+    else:
+        failures += 1
+        print(f"  FAIL  {label}: {text!r}", file=sys.stderr)
 
     # `ok: 0 package(s) via []` was reachable, and it is the same string a
     # completely blind gate prints.
