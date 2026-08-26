@@ -193,9 +193,41 @@ that row it is **bit-identical** to `after` under a build that is deliberately
 wrong. The two binaries therefore differ, on that row, only in code that does
 not execute.
 
+The boolean table above is not the whole control, because on its own "this row
+did not move" is consistent with "the poison is inert at `m = 1`" or "the poison
+is inert at block 32". Both are excluded by bracketing the cell on *both* axes.
+Raw FNV folds, re-taken on `9b577b2c5` from arms rebuilt for this purpose:
+
+| block | m | GEBP | `after` | `poison` | moves? |
+|---:|---:|---:|---|---|---|
+| 16 | 1 | on | `01c5b99695edbba2` | `7439f2cba5901add` | **yes** |
+| 32 | 8 | on | `a504a827d5336008` | `8bc857141884caa2` | **yes** |
+| 32 | 1 | on | `4cb1dcffe7454cff` | `4cb1dcffe7454cff` | no |
+| 32 | 1 | off | `4cb1dcffe7454cff` | `4cb1dcffe7454cff` | no |
+| 32 | 8 | off | `06effc7d87d80700` | `06effc7d87d80700` | no |
+
+Hold `m = 1` and change the block: it moves. Hold block 32 and change `m`: it
+moves. The poison is live at `m = 1` and live at block 32; the single cell where
+it goes quiet is exactly the one `int4_prefill_gebp_min_rows` predicts.
+
+The last two rows close the remaining gap, and they are the reason the
+env-var control is not the argument here. `ONNX_GENAI_CPU_MM_INT4_GEBP=0`
+demonstrably takes the pack off the route — at `m = 8` it collapses `poison` onto
+`after` (`06effc7d87d80700` both), which is the same signature the control cell
+shows. But at block 32 `m = 1` the output is `4cb1dcffe7454cff` **with the flag
+on and with it off**: toggling the flag does not change what that row computes,
+so it does not change which kernel that row runs. Any timing movement observed
+at that cell under the flag is therefore movement on a bit-identical
+computation — layout or noise, not a route change, and not a residual pack path.
+That matters because the flag swaps a whole algorithm and drags cache behaviour
+and layout along with it, so its *timing* delta at any row is unattributable by
+construction; only the checksum makes it an observation. A route claim rests on
+the poison, never on the env var.
+
 It reads **0.9807, CI [0.9794, 0.9835]** — a 1.9% *loss*, reproduced at
 0.9821 [0.9807, 0.9862] under `ONNX_GENAI_CPU_MM_INT4_GEBP=0`, with its own
-A/A sitting at 1.0000 [0.9973, 1.0014].
+A/A sitting at 1.0000 [0.9973, 1.0014]. Both readings are of a row whose bytes
+are provably identical in both arms, so neither is a cost of the change.
 
 **Two other pairs of binaries, built from the same source change — one against
 a `main` three commits earlier, one against current `main` with every function
