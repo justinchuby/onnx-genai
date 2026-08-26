@@ -36,11 +36,13 @@ use onnx_runtime_ep_cpu::kernels::planar_block_quant::{
     FP4_MICROSCALE_BLOCK, FP4_PACK_FACTOR, PlanarBlockFormat, PlanarExpertBank, PlanarLayout,
     planar_block_matmul,
 };
+#[cfg(feature = "gpu-tests")]
+use onnx_runtime_ep_cuda::planar_moe_source_build_count;
 use onnx_runtime_ep_cuda::runtime::cuptr;
 use onnx_runtime_ep_cuda::{
-    CudaExecutionProvider, PLANAR_FORMAT_BLOCK_FP8, PLANAR_FORMAT_FP4_PLANAR,
-    PlanarMoeBufferLengths, PlanarMoeDims, PlanarMoeProjection, PlanarMoePtrs, launch_planar_moe,
-    planar_moe_capable_formats, validate_planar_moe, warm_planar_moe,
+    CudaExecutionProvider, PLANAR_FORMAT_BLOCK_FP8, PLANAR_FORMAT_FP4_PLANAR, PlanarMoeBank,
+    PlanarMoeBufferLengths, PlanarMoeDims, PlanarMoeProjection, PlanarMoePtrs, ValidatedPlanarMoe,
+    launch_planar_moe, planar_moe_capable_formats, validate_planar_moe, warm_planar_moe,
 };
 
 // ---------------------------------------------------------------------------
@@ -196,6 +198,14 @@ impl Projection {
             out_features: self.out_features,
             bs0: self.bs0,
             bs1: self.bs1,
+        }
+    }
+
+    fn admission_bank(&self) -> PlanarMoeBank<'_> {
+        PlanarMoeBank {
+            packed: &self.packed_bank,
+            scale: &self.scale_bank,
+            bias_elems: self.bias.as_ref().map(Vec::len),
         }
     }
 
@@ -526,27 +536,16 @@ fn validate(
     fc2: &Projection,
     fc3: Option<&Projection>,
     has_router_weights: bool,
-) {
-    let fc3_banks = fc3.map(|fc3| {
-        (
-            fc3.packed_bank.len(),
-            fc3.scale_bank.len(),
-            fc3.bias.as_ref().map(|b| b.len()),
-        )
-    });
+) -> ValidatedPlanarMoe {
     let buffer_lengths = PlanarMoeBufferLengths::for_dims(dims, has_router_weights).unwrap();
     validate_planar_moe(
         dims,
-        fc1.packed_bank.len(),
-        fc1.scale_bank.len(),
-        fc1.bias.as_ref().map(|b| b.len()),
-        fc2.packed_bank.len(),
-        fc2.scale_bank.len(),
-        fc2.bias.as_ref().map(|b| b.len()),
-        fc3_banks,
+        fc1.admission_bank(),
+        fc2.admission_bank(),
+        fc3.map(Projection::admission_bank),
         &buffer_lengths,
     )
-    .expect("planar MoE geometry/banks must validate");
+    .expect("planar MoE geometry/banks must validate")
 }
 
 fn assert_parity(label: &str, got: &[f32], want: &[f32]) {
@@ -595,7 +594,7 @@ fn run_moe_case(
         fc3,
     });
 
-    validate(dims, fc1, fc2, fc3, use_router_weights);
+    let admission = validate(dims, fc1, fc2, fc3, use_router_weights);
     let buffers = stage_moe(
         ep,
         dims,
@@ -607,7 +606,7 @@ fn run_moe_case(
         fc3,
     );
     warm_planar_moe(ep.runtime()).unwrap();
-    launch_planar_moe(ep.runtime(), dims, &buffers.ptrs).unwrap();
+    launch_planar_moe(ep.runtime(), &admission, &buffers.ptrs).unwrap();
     ep.runtime().synchronize().unwrap();
     let got = download_f32(ep, &buffers.output, dims.rows * dims.hidden);
     assert_parity(label, &got, &want);
@@ -633,7 +632,7 @@ fn dims_relu(
         swiglu_fusion: 0,
         activation_alpha: 1.0,
         activation_beta: 1.0,
-        swiglu_limit: f32::INFINITY,
+        swiglu_limit: f32::MAX,
         normalize_routing_weights: true,
         fc1: fc1.descriptor(),
         fc2: fc2.descriptor(),
@@ -789,7 +788,7 @@ fn fused_swiglu_routed_moe_matches_oracle() {
         swiglu_fusion: 1,
         activation_alpha: 1.0,
         activation_beta: 1.0,
-        swiglu_limit: f32::INFINITY,
+        swiglu_limit: f32::MAX,
         normalize_routing_weights: true,
         fc1: fc1.descriptor(),
         fc2: fc2.descriptor(),
@@ -870,7 +869,7 @@ fn multi_request_shape_change_is_stable() {
     ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
 )]
 fn invalid_geometry_is_typed_rejected() {
-    let ep = require_cuda();
+    let _ep = require_cuda();
     let (hidden, inter, experts, top_k) = (128usize, 64usize, 4usize, 2usize);
     let fc1 = Projection::build(PLANAR_FORMAT_BLOCK_FP8, hidden, inter, experts, 0x30, false);
     let fc2 = Projection::build(PLANAR_FORMAT_BLOCK_FP8, inter, hidden, experts, 0x31, false);
@@ -878,15 +877,17 @@ fn invalid_geometry_is_typed_rejected() {
 
     // Ragged packed bank (one byte too many) → validate rejects.
     let buffer_lengths = PlanarMoeBufferLengths::for_dims(&dims, false).unwrap();
+    let mut ragged_fc1 = fc1.packed_bank.clone();
+    ragged_fc1.push(0);
     assert!(
         validate_planar_moe(
             &dims,
-            fc1.packed_bank.len() + 1,
-            fc1.scale_bank.len(),
-            None,
-            fc2.packed_bank.len(),
-            fc2.scale_bank.len(),
-            None,
+            PlanarMoeBank {
+                packed: &ragged_fc1,
+                scale: &fc1.scale_bank,
+                bias_elems: None,
+            },
+            fc2.admission_bank(),
             None,
             &buffer_lengths,
         )
@@ -900,12 +901,8 @@ fn invalid_geometry_is_typed_rejected() {
     assert!(
         validate_planar_moe(
             &bad_topk,
-            fc1.packed_bank.len(),
-            fc1.scale_bank.len(),
-            None,
-            fc2.packed_bank.len(),
-            fc2.scale_bank.len(),
-            None,
+            fc1.admission_bank(),
+            fc2.admission_bank(),
             None,
             &bad_buffer_lengths,
         )
@@ -918,20 +915,15 @@ fn invalid_geometry_is_typed_rejected() {
     assert!(
         validate_planar_moe(
             &dims,
-            fc1.packed_bank.len(),
-            fc1.scale_bank.len(),
-            None,
-            fc2.packed_bank.len(),
-            fc2.scale_bank.len(),
-            None,
+            fc1.admission_bank(),
+            fc2.admission_bank(),
             None,
             &short_buffers,
         )
         .is_err()
     );
 
-    // Odd fp4 contraction on fc2 → the launcher re-validates projection geometry
-    // and refuses before touching any pointer (null ptrs are never dereferenced).
+    // Odd fp4 contraction on fc2 cannot produce an admission proof.
     let odd_dims = PlanarMoeDims {
         rows: 1,
         hidden: 32,
@@ -942,7 +934,7 @@ fn invalid_geometry_is_typed_rejected() {
         swiglu_fusion: 0,
         activation_alpha: 1.0,
         activation_beta: 1.0,
-        swiglu_limit: f32::INFINITY,
+        swiglu_limit: f32::MAX,
         normalize_routing_weights: true,
         fc1: PlanarMoeProjection {
             format: PLANAR_FORMAT_BLOCK_FP8,
@@ -960,7 +952,153 @@ fn invalid_geometry_is_typed_rejected() {
         },
         fc3: None,
     };
-    assert!(launch_planar_moe(ep.runtime(), &odd_dims, &PlanarMoePtrs::default()).is_err());
+    let odd_buffers = PlanarMoeBufferLengths::for_dims(&odd_dims, false).unwrap();
+    let empty = PlanarMoeBank {
+        packed: &[],
+        scale: &[],
+        bias_elems: None,
+    };
+    assert!(validate_planar_moe(&odd_dims, empty, empty, None, &odd_buffers).is_err());
+}
+
+#[test]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+fn malformed_values_and_attributes_reject_before_device_activity() {
+    let ep = require_cuda();
+    let runtime = ep.runtime();
+    let allocations = runtime.allocation_counts();
+    let transfers = runtime.transfer_counts();
+    let (hidden, inter, experts, top_k) = (32usize, 32usize, 2usize, 1usize);
+    let fc1 = Projection::build(PLANAR_FORMAT_BLOCK_FP8, hidden, inter, experts, 0x61, false);
+    let fc2 = Projection::build(PLANAR_FORMAT_BLOCK_FP8, inter, hidden, experts, 0x62, false);
+    let dims = dims_relu(1, hidden, inter, experts, top_k, &fc1, &fc2);
+    let buffers = PlanarMoeBufferLengths::for_dims(&dims, false).unwrap();
+
+    let mut bad_packed = fc1.packed_bank.clone();
+    bad_packed[0] = 0x7f;
+    assert!(
+        validate_planar_moe(
+            &dims,
+            PlanarMoeBank {
+                packed: &bad_packed,
+                scale: &fc1.scale_bank,
+                bias_elems: None,
+            },
+            fc2.admission_bank(),
+            None,
+            &buffers,
+        )
+        .is_err()
+    );
+
+    bad_packed[0] = 0x7e;
+    let mut bad_scale = fc1.scale_bank.clone();
+    bad_scale[0] = 247;
+    assert!(
+        validate_planar_moe(
+            &dims,
+            PlanarMoeBank {
+                packed: &bad_packed,
+                scale: &bad_scale,
+                bias_elems: None,
+            },
+            fc2.admission_bank(),
+            None,
+            &buffers,
+        )
+        .is_err()
+    );
+
+    let mut reserved_scale = fc2.scale_bank.clone();
+    reserved_scale[0] = 0xff;
+    assert!(
+        validate_planar_moe(
+            &dims,
+            fc1.admission_bank(),
+            PlanarMoeBank {
+                packed: &fc2.packed_bank,
+                scale: &reserved_scale,
+                bias_elems: None,
+            },
+            None,
+            &buffers,
+        )
+        .is_err()
+    );
+
+    let fp4_fc1 = Projection::build(
+        PLANAR_FORMAT_FP4_PLANAR,
+        hidden,
+        inter,
+        experts,
+        0x63,
+        false,
+    );
+    let fp4_fc2 = Projection::build(
+        PLANAR_FORMAT_FP4_PLANAR,
+        inter,
+        hidden,
+        experts,
+        0x64,
+        false,
+    );
+    let fp4_dims = dims_relu(1, hidden, inter, experts, top_k, &fp4_fc1, &fp4_fc2);
+    let fp4_buffers = PlanarMoeBufferLengths::for_dims(&fp4_dims, false).unwrap();
+    let max_codes = vec![0x77u8; fp4_fc1.packed_bank.len()];
+    let overflow_scales = vec![253u8; fp4_fc1.scale_bank.len()];
+    assert!(
+        validate_planar_moe(
+            &fp4_dims,
+            PlanarMoeBank {
+                packed: &max_codes,
+                scale: &overflow_scales,
+                bias_elems: None,
+            },
+            fp4_fc2.admission_bank(),
+            None,
+            &fp4_buffers,
+        )
+        .is_err()
+    );
+
+    for (alpha, beta, limit) in [
+        (f32::NAN, 0.0, 1.0),
+        (f32::INFINITY, 0.0, 1.0),
+        (f32::NEG_INFINITY, 0.0, 1.0),
+        (1.0, f32::NAN, 1.0),
+        (1.0, f32::INFINITY, 1.0),
+        (1.0, f32::NEG_INFINITY, 1.0),
+        (1.0, 0.0, f32::NAN),
+        (1.0, 0.0, f32::INFINITY),
+        (1.0, 0.0, f32::NEG_INFINITY),
+        (1.0, 0.0, 0.0),
+        (1.0, 0.0, -1.0),
+    ] {
+        let invalid = PlanarMoeDims {
+            activation: 3,
+            swiglu_fusion: 1,
+            activation_alpha: alpha,
+            activation_beta: beta,
+            swiglu_limit: limit,
+            ..dims
+        };
+        assert!(
+            validate_planar_moe(
+                &invalid,
+                fc1.admission_bank(),
+                fc2.admission_bank(),
+                None,
+                &buffers,
+            )
+            .is_err()
+        );
+    }
+
+    assert_eq!(runtime.allocation_counts(), allocations);
+    assert_eq!(runtime.transfer_counts(), transfers);
 }
 
 /// A warmed fixed-shape routed MoE records into a CUDA-graph capture and replays
@@ -984,23 +1122,41 @@ fn capture_replay_parity() {
         .map(|_| rng.next_f32() * 3.0)
         .collect();
 
-    validate(&dims, &fc1, &fc2, None, false);
+    let admission = validate(&dims, &fc1, &fc2, None, false);
     let buffers = stage_moe(&ep, &dims, &input, &logits, None, &fc1, &fc2, None);
 
     warm_planar_moe(runtime).unwrap();
+    #[cfg(feature = "gpu-tests")]
+    assert_eq!(planar_moe_source_build_count(), 1);
 
-    // Eager reference.
-    launch_planar_moe(runtime, &dims, &buffers.ptrs).unwrap();
+    // Repeated warmed launches do not rebuild source, allocate, or transfer.
+    let warmed_allocations = runtime.allocation_counts();
+    let warmed_transfers = runtime.transfer_counts();
+    for _ in 0..2 {
+        launch_planar_moe(runtime, &admission, &buffers.ptrs).unwrap();
+    }
+    #[cfg(feature = "gpu-tests")]
+    assert_eq!(planar_moe_source_build_count(), 1);
+    assert_eq!(runtime.allocation_counts(), warmed_allocations);
+    assert_eq!(runtime.transfer_counts(), warmed_transfers);
     runtime.synchronize().unwrap();
     let eager = download_f32(&ep, &buffers.output, dims.rows * hidden);
 
     // Capture the warmed pipeline, then replay ≥3× and compare byte-for-byte.
+    let capture_allocations = runtime.allocation_counts();
+    let capture_transfers = runtime.transfer_counts();
     runtime.begin_graph_capture(&[]).unwrap();
-    launch_planar_moe(runtime, &dims, &buffers.ptrs).unwrap();
+    launch_planar_moe(runtime, &admission, &buffers.ptrs).unwrap();
     runtime.end_graph_capture().unwrap();
+    #[cfg(feature = "gpu-tests")]
+    assert_eq!(planar_moe_source_build_count(), 1);
+    assert_eq!(runtime.allocation_counts(), capture_allocations);
+    assert_eq!(runtime.transfer_counts(), capture_transfers);
 
     let zeros = vec![0u8; dims.rows * hidden * 4];
     for replay in 0..3 {
+        let before_allocations = runtime.allocation_counts();
+        let before_transfers = runtime.transfer_counts();
         // SAFETY: output is rows*hidden*4 bytes wide.
         unsafe {
             runtime
@@ -1013,6 +1169,22 @@ fn capture_replay_parity() {
         assert_eq!(
             replayed, eager,
             "capture replay {replay} diverged from eager"
+        );
+        #[cfg(feature = "gpu-tests")]
+        assert_eq!(planar_moe_source_build_count(), 1);
+        assert_eq!(runtime.allocation_counts(), before_allocations);
+        let after_transfers = runtime.transfer_counts();
+        assert_eq!(
+            after_transfers.host_to_device,
+            before_transfers.host_to_device + 1
+        );
+        assert_eq!(
+            after_transfers.device_to_host,
+            before_transfers.device_to_host + 1
+        );
+        assert_eq!(
+            after_transfers.async_host_to_device,
+            before_transfers.async_host_to_device
         );
     }
 
@@ -1119,7 +1291,12 @@ fn foreign_compute_present() -> bool {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 fn resolve_smi_device_maps_visible_ordinal_to_physical_target() {
+    let _ep = require_cuda();
     assert_eq!(resolve_smi_device(None, 0).as_deref(), Some("0"));
     assert_eq!(resolve_smi_device(None, 3).as_deref(), Some("3"));
     assert_eq!(resolve_smi_device(Some(""), 2).as_deref(), Some("2"));
@@ -1173,13 +1350,14 @@ fn planar_moe_measurement() {
     let mut rng = Lcg::new(0xCAFE);
     let input: Vec<f32> = (0..rows * hidden).map(|_| rng.next_f32()).collect();
     let logits: Vec<f32> = (0..rows * experts).map(|_| rng.next_f32() * 3.0).collect();
+    let admission = validate(&dims, &fc1, &fc2, None, false);
     let buffers = stage_moe(&ep, &dims, &input, &logits, None, &fc1, &fc2, None);
     warm_planar_moe(runtime).unwrap();
 
     let ramp = Instant::now();
     while ramp.elapsed().as_secs_f32() < 8.0 {
         for _ in 0..16 {
-            launch_planar_moe(runtime, &dims, &buffers.ptrs).unwrap();
+            launch_planar_moe(runtime, &admission, &buffers.ptrs).unwrap();
         }
         runtime.synchronize().unwrap();
     }
@@ -1187,7 +1365,7 @@ fn planar_moe_measurement() {
     let enqueue_n = 100;
     let host = Instant::now();
     for _ in 0..enqueue_n {
-        launch_planar_moe(runtime, &dims, &buffers.ptrs).unwrap();
+        launch_planar_moe(runtime, &admission, &buffers.ptrs).unwrap();
     }
     let host_enqueue = host.elapsed();
     runtime.synchronize().unwrap();
@@ -1201,7 +1379,7 @@ fn planar_moe_measurement() {
             );
             let t = Instant::now();
             for _ in 0..batch {
-                launch_planar_moe(runtime, &dims, &buffers.ptrs).unwrap();
+                launch_planar_moe(runtime, &admission, &buffers.ptrs).unwrap();
             }
             runtime.synchronize().unwrap();
             samples.push(t.elapsed().as_secs_f64() / batch as f64);

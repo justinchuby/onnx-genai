@@ -35,6 +35,9 @@ use onnx_runtime_ep_api::{
     EpError, Kernel, KernelFactory, Result, TensorMetadata, TensorMut, TensorView,
     WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
 };
+use onnx_runtime_ep_cpu::kernels::moe::{
+    Activation, DEFAULT_SWIGLU_LIMIT, validate_moe_activation_attributes,
+};
 use onnx_runtime_ir::{DataType, Node, Shape};
 use onnx_runtime_memory_governor::MemoryRole;
 
@@ -380,46 +383,6 @@ pub(crate) fn moe_module_source() -> &'static str {
     module_source()
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Activation {
-    Relu,
-    Gelu,
-    Silu,
-    Swiglu,
-    Identity,
-}
-
-impl Activation {
-    fn parse(node: &Node) -> Result<Self> {
-        let name = match node.attr("activation_type") {
-            Some(value) => value
-                .as_str()
-                .ok_or_else(|| error("attribute activation_type must be a string"))?,
-            None => "relu",
-        };
-        match name {
-            "relu" => Ok(Self::Relu),
-            "gelu" => Ok(Self::Gelu),
-            "silu" => Ok(Self::Silu),
-            "swiglu" => Ok(Self::Swiglu),
-            "identity" => Ok(Self::Identity),
-            other => Err(error(format!(
-                "unsupported activation_type '{other}' (supported: relu, gelu, silu, swiglu, identity)"
-            ))),
-        }
-    }
-
-    fn kernel_id(self) -> i32 {
-        match self {
-            Self::Relu => 0,
-            Self::Gelu => 1,
-            Self::Silu => 2,
-            Self::Swiglu => 3,
-            Self::Identity => 4,
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug)]
 struct MoeAttributes {
     k: usize,
@@ -456,27 +419,33 @@ impl MoeAttributes {
         if k <= 0 {
             return Err(error(format!("k must be > 0, got {k}")));
         }
-        let activation = Activation::parse(node)?;
+        let activation_name = match node.attr("activation_type") {
+            Some(value) => value
+                .as_str()
+                .ok_or_else(|| error("attribute activation_type must be a string"))?,
+            None => "relu",
+        };
         let normalize_routing_weights = bool_attr(node, "normalize_routing_weights", false)?;
         let swiglu_fusion = int_attr(node, "swiglu_fusion", 0)?;
-        if !(0..=2).contains(&swiglu_fusion) {
-            return Err(error(format!(
-                "swiglu_fusion must be 0, 1, or 2, got {swiglu_fusion}"
-            )));
-        }
-        if activation != Activation::Swiglu && swiglu_fusion != 0 {
-            return Err(error(
-                "swiglu_fusion is only valid when activation_type='swiglu'",
-            ));
-        }
+        let activation_alpha = float_attr(node, "activation_alpha", 1.0)?;
+        let activation_beta = float_attr(node, "activation_beta", 0.0)?;
+        let swiglu_limit = float_attr(node, "swiglu_limit", DEFAULT_SWIGLU_LIMIT)?;
+        let activation_attributes = validate_moe_activation_attributes(
+            activation_name,
+            swiglu_fusion,
+            activation_alpha,
+            activation_beta,
+            swiglu_limit,
+        )
+        .map_err(error)?;
         Ok(Self {
             k: usize::try_from(k).map_err(|_| error("k exceeds usize limits"))?,
-            activation,
+            activation: activation_attributes.activation,
             normalize_routing_weights,
-            swiglu_fusion: swiglu_fusion as usize,
-            activation_alpha: float_attr(node, "activation_alpha", 1.0)?,
-            activation_beta: float_attr(node, "activation_beta", 0.0)?,
-            swiglu_limit: float_attr(node, "swiglu_limit", f32::INFINITY)?,
+            swiglu_fusion: activation_attributes.swiglu_fusion,
+            activation_alpha: activation_attributes.activation_alpha,
+            activation_beta: activation_attributes.activation_beta,
+            swiglu_limit: activation_attributes.swiglu_limit,
         })
     }
 
@@ -703,6 +672,9 @@ pub(crate) fn unsupported_reason(
     // is an explicit follow-up.
     if let Err(reason) = formats.uniform() {
         return Some(Cow::Owned(format!("BlockQuantizedMoE: {reason}")));
+    }
+    if let Err(reason) = MoeAttributes::from_node(node) {
+        return Some(Cow::Owned(reason.to_string()));
     }
     if let Some(attribute) = node.attr("block_layout_version") {
         match attribute.as_int() {
@@ -1821,6 +1793,41 @@ mod claim_gate_tests {
             unsupported_reason(&fused, &[], &[]).is_none(),
             "uniform fused-projection node must not be declined by the CUDA claim gate"
         );
+    }
+
+    #[test]
+    fn invalid_activation_attributes_reject_at_claim_and_create_parsing() {
+        for (name, value) in [
+            ("activation_alpha", f32::NAN),
+            ("activation_alpha", f32::INFINITY),
+            ("activation_alpha", f32::NEG_INFINITY),
+            ("activation_beta", f32::NAN),
+            ("activation_beta", f32::INFINITY),
+            ("activation_beta", f32::NEG_INFINITY),
+            ("swiglu_limit", f32::NAN),
+            ("swiglu_limit", f32::INFINITY),
+            ("swiglu_limit", f32::NEG_INFINITY),
+            ("swiglu_limit", 0.0),
+            ("swiglu_limit", -1.0),
+        ] {
+            let mut node = claim_node("iq1_s", "iq1_s", None);
+            node.attributes.insert(
+                "activation_type".into(),
+                Attribute::String(b"swiglu".to_vec()),
+            );
+            node.attributes
+                .insert("swiglu_fusion".into(), Attribute::Int(1));
+            node.attributes.insert(name.into(), Attribute::Float(value));
+            let reason = unsupported_reason(&node, &[], &[])
+                .unwrap_or_else(|| panic!("{name}={value} must be declined at claim time"));
+            assert!(reason.contains(name), "unexpected claim reason: {reason}");
+            let error = MoeAttributes::from_node(&node)
+                .expect_err("the same attribute must fail factory/create parsing");
+            assert!(
+                error.to_string().contains(name),
+                "unexpected create error: {error}"
+            );
+        }
     }
 
     #[test]

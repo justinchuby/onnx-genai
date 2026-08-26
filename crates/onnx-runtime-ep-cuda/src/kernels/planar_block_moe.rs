@@ -52,15 +52,25 @@
 //! gate in [`super::block_quantized_moe`] still **typed-rejects** these formats:
 //! the current 9-input node ABI has no per-projection aux-scale *input* to carry
 //! the planar UE8M0 banks, and that node ABI is co-designed with the unmerged
-//! Mobius #602 / Deckard #593 exporter. Wiring the aux-scale node inputs — and
-//! adding reserved-code validation (see [`super::planar_block_decode`]) — is the
-//! explicit next slice. The onnx-runtime-ep-cpu `planar_block_quant` oracle owns
-//! the op-level routed path until then. This primitive is the runtime capability
-//! the exporter probes before it may emit a planar MoE node.
+//! Mobius #602 / Deckard #593 exporter. Wiring the aux-scale node inputs is the
+//! explicit next slice; immutable bank value admission already reuses the CPU
+//! planar oracle and is required by this primitive's launch API. The
+//! onnx-runtime-ep-cpu `planar_block_quant` oracle owns the op-level routed path
+//! until then. This primitive is the runtime capability the exporter probes
+//! before it may emit a planar MoE node.
+
+use std::sync::OnceLock;
+#[cfg(any(test, feature = "gpu-tests"))]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use cudarc::driver::sys::CUdeviceptr;
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 use onnx_runtime_ep_api::{EpError, Result};
+use onnx_runtime_ep_cpu::kernels::moe::{Activation, validate_moe_activation_attributes};
+use onnx_runtime_ep_cpu::kernels::planar_block_quant::{
+    FP4_MICROSCALE_BLOCK as CPU_FP4_MICROSCALE_BLOCK, PlanarBankIdentity, PlanarBlockFormat,
+    PlanarLayout, validate_planar_expert_bank_values,
+};
 
 use crate::error::driver_err;
 use crate::kernels::block_quantized_matmul::decoder_prelude;
@@ -143,11 +153,27 @@ extern "C" __global__ void pbmoe_planar_linear_f32(
 /// Full NVRTC source for [`PLANAR_MOE_MODULE`]: the shared decoder prelude (for
 /// `warp_sum`/`block_sum`), the planar decode device functions, and the
 /// expert-indexed planar linear kernel.
-fn planar_moe_module_source() -> String {
-    let mut source = decoder_prelude();
-    source.push_str(PLANAR_BLOCK_DECODE_CUH);
-    source.push_str(PLANAR_MOE_KERNEL);
-    source
+fn planar_moe_module_source() -> &'static str {
+    static SOURCE: OnceLock<String> = OnceLock::new();
+    SOURCE.get_or_init(|| {
+        #[cfg(any(test, feature = "gpu-tests"))]
+        PLANAR_MOE_SOURCE_BUILDS.fetch_add(1, Ordering::Relaxed);
+        let mut source = decoder_prelude();
+        source.push_str(PLANAR_BLOCK_DECODE_CUH);
+        source.push_str(PLANAR_MOE_KERNEL);
+        source
+    })
+}
+
+#[cfg(any(test, feature = "gpu-tests"))]
+static PLANAR_MOE_SOURCE_BUILDS: AtomicUsize = AtomicUsize::new(0);
+
+/// Test-only observability for the warm-source contract. The counter advances
+/// only inside the process-level [`OnceLock`] initializer, never on the launch
+/// hot path.
+#[cfg(any(test, feature = "gpu-tests"))]
+pub fn planar_moe_source_build_count() -> usize {
+    PLANAR_MOE_SOURCE_BUILDS.load(Ordering::Relaxed)
 }
 
 fn kernel_err(message: impl Into<String>) -> EpError {
@@ -195,6 +221,26 @@ impl PlanarMoeProjection {
             .expected_lengths()
             .map_err(|err| kernel_err(err.to_string()))?;
         Ok((lengths.packed_bytes, lengths.scale_bytes))
+    }
+
+    fn cpu_layout(&self) -> Result<PlanarLayout> {
+        let (format, block_out, block_in) = match self.format {
+            crate::kernels::planar_block_decode::PLANAR_FORMAT_BLOCK_FP8 => {
+                (PlanarBlockFormat::BlockFp8, self.bs0, self.bs1)
+            }
+            crate::kernels::planar_block_decode::PLANAR_FORMAT_FP4_PLANAR => {
+                (PlanarBlockFormat::Fp4Planar, 1, CPU_FP4_MICROSCALE_BLOCK)
+            }
+            other => return Err(kernel_err(format!("unknown planar format id {other}"))),
+        };
+        PlanarLayout::new(
+            format,
+            self.out_features,
+            self.in_features,
+            block_out,
+            block_in,
+        )
+        .map_err(|err| kernel_err(err.to_string()))
     }
 }
 
@@ -268,6 +314,51 @@ pub struct PlanarMoeBufferLengths {
     pub output_elems: usize,
 }
 
+/// Immutable host view of one expert-major planar projection bank.
+#[derive(Clone, Copy, Debug)]
+pub struct PlanarMoeBank<'a> {
+    pub packed: &'a [u8],
+    pub scale: &'a [u8],
+    pub bias_elems: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ValidatedPlanarMoeProjection {
+    projection: PlanarMoeProjection,
+    packed_expert_stride: usize,
+    scale_expert_stride: usize,
+    identity: PlanarBankIdentity,
+}
+
+/// Cached admission proof for an immutable planar routed-MoE bank set.
+#[derive(Clone, Copy, Debug)]
+pub struct ValidatedPlanarMoe {
+    dims: PlanarMoeDims,
+    buffers: PlanarMoeBufferLengths,
+    routes: usize,
+    fc1: ValidatedPlanarMoeProjection,
+    fc2: ValidatedPlanarMoeProjection,
+    fc3: Option<ValidatedPlanarMoeProjection>,
+}
+
+impl ValidatedPlanarMoe {
+    pub fn dims(&self) -> &PlanarMoeDims {
+        &self.dims
+    }
+
+    pub fn buffers(&self) -> &PlanarMoeBufferLengths {
+        &self.buffers
+    }
+
+    pub fn bank_identities(&self) -> [Option<PlanarBankIdentity>; 3] {
+        [
+            Some(self.fc1.identity),
+            Some(self.fc2.identity),
+            self.fc3.map(|projection| projection.identity),
+        ]
+    }
+}
+
 impl PlanarMoeBufferLengths {
     /// Compute the exact buffer extents for `dims`, rejecting any multiplication
     /// overflow before allocation or launch.
@@ -315,24 +406,18 @@ impl PlanarMoeBufferLengths {
     }
 }
 
-/// Validate a planar routed MoE's geometry and every supplied bank/workspace
-/// byte/element length against the exact extents the kernels require. This is the
-/// host-side aux/OOB guard (ragged expert banks, wrong projection widths,
-/// truncated scales, mis-sized workspace, missing gate) that must pass before
-/// any launch. Any mismatch is a typed rejection — never a dense-expert
-/// fallback.
+/// Validate a planar routed MoE's geometry, immutable host-bank values, and
+/// every supplied bank/workspace extent. This is the host-side reserved-code,
+/// decoded-overflow, and aux/OOB guard that must pass before upload or launch.
+/// Any mismatch is a typed rejection — never a dense-expert fallback.
 #[allow(clippy::too_many_arguments)]
 pub fn validate_planar_moe(
     dims: &PlanarMoeDims,
-    fc1_packed_bytes: usize,
-    fc1_scale_bytes: usize,
-    fc1_bias_elems: Option<usize>,
-    fc2_packed_bytes: usize,
-    fc2_scale_bytes: usize,
-    fc2_bias_elems: Option<usize>,
-    fc3_banks: Option<(usize, usize, Option<usize>)>,
+    fc1_bank: PlanarMoeBank<'_>,
+    fc2_bank: PlanarMoeBank<'_>,
+    fc3_bank: Option<PlanarMoeBank<'_>>,
     buffers: &PlanarMoeBufferLengths,
-) -> Result<()> {
+) -> Result<ValidatedPlanarMoe> {
     if dims.rows == 0 || dims.hidden == 0 || dims.inter == 0 || dims.experts == 0 {
         return Err(kernel_err(format!(
             "non-positive dims rows={} hidden={} inter={} experts={}",
@@ -345,28 +430,16 @@ pub fn validate_planar_moe(
             dims.top_k, dims.experts
         )));
     }
-    if !(0..=4).contains(&dims.activation) {
-        return Err(kernel_err(format!(
-            "unknown activation id {}",
-            dims.activation
-        )));
-    }
-    if !(0..=2).contains(&dims.swiglu_fusion) {
-        return Err(kernel_err(format!(
-            "swiglu_fusion must be 0, 1, or 2, got {}",
-            dims.swiglu_fusion
-        )));
-    }
-    // SwiGLU fusion packs gate+linear into fc1 and is only defined for the
-    // SwiGLU activation (id 3). Any other activation with fusion set would make
-    // `fc1_out()` demand a 2*inter fc1 while the reused activate kernel indexes
-    // it as inter-wide (base = route*inter), silently reading misaligned data.
-    if dims.swiglu_fusion != 0 && dims.activation != 3 {
-        return Err(kernel_err(format!(
-            "swiglu_fusion={} is only valid with the SwiGLU activation (id 3), got activation {}",
-            dims.swiglu_fusion, dims.activation
-        )));
-    }
+    let activation = Activation::from_kernel_id(dims.activation)
+        .ok_or_else(|| kernel_err(format!("unknown activation id {}", dims.activation)))?;
+    validate_moe_activation_attributes(
+        activation.name(),
+        i64::from(dims.swiglu_fusion),
+        dims.activation_alpha,
+        dims.activation_beta,
+        dims.swiglu_limit,
+    )
+    .map_err(kernel_err)?;
     // SwiGLU needs both a gate and a linear projection. The only correct sources
     // are fused packing (swiglu_fusion != 0, gate+linear in a 2*inter fc1) or a
     // separate fc3 gate (swiglu_fusion == 0, fc1=gate, fc3=linear). The remaining
@@ -411,25 +484,11 @@ pub fn validate_planar_moe(
         )));
     }
 
-    validate_projection_banks(
-        dims,
-        &dims.fc1,
-        "fc1",
-        fc1_packed_bytes,
-        fc1_scale_bytes,
-        fc1_bias_elems,
-    )?;
-    validate_projection_banks(
-        dims,
-        &dims.fc2,
-        "fc2",
-        fc2_packed_bytes,
-        fc2_scale_bytes,
-        fc2_bias_elems,
-    )?;
+    let fc1 = validate_projection_bank(dims, &dims.fc1, "fc1", fc1_bank)?;
+    let fc2 = validate_projection_bank(dims, &dims.fc2, "fc2", fc2_bank)?;
 
-    match (dims.fc3.as_ref(), fc3_banks) {
-        (Some(fc3), Some((packed, scale, bias))) => {
+    let fc3 = match (dims.fc3.as_ref(), fc3_bank) {
+        (Some(fc3), Some(bank)) => {
             if dims.swiglu_fusion != 0 {
                 return Err(kernel_err(
                     "a separate fc3 gate is incompatible with fused SwiGLU (swiglu_fusion != 0)",
@@ -453,16 +512,16 @@ pub fn validate_planar_moe(
                     fc3.out_features, dims.inter
                 )));
             }
-            validate_projection_banks(dims, fc3, "fc3", packed, scale, bias)?;
+            Some(validate_projection_bank(dims, fc3, "fc3", bank)?)
         }
-        (None, None) => {}
+        (None, None) => None,
         (Some(_), None) => {
             return Err(kernel_err("fc3 projection present but fc3 banks missing"));
         }
         (None, Some(_)) => {
             return Err(kernel_err("fc3 banks present but fc3 projection missing"));
         }
-    }
+    };
 
     let expected = PlanarMoeBufferLengths::for_dims(dims, buffers.router_weights_elems.is_some())?;
     for (label, supplied, required) in [
@@ -523,17 +582,22 @@ pub fn validate_planar_moe(
             )));
         }
     }
-    Ok(())
+    Ok(ValidatedPlanarMoe {
+        dims: *dims,
+        buffers: *buffers,
+        routes: expected.route_indices_elems,
+        fc1,
+        fc2,
+        fc3,
+    })
 }
 
-fn validate_projection_banks(
+fn validate_projection_bank(
     dims: &PlanarMoeDims,
     projection: &PlanarMoeProjection,
     label: &str,
-    packed_bytes: usize,
-    scale_bytes: usize,
-    bias_elems: Option<usize>,
-) -> Result<()> {
+    bank: PlanarMoeBank<'_>,
+) -> Result<ValidatedPlanarMoeProjection> {
     let (per_packed, per_scale) = projection.per_expert_bytes()?;
     let expected_packed = per_packed
         .checked_mul(dims.experts)
@@ -541,17 +605,19 @@ fn validate_projection_banks(
     let expected_scale = per_scale
         .checked_mul(dims.experts)
         .ok_or_else(|| kernel_err(format!("{label} scale bank byte count overflow")))?;
-    if packed_bytes != expected_packed {
+    if bank.packed.len() != expected_packed {
         return Err(kernel_err(format!(
-            "{label} packed bank has {packed_bytes} bytes, expected experts*{per_packed} = {expected_packed}"
+            "{label} packed bank has {} bytes, expected experts*{per_packed} = {expected_packed}",
+            bank.packed.len()
         )));
     }
-    if scale_bytes != expected_scale {
+    if bank.scale.len() != expected_scale {
         return Err(kernel_err(format!(
-            "{label} scale bank has {scale_bytes} bytes, expected experts*{per_scale} = {expected_scale}"
+            "{label} scale bank has {} bytes, expected experts*{per_scale} = {expected_scale}",
+            bank.scale.len()
         )));
     }
-    if let Some(bias_elems) = bias_elems {
+    if let Some(bias_elems) = bank.bias_elems {
         let expected_bias = projection
             .out_features
             .checked_mul(dims.experts)
@@ -562,7 +628,19 @@ fn validate_projection_banks(
             )));
         }
     }
-    Ok(())
+    let identity = validate_planar_expert_bank_values(
+        &projection.cpu_layout()?,
+        dims.experts,
+        bank.packed,
+        bank.scale,
+    )
+    .map_err(|err| kernel_err(format!("{label} value admission failed: {err}")))?;
+    Ok(ValidatedPlanarMoeProjection {
+        projection: *projection,
+        packed_expert_stride: per_packed,
+        scale_expert_stride: per_scale,
+        identity,
+    })
 }
 
 /// Device pointers for one planar routed-MoE launch. Every pointer is a live
@@ -658,7 +736,7 @@ pub fn warm_planar_moe(runtime: &CudaRuntime) -> Result<()> {
     runtime.require_nvrtc_half_headers("planar moe")?;
     let linear = runtime.nvrtc_function(
         PLANAR_MOE_MODULE,
-        &planar_moe_module_source(),
+        planar_moe_module_source(),
         PLANAR_MOE_LINEAR_ENTRY,
     )?;
     // Pre-apply any MAX_DYNAMIC_SHARED_SIZE opt-in outside capture. The
@@ -679,7 +757,7 @@ fn as_i32(label: &str, value: usize) -> Result<i32> {
 #[allow(clippy::too_many_arguments)]
 fn launch_planar_linear(
     runtime: &CudaRuntime,
-    projection: &PlanarMoeProjection,
+    admission: &ValidatedPlanarMoeProjection,
     input: CUdeviceptr,
     route_indices: CUdeviceptr,
     packed: CUdeviceptr,
@@ -690,10 +768,10 @@ fn launch_planar_linear(
     top_k: usize,
     input_rows_are_routes: bool,
 ) -> Result<()> {
-    let (per_packed, per_scale) = projection.per_expert_bytes()?;
+    let projection = &admission.projection;
     let function = runtime.nvrtc_function(
         PLANAR_MOE_MODULE,
-        &planar_moe_module_source(),
+        planar_moe_module_source(),
         PLANAR_MOE_LINEAR_ENTRY,
     )?;
     let tasks = (routes as u64)
@@ -711,8 +789,8 @@ fn launch_planar_linear(
     let format = projection.format;
     let bs0 = as_i32("bs0", projection.bs0)?;
     let bs1 = as_i32("bs1", projection.bs1)?;
-    let packed_stride = per_packed as u64;
-    let scale_stride = per_scale as u64;
+    let packed_stride = admission.packed_expert_stride as u64;
+    let scale_stride = admission.scale_expert_stride as u64;
 
     let stream = runtime.stream();
     let mut builder = stream.launch_builder(&function);
@@ -744,27 +822,17 @@ fn launch_planar_linear(
 /// Launch the full planar routed top-k MoE pipeline on `runtime`'s EP stream:
 /// `route → fc1 (+ fc3) → activate → fc2 → combine`.
 ///
-/// Geometry is re-validated here (defence in depth); bank/workspace byte lengths
-/// must be validated by the caller with [`validate_planar_moe`] before this
-/// call. The launch issues **no** allocation, host→device copy, compile, or host
-/// synchronization, so a warmed signature (see [`warm_planar_moe`]) records
-/// cleanly into a CUDA-graph capture.
+/// The admission proof carries geometry, workspace extents, and immutable-bank
+/// validation from [`validate_planar_moe`]. The launch issues **no** allocation,
+/// host→device copy, compile, or host synchronization, so a warmed signature
+/// (see [`warm_planar_moe`]) records cleanly into a CUDA-graph capture.
 pub fn launch_planar_moe(
     runtime: &CudaRuntime,
-    dims: &PlanarMoeDims,
+    admission: &ValidatedPlanarMoe,
     ptrs: &PlanarMoePtrs,
 ) -> Result<()> {
-    if dims.rows == 0 || dims.hidden == 0 || dims.inter == 0 {
-        return Ok(());
-    }
-    // Re-validate projection geometry (defence in depth); the caller validates
-    // concrete bank byte lengths with `validate_planar_moe`.
-    dims.fc1.per_expert_bytes()?;
-    dims.fc2.per_expert_bytes()?;
-    if let Some(fc3) = dims.fc3.as_ref() {
-        fc3.per_expert_bytes()?;
-    }
-    let routes = dims.routes();
+    let dims = admission.dims();
+    let routes = admission.routes;
 
     // 1. Route: top-k selection + weights (telemetry pointers null / inert).
     let route_fn = runtime.nvrtc_function(MOE_MODULE, moe_module_source(), MOE_ROUTE_ENTRY)?;
@@ -799,7 +867,7 @@ pub fn launch_planar_moe(
     // 2. FC1 (and optional FC3 gate): token rows shared across a token's routes.
     launch_planar_linear(
         runtime,
-        &dims.fc1,
+        &admission.fc1,
         ptrs.input,
         ptrs.route_indices,
         ptrs.fc1_packed,
@@ -810,7 +878,7 @@ pub fn launch_planar_moe(
         dims.top_k,
         false,
     )?;
-    if let Some(fc3) = dims.fc3.as_ref() {
+    if let Some(fc3) = admission.fc3.as_ref() {
         launch_planar_linear(
             runtime,
             fc3,
@@ -869,7 +937,7 @@ pub fn launch_planar_moe(
     // 4. FC2 down-projection: input rows are per-route activations.
     launch_planar_linear(
         runtime,
-        &dims.fc2,
+        &admission.fc2,
         ptrs.activated,
         ptrs.route_indices,
         ptrs.fc2_packed,
@@ -961,7 +1029,7 @@ mod tests {
             swiglu_fusion: 0,
             activation_alpha: 1.0,
             activation_beta: 1.0,
-            swiglu_limit: f32::INFINITY,
+            swiglu_limit: f32::MAX,
             normalize_routing_weights: true,
             fc1: fp8(256, 128),
             fc2: fp8(128, 256),
@@ -990,17 +1058,35 @@ mod tests {
         fc3_banks: Option<(usize, usize, Option<usize>)>,
     ) -> Result<()> {
         let buffers = PlanarMoeBufferLengths::for_dims(dims, false)?;
+        let fc1_packed = vec![0u8; fc1_packed_bytes];
+        let fc1_scale = vec![127u8; fc1_scale_bytes];
+        let fc2_packed = vec![0u8; fc2_packed_bytes];
+        let fc2_scale = vec![127u8; fc2_scale_bytes];
+        let fc3_storage = fc3_banks
+            .map(|(packed, scale, bias_elems)| (vec![0u8; packed], vec![127u8; scale], bias_elems));
+        let fc3_bank = fc3_storage
+            .as_ref()
+            .map(|(packed, scale, bias_elems)| PlanarMoeBank {
+                packed,
+                scale,
+                bias_elems: *bias_elems,
+            });
         super::validate_planar_moe(
             dims,
-            fc1_packed_bytes,
-            fc1_scale_bytes,
-            fc1_bias_elems,
-            fc2_packed_bytes,
-            fc2_scale_bytes,
-            fc2_bias_elems,
-            fc3_banks,
+            PlanarMoeBank {
+                packed: &fc1_packed,
+                scale: &fc1_scale,
+                bias_elems: fc1_bias_elems,
+            },
+            PlanarMoeBank {
+                packed: &fc2_packed,
+                scale: &fc2_scale,
+                bias_elems: fc2_bias_elems,
+            },
+            fc3_bank,
             &buffers,
         )
+        .map(|_| ())
     }
 
     #[test]
@@ -1067,9 +1153,26 @@ mod tests {
         let (fc2p, fc2s) = banks(&dims, &dims.fc2);
         let mut buffers = PlanarMoeBufferLengths::for_dims(&dims, false).unwrap();
         buffers.fc1_output_elems -= 1;
-        let err =
-            super::validate_planar_moe(&dims, fc1p, fc1s, None, fc2p, fc2s, None, None, &buffers)
-                .expect_err("undersized fc1 workspace must be rejected");
+        let fc1_packed = vec![0u8; fc1p];
+        let fc1_scale = vec![127u8; fc1s];
+        let fc2_packed = vec![0u8; fc2p];
+        let fc2_scale = vec![127u8; fc2s];
+        let err = super::validate_planar_moe(
+            &dims,
+            PlanarMoeBank {
+                packed: &fc1_packed,
+                scale: &fc1_scale,
+                bias_elems: None,
+            },
+            PlanarMoeBank {
+                packed: &fc2_packed,
+                scale: &fc2_scale,
+                bias_elems: None,
+            },
+            None,
+            &buffers,
+        )
+        .expect_err("undersized fc1 workspace must be rejected");
         assert!(format!("{err:?}").contains("fc1_output"));
     }
 
@@ -1148,7 +1251,7 @@ mod tests {
         let (fc2p, fc2s) = banks(&dims, &dims.fc2);
         let err = validate_planar_moe(&dims, fc1p, fc1s, None, fc2p, fc2s, None, None)
             .expect_err("swiglu_fusion with a non-SwiGLU activation must be rejected");
-        assert!(format!("{err:?}").contains("only valid with the SwiGLU activation"));
+        assert!(format!("{err:?}").contains("only valid when activation_type='swiglu'"));
     }
 
     #[test]
@@ -1161,6 +1264,146 @@ mod tests {
         let err = validate_planar_moe(&dims, fc1p, fc1s, None, fc2p, fc2s, None, None)
             .expect_err("negative swiglu_fusion must be rejected");
         assert!(format!("{err:?}").contains("must be 0, 1, or 2"));
+    }
+
+    #[test]
+    fn invalid_activation_parameters_are_typed_rejected() {
+        for (name, alpha, beta, limit) in [
+            ("activation_alpha NaN", f32::NAN, 0.0, 1.0),
+            ("activation_alpha +Inf", f32::INFINITY, 0.0, 1.0),
+            ("activation_alpha -Inf", f32::NEG_INFINITY, 0.0, 1.0),
+            ("activation_beta NaN", 1.0, f32::NAN, 1.0),
+            ("activation_beta +Inf", 1.0, f32::INFINITY, 1.0),
+            ("activation_beta -Inf", 1.0, f32::NEG_INFINITY, 1.0),
+            ("swiglu_limit NaN", 1.0, 0.0, f32::NAN),
+            ("swiglu_limit +Inf", 1.0, 0.0, f32::INFINITY),
+            ("swiglu_limit -Inf", 1.0, 0.0, f32::NEG_INFINITY),
+            ("swiglu_limit zero", 1.0, 0.0, 0.0),
+            ("swiglu_limit negative", 1.0, 0.0, -1.0),
+        ] {
+            let mut dims = base_dims();
+            dims.activation = 3;
+            dims.swiglu_fusion = 1;
+            dims.fc1 = fp8(dims.hidden, dims.inter * 2);
+            dims.activation_alpha = alpha;
+            dims.activation_beta = beta;
+            dims.swiglu_limit = limit;
+            let (fc1p, fc1s) = banks(&dims, &dims.fc1);
+            let (fc2p, fc2s) = banks(&dims, &dims.fc2);
+            assert!(
+                validate_planar_moe(&dims, fc1p, fc1s, None, fc2p, fc2s, None, None).is_err(),
+                "{name} must fail before a launch token exists"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_moe_banks_reject_reserved_and_overflowing_values() {
+        let mut dims = base_dims();
+        dims.rows = 1;
+        dims.hidden = 32;
+        dims.inter = 32;
+        dims.experts = 2;
+        dims.top_k = 1;
+        dims.fc1 = fp8(32, 32);
+        dims.fc2 = fp8(32, 32);
+        let buffers = PlanarMoeBufferLengths::for_dims(&dims, false).unwrap();
+        let (fc1p, fc1s) = banks(&dims, &dims.fc1);
+        let (fc2p, fc2s) = banks(&dims, &dims.fc2);
+        let mut fc1_packed = vec![0u8; fc1p];
+        let mut fc1_scale = vec![127u8; fc1s];
+        let fc2_packed = vec![0u8; fc2p];
+        let mut fc2_scale = vec![127u8; fc2s];
+
+        fc1_packed[0] = 0x7f;
+        assert!(
+            super::validate_planar_moe(
+                &dims,
+                PlanarMoeBank {
+                    packed: &fc1_packed,
+                    scale: &fc1_scale,
+                    bias_elems: None,
+                },
+                PlanarMoeBank {
+                    packed: &fc2_packed,
+                    scale: &fc2_scale,
+                    bias_elems: None,
+                },
+                None,
+                &buffers,
+            )
+            .is_err()
+        );
+
+        fc1_packed[0] = 0x7e;
+        fc1_scale[0] = 247;
+        assert!(
+            super::validate_planar_moe(
+                &dims,
+                PlanarMoeBank {
+                    packed: &fc1_packed,
+                    scale: &fc1_scale,
+                    bias_elems: None,
+                },
+                PlanarMoeBank {
+                    packed: &fc2_packed,
+                    scale: &fc2_scale,
+                    bias_elems: None,
+                },
+                None,
+                &buffers,
+            )
+            .is_err()
+        );
+
+        fc1_packed[0] = 0;
+        fc1_scale[0] = 127;
+        fc2_scale[0] = 0xff;
+        assert!(
+            super::validate_planar_moe(
+                &dims,
+                PlanarMoeBank {
+                    packed: &fc1_packed,
+                    scale: &fc1_scale,
+                    bias_elems: None,
+                },
+                PlanarMoeBank {
+                    packed: &fc2_packed,
+                    scale: &fc2_scale,
+                    bias_elems: None,
+                },
+                None,
+                &buffers,
+            )
+            .is_err()
+        );
+
+        dims.fc1 = fp4(32, 32);
+        dims.fc2 = fp4(32, 32);
+        let (fc1p, fc1s) = banks(&dims, &dims.fc1);
+        let (fc2p, fc2s) = banks(&dims, &dims.fc2);
+        let fc1_packed = vec![0x77u8; fc1p];
+        let fc1_scale = vec![253u8; fc1s];
+        let fc2_packed = vec![0u8; fc2p];
+        let fc2_scale = vec![127u8; fc2s];
+        assert!(
+            super::validate_planar_moe(
+                &dims,
+                PlanarMoeBank {
+                    packed: &fc1_packed,
+                    scale: &fc1_scale,
+                    bias_elems: None,
+                },
+                PlanarMoeBank {
+                    packed: &fc2_packed,
+                    scale: &fc2_scale,
+                    bias_elems: None,
+                },
+                None,
+                &buffers,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1209,6 +1452,9 @@ mod tests {
     #[test]
     fn module_source_embeds_planar_decode_and_reduction() {
         let source = planar_moe_module_source();
+        let same_source = planar_moe_module_source();
+        assert!(std::ptr::eq(source, same_source));
+        assert_eq!(planar_moe_source_build_count(), 1);
         assert!(source.contains("pbmoe_planar_linear_f32"));
         assert!(source.contains("planar_bf8_element"));
         assert!(source.contains("planar_fp4_element"));

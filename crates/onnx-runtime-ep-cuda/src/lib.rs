@@ -135,12 +135,15 @@ pub use kernels::non_max_suppression::{
 };
 pub use kernels::planar_block_decode::{
     PLANAR_FORMAT_BLOCK_FP8, PLANAR_FORMAT_FP4_PLANAR, PlanarActivationDtype, PlanarLinearDims,
-    PlanarLinearPtrs, PlanarTensorLengths, launch_planar_linear, planar_matmul_capable_formats,
-    validate_planar_linear, warm_planar_linear,
+    PlanarLinearPtrs, PlanarTensorLengths, ValidatedPlanarLinear, launch_planar_linear,
+    planar_matmul_capable_formats, validate_planar_linear, warm_planar_linear,
 };
+#[cfg(any(test, feature = "gpu-tests"))]
+pub use kernels::planar_block_moe::planar_moe_source_build_count;
 pub use kernels::planar_block_moe::{
-    PlanarMoeBufferLengths, PlanarMoeDims, PlanarMoeProjection, PlanarMoePtrs, launch_planar_moe,
-    planar_moe_capable_formats, validate_planar_moe, warm_planar_moe,
+    PlanarMoeBank, PlanarMoeBufferLengths, PlanarMoeDims, PlanarMoeProjection, PlanarMoePtrs,
+    ValidatedPlanarMoe, launch_planar_moe, planar_moe_capable_formats, validate_planar_moe,
+    warm_planar_moe,
 };
 pub use kernels::reduce::REDUCE_CAPTURE_ERROR_AXES;
 pub use kernels::stft::{StftExecutionStats, stft_last_execution_stats};

@@ -49,6 +49,63 @@ fn error(message: impl Into<String>) -> EpError {
     EpError::KernelFailed(format!("planar block quant: {}", message.into()))
 }
 
+/// Stable content identity returned by fail-closed planar bank admission.
+///
+/// The identity is process-independent and covers the format, logical/block
+/// geometry, packed bytes, and scale bytes. CUDA keeps this result with its
+/// immutable weight-bank admission so graph replay never rescans host data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PlanarBankIdentity(u64);
+
+impl PlanarBankIdentity {
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
+const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+fn hash_bytes(mut hash: u64, bytes: &[u8]) -> u64 {
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+fn hash_u64(hash: u64, value: u64) -> u64 {
+    hash_bytes(hash, &value.to_le_bytes())
+}
+
+fn bank_identity(
+    layout: &PlanarLayout,
+    num_experts: usize,
+    packed: &[u8],
+    scale: &[u8],
+) -> PlanarBankIdentity {
+    let mut hash = FNV_OFFSET_BASIS;
+    hash = hash_u64(
+        hash,
+        match layout.format {
+            PlanarBlockFormat::BlockFp8 => 0,
+            PlanarBlockFormat::Fp4Planar => 1,
+        },
+    );
+    for value in [
+        layout.out_features,
+        layout.in_features,
+        layout.block_out,
+        layout.block_in,
+        num_experts,
+    ] {
+        hash = hash_u64(hash, value as u64);
+    }
+    hash = hash_bytes(hash, packed);
+    hash = hash_bytes(hash, scale);
+    PlanarBankIdentity(hash)
+}
+
 // ---------------------------------------------------------------------------
 // Format
 // ---------------------------------------------------------------------------
@@ -373,16 +430,34 @@ fn decode_element(
     Ok(result)
 }
 
-/// Materialise the dense weight in `[K = in, N = out]` (`in`-major) layout, the
-/// orientation the runtime matmul consumes (`C[M, N] = A[M, K] * W[K, N]`).
-/// This is the CPU oracle. `packed` and `scale` must already have passed
-/// [`PlanarLayout::validate_tensors`]; their lengths are re-checked here so the
-/// function is memory-safe on any input.
-pub fn dequantize_planar_kn(
+/// Validate every encoded value in one immutable planar weight/scale pair.
+///
+/// This is the CPU authority for CUDA admission. Exact rejected encodings are:
+/// E4M3FN `0x7f` and `0xff`, UE8M0 `0xff`, and any otherwise-finite
+/// code×scale pair whose decoded `f32` product overflows. Every E2M1 nibble
+/// `0x0..=0xf` is valid; only its product with the selected UE8M0 scale can be
+/// rejected. The returned identity caches that successful result for later
+/// launches without another scan.
+pub fn validate_planar_values(
     layout: &PlanarLayout,
     packed: &[u8],
     scale: &[u8],
-) -> Result<Vec<f32>> {
+) -> Result<PlanarBankIdentity> {
+    validate_planar_elements(layout, packed, scale)?;
+    Ok(bank_identity(layout, 1, packed, scale))
+}
+
+fn validate_planar_elements(layout: &PlanarLayout, packed: &[u8], scale: &[u8]) -> Result<()> {
+    require_planar_value_lengths(layout, packed, scale)?;
+    for out_row in 0..layout.out_features {
+        for in_col in 0..layout.in_features {
+            decode_element(layout, packed, scale, out_row, in_col)?;
+        }
+    }
+    Ok(())
+}
+
+fn require_planar_value_lengths(layout: &PlanarLayout, packed: &[u8], scale: &[u8]) -> Result<()> {
     if packed.len() != layout.packed_bytes()? {
         return Err(error(format!(
             "{} packed weight must be {} bytes, got {}",
@@ -399,6 +474,60 @@ pub fn dequantize_planar_kn(
             scale.len()
         )));
     }
+    Ok(())
+}
+
+/// Validate an expert-major immutable bank using the same element contract as
+/// [`validate_planar_values`].
+pub fn validate_planar_expert_bank_values(
+    layout: &PlanarLayout,
+    num_experts: usize,
+    packed_bank: &[u8],
+    scale_bank: &[u8],
+) -> Result<PlanarBankIdentity> {
+    if num_experts == 0 {
+        return Err(error("cannot validate an empty routed-expert bank"));
+    }
+    let per_packed = layout.packed_bytes()?;
+    let per_scale = layout.scale_bytes()?;
+    let expected_packed = num_experts
+        .checked_mul(per_packed)
+        .ok_or_else(|| error("packed bank size overflow"))?;
+    let expected_scale = num_experts
+        .checked_mul(per_scale)
+        .ok_or_else(|| error("scale bank size overflow"))?;
+    if packed_bank.len() != expected_packed {
+        return Err(error(format!(
+            "packed expert bank must be experts*{per_packed} = {expected_packed} bytes, got {}",
+            packed_bank.len()
+        )));
+    }
+    if scale_bank.len() != expected_scale {
+        return Err(error(format!(
+            "scale expert bank must be experts*{per_scale} = {expected_scale} bytes, got {}",
+            scale_bank.len()
+        )));
+    }
+    for expert in 0..num_experts {
+        let packed = &packed_bank[expert * per_packed..][..per_packed];
+        let scale = &scale_bank[expert * per_scale..][..per_scale];
+        validate_planar_elements(layout, packed, scale)
+            .map_err(|err| error(format!("expert {expert} failed value validation: {err}")))?;
+    }
+    Ok(bank_identity(layout, num_experts, packed_bank, scale_bank))
+}
+
+/// Materialise the dense weight in `[K = in, N = out]` (`in`-major) layout, the
+/// orientation the runtime matmul consumes (`C[M, N] = A[M, K] * W[K, N]`).
+/// This is the CPU oracle. `packed` and `scale` must already have passed
+/// [`PlanarLayout::validate_tensors`]; their lengths are re-checked here so the
+/// function is memory-safe on any input.
+pub fn dequantize_planar_kn(
+    layout: &PlanarLayout,
+    packed: &[u8],
+    scale: &[u8],
+) -> Result<Vec<f32>> {
+    require_planar_value_lengths(layout, packed, scale)?;
     let n = layout.out_features;
     let k = layout.in_features;
     let mut weight_kn = vec![0.0f32; layout.dense_elements()?];

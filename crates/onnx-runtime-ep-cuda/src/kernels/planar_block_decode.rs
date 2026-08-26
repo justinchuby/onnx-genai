@@ -34,15 +34,13 @@
 //!
 //! ## Reserved-code contract
 //!
-//! The CPU oracle's `decode_element` *fail-closes* on reserved E4M3 NaN codes and
-//! reserved UE8M0 `0xff` scale exponents. The device decode here mirrors only the
-//! *arithmetic*, so a reserved code decodes to a propagating `NaN` rather than a
-//! typed error. That is safe while the routed-MoE claim gate typed-rejects these
-//! formats and the parity fixtures contain no reserved codes.
-//! [`validate_planar_linear`] checks tensor *lengths/shapes* against the logical
-//! dims (typed-rejecting ragged/overflowing aux banks) but, like the CPU
-//! `PlanarLayout::validate_tensors`, not individual codes; a routed-MoE claim
-//! must add reserved-code validation before it flips.
+//! [`validate_planar_linear`] admits immutable host weight/scale bytes through
+//! the CPU planar oracle before upload. It rejects E4M3FN `0x7f`/`0xff`, UE8M0
+//! `0xff`, and every finite code×scale pair whose decoded `f32` product
+//! overflows. The returned [`ValidatedPlanarLinear`] is the cached proof required
+//! by [`launch_planar_linear`], so eager launch and graph replay never rescan,
+//! copy, allocate, or synchronize for validation and malformed banks cannot
+//! reach the device arithmetic.
 //!
 //! ## Formats
 //!
@@ -61,6 +59,10 @@
 use cudarc::driver::sys::CUdeviceptr;
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 use onnx_runtime_ep_api::{EpError, Result};
+use onnx_runtime_ep_cpu::kernels::planar_block_quant::{
+    FP4_MICROSCALE_BLOCK as CPU_FP4_MICROSCALE_BLOCK, PlanarBankIdentity, PlanarBlockFormat,
+    PlanarLayout, validate_planar_values,
+};
 use onnx_runtime_ir::DataType;
 
 use crate::error::driver_err;
@@ -229,7 +231,7 @@ impl PlanarActivationDtype {
 }
 
 /// Logical geometry of a single planar linear `C[M,N] = A[M,K]·W[K,N]`.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PlanarLinearDims {
     /// `PLANAR_FORMAT_BLOCK_FP8` or `PLANAR_FORMAT_FP4_PLANAR`.
     pub format: i32,
@@ -250,6 +252,22 @@ fn kernel_err(message: impl Into<String>) -> EpError {
 }
 
 impl PlanarLinearDims {
+    fn cpu_layout(&self) -> Result<PlanarLayout> {
+        let (format, block_out, block_in) = match self.format {
+            PLANAR_FORMAT_BLOCK_FP8 => (PlanarBlockFormat::BlockFp8, self.bs0, self.bs1),
+            PLANAR_FORMAT_FP4_PLANAR => (PlanarBlockFormat::Fp4Planar, 1, CPU_FP4_MICROSCALE_BLOCK),
+            other => return Err(kernel_err(format!("unknown planar format id {other}"))),
+        };
+        PlanarLayout::new(
+            format,
+            self.out_features,
+            self.in_features,
+            block_out,
+            block_in,
+        )
+        .map_err(|err| kernel_err(err.to_string()))
+    }
+
     /// Exact packed-weight and aux-scale byte lengths this geometry requires,
     /// typed-rejecting any geometry the kernel cannot decode (non-positive dims,
     /// odd/unaligned `fp4_planar` contraction, zero `block_fp8` block sizes, or a
@@ -333,15 +351,15 @@ pub struct PlanarTensorLengths {
 
 /// Typed-reject a planar linear whose supplied tensor extents do not match the
 /// exact extents its geometry requires. This is the host-side aux/OOB guard
-/// (ragged banks, truncated scales, an under-sized output buffer, overflow) that
-/// must pass before any launch.
+/// plus the one-time CPU-authoritative value admission (reserved encodings and
+/// decoded-product overflow) that must pass before upload or launch.
 pub fn validate_planar_linear(
     dims: &PlanarLinearDims,
     activation_elems: usize,
-    packed_bytes: usize,
-    scale_bytes: usize,
+    packed: &[u8],
+    scale: &[u8],
     output_elems: usize,
-) -> Result<()> {
+) -> Result<ValidatedPlanarLinear> {
     let expected = dims.expected_lengths()?;
     let expected_activation = dims.m_rows * dims.in_features;
     if activation_elems != expected_activation {
@@ -349,15 +367,17 @@ pub fn validate_planar_linear(
             "activation has {activation_elems} elements, expected M*K = {expected_activation}"
         )));
     }
-    if packed_bytes != expected.packed_bytes {
+    if packed.len() != expected.packed_bytes {
         return Err(kernel_err(format!(
-            "packed weight has {packed_bytes} bytes, expected {}",
+            "packed weight has {} bytes, expected {}",
+            packed.len(),
             expected.packed_bytes
         )));
     }
-    if scale_bytes != expected.scale_bytes {
+    if scale.len() != expected.scale_bytes {
         return Err(kernel_err(format!(
-            "aux scale has {scale_bytes} bytes, expected {}",
+            "aux scale has {} bytes, expected {}",
+            scale.len(),
             expected.scale_bytes
         )));
     }
@@ -367,7 +387,30 @@ pub fn validate_planar_linear(
             expected.output_elems
         )));
     }
-    Ok(())
+    let bank_identity = validate_planar_values(&dims.cpu_layout()?, packed, scale)
+        .map_err(|err| kernel_err(err.to_string()))?;
+    Ok(ValidatedPlanarLinear {
+        dims: *dims,
+        bank_identity,
+    })
+}
+
+/// Cached proof that one immutable planar linear bank passed the CPU oracle's
+/// exact geometry and value contract.
+#[derive(Clone, Copy, Debug)]
+pub struct ValidatedPlanarLinear {
+    dims: PlanarLinearDims,
+    bank_identity: PlanarBankIdentity,
+}
+
+impl ValidatedPlanarLinear {
+    pub fn dims(&self) -> &PlanarLinearDims {
+        &self.dims
+    }
+
+    pub fn bank_identity(&self) -> PlanarBankIdentity {
+        self.bank_identity
+    }
 }
 
 /// Warm-compile every planar linear entry point on `runtime`.
@@ -399,18 +442,18 @@ const PLANAR_LINEAR_BLOCK: u32 = 256;
 
 /// Launch the planar linear kernel on `runtime`'s EP stream for `dtype`.
 ///
-/// Geometry is re-validated here (defence in depth); tensor byte lengths must be
-/// validated by the caller with [`validate_planar_linear`] before this call. The
-/// launch issues **no** host synchronization and allocates nothing, so a warmed
-/// signature records cleanly into a CUDA-graph capture. Ordering with a later
-/// device→host read is guaranteed by the single in-order EP stream.
+/// The admission proof carries geometry and immutable-bank validation from
+/// [`validate_planar_linear`]. The launch issues **no** host synchronization and
+/// allocates nothing, so a warmed signature records cleanly into a CUDA-graph
+/// capture. Ordering with a later device→host read is guaranteed by the single
+/// in-order EP stream.
 pub fn launch_planar_linear(
     runtime: &CudaRuntime,
     dtype: PlanarActivationDtype,
-    dims: &PlanarLinearDims,
+    admission: &ValidatedPlanarLinear,
     ptrs: &PlanarLinearPtrs,
 ) -> Result<()> {
-    dims.expected_lengths()?;
+    let dims = admission.dims();
     let function =
         runtime.nvrtc_function(PLANAR_LINEAR_MODULE, PLANAR_BLOCK_DECODE_CUH, dtype.entry())?;
 
