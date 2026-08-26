@@ -432,6 +432,19 @@ fn unsupported_dtype_strided_oversize_and_capture_decline() {
             .unwrap()
             .contains("8-byte")
     );
+    reset_nms_execution_stats();
+    let capture_error = ep
+        .runtime()
+        .begin_graph_capture(&[kernel.as_ref()])
+        .expect_err("NMS capture must be rejected before either DeviceWorkspace phase");
+    assert!(
+        capture_error
+            .to_string()
+            .contains("rejected before begin_capture")
+    );
+    assert!(capture_error.to_string().contains("DeviceWorkspace"));
+    assert_eq!(nms_execution_stats(), Default::default());
+    assert!(!ep.runtime().is_capturing().unwrap());
 }
 
 #[cfg_attr(
