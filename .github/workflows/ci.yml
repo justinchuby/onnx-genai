@@ -441,6 +441,18 @@ jobs:
       - name: Verify every workspace crate is tested by a required lane
         run: python .github/scripts/workspace_test_packages.py verify-required-tier
 
+      # Both gates above read `ci.yml` and nothing else, so the stray-key rule
+      # that refuses a job nested one level too far never looked at the other
+      # 23 workflow files. Measured on `diff-guard.yml`: nesting `root-files`
+      # two spaces deeper is valid YAML, drops the root allowlist from what
+      # GitHub runs, and `verify`, `verify-required-tier` and `self-test` all
+      # returned 0. `ci.yml` escapes that only because branch protection blocks
+      # on a missing required check, and a file with no required job in it has
+      # no such backstop. Scope and host are separate choices: this reads every
+      # workflow file, from a job the ruleset requires. See #2206.
+      - name: Verify every workflow still defines the jobs it is recorded as defining
+        run: python .github/scripts/workspace_test_packages.py verify-workflow-integrity
+
       # Both gates above are the kind that pass by seeing nothing, so each one
       # is asked to fail on demand and is judged on what it *names*, not on its
       # exit status: `python` missing exits 127 and every SystemExit in that
