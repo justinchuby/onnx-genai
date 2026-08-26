@@ -1,6 +1,16 @@
-# CUDA runtime libraries for building and testing the native CUDA EP.
+# Authoritative CUDA runtime dependency lock for this repository's Python CUDA
+# surfaces and native CUDA development environment.
 #
 #   python -m pip install -r requirements-cuda-dev.txt
+#
+# `python/nxrt-ep-cuda/pyproject.toml` and
+# `crates/onnx-runtime-python/pyproject.toml` must carry this exact package set
+# and these exact versions. Run:
+#
+#   python .github/scripts/verify_cuda_runtime_dependencies.py
+#
+# Add `--pypi` to verify that every locked release still exists and has a
+# non-yanked wheel on the live package index.
 #
 # These are NVIDIA's redistributable runtime wheels. They are the supported way
 # to get cuBLAS/NVRTC/cudart without installing a full CUDA toolkit, and the
@@ -78,9 +88,13 @@ nvidia-nvjitlink==13.1.115
 # compile at runtime with "require cuda_fp16.h and cuda_bf16.h". Required.
 nvidia-cuda-runtime==13.1.80
 
-# CUPTI — profiling/tracing dependency declared by CUDA Python packages.
+# CUPTI — profiling/tracing dependency in the standard Python CUDA distribution
+# set (`onnx-runtime-python` enables the CUPTI tracer with its CUDA feature).
 nvidia-cuda-cupti==13.1.115
 
-# cuDNN — required for the advertised softmax/reduce/conv/pool paths. This one
-# still uses the -cu13 suffix because the unsuffixed package is a placeholder.
+# cuDNN — required for advertised Conv/MaxPool/AveragePool execution. Softmax
+# and reductions have bounded fallbacks, but Conv and pooling decline placement
+# when cuDNN is unavailable, so a complete CUDA distribution must install it.
+# This one still uses the -cu13 suffix because the unsuffixed package is a
+# placeholder.
 nvidia-cudnn-cu13==9.24.0.43

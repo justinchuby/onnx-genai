@@ -212,8 +212,9 @@ each NVIDIA component under `nvidia/<component>/lib` on Linux and
 GPU kernel tracing is enabled by default when the wheel is built with
 `maturin build --release --features cuda`; the CPU wheel keeps the tracer and
 CUPTI loader disabled. Install the CUDA runtime extra with `pip install
-nxrt[cuda]`, or install `nvidia-cuda-cupti-cu13` alongside a locally built CUDA
-wheel. The loader checks both normal system library paths and the package's
+nxrt[cuda]`, or install `nvidia-cuda-cupti==13.1.115` alongside a locally built
+CUDA wheel. The `-cu13` spelling is a placeholder, not a binary runtime package.
+The loader checks both normal system library paths and the package's
 `site-packages/nvidia/cuda_cupti/lib` directory. CUDA builds also expose
 `nxrt.cupti_available() -> bool`.
 

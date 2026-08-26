@@ -226,6 +226,49 @@ fn the_removed_type_and_flag_are_absent_from_production_code() {
     }
 }
 
+/// The deleted arena-selection flag has no parser left, and native decode must
+/// not offer it as an actionable recovery step.
+#[test]
+fn the_deleted_vmm_flag_has_no_parser_or_native_decode_guidance() {
+    let crates = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("crates/");
+    let parser_tokens = [
+        "env::var(\"ONNX_GENAI_CUDA_VMM\")",
+        "env::var_os(\"ONNX_GENAI_CUDA_VMM\")",
+        "var(\"ONNX_GENAI_CUDA_VMM\")",
+        "var_os(\"ONNX_GENAI_CUDA_VMM\")",
+    ];
+    for crate_name in [
+        "onnx-runtime-cuda-memory",
+        "onnx-runtime-ep-cuda",
+        "onnx-genai-engine",
+        "onnx-genai-cli",
+    ] {
+        let source = crates.join(crate_name).join("src");
+        for parser in parser_tokens {
+            let hits = count_code(&source, parser);
+            assert!(
+                hits.is_empty(),
+                "{crate_name} still parses the deleted ONNX_GENAI_CUDA_VMM flag via \
+                 {parser:?}: {hits:?}"
+            );
+        }
+    }
+
+    let native_decode = crates
+        .join("onnx-genai-engine")
+        .join("src")
+        .join("native_decode")
+        .join("cuda.rs");
+    let text = std::fs::read_to_string(&native_decode).expect("native CUDA decode source");
+    assert!(
+        !text.contains("ONNX_GENAI_CUDA_VMM"),
+        "{} still presents the deleted allocator-selection flag to users",
+        native_decode.display()
+    );
+}
+
 /// Criterion 12, and the non-vacuity anchor for the test above: the removed
 /// flag is still *explained* in prose, and the code scan is what makes the
 /// difference.

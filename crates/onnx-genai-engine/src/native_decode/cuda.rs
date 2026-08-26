@@ -4199,7 +4199,8 @@ impl DecodeCudaState {
                  max_sequence_length metadata ({}): the device free-memory query is \
                  unavailable, so there is no bound to reserve up front. Set \
                  ONNX_GENAI_CUDA_KV_MAX_LEN or load_with_cuda_kv_max_len to a concrete \
-                 length, or run without ONNX_GENAI_CUDA_VMM to use the grow-on-demand path.",
+                 length. VMM is the CUDA provider's sole built-in allocator, so there is \
+                 no allocator-selection flag to disable.",
                 capacity.source
             )
         })?;

@@ -1695,10 +1695,79 @@ pub fn build_cuda_registry_with_metrics(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::{
         CUDA_COVERED_OPS, CUDA_DFT_DTYPES, CUDA_FLOAT_DTYPES, CUDA_NMS_DTYPES, CUDA_STFT_DTYPES,
         build_cuda_registry_descriptors, cuda_supported_dtypes_for_op,
     };
+
+    fn coverage_matrix(doc: &str) -> &str {
+        const START: &str = "<!-- CUDA_COVERAGE_MATRIX_START -->";
+        const END: &str = "<!-- CUDA_COVERAGE_MATRIX_END -->";
+
+        let (_, after_start) = doc
+            .split_once(START)
+            .expect("CUDA coverage document must retain the matrix start marker");
+        after_start
+            .split_once(END)
+            .expect("CUDA coverage document must retain the matrix end marker")
+            .0
+    }
+
+    fn coverage_matrix_pairs(matrix: &str) -> BTreeSet<(String, String)> {
+        let mut pairs = BTreeSet::new();
+        for line in matrix.lines().filter(|line| line.starts_with("| `")) {
+            let mut cells = line.trim_matches('|').split('|').map(str::trim);
+            let ops = cells.next().expect("matrix row has an op cell");
+            let domain_cell = cells.next().expect("matrix row has a domain cell");
+            let status = cells.next().expect("matrix row has a status cell");
+            if status != "✅" {
+                continue;
+            }
+            assert!(
+                !domain_cell.contains('/') && domain_cell != "standard",
+                "CUDA coverage matrix domains must be exact and unambiguous, not \
+                 {domain_cell:?}, in row {line:?}; split multi-domain rows"
+            );
+            let domain = if domain_cell == "``" {
+                ""
+            } else {
+                domain_cell
+                    .strip_prefix('`')
+                    .and_then(|value| value.strip_suffix('`'))
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "CUDA coverage matrix domain must be `` or one backticked domain, \
+                             got {domain_cell:?} in row {line:?}"
+                        )
+                    })
+            };
+
+            let mut op_count = 0;
+            let mut spans = ops.split('`');
+            while let Some(_before) = spans.next() {
+                let Some(op) = spans.next() else {
+                    break;
+                };
+                assert!(
+                    !op.is_empty(),
+                    "CUDA coverage matrix contains an empty op name in row {line:?}"
+                );
+                pairs.insert((domain.to_string(), op.to_string()));
+                op_count += 1;
+            }
+            assert!(
+                op_count > 0,
+                "CUDA coverage matrix row has no backticked op names: {line:?}"
+            );
+        }
+        assert!(
+            !pairs.is_empty(),
+            "CUDA coverage matrix parser found no (domain, name) pairs"
+        );
+        pairs
+    }
 
     /// Every operator the CPU EP registers but CUDA does not must be named in
     /// the coverage document.
@@ -1778,31 +1847,42 @@ mod tests {
     #[test]
     fn every_cuda_covered_op_is_named_in_current_coverage_matrix() {
         const DOC: &str = include_str!("../../../../docs/execution/CUDA_COVERAGE.md");
-        const START: &str = "<!-- CUDA_COVERAGE_MATRIX_START -->";
-        const END: &str = "<!-- CUDA_COVERAGE_MATRIX_END -->";
-
-        let (_, after_start) = DOC
-            .split_once(START)
-            .expect("CUDA coverage document must retain the matrix start marker");
-        let (matrix, _) = after_start
-            .split_once(END)
-            .expect("CUDA coverage document must retain the matrix end marker");
+        let matrix_pairs = coverage_matrix_pairs(coverage_matrix(DOC));
         assert!(
             !CUDA_COVERED_OPS.is_empty(),
             "CUDA_COVERED_OPS unexpectedly empty; matrix check would be vacuous"
         );
 
-        let missing: Vec<&str> = CUDA_COVERED_OPS
-            .iter()
-            .copied()
-            .filter(|op| {
-                !matrix.contains(&format!("`{op}`")) && !matrix.contains(&format!("::{op}`"))
-            })
-            .collect();
+        let covered_names: BTreeSet<&str> = CUDA_COVERED_OPS.iter().copied().collect();
+        let matrix_names: BTreeSet<&str> = matrix_pairs.iter().map(|(_, op)| op.as_str()).collect();
+        assert_eq!(
+            matrix_names, covered_names,
+            "CUDA_COVERED_OPS names and current coverage-matrix names diverged"
+        );
+    }
+
+    #[test]
+    fn coverage_matrix_domain_mutation_changes_the_guarded_pair_set() {
+        const DOC: &str = include_str!("../../../../docs/execution/CUDA_COVERAGE.md");
+        let matrix = coverage_matrix(DOC);
+        let expected = coverage_matrix_pairs(matrix);
+        let needle = "| `GatherBlockQuantized` | `com.microsoft` |";
         assert!(
-            missing.is_empty(),
-            "these CUDA_COVERED_OPS names are missing from the current coverage matrix: \
-             {missing:?}"
+            matrix.contains(needle),
+            "GatherBlockQuantized must be documented in its registered com.microsoft domain"
+        );
+        let mutated = matrix.replacen(needle, "| `GatherBlockQuantized` | `pkg.nxrt` |", 1);
+        let actual = coverage_matrix_pairs(&mutated);
+        assert_ne!(
+            actual, expected,
+            "changing only an operator domain must change the guarded pair set"
+        );
+        assert!(
+            !actual.contains(&(
+                "com.microsoft".to_string(),
+                "GatherBlockQuantized".to_string()
+            )),
+            "the wrong-domain mutation unexpectedly retained the registered pair"
         );
     }
 
@@ -1840,6 +1920,16 @@ mod tests {
             "CUDA_COVERED_OPS and the actual CUDA registry name set diverged"
         );
 
+        const DOC: &str = include_str!("../../../../docs/execution/CUDA_COVERAGE.md");
+        let documented_pairs = coverage_matrix_pairs(coverage_matrix(DOC));
+        let missing_from_matrix: Vec<_> = pairs.difference(&documented_pairs).collect();
+        let absent_from_registry: Vec<_> = documented_pairs.difference(&pairs).collect();
+        assert!(
+            missing_from_matrix.is_empty() && absent_from_registry.is_empty(),
+            "the actual CUDA registry and coverage-matrix (domain, name) sets diverged: \
+             missing from matrix={missing_from_matrix:?}; absent from registry={absent_from_registry:?}"
+        );
+
         let cpu_pairs: BTreeSet<(String, String)> =
             onnx_runtime_ep_cpu::kernels::build_cpu_registry()
                 .keys()
@@ -1847,7 +1937,6 @@ mod tests {
                 .collect();
         let cpu_only: BTreeSet<(String, String)> = cpu_pairs.difference(&pairs).cloned().collect();
 
-        const DOC: &str = include_str!("../../../../docs/execution/CUDA_COVERAGE.md");
         const GAP_START: &str = "<!-- CUDA_CPU_ONLY_GAPS_START -->";
         const GAP_END: &str = "<!-- CUDA_CPU_ONLY_GAPS_END -->";
         let (_, after_gap_start) = DOC

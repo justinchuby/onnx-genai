@@ -29,17 +29,22 @@ dynamic = ["version"]
 [project.optional-dependencies]
 # bfloat16 numpy interop (nxrt only needs this to *return* bf16 outputs).
 bfloat16 = ["ml_dtypes"]
-# Runtime NVIDIA libraries for CUDA wheels, so `nxrt[cuda]` needs no CUDA toolkit.
-# This opt-in extra keeps CPU/macOS wheels from pulling NVIDIA packages; the CUDA
-# driver (`libcuda.so.1`) remains a host prerequisite. These wheels target Linux/Windows.
-# Add nvidia-cudnn-cu13 and nvidia-curand when the cuDNN backend lands.
+# Runtime NVIDIA libraries for CUDA wheels, so `nxrt[cuda]` needs no CUDA
+# toolkit. `requirements-cuda-dev.txt` is the authoritative lock;
+# `.github/scripts/verify_cuda_runtime_dependencies.py` requires this extra and
+# the plugin wheel to match it exactly. This opt-in extra keeps CPU/macOS wheels
+# from pulling NVIDIA packages; the CUDA driver (`libcuda.so.1`) remains a host
+# prerequisite. cuDNN is required because the CUDA EP's advertised Conv and
+# pooling kernels decline placement without it. These wheels target
+# Linux/Windows.
 cuda = [
-    "nvidia-cuda-runtime>=13",
-    "nvidia-cublas>=13", # provides libcublas + libcublasLt (cuBLASLt MatMul)
-    "nvidia-cufft>=12,<13", # cuFFT 12.x shipped with the CUDA 13 line
-    "nvidia-nvjitlink>=13,<14", # cuFFT JIT dependency
-    "nvidia-cuda-nvrtc>=13", # runtime NVRTC compilation of fused/pointwise kernels
-    "nvidia-cuda-cupti>=13", # GPU kernel tracing (tracer cupti feature)
+    "nvidia-cuda-runtime==13.1.80",
+    "nvidia-cublas==13.1.1.3", # provides libcublas + libcublasLt
+    "nvidia-cufft==12.1.0.78", # cuFFT release paired with CUDA 13.1
+    "nvidia-nvjitlink==13.1.115", # cuFFT JIT dependency
+    "nvidia-cuda-nvrtc==13.1.115", # runtime NVRTC compilation
+    "nvidia-cuda-cupti==13.1.115", # tracer cupti feature
+    "nvidia-cudnn-cu13==9.24.0.43", # required by advertised Conv/pooling
 ]
 
 [project.urls]

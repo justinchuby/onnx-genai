@@ -81,6 +81,7 @@ The pinned CUDA 13.1 set includes:
 | cuFFT | `nvidia-cufft==12.1.0.78` |
 | nvJitLink | `nvidia-nvjitlink==13.1.115` |
 | NVRTC | `nvidia-cuda-nvrtc==13.1.115` |
+| CUPTI tracing | `nvidia-cuda-cupti==13.1.115` |
 | cuDNN | `nvidia-cudnn-cu13==9.24.0.43` |
 
 The NVIDIA driver remains a host prerequisite. The `nxrt-ep-cuda` wheel pins

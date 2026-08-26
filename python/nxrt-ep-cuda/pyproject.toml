@@ -36,11 +36,13 @@ classifiers = [
     "Environment :: GPU :: NVIDIA CUDA :: 13",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
-# CUDA 13 runtime NVIDIA libraries (mirrors crates/onnx-runtime-python's [cuda]
-# set). REQUIRED deps (not an extra): `pip install nxrt-ep-cuda` must pull them
-# so the EP's dlopen'd libs (libcudart / libcublas(+Lt) / libcufft / libnvrtc / libcupti,
-# which auditwheel excludes from the wheel) resolve at runtime. The CUDA driver
-# (libcuda.so.1) remains a host prerequisite. These wheels target Linux/Windows.
+# CUDA 13 NVIDIA distribution set. `requirements-cuda-dev.txt` is the
+# authoritative lock; `.github/scripts/verify_cuda_runtime_dependencies.py`
+# requires this list and nxrt's [cuda] extra to match it exactly. These are
+# required dependencies (not an extra), so the EP's dlopen'd core libraries
+# resolve and the repository's standard CUDA diagnostics set stays available.
+# The CUDA driver (libcuda.so.1) remains a host prerequisite. These wheels
+# target Linux/Windows.
 #
 # Use the unsuffixed names except for cuDNN. The other `-cu13` package names are
 # placeholder stubs rather than binary wheels. Pin the same CUDA 13.1 set as
@@ -52,8 +54,8 @@ dependencies = [
     "nvidia-cufft==12.1.0.78",       # cuFFT release paired with CUDA 13.1
     "nvidia-nvjitlink==13.1.115",    # cuFFT JIT dependency, driver-line matched
     "nvidia-cuda-nvrtc==13.1.115",   # runtime NVRTC compilation
-    "nvidia-cuda-cupti==13.1.115",   # GPU kernel tracing
-    "nvidia-cudnn-cu13==9.24.0.43",  # cuDNN conv/pool/softmax/reduce
+    "nvidia-cuda-cupti==13.1.115",   # standard CUDA diagnostics/tracing set
+    "nvidia-cudnn-cu13==9.24.0.43",  # required by advertised Conv/pooling
 ]
 
 [project.optional-dependencies]

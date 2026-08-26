@@ -129,7 +129,9 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 
 | Op | Domain | Status | Backend | Notes |
 |----|--------|--------|---------|-------|
-| `Relu`, `Sqrt`, `Erf`, `Tanh`, `Sigmoid`, `Gelu` | standard / `com.microsoft` | ✅ | **NVRTC-custom** | f32/f16/bf16; half storage widens to f32 compute and narrows once on store (`elementwise.rs`). |
+| `Relu`, `Sqrt`, `Erf`, `Tanh`, `Sigmoid` | `` | ✅ | **NVRTC-custom** | f32/f16/bf16; half storage widens to f32 compute and narrows once on store (`elementwise.rs`). |
+| `Gelu` | `` | ✅ | **NVRTC-custom** | Standard-domain opset-20 exact or tanh-approximate GELU (`elementwise.rs`). |
+| `Gelu`, `Silu` | `com.microsoft` | ✅ | **NVRTC-custom** | Contrib activation forms (`elementwise.rs`). |
 | `Abs`, `Neg`, `Reciprocal`, `Exp`, `Log`, `Sign`, `Floor`, `Ceil`, `Round`, `Sin`, `Cos`, `Softplus` | `` | ✅ | **NVRTC-custom** | f32/f16/bf16 with CPU-matched formulas (`pointwise.rs`); `Round` uses ties-to-even and `Sign` preserves NaN. |
 | `Tan`, `Sinh`, `Cosh`, `Asin`, `Acos`, `Atan`, `Asinh`, `Acosh`, `Atanh` | `` | ✅ | **NVRTC-custom** | Trigonometric/hyperbolic family (`pointwise.rs`); f32/f16/bf16 with half storage widened to f32 compute, matching the CPU EP's f32-widened reference. |
 | `LeakyRelu`, `Elu`, `HardSigmoid`, `Clip`, `Softsign`, `Selu` | `` | ✅ | **NVRTC-custom** | Attribute/input-driven f32/f16/bf16 activations (`activations.rs`), computed in f32 for half storage. |
@@ -156,10 +158,12 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | Op | Domain | Status | Backend | Notes |
 |----|--------|--------|---------|-------|
 | `Softmax` (v1 & v13) | `` | ✅ | **cuDNN** `cudnnSoftmaxForward` | `ACCURATE` algorithm, f32/f16/bf16. Legacy coerce-to-2D uses INSTANCE mode; opset ≥ 13 uses a 4-D channel view for exact single-axis semantics. Falls back to the prior NVRTC kernel for f32 when cuDNN is unavailable. |
-| `LayerNormalization` | `` / `com.microsoft` | ✅ | **NVRTC-custom** (fused) | Mean/var + normalize + affine in **one** pass over one HBM read — beats a cuDNN reduce + separate pointwise affine. Population stats, optional `Mean`/`InvStdDev` outputs, arbitrary `axis` (`normalization.rs`). f32. |
+| `LayerNormalization` | `` | ✅ | **NVRTC-custom** (fused) | Mean/var + normalize + affine in **one** pass over one HBM read — beats a cuDNN reduce + separate pointwise affine. Population stats, optional `Mean`/`InvStdDev` outputs, arbitrary `axis` (`normalization.rs`). f32. |
+| `LayerNormalization` | `com.microsoft` | ✅ | **NVRTC-custom** (fused) | Contrib-domain registration of the same fused implementation and validated semantics. |
 | `SkipLayerNormalization` | `com.microsoft` | ✅ | **NVRTC-custom** (fused) | `LayerNorm(input + skip + bias)·γ + β` — the residual add is fused into the norm, saving a whole tensor round-trip. Optional `beta`/`bias` inputs, optional `mean`/`inv_std`/`input_skip_bias_sum` outputs (`normalization.rs`). f32. |
 | `SkipSimplifiedLayerNormalization` | `com.microsoft` | ✅ | **NVRTC-custom** (fused) | `RMSNorm(input + skip + bias)·γ` with no mean subtraction. Right-aligned broadcast `skip`, optional `bias`, and optional mean/inverse-RMS/residual-sum outputs (`normalization.rs`). f32. |
-| `RMSNormalization` / `SimplifiedLayerNormalization` | `` / `com.microsoft` | ✅ | **NVRTC-custom** (fused) | Root-mean-square scale, no mean subtraction (LLaMA-family norm). Optional `InvStdDev` output, arbitrary `axis` (`normalization.rs`). f32. |
+| `RMSNormalization`, `SimplifiedLayerNormalization` | `` | ✅ | **NVRTC-custom** (fused) | Root-mean-square scale, no mean subtraction (LLaMA-family norm). Optional `InvStdDev` output, arbitrary `axis` (`normalization.rs`). f32. |
+| `SimplifiedLayerNormalization` | `com.microsoft` | ✅ | **NVRTC-custom** (fused) | Contrib-domain registration of the same fused RMS-normalization implementation. |
 | `BatchNormalization` | `` | ✅ | **NVRTC-custom** | Inference-mode channel-wise normalization for contiguous f32/f16/bf16 NCHW-style tensors; custom epsilon and per-channel scale/bias/mean/variance (`batch_normalization.rs`). |
 | `InstanceNormalization`, `GroupNormalization` | `` | ✅ | **NVRTC block reduction** | Arbitrary-rank contiguous NCHW-style f32/f16/bf16 normalization. Instance normalization reduces per `(N,C)` slice; group normalization supports opset-18 per-group and opset-21 per-channel affine parameters with float stash semantics (`group_normalization.rs`). |
 | `LpNormalization` | `` | ✅ | **NVRTC block reduction** | Axis-wise p=1/p=2 normalization for f32/f16/bf16, including negative and interior axes with CPU-matched tiny-norm clamping (`global_reduction.rs`). |
@@ -193,10 +197,13 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | `Attention` | `com.microsoft` | ✅ | **NVRTC tiled online-softmax + Phase-2a fallback** | Phase-2b fused f32/f16/bf16 prefill, including GQA and additive masks; measured auto-gate retains the cuBLAS baseline where faster. See `CUDA_FLASH_ATTENTION.md`. |
 | `Attention` (opset 23/24) | `` | ✅ | **deterministic CUDA EP fallback** | Standard ONNX SDPA with 3D/4D layouts, GQA, bool/additive masks, and in-op KV cache. f32. |
 | `RotaryEmbedding` (opset 23) | `` | ✅ | **deterministic CUDA EP fallback** | f32 interleaved/non-interleaved RoPE, partial rotary dimensions, and optional position-id gathering. |
+| `RotaryEmbedding` | `com.microsoft` | ✅ | **NVRTC-custom** | Contrib-domain RoPE registration with shape/dtype/attribute validation in `rotary_embedding.rs`. |
 | `MultiHeadAttention` | `com.microsoft` | ✅ | **cuBLASLt Phase-2a SDPA + NVRTC layout adapters** | Contiguous f32/f16/bf16 separate Q/K/V. Query is BSH; K/V may be BSH or BNSH. Supports optional same-dtype projection bias, broadcast additive attention bias, Int32/Int64 key-padding mask, causal mode, and paired BNSH past/present KV. Q/K/V head sizes must match. Packed QKV/KV, DecoderMaskedMHA inputs, unequal V head size, and mixed float dtypes fail closed. Per-call scratch, a host-resolved padding mask, and a trailing synchronization make graph capture unsupported (`multi_head_attention.rs`). |
-| `GroupQueryAttention`, `PagedAttention`, `VarlenAttention`, `PackedVarlenAttention` | `com.microsoft` / `pkg.nxrt` | ✅ | **shared tiled attention cores** | Registered attention/KV variants with f32/f16/bf16 compute and integer sequence metadata; each variant's shape, cache, and capture bounds are enforced by its claim gate and dedicated GPU suite. |
+| `GroupQueryAttention`, `PagedAttention` | `com.microsoft` | ✅ | **shared tiled attention cores** | Registered attention/KV variants with f32/f16/bf16 compute and integer sequence metadata; each variant's shape, cache, and capture bounds are enforced by its claim gate and dedicated GPU suite. |
+| `VarlenAttention`, `PackedVarlenAttention` | `pkg.nxrt` | ✅ | **shared tiled attention cores** | Runtime-owned variable-length attention variants over the shared tiled cores. |
 | `CompressedSparseAttention`, `SparseKvGather`, `IndexShare`, `KvCacheCapacityAppend` | `pkg.nxrt` | ✅ | **NVRTC sparse/KV kernels** | Runtime-owned sparse-attention and stable-KV primitives. `KvCacheCapacityAppend` and `IndexShare` have explicit capture-safe device-error paths; see their dedicated GPU suites. |
-| `LinearAttention`, `CausalConvWithState` | `` / `com.microsoft` | ✅ | **NVRTC recurrent kernels** | Dual-domain f32/f16/bf16 hybrid-decoder state kernels. `LinearAttention` supports the four update rules and fails closed for unsupported geometry; `CausalConvWithState` implements depthwise causal state carry. |
+| `LinearAttention`, `CausalConvWithState` | `` | ✅ | **NVRTC recurrent kernels** | Standard-domain f32/f16/bf16 hybrid-decoder state kernels. `LinearAttention` supports the four update rules and fails closed for unsupported geometry; `CausalConvWithState` implements depthwise causal state carry. |
+| `LinearAttention`, `CausalConvWithState` | `com.microsoft` | ✅ | **NVRTC recurrent kernels** | Contrib-domain registrations of the same recurrent kernels. |
 | `FusedAttention` | `com.microsoft` | 🔬 | **fusion rewrite to `Attention`** | The fused kernel exists behind `AttentionKernel`; registering/lowering this op name remains. |
 
 ### Shape / data-movement / misc
@@ -246,10 +253,11 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | `CenterCropPad` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic fixed-width centered crop/zero-pad over all or selected axes, including negative axes and CPU-matched odd-difference placement (`index_transform.rs`). |
 | `Col2Im` | `` | ✅ | **NVRTC-custom** | Arbitrary spatial-rank f32/f16/bf16 inverse image-column transform with overlap accumulation, dilation, strides, and padding; accumulation is widened to f32 (`index_transform.rs`). |
 | `Unique` | `` | ✅ | **bounded NVRTC sort/group + governed workspace** | Flattened, contiguous, statically shaped Float32 only; `sorted=0|1`; 1–4 positional outputs; at most `min(1024, device max threads/block)` elements. Axis mode, other dtypes, symbolic shapes, strided input, and larger tensors fail closed. It copies only the 8-byte output count to host before device materialization, so CUDA graph capture is explicitly unsupported (`unique.rs`). |
-| `BlockQuantizedMatMul`, `BlockQuantizedMoE`, `GatherBlockQuantized` | `pkg.nxrt` | ✅ | **NVRTC quantized kernels** | Runtime block-quantized dense, expert, and embedding paths; packed formats, scales, auxiliary indices, and device geometry are validated by their claim gates. |
-| `Silu`, `Mish`, `Celu`, `IsInf`, `IsNaN`, `PRelu`, `LogSoftmax`, `Hardmax` | standard / `com.microsoft` | ✅ | **NVRTC-custom** | Implemented activation, predicate, and softmax-family kernels with dtype/attribute bounds locked by the conformance profile. |
+| `BlockQuantizedMatMul`, `BlockQuantizedMoE` | `pkg.nxrt` | ✅ | **NVRTC quantized kernels** | Runtime block-quantized dense and expert paths; packed formats, scales, auxiliary indices, and device geometry are validated by their claim gates. |
+| `GatherBlockQuantized` | `com.microsoft` | ✅ | **NVRTC quantized kernel** | Block-quantized embedding gather; packed formats, scales, indices, and device geometry are validated by its claim gate. |
+| `Mish`, `Celu`, `IsInf`, `IsNaN`, `PRelu`, `LogSoftmax`, `Hardmax` | `` | ✅ | **NVRTC-custom** | Implemented activation, predicate, and softmax-family kernels with dtype/attribute bounds locked by the conformance profile. |
 | `BitwiseAnd`, `BitwiseOr`, `BitwiseXor`, `BitwiseNot`, `BitShift` | `` | ✅ | **NVRTC-custom** | Integer bitwise family, including broadcasting and CPU-matched over-shift behavior. |
-| `ConstantOfShape`, `OneHot`, `TensorScatter` | standard / `pkg.nxrt` | ✅ | **NVRTC / device materialization** | Shape-driven construction and fixed-capacity scatter paths with explicit dtype, bounds, and capture checks. |
+| `ConstantOfShape`, `OneHot`, `TensorScatter` | `` | ✅ | **NVRTC / device materialization** | Shape-driven construction and fixed-capacity scatter paths with explicit dtype, bounds, and capture checks. |
 | `QuantizeLinear`, `DequantizeLinear`, `QLinearMatMul`, `DynamicQuantizeLinear` | `` | ✅ | **NVRTC quantization** | Per-tensor/per-axis constraints and supported integer storage are enforced by each kernel's claim gate. |
 | `Dropout`, `NonZero` | `` | ✅ | **NVRTC-custom** | Inference Dropout and bounded dynamic-output coordinate extraction; dynamic metadata paths decline capture where host materialization is required. |
 | `Resize`, `GridSample`, `ConvTranspose` | `` | ✅ | **NVRTC-custom** | Implemented interpolation/sampling and transposed-convolution subsets; unsupported coordinate modes, cubic/volumetric cases, and output-shape policies fail closed. |
@@ -258,16 +266,18 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 
 ## Source-derived coverage audit
 
-The authoritative statement of coverage is the **gap set below**. Two
-GPU-independent tests in `crates/onnx-runtime-ep-cuda/src/kernels/mod.rs`
-enforce it bidirectionally:
+The authoritative statement of coverage is the **gap set below**. Tests in
+`crates/onnx-runtime-ep-cuda/src/kernels/mod.rs` enforce the name and gap
+surfaces on every host:
 
 - `every_cpu_only_op_is_named_in_the_coverage_doc` builds the real CPU registry,
   subtracts `CUDA_COVERED_OPS`, and rejects an undocumented gap.
-- `every_cuda_covered_op_is_named_in_current_coverage_matrix` requires every
-  `CUDA_COVERED_OPS` name between the matrix markers above.
+- `every_cuda_covered_op_is_named_in_current_coverage_matrix` parses
+  `(domain, name)` pairs between the matrix markers above and requires every
+  advertised name to use an unambiguous domain.
 
-For a source-derived CUDA census, run this on a CUDA host:
+The exact pair comparison needs the real CUDA registry, whose factories hold a
+CUDA runtime. Run its source-derived census on a CUDA host:
 
 ```powershell
 cargo test -p onnx-runtime-ep-cuda --features gpu-tests `
@@ -275,8 +285,9 @@ cargo test -p onnx-runtime-ep-cuda --features gpu-tests `
 ```
 
 It builds the actual registry, deduplicates `(domain, op_type)` registrations,
-checks that its name set exactly equals `CUDA_COVERED_OPS`, and prints the
-current name, pair, and dual-domain sets. No census number is stored here.
+checks that the pair set exactly equals the current matrix and that its name set
+exactly equals `CUDA_COVERED_OPS`, and prints the current name, pair, and
+dual-domain sets. No census number is stored here.
 
 This section used to carry a table of six hand-maintained counts and the claim
 that *"the 2 remaining CPU `ai.onnx` gaps are `NonMaxSuppression` and `Unique`"*.
@@ -320,9 +331,9 @@ nodes on CUDA (the only "uncovered" types are executor-handled control-flow
 (Mamba + linear-attention) family. This batch landed **`CausalConvWithState`**
 (new NVRTC fp32/fp16/bf16 kernel — depthwise causal short-conv with rolling
 state) and declared the already-registered **`GatherBlockQuantized`** in
-`CUDA_COVERED_OPS` with a dedicated GPU parity suite. Honest follow-ups:
-`com.microsoft::LinearAttention`, registering `RotaryEmbedding` for the
-`com.microsoft` domain, and a `Bool`-input `NonZero` path.
+`CUDA_COVERED_OPS` with a dedicated GPU parity suite. Its then-open follow-ups
+were `com.microsoft::LinearAttention`, `com.microsoft::RotaryEmbedding`, and a
+`Bool`-input `NonZero` path; all are represented in the current matrix above.
 
 The decode/transformer-oriented priority set from issue #67 is already covered:
 `LogSoftmax`, `Hardmax`, `PRelu`, `IsInf`, the five bitwise/shift operators,
