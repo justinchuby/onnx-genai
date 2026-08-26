@@ -4321,9 +4321,11 @@ fn explicit_affinity_shards_for(
         // the allowed set is the whole machine.
         ExplicitAffinity::Unpinned => {
             let allowed = allowed_cpus().unwrap_or_default();
+            let budget = host_cpu_budget(allowed.len());
             let core_count = crate::core_topology::host()
-                .map_or(0, |cores| cores.leaders_within(&allowed).len());
-            let workers = reserve_single_group_headroom(total, allowed.len(), core_count);
+                .map_or(0, |cores| cores.leaders_within(&allowed).len())
+                .min(budget);
+            let workers = reserve_single_group_headroom(total, budget, core_count);
             Some(vec![NodeShard {
                 index: 0,
                 cpus: Vec::new(),
@@ -4344,8 +4346,11 @@ fn explicit_affinity_shards_for(
             // defaults to spread.
             let cores = crate::core_topology::host();
             let cpus = crate::decode_affinity::order_pin_targets(&cpus, cores);
-            let core_count = cores.map_or(0, |cores| cores.leaders_within(&cpus).len());
-            let workers = reserve_single_group_headroom(total, cpus.len(), core_count);
+            let budget = host_cpu_budget(cpus.len());
+            let core_count = cores
+                .map_or(0, |cores| cores.leaders_within(&cpus).len())
+                .min(budget);
+            let workers = reserve_single_group_headroom(total, budget, core_count);
             Some(vec![NodeShard {
                 index: 0,
                 cpus,
@@ -4406,8 +4411,11 @@ fn node_shards_with(
     // Single-node / non-NUMA / no-pinning fallback: one group. Pin to the
     // process's allowed CPUs when known (best-effort), else leave unpinned.
     let cpus = crate::decode_affinity::order_pin_targets(&allowed.unwrap_or_default(), cores);
-    let core_count = cores.map_or(0, |cores| cores.leaders_within(&cpus).len());
-    let workers = reserve_single_group_headroom(total, cpus.len(), core_count);
+    let budget = host_cpu_budget(cpus.len());
+    let core_count = cores
+        .map_or(0, |cores| cores.leaders_within(&cpus).len())
+        .min(budget);
+    let workers = reserve_single_group_headroom(total, budget, core_count);
     vec![NodeShard {
         index: 0,
         cpus,
@@ -4538,6 +4546,44 @@ thread_local! {
 /// `ONNX_GENAI_CPU_DECODE_THREADS=N` on an exactly-N-CPU cpuset gets N-1 pinned
 /// workers (never zero); the single-CPU case is handled earlier by falling back
 /// to the flat path in [`build_from_env`].
+/// The number of CPUs this process can actually keep busy: the affinity mask,
+/// clamped by the cgroup CPU quota.
+///
+/// The two are different limits and only one of them is a set of CPUs. A cpuset
+/// (`taskset`, `cpuset.cpus`, a pinned k8s guaranteed pod) narrows the mask, so
+/// counting the mask is right. A *quota* (`docker --cpus`, `cpu.max`, the
+/// default k8s CPU limit) narrows nothing: the mask still names every CPU on
+/// the machine and the kernel simply stops scheduling the group once it has
+/// spent its share of each period.
+///
+/// `available_parallelism` already accounts for both -- on Linux it returns
+/// `min(CPU_COUNT(affinity), cgroup quota)` -- and the requested width is
+/// clamped to it. The headroom reserve was not: it compared the width against
+/// the *mask*, so under a quota the width was always strictly below the mask
+/// and the reserve was a permanent no-op. The result on a quota-limited
+/// container is the exact configuration the reserve exists to prevent: a
+/// worker for every CPU of the budget, all of them spinning, plus a dispatcher
+/// thread that can only publish the next op by preempting one of them.
+///
+/// `parallelism == 0` means the platform could not report it, and `mask_len ==
+/// 0` means the allowed set is unknown; in both cases the other limit is used
+/// alone, and when neither is known the caller keeps its "no reserve" path.
+fn effective_cpu_budget(mask_len: usize, parallelism: usize) -> usize {
+    match (mask_len, parallelism) {
+        (0, p) => p,
+        (m, 0) => m,
+        (m, p) => m.min(p),
+    }
+}
+
+/// [`effective_cpu_budget`] against the running host.
+fn host_cpu_budget(mask_len: usize) -> usize {
+    effective_cpu_budget(
+        mask_len,
+        std::thread::available_parallelism().map_or(0, std::num::NonZeroUsize::get),
+    )
+}
+
 fn reserve_single_group_headroom(total: usize, allowed_count: usize, core_count: usize) -> usize {
     if allowed_count == 0 {
         return total;
@@ -5571,6 +5617,68 @@ mod tests {
         assert_ne!(
             parse_decode_blocktime(Some("250")),
             Duration::from_nanos(250)
+        );
+    }
+
+    /// A cpuset and a CPU quota are different limits, and only the cpuset is a
+    /// set of CPUs. The reserve compares the requested width against a count of
+    /// CPUs, so it has to be given the count the process can actually keep busy
+    /// -- otherwise a quota-limited container (the ordinary `docker --cpus` /
+    /// k8s `limits.cpu` shape, where the mask still names the whole machine)
+    /// makes the reserve a permanent no-op.
+    #[test]
+    fn the_cpu_budget_is_the_smaller_of_the_mask_and_the_quota() {
+        // Unconfined: the two agree and nothing changes.
+        assert_eq!(effective_cpu_budget(32, 32), 32);
+        // cpuset: `available_parallelism` follows the mask down.
+        assert_eq!(effective_cpu_budget(4, 4), 4);
+        // Quota: the mask still names every CPU, and this is the case the
+        // reserve could not see.
+        assert_eq!(effective_cpu_budget(32, 4), 4);
+        // Either limit unknown falls back to the other rather than to zero,
+        // which would read as "no allowed set" and skip the reserve entirely.
+        assert_eq!(effective_cpu_budget(0, 4), 4);
+        assert_eq!(effective_cpu_budget(32, 0), 32);
+        assert_eq!(effective_cpu_budget(0, 0), 0);
+    }
+
+    /// The consequence of the above, stated as the numbers the pool builds.
+    /// Under a 4-CPU quota on a 32-CPU host the width is already clamped to 4
+    /// by `available_parallelism`, so against the *mask* the reserve sees
+    /// `4 < 32` and stands down -- four spinning workers holding the entire
+    /// budget, with the dispatcher able to publish work only by preempting one.
+    /// Against the budget it reserves, and the lane it gives up comes straight
+    /// back as the dispatcher's own shard.
+    #[test]
+    fn a_quota_limited_container_still_gets_dispatcher_headroom() {
+        let mask = 32;
+        let quota = 4;
+        let total = quota;
+
+        let unclamped_cores = 16;
+        assert_eq!(
+            reserve_single_group_headroom(total, mask, unclamped_cores.min(mask)),
+            4,
+            "against the mask the reserve is a no-op, which is the defect"
+        );
+
+        let budget = effective_cpu_budget(mask, quota);
+        let cores = unclamped_cores.min(budget);
+        assert_eq!(
+            reserve_single_group_headroom(total, budget, cores),
+            3,
+            "against the budget the dispatcher keeps a CPU"
+        );
+        assert!(
+            dispatcher_owns_a_shard(
+                &[NodeShard {
+                    index: 0,
+                    cpus: (0..mask).collect(),
+                    workers: 3,
+                }],
+                total
+            ),
+            "the reserved lane returns as the dispatcher's shard, so compute width is unchanged"
         );
     }
 
