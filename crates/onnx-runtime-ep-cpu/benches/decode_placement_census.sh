@@ -65,6 +65,11 @@ cd "$(dirname "$SELF")/../../.." || exit 1
 # somebody else's matrix costs nothing here, and starting three pools on top
 # of one costs them their numbers.
 holder_of_the_host_lock() {
+  # Only `HELD` counts. `EXPIRED` and `STALE` print a pid too, and reading
+  # either as custody would let this census run three pool launches behind a
+  # claim nobody is honouring. Yielding nothing there means we re-exec and
+  # take the lock properly -- including, in the expired case, from an
+  # ancestor of our own, which is a beat of double custody and correct.
   ./scripts/hostlock.sh status 2>/dev/null |
     sed -n 's/^HELD by [^ ]* pid=\([0-9][0-9]*\) .*/\1/p'
 }
