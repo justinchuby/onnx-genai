@@ -146,6 +146,61 @@ This is not theoretical: the first two sweeps run after the harnesses started
 taking the lock were both refused, against two different agents, at moments when
 the host had been announced as free.
 
+#### Why a lock, and not an announce protocol plus a good guard
+
+This gets re-litigated roughly once a week, usually by someone who has just had
+a good day with announce-before/announce-after. Three arguments, each from a
+measured failure rather than a preference, so the next round is short.
+
+**1. Announcement is pairwise; the host is not.** "I'm taking the box" / "host
+free" is a two-party protocol, and this machine is shared by a roster of
+eighteen agents with eight or so active on any given day. On 2026-08-25 one
+agent correctly yielded the host to a second, and a third then negotiated with
+the first for a box that had already been given away. Nobody defected,
+everybody was polite, and the protocol still could not represent the state,
+because pairwise etiquette has nowhere to *put* a third party. A lock has
+exactly one holder and every non-holder reads the same answer.
+
+**2. An announcement describes an edge; a lock covers the interval.** Both
+false host-state claims recorded on 2026-08-25 were assertions that outlived
+their measurement: one agent read the host, and sent "host free, I checked
+independently" from a reading that was by then **74 minutes stale** — a hung
+process had started 14 minutes before the message went out. Three test
+processes ran for 75, 61 and 51 minutes against a ~7-minute baseline and were
+found only because somebody went looking. Note whose claims those were: one
+came from the agent who proposed the announce discipline, one from the agent
+policing it. A protocol that its own author and its own enforcer each break
+within an hour is not being defeated by carelessness.
+
+This is the same defect as `ps`-based liveness, one layer up, and it is why the
+outer harness holds the lock rather than each benchmark child: an arm that has
+exited because the harness advanced to the next arm looks exactly like a clear
+host to anyone sampling processes.
+
+**3. A per-run efficiency guard is self-protective, not preventive.** Per-run
+rusage `(utime+stime)/wall` is a genuinely excellent instrument and it belongs
+in every harness — it took an A/A null from 52% to 0.04–0.56% on this box. But
+it tells you when somebody contaminated **your** run. It does nothing about
+**you** contaminating **theirs**, so it does not compose across agents: if
+everyone adopts it and nobody locks, every run is correctly labelled and half
+of them are discarded. It converts a correctness problem into a throughput
+one, which is the right trade on a quiet box and the wrong one here, where
+processes hang for an hour unnoticed — you can discard 100% of your reps and
+never learn why. It is also blind to SMT-sibling contention and to steady
+external load, both of which hold efficiency near 1.0 while moving the number.
+
+So: hold the lock, **and** keep the efficiency guard and the A/A null. The
+lock decides whether you may **start**; the guard decides whether to
+**believe** the reps you got. Neither substitutes for the other, and the
+guards are supplementary — a run with a clean efficiency trace and no lock is
+not a defensible measurement.
+
+Do not infer HOST FREE from "nothing of mine is running", from a point-in-time
+`ps`, or from `/proc/loadavg`. A deliberately-bounded 4-of-32-CPU protocol
+shows runnable ≈4–5 and trips a `-le 3` gate while being a good citizen; a
+single-threaded 100% CPU hog shows ≈1 and passes. Load average measures the
+wrong thing for admission control. Ask the lock.
+
 ### 6. Wall-clock on a box that pages your own memory
 
 Identical configurations here have ranged **3.9–28 tok/s**, and #863 showed the
