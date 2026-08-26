@@ -195,6 +195,69 @@ lock decides whether you may **start**; the guard decides whether to
 guards are supplementary — a run with a clean efficiency trace and no lock is
 not a defensible measurement.
 
+#### There is a third axis, and it is the one that answers the SMT blind spot
+
+The paragraph above says the efficiency guard is blind to SMT-sibling
+contention. That was written as a caveat, and it stayed a caveat for a while
+because nothing measured the thing it named. Something does now, so the
+guidance is no longer two axes and a known hole.
+
+Ask three questions, in this order, because each is blind to what the next
+one sees:
+
+| axis | question | instrument | blind to |
+|---|---|---|---|
+| **lock** | does anybody *claim* this box? | `scripts/hostlock.sh` | anyone outside the protocol |
+| **gate** | is anything *runnable* right now? | `hostlock.sh --gate N` | anything that starts after you do |
+| **foreign CPU** | is anyone on **your cores specifically**? | `onnx-runtime-hostmon` | nothing on this list, which is why it is last |
+
+The third is the one that survives a bounded, well-behaved co-tenant — the
+case that defeats runnable-count-as-admission-test outright. A deliberately
+bounded 4-of-32-CPU protocol is a good citizen and still trips a `-le 3` gate;
+it is also invisible to the lock if it never took one. What matters to your
+number is not whether the host is busy but whether the busy part overlaps the
+cores you were confined to, and that is a different question from both of the
+others.
+
+`onnx-runtime-hostmon` (`crates/onnx-runtime-hostmon`) answers it by reading
+`/proc/stat` for the CPUs in the process's own `Cpus_allowed_list` and
+subtracting the process's own time. Two things about it are worth knowing
+before you cite a column it produced:
+
+* **`foreign_pct` cannot see an SMT sibling, by construction.** A decode
+  budget of `N` confines the process to `N` *physical* cores, one logical CPU
+  per core — so the partner logical CPU of every core you run on is **outside
+  your mask**, is never counted, and shares the core's execution units with
+  your worker anyway. Measured on a 16-core/32-thread host at budget 12, a
+  verified 100%-busy spinner pinned to a sibling slowed the predicted worker
+  in five of six arms (p ≈ 2e-5 against a uniform choice among 12) with
+  in-shard time up ~1.7x for an exactly equal row segment — while
+  `foreign_%` read as low as **0.0**. Use `sibling_peak_pct`, which needs no
+  own-time subtraction (you cannot run there, so every busy jiffy is foreign)
+  and takes a peak rather than a sum, because under a barrier one saturated
+  sibling gates the whole dispatch.
+* **It reads the lock at both ends of the window, not once.** A single
+  reading at the end reports a plausible holder for a window that changed
+  hands halfway through — the stale-snapshot error moved out of `ps` and into
+  the row, where it is harder to spot. `hostlock::field` reports `Changed`
+  when the two readings disagree, and `Unverified` (rendered
+  `unverified:<owner>`; `ab.py` spells the same fact `unverified-end` in its
+  CSV) when the second read fails — because an unreadable lock is evidence
+  neither for a handoff nor against one.
+
+The library only **reads**. It does not acquire or enforce, and it must not:
+taking a lock is a decision the harness makes, and a library that took one as
+a side effect of formatting a field would be worse than no lock at all. The
+outer harness still holds the lock across every A/B/null arm.
+
+Note the failure mode this axis was built out of, because it is the general
+one: `scripts/hostlock.sh` sat on `main` for some time while
+`grep -r hostlock crates/` returned **nothing**. No benchmark, no harness and
+no result row consumed it. A capability that exists, is `pub`, and has no
+caller is indistinguishable in the output from one that was never built — and
+the absence reads as success. Shipping the lock was not the same as measuring
+under it.
+
 Do not infer HOST FREE from "nothing of mine is running", from a point-in-time
 `ps`, or from `/proc/loadavg`. A deliberately-bounded 4-of-32-CPU protocol
 shows runnable ≈4–5 and trips a `-le 3` gate while being a good citizen; a
