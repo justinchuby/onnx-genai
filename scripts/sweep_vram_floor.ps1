@@ -7,9 +7,6 @@ param(
 
     [double[]]$LimitsGiB = @(2.34, 2.35, 2.36, 2.37, 2.38, 2.39, 2.40, 2.41, 2.42, 2.43, 2.44, 2.45, 2.46, 2.47, 2.48, 2.49, 2.50, 2.55, 2.56, 2.58, 2.59, 2.60),
 
-    [ValidateSet("0", "1")]
-    [string]$Vmm = "1",
-
     [string]$Prompt = "hi",
 
     [int]$MaxNewTokens = 32,
@@ -23,7 +20,6 @@ $ledgerRefusalPattern = "memory ledger refused|ledger understates device use"
 $results = @()
 
 foreach ($limit in ($LimitsGiB | Sort-Object)) {
-    $env:ONNX_GENAI_CUDA_VMM = $Vmm
     $limitText = "{0:0.00}GiB" -f $limit
     $output = & $Exe --profile generate $ModelDir --prompt $Prompt --max-new-tokens $MaxNewTokens --greedy --seed $Seed --vram-limit $limitText 2>&1 | Out-String
     $exitCode = $LASTEXITCODE

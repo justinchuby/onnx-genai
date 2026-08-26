@@ -4835,9 +4835,10 @@ extern "C" __global__ void write_after_delay(unsigned int* out, long long spin) 
     /// the plugin projects through `allocate`/`deallocate` — through the pooled
     /// VMM arena.
     ///
-    /// No environment variable is set here, and that is the point: before
-    /// Phase 7 this test had to opt in with `ONNX_GENAI_CUDA_VMM=1` or it would
-    /// have measured the eager `cuMemAlloc` path instead (#956).
+    /// No environment variable is set here, and that is the point. Before
+    /// Phase 7 this test had to opt in with the now-deleted
+    /// `ONNX_GENAI_CUDA_VMM=1` flag or it would have measured the eager
+    /// `cuMemAlloc` path instead (#956).
     #[cfg_attr(
         not(feature = "gpu-tests"),
         ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"

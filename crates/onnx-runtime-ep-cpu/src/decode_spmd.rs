@@ -4144,6 +4144,15 @@ pub fn build_from_env(threads: Option<usize>) -> Option<SpmdDecodePools> {
     // 32 workers on `taskset -c 0-31` vs ~29 tok/s once one CPU is spare). If the
     // whole allowed cpuset is a single CPU there is no core to reserve, so the
     // pool cannot run without starving itself -- fall back to the flat path.
+    //
+    // This guard reads the *mask*, not the budget, and that is deliberate: a
+    // 1-CPU quota looks like the same starvation shape (#2185) but does not
+    // behave like one. Measured under `cpu.max=100000 100000` on this 32-CPU
+    // host, one pinned worker sharing a CPU's worth of quota with the spinning
+    // dispatcher runs at 28.74 tok/s while the flat path runs 28.52 -- 0/6
+    // paired launches favoured the fallback, a consistent ~1% loss. Extending
+    // the fallback to quota would trade a measured regression for a starvation
+    // that does not occur, so the quota fix stops at the headroom reserve.
     if let Some(allowed) = crate::decode_affinity::allowed_cpus()
         && allowed.len() == 1
     {
@@ -4269,6 +4278,7 @@ fn explicit_affinity_shards(total: usize) -> Option<Vec<NodeShard>> {
     explicit_affinity_shards_for(
         request,
         total,
+        host_parallelism(),
         || match crate::decode_affinity::plan_decode_affinity(total) {
             Ok(plan) => {
                 if let Some(message) = plan.log {
@@ -4297,9 +4307,16 @@ fn explicit_affinity_shards(total: usize) -> Option<Vec<NodeShard>> {
 /// [`parse_decode_blocktime`]: the env read is the only impure part, so keeping
 /// it out means the precedence can be tested exhaustively without `set_var` and
 /// without depending on the test host's NUMA layout.
+///
+/// `parallelism` is that same seam for the CPU *quota* -- the one limit that is
+/// not visible in `allowed_cpus` (see [`effective_cpu_budget`]). It is passed
+/// in rather than read from the host so a synthetic 16-CPU allowed set stays a
+/// synthetic 16-CPU host on a 2-vCPU CI runner. `0` means "unknown", which is
+/// what a test that is not describing a quota should pass.
 fn explicit_affinity_shards_for(
     request: ExplicitAffinity,
     total: usize,
+    parallelism: usize,
     planned_cpus: impl FnOnce() -> Option<Vec<usize>>,
     allowed_cpus: impl FnOnce() -> Option<Vec<usize>>,
 ) -> Option<Vec<NodeShard>> {
@@ -4321,9 +4338,11 @@ fn explicit_affinity_shards_for(
         // the allowed set is the whole machine.
         ExplicitAffinity::Unpinned => {
             let allowed = allowed_cpus().unwrap_or_default();
+            let budget = effective_cpu_budget(allowed.len(), parallelism);
             let core_count = crate::core_topology::host()
-                .map_or(0, |cores| cores.leaders_within(&allowed).len());
-            let workers = reserve_single_group_headroom(total, allowed.len(), core_count);
+                .map_or(0, |cores| cores.leaders_within(&allowed).len())
+                .min(budget);
+            let workers = reserve_single_group_headroom(total, budget, core_count);
             Some(vec![NodeShard {
                 index: 0,
                 cpus: Vec::new(),
@@ -4344,8 +4363,11 @@ fn explicit_affinity_shards_for(
             // defaults to spread.
             let cores = crate::core_topology::host();
             let cpus = crate::decode_affinity::order_pin_targets(&cpus, cores);
-            let core_count = cores.map_or(0, |cores| cores.leaders_within(&cpus).len());
-            let workers = reserve_single_group_headroom(total, cpus.len(), core_count);
+            let budget = effective_cpu_budget(cpus.len(), parallelism);
+            let core_count = cores
+                .map_or(0, |cores| cores.leaders_within(&cpus).len())
+                .min(budget);
+            let workers = reserve_single_group_headroom(total, budget, core_count);
             Some(vec![NodeShard {
                 index: 0,
                 cpus,
@@ -4369,7 +4391,7 @@ fn explicit_affinity_shards_for(
 /// [`explicit_affinity_shards`]); it selects the CPU *set*, and the worker
 /// count is still capped by the same reservation.
 fn node_shards(total: usize) -> Vec<NodeShard> {
-    node_shards_with(total, explicit_affinity_shards)
+    node_shards_with(total, host_parallelism(), explicit_affinity_shards)
 }
 
 /// [`node_shards`] with the explicit-request lookup injected.
@@ -4380,6 +4402,7 @@ fn node_shards(total: usize) -> Vec<NodeShard> {
 /// passes. Deleting the early return has to fail something.
 fn node_shards_with(
     total: usize,
+    parallelism: usize,
     explicit: impl FnOnce(usize) -> Option<Vec<NodeShard>>,
 ) -> Vec<NodeShard> {
     // An explicit request wins over the default placement. Without this the
@@ -4406,8 +4429,11 @@ fn node_shards_with(
     // Single-node / non-NUMA / no-pinning fallback: one group. Pin to the
     // process's allowed CPUs when known (best-effort), else leave unpinned.
     let cpus = crate::decode_affinity::order_pin_targets(&allowed.unwrap_or_default(), cores);
-    let core_count = cores.map_or(0, |cores| cores.leaders_within(&cpus).len());
-    let workers = reserve_single_group_headroom(total, cpus.len(), core_count);
+    let budget = effective_cpu_budget(cpus.len(), parallelism);
+    let core_count = cores
+        .map_or(0, |cores| cores.leaders_within(&cpus).len())
+        .min(budget);
+    let workers = reserve_single_group_headroom(total, budget, core_count);
     vec![NodeShard {
         index: 0,
         cpus,
@@ -4526,6 +4552,50 @@ thread_local! {
     static DISPATCHER_IS_RECORDED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// The number of CPUs this process can actually keep busy: the affinity mask,
+/// clamped by the cgroup CPU quota.
+///
+/// The two are different limits and only one of them is a set of CPUs. A cpuset
+/// (`taskset`, `cpuset.cpus`, a pinned k8s guaranteed pod) narrows the mask, so
+/// counting the mask is right. A *quota* (`docker --cpus`, `cpu.max`, the
+/// default k8s CPU limit) narrows nothing: the mask still names every CPU on
+/// the machine and the kernel simply stops scheduling the group once it has
+/// spent its share of each period.
+///
+/// `available_parallelism` already accounts for both -- on Linux it returns
+/// `min(CPU_COUNT(affinity), cgroup quota)` -- and the requested width is
+/// clamped to it. The headroom reserve was not: it compared the width against
+/// the *mask*, so under a quota the width was always strictly below the number
+/// of usable CPUs the reserve was checking and the reserve was a permanent
+/// no-op. The result on a quota-limited container is the exact configuration
+/// the reserve exists to prevent: a worker for every CPU of the budget, all of
+/// them spinning, plus a dispatcher thread that can only publish the next op by
+/// preempting one of them.
+///
+/// `mask_len == 0` means the allowed set is unknown, and that answer is
+/// preserved rather than replaced by the quota: it is what
+/// [`reserve_single_group_headroom`] reads as "workers are unpinned, so they
+/// cannot occupy a CPU the dispatcher needs", and turning it into a live budget
+/// would silently start reserving on every platform that cannot report an
+/// affinity mask (macOS, a seccomp-filtered container). `parallelism == 0`
+/// means the platform could not report *that*, so the mask stands alone.
+fn effective_cpu_budget(mask_len: usize, parallelism: usize) -> usize {
+    match (mask_len, parallelism) {
+        // "Allowed set unknown" is a distinct answer from any budget, and its
+        // meaning belongs to the reserve, not here.
+        (0, _) => 0,
+        (m, 0) => m,
+        (m, p) => m.min(p),
+    }
+}
+
+/// CPUs this process may run on at once, as the platform reports it, or 0 when
+/// it cannot. Injected into the shard helpers rather than read inside them so
+/// their unit tests keep describing a synthetic host instead of this one.
+fn host_parallelism() -> usize {
+    std::thread::available_parallelism().map_or(0, std::num::NonZeroUsize::get)
+}
+
 /// Cap a single pinned worker group so at least [`DISPATCHER_RESERVED_CPUS`]
 /// allowed CPU stays free for the inline dispatcher.
 ///
@@ -4569,6 +4639,14 @@ fn reserve_single_group_headroom(total: usize, allowed_count: usize, core_count:
 /// subscribed (`workers == node CPUs`) are reduced; a node that already has a
 /// spare core is left untouched, so this is a no-op wherever headroom exists.
 /// Each shard keeps at least one worker.
+///
+/// Note: this reserve compares against each node's *CPU list*, so like its
+/// single-group sibling it cannot see a CPU quota (#2185). It is deliberately
+/// left alone here: a quota is one global limit with no per-node share to
+/// compare against, and unlike the single-group path a worker taken here is
+/// *not* handed back -- `dispatcher_owns_a_shard` is false whenever there is
+/// more than one shard -- so guessing a per-node budget would cost compute
+/// width on hosts this change cannot measure. Tracked as #2195.
 fn reserve_split_headroom(shards: &mut [NodeShard]) {
     for shard in shards.iter_mut() {
         let cap = shard
@@ -5574,6 +5652,132 @@ mod tests {
         );
     }
 
+    /// A cpuset and a CPU quota are different limits, and only the cpuset is a
+    /// set of CPUs. The reserve compares the requested width against a count of
+    /// CPUs, so it has to be given the count the process can actually keep busy
+    /// -- otherwise a quota-limited container (the ordinary `docker --cpus` /
+    /// k8s `limits.cpu` shape, where the mask still names the whole machine)
+    /// makes the reserve a permanent no-op.
+    #[test]
+    fn the_cpu_budget_is_the_smaller_of_the_mask_and_the_quota() {
+        // Unconfined: the two agree and nothing changes.
+        assert_eq!(effective_cpu_budget(32, 32), 32);
+        // cpuset: `available_parallelism` follows the mask down.
+        assert_eq!(effective_cpu_budget(4, 4), 4);
+        // Quota: the mask still names every CPU, and this is the case the
+        // reserve could not see.
+        assert_eq!(effective_cpu_budget(32, 4), 4);
+        // An unknown *quota* falls back to the mask. An unknown *mask* stays
+        // unknown: 0 is the answer `reserve_single_group_headroom` reads as
+        // "workers are unpinned", and replacing it with the quota would start
+        // reserving a worker on every platform that cannot report an affinity
+        // mask (macOS, a seccomp-filtered container) -- a behaviour change on
+        // hosts this defect does not affect.
+        assert_eq!(effective_cpu_budget(32, 0), 32);
+        assert_eq!(effective_cpu_budget(0, 4), 0);
+        assert_eq!(effective_cpu_budget(0, 0), 0);
+    }
+
+    /// The consequence of the above, stated as the shards the pool would build,
+    /// through the call site rather than through the helper: the defect was
+    /// never in `reserve_single_group_headroom`, it was in what the callers
+    /// handed it.
+    ///
+    /// Under a 4-CPU quota on a 32-CPU host the width is already clamped to 4
+    /// by `available_parallelism`, but both inputs the reserve consults still
+    /// describe the whole machine, so it stands down -- four spinning workers
+    /// holding the entire budget, with the dispatcher able to publish work only
+    /// by preempting one. (Which rule declines depends on the host: with a
+    /// readable topology `4 <= 16` cores takes the core rule, and with no
+    /// topology `4 < 32` allowed CPUs takes the headroom rule. Both return 4,
+    /// which is why the fix is at the inputs and not in the rules.)
+    #[test]
+    fn a_quota_limited_container_still_gets_dispatcher_headroom() {
+        let mask: Vec<usize> = (0..32).collect();
+        let quota = 4;
+        let total = quota;
+
+        // Pass `0` for the quota and the call site sees exactly what it saw
+        // before this fix, on any host, because the mask is synthetic.
+        let unclamped = explicit_affinity_shards_for(
+            ExplicitAffinity::Unpinned,
+            total,
+            0,
+            || None,
+            || Some(mask.clone()),
+        )
+        .expect("`off` always resolves to a single unpinned group");
+        assert_eq!(
+            unclamped[0].workers, 4,
+            "without the quota the reserve is a no-op, which is the defect"
+        );
+
+        let shards = explicit_affinity_shards_for(
+            ExplicitAffinity::Unpinned,
+            total,
+            quota,
+            || None,
+            || Some(mask.clone()),
+        )
+        .expect("`off` always resolves to a single unpinned group");
+        assert_eq!(
+            shards[0].workers, 3,
+            "against the quota-clamped budget the dispatcher keeps a CPU"
+        );
+        assert!(
+            dispatcher_owns_a_shard(&shards, total),
+            "the reserved lane returns as the dispatcher's shard, so compute width is unchanged"
+        );
+
+        // The planned-CPU arm reserves from the same budget. Its CPU list is
+        // the selection, so the quota has to be applied to it too -- a plan
+        // naming 32 CPUs under a 4-CPU quota is still a 4-CPU budget.
+        let planned = explicit_affinity_shards_for(
+            ExplicitAffinity::FromPlan,
+            total,
+            quota,
+            || Some(mask.clone()),
+            || None,
+        )
+        .expect("a non-empty plan resolves to a single pinned group");
+        assert_eq!(
+            planned[0].workers, 3,
+            "the planned arm reserves against the quota as well"
+        );
+        assert_eq!(
+            planned[0].cpus.len(),
+            mask.len(),
+            "the quota caps the worker count, never the CPU set: pinning stays free to spread"
+        );
+    }
+
+    /// The third call site, the default fallback, reached through
+    /// `node_shards_with`. It reads the host's own allowed set rather than a
+    /// synthetic one, so this asserts the one value that is host-independent:
+    /// a budget of one CPU leaves one worker, whatever the mask says. Off
+    /// single-node Linux (no readable mask, or a split across nodes) the
+    /// fallback is not the path under test and the check stands down.
+    #[test]
+    fn the_default_fallback_reserves_against_the_quota_too() {
+        let Some(allowed) = crate::decode_affinity::allowed_cpus() else {
+            return;
+        };
+        if allowed.is_empty() {
+            return;
+        }
+        let shards = node_shards_with(4, 1, |_| None);
+        if shards.len() != 1 {
+            return;
+        }
+        assert_eq!(
+            shards[0].workers,
+            1,
+            "a one-CPU budget cannot host four spinning workers plus a dispatcher, \
+             whatever the {}-CPU affinity mask says",
+            allowed.len()
+        );
+    }
+
     #[test]
     fn reserve_single_group_headroom_frees_a_dispatcher_cpu_when_fully_subscribed() {
         // The pathological forced case: requested workers == allowed CPUs (e.g.
@@ -5682,6 +5886,7 @@ mod tests {
             explicit_affinity_shards_for(
                 ExplicitAffinity::Malformed,
                 4,
+                0,
                 || panic!("a malformed value must not consult topology"),
                 || panic!("a malformed value must not consult topology"),
             )
@@ -5700,6 +5905,7 @@ mod tests {
         let shards = explicit_affinity_shards_for(
             ExplicitAffinity::Unpinned,
             4,
+            0,
             || panic!("`off` must not consult the affinity plan"),
             || Some((0..16).collect()),
         )
@@ -5721,6 +5927,7 @@ mod tests {
         let saturated = explicit_affinity_shards_for(
             ExplicitAffinity::Unpinned,
             4,
+            0,
             || panic!("`off` must not consult the affinity plan"),
             || Some(vec![0, 1, 2, 3]),
         )
@@ -5737,6 +5944,7 @@ mod tests {
         let unknown = explicit_affinity_shards_for(
             ExplicitAffinity::Unpinned,
             4,
+            0,
             || panic!("`off` must not consult the affinity plan"),
             || None,
         )
@@ -5755,6 +5963,7 @@ mod tests {
         let shards = explicit_affinity_shards_for(
             ExplicitAffinity::FromPlan,
             4,
+            0,
             || Some(planned.clone()),
             || panic!("a planned request must not consult the allowed set"),
         )
@@ -5813,6 +6022,7 @@ mod tests {
         let roomy = explicit_affinity_shards_for(
             ExplicitAffinity::FromPlan,
             2,
+            0,
             || Some(vec![0, 1, 2, 3, 4, 5, 6, 7]),
             || panic!("a planned request must not consult the allowed set"),
         )
@@ -5827,13 +6037,14 @@ mod tests {
     fn an_unresolvable_plan_falls_back_to_default_placement() {
         let no_allowed = || panic!("the allowed set is only for `off`");
         assert!(
-            explicit_affinity_shards_for(ExplicitAffinity::FromPlan, 4, || None, no_allowed)
+            explicit_affinity_shards_for(ExplicitAffinity::FromPlan, 4, 0, || None, no_allowed)
                 .is_none()
         );
         assert!(
             explicit_affinity_shards_for(
                 ExplicitAffinity::FromPlan,
                 4,
+                0,
                 || Some(Vec::new()),
                 no_allowed
             )
@@ -5843,6 +6054,7 @@ mod tests {
             explicit_affinity_shards_for(
                 ExplicitAffinity::DeferToDefault,
                 4,
+                0,
                 || panic!("deferring must not consult the plan"),
                 || panic!("deferring must not consult the allowed set"),
             )
@@ -5860,12 +6072,14 @@ mod tests {
     #[test]
     fn different_affinity_requests_do_not_collapse_to_the_same_placement() {
         let planned = || Some(vec![16, 17, 18, 19]);
-        let off =
-            explicit_affinity_shards_for(ExplicitAffinity::Unpinned, 4, planned, || Some(vec![16]))
-                .expect("`off` is honored");
-        let node =
-            explicit_affinity_shards_for(ExplicitAffinity::FromPlan, 4, planned, || Some(vec![16]))
-                .expect("`node:<index>` is honored");
+        let off = explicit_affinity_shards_for(ExplicitAffinity::Unpinned, 4, 0, planned, || {
+            Some(vec![16])
+        })
+        .expect("`off` is honored");
+        let node = explicit_affinity_shards_for(ExplicitAffinity::FromPlan, 4, 0, planned, || {
+            Some(vec![16])
+        })
+        .expect("`node:<index>` is honored");
         assert_ne!(
             off[0].cpus, node[0].cpus,
             "`off` and `node:<index>` must not resolve to the same CPU set"
@@ -7964,7 +8178,7 @@ mod tests {
             cpus: vec![100, 101],
             workers: 2,
         };
-        let shards = node_shards_with(16, |total| {
+        let shards = node_shards_with(16, 0, |total| {
             assert_eq!(total, 16, "the worker count must reach the request");
             Some(vec![sentinel.clone()])
         });
@@ -7984,7 +8198,7 @@ mod tests {
     /// `DecodeAffinity::parse(None)` is `Off`.
     #[test]
     fn no_explicit_request_leaves_default_placement_intact() {
-        let defaulted = node_shards_with(16, |_| None);
+        let defaulted = node_shards_with(16, 0, |_| None);
         // Whatever this host's topology, the default path never returns an
         // empty schedule or a pool with no workers.
         assert!(!defaulted.is_empty());

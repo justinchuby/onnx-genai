@@ -76,7 +76,9 @@
 #                     runs as the same unix user, so that would make every
 #                     lock read as ours. See #1929.
 #   --wait            block until free instead of failing immediately
-#   --timeout S       give up after S seconds (default 3600 with --wait)
+#   --timeout S       give up after S seconds (default 3600). Only `wait`,
+#                     `run`, and `acquire --wait` ever enter a wait loop, so
+#                     passing it anywhere else is refused rather than ignored.
 #   --gate N          after taking the lock, also wait until the instantaneous
 #                     runnable count is <= N, so non-participating load (other
 #                     agents' builds, a stray editor) is drained too.
@@ -169,6 +171,12 @@
 #     directory is not the problem, the host is. No lock is ever taken on this
 #     path, so the caller can treat it as "this box cannot participate" rather
 #     than as contention. See require_supported_platform.
+#   9 nested against our own holder -- this process is already inside a `run`
+#     holding THIS lock, so the holder we would wait for cannot release until
+#     we return. Separate from 2 and 3 for the same reason 7 is: those say a
+#     peer has the box, and reporting contention for a lock we ourselves hold
+#     sends the caller looking for a co-tenant who does not exist (#1977).
+#     See nested_under_own_run.
 #
 # `run` otherwise does NOT use this table: it returns the wrapped command's
 # own status, so a command exiting 5 is indistinguishable from a gate failure.
@@ -879,6 +887,35 @@ holder_alive() {
     anchor_alive "$pid" "$start"
 }
 
+# Are we running INSIDE a `run` that holds this very lock?
+#
+# `run` always sets DO_WAIT, so a nested acquire against the same lock path
+# waits for a holder that is its own ancestor: the parent cannot release until
+# the wrapped command returns, and the wrapped command is the thing waiting.
+# That is not contention, it is a cycle, and it burns the full --timeout
+# (default 3600s) before reporting a peer that was never there (#1977).
+#
+# Both halves are load-bearing. The path alone is not enough: a `run` whose
+# wrapped command daemonises leaves the variable set in a process that outlives
+# the lock, and refusing that process's later, legitimate acquire would be a
+# fail-closed bug of our own making. So the live lock's own anchor must still
+# be the one we exported -- if the parent released, or was reaped and the lock
+# republished by somebody else, the anchors differ and this is an ordinary
+# acquire against an ordinary peer.
+#
+# Deliberately NOT a pid-ancestry walk. /proc/<pid>/stat ppid chains break the
+# moment anything reparents (a daemonised harness, a subreaper, an agent whose
+# shell exits), and the failure direction there is to stop recognising our own
+# holder -- back to the hang. The exported pair is exact for the case that
+# actually deadlocks, and silent for every case that does not.
+nested_under_own_run() {
+    [ -n "${HOSTLOCK_HELD_DIR:-}" ] || return 1
+    [ -n "${HOSTLOCK_HELD_ANCHOR:-}" ] || return 1
+    [ "$HOSTLOCK_HELD_DIR" = "$LOCK_DIR" ] || return 1
+    [ "$(meta_get anchor_pid 2>/dev/null || echo "")" = "$HOSTLOCK_HELD_ANCHOR" ] || return 1
+    return 0
+}
+
 lock_age() {
     local epoch now
     epoch=$(num_or "$(meta_get acquired_epoch || echo 0)" 0)
@@ -1524,7 +1561,7 @@ abandon_lock() {
 }
 
 cmd_acquire() {
-    local deadline=$((SECONDS + TIMEOUT)) rc problem
+    local deadline=$((SECONDS + TIMEOUT)) rc problem announced_wait=0
     # Refuse BEFORE anything else, including the legacy consult. An acquire
     # that cannot possibly publish must not spend --timeout looking busy: with
     # --wait (which `run` always sets) the unusable host reported "timed out
@@ -1535,6 +1572,19 @@ cmd_acquire() {
     if problem=$(lock_dir_problem); then
         explain_unusable "$problem"
         return 7
+    fi
+    # Refuse a cycle before refusing a peer, and before waiting for either.
+    # The order matters for the same reason the unusable-host check comes
+    # first: a nested acquire that falls through to the wait loop spends
+    # --timeout (3600s by default under `run`) and then reports code 3, which
+    # says a co-tenant held the box. There was no co-tenant. See #1977.
+    if nested_under_own_run; then
+        echo "hostlock: outcome=nested by ${OWNER}" >&2
+        echo "hostlock: this process is already inside a \`run\` holding ${LOCK_DIR} (anchor pid ${HOSTLOCK_HELD_ANCHOR})." >&2
+        echo "hostlock: that holder cannot release until this command returns, so waiting for it can only time out." >&2
+        echo "hostlock: run the inner command directly -- the host is already held for it -- or give the inner lock its own path via HOSTLOCK_DIR." >&2
+        cmd_status >&2
+        return 9
     fi
     refuse_if_legacy_held || return $?
     while :; do
@@ -1605,6 +1655,30 @@ cmd_acquire() {
             echo "hostlock: BUSY" >&2
             cmd_status >&2
             return 2
+        fi
+        # Say so, once, on the first pass that finds the lock held.
+        #
+        # A silent wait is indistinguishable from a slow build, which is the
+        # worst way for a lock to fail on a box where "is this wedged?" is the
+        # question people are already asking (#1977). The holder's identity is
+        # the answer, and it is already printed by two other paths (BUSY and
+        # timeout); the wait path was the only one that withheld it. Once, not
+        # per iteration: a line every 5s for an hour is how a message gets
+        # filtered out.
+        #
+        # This sits BEFORE the deadline check on purpose, and the ordering is
+        # not cosmetic. With it after, whether you were told who held the lock
+        # depended on whether the first pass happened to cross the deadline --
+        # so on a loaded box, the one condition that makes a wait worth
+        # explaining is the one that silences the explanation. It was measured:
+        # the cell below failed 1 run in 4 at --timeout 1 until the
+        # announcement moved above the check. It is deliberately not gated on
+        # the timeout value either, so that the ordering is observable at
+        # --timeout 0 without waiting for a clock.
+        if [ "$announced_wait" != 1 ]; then
+            announced_wait=1
+            echo "hostlock: waiting up to ${TIMEOUT}s for the lock" >&2
+            cmd_status >&2
         fi
         if [ "$SECONDS" -ge "$deadline" ]; then
             echo "hostlock: timed out after ${TIMEOUT}s waiting for the lock" >&2
@@ -1743,6 +1817,18 @@ cmd_run() {
         export HOSTLOCK_OWNER="$OWNER"
     fi
 
+    # Tell the wrapped command which lock we are holding for it, and with which
+    # anchor. A harness that calls back into hostlock.sh would otherwise wait
+    # on its own parent until --timeout expires (#1977); nested_under_own_run
+    # reads exactly this pair. Unconditional, unlike HOSTLOCK_OWNER above: that
+    # export is withheld on the default path because a $USER-derived owner
+    # would manufacture an attribution nobody made (#1929), whereas the lock
+    # path and the anchor pid are facts about this invocation, attribute
+    # nothing to anybody, and are wrong to withhold -- the deadlock does not
+    # care whether --owner was passed.
+    export HOSTLOCK_HELD_DIR="$LOCK_DIR"
+    export HOSTLOCK_HELD_ANCHOR="$ANCHOR_PID"
+
     # Run the command in the BACKGROUND and wait for it, rather than inline.
     #
     # Bash does not run a trap until the current foreground command finishes.
@@ -1808,6 +1894,10 @@ OWNER="${HOSTLOCK_OWNER:-${USER:-unknown}}"
 REASON="${HOSTLOCK_REASON:-}"
 DO_WAIT=0
 TIMEOUT=3600
+# Distinguishes "the caller asked for this bound" from the default, so the
+# guard below can refuse an inert `--timeout` without also refusing every
+# subcommand that merely inherits 3600.
+TIMEOUT_GIVEN=""
 GATE=""
 GATE_TIMEOUT=900
 TTL=""
@@ -1917,6 +2007,7 @@ while [ "$#" -gt 0 ]; do
         --timeout)
             TIMEOUT=$2
             require_uint "$1" "$TIMEOUT"
+            TIMEOUT_GIVEN=1
             shift 2
             ;;
         --gate)
@@ -2034,6 +2125,34 @@ else
     # environment variable, where every setting produced identical placement.
     if [ -n "$EXPECT_CORES" ] || [ -n "$MIN_EFFICIENCY" ]; then
         die "--expect-cores/--min-efficiency apply to \`run\` only; ${SUB} has no command to measure"
+    fi
+    # `--timeout` is read from exactly two places, and both are wait loops:
+    # `cmd_wait`'s own, and `cmd_acquire`'s deadline check, which sits *after*
+    # the `DO_WAIT != 1` early return and so is unreachable without `--wait`
+    # (`run` needs no flag -- it sets DO_WAIT itself). For every other form the
+    # value is parsed, range-checked by require_uint, and never compared:
+    # `acquire --timeout 1800` returns BUSY immediately while its caller
+    # believes it waited half an hour. Refused for the same reason as the two
+    # knobs above, and stated by the same comment -- accepting it silently is
+    # how a knob comes to be believed in while being inert (#2109).
+    #
+    # The exemption is `acquire --wait`, not `--wait`. `--wait` sets DO_WAIT for
+    # whatever subcommand it is passed to, but only `cmd_acquire` reads it, so
+    # `status --wait` is itself inert. Keying off DO_WAIT alone would let
+    # `status --wait --timeout 10` launder an inert bound past the guard by
+    # pairing it with a second inert flag -- catching the bare form and missing
+    # that one would leave the defect exactly where it started.
+    if [ -n "$TIMEOUT_GIVEN" ] && [ "$SUB" != wait ] &&
+       ! { [ "$SUB" = acquire ] && [ "$DO_WAIT" = 1 ]; }; then
+        if [ "$SUB" = acquire ]; then
+            die "--timeout is inert here: acquire without --wait never enters a wait loop, so the bound would be parsed and ignored.
+       Use \`acquire --wait --timeout ${TIMEOUT}\` to actually wait, \`wait --timeout ${TIMEOUT}\` to block without taking the lock, or drop --timeout to fail fast."
+        fi
+        # Every other subcommand returns without looping at all, so there is no
+        # form of it that would honour the bound -- naming `--wait` here would
+        # just be advice to pass a second flag that is equally inert.
+        die "--timeout is inert here: \`${SUB}\` never enters a wait loop, so the bound would be parsed and ignored.
+       Only \`wait\`, \`run\`, and \`acquire --wait\` consult it; drop --timeout from this invocation."
     fi
     : "${ANCHOR_PID:=$PPID}"
     : "${TTL:=3600}"

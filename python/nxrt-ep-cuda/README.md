@@ -19,11 +19,11 @@ The bundled library exports the ORT plugin-EP C ABI
 
 ## Requirements
 
-- **CUDA 13** runtime. The wheel declares the NVIDIA runtime libraries as
-  dependencies (`nvidia-cuda-runtime>=13`, `nvidia-cublas>=13`,
-  `nvidia-cuda-nvrtc>=13`, `nvidia-cuda-cupti>=13`), so they are installed
-  automatically. The NVIDIA **driver** (`libcuda.so.1`) remains a host
-  prerequisite.
+- The validated **CUDA 13.1** runtime line. The wheel pins the same NVIDIA
+  runtime packages as `requirements-cuda-dev.txt`, including cuBLASLt, cuFFT,
+  NVRTC, CUPTI, and cuDNN, so they are installed automatically. It does not
+  require `nvcc` or a system CUDA toolkit. The NVIDIA **driver**
+  (`libcuda.so.1`) remains a host prerequisite.
 - Linux (x86_64) and Windows (AMD64) only. There is no macOS build.
 
 ## Install

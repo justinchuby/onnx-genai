@@ -897,8 +897,8 @@ def census_errors(by_dir: Mapping[Path, Sequence[Path]]) -> list[str]:
     guard reads.
 
     The check is per-directory rather than on the total. An aggregate
-    non-empty test only defends the all-or-nothing case: with 61 targets in
-    one directory and 21 in the other, deleting the larger leaves the total
+    non-empty test only defends the all-or-nothing case: if one directory has
+    many targets and another has fewer, deleting either can leave the total
     comfortably non-zero and the gate reports a confident pass over the
     remainder. The crates have already split once for exactly this kind of
     reason, so a move that lands one directory somewhere TEST_DIRS does not
@@ -1110,6 +1110,11 @@ def declares_gpu_tests_feature(manifest: str) -> bool:
 
 
 def self_test() -> None:
+    if re.search(r"\b\d+\s+targets?\b", census_errors.__doc__ or ""):
+        raise AssertionError(
+            "census_errors documentation must describe relative inventory sizes, "
+            "not copy a source-derived target count that will go stale"
+        )
     for manifest, expected in (
         ("[features]\ngpu-tests = []\n", True),
         ('[features]\ngpu-tests = ["onnx-runtime-cuda-memory/gpu-tests"]\n', True),

@@ -28,6 +28,18 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
+      # The guard has to survive `git checkout preview` below. It is a tracked
+      # file, so switching branches removes it from the working tree unless the
+      # target branch happens to have it -- and `preview` gets it only via the
+      # very merge this script performs. Staging a copy outside the tree breaks
+      # that circle, and is the better semantics anyway: the guard that runs is
+      # the one on the ref you dispatched, not whichever older copy is sitting
+      # on the branch being promoted. A guard that lives on the branch it
+      # polices can be weakened by the promotion it is meant to police.
+      - name: Stage the promotion guard outside the working tree
+        run: |
+          install -m 0755 scripts/squad_promote_guard.sh "$RUNNER_TEMP/squad_promote_guard.sh"
+
       - name: Fetch all branches
         run: git fetch --all
 
@@ -36,21 +48,18 @@ jobs:
           echo "=== dev HEAD ===" && git log origin/dev -1 --oneline
           echo "=== preview HEAD ===" && git log origin/preview -1 --oneline
           echo "=== Files that would be stripped ==="
-          git diff origin/preview..origin/dev --name-only | grep -E "^(\.(ai-team|squad|ai-team-templates)|team-docs/|docs/proposals/)" || echo "(none)"
+          bash "$RUNNER_TEMP/squad_promote_guard.sh" strip-list "origin/preview..origin/dev"
 
       - name: Merge dev → preview (strip forbidden paths)
         if: ${{ inputs.dry_run == 'false' }}
         run: |
           git checkout preview
-          git merge origin/dev --no-commit --no-ff -X theirs || true
+          bash "$RUNNER_TEMP/squad_promote_guard.sh" merge-dev
 
-          # Strip forbidden paths from merge commit
-          git rm -rf --cached --ignore-unmatch \
-            .ai-team/ \
-            .squad/ \
-            .ai-team-templates/ \
-            team-docs/ \
-            "docs/proposals/" || true
+          # Strip forbidden paths from the merge commit. Fatal if it fails: this
+          # is the step that keeps team-only paths off the release branch, and
+          # the commit-and-push below does not re-check it.
+          bash "$RUNNER_TEMP/squad_promote_guard.sh" strip
 
           # Commit if there are staged changes
           if ! git diff --cached --quiet; then
@@ -80,6 +89,18 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
+      # The guard has to survive `git checkout preview` below. It is a tracked
+      # file, so switching branches removes it from the working tree unless the
+      # target branch happens to have it -- and `preview` gets it only via the
+      # very merge this script performs. Staging a copy outside the tree breaks
+      # that circle, and is the better semantics anyway: the guard that runs is
+      # the one on the ref you dispatched, not whichever older copy is sitting
+      # on the branch being promoted. A guard that lives on the branch it
+      # polices can be weakened by the promotion it is meant to police.
+      - name: Stage the promotion guard outside the working tree
+        run: |
+          install -m 0755 scripts/squad_promote_guard.sh "$RUNNER_TEMP/squad_promote_guard.sh"
+
       - name: Fetch all branches
         run: git fetch --all
 
@@ -100,12 +121,7 @@ jobs:
           echo "✅ Version $VERSION has CHANGELOG entry"
 
           # Verify no forbidden files on preview
-          FORBIDDEN=$(git ls-files | grep -E "^(\.(ai-team|squad|ai-team-templates)/|team-docs/|docs/proposals/)" || true)
-          if [ -n "$FORBIDDEN" ]; then
-            echo "::error::Forbidden files found on preview: $FORBIDDEN"
-            exit 1
-          fi
-          echo "✅ No forbidden files on preview"
+          bash "$RUNNER_TEMP/squad_promote_guard.sh" verify-clean
 
       - name: Merge preview → main
         if: ${{ inputs.dry_run == 'false' }}
