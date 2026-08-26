@@ -2135,7 +2135,15 @@ else
     # believes it waited half an hour. Refused for the same reason as the two
     # knobs above, and stated by the same comment -- accepting it silently is
     # how a knob comes to be believed in while being inert (#2109).
-    if [ -n "$TIMEOUT_GIVEN" ] && [ "$SUB" != wait ] && [ "$DO_WAIT" != 1 ]; then
+    #
+    # The exemption is `acquire --wait`, not `--wait`. `--wait` sets DO_WAIT for
+    # whatever subcommand it is passed to, but only `cmd_acquire` reads it, so
+    # `status --wait` is itself inert. Keying off DO_WAIT alone would let
+    # `status --wait --timeout 10` launder an inert bound past the guard by
+    # pairing it with a second inert flag -- catching the bare form and missing
+    # that one would leave the defect exactly where it started.
+    if [ -n "$TIMEOUT_GIVEN" ] && [ "$SUB" != wait ] &&
+       ! { [ "$SUB" = acquire ] && [ "$DO_WAIT" = 1 ]; }; then
         if [ "$SUB" = acquire ]; then
             die "--timeout is inert here: acquire without --wait never enters a wait loop, so the bound would be parsed and ignored.
        Use \`acquire --wait --timeout ${TIMEOUT}\` to actually wait, \`wait --timeout ${TIMEOUT}\` to block without taking the lock, or drop --timeout to fail fast."

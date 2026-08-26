@@ -2676,6 +2676,14 @@ chk "and it names the three forms that do consult the bound" \
     "$(echo "$out" | grep -c 'Only .wait., .run., and .acquire --wait.')" "1"
 chk "status without --timeout is unaffected" \
     "$($HL status >/dev/null 2>&1; echo $?)" "0"
+# The exemption is `acquire --wait`, not `--wait`. Only cmd_acquire reads
+# DO_WAIT, so --wait is itself inert on status -- and a guard keyed off DO_WAIT
+# alone would let a second inert flag launder the first one past it.
+out=$($HL status --wait --timeout 10 2>&1)
+chk "status --wait --timeout is refused too, because --wait is inert there" \
+    "$?" "1"
+chk "and adding an inert --wait does not buy an exemption" \
+    "$(echo "$out" | grep -c -- '--wait --timeout')" "0"
 cleanup
 # `run` sets DO_WAIT itself rather than taking --wait, so its bound is live and
 # must not be swept up by a guard aimed at the subcommands that never wait.
@@ -2812,7 +2820,7 @@ cleanup
 # the inert R1 block and the vacuous STALE arm that this PR exists to fix.
 # Every probe branch asserts something, so the total is invariant across
 # environments; if a refactor drops a check, this fails and says so.
-chk "every assertion in this file ran" "$((pass + fail + 1))" "435"
+chk "every assertion in this file ran" "$((pass + fail + 1))" "437"
 
 echo
 echo "passed=${pass} failed=${fail}"
