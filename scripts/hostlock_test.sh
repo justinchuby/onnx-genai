@@ -60,7 +60,7 @@ HL=scripts/hostlock.sh
 pass=0
 fail=0
 
-cleanup() { rm -rf "$LOCK" "$LOCK".cpuself "$LOCK".reaper "$LOCK".reaper.stage.* "$LOCK".reaper.dead.* "$LOCK".reaper.rel.* "$LOCK".dead.* "$LOCK".stage.* "$LOCK".gate "$LOCK".warn "$LOCK".zombie.* "$LOCK".zpid "$LOCK".ttlmarker "$LOCK".ran "$LOCK".conf "$LOCK".legacy "$LOCK".box "$LOCK".sourced "$LOCK".legacyran "$LOCK".owner "$LOCK".nested "$LOCK".ro "$LOCK".deep "$LOCK".file "$LOCK".nox "$LOCK".conf2 "$LOCK".helpconf "$LOCK".helppoison 2>/dev/null; }
+cleanup() { rm -rf "$LOCK" "$LOCK".cpuself "$LOCK".reaper "$LOCK".reaper.stage.* "$LOCK".reaper.dead.* "$LOCK".reaper.rel.* "$LOCK".dead.* "$LOCK".stage.* "$LOCK".gate "$LOCK".warn "$LOCK".zombie.* "$LOCK".zpid "$LOCK".ttlmarker "$LOCK".ran "$LOCK".conf "$LOCK".legacy "$LOCK".box "$LOCK".sourced "$LOCK".legacyran "$LOCK".owner "$LOCK".nested "$LOCK".ro "$LOCK".deep "$LOCK".file "$LOCK".nox "$LOCK".conf2 "$LOCK".helpconf "$LOCK".helppoison "$LOCK".wait 2>/dev/null; }
 trap cleanup EXIT
 
 chk() {
@@ -2633,13 +2633,136 @@ chk "the help interception precedes the lock_dir config gate" \
     "$([ -n "$help_at" ] && [ -n "$conf_die_at" ] && [ "$help_at" -lt "$conf_die_at" ] && echo yes || echo no)" "yes"
 rm -rf "$LOCK.helpconf" "$LOCK.helppoison"
 
+# ---------------------------------------------------------------------------
+# A `run` NESTED INSIDE ITS OWN `run` IS A CYCLE, NOT CONTENTION (#1977).
+#
+# `run` always sets DO_WAIT, so before this was fixed the inner acquire waited
+# on a holder that could not release until the inner command returned. It
+# printed nothing at all for the full --timeout -- 3600s by default -- and
+# then reported code 3, which claims a peer had the box. Three separate
+# failures in one: it hung, it was silent while hanging, and it blamed
+# somebody who did not exist.
+#
+# The immediacy cell is the one that pins the defect. Exit 9 alone could be
+# reached after an hour of waiting and still satisfy a code check, so the
+# elapsed time is asserted too: the old behaviour cannot produce a refusal in
+# under five seconds because five seconds is one iteration of the wait loop.
+#
+# The inner `--timeout 1` is there so that a REGRESSION of this fix fails in
+# seconds rather than hanging the suite for the default hour. It cannot weaken
+# the assertions: with the guard working the refusal happens before the wait
+# loop is entered, so the timeout is never consulted, and without it the cell
+# reports rc=3 at ~5s -- which is what the two cells below are checking is not
+# what happens. A test whose failure mode is "runs for an hour" is the same
+# defect as the one under repair.
+rm -f "$LOCK.ran"
+nest_t0=$SECONDS
+nest_rc=$(HOSTLOCK_DIR="$LOCK.deep" "$HL" run --owner pris-outer --reason "outer" -- \
+    env HOSTLOCK_DIR="$LOCK.deep" "$HL" run --timeout 1 --owner pris-inner --reason "inner" -- \
+    touch "$LOCK.ran" >"$LOCK.conf" 2>&1; echo $?)
+nest_el=$((SECONDS - nest_t0))
+chk "a run nested inside its own run is refused, not waited on" \
+    "$nest_rc" "9"
+chk "and the refusal is immediate rather than one wait iteration later" \
+    "$([ "$nest_el" -lt 5 ] && echo immediate || echo "waited:${nest_el}s")" "immediate"
+chk "and the inner command never ran" \
+    "$([ -e "$LOCK.ran" ] && echo ran || echo none)" "none"
+chk "and the refusal names the lock the caller is already holding" \
+    "$(grep -c "already inside a .run. holding $LOCK.deep" "$LOCK.conf")" "1"
+chk "and it does not report the cycle as a peer holding the box" \
+    "$(grep -c 'timed out' "$LOCK.conf")" "0"
+rm -f "$LOCK.ran" "$LOCK.conf"
+rm -rf "$LOCK.deep"
+
+# The same nesting against a DIFFERENT lock path is legitimate and must keep
+# working: two locks, no cycle. This is the control for the cells above -- a
+# guard that refused every nested run would satisfy all four of them.
+rm -f "$LOCK.ran"
+nest2_rc=$(HOSTLOCK_DIR="$LOCK.deep" "$HL" run --owner pris-outer --reason "outer" -- \
+    env HOSTLOCK_DIR="$LOCK.nested" "$HL" run --owner pris-inner --reason "inner" -- \
+    touch "$LOCK.ran" >/dev/null 2>&1; echo $?)
+chk "a run nested against a different lock path still runs" "$nest2_rc" "0"
+chk "and its command did run" \
+    "$([ -e "$LOCK.ran" ] && echo ran || echo none)" "ran"
+rm -f "$LOCK.ran"
+rm -rf "$LOCK.deep" "$LOCK.nested"
+
+# The exported pair must stop describing us the moment it stops being true.
+# A `run` whose command daemonises leaves HOSTLOCK_HELD_* set in a process
+# that outlives the lock; refusing that process's later acquire would be a
+# fail-closed bug introduced by the fix itself. The live lock's anchor is what
+# decides, so a stale anchor is simply not us.
+rm -f "$LOCK.ran"
+stale_rc=$(HOSTLOCK_HELD_DIR="$LOCK" HOSTLOCK_HELD_ANCHOR=999999 \
+    "$HL" run --owner pris --reason "stale export" -- touch "$LOCK.ran" >/dev/null 2>&1; echo $?)
+chk "a stale HOSTLOCK_HELD_ANCHOR does not refuse an acquire that is really free" \
+    "$stale_rc" "0"
+chk "and that command ran" \
+    "$([ -e "$LOCK.ran" ] && echo ran || echo none)" "ran"
+rm -f "$LOCK.ran"
+cleanup
+
+# ---------------------------------------------------------------------------
+# A WAIT THAT PRINTS NOTHING IS INDISTINGUISHABLE FROM A WEDGE (#1977).
+#
+# The BUSY and timeout paths both dump `status`, so the holder's identity was
+# available everywhere except the one place it is actually needed: while you
+# are still waiting. Costs about seven seconds of *sleeping* -- no cores, so
+# it is not one of the two CPU exceptions in the header note.
+rm -rf "$LOCK.wait"
+HOSTLOCK_DIR="$LOCK.wait" "$HL" run --owner holder-1977 --reason "holds it briefly" -- \
+    sleep 3 >/dev/null 2>&1 &
+wait_holder=$!
+for _ in $(seq 1 20); do
+    [ -d "$LOCK.wait" ] && break
+    sleep 0.5
+done
+
+# Probe 1 -- the ORDERING, at --timeout 0, which reaches the deadline on the
+# first pass and so cannot race the clock. This is the cell that distinguishes
+# "announce before the deadline check" from "announce after it": with the
+# announcement below the check, a wait whose deadline has already passed
+# reports the timeout and never says who it was waiting for. An earlier
+# version of this probe used --timeout 1 and failed 1 run in 4 -- it was
+# asserting an ordering by hoping the first pass was fast, which is the
+# apparatus deciding the verdict rather than the code.
+order_out=$(env -u HOSTLOCK_HELD_DIR -u HOSTLOCK_HELD_ANCHOR HOSTLOCK_DIR="$LOCK.wait" \
+    "$HL" run --timeout 0 --owner waiter-1977 --reason "wants it" -- true 2>&1; echo "rc=$?")
+chk "a blocked run says it is waiting, before it blocks" \
+    "$(printf '%s' "$order_out" | grep -c 'waiting up to 0s for the lock')" "1"
+chk "and names the holder it is waiting for" \
+    "$(printf '%s' "$order_out" | grep -A3 'waiting up to' | grep -c 'holds it briefly')" "1"
+chk "and says it before it reports the timeout, not after" \
+    "$(printf '%s' "$order_out" | grep -n 'waiting up to\|timed out after' | head -1 | grep -c 'waiting up to')" "1"
+chk "and still times out with the documented status" \
+    "$(printf '%s' "$order_out" | sed -n 's/.*rc=//p')" "3"
+
+# Probe 2 -- ONCE, across a wait that really takes more than one pass. The
+# loop sleeps 5s per pass and the holder above releases at 3s, so this blocks,
+# retries, and succeeds: two passes, one announcement. Asserting "only once"
+# against the --timeout 0 probe would have been vacuous -- one pass cannot
+# print twice, so the assertion would have held with the guard deleted.
+once_out=$(env -u HOSTLOCK_HELD_DIR -u HOSTLOCK_HELD_ANCHOR HOSTLOCK_DIR="$LOCK.wait" \
+    "$HL" run --timeout 30 --owner waiter2-1977 --reason "wants it too" -- \
+    touch "$LOCK.ran" 2>&1; echo "rc=$?")
+chk "and says so only once, however long it waits" \
+    "$(printf '%s' "$once_out" | grep -c 'waiting up to')" "1"
+chk "and the wait that announced still goes on to acquire" \
+    "$(printf '%s' "$once_out" | sed -n 's/.*rc=//p')" "0"
+chk "and the command it was waiting to run did run" \
+    "$([ -e "$LOCK.ran" ] && echo ran || echo none)" "ran"
+rm -f "$LOCK.ran"
+wait "$wait_holder" 2>/dev/null
+rm -rf "$LOCK.wait"
+cleanup
+
 # Finally, pin the assertion count itself. Several of the checks in this file
 # sit behind environment probes, and an assertion that quietly stops running is
 # indistinguishable from one that passes -- which is the same failure mode as
 # the inert R1 block and the vacuous STALE arm that this PR exists to fix.
 # Every probe branch asserts something, so the total is invariant across
 # environments; if a refactor drops a check, this fails and says so.
-chk "every assertion in this file ran" "$((pass + fail + 1))" "406"
+chk "every assertion in this file ran" "$((pass + fail + 1))" "422"
 
 echo
 echo "passed=${pass} failed=${fail}"
