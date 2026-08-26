@@ -264,6 +264,41 @@ mod mock_kernel_ctx {
         ptr::null_mut()
     }
 
+    pub unsafe extern "C" fn mock_get_tensor_memory_info(
+        _value: *const ort::OrtValue,
+        out: *mut *const ort::OrtMemoryInfo,
+    ) -> ort::OrtStatusPtr {
+        // The production adapter now requires the same residency hooks real ORT
+        // API 27 provides. This mock models a CPU allocator; omitting the hooks
+        // is not an older supported plugin ABI, it is an incomplete OrtApi
+        // fixture that correctly makes Compute fail closed.
+        unsafe { *out = ptr::dangling::<ort::OrtMemoryInfo>() };
+        ptr::null_mut()
+    }
+
+    pub unsafe extern "C" fn mock_memory_info_get_device_type(
+        _memory_info: *const ort::OrtMemoryInfo,
+        out: *mut ort::OrtMemoryInfoDeviceType,
+    ) {
+        unsafe { *out = ort::OrtMemoryInfoDeviceType_CPU };
+    }
+
+    pub unsafe extern "C" fn mock_memory_info_get_name(
+        _memory_info: *const ort::OrtMemoryInfo,
+        out: *mut *const std::ffi::c_char,
+    ) -> ort::OrtStatusPtr {
+        unsafe { *out = c"Cpu".as_ptr() };
+        ptr::null_mut()
+    }
+
+    pub unsafe extern "C" fn mock_memory_info_get_id(
+        _memory_info: *const ort::OrtMemoryInfo,
+        out: *mut i32,
+    ) -> ort::OrtStatusPtr {
+        unsafe { *out = 0 };
+        ptr::null_mut()
+    }
+
     pub unsafe extern "C" fn mock_get_output(
         _ctx: *mut ort::OrtKernelContext,
         index: usize,
@@ -339,6 +374,10 @@ mod mock_kernel_ctx {
             GetDimensionsCount: Some(mock_get_dimensions_count),
             GetDimensions: Some(mock_get_dimensions),
             GetTensorData: Some(mock_get_tensor_data),
+            GetTensorMemoryInfo: Some(mock_get_tensor_memory_info),
+            MemoryInfoGetDeviceType: Some(mock_memory_info_get_device_type),
+            MemoryInfoGetName: Some(mock_memory_info_get_name),
+            MemoryInfoGetId: Some(mock_memory_info_get_id),
             GetTensorMutableData: Some(mock_get_tensor_mutable_data),
             ReleaseTensorTypeAndShapeInfo: Some(mock_release_tensor_type_and_shape_info),
             ..Default::default()
