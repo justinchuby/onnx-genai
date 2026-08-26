@@ -61,6 +61,26 @@ ONNX_GENAI_CPU_DECODE_SCHEDULE=fixed  ->  path=spmd-pool
 ONNX_GENAI_CPU_DECODE_SCHEDULE=steal  ->  path=work-stealing-pool
 ```
 
+> **Correction, 2026-08-30 (#2168).** Those two lines were written on a
+> `--features mlas` build and are true only there. `path` names the *executor*,
+> and only MLAS swaps the pool out for a foreign one; the native `steal` is the
+> same pool, threads and pinning, so in a default build **both** arms print
+> `path=spmd-pool` and this width line does not distinguish them. That is the
+> failure the section itself names, reintroduced by the fix for it.
+>
+> The read that does distinguish them is `decode_schedule_label()`, printed as a
+> separate `schedule=` field from the built pool:
+>
+> ```
+> (unset, default build)                ->  path=spmd-pool  schedule=steal-native:4
+> ONNX_GENAI_CPU_DECODE_SCHEDULE=fixed  ->  path=spmd-pool  schedule=fixed
+> ```
+>
+> Note also that the *default* changed in #2168 (native, confirmed single NUMA
+> node -> `steal`), so on such a host an arm that sets nothing is no longer the
+> fixed split. Any A/B in this document that used "unset" as its fixed control
+> would silently become an A/A if re-run today; use an explicit `=fixed`.
+
 The first smoke run of the A/B was three arms all printing `spmd-pool` — an
 experiment comparing a configuration with itself, three times. It produced no
 data and its `CONTROL 1` is what caught this.

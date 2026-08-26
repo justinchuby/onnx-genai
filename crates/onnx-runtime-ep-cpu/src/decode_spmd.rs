@@ -1876,12 +1876,17 @@ fn decode_schedule_from_raw(raw: Option<&str>) -> Option<DecodeSchedule> {
 /// The default is the dynamic cursor on a **single-node native** pool, and the
 /// fixed split everywhere else. Both exclusions are deliberate:
 ///
-/// - **Multi-node.** [`SpmdDecodePools::place_rows`] first-touches each lane's
-///   row range on that lane's node, so under a fixed split a lane only ever
-///   streams node-local weights. A dynamic cursor breaks that pairing: a lane
-///   can claim a tile another node first-touched and read it across the
-///   interconnect. On one node there is no remote memory to reach and the
-///   locality argument is vacuous, which is the only case measured here.
+/// - **Not a confirmed single node.** [`SpmdDecodePools::place_rows`]
+///   first-touches each lane's row range on that lane's node, so under a fixed
+///   split a lane only ever streams node-local weights. A dynamic cursor breaks
+///   that pairing: a lane can claim a tile another node first-touched and read
+///   it across the interconnect. That argument is vacuous only when there is
+///   genuinely no remote memory to reach, so the guard is *positive*: one
+///   worker shard **and** [`decode_affinity::host_is_single_numa_node`]
+///   affirming it. One shard alone is not evidence -- `node_shards_with` also
+///   builds a single shard when the topology could not be read at all, which is
+///   exactly what a container with an unmounted `/sys/devices/system/node` and a
+///   cpuset spanning two sockets looks like. Unknown resolves to `Fixed`.
 /// - **`--features mlas`.** There, `Steal` does not tile our pool at all -- it
 ///   substitutes MLAS's own executor, which spawns and places its own threads,
 ///   has no dispatcher shard, no pinning of ours and no barrier counters. That
@@ -1891,20 +1896,27 @@ fn decode_schedule_from_raw(raw: Option<&str>) -> Option<DecodeSchedule> {
 /// An explicit value keeps its exact current meaning in every configuration, so
 /// `=fixed` is a complete escape hatch and `=steal` still selects MLAS's pool
 /// where that is what it selects today.
-fn resolve_decode_schedule(raw: Option<&str>, node_count: usize) -> DecodeSchedule {
+fn resolve_decode_schedule(raw: Option<&str>, single_node: bool) -> DecodeSchedule {
     if let Some(explicit) = decode_schedule_from_raw(raw) {
         return explicit;
     }
-    if cfg!(feature = "mlas") || node_count != 1 {
+    if cfg!(feature = "mlas") || !single_node {
         return DecodeSchedule::Fixed;
     }
     DecodeSchedule::Steal
 }
 
+/// Whether the pool spans one worker shard *and* the host affirmatively reports
+/// a single NUMA node over the CPUs this process may use. See
+/// [`resolve_decode_schedule`] for why one shard on its own is not enough.
+fn on_confirmed_single_node(node_count: usize) -> bool {
+    node_count == 1 && crate::decode_affinity::host_is_single_numa_node()
+}
+
 fn decode_schedule(node_count: usize) -> DecodeSchedule {
     resolve_decode_schedule(
         std::env::var(DECODE_SCHEDULE_ENV).ok().as_deref(),
-        node_count,
+        on_confirmed_single_node(node_count),
     )
 }
 
@@ -2575,6 +2587,20 @@ impl SpmdDecodePools {
         self.schedule == DecodeSchedule::Steal
     }
 
+    /// Whether `Steal` is served by MLAS's own thread pool rather than by the
+    /// cursor over our tiles. Distinct executors, distinct grain, distinct
+    /// threads -- so a reader that only knows "stealing" knows very little.
+    fn work_stealing_executor_is_foreign(&self) -> bool {
+        #[cfg(feature = "mlas")]
+        {
+            self.work_stealing_pool.is_some()
+        }
+        #[cfg(not(feature = "mlas"))]
+        {
+            false
+        }
+    }
+
     /// Tiles per worker to cut the output into when no explicit override is set.
     ///
     /// Keyed off the executor that will actually run the tiles rather than off
@@ -3060,6 +3086,24 @@ impl SpmdDecodePools {
     }
 
     fn work_stealing_segments_aligned(&self, n: usize, align: usize) -> Vec<(usize, usize)> {
+        let tiles_per_worker = steal_tiles_per_worker_override()
+            .unwrap_or_else(|| self.default_steal_tiles_per_worker());
+        self.work_stealing_segments_with_tiles(n, align, tiles_per_worker)
+    }
+
+    /// The tile table for `tiles_per_worker` tiles per lane.
+    ///
+    /// Split out from [`Self::work_stealing_segments_aligned`] so the grain is
+    /// reachable as an argument: the process-global `OnceLock` behind the
+    /// override latches on first read, so a test that wants a specific grain
+    /// cannot get one through the env and would otherwise have to re-implement
+    /// the arithmetic it is meant to be checking.
+    fn work_stealing_segments_with_tiles(
+        &self,
+        n: usize,
+        align: usize,
+        tiles_per_worker: usize,
+    ) -> Vec<(usize, usize)> {
         if n == 0 {
             return vec![(0, 0)];
         }
@@ -3068,13 +3112,14 @@ impl SpmdDecodePools {
         let max_by_size = n.div_ceil(min_tile).max(1);
         let target = self
             .total_workers
-            .saturating_mul(
-                steal_tiles_per_worker_override()
-                    .unwrap_or_else(|| self.default_steal_tiles_per_worker()),
-            )
+            .saturating_mul(tiles_per_worker)
             .max(1)
             .min(max_by_size)
             .min(n);
+        // A shortcut, not a semantic: at `target <= total_workers` the loop
+        // below reproduces the fixed split anyway (mutation-checked). It is kept
+        // because it also preserves the chunk permutation the fixed split
+        // applies, which the loop does not.
         if target <= self.total_workers {
             return self.worker_row_segments_aligned(n, align);
         }
@@ -3677,6 +3722,38 @@ static DECODE_PATH_LABEL: OnceLock<&'static str> = OnceLock::new();
 /// - `"unresolved"` — pool initialization has not run yet
 pub fn decode_path_label() -> &'static str {
     DECODE_PATH_LABEL.get().copied().unwrap_or("unresolved")
+}
+
+/// How the built pool actually splits rows, and at what grain -- e.g.
+/// `"steal-native:4"`, `"steal-mlas:1"`, `"fixed"`, `"unresolved"`.
+///
+/// Space-free on purpose: this is printed as one whitespace-delimited field in
+/// benchmark output.
+///
+/// [`decode_path_label`] deliberately names the *executor*, so a native pool
+/// reports `spmd-pool` whether it tiles dynamically or not. That leaves the
+/// schedule -- which is a default, and so changes underneath a benchmark
+/// without anyone typing anything -- with no runtime read at all. A results
+/// table would then say which pool ran and stay silent about the thing being
+/// compared. This is that read: it is taken from the pool `POOLS` holds, not
+/// from the environment, so it reports what ran rather than what was asked for.
+///
+/// Returns `"unresolved"` before the first decode builds the pool.
+pub fn decode_schedule_label() -> String {
+    let Some(pool) = POOLS.get().and_then(|p| p.as_ref()) else {
+        return "unresolved".to_string();
+    };
+    if !pool.uses_work_stealing() {
+        return "fixed".to_string();
+    }
+    let tiles =
+        steal_tiles_per_worker_override().unwrap_or_else(|| pool.default_steal_tiles_per_worker());
+    let executor = if pool.work_stealing_executor_is_foreign() {
+        "steal-mlas"
+    } else {
+        "steal-native"
+    };
+    format!("{executor}:{tiles}")
 }
 
 /// The width a decode request asked for, what it actually got, and which path
@@ -5246,13 +5323,13 @@ mod tests {
     fn an_unset_or_unparseable_schedule_takes_the_same_default() {
         for raw in [None, Some(""), Some("   "), Some("bogus"), Some("stealing")] {
             assert_eq!(
-                resolve_decode_schedule(raw, 1),
-                resolve_decode_schedule(None, 1),
+                resolve_decode_schedule(raw, true),
+                resolve_decode_schedule(None, true),
                 "{raw:?} must resolve exactly like an unset variable"
             );
             assert_eq!(
-                resolve_decode_schedule(raw, 2),
-                resolve_decode_schedule(None, 2)
+                resolve_decode_schedule(raw, false),
+                resolve_decode_schedule(None, false)
             );
         }
     }
@@ -5263,32 +5340,56 @@ mod tests {
     /// an MLAS build would substitute a foreign executor instead of tiling ours.
     #[test]
     fn the_default_schedule_steals_only_on_a_single_node_native_pool() {
-        let single = resolve_decode_schedule(None, 1);
+        let single = resolve_decode_schedule(None, true);
         if cfg!(feature = "mlas") {
             assert_eq!(single, DecodeSchedule::Fixed);
         } else {
             assert_eq!(single, DecodeSchedule::Steal);
         }
-        for nodes in [0, 2, 4] {
-            assert_eq!(
-                resolve_decode_schedule(None, nodes),
-                DecodeSchedule::Fixed,
-                "a {nodes}-node pool must keep the node-local fixed split"
-            );
-        }
+        assert_eq!(
+            resolve_decode_schedule(None, false),
+            DecodeSchedule::Fixed,
+            "anything but a confirmed single node keeps the node-local fixed split"
+        );
         // An explicit value still means exactly what it means today, in every
         // configuration -- this is the escape hatch, so it must not be topology
         // dependent.
-        for nodes in [1, 2] {
+        for single_node in [true, false] {
             assert_eq!(
-                resolve_decode_schedule(Some("fixed"), nodes),
+                resolve_decode_schedule(Some("fixed"), single_node),
                 DecodeSchedule::Fixed
             );
             assert_eq!(
-                resolve_decode_schedule(Some("steal"), nodes),
+                resolve_decode_schedule(Some("steal"), single_node),
                 DecodeSchedule::Steal
             );
         }
+    }
+
+    /// The guard is *positive*, which is the whole point of it: a single worker
+    /// shard is not evidence of a single node, because `node_shards_with` also
+    /// builds one shard when the topology could not be read. A host that cannot
+    /// answer must therefore fall to `Fixed` even at `node_count == 1`.
+    #[test]
+    fn a_single_shard_alone_does_not_authorise_stealing() {
+        for nodes in [0, 2, 4] {
+            assert!(
+                !on_confirmed_single_node(nodes),
+                "a {nodes}-shard pool spans nodes, so locality is not confirmed"
+            );
+            assert_eq!(
+                resolve_decode_schedule(None, on_confirmed_single_node(nodes)),
+                DecodeSchedule::Fixed
+            );
+        }
+        // The one-shard case defers entirely to the host probe, so the two must
+        // agree: whatever this machine reports, the shard count cannot override
+        // it in the permissive direction.
+        assert_eq!(
+            on_confirmed_single_node(1),
+            crate::decode_affinity::host_is_single_numa_node(),
+            "one shard must neither add nor remove confirmation"
+        );
     }
 
     /// The regression guard for the defect this default fixes. One tile per
@@ -5296,21 +5397,41 @@ mod tests {
     /// split and no lane can ever claim a second tile: `steal` and `fixed`
     /// produce byte-identical segments. The knob reported a schedule it did not
     /// implement, and every measurement of it was measuring the fixed split.
+    ///
+    /// Note what this does *not* guard, since the first version of it claimed
+    /// otherwise: the `target <= total_workers` early return is an
+    /// optimisation, not the mechanism. Deleting it leaves every assertion here
+    /// passing, because at `target == total_workers` the general tiling loop
+    /// reproduces the fixed split exactly -- verified by mutation across all
+    /// seven shapes below, ragged ones included. The degeneracy is arithmetic
+    /// and survives the shortcut being removed.
     #[test]
     fn one_tile_per_worker_degenerates_to_the_fixed_split() {
         let pool = single_group_pool_with_schedule(8, DecodeSchedule::Steal);
         let n = 8192;
         let align = 64;
-        let fixed = pool.worker_row_segments_aligned(n, align);
-        let degenerate = {
-            let target = pool.total_workers.saturating_mul(1).max(1);
-            assert!(
-                target <= pool.total_workers,
-                "one tile per worker cannot out-number the workers"
+        // The real function, not a re-derivation of it: this is the arithmetic
+        // that made the knob inert, so the test has to execute it. Swept over
+        // ragged shapes as well as round ones -- an equality that only holds
+        // when `n` divides evenly would be a property of the shape rather than
+        // of the schedule.
+        for (workers, n, align) in [
+            (8usize, 8192usize, 64usize),
+            (8, 8191, 64),
+            (6, 14336, 64),
+            (6, 4097, 32),
+            (15, 6144, 64),
+            (15, 6151, 16),
+            (3, 97, 8),
+        ] {
+            let pool = single_group_pool_with_schedule(workers, DecodeSchedule::Steal);
+            assert_eq!(
+                pool.work_stealing_segments_with_tiles(n, align, 1),
+                pool.worker_row_segments_aligned(n, align),
+                "one tile per lane is the fixed split at ({workers}, {n}, {align}), \
+                 so `steal` was `fixed`"
             );
-            fixed.clone()
-        };
-        assert_eq!(degenerate, fixed);
+        }
 
         // And the shipped default does not: strictly more tiles than lanes is
         // the whole mechanism, since a straggler is only absorbed if there is an
