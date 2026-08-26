@@ -4283,10 +4283,11 @@ impl RunScratch {
             self.slots = Vec::new();
         }
 
-        // Judged on its own: output *shapes* and output *bookkeeping* are the
-        // same length, but a spilled `DimVec` (rank > INLINE_RANK) owns a heap
-        // buffer that the others do not, so the memory a pathological node
-        // pins here is not the memory it pins there.
+        // Judged on its own, for the same spine-capacity reason as the pair
+        // above. Any heap a spilled `DimVec` (rank > INLINE_RANK) owned is
+        // already gone: `clear()` drops the elements, and that is where the
+        // out-of-line buffer is released. What this bounds is only the outer
+        // Vec's own capacity.
         if self.shapes.capacity() > SCRATCH_MAX_CAPACITY {
             self.shapes = Vec::new();
         }
@@ -4658,8 +4659,14 @@ pub fn shared_native_rule_names_for_test() -> Vec<&'static str> {
         .collect()
 }
 
-/// Infer output shapes into reusable storage, allocating nothing on the paths
-/// the dispatch grid actually takes.
+/// Infer output shapes into reusable storage, allocating nothing on the
+/// elementwise paths the dispatch grid actually measures.
+///
+/// Not on *every* path: the shared-native arm still receives an owned
+/// `Vec<Vec<usize>>` from `infer_shared_node` and copies it in, which is
+/// strictly more work than returning it would have been. That arm is here to
+/// route a *declining* rule's fallback through the fast arms, not to save an
+/// allocation on resolve, and it is off the measured path.
 ///
 /// [`infer_shapes`] hands back a fresh `Vec<Vec<usize>>` for every node of
 /// every `Run`. Callers only ever read it as a slice and drop it a few hundred
@@ -6394,26 +6401,134 @@ fn after() {}
         }
     }
 
-    /// A delegated arm still lands in the buffer, and a *shorter* result after
-    /// a longer one must not leave the tail of the previous node visible.
+    /// A *shorter* result after a longer one must not leave the tail of the
+    /// previous node visible.
+    ///
+    /// Every arm that writes the buffer needs its own case here, because each
+    /// one clears it separately. Driving only the `SameAsInput` arm proves only
+    /// that `SameAsInput` clears: deleting the `out.clear()` from the
+    /// delegating arm, or from the shared-native arm, survived an earlier
+    /// version of this test. Both are load-bearing in production, where the
+    /// routed path reads `output_shapes.iter().enumerate()` as the node's
+    /// output arity — a stale tail becomes a phantom output slot.
     #[test]
-    fn infer_shapes_into_truncates_when_a_node_has_fewer_outputs() {
+    fn every_arm_truncates_when_a_node_has_fewer_outputs() {
         let a = view(&[2, 3], &[3, 1]);
         assert_paths_agree(&ShapeInference::MatMul, &[a, a]);
 
-        let mut buf = Vec::new();
-        // CausalConvWithState yields two shapes; SameAsInput yields one.
+        // Two outputs, via the delegating arm, to leave a tail behind.
         let input = view(&[1, 2, 5], &[10, 5, 1]);
         let weight = view(&[2, 1, 3], &[3, 3, 1]);
-        infer_shapes_into(
-            &ShapeInference::CausalConvWithState,
-            &[input, weight],
-            &mut buf,
-        )
-        .unwrap();
-        assert_eq!(buf.len(), 2, "two outputs");
+        let fill_two = |buf: &mut Vec<crate::dim_vec::DimVec<usize>>| {
+            infer_shapes_into(&ShapeInference::CausalConvWithState, &[input, weight], buf).unwrap();
+            assert_eq!(buf.len(), 2, "two outputs");
+        };
+
+        // Fast arm.
+        let mut buf = Vec::new();
+        fill_two(&mut buf);
         infer_shapes_into(&ShapeInference::SameAsInput(0), &[input], &mut buf).unwrap();
-        assert_eq!(buf.len(), 1, "the second output slot must not survive");
+        assert_eq!(buf.len(), 1, "SameAsInput left the second slot behind");
+
+        // Delegating arm: a one-output strategy that is NOT reimplemented.
+        fill_two(&mut buf);
+        infer_shapes_into(&ShapeInference::MatMul, &[a, a], &mut buf).unwrap();
+        assert_eq!(
+            buf.len(),
+            1,
+            "the delegating arm left the second slot behind"
+        );
+
+        // Shared-native arm, resolving.
+        fill_two(&mut buf);
+        let (strategy, ins) = resolving_shared_native();
+        infer_shapes_into(&strategy, &ins, &mut buf).unwrap();
+        assert_eq!(
+            buf.len(),
+            1,
+            "the shared-native arm left the second slot behind"
+        );
+    }
+
+    /// A `SharedNative` node that resolves natively, plus its operands.
+    fn resolving_shared_native() -> (ShapeInference, [TensorView<'static>; 2]) {
+        static DATA: [f32; 3] = [0.0; 3];
+        static WANT: [i64; 2] = [1, 4];
+        static DSHAPE: [usize; 2] = [3, 1];
+        static DSTRIDE: [i64; 2] = [1, 1];
+        static WSHAPE: [usize; 1] = [2];
+        static WSTRIDE: [i64; 1] = [1];
+        let data = TensorView::new(
+            DevicePtr(DATA.as_ptr().cast()),
+            DataType::Float32,
+            &DSHAPE,
+            &DSTRIDE,
+            DeviceId::cpu(),
+        );
+        let shape_in = TensorView::new(
+            DevicePtr(WANT.as_ptr().cast()),
+            DataType::Int64,
+            &WSHAPE,
+            &WSTRIDE,
+            DeviceId::cpu(),
+        );
+        let mut node = Node::new(
+            onnx_runtime_ir::NodeId(0),
+            "Expand",
+            vec![
+                Some(onnx_runtime_ir::ValueId(0)),
+                Some(onnx_runtime_ir::ValueId(1)),
+            ],
+            vec![onnx_runtime_ir::ValueId(2)],
+        );
+        node.version = Some(8);
+        (
+            ShapeInference::SharedNative {
+                node: Box::new(node),
+                fallback: Box::new(ShapeInference::SameAsInput(0)),
+            },
+            [data, shape_in],
+        )
+    }
+
+    /// The shared-native arm is reimplemented too, so it needs the oracle just
+    /// as much as the others -- on both sides of its branch. The `Resolved`
+    /// side is the one production actually takes for `Expand`/`Tile` with
+    /// concrete shape operands; the declining side is what routes a rule's
+    /// fallback back through the fast arms.
+    #[test]
+    fn infer_shapes_into_matches_infer_shapes_on_shared_native() {
+        let (resolving, ins) = resolving_shared_native();
+        assert_paths_agree(&resolving, &ins);
+
+        // A node no native rule knows: SymbolicOrUnknown, so the fallback runs.
+        let unknown = Node::new(
+            onnx_runtime_ir::NodeId(0),
+            "NotRegisteredAnywhere",
+            vec![Some(onnx_runtime_ir::ValueId(0))],
+            vec![onnx_runtime_ir::ValueId(1)],
+        );
+        let input = view(&[2, 3], &[3, 1]);
+        assert_eq!(
+            infer_shared_node(&unknown, &[input]),
+            SharedShapeResult::SymbolicOrUnknown,
+            "this test is vacuous unless the rule really declines"
+        );
+        assert_paths_agree(
+            &ShapeInference::SharedNative {
+                node: Box::new(unknown.clone()),
+                fallback: Box::new(ShapeInference::SameAsInput(0)),
+            },
+            &[input],
+        );
+        // A fallback that itself fails must surface the fallback's own error.
+        assert_paths_agree(
+            &ShapeInference::SharedNative {
+                node: Box::new(unknown),
+                fallback: Box::new(ShapeInference::SameAsInput(9)),
+            },
+            &[input],
+        );
     }
 
     // ── Shapes carried in input values ───────────────────────────────────────
