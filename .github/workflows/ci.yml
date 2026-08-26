@@ -611,6 +611,19 @@ jobs:
           shellcheck scripts/merge_when_green.sh scripts/merge_when_green_test.sh
           bash scripts/merge_when_green_test.sh
 
+      # Same shape one branch further out: the promotion workflow strips the
+      # team-only paths on the way to the release branch, and both the strip and
+      # the check that backstops it used to end in `|| true`. A failed
+      # `git ls-files` produced an empty match set, which the consumer read as
+      # "no forbidden files" and promoted. The suite is hermetic (`git` is
+      # shimmed) and every arm is differential -- it runs the pre-fix shape too
+      # and requires it to pass what the fixed shape fails, so the day it stops
+      # discriminating it says so rather than going quiet.
+      - name: Promotion guards fail closed (self-test)
+        run: |
+          shellcheck scripts/squad_promote_guard.sh scripts/squad_promote_guard_test.sh
+          bash scripts/squad_promote_guard_test.sh
+
       # The Miri lane and the three MLAS steps above select tests by name, and
       # libtest exits 0 on a filter that matches nothing -- so a renamed test
       # turns its step into a no-op that reports `ok`. `run_miri` and
