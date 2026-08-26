@@ -86,8 +86,13 @@
 # So SKIPPED is a THIRD outcome, not folded into either: by default it exits 7
 # and names the contexts, and `--allow-skipped` is the caller stating that the
 # skip is by design. Even then the merge requires that every required context
-# be present and be SUCCESS or SKIPPED, that at least one really was skipped,
-# and that GitHub itself does not report the pull request as BLOCKED.
+# be present, that every RUN under each of those names be SUCCESS or SKIPPED
+# (a name that skipped once and failed once is a failure -- see the fold in
+# `verdict`), that at least one really was skipped, and that GitHub's own
+# `mergeStateStatus` be one of the states that accept a merge. That last is an
+# allowlist: refusing only BLOCKED would let `UNKNOWN` -- GitHub saying it has
+# not computed mergeability yet -- and a vanished field count as acceptance.
+# Not-yet-known is a third outcome there too, and it waits.
 
 set -uo pipefail
 
@@ -299,8 +304,18 @@ for name in names:
     # would let the rollup ARRAY ORDER decide whether we merge -- ordering
     # GitHub does not document as chronological. A name is green only if
     # every entry carrying it is green.
+    #
+    # The old bad[0] fold was array-order-first, which was harmless while
+    # the only question was green-or-not. It stopped being harmless when SKIPPED became
+    # a mergeable outcome: a name with one SKIPPED run and one FAILURE run
+    # folds to whichever the array lists first, so array order alone could
+    # decide whether --allow-skipped merges over a failure. A name counts as
+    # skipped only if SKIPPED is the ONLY thing wrong with it; anything harder
+    # outranks it, and SKIPPED is reported for a name only when nothing else
+    # is competing for the slot.
     bad = [e for e in seen if e[1] != "SUCCESS"]
-    status, concl = bad[0] if bad else seen[0]
+    hard = [e for e in bad if e[1] != "SKIPPED"]
+    status, concl = (hard or bad or seen)[0]
     if len(seen) > 1:
         status = "%s[%d/%d]" % (status, len(seen) - len(bad), len(seen))
     print("%s\t%s\t%s" % (name, status, concl))
@@ -309,6 +324,8 @@ for name in names:
 
 deadline=$((SECONDS + TIMEOUT))
 misses=0
+skip_announced=0
+state_pending_warned=0
 while :; do
     SNAP=$(pr_json)
     if [ -z "$SNAP" ]; then
@@ -404,23 +421,53 @@ while :; do
     nskipped=$(printf '%s\n' "$skipped" | grep -c '[^[:space:]]')
     if [ "$nskipped" -gt 0 ] && [ "$((green + nskipped))" = "$want" ] &&
         [ "$notgreen" = "$skipped" ]; then
-        echo "$PROG: required check(s) concluded SKIPPED at $HEAD:"
-        printf '%s\n' "$skipped" | sed 's/^/  /'
+        if [ "$skip_announced" != 1 ]; then
+            skip_announced=1
+            echo "$PROG: required check(s) concluded SKIPPED at $HEAD:"
+            printf '%s\n' "$skipped" | sed 's/^/  /'
+        fi
         if [ "$ALLOW_SKIPPED" != 1 ]; then
             echo "$PROG: SKIPPED is not SUCCESS -- the check did not run." >&2
             echo "$PROG: if the change's scope skips it by design, re-run with" >&2
             echo "$PROG: --allow-skipped. Do NOT use --admin." >&2
             exit 7
         fi
-        # `mergeStateStatus` is GitHub's own verdict on the ruleset. BLOCKED
-        # here would mean the skip does NOT satisfy the requirement, and
-        # `--allow-skipped` must not be able to override the repository.
-        if [ "$now_merge_state" = "BLOCKED" ]; then
+        # `mergeStateStatus` is GitHub's own verdict on the ruleset, and it is
+        # read as an ALLOWLIST. Refusing only BLOCKED would mean every other
+        # value -- including `UNKNOWN`, which is GitHub saying it has not
+        # computed mergeability yet, and including the field being absent
+        # altogether after an API shape change -- counted as the repository
+        # affirmatively accepting the skip. That is the same "absent is not
+        # pending, unknown is not pass" fault this script exists to refuse,
+        # and letting it through here would be worse than elsewhere, because
+        # only the caller's own flag stands behind it.
+        #
+        # So three outcomes again, not two: states that mean mergeable,
+        # states that mean no, and not-yet-known, which is neither and must
+        # keep waiting rather than resolve either way.
+        case "$now_merge_state" in
+        CLEAN | UNSTABLE | HAS_HOOKS) ;;
+        UNKNOWN | "")
+            if [ "$state_pending_warned" != 1 ]; then
+                state_pending_warned=1
+                echo "$PROG: GitHub has not computed mergeability yet" \
+                    "(mergeStateStatus=${now_merge_state:-<absent>}); waiting."
+            fi
+            if [ "$SECONDS" -lt "$deadline" ]; then
+                sleep "$POLL"
+                continue
+            fi
+            echo "$PROG: timed out with mergeability still uncomputed." >&2
+            echo "$PROG: an unknown merge state is not an accepting one." >&2
+            exit 3
+            ;;
+        *)
             echo "$PROG: --allow-skipped given, but GitHub reports the pull" >&2
-            echo "$PROG: request BLOCKED -- the skip does not satisfy the" >&2
-            echo "$PROG: ruleset. Not merging." >&2
+            echo "$PROG: request $now_merge_state -- that is not a state that" >&2
+            echo "$PROG: accepts a merge. Not merging." >&2
             exit 6
-        fi
+            ;;
+        esac
         echo "$PROG: --allow-skipped given, and GitHub reports $now_merge_state."
         if [ "$DRY_RUN" = 1 ]; then
             echo "$PROG: --dry-run, not merging."
