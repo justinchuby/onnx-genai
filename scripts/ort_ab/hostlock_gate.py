@@ -261,6 +261,90 @@ def lock_columns(label: str, prov: dict[str, str]) -> dict[str, str]:
     }
 
 
+def read_runnable(path: str = "/proc/loadavg") -> int | None:
+    """The runnable-task count, parsed as `hostlock.sh`'s `runnable_now()` does.
+
+    **Parses the same, does not measure the same.** `runnable_now()` is a
+    two-process pipeline, `cut -d' ' -f4 /proc/loadavg | cut -d/ -f1`, run
+    from a `bash -c`. Field 4's numerator is `nr_running` *at the instant of
+    the read*, and it counts the reader: a shell pipeline has its own
+    processes runnable while it samples, so it reports systematically higher
+    than a lone in-process `open()`. Measured on this box, 80 interleaved
+    pairs: mean `shell - python` = **+1.24**, shell strictly higher in
+    **92.5%** of samples, modal delta exactly +1.
+
+    That is why `runnable_at_start` (which comes from the script, via
+    provenance) is **not comparable** to the samples taken here, and why
+    `occupancy_columns` publishes its own `runnable_window_start` read through
+    this function instead of reusing it. Comparing across the two would put a
+    ~1-runnable instrument offset into the middle of the comparison the
+    occupancy columns exist to support -- absorbing exactly the small-arrival
+    signal they are meant to surface.
+
+    A file read, not a subprocess, for two reasons: it is called between cells
+    of a live matrix, where forking would put the instrument's own load on the
+    host being measured -- which is the very effect described above.
+
+    `None`, never a guess, when the file is absent or malformed. A host
+    without `/proc` cannot answer this and must not appear to, and `0` would
+    read as "perfectly quiet" -- the most reassuring possible answer to a
+    question that was never answered.
+    """
+    try:
+        with open(path) as fh:
+            field = fh.read().split()[3]
+    except (OSError, IndexError):
+        return None
+    try:
+        return int(field.split("/")[0])
+    except ValueError:
+        return None
+
+
+def occupancy_columns(samples: list[int | None]) -> dict[str, str]:
+    """What the host looked like across the window, not at one instant.
+
+    The lock guarantees **custody, not quiet.** It stops a cooperating peer,
+    which is the only thing it can do; it says nothing about a process that
+    never took it -- a stray build, a test matrix, an agent outside the
+    protocol. So a matrix can hold the lock legitimately end to end, have
+    `window_label` report no handoff, and still have run half its reps against
+    a competitor. Every column would read clean and the contention would be
+    invisible downstream. That is the same "number that was never measured"
+    shape as the gate that expires and proceeds.
+
+    All four columns are read through `read_runnable`, including the window's
+    own start. `runnable_at_start` from `lock_columns` is the *script's*
+    reading at admission and carries a ~1-runnable instrument offset relative
+    to these (see `read_runnable`), so the honest comparison is
+    `runnable_max` against `runnable_window_start` -- like against like.
+
+    Facts, deliberately not a verdict. `lock_columns` refuses a `contended`
+    column because this host is shared by design (#1802) and there is no
+    honest threshold; that reasoning applies here unchanged. A reader compares
+    the peak against the window start and decides. A driver that shipped a
+    boolean would be inventing the threshold that was refused.
+
+    Sampling is once per cell, so a competitor that both arrives and departs
+    inside a single cell is not seen. These columns bound what was observed,
+    not what occurred.
+    """
+    seen = [s for s in samples if s is not None]
+    if not seen:
+        return {
+            "runnable_window_start": "unknown",
+            "runnable_at_end": "unknown",
+            "runnable_max": "unknown",
+            "runnable_samples": "0",
+        }
+    return {
+        "runnable_window_start": str(seen[0]),
+        "runnable_at_end": str(seen[-1]),
+        "runnable_max": str(max(seen)),
+        "runnable_samples": str(len(seen)),
+    }
+
+
 def remedy(command: str) -> str:
     """The message someone reads at the moment they are stopped.
 

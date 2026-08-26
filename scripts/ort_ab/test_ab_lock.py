@@ -27,8 +27,10 @@ from ab import (  # noqa: E402
     ancestry,
     lock_verdict,
     lock_columns,
+    occupancy_columns,
     parse_provenance,
     read_provenance,
+    read_runnable,
     window_label,
 )
 
@@ -195,6 +197,115 @@ class Columns(unittest.TestCase):
         )
 
 
+class Occupancy(unittest.TestCase):
+    """The window's occupancy, which the lock itself cannot report.
+
+    `window_label` covers custody: it says whether the declaration changed
+    hands. It cannot say whether a process that never took the lock was
+    running, and that is exactly how #1803 happened -- and how a matrix can
+    hold the lock end to end and still be contended for half its reps.
+    """
+
+    def test_the_definition_matches_the_one_hostlock_sh_uses(self):
+        # `runnable_now()` is `cut -d' ' -f4 /proc/loadavg | cut -d/ -f1`.
+        # This pins that the two read the same FIELD. It does not, and cannot,
+        # make them the same measurement: the shell reads ~1 higher because
+        # its own pipeline is runnable while it samples (see `read_runnable`).
+        # Parse-parity is worth holding on its own -- a drift to field 3 would
+        # publish a load average as a task count -- but nothing here licenses
+        # comparing `runnable_at_start` against the window's columns.
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "loadavg"
+            p.write_text("4.41 4.06 4.19 7/1223 97531\n")
+            self.assertEqual(read_runnable(str(p)), 7)
+
+    def test_an_unreadable_host_answers_none_rather_than_guessing(self):
+        # A host without /proc cannot answer this and must not appear to.
+        self.assertIsNone(read_runnable("/nonexistent/loadavg"))
+
+    def test_a_malformed_field_is_not_silently_zero(self):
+        # Zero would read as "perfectly quiet", which is the most reassuring
+        # possible answer to give to a question that was never answered.
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "loadavg"
+            p.write_text("0.00 0.00 0.00 notanumber/1223 1\n")
+            self.assertIsNone(read_runnable(str(p)))
+            short = Path(d) / "short"
+            short.write_text("0.00 0.00\n")
+            self.assertIsNone(read_runnable(str(short)))
+
+    def test_the_peak_survives_a_quiet_start_and_a_quiet_end(self):
+        # The collision this exists for: admitted on a quiet host, competitor
+        # arrives mid-sweep, leaves before the final read. Start and end both
+        # say 2. Only the peak records that anything happened.
+        cols = occupancy_columns([2, 2, 9, 8, 2])
+        self.assertEqual(cols["runnable_window_start"], "2")
+        self.assertEqual(cols["runnable_max"], "9")
+        self.assertEqual(cols["runnable_at_end"], "2")
+        self.assertEqual(cols["runnable_samples"], "5")
+
+    def test_failed_samples_are_dropped_without_dragging_the_peak_down(self):
+        cols = occupancy_columns([None, 3, None, 11, None])
+        self.assertEqual(cols["runnable_max"], "11")
+        # The first and last samples that ANSWERED, not the first and last
+        # attempts -- a leading or trailing unreadable read must not blank a
+        # window that was measured.
+        self.assertEqual(cols["runnable_window_start"], "3")
+        self.assertEqual(cols["runnable_at_end"], "11")
+        # The count is samples that ANSWERED, not attempts. A row claiming
+        # five readings when two were unreadable overstates its own evidence.
+        self.assertEqual(cols["runnable_samples"], "2")
+
+    def test_a_host_that_answered_nothing_says_so_rather_than_blank(self):
+        # Same rule as `lock_columns`: an empty CSV cell reads as "not
+        # applicable". These rows always have an answer, even when the answer
+        # is that there was none.
+        self.assertEqual(
+            occupancy_columns([None, None]),
+            {
+                "runnable_window_start": "unknown",
+                "runnable_at_end": "unknown",
+                "runnable_max": "unknown",
+                "runnable_samples": "0",
+            },
+        )
+
+    def test_the_window_carries_its_own_start_read_by_its_own_instrument(self):
+        """`runnable_at_start` is the script's reading and is NOT comparable.
+
+        `runnable_now()` is a two-process shell pipeline and counts itself in
+        `nr_running`; this module's read is a lone in-process `open()`. On
+        this box, 80 interleaved pairs gave mean `shell - python` = +1.24 with
+        the shell strictly higher 92.5% of the time, modal delta exactly +1.
+
+        So the window has to publish its own start, or the headline comparison
+        `runnable_max` vs the start would carry a ~1-runnable instrument
+        offset -- absorbing exactly the small-arrival signal these columns
+        exist to surface, and reporting a quiet host as contended-free in the
+        reassuring direction. This pins that the window's start comes from the
+        samples, not from provenance.
+        """
+        cols = occupancy_columns([4, 5, 6])
+        self.assertEqual(cols["runnable_window_start"], "4")
+        self.assertNotIn("runnable_at_start", cols)
+
+    def test_no_verdict_column_is_invented(self):
+        # `lock_columns` refuses a `contended` column because this host is
+        # shared by design (#1802) and there is no honest threshold. That
+        # reasoning applies here unchanged: emit the facts, let the reader
+        # compare. A boolean here would be inventing the refused threshold.
+        cols = occupancy_columns([1, 40])
+        self.assertEqual(
+            set(cols),
+            {
+                "runnable_window_start",
+                "runnable_at_end",
+                "runnable_max",
+                "runnable_samples",
+            },
+        )
+
+
 class Ancestry(unittest.TestCase):
     def test_the_walk_terminates_on_a_cycle(self):
         # A reparented or namespaced process can report a parent already in
@@ -294,6 +405,11 @@ class EndToEnd(unittest.TestCase):
         )
 
     def test_the_wrapped_invocation_is_admitted_and_stamps_every_row(self):
+        # Two thread counts, so the matrix emits more than one row: the window
+        # assertions below are about what is shared ACROSS rows, and a
+        # single-row matrix would pass them without testing anything.
+        args = self.ab_args()
+        args[args.index("--threads") + 1 : args.index("--threads") + 2] = ["1", "2"]
         out = subprocess.run(
             [
                 "bash",
@@ -304,7 +420,7 @@ class EndToEnd(unittest.TestCase):
                 "--reason",
                 "ab-admission-selftest",
                 "--",
-                *self.ab_args(),
+                *args,
             ],
             capture_output=True,
             text=True,
@@ -323,6 +439,23 @@ class EndToEnd(unittest.TestCase):
             self.assertEqual(row["lock_owner"], "leon-selftest", row)
             self.assertNotEqual(row["lock_anchor_pid"], "none", row)
             self.assertTrue(row["runnable_at_start"].isdigit(), row)
+            # The window columns, on a real run rather than a unit fixture.
+            # By name and value: the unit tests above prove the mapping, only
+            # this proves the driver actually stamps it.
+            self.assertTrue(row["runnable_max"].isdigit(), row)
+            self.assertTrue(row["runnable_at_end"].isdigit(), row)
+            self.assertTrue(row["runnable_window_start"].isdigit(), row)
+            # The window is seeded ONCE, before the matrix, then sampled once
+            # per cell -- so the count is exactly `cells + 1`, and the start
+            # is one reading stamped identically onto every row. Asserting the
+            # identity rather than `>= 2` is what makes this bite: dropping
+            # the per-cell sample gives 1, and re-seeding inside the loop
+            # gives 2, which a `>= 2` bound would wave through while the
+            # window silently narrowed to a single cell.
+            self.assertEqual(int(row["runnable_samples"]), len(rows) + 1, row)
+            self.assertEqual(
+                row["runnable_window_start"], rows[0]["runnable_window_start"], row
+            )
 
     def test_an_arm_with_env_overrides_still_runs(self):
         """The gate refactor deleted `import os`, and only this path uses it.
