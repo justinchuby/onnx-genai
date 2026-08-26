@@ -219,9 +219,31 @@ fn constant_of_shape_agrees() {
     );
 }
 
+fn dft_opset17_default_axis_agrees() {
+    let data = [0.0f32; 48];
+    let input = view(
+        DataType::Float32,
+        &[1, 8, 6, 1],
+        &[48, 6, 1, 1],
+        data.as_ptr().cast(),
+    );
+    assert_agree(
+        "DFT opset 17 default axis",
+        &node("DFT", 1, &[("onesided", 1)], 17),
+        17,
+        ShapeInference::Dft {
+            onesided: true,
+            axis_attr: None,
+            default_axis: 1,
+        },
+        &[input],
+        vec![typed(DataType::Float32, &[1, 8, 6, 1])],
+    );
+}
+
 #[test]
 fn migrated_shared_rules_agree() {
-    const EXPECTED_RULES: &[&str] = &["ConstantOfShape", "Expand", "STFT", "Tile"];
+    const EXPECTED_RULES: &[&str] = &["ConstantOfShape", "DFT", "Expand", "STFT", "Tile"];
     let rules = onnx_runtime_ep_plugin::compute::shared_native_rule_names_for_test();
     assert_eq!(
         rules, EXPECTED_RULES,
@@ -231,6 +253,7 @@ fn migrated_shared_rules_agree() {
     for rule in rules {
         match rule {
             "ConstantOfShape" => constant_of_shape_agrees(),
+            "DFT" => dft_opset17_default_axis_agrees(),
             "Expand" => expand_agrees_on_bidirectional_broadcast(),
             "STFT" => stft_agrees_on_overlapping_frames_and_onesided_bins(),
             "Tile" => tile_agrees(),

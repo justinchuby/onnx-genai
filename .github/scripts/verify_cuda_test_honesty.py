@@ -123,6 +123,15 @@ class ActiveResult(LibtestResult):
 
 BASE_CONFIG = FeatureConfig("without-gpu-tests", "cuda")
 GPU_CONFIG = FeatureConfig("with-gpu-tests", "cuda,gpu-tests")
+CUDA_PLUGIN_PACKAGE = "onnx-runtime-ep-cuda-plugin"
+CUDA_PLUGIN_TARGET = "cuda_unique_ort_e2e"
+CUDA_PLUGIN_FEATURES = "cuda"
+CUDA_PLUGIN_MIN_TESTS = 3
+SESSION_PACKAGE = "onnx-runtime-session"
+SESSION_HETERO_TARGET = "hetero_cuda_gpu"
+SESSION_BASE_FEATURES = "cuda,cuda-13000"
+SESSION_GPU_FEATURES = "gpu-tests,cuda-13000"
+SESSION_HETERO_MIN_TESTS = 1
 
 
 def run(command: list[str | Path]) -> subprocess.CompletedProcess[str]:
@@ -949,6 +958,151 @@ def parse_test_binaries_from_json(stdout: str) -> list[TestBinary]:
     ]
 
 
+def parse_named_test_binary_from_json(stdout: str, expected_target: str) -> TestBinary | None:
+    """Find one explicitly requested integration-test artifact in Cargo JSON."""
+    binary: TestBinary | None = None
+    for line in stdout.splitlines():
+        try:
+            message = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if message.get("reason") != "compiler-artifact":
+            continue
+        target = message.get("target", {})
+        if target.get("name") != expected_target or "test" not in target.get("kind", []):
+            continue
+        executable = message.get("executable")
+        if executable:
+            binary = TestBinary(expected_target, Path(executable))
+    return binary
+
+
+def feature_target_inventory_errors(
+    label: str,
+    binary: TestBinary | None,
+    inventory: frozenset[str],
+    minimum: int,
+) -> list[str]:
+    errors: list[str] = []
+    if binary is None:
+        errors.append(
+            f"{label}: Cargo emitted no executable for the requested feature-gated test target"
+        )
+    if len(inventory) < minimum:
+        errors.append(
+            f"{label}: feature-enabled inventory has {len(inventory)} test(s); "
+            f"expected at least {minimum}"
+        )
+    return errors
+
+
+def build_named_test_binary(
+    package: str, target: str, features: str
+) -> TestBinary:
+    result = run(
+        [
+            "cargo",
+            "test",
+            "--locked",
+            "-p",
+            package,
+            "--no-default-features",
+            "--features",
+            features,
+            "--test",
+            target,
+            "--no-run",
+            "--message-format=json",
+        ]
+    )
+    if result.returncode != 0:
+        print(result.stdout, file=sys.stderr, end="")
+        print(result.stderr, file=sys.stderr, end="")
+        raise RuntimeError(
+            f"cargo test --no-run failed for {package}/{target} with {features}"
+        )
+    binary = parse_named_test_binary_from_json(result.stdout, target)
+    errors = feature_target_inventory_errors(
+        f"{package}/{target}", binary, frozenset(), 0
+    )
+    if errors:
+        raise RuntimeError(errors[0])
+    assert binary is not None
+    return binary
+
+
+def verify_production_feature_targets() -> tuple[list[str], list[str]]:
+    """Compile and census production GPU tests without executing GPU paths."""
+    errors: list[str] = []
+
+    plugin_binary = build_named_test_binary(
+        CUDA_PLUGIN_PACKAGE, CUDA_PLUGIN_TARGET, CUDA_PLUGIN_FEATURES
+    )
+    plugin_inventory = list_inventory(plugin_binary)
+    errors.extend(
+        feature_target_inventory_errors(
+            f"{CUDA_PLUGIN_PACKAGE}/{CUDA_PLUGIN_TARGET} with {CUDA_PLUGIN_FEATURES}",
+            plugin_binary,
+            plugin_inventory,
+            CUDA_PLUGIN_MIN_TESTS,
+        )
+    )
+
+    session_base_binary = build_named_test_binary(
+        SESSION_PACKAGE, SESSION_HETERO_TARGET, SESSION_BASE_FEATURES
+    )
+    session_base_inventory = list_inventory(session_base_binary)
+    errors.extend(
+        feature_target_inventory_errors(
+            f"{SESSION_PACKAGE}/{SESSION_HETERO_TARGET} without gpu-tests",
+            session_base_binary,
+            session_base_inventory,
+            SESSION_HETERO_MIN_TESTS,
+        )
+    )
+    _, passed, failed, ignored, names = run_libtest(session_base_binary)
+    errors.extend(
+        validate_ignored_result(
+            IgnoredResult(
+                SESSION_HETERO_TARGET,
+                len(session_base_inventory),
+                passed,
+                failed,
+                ignored,
+                known_names(names, session_base_inventory),
+            )
+        )
+    )
+
+    session_gpu_binary = build_named_test_binary(
+        SESSION_PACKAGE, SESSION_HETERO_TARGET, SESSION_GPU_FEATURES
+    )
+    session_gpu_inventory = list_inventory(session_gpu_binary)
+    errors.extend(
+        feature_target_inventory_errors(
+            f"{SESSION_PACKAGE}/{SESSION_HETERO_TARGET} with gpu-tests",
+            session_gpu_binary,
+            session_gpu_inventory,
+            SESSION_HETERO_MIN_TESTS,
+        )
+    )
+    errors.extend(
+        compare_inventories(
+            {SESSION_HETERO_TARGET: session_base_inventory},
+            {SESSION_HETERO_TARGET: session_gpu_inventory},
+        )
+    )
+
+    summaries = [
+        f"{CUDA_PLUGIN_PACKAGE}/{CUDA_PLUGIN_TARGET}: "
+        f"{len(plugin_inventory)} test(s) compiled with {CUDA_PLUGIN_FEATURES}",
+        f"{SESSION_PACKAGE}/{SESSION_HETERO_TARGET}: "
+        f"{len(session_base_inventory)} test(s) present without gpu-tests and ignored; "
+        f"{len(session_gpu_inventory)} present with gpu-tests and compiled only",
+    ]
+    return summaries, errors
+
+
 def build_test_binaries(config: FeatureConfig) -> list[TestBinary]:
     result = run(
         [
@@ -1255,6 +1409,21 @@ def self_test() -> None:
     ]
     if parsed != expected:
         raise AssertionError(f"JSON parser fixture returned {parsed!r}")
+    named_binary = parse_named_test_binary_from_json(fixture_stdout, "fixture_gpu")
+    if named_binary != expected[0]:
+        raise AssertionError(f"named feature target parser returned {named_binary!r}")
+    missing_target_errors = feature_target_inventory_errors(
+        "missing-feature-target", None, frozenset(), 1
+    )
+    if not any("no executable" in error for error in missing_target_errors):
+        raise AssertionError(
+            "a missing feature-gated target must fail even before its inventory is read"
+        )
+    empty_feature_errors = feature_target_inventory_errors(
+        "empty-feature-target", expected[0], frozenset(), 1
+    )
+    if not any("inventory has 0" in error for error in empty_feature_errors):
+        raise AssertionError("an empty feature-enabled target inventory must fail")
 
     if compare_inventories({"target": frozenset({"a"})}, {"target": frozenset({"a"})}):
         raise AssertionError("matching inventories should pass")
@@ -1720,6 +1889,8 @@ def main() -> int:
     base_inventory = collect_inventories(base_binaries)
     gpu_inventory = collect_inventories(gpu_binaries)
     errors.extend(compare_inventories(base_inventory, gpu_inventory))
+    production_summaries, production_errors = verify_production_feature_targets()
+    errors.extend(production_errors)
 
     base_by_target = {binary.target: binary for binary in base_binaries}
     gpu_by_target = {binary.target: binary for binary in gpu_binaries}
@@ -1772,6 +1943,8 @@ def main() -> int:
         f"({total_ignored} ignored), {total_gpu_inventory} tests/{len(gpu_inventory)} targets with gpu-tests "
         f"({total_active_failed} fail-loud, {total_active_ignored} ignored, 0 passed on this no-CUDA host)"
     )
+    for summary in production_summaries:
+        print(f"Production feature target census passed: {summary}")
     return 0
 
 

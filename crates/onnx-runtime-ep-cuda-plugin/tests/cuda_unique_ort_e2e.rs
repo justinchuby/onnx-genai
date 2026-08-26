@@ -30,6 +30,7 @@ unsafe fn check(api: *const ort::OrtApi, status: *mut ort::OrtStatus, stage: &st
     if status.is_null() {
         return;
     }
+
     let message = unsafe {
         CStr::from_ptr(((*api).GetErrorMessage.unwrap())(status))
             .to_string_lossy()
@@ -37,6 +38,66 @@ unsafe fn check(api: *const ort::OrtApi, status: *mut ort::OrtStatus, stage: &st
     };
     unsafe { ((*api).ReleaseStatus.unwrap())(status) };
     panic!("{stage}: {message}");
+}
+
+unsafe fn assignments(
+    api: *const ort::OrtApi,
+    session: *mut ort::OrtSession,
+) -> Vec<(String, String)> {
+    let get_info = unsafe { (*api).Session_GetEpGraphAssignmentInfo.unwrap() };
+    let get_ep_name = unsafe { (*api).EpAssignedSubgraph_GetEpName.unwrap() };
+    let get_nodes = unsafe { (*api).EpAssignedSubgraph_GetNodes.unwrap() };
+    let get_op_type = unsafe { (*api).EpAssignedNode_GetOperatorType.unwrap() };
+    let mut subgraphs: *const *const ort::OrtEpAssignedSubgraph = ptr::null();
+    let mut subgraph_count = 0usize;
+    unsafe {
+        check(
+            api,
+            get_info(session, &mut subgraphs, &mut subgraph_count),
+            "Session_GetEpGraphAssignmentInfo",
+        )
+    };
+    let mut result = Vec::new();
+    for subgraph_index in 0..subgraph_count {
+        let subgraph = unsafe { *subgraphs.add(subgraph_index) };
+        let mut ep_name = ptr::null();
+        unsafe {
+            check(
+                api,
+                get_ep_name(subgraph, &mut ep_name),
+                "EpAssignedSubgraph_GetEpName",
+            )
+        };
+        let ep_name = unsafe { CStr::from_ptr(ep_name) }
+            .to_string_lossy()
+            .into_owned();
+        let mut nodes: *const *const ort::OrtEpAssignedNode = ptr::null();
+        let mut node_count = 0usize;
+        unsafe {
+            check(
+                api,
+                get_nodes(subgraph, &mut nodes, &mut node_count),
+                "EpAssignedSubgraph_GetNodes",
+            )
+        };
+        for node_index in 0..node_count {
+            let mut op_type = ptr::null();
+            unsafe {
+                check(
+                    api,
+                    get_op_type(*nodes.add(node_index), &mut op_type),
+                    "EpAssignedNode_GetOperatorType",
+                )
+            };
+            result.push((
+                ep_name.clone(),
+                unsafe { CStr::from_ptr(op_type) }
+                    .to_string_lossy()
+                    .into_owned(),
+            ));
+        }
+    }
+    result
 }
 
 struct Session {
@@ -65,6 +126,14 @@ impl Drop for Session {
 }
 
 unsafe fn session(model: &str, registration: &str) -> Option<Session> {
+    unsafe { session_with_fallback(model, registration, true) }
+}
+
+unsafe fn session_with_fallback(
+    model: &str,
+    registration: &str,
+    disable_cpu_fallback: bool,
+) -> Option<Session> {
     let ort_dir = onnx_runtime_ort_testkit::find_ort_lib_dir()?;
     let plugin_path = onnx_runtime_ort_testkit::find_plugin_cdylib_with_features(
         "onnx-runtime-ep-cuda-plugin",
@@ -132,10 +201,11 @@ unsafe fn session(model: &str, registration: &str) -> Option<Session> {
         )
     };
     let add_config = unsafe { (*api).AddSessionConfigEntry.unwrap() };
-    for (key, value) in [
-        ("session.disable_cpu_ep_fallback", "1"),
-        ("session.record_ep_graph_assignment_info", "1"),
-    ] {
+    let mut config = vec![("session.record_ep_graph_assignment_info", "1")];
+    if disable_cpu_fallback {
+        config.push(("session.disable_cpu_ep_fallback", "1"));
+    }
+    for (key, value) in config {
         let key = CString::new(key).unwrap();
         let value = CString::new(value).unwrap();
         unsafe {
@@ -143,6 +213,15 @@ unsafe fn session(model: &str, registration: &str) -> Option<Session> {
                 api,
                 add_config(options, key.as_ptr(), value.as_ptr()),
                 "AddSessionConfigEntry",
+            )
+        };
+    }
+    if !disable_cpu_fallback {
+        unsafe {
+            check(
+                api,
+                ((*api).SetSessionGraphOptimizationLevel.unwrap())(options, ort::ORT_DISABLE_ALL),
+                "SetSessionGraphOptimizationLevel",
             )
         };
     }
@@ -170,7 +249,15 @@ unsafe fn session(model: &str, registration: &str) -> Option<Session> {
     let text = std::fs::read_to_string(&fixture).unwrap();
     let parsed = onnx_std::textproto::from_textproto(&text)
         .unwrap_or_else(|error| panic!("{model}: parse textproto: {error}"));
-    verify_fixture(model, &parsed);
+    if matches!(model, "dft_device_shape" | "stft_device_shape") {
+        verify_signal_fixture(model, &parsed);
+    } else if model == "squeeze_device_axes" {
+        verify_squeeze_fixture(&parsed);
+    } else if model == "reduce_sum_device_axes" {
+        verify_reduce_sum_fixture(&parsed);
+    } else {
+        verify_fixture(model, &parsed);
+    }
     let bytes = ort_fixture_bytes(&text);
     let mut session = ptr::null_mut();
     unsafe {
@@ -195,6 +282,89 @@ unsafe fn session(model: &str, registration: &str) -> Option<Session> {
         session,
         registration,
     })
+}
+
+fn verify_signal_fixture(name: &str, model: &onnx_std::Model) {
+    use onnx_runtime_ir::DataType;
+
+    assert_eq!(model.metadata.ir_version, 11);
+    assert_eq!(model.graph.opset_imports.get("").copied(), Some(17));
+    assert!(model.graph.initializers.is_empty());
+    assert_eq!(
+        model.graph.inputs.len(),
+        if name == "dft_device_shape" { 2 } else { 3 }
+    );
+    assert_eq!(model.graph.outputs.len(), 1);
+    let input = model.graph.value(model.graph.inputs[0]);
+    let output = model.graph.value(model.graph.outputs[0]);
+    assert_eq!(input.name.as_deref(), Some("X"));
+    assert_eq!(input.dtype, DataType::Float32);
+    assert_eq!(output.name.as_deref(), Some("Y"));
+    assert_eq!(output.dtype, DataType::Float32);
+    let nodes: Vec<_> = model.graph.nodes.iter().map(|(_, node)| node).collect();
+    let signal_op = if name == "dft_device_shape" {
+        "DFT"
+    } else {
+        "STFT"
+    };
+    assert!(nodes.iter().any(|node| node.op_type == signal_op));
+    assert!(
+        nodes.iter().any(|node| node.op_type == "Identity"),
+        "{name}: scalar metadata must pass through a device-capable producer"
+    );
+}
+
+fn verify_squeeze_fixture(model: &onnx_std::Model) {
+    use onnx_runtime_ir::DataType;
+
+    assert_eq!(model.metadata.ir_version, 11);
+    assert_eq!(model.graph.opset_imports.get("").copied(), Some(13));
+    assert!(model.graph.initializers.is_empty());
+    assert_eq!(model.graph.inputs.len(), 2);
+    assert_eq!(model.graph.outputs.len(), 1);
+    let input = model.graph.value(model.graph.inputs[0]);
+    let axes = model.graph.value(model.graph.inputs[1]);
+    let output = model.graph.value(model.graph.outputs[0]);
+    assert_eq!(input.name.as_deref(), Some("X"));
+    assert_eq!(input.dtype, DataType::Float32);
+    assert_eq!(axes.name.as_deref(), Some("axes_input"));
+    assert_eq!(axes.dtype, DataType::Int64);
+    assert_eq!(output.name.as_deref(), Some("Y"));
+    assert_eq!(output.dtype, DataType::Float32);
+    let nodes: Vec<_> = model.graph.nodes.iter().map(|(_, node)| node).collect();
+    assert!(nodes.iter().any(|node| node.op_type == "Identity"));
+    assert!(nodes.iter().any(|node| node.op_type == "Squeeze"));
+}
+
+fn verify_reduce_sum_fixture(model: &onnx_std::Model) {
+    use onnx_runtime_ir::DataType;
+
+    assert_eq!(model.metadata.ir_version, 11);
+    assert_eq!(model.graph.opset_imports.get("").copied(), Some(13));
+    assert!(model.graph.initializers.is_empty());
+    assert_eq!(model.graph.inputs.len(), 2);
+    assert_eq!(model.graph.outputs.len(), 1);
+    let input = model.graph.value(model.graph.inputs[0]);
+    let axes = model.graph.value(model.graph.inputs[1]);
+    let output = model.graph.value(model.graph.outputs[0]);
+    assert_eq!(input.name.as_deref(), Some("X"));
+    assert_eq!(input.dtype, DataType::Float32);
+    assert_eq!(axes.name.as_deref(), Some("axes_input"));
+    assert_eq!(axes.dtype, DataType::Int64);
+    assert_eq!(output.name.as_deref(), Some("Y"));
+    assert_eq!(output.dtype, DataType::Float32);
+    let nodes: Vec<_> = model.graph.nodes.iter().map(|(_, node)| node).collect();
+    assert!(nodes.iter().any(|node| node.op_type == "Identity"));
+    let reduction = nodes
+        .iter()
+        .find(|node| node.op_type == "ReduceSum")
+        .expect("ReduceSum fixture node");
+    assert_eq!(
+        reduction
+            .attr("keepdims")
+            .and_then(onnx_runtime_ir::Attribute::as_int),
+        Some(0)
+    );
 }
 
 fn ort_fixture_bytes(text: &str) -> Vec<u8> {
@@ -890,6 +1060,151 @@ fn cuda_nms_dynamic_output_runs_through_real_ort_plugin() {
         ((*session.api).ReleaseValue.unwrap())(output);
         for value in values {
             ((*session.api).ReleaseValue.unwrap())(value);
+        }
+    }
+}
+
+#[test]
+fn cuda_shape_value_ops_decline_before_device_scalar_host_reads() {
+    struct RestorePartialClaim(Option<std::ffi::OsString>);
+    impl Drop for RestorePartialClaim {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(value) => unsafe {
+                    std::env::set_var("ONNX_GENAI_PLUGIN_PARTIAL_GPU_CLAIM", value)
+                },
+                None => unsafe { std::env::remove_var("ONNX_GENAI_PLUGIN_PARTIAL_GPU_CLAIM") },
+            }
+        }
+    }
+
+    let _lock = lock_ort();
+    let _restore = RestorePartialClaim(std::env::var_os("ONNX_GENAI_PLUGIN_PARTIAL_GPU_CLAIM"));
+    unsafe { std::env::set_var("ONNX_GENAI_PLUGIN_PARTIAL_GPU_CLAIM", "1") };
+    for (fixture, op_type, input_shape, output_shape) in [
+        (
+            "dft_device_shape",
+            "DFT",
+            vec![1i64, 8, 6, 1],
+            vec![1i64, 5, 6, 2],
+        ),
+        (
+            "stft_device_shape",
+            "STFT",
+            vec![1i64, 8, 1],
+            vec![1i64, 3, 3, 2],
+        ),
+        (
+            "squeeze_device_axes",
+            "Squeeze",
+            vec![1i64, 1, 3],
+            vec![1i64, 3],
+        ),
+        (
+            "reduce_sum_device_axes",
+            "ReduceSum",
+            vec![2i64, 3, 4],
+            vec![2i64, 4],
+        ),
+    ] {
+        let registration = format!("cuda_shape_{op_type}");
+        let Some(session) = (unsafe { session_with_fallback(fixture, &registration, false) })
+        else {
+            if std::env::var("NXRT_REQUIRE_ORT_TESTS").as_deref() == Ok("1") {
+                panic!("CUDA plugin or ORT unavailable for {fixture}");
+            }
+            return;
+        };
+        unsafe {
+            let assigned = assignments(session.api, session.session);
+            assert!(
+                assigned
+                    .iter()
+                    .any(|(ep, op)| ep == "cuda_ep" && op == "Identity"),
+                "{fixture}: scalar Identity must execute on CUDA so its output is device-resident; \
+                     assignments={assigned:?}"
+            );
+            assert!(
+                !assigned
+                    .iter()
+                    .any(|(ep, op)| ep == "cuda_ep" && op == op_type),
+                "{fixture}: {op_type} must decline before plugin Compute can host-read its device \
+                     scalar; assignments={assigned:?}"
+            );
+
+            let elements = input_shape.iter().product::<i64>() as usize;
+            let mut values = vec![0.0f32; elements];
+            let input_value = tensor(
+                session.api,
+                &mut values,
+                &input_shape,
+                ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+            );
+            let mut scalar_storage = match op_type {
+                "DFT" => vec![8i64],
+                "STFT" => vec![2i64, 4],
+                "Squeeze" => vec![0i64],
+                "ReduceSum" => vec![1i64],
+                other => panic!("unhandled device-shape fixture op {other}"),
+            };
+            let mut input_values = vec![input_value];
+            for scalar in &mut scalar_storage {
+                let metadata_shape: &[i64] = if matches!(op_type, "Squeeze" | "ReduceSum") {
+                    &[1]
+                } else {
+                    &[]
+                };
+                input_values.push(tensor(
+                    session.api,
+                    std::slice::from_mut(scalar),
+                    metadata_shape,
+                    ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64,
+                ));
+            }
+            let input_names: Vec<CString> = match op_type {
+                "DFT" => vec!["X", "dft_length_input"],
+                "STFT" => vec!["X", "frame_step_input", "frame_length_input"],
+                "Squeeze" => vec!["X", "axes_input"],
+                "ReduceSum" => vec!["X", "axes_input"],
+                other => panic!("unhandled device-shape fixture op {other}"),
+            }
+            .into_iter()
+            .map(|name| CString::new(name).unwrap())
+            .collect();
+            let input_name_ptrs: Vec<_> = input_names.iter().map(|name| name.as_ptr()).collect();
+            let input_value_ptrs: Vec<_> = input_values
+                .iter()
+                .map(|value| *value as *const ort::OrtValue)
+                .collect();
+            let output_name = CString::new("Y").unwrap();
+            let mut output = ptr::null_mut();
+            check(
+                session.api,
+                ((*session.api).Run.unwrap())(
+                    session.session,
+                    ptr::null(),
+                    input_name_ptrs.as_ptr(),
+                    input_value_ptrs.as_ptr(),
+                    input_values.len(),
+                    [output_name.as_ptr()].as_ptr(),
+                    1,
+                    &mut output,
+                ),
+                "Run device-shape fallback",
+            );
+            let (actual_shape, dtype, bytes) = output_bytes(session.api, output);
+            assert_eq!(actual_shape, output_shape);
+            assert_eq!(dtype, ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT);
+            assert!(
+                bytes
+                    .chunks_exact(4)
+                    .all(|value| f32::from_ne_bytes(value.try_into().unwrap()) == 0.0),
+                "{fixture}: zero input must produce zero output"
+            );
+            ((*session.api).ReleaseValue.unwrap())(output);
+            for value in input_values {
+                ((*session.api).ReleaseValue.unwrap())(value);
+            }
         }
     }
 }

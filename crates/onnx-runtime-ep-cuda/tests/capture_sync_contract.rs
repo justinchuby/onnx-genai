@@ -150,7 +150,7 @@ fn allowlisted_unconditional_syncs() -> BTreeSet<String> {
         // Declares CaptureSupport::unsupported: the Phase-2a workspace path
         // allocates per-call scratch and drains the trailing transpose before
         // returning it to the pool. Same shape as packed_varlen_attention below.
-        "multi_head_attention.rs::execute".to_string(),
+        "multi_head_attention.rs::synchronize_runtime".to_string(),
         "nary.rs::run".to_string(),
         // DeviceWorkspace prepare must copy the scalar count D2H so ORT can
         // allocate the dynamic output before materialize. The per-kernel audit

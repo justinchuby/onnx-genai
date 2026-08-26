@@ -81,6 +81,19 @@ jobs:
           # Only an explicit, fully-classified all-docs diff flips it to true.
           docs_only=false
 
+          # Use and test the same predicate that classifies the real diff. A
+          # broken/missing classifier cannot abort this job and make dependent
+          # required checks skip: it marks the instrument unhealthy below,
+          # which forces full CI.
+          scope_classifier_ok=false
+          if [ -r .github/scripts/ci_change_scope.sh ] \
+            && . .github/scripts/ci_change_scope.sh \
+            && ci_change_scope_self_test; then
+            scope_classifier_ok=true
+          else
+            echo "change-scope classifier missing or failed its self-test"
+          fi
+
           # A file whose bytes are compiled into an artifact is source, whatever
           # its extension. `include_str!`/`include_bytes!` make a markdown file
           # part of the build, so a docs-only edit to one can break `cargo test`
@@ -128,7 +141,7 @@ jobs:
 
           # A scan that found nothing and a scan that cannot find anything are
           # the same two lines of log. If the regex, the pathspec or perl ever
-          # stops matching, `embedded` is empty, is_docs_path never blocks, and
+          # stops matching, `embedded` is empty, ci_is_docs_path never blocks, and
           # this guard is inert -- reopening #2077 behind a green run. So report
           # the count, and treat zero as a broken instrument rather than as an
           # answer: this repo has 149 such targets and cannot legitimately
@@ -143,20 +156,6 @@ jobs:
             echo "embed scan resolved no targets; the scan itself is broken"
             embed_scan_ok=false
           fi
-
-          is_docs_path() {
-            case "$1" in
-              docs/*|wiki/*|*.md|*.mdx|*.markdown|LICENSE|NOTICE)
-                ;;
-              *)
-                return 1 ;;
-            esac
-            # Compiled into an artifact => source, not docs.
-            if [ -n "$embedded" ] && printf '%s\n' "$embedded" | grep -qxF -- "$1"; then
-              return 1
-            fi
-            return 0
-          }
 
           files=""
           case "$EVENT_NAME" in
@@ -184,14 +183,14 @@ jobs:
               ;;
           esac
 
-          if [ "$embed_scan_ok" != true ]; then
-            echo "embedded-file scan failed; classifying as code (fail closed)"
+          if [ "$embed_scan_ok" != true ] || [ "$scope_classifier_ok" != true ]; then
+            echo "change-scope instrument failed; classifying as code (fail closed)"
             docs_only=false
           elif [ -n "$files" ]; then
             docs_only=true
             while IFS= read -r f; do
               [ -z "$f" ] && continue
-              if ! is_docs_path "$f"; then
+              if ! ci_is_docs_path "$f" "$embedded"; then
                 docs_only=false
                 break
               fi
@@ -321,6 +320,20 @@ jobs:
         run: >-
           cargo build --locked
           -p onnx-genai-bench --features bench-native --bin profile_native
+      # The broad offline package run below includes this target, but a
+      # dedicated guarded step keeps the repository-wide fixture census visible
+      # in a required check and refuses a zero-test target. The guard checks a
+      # positive textproto floor plus sentinels rooted in unrelated fixture
+      # trees, as well as the zero-binary invariant.
+      - name: Verify checked-in ONNX fixture census
+        shell: bash
+        run: |
+          # shellcheck source=scripts/test_step.sh
+          . ./scripts/test_step.sh
+          run_test_step "checked-in ONNX fixture census" \
+            cargo test --locked \
+            -p onnx-genai-metadata \
+            --test textproto_fixtures
       # The package set is resolved into a variable before use, never
       # substituted inline. As `cargo test $(resolver ...)` a resolver failure
       # expands to nothing and leaves a bare `cargo test`, which exits 0 having
@@ -427,6 +440,18 @@ jobs:
       # `main` with both required checks green; #2015 is the general case.
       - name: Verify every workspace crate is tested by a required lane
         run: python .github/scripts/workspace_test_packages.py verify-required-tier
+
+      # Both gates above read `ci.yml` and nothing else, so the stray-key rule
+      # that refuses a job nested one level too far never looked at the other
+      # 23 workflow files. Measured on `diff-guard.yml`: nesting `root-files`
+      # two spaces deeper is valid YAML, drops the root allowlist from what
+      # GitHub runs, and `verify`, `verify-required-tier` and `self-test` all
+      # returned 0. `ci.yml` escapes that only because branch protection blocks
+      # on a missing required check, and a file with no required job in it has
+      # no such backstop. Scope and host are separate choices: this reads every
+      # workflow file, from a job the ruleset requires. See #2206.
+      - name: Verify every workflow still defines the jobs it is recorded as defining
+        run: python .github/scripts/workspace_test_packages.py verify-workflow-integrity
 
       # Both gates above are the kind that pass by seeing nothing, so each one
       # is asked to fail on demand and is judged on what it *names*, not on its
@@ -1275,9 +1300,11 @@ jobs:
       # CUDA uses dynamic loading, so compile coverage needs no GPU or toolkit.
       # The CUDA integration tests are compiled and reported as ignored unless
       # the `gpu-tests` feature is enabled on a real CUDA runner. ORT-linked
-      # crates stay out of portable tests because onnx-genai-ort-sys downloads
-      # native ORT; onnx-runtime-python's feature check here provides compile
-      # coverage for that integration path.
+      # crates stay out of portable execution because onnx-genai-ort-sys
+      # downloads native ORT; the inventory step below deliberately pays that
+      # setup cost to compile (but not execute) the CUDA plugin E2E target.
+      # onnx-runtime-python's feature check here provides compile coverage for
+      # that integration path.
       - name: Check CUDA execution provider and Python feature
         run: >-
           cargo check --locked
@@ -1299,7 +1326,14 @@ jobs:
       #
       # The job still fails if any of them fails; this only stops one step's
       # failure from silencing gates that have nothing to do with it.
-      - name: Verify CUDA test inventory and skip honesty
+      # Besides the broad EP/memory inventory, this compiles and lists the
+      # exact production targets that had been absent from CI:
+      # onnx-runtime-ep-cuda-plugin/cuda_unique_ort_e2e with `cuda`, and
+      # onnx-runtime-session/hetero_cuda_gpu both without and with `gpu-tests`.
+      # The base hetero inventory is executed only to prove its device test is
+      # ignored; both feature-enabled GPU paths are compile/list-only because
+      # GitHub-hosted runners have no CUDA device.
+      - name: Verify CUDA and production feature test inventories
         if: ${{ !cancelled() }}
         run: python .github/scripts/verify_cuda_test_honesty.py
 
