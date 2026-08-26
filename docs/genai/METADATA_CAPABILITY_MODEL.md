@@ -327,7 +327,7 @@ provenance instead hashes the exact generated deployment files.
 The collection API resolved
 [`justinchuby/onnx-genai-inference-metadata-examples`](https://huggingface.co/collections/justinchuby/onnx-genai-inference-metadata-examples)
 to 29 items at publication time: 28 model repositories plus the
-[`onnx-genai-inference-metadata-catalogue`](https://huggingface.co/datasets/justinchuby/onnx-genai-inference-metadata-catalogue/tree/6df78ce20485fbe41c807186ec554c18f7575554)
+[`onnx-genai-inference-metadata-catalogue`](https://huggingface.co/datasets/justinchuby/onnx-genai-inference-metadata-catalogue/tree/8ba416600109201e10256841e20f0c1d2777af6e)
 dataset. Every model now publishes `inference_metadata.annotated.yaml` beside
 an unchanged canonical `inference_metadata.yaml`, and its README links the
 companion. Comments are tailored to the actual model form and cover top-level
@@ -341,7 +341,7 @@ all 56 exact-revision files pass current metadata-only shape validation. The
 automated check is
 [`scripts/validate_hf_metadata_annotations.py`](../../scripts/validate_hf_metadata_annotations.py).
 The catalogue dataset publishes the same check plus a machine-readable
-[`annotation_inventory.json`](https://huggingface.co/datasets/justinchuby/onnx-genai-inference-metadata-catalogue/blob/6df78ce20485fbe41c807186ec554c18f7575554/annotation_inventory.json).
+[`annotation_inventory.json`](https://huggingface.co/datasets/justinchuby/onnx-genai-inference-metadata-catalogue/blob/8ba416600109201e10256841e20f0c1d2777af6e/annotation_inventory.json).
 
 Canonical producer provenance remains authoritative:
 
@@ -524,7 +524,7 @@ Ordered annotated references:
    [§1.4](#14-policy-graph-means-executable-semantics);
 2. the complete [published annotation inventory](#published-collection-annotations)
    and its machine-readable
-   [catalogue record](https://huggingface.co/datasets/justinchuby/onnx-genai-inference-metadata-catalogue/blob/6df78ce20485fbe41c807186ec554c18f7575554/annotation_inventory.json);
+   [catalogue record](https://huggingface.co/datasets/justinchuby/onnx-genai-inference-metadata-catalogue/blob/8ba416600109201e10256841e20f0c1d2777af6e/annotation_inventory.json);
 3. the in-tree [catalogue](../../examples/inference_metadata/catalogue/README.md),
    especially decoder/static cache examples 1 and 18, multimodal/diffusion
    examples 3 and 7–9, adapters/speculation examples 10–11 and 20–24, and
