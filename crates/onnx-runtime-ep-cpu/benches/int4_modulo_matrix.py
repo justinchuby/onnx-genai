@@ -314,6 +314,19 @@ def decode_matrix(rounds, block, tokens):
                 samples[arm].append(rec["steady"])
             cold_samples[arm].append(rec.get("cold", float("nan")))
         print(f"  decode round {r + 1}/{rounds} done", flush=True)
+    # Same guard as the prefill matrix, and it has to be here rather than only
+    # there: a fully starved `before` or `aa` reaches `ratio_stats` and dies on
+    # `no median for empty data`, while a fully starved `after` returns the
+    # generic "no parseable decode samples" below -- which names neither the
+    # gate nor the arm, and so reads as a parsing bug rather than an admission
+    # one.
+    starved = [a for a in arms if attempts[a] and discarded[a] == attempts[a]]
+    if starved:
+        raise SystemExit(
+            f"cpu-efficiency gate (floor {CPU_EFF_FLOOR}) discarded every decode launch "
+            f"of {', '.join(starved)} -- no sample survives to compare. "
+            f"admission={admission_columns(discarded, attempts)}"
+        )
     if not samples["after"]:
         return (
             {"error": "no parseable decode samples", "raw": raw},

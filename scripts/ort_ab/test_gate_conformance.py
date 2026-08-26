@@ -2673,6 +2673,31 @@ class GateAdmission(unittest.TestCase):
         for arm in ("before", "after", "aa"):
             self.assertIn(arm, message)
 
+    def test_the_decode_matrix_names_a_starved_arm_too(self):
+        """The guard has to exist on both matrices, not just the prefill one.
+
+        Review caught the first version of this change claiming, in the
+        report, that the *instrument* now names a starved arm, when the guard
+        was only in `prefill_matrix`. A fully starved `before` or `aa` reached
+        `ratio_stats` here and died on `no median for empty data` -- the exact
+        error the claim said was retired -- and a fully starved `after` hit the
+        generic "no parseable decode samples" return, which reads as a parsing
+        bug rather than an admission one.
+        """
+        m = self._harness()
+
+        def only_before_starved(binary, env_extra, timeout=1800):
+            arm = Path(binary).name.replace("decode_", "")
+            eff = 0.10 if arm == "before" else 0.99
+            return {"steady": 1.0, "cold": 2.0, "checksum": "x", "raw": "r"}, eff
+
+        with unittest.mock.patch.object(m, "decode_launch", only_before_starved):
+            with self.assertRaises(SystemExit) as caught:
+                m.decode_matrix(2, 16, 8)
+        message = str(caught.exception)
+        self.assertIn("discarded every decode launch", message)
+        self.assertIn("before", message)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=1)
