@@ -2696,7 +2696,11 @@ class GateAdmission(unittest.TestCase):
                 m.decode_matrix(2, 16, 8)
         message = str(caught.exception)
         self.assertIn("discarded every decode launch", message)
-        self.assertIn("before", message)
+        # Assert the *starved list*, not a bare "before" -- that substring also
+        # appears in the embedded `by_arm` dict whichever arm is starved, so it
+        # would pass under a wrong-arm attribution.
+        self.assertIn("launch of before --", message)
+        self.assertNotIn("after", message.split("--")[0])
 
 
 if __name__ == "__main__":
