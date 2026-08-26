@@ -543,15 +543,34 @@ def function_body(source: str, name: str, start_line: int = 1) -> str | None:
 
 
 def tests_missing_suite_lock(source: str, lock_function: str) -> list[TestItem]:
-    """Tests whose first code statement is not the target's suite lock."""
+    """Tests that do not hold the target's suite lock through function exit.
+
+    The accepted shape deliberately binds the guard as the first statement and
+    never names that binding again. A Rust local otherwise lives to the end of
+    its enclosing function, so this proves the critical section includes every
+    later operation and assertion. Any later identifier use fails closed: it
+    covers explicit/qualified `drop`, assignment, shadowing, and moving the
+    guard into a call or shorter scope without pretending this source guard is
+    a complete Rust parser. Comments and literals are already blanked by
+    `function_body`, so prose cannot manufacture a premature release.
+    """
     first_statement = re.compile(
-        rf"\s*let\s+(?:[A-Za-z][A-Za-z0-9_]*|_[A-Za-z0-9_]+)\s*=\s*"
+        rf"\s*let\s+(?:mut\s+)?(?P<guard>[A-Za-z][A-Za-z0-9_]*|_[A-Za-z0-9_]+)\s*=\s*"
         rf"{re.escape(lock_function)}\s*\(\s*\)\s*;"
     )
     missing: list[TestItem] = []
     for item in test_items(source):
         body = function_body(source, item.name, item.line)
-        if body is None or first_statement.match(body) is None:
+        acquisition = first_statement.match(body) if body is not None else None
+        if acquisition is None:
+            missing.append(item)
+            continue
+        guard = acquisition.group("guard")
+        later_guard_use = re.search(
+            rf"(?<![A-Za-z0-9_]){re.escape(guard)}(?![A-Za-z0-9_])",
+            body[acquisition.end() :],
+        )
+        if later_guard_use is not None:
             missing.append(item)
     return missing
 
@@ -629,8 +648,9 @@ def suite_isolation_errors(
         for item in tests_missing_suite_lock(source, lock_function):
             errors.append(
                 f"{relative}:{item.line}: {item.name} must acquire {lock_function}() "
-                "as its first statement so EP construction, execution, telemetry, and "
-                "assertions share one critical section"
+                "as its first statement and keep that guard live through function exit "
+                "so EP construction, execution, telemetry, and assertions share one "
+                "critical section"
             )
     return errors
 
@@ -1354,6 +1374,45 @@ def self_test() -> None:
             "#[test]\nfn a() {\n    let _ = lock_gpu();\n    run();\n}\n",
             ["a"],
         ),
+        # Acquiring first is insufficient if the guard is explicitly ended.
+        (
+            "#[test]\nfn a() {\n    let _suite_lock = lock_gpu();\n"
+            "    drop(_suite_lock);\n    run();\n}\n",
+            ["a"],
+        ),
+        (
+            "#[test]\nfn a() {\n    let _suite_lock = lock_gpu();\n"
+            "    std::mem::drop(_suite_lock);\n    run();\n}\n",
+            ["a"],
+        ),
+        (
+            "#[test]\nfn a() {\n    let _suite_lock = lock_gpu();\n"
+            "    { core::mem::drop(_suite_lock); }\n    run();\n}\n",
+            ["a"],
+        ),
+        # Rebinding, assignment, and moves can also end the original guard.
+        (
+            "#[test]\nfn a() {\n    let _suite_lock = lock_gpu();\n"
+            "    let _suite_lock = ();\n    run();\n}\n",
+            ["a"],
+        ),
+        (
+            "#[test]\nfn a() {\n    let mut suite_lock = lock_gpu();\n"
+            "    suite_lock = lock_gpu();\n    run();\n}\n",
+            ["a"],
+        ),
+        (
+            "#[test]\nfn a() {\n    let _suite_lock = lock_gpu();\n"
+            "    consume(_suite_lock);\n    run();\n}\n",
+            ["a"],
+        ),
+        # Masked comments and literals must not look like guard uses.
+        (
+            "#[test]\nfn a() {\n    let _suite_lock = lock_gpu();\n"
+            "    // std::mem::drop(_suite_lock);\n"
+            "    let note = \"drop(_suite_lock)\";\n    run();\n}\n",
+            [],
+        ),
     ):
         names = [item.name for item in tests_missing_suite_lock(source, "lock_gpu")]
         if names != expected:
@@ -1631,7 +1690,7 @@ def main() -> int:
             f"CUDA test source scan passed over {len(policed)} CUDA test targets: "
             "every test carries an ignore and is present with gpu-tests off; "
             f"{len(EXPECTED_SUITE_ISOLATION_TARGETS)} resource-sensitive targets acquire their "
-            "suite lock before test work"
+            "suite lock before test work and keep its guard live through function exit"
         )
         return 0
 
