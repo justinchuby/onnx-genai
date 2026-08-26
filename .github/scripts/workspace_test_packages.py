@@ -969,11 +969,57 @@ def required_lane_commands(skip_lane: str | None = None) -> tuple[list[str], set
 # existed. Measured, on the real workflow, before writing it: all three of
 # `verify`, `verify-required-tier` and `self-test` exited 0 with the sole
 # Windows executor of the ORT-backed tests removed.
-_WINDOWS_RUNNER = re.compile(r"windows-[A-Za-z0-9_.-]+")
-_RUNS_ON = re.compile(r"^\s{4}runs-on:\s*(.+?)\s*$", re.MULTILINE)
+_WINDOWS_RUNNER = re.compile(r"windows-(?!msvc\b|gnu)[A-Za-z0-9_.-]+")
+_RUNS_ON = re.compile(r"^\ {4}runs-on:\s*(.+?)\s*$", re.MULTILINE)
 _STRATEGY_BLOCK = re.compile(
     r"^\ {4}strategy:\s*$\n(?P<body>(?:^(?:\ {5,}.*)?$\n?)*)", re.MULTILINE
 )
+_MATRIX_REF = re.compile(r"matrix\.([A-Za-z_][A-Za-z0-9_-]*)")
+_MATRIX_KEY = re.compile(
+    r"^(?P<indent>\s*)(?P<dash>-\s+)?(?P<key>[A-Za-z_][A-Za-z0-9_-]*):\s*(?P<inline>.*)$"
+)
+
+
+def _matrix_values(body: str, keys: set[str]) -> str:
+    """Values of the named matrix keys only, never the whole `strategy:` block.
+
+    Reading the entire block reopens the hole this function exists to close: a
+    matrix that carries `target: x86_64-pc-windows-msvc` beside
+    `os: ubuntu-latest` puts `windows-msvc` in the searched text, and a job that
+    only ever cross-compiles is credited as a Windows runner again. Caught in
+    review of this change, in the fix for that very over-read -- the matrix arm
+    added here exercised `os:` alone, so re-running it could never have found it.
+    """
+    match = _STRATEGY_BLOCK.search(body)
+    if match is None:
+        return ""
+    lines = match.group("body").splitlines()
+    collected: list[str] = []
+    index = 0
+    while index < len(lines):
+        entry = _MATRIX_KEY.match(lines[index])
+        # The key's own column, not the list dash's: in `- os: ubuntu-latest`
+        # the sibling `name:` sits at the same column as `os`, and measuring
+        # from the dash would swallow it as if it were `os`'s value.
+        column = (
+            len(entry.group("indent")) + len(entry.group("dash") or "") if entry else 0
+        )
+        wanted = bool(entry) and entry.group("key") in keys
+        index += 1
+        if not wanted:
+            continue
+        collected.append(_TRAILING_COMMENT.sub("", entry.group("inline")))
+        # A key written as a block list owns the deeper-indented lines below it.
+        while index < len(lines):
+            following = lines[index]
+            if not following.strip():
+                index += 1
+                continue
+            if len(following) - len(following.lstrip()) <= column:
+                break
+            collected.append(_TRAILING_COMMENT.sub("", following))
+            index += 1
+    return "\n".join(collected)
 
 
 def job_runner_labels(body: str) -> str:
@@ -992,16 +1038,26 @@ def job_runner_labels(body: str) -> str:
     today, so this is one edit away from being live rather than hypothetical.
 
     `runs-on:` alone is not enough: two jobs here say `runs-on: ${{ matrix.os }}`
-    and get their real labels from the matrix. So the `strategy:` block counts
-    too, but only when a `runs-on:` actually defers to an expression -- reading
-    it unconditionally would credit a matrix that names a Windows runner for
-    something else entirely.
+    and get their real labels from the matrix. So the matrix counts too -- but
+    only the keys the `runs-on:` expression actually names, and only their
+    values. Trailing comments are stripped, since `parse_jobs` removes whole
+    comment lines and leaves these: `runs-on: ubuntu-latest  # was
+    windows-latest` otherwise credits a Linux job on the strength of its own
+    changelog.
+
+    Under-reads on purpose. A `runs-on:` that resolves through anything other
+    than the matrix, or a flow-style `strategy: {matrix: ...}`, yields no labels
+    and the job goes uncredited; if it was the only Windows executor the gate
+    refuses by name. That direction is loud and fixable, while crediting a job
+    that never touches Windows is silent -- the same trade this file's
+    `packages_tested_by` docstring already states.
     """
-    runs_on = _RUNS_ON.findall(body)
-    text = "\n".join(runs_on)
-    if any("${{" in value for value in runs_on):
-        if match := _STRATEGY_BLOCK.search(body):
-            text += "\n" + match.group("body")
+    values = [_TRAILING_COMMENT.sub("", value).strip() for value in _RUNS_ON.findall(body)]
+    text = "\n".join(values)
+    if keys := {
+        key for value in values if "${{" in value for key in _MATRIX_REF.findall(value)
+    }:
+        text += "\n" + _matrix_values(body, keys)
     return text
 
 # Refusal reasons that are discharged *on a Windows runner only*. `job_steps`
@@ -1356,7 +1412,7 @@ def _conditional_arms() -> int:
 # Hand-maintained because `_parser_arms` is inline code rather than a table.
 # `self_test` recounts the arms it actually observed and refuses if this number
 # disagrees, so a stale value here fails loudly instead of under-reporting.
-_PARSER_ARM_COUNT = 14
+_PARSER_ARM_COUNT = 18
 
 
 # Each arm is (label, workflow text, the packages the scanner must credit).
@@ -1679,6 +1735,57 @@ def _parser_arms() -> int:
         0,
     )
 
+    # Every route review found back into the over-read this change is named for.
+    # The matrix arm above exercises `os:` only, so it could not have caught any
+    # of these -- which is the point: a battery only refutes what it varies.
+    failures += _coverage_arm(
+        "a Windows target triple in the matrix is not a Windows runner",
+        {
+            "Cross Job": (
+                "    runs-on: ${{ matrix.os }}\n"
+                "    strategy:\n      matrix:\n        include:\n"
+                "          - os: ubuntu-latest\n"
+                "            target: x86_64-pc-windows-msvc\n"
+                "    steps:\n      - name: s\n"
+                f"        run: cargo test {ort_flags} --target ${{{{ matrix.target }}}}\n"
+            )
+        },
+        1,
+    )
+    failures += _coverage_arm(
+        "a matrix key the runs-on expression never names is not read",
+        {
+            "Unrelated Key Job": (
+                "    runs-on: ${{ matrix.os }}\n"
+                "    strategy:\n      matrix:\n        include:\n"
+                "          - os: ubuntu-latest\n"
+                "            name: windows-parity-check\n"
+                "    steps:\n      - name: s\n"
+                f"        run: cargo test {ort_flags}\n"
+            )
+        },
+        1,
+    )
+    failures += _coverage_arm(
+        "a trailing comment on runs-on does not make a Linux job Windows",
+        _ort_job("ubuntu-latest  # was windows-latest until #1234"),
+        1,
+    )
+    failures += _coverage_arm(
+        "a Windows runner in a block-list matrix is still credited",
+        {
+            "Matrix List Job": (
+                "    runs-on: ${{ matrix.os }}\n"
+                "    strategy:\n      matrix:\n        os:\n"
+                "          - ubuntu-latest\n"
+                "          - windows-latest\n"
+                "    steps:\n      - name: s\n"
+                f"        run: cargo test {ort_flags}\n"
+            )
+        },
+        0,
+    )
+
     # `ok: 0 package(s) via []` was reachable, and it is the same string a
     # completely blind gate prints.
     label = "an empty ORT_BACKED is fatal rather than vacuously ok"
@@ -1900,11 +2007,17 @@ def self_test() -> int:
     actually printed. A miscount is now a failure rather than a cosmetic slip.
     """
     out_buffer, err_buffer = io.StringIO(), io.StringIO()
-    with redirect_stdout(out_buffer), redirect_stderr(err_buffer):
-        failures, claimed = _self_test_arms()
+    try:
+        with redirect_stdout(out_buffer), redirect_stderr(err_buffer):
+            failures, claimed = _self_test_arms()
+    finally:
+        # On the crash path the arms that already ran are the only evidence of
+        # where it crashed, and they exist solely in these buffers. Emitting
+        # them in `finally` keeps this function's promise to re-emit unchanged
+        # even when an arm raises something the loops do not catch.
+        sys.stdout.write(out_buffer.getvalue())
+        sys.stderr.write(err_buffer.getvalue())
     captured_out, captured_err = out_buffer.getvalue(), err_buffer.getvalue()
-    sys.stdout.write(captured_out)
-    sys.stderr.write(captured_err)
 
     observed = sum(
         1
