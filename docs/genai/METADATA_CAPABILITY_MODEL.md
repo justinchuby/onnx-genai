@@ -72,6 +72,11 @@ performance evidence. A model-family label is evidence of none of them.
    real enable/disable or fallback knob is policy; the generated plan itself
    remains derived.
 
+Core field names are reserved and fail closed when unknown. Package-local names,
+artifact port names, and registered extension identifiers are separate naming
+classes with different validation rules; see
+[reserved fields, local names, and extension identifiers](INFERENCE_METADATA_DECISIONS.md#42a-reserved-fields-local-names-and-extension-identifiers).
+
 ### 1.4 “Policy graph” means executable semantics
 
 A workflow **policy graph** is a tensor program that computes observable model
