@@ -93,6 +93,9 @@ pub struct TokenFacts {
     /// Prompt placeholder replaced by video features.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub video_token_id: Option<u32>,
+    /// Prompt placeholder replaced by audio features.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_token_id: Option<u32>,
     /// Token that opens a vision segment in a multimodal prompt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vision_start_token_id: Option<u32>,
