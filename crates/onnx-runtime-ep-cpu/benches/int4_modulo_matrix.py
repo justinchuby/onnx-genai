@@ -180,6 +180,37 @@ def ratio_stats(before_vals, after_vals):
     }
 
 
+def admission_columns(discarded, attempts):
+    """What the efficiency gate admitted, per arm and as a rate.
+
+    `total` alone is what this harness used to report, and it cannot answer the
+    question a reader actually has. "Every launch in this document passed the
+    gate" is true of any gated dataset by construction -- discarded launches
+    are not in the document -- so it conveys nothing. Keeping 17 of 18 and
+    keeping 17 of 40 are very different datasets, and only the second is at
+    real risk of having selected its reps.
+
+    `max_arm_rate - min_arm_rate` is the number that closes the selection
+    question. A gate that discards evenly across arms costs precision; a gate
+    that discards one arm twice as often is choosing which launches of that
+    arm survive, and the surviving set is no longer a fair sample of it.
+    Reported, never enforced: this harness does not know what an acceptable
+    spread is on an arbitrary host, and a threshold invented here would be the
+    same unmeasured number it exists to expose.
+    """
+    rates = {
+        arm: (discarded[arm] / attempts[arm] if attempts[arm] else 0.0)
+        for arm in attempts
+    }
+    return {
+        "total": sum(discarded.values()),
+        "by_arm": dict(discarded),
+        "attempts_by_arm": dict(attempts),
+        "rate_by_arm": rates,
+        "rate_spread": (max(rates.values()) - min(rates.values())) if rates else 0.0,
+    }
+
+
 def prefill_matrix(rounds, block, shape, m_list, extra_env=None):
     arms = ["before", "after", "aa"]
     bins = {a: os.path.join(BIN, "prefill_" + ("after" if a == "aa" else a)) for a in arms}
@@ -190,15 +221,24 @@ def prefill_matrix(rounds, block, shape, m_list, extra_env=None):
     samples = {a: {m: [] for m in m_list} for a in arms}
     cold = {a: {m: [] for m in m_list} for a in arms}
     fnv = {a: {} for a in arms}
-    discarded = 0
+    # Per arm, not one total. A single counter answers "how many launches were
+    # thrown away" but not "were they thrown away evenly", and only the second
+    # closes the selection question: the arms have genuinely different
+    # runtimes, so a fixed efficiency floor can admit them at different rates
+    # and quietly select for the launches that happened to land in a quiet
+    # window. Attempts are counted alongside, so the rate is readable from the
+    # artifact instead of inferred from `rounds`.
+    discarded = {a: 0 for a in arms}
+    attempts = {a: 0 for a in arms}
     for r in range(rounds):
         # Rotate, so no arm is permanently first in a round and no arm
         # permanently inherits another's cache and frequency state.
         order = arms[r % len(arms):] + arms[: r % len(arms)]
         for arm in order:
             rows, eff = launch(bins[arm], env)
+            attempts[arm] += 1
             if eff < CPU_EFF_FLOOR:
-                discarded += 1
+                discarded[arm] += 1
                 continue
             for m, row in rows.items():
                 if m not in samples[arm]:
@@ -207,6 +247,19 @@ def prefill_matrix(rounds, block, shape, m_list, extra_env=None):
                 cold[arm][m].append(row["cold_ms"])
                 fnv[arm].setdefault(m, set()).add(row["fnv"])
         print(f"  round {r + 1}/{rounds} done", flush=True)
+    # If the gate ate an entire arm there is nothing to compare, and the
+    # symptom without this is `statistics.StatisticsError: no median for empty
+    # data` from inside the ratio -- which names neither the arm nor the gate.
+    # The whole point of the admission columns is that a one-sided gate is
+    # visible; the totally one-sided case should not be the one that reports
+    # worst.
+    starved = [a for a in arms if attempts[a] and discarded[a] == attempts[a]]
+    if starved:
+        raise SystemExit(
+            f"cpu-efficiency gate (floor {CPU_EFF_FLOOR}) discarded every launch of "
+            f"{', '.join(starved)} -- no sample survives to compare. "
+            f"admission={admission_columns(discarded, attempts)}"
+        )
     table = []
     for m in m_list:
         row = {"m": m, "block": block, "shape": shape}
@@ -232,7 +285,7 @@ def prefill_matrix(rounds, block, shape, m_list, extra_env=None):
             len(fnv["before"].get(m, set()) | fnv["after"].get(m, set()) | fnv["aa"].get(m, set())) == 1
         )
         table.append(row)
-    return table, discarded
+    return table, admission_columns(discarded, attempts)
 
 
 def decode_matrix(rounds, block, tokens):
@@ -244,13 +297,15 @@ def decode_matrix(rounds, block, tokens):
     cold_samples = {a: [] for a in arms}
     checks = {a: set() for a in arms}
     raw = {}
-    discarded = 0
+    discarded = {a: 0 for a in arms}
+    attempts = {a: 0 for a in arms}
     for r in range(rounds):
         order = arms[r % len(arms):] + arms[: r % len(arms)]
         for arm in order:
             rec, eff = decode_launch(bins[arm], env)
+            attempts[arm] += 1
             if eff < CPU_EFF_FLOOR:
-                discarded += 1
+                discarded[arm] += 1
                 continue
             raw.setdefault(arm, rec["raw"])
             if "checksum" in rec:
@@ -260,7 +315,10 @@ def decode_matrix(rounds, block, tokens):
             cold_samples[arm].append(rec.get("cold", float("nan")))
         print(f"  decode round {r + 1}/{rounds} done", flush=True)
     if not samples["after"]:
-        return {"error": "no parseable decode samples", "raw": raw}, discarded
+        return (
+            {"error": "no parseable decode samples", "raw": raw},
+            admission_columns(discarded, attempts),
+        )
     out = {"block": block, "tokens": tokens}
     out.update(ratio_stats(samples["before"], samples["after"]))
     aa = ratio_stats(samples["aa"], samples["after"])
@@ -270,7 +328,7 @@ def decode_matrix(rounds, block, tokens):
     out["checksums"] = {a: sorted(checks[a]) for a in arms}
     out["bit_identical"] = len(checks["before"] | checks["after"] | checks["aa"]) == 1
     out["samples"] = samples
-    return out, discarded
+    return out, admission_columns(discarded, attempts)
 
 
 def route_proof(m_list, shape):
@@ -379,21 +437,41 @@ def main():
             print(f"prefill matrix block={args.block} shape={args.shape}", flush=True)
         extra_env = dict(kv.split("=", 1) for kv in args.env)
         result["extra_env"] = extra_env
-        table, disc = [], 0
+        table, disc = [], admission_columns({}, {})
         if not args.skip_prefill:
             table, disc = prefill_matrix(args.rounds, args.block, args.shape, m_list, extra_env)
         result["prefill"] = table
-        result["prefill_discarded_launches"] = disc
+        # Kept for anyone reading an older artifact; the per-arm breakdown
+        # beside it is the one that says whether the gate was even-handed.
+        result["prefill_discarded_launches"] = disc["total"]
+        result["prefill_admission"] = disc
         if not args.skip_decode:
             print("decode matrix block=16", flush=True)
             dec, ddisc = decode_matrix(args.decode_rounds, 16, args.tokens)
             result["decode"] = dec
-            result["decode_discarded_launches"] = ddisc
+            result["decode_discarded_launches"] = ddisc["total"]
+            result["decode_admission"] = ddisc
     with open(args.out, "w") as fh:
         json.dump(result, fh, indent=2)
 
     print(f"\npin=cpu{PIN}  cpu_eff floor={CPU_EFF_FLOOR}  "
           f"discarded={result['prefill_discarded_launches']}")
+    for label in ("prefill", "decode"):
+        adm = result.get(f"{label}_admission")
+        if not adm or not adm["attempts_by_arm"]:
+            continue
+        kept = {
+            a: adm["attempts_by_arm"][a] - adm["by_arm"][a] for a in adm["by_arm"]
+        }
+        print(
+            f"  {label} admitted: "
+            + ", ".join(
+                f"{a} {kept[a]}/{adm['attempts_by_arm'][a]}"
+                for a in sorted(adm["by_arm"])
+            )
+            + f"  (discard-rate spread {adm['rate_spread']:.3f}"
+            + " -- an uneven gate selects which launches of an arm survive)"
+        )
     if table:
         print(f"\nprefill block {args.block} ({args.shape}), {args.rounds} "
               f"independent launches per arm")

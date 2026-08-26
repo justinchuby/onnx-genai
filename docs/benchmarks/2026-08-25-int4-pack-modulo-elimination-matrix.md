@@ -295,7 +295,22 @@ dominated by which mode each side's launch landed in.
 runnable count sampled at run boundaries. A short run has room for a burst that
 starts after the opening sample and ends before the closing one; that is how a
 52% A/A null passed a "host clean" check during #1809. Every launch in this
-document passed the gate.
+document passed the gate: the discard count is **0** for the 61-launch sweep
+and 0 again for both pair-C sweeps, so the kept set is the attempted set and
+no launch here was selected by the gate at all.
+
+That is a property of this run, not of the instrument, and the instrument
+could not have told the difference. Until now the harness kept a single
+aggregate discard counter, which answers "how many were thrown away" but not
+"were they thrown away evenly" -- and only the second closes the question,
+because the arms have genuinely different runtimes and a fixed efficiency
+floor can therefore admit them at different rates. At a zero discard rate the
+two are the same number; at any non-zero rate they are not. `admission` in the
+result JSON now carries `by_arm`, `attempts_by_arm`, `rate_by_arm` and
+`rate_spread`, so a future sweep states its own answer rather than leaving a
+reader to assume this one's. A gate that discards every launch of an arm now
+says so by name instead of failing inside the ratio with `no median for empty
+data`.
 
 **The null arm is a separate file**, not a second run of the same path, so it
 is a genuinely independent launch that pays every per-launch cost the real arms

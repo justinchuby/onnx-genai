@@ -88,6 +88,7 @@ import re
 import subprocess
 import sys
 import unittest
+import unittest.mock
 from pathlib import Path
 
 ORT_AB = Path(__file__).resolve().parent
@@ -2580,6 +2581,97 @@ class Custody(unittest.TestCase):
         self.assertEqual(acquired_inside_a_loop(deep), [3])
 
 
+
+class GateAdmission(unittest.TestCase):
+    """A quality gate must report *who* it discarded, not just how many.
+
+    The rest of this file is static analysis. These are behavioural, because
+    the property is about accounting a reader cannot see by reading the source
+    -- whether the counter that lands in the artifact is attributed to the arm
+    that was actually rejected.
+
+    Why it matters here: `int4_modulo_matrix.py` discards any launch whose
+    rusage CPU efficiency falls below a floor, and the arms it compares have
+    genuinely different runtimes. A fixed floor can therefore admit them at
+    different rates and silently select which launches of an arm survive. The
+    harness previously kept one aggregate counter, which cannot distinguish
+    that from an even-handed gate.
+
+    The import is inside each test so a breakage in the bench module fails
+    these tests rather than the collection of this whole file.
+    """
+
+    @staticmethod
+    def _harness():
+        if str(EP_BENCHES) not in sys.path:
+            sys.path.insert(0, str(EP_BENCHES))
+        import int4_modulo_matrix
+
+        return int4_modulo_matrix
+
+    def test_the_rate_is_per_arm_and_an_empty_run_does_not_divide_by_zero(self):
+        m = self._harness()
+        cols = m.admission_columns({"before": 3, "after": 0}, {"before": 12, "after": 12})
+        self.assertEqual(cols["total"], 3)
+        self.assertEqual(cols["by_arm"], {"before": 3, "after": 0})
+        self.assertAlmostEqual(cols["rate_by_arm"]["before"], 0.25)
+        self.assertAlmostEqual(cols["rate_spread"], 0.25)
+        # A skipped matrix reports zeroes rather than raising on 0/0.
+        self.assertEqual(m.admission_columns({}, {})["rate_spread"], 0.0)
+
+    def test_a_discard_is_attributed_to_the_arm_that_was_actually_rejected(self):
+        """The assertion an aggregate counter cannot make.
+
+        Only `before` is starved. A harness that counted a total, or that
+        attributed to the wrong arm, still reports three discards -- and only
+        the per-arm breakdown says the gate was one-sided, which is exactly
+        the case where the surviving launches of that arm are a biased sample.
+        """
+        m = self._harness()
+        rounds, starved, seen = 4, "before", []
+
+        def fake_launch(binary, env_extra, timeout=1800):
+            arm = Path(binary).name.replace("prefill_", "")
+            seen.append(arm)
+            # Starve one arm on the first round only, so the arm still has
+            # surviving samples and the matrix reaches its table.
+            first_touch = seen.count(arm) == 1
+            eff = 0.10 if (arm == starved and first_touch) else 0.99
+            rows = {1: {"steady_ms": 1.0, "cold_ms": 2.0, "fnv": "abcd"}}
+            return rows, eff
+
+        with unittest.mock.patch.object(m, "launch", fake_launch):
+            _table, adm = m.prefill_matrix(rounds, 16, "shape", [1])
+
+        self.assertEqual(adm["by_arm"][starved], 1, adm)
+        self.assertEqual(adm["attempts_by_arm"][starved], rounds, adm)
+        for arm in ("after", "aa"):
+            self.assertEqual(adm["by_arm"][arm], 0, adm)
+        self.assertEqual(adm["total"], 1)
+        # Only one arm was ever rejected, so the spread is that arm's rate.
+        # An even-handed gate reads 0.0 here no matter how much it discards.
+        self.assertAlmostEqual(adm["rate_spread"], 1 / rounds)
+
+    def test_a_gate_that_eats_a_whole_arm_says_so_instead_of_dying_on_a_median(self):
+        """Without the guard this is `StatisticsError: no median for empty data`.
+
+        That message names neither the arm nor the gate, and it appears at the
+        end of a long sweep. The totally one-sided gate is the case the
+        admission columns exist for; it should not be the one that reports
+        worst.
+        """
+        m = self._harness()
+
+        def all_starved(binary, env_extra, timeout=1800):
+            return {1: {"steady_ms": 1.0, "cold_ms": 2.0, "fnv": "abcd"}}, 0.10
+
+        with unittest.mock.patch.object(m, "launch", all_starved):
+            with self.assertRaises(SystemExit) as caught:
+                m.prefill_matrix(2, 16, "shape", [1])
+        message = str(caught.exception)
+        self.assertIn("discarded every launch", message)
+        for arm in ("before", "after", "aa"):
+            self.assertIn(arm, message)
 
 
 if __name__ == "__main__":
