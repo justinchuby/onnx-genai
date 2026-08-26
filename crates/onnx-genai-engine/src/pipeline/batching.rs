@@ -159,6 +159,16 @@ pub enum BatchContractError {
         request_count: usize,
     },
     #[error(
+        "native workflow backend cannot execute grouped encoder component '{component}' with \
+         {request_count} requests: packed or padded component batching has no independently \
+         verified native capability yet; use the ORT backend or execute one request per \
+         invocation"
+    )]
+    UnsupportedNativeEncoderBatch {
+        component: String,
+        request_count: usize,
+    },
+    #[error(
         "component '{component}' batch contribution for sequence {sequence_id} carries \
          {request_count} logical requests; the grouping API requires one request per contribution"
     )]
@@ -1306,6 +1316,19 @@ pub(crate) fn component_output_ownership_companions(
         .collect()
 }
 
+#[cfg(feature = "native-backend")]
+pub(crate) fn requires_generalized_encoder_batching(declaration: &WorkflowComponent) -> bool {
+    declaration
+        .ports
+        .inputs
+        .values()
+        .chain(declaration.ports.outputs.values())
+        .any(|contract| {
+            matches!(contract.batch_layout, BatchLayout::TokenPacked { .. })
+                || !contract.padding.is_empty()
+        })
+}
+
 fn component_batch_policy(
     component: &str,
     declaration: &WorkflowComponent,
@@ -1677,7 +1700,7 @@ ports:
     }
 
     #[test]
-    fn device_companion_path_stages_only_the_metadata_snapshot() {
+    fn device_companion_path_stages_metadata_without_copying_the_payload() {
         let source = Value::from_slice_i64(&[0, 2, 5], &[3]).unwrap();
         let staged = std::cell::Cell::new(false);
         let snapshot = snapshot_companion_i64(&source, false, |value| {
@@ -1690,6 +1713,20 @@ ports:
         assert!(staged.get());
         assert_eq!(snapshot, [0, 2, 5]);
         assert_eq!(source.to_vec_i64().unwrap(), [0, 2, 5]);
+
+        let payload = Value::from_slice_f32(&[10.0, 11.0, 20.0, 21.0, 22.0], &[5, 1]).unwrap();
+        let payload_ptr = payload.data_ptr_addr().unwrap();
+        let packed = PackedTensor::new(
+            payload,
+            PackedOwnership::new(5, vec![level(&[0, 2, 5], &[0, 0, 1, 1, 1])], 2).unwrap(),
+        )
+        .unwrap();
+        let second = packed.request_view(1).unwrap();
+        assert_eq!(second.value().to_vec_f32().unwrap(), [20.0, 21.0, 22.0]);
+        assert_eq!(
+            second.value().data_ptr_addr().unwrap(),
+            payload_ptr + 2 * std::mem::size_of::<f32>()
+        );
     }
 
     #[test]

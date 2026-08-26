@@ -1916,6 +1916,7 @@ impl WorkflowRuntime {
                             component,
                             selected_component,
                             selected_declaration,
+                            request_count,
                             &component_symbols,
                             &resolved,
                             &selected_outputs,
@@ -2669,6 +2670,7 @@ impl WorkflowRuntime {
             component,
             component,
             declaration,
+            request_count,
             &component_symbols,
             inputs,
             outputs,
@@ -2716,6 +2718,7 @@ impl WorkflowRuntime {
         component: &str,
         selected_component: &str,
         selected_declaration: &onnx_genai_metadata::WorkflowComponent,
+        request_count: usize,
         component_symbols: &HashMap<String, i64>,
         resolved: &[(&str, &Value)],
         selected_outputs: &std::collections::BTreeMap<String, String>,
@@ -2725,6 +2728,19 @@ impl WorkflowRuntime {
             EngineDecodeBackend::Native => {
                 #[cfg(feature = "native-backend")]
                 {
+                    if request_count > 1
+                        && super::batching::requires_generalized_encoder_batching(
+                            selected_declaration,
+                        )
+                    {
+                        return Err(
+                            super::batching::BatchContractError::UnsupportedNativeEncoderBatch {
+                                component: selected_component.to_owned(),
+                                request_count,
+                            }
+                            .into(),
+                        );
+                    }
                     let _ = (workflow, component, selected_declaration, component_symbols);
                     let set = self.backend.native_components.as_ref().with_context(|| {
                         format!(
@@ -2746,6 +2762,7 @@ impl WorkflowRuntime {
                         component,
                         selected_component,
                         selected_declaration,
+                        request_count,
                         component_symbols,
                         resolved,
                         selected_outputs,

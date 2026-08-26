@@ -1,12 +1,14 @@
 # Generalized encoder batching metadata
 
-Status: **metadata implemented; generalized runtime grouping not implemented**.
+Status: **metadata and bounded grouped-runtime primitives implemented; automatic
+serving-queue batching remains open**.
 
 This is the design of record for batching independent encoder/media work through
 workflow components. The v1.1 schema, parser migrations, semantic validation,
-and metadata tests are shipped on `main`. The workflow interpreter,
-preprocessors, scheduler, and backend-readiness work needed to assemble and run
-groups are not shipped.
+grouped image/frame preprocessing, symbol-keyed admission, packed ownership
+composition/splitting, and ORT component invocation are implemented. The
+runtime does not yet automatically collect unrelated live requests into encoder
+queues or decode encoded video containers.
 
 The normative schema rules also appear in
 [`INFERENCE_METADATA_DECISIONS.md`](INFERENCE_METADATA_DECISIONS.md), especially
@@ -295,9 +297,11 @@ The metadata crate currently rejects:
 - a padded output also trimmed with `Emit.valid_length`;
 - an externally supplied owner map.
 
-Load-time validation checks declarations. Value-content checks such as monotonic
-offsets, in-range owners, right-padding lengths, and totals matching concrete
-tensor extents require invocation-time runtime code and are not implemented.
+Load-time validation checks declarations. Invocation-time runtime validation now
+checks monotonic offsets, terminal extents, owner lengths/ranges/order, logical
+request cardinality, and materialized capacity budgets before backend enqueue.
+The grouped preprocessor emits one valid length per physical image/frame and
+refuses unresolved empty-tensor dimensions rather than inventing extents.
 
 ## 5. Current implementation status
 
@@ -311,45 +315,46 @@ tensor extents require invocation-time runtime code and are not implemented.
 | Video preprocessing schema | Implemented with the shared vision program and `sample_frames`/`pad_frames` vocabulary |
 | Audio preprocessing schema | Implemented |
 | Text preprocessing schema | No dedicated program; typed application/runtime tensors can use the same contracts |
-| Runtime image preprocessing | Existing adapter accepts one encoded image per workflow invocation |
+| Runtime image preprocessing | Workflow adapter accepts one encoded image; `GroupedVisionPreprocessor` accepts ordered multi-image request rows and emits padding/ownership companions |
 | Runtime audio preprocessing | Existing adapter accepts one encoded audio item per workflow invocation |
-| Runtime video preprocessing | Not implemented; no `onnx-genai.video-preprocess` executor is registered |
-| Packed/padded group assembly and split | Not implemented |
-| Encoder scheduling across requests | Not implemented; the scheduler groups decode work only |
-| Backend readiness registry | Not implemented |
+| Runtime video preprocessing | Ordered pre-extracted frame images are decoded individually by the grouped vision program, producing tensors with frames → clips → requests ownership; encoded containers/temporal sampling return typed `UnsupportedExecution`, including an ordered image-then-video mixed request |
+| Packed/padded group assembly and split | Implemented for axis-0 ownership depth 1–2; companions are rebuilt, request views rebase metadata, and payload views alias without copying |
+| Encoder scheduling across requests | `group_workflow_component_inputs` deterministically groups request-local contributions under uniform dimensions and materialized budgets; automatic serving queues/materialization remain open |
+| Backend readiness | ORT grouped invocation is covered by deterministic image/video fixtures; packed/padded native workflow execution fails closed with `UnsupportedNativeEncoderBatch` |
 
-Declaring `batch_capacity` is therefore inert on current `main`: it validates,
-but no runtime automatically forms a group from it.
+Declaring `batch_capacity` is enforced at the component boundary. It is not an
+instruction to queue automatically: a caller/backend packer still chooses when
+to materialize an admitted group.
 
 ## 6. Modality acceptance matrix
 
-“Represented” means the current schema and validator can faithfully state the
-case. “Runtime” means automatic generalized grouping on current `main`.
+“Represented” means the schema and validator can faithfully state the case.
+“Runtime slice” means the bounded preprocessing/admission/ORT/split APIs are
+implemented; it does not mean automatic serving-queue collection.
 
-| Modality | Dense/padded form | Packed form | Nested form | Represented | Runtime |
+| Modality | Dense/padded form | Packed form | Nested form | Represented | Runtime slice |
 | --- | --- | --- | --- | --- | --- |
-| Image | request rows, padded tiles/patches | images → rows | normally unnecessary | yes | no |
-| Video | request rows, padded frames/patches | clips → rows or frames → rows | frames → clips → rows | yes | no |
-| Audio | request rows, padded samples/frames | windows/frames → rows | frames → windows → rows | yes | no |
-| Text encoder/reranker | request rows, padded tokens | segments/tokens → rows | tokens → segments → rows | yes | no |
+| Image | request rows, padded tiles/patches | images → rows | normally unnecessary | yes | yes, encoded images through grouped API + ORT |
+| Video | request rows, padded frames/patches | clips → rows or frames → rows | frames → clips → rows | yes | yes for ordered encoded frame images; no encoded-container decoder |
+| Audio | request rows, padded samples/frames | windows/frames → rows | frames → windows → rows | yes | contracts/admission only |
+| Text encoder/reranker | request rows, padded tokens | segments/tokens → rows | tokens → segments → rows | yes | contracts/admission only |
 
 Per-item execution is represented for every modality by omitting
 `batch_capacity`.
 
 ## 7. Required edge-case behavior
 
-The metadata represents each case below. Runtime behavior remains acceptance
-criteria for the unimplemented grouping work.
+The current bounded runtime behavior is:
 
-| Case | Metadata representation | Runtime acceptance criterion |
+| Case | Metadata representation | Current runtime behavior |
 | --- | --- | --- |
-| Empty media for one request | repeated outer offsets and no owner entries for that span | return an empty request-local result; never fabricate a placeholder |
-| Every request has zero new media | packed extent and owner vectors are empty | skip the encoder invocation |
-| Mixed media requests | separate image/video/audio/text components and queues | group per component; no modality branch in group assembly |
-| Decode with zero new media | optional-input presence or an empty span; cached encoder state may be externally supplied | reuse cached state or take the no-media branch; do not re-run an empty encoder |
+| Empty media for one request | repeated outer offsets and no owner entries for that span | preserved exactly, including empty clips inside a nonempty video request |
+| Every request has zero new media | packed extent and owner vectors are empty | empty ranked tensors execute on the ORT fixture and return empty output; no prior payload/companions are reused |
+| Mixed media requests | separate image/video/audio/text components and queues | no ordered mixed-media grouping surface yet; encoded video and temporal transforms return typed rejection rather than image reinterpretation |
+| Decode with zero new media | optional-input presence or an empty span; cached encoder state may be externally supplied | a zero-new-media turn produces fresh empty inputs/outputs and cannot observe a prior media-bearing turn |
 | Cancellation/compaction | request ownership chain plus runtime row selection | lift selection through ownership, rebuild companions, and prevent cross-request leakage |
-| Packed serving output | output plus every offsets/owner companion | return request-local slices with offsets rebased to zero; never expose invocation-global owners |
-| Padded serving output | output plus every `valid_lengths` companion | return the lengths slice indexing that request's data |
+| Packed serving output | output plus every offsets/owner companion | `PackedTensor::request_view` returns a contiguous no-copy payload alias with offsets/owners rebased |
+| Padded serving output | output plus every `valid_lengths` companion | `PackedOwnership::slice_lengths` returns the request-local magnitude slice without rebasing |
 
 An owner map is not request data. The validator forbids
 `externally_suppliable` owner maps because their positions exist only after the
@@ -381,9 +386,11 @@ preferred occupancy remain runtime measurements.
 `batch_capacity` says the artifact's contract permits grouping. It does not
 prove that every backend/provider implementation is ready.
 
-The planned execution seam must derive readiness for the resolved component and
-backend before forming a group. An unproven combination runs per item. It must
-not be probed by attempting a group in a serving process.
+The ORT workflow path has fixture-level evidence for grouped axis-0 image and
+nested-video encoder calls. Native workflow execution deliberately rejects a
+multi-request component carrying packed or padded contracts before its native
+session runs. It returns `UnsupportedNativeEncoderBatch`; it never silently
+routes the request through ORT.
 
 Backend readiness is intentionally not metadata:
 
@@ -391,25 +398,28 @@ Backend readiness is intentionally not metadata:
 - it is evidence about an implementation, not a model-package semantic;
 - declining to group preserves correctness.
 
-The existing engine `BatchingCapability` is the right kind of concept: a
-runtime-derived, operator-facing report. It is not an authored package flag and
-currently describes decoder shared-forward support only.
+The existing engine `BatchingCapability` remains decoder-focused. Generalized
+encoder grouping currently exposes admission and an explicit native refusal,
+not a provider-wide readiness registry.
 
 ## 10. Runtime work intentionally left open
 
-The following do not exist on current `main`:
+The following remain open:
 
-1. multi-item image/audio adapter inputs and a video adapter executor;
-2. host/device group assembly for dense padding and token packing;
-3. invocation-time companion validation;
-4. request-local split/rebase of packed and padded results;
-5. scheduler queues for non-decoder component work;
-6. cancellation and compaction lifting through ownership levels;
-7. per-component/backend/provider readiness evidence;
-8. end-to-end solo-versus-grouped equality tests and performance reporting.
+1. multi-item workflow adapter inputs (the grouped image/frame API is currently
+   called before the workflow boundary);
+2. encoded video-container decode, frame sampling, and temporal padding;
+3. automatic non-decoder serving queues and backend payload materialization;
+4. ordered mixed-media orchestration across image/video/audio components;
+5. cancellation and compaction lifting through ownership levels;
+6. native/provider readiness evidence sufficient to remove the fail-closed
+   packed/padded native guard;
+7. generalized audio/text preprocessing and ORT E2E fixtures;
+8. production-model and production-size performance evidence.
 
-Those changes belong in runtime preprocessing, interpreter, scheduler, and
-backend branches. They do not require another metadata capability or policy
+The current benchmark is intentionally fixture-level only; see
+[`../benchmarks/2026-08-25-media-batching-fixture.md`](../benchmarks/2026-08-25-media-batching-fixture.md).
+These remaining changes do not require another metadata capability or policy
 field.
 
 ## 11. Definition of done for runtime branches

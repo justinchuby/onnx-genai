@@ -777,10 +777,26 @@ pipeline:
 }
 
 #[test]
-fn encoded_video_adapter_fails_closed_at_the_registered_runtime_boundary() -> anyhow::Result<()> {
+fn mixed_image_and_encoded_video_fail_closed_at_the_video_runtime_boundary() -> anyhow::Result<()> {
     let metadata = r#"
 schema_version: v1.1
 preprocessing:
+  image:
+    transforms:
+      - { op: decode, outputs: [decoded] }
+      - { op: convert_rgb, inputs: [decoded], outputs: [rgb] }
+      - { op: resize, inputs: [rgb], outputs: [pixels], size: 2, mode: stretch,
+          interpolation: bilinear }
+    outputs:
+      - source: pixels
+        name: image.pixel_values
+        content: pixels
+        dtype: float32
+        contract:
+          dtype: float32
+          rank: 4
+          shape: [batch, 3, 2, 2]
+          batch_layout: { kind: request_aligned, axis: 0 }
   video:
     transforms:
       - { op: decode, outputs: [decoded] }
@@ -799,11 +815,18 @@ preprocessing:
 pipeline:
   workflow:
     manifest:
-      adapter_abis: { onnx-genai.video-preprocess: "1" }
+      adapter_abis:
+        onnx-genai.image-preprocess: "1"
+        onnx-genai.video-preprocess: "1"
       capabilities: [workflow_ssa, typed_emit]
     inputs:
+      request.image:
+        contract: { dtype: uint8, rank: 1, shape: [image_bytes] }
+        role: { kind: opaque }
+        source: { kind: application, name: image }
+        required: true
       request.video:
-        contract: { dtype: uint8, rank: 1, shape: [encoded_bytes] }
+        contract: { dtype: uint8, rank: 1, shape: [video_bytes] }
         role: { kind: opaque }
         source: { kind: application, name: video }
         required: true
@@ -817,11 +840,22 @@ pipeline:
         role: video
         stage: post_adapter
     components:
-      preprocess:
+      image_preprocess:
+        implementation: { kind: adapter, abi: onnx-genai.image-preprocess, version: "1" }
+        ports:
+          inputs:
+            encoded: { dtype: uint8, rank: 1, shape: [image_bytes] }
+          outputs:
+            pixels:
+              dtype: float32
+              rank: 4
+              shape: [batch, 3, 2, 2]
+              batch_layout: { kind: request_aligned, axis: 0 }
+      video_preprocess:
         implementation: { kind: adapter, abi: onnx-genai.video-preprocess, version: "1" }
         ports:
           inputs:
-            encoded: { dtype: uint8, rank: 1, shape: [encoded_bytes] }
+            encoded: { dtype: uint8, rank: 1, shape: [video_bytes] }
           outputs:
             pixels:
               dtype: float32
@@ -830,7 +864,11 @@ pipeline:
               batch_layout: { kind: request_aligned, axis: 0 }
     steps:
       - kind: invoke
-        component: preprocess
+        component: image_preprocess
+        inputs: { encoded: request.image }
+        outputs: { pixels: image.pixel_values }
+      - kind: invoke
+        component: video_preprocess
         inputs: { encoded: request.video }
         outputs: { pixels: video.pixel_values }
       - kind: emit
@@ -838,21 +876,44 @@ pipeline:
         output: result
         mode: replace
 "#;
-    let root = package("video-adapter-fail-closed", metadata, &[])?;
+    let root = package("mixed-media-adapter-fail-closed", metadata, &[])?;
     let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+    let png = vec![
+        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 2,
+        0, 0, 0, 144, 119, 83, 222, 0, 0, 0, 12, 73, 68, 65, 84, 120, 156, 99, 248, 207, 192, 0, 0,
+        3, 1, 1, 0, 201, 254, 146, 239, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+    ];
+    let png_len = i64::try_from(png.len())?;
     let encoded = vec![0_u8; 16];
     let request =
         PipelineGenerateRequest::new(GenerateRequest::new(GeneratePrompt::TokenIds(vec![])))
+            .with_input(
+                "image",
+                Value::from_raw_bytes(png, &[png_len], DataType::Uint8)?,
+            )
             .with_input(
                 "video",
                 Value::from_raw_bytes(encoded, &[16], DataType::Uint8)?,
             );
 
     let error = match engine.run_pipeline(request) {
-        Ok(_) => panic!("encoded video execution is not implemented"),
+        Ok(_) => panic!("mixed encoded media execution is not implemented"),
         Err(error) => error,
     };
     let message = format!("{error:#}");
+    assert!(
+        error.chain().any(|cause| {
+            matches!(
+                cause.downcast_ref::<onnx_genai_preprocess::batching::EncoderBatchingError>(),
+                Some(
+                    onnx_genai_preprocess::batching::EncoderBatchingError::UnsupportedExecution {
+                        ..
+                    }
+                )
+            )
+        }),
+        "unexpected error: {message}"
+    );
     assert!(
         message.contains("encoded video-container decode"),
         "unexpected error: {message}"

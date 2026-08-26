@@ -2100,6 +2100,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "half",
+ "image",
  "libc",
  "llguidance",
  "memmap2",
