@@ -218,6 +218,34 @@ The core is strict. Every core structure uses `deny_unknown_fields`; an unknown
 core field **MUST** fail validation. There is no "ignore what you do not know"
 mode for the core.
 
+### 4.2a Reserved fields, local names, and extension identifiers
+
+Metadata has five different naming classes. They are not interchangeable:
+
+| Naming class | Who defines it | Examples | Reader behavior |
+| --- | --- | --- | --- |
+| **Reserved schema field** | This specification and generated JSON Schema. | `pipeline`, `workflow`, `inputs`, `contract`, `dtype`, `state`, `recurrence`, `special_tokens`. | Unknown keys fail because typed core objects deny unknown fields. A producer cannot add `workflow.my_option` or `contract.vendor_hint`. |
+| **Package-local identifier/reference** | The package author, within the map or scope that owns it. | Keys under `workflow.inputs`, `outputs`, `components`, `state`, `effects`, `serving.state_service.groups`, `profiles`, adapter artifacts, and branch cases; SSA value names; component and state-group references. | The spelling is author-defined, but every reference must resolve, names must be unique in their scope, and the runtime must not infer semantics from the spelling. |
+| **Artifact-defined name** | The referenced artifact. | ONNX input/output and initializer names used by component ports, invoke bindings, optional inputs, state aliases, and adapter targets. | Must match the artifact exactly. It is not a portable semantic vocabulary and must never be guessed from a model family. |
+| **Extensible semantic identifier** | A registered producer/runtime extension, normally owner-qualified and versioned. | Capability strings, adapter ABI keys, component contract IDs, adapter application/loader IDs, checkpoint adapter IDs, constraint dialects, profile kinds, and extensible operation/vocabulary strings. | Built-ins have normative semantics. Unknown extensions may parse where the schema declares an extension branch, but execution must fail closed unless the runtime implements that exact identifier/version. |
+| **Ordinary data value** | Package contents or request contract. | Artifact locations, source URIs, revisions, symbolic dimension labels, provenance labels, and numeric bounds. | Treated as data under the surrounding reserved field; it does not create a new schema field or runtime capability. |
+
+Two rules prevent ambiguity:
+
+1. A `BTreeMap<String, ...>` does **not** automatically mean arbitrary schema
+   extension. Its keys are customizable only for the purpose documented by that
+   map. For example, `workflow.components.decoder` may use a different local
+   component name, while `ComponentContract.bindings.logits` is a semantic role
+   defined by that contract.
+2. A free-form `String` does **not** automatically mean the runtime may ignore
+   an unfamiliar value. Known vocabularies are reserved; extension branches are
+   explicit. An owner-defined identifier should use an owner-qualified name
+   such as `com.example.audio-preprocess` and a separate version, and a runtime
+   that has not registered it must reject the package.
+
+Comments are unrestricted review prose and have no parsed semantics. Adding a
+comment never creates an extension point or changes the canonical YAML object.
+
 ### 4.3 Versioning and evolution
 
 The document carries `schema_version`. Each entry in `profiles` additionally
@@ -1808,21 +1836,53 @@ data**, not metadata. What metadata carries is everything needed to interpret
 that request data correctly:
 
 ```yaml
+schema_version: v1.2
 package:
   tokenizer:
     algorithm: bpe
     vocab_size: 32000
     byte_level: true
+    special_tokens:
+      pad_token_id: 0
+      bos_token_id: 1
+      eos_token_id: [2]
     artifacts:
       - location: tokenizer.json
-    special_tokens:
-      bos: { id: 1, content: "<s>" }
-      eos: { id: 2, content: "</s>" }
   constraint_languages:
     - dialect: llguidance.lark
       version: "1"
       component: grammar
 ```
+
+Numeric model/control ids have one package authority:
+`package.tokenizer.special_tokens`. Co-locating the ids with the vocabulary
+contract makes their namespace explicit. Their text spellings, added-token
+mappings, and chat templates remain in the declared tokenizer assets and are
+not repeated in metadata.
+
+The numeric fields are `pad_token_id`, `bos_token_id`, the ordered
+`eos_token_id` list, `sep_token_id`, `decoder_start_token_id`,
+`image_token_id`, `video_token_id`, `audio_token_id`, and
+`vision_start_token_id`. A producer
+derives them from the package's authoritative source configuration. When more
+than one source is present, package-authored `genai_config.json` wins over the
+pinned `generation_config.json`, which wins over pinned model `config.json`;
+`tokenizer_config.json` is only a fallback, and a string there is resolved
+through the pinned tokenizer asset. The producer records provenance rather than
+leaving the runtime to repeat this precedence.
+
+`request.eos_ids`/`request.eos_lengths` are optional request overrides. Their
+runtime roles receive the effective request set: the explicit request set when
+present, otherwise `package.tokenizer.special_tokens.eos_token_id`. They carry
+no authored literal default and do not become a second package authority.
+
+EOS values and EOS execution are separate contracts. A portable
+`onnx-genai.termination-predicate` graph computes done/active state from the
+effective values; an `onnx-genai.token-policy` binding declares equivalent
+runtime-native semantics. Neither owns the ids. A v1.2 autoregressive workflow
+with a `generation_eos` loop must declare non-empty EOS facts and invoke one of
+those contracts. A speculative package must do the same explicitly. Encoder,
+embedding, diffusion, and other non-token-generation workflows need neither.
 
 The tokenizer's declared vocabulary facts and artifact location are part of the
 semantic contract, while byte-level integrity belongs to distribution. The

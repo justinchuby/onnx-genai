@@ -105,20 +105,20 @@ fn the_constant_an_emitter_stamps_is_the_one_it_already_stamped() {
         INITIAL_SCHEMA_VERSION
     );
     assert_eq!(INITIAL_SCHEMA_VERSION.to_string(), "v1.0");
-    assert_eq!(SUPPORTED_SCHEMA_VERSION.to_string(), "v1.1");
+    assert_eq!(SUPPORTED_SCHEMA_VERSION.to_string(), "v1.2");
 }
 
 #[test]
 fn a_newer_document_is_refused_by_version_rather_than_by_the_first_field_it_uses() {
     // This is the whole point of reading the version first. The document below
-    // is well formed at 1.2 and merely unreadable here; without the gate the
+    // is well formed at 1.3 and merely unreadable here; without the gate the
     // reader would report `unknown field` and send someone hunting for a typo.
     let document =
-        format!("schema_version: \"1.2\"\nfuture_section: {{ shape: circular }}\n{PLAIN}");
-    let error = parse_metadata(&document, Some("yaml")).expect_err("1.2 is newer than this build");
+        format!("schema_version: \"1.3\"\nfuture_section: {{ shape: circular }}\n{PLAIN}");
+    let error = parse_metadata(&document, Some("yaml")).expect_err("1.3 is newer than this build");
     let error = error.to_string();
     assert!(
-        error.contains("schema version v1.2") && error.contains("reads up to v1.1"),
+        error.contains("schema version v1.3") && error.contains("reads up to v1.2"),
         "{error}"
     );
     assert!(
@@ -140,7 +140,7 @@ fn a_version_no_one_can_compare_says_how_to_write_one() {
         .expect_err("'latest' is not a version");
     let error = error.to_string();
     assert!(error.contains("'v<major>.<minor>'"), "{error}");
-    assert!(error.contains("v1.1"), "{error}");
+    assert!(error.contains("v1.2"), "{error}");
 
     // Three components is not this grammar either, however plausible it looks.
     assert!(parse_metadata(&with_version(PLAIN, Some("v1.2.3")), Some("yaml")).is_err());
@@ -152,10 +152,10 @@ fn the_gate_is_on_the_path_a_file_takes() {
     // the real file entry point rather than the string one.
     let directory = tempfile::tempdir().expect("temporary directory");
     let path = directory.path().join("inference_metadata.yaml");
-    std::fs::write(&path, with_version(PLAIN, Some("1.2"))).expect("write the document");
+    std::fs::write(&path, with_version(PLAIN, Some("1.3"))).expect("write the document");
     let error =
-        onnx_genai_metadata::load_metadata(&path).expect_err("1.2 is newer than this build");
-    assert!(error.to_string().contains("reads up to v1.1"), "{error}");
+        onnx_genai_metadata::load_metadata(&path).expect_err("1.3 is newer than this build");
+    assert!(error.to_string().contains("reads up to v1.2"), "{error}");
 
     std::fs::write(&path, with_version(PLAIN, Some("v1"))).expect("write the document");
     onnx_genai_metadata::load_metadata(&path).expect("an old spelling still loads from a file");
@@ -166,9 +166,9 @@ fn the_gate_is_on_the_path_a_document_built_in_memory_takes() {
     // A lowering that builds its own document is exactly as capable of stamping
     // a version it does not mean as a file on disk is.
     let mut document = serde_json::json!({ "model": { "vocab_size": 32000 } });
-    document["schema_version"] = serde_json::json!("1.2");
-    let error = parse_metadata_json(&document).expect_err("1.2 is newer than this build");
-    assert!(error.to_string().contains("reads up to v1.1"), "{error}");
+    document["schema_version"] = serde_json::json!("1.3");
+    let error = parse_metadata_json(&document).expect_err("1.3 is newer than this build");
+    assert!(error.to_string().contains("reads up to v1.2"), "{error}");
 
     document["schema_version"] = serde_json::json!(SCHEMA_VERSION);
     parse_metadata_json(&document).expect("the canonical base version parses");
@@ -204,7 +204,7 @@ fn declaring_the_version_the_fields_belong_to_is_all_it_takes() {
             .unwrap_or_else(|errors| panic!("'{spelling}' is truthful: {errors:#?}"));
         assert_eq!(
             version::normalize(metadata.schema_version.as_deref()).expect("a version"),
-            SUPPORTED_SCHEMA_VERSION
+            version::BATCHING_SCHEMA_VERSION
         );
     }
 }
@@ -219,6 +219,35 @@ fn a_document_that_uses_nothing_new_is_free_to_say_nothing() {
 }
 
 #[test]
+fn tokenizer_special_tokens_require_the_version_that_introduced_them() {
+    let document = r#"
+schema_version: v1.1
+package:
+  tokenizer:
+    special_tokens:
+      eos_token_id: [2]
+"#;
+    let metadata = parse_metadata(document, Some("yaml")).expect("the document parses");
+    let errors = validate_metadata(&metadata).expect_err("the declared version is not true");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("schema version v1.2 introduced")),
+        "{errors:?}"
+    );
+
+    let document = r#"
+schema_version: v1.2
+package:
+  tokenizer:
+    special_tokens:
+      eos_token_id: [2]
+"#;
+    let metadata = parse_metadata(document, Some("yaml")).expect("the document parses");
+    validate_metadata(&metadata).expect("v1.2 truthfully declares token facts");
+}
+
+#[test]
 fn the_canonical_spelling_of_a_new_batching_document_carries_the_v() {
     // Two versions are in play and they are canonically spelled the same way.
     // `v1` is what a writer stamps on a document that uses nothing new; `v1.1`
@@ -226,7 +255,7 @@ fn the_canonical_spelling_of_a_new_batching_document_carries_the_v() {
     // the newer one would leave one schema with two house styles.
     assert_eq!(SCHEMA_VERSION, "v1");
     assert_eq!(version::BATCHING_SCHEMA_VERSION.to_string(), "v1.1");
-    assert_eq!(SUPPORTED_SCHEMA_VERSION.to_string(), "v1.1");
+    assert_eq!(SUPPORTED_SCHEMA_VERSION.to_string(), "v1.2");
 
     // And it is the spelling the document is *told* to write, not merely one the
     // reader tolerates.

@@ -12,7 +12,7 @@
 ///
 /// A package that uses a field a later version introduced states that later
 /// version instead, and must: see [`version`] and
-/// [`BATCHING_SCHEMA_VERSION`].
+/// [`BATCHING_SCHEMA_VERSION`] / [`TOKEN_AUTHORITY_SCHEMA_VERSION`].
 pub const SCHEMA_VERSION: &str = "v1";
 
 /// Built-in serialized capability identifiers.
@@ -140,6 +140,7 @@ pub use validation::{
 };
 pub use version::{
     BATCHING_SCHEMA_VERSION, INITIAL_SCHEMA_VERSION, SUPPORTED_SCHEMA_VERSION, SchemaVersion,
+    TOKEN_AUTHORITY_SCHEMA_VERSION,
 };
 
 /// Generates the inference-metadata JSON Schema with deterministic object-key ordering.

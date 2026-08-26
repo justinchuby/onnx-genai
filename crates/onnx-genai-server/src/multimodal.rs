@@ -301,8 +301,7 @@ pub fn audio_decoder_prompt(
     let mut tokens = vec![
         tokenizer
             .token_id("<|startoftranscript|>")
-            .or_else(|| tokenizer.eos_token_id())
-            .unwrap_or(0),
+            .context("tokenizer is missing required '<|startoftranscript|>' token")?,
     ];
     if let Some(language) = language.filter(|value| !value.is_empty()) {
         let token = format!("<|{}|>", language.to_ascii_lowercase());
@@ -329,9 +328,6 @@ pub fn build(directory: &PipelineModelDirectory) -> anyhow::Result<MultimodalSpe
 }
 
 /// The token a package declares as its expandable image placeholder.
-///
-/// This is an ordinary tokenizer fact, keyed by semantic role like `bos` and
-/// `eos`, so a package states it once and every front end reads the same value.
 fn image_placeholder_token_id(
     metadata: Option<&onnx_genai_metadata::InferenceMetadata>,
 ) -> Option<u32> {
@@ -341,12 +337,9 @@ fn image_placeholder_token_id(
         .tokenizer
         .as_ref()?
         .special_tokens
-        .get(IMAGE_PLACEHOLDER_ROLE)
-        .map(|token| token.id)
+        .as_ref()?
+        .image_token_id
 }
-
-/// Semantic role naming the prompt token that stands for one whole image.
-pub const IMAGE_PLACEHOLDER_ROLE: &str = "image_placeholder";
 
 /// Replace each declared image placeholder with that image's token run.
 ///
@@ -362,13 +355,13 @@ fn expand_image_placeholders(
     prompt_token_ids: &mut Vec<u32>,
 ) -> anyhow::Result<()> {
     let placeholder = spec.placeholder_token_id.with_context(|| {
-        format!(
-            "What: this package accepts an image but cannot place it in the prompt. \
-             Why: it declares no `{IMAGE_PLACEHOLDER_ROLE}` special token, so there is no \
-             token for the image's features to replace, and the encoded image would be \
-             preprocessed and then ignored. \
-             How: declare package.tokenizer.special_tokens.{IMAGE_PLACEHOLDER_ROLE}."
-        )
+        "What: this package accepts an image but cannot place it in the prompt. \
+         Why: it declares no numeric image placeholder token, so there is no \
+         token for the image's features to replace, and the encoded image would be \
+         preprocessed and then ignored. \
+         How: declare `package.tokenizer.special_tokens.image_token_id`; keep its text \
+         spelling only in tokenizer assets."
+            .to_string()
     })?;
     let program = spec
         .program
@@ -554,9 +547,9 @@ fn derive_specs(
 
 #[cfg(test)]
 mod media_binding_tests {
-    use onnx_genai_metadata::{PreprocessingSpec, WorkflowSpec};
+    use onnx_genai_metadata::{InferenceMetadata, PreprocessingSpec, WorkflowSpec};
 
-    use super::derive_specs;
+    use super::{derive_specs, image_placeholder_token_id};
 
     /// A workflow declaring exactly the given `media` runtime inputs.
     fn workflow(inputs: serde_json::Value) -> WorkflowSpec {
@@ -576,6 +569,23 @@ mod media_binding_tests {
             "source": { "kind": "request" },
             "contract": contract,
         })
+    }
+
+    #[test]
+    fn image_placeholder_comes_from_package_tokenizer_facts() {
+        let metadata: InferenceMetadata = serde_json::from_value(serde_json::json!({
+            "schema_version": "v1.2",
+            "package": {
+                "tokenizer": {
+                    "special_tokens": {
+                        "image_token_id": 151655,
+                    },
+                },
+            },
+        }))
+        .expect("metadata");
+
+        assert_eq!(image_placeholder_token_id(Some(&metadata)), Some(151655));
     }
 
     #[test]
@@ -770,7 +780,7 @@ mod media_binding_tests {
             super::MultimodalInput::from_images(&vision, &[encoded_png()], &mut prompt, 4096)
                 .expect_err("must refuse");
         assert!(
-            format!("{error:#}").contains("image_placeholder"),
+            format!("{error:#}").contains("tokens.image_token_id"),
             "{error:#}"
         );
     }
