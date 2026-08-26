@@ -2560,6 +2560,7 @@ unsafe extern "C" fn compute_execute(
                 owned: owned_outputs,
                 slots: slot_map,
                 shapes,
+                host_pool,
             } = scratch;
             if let Err(e) = unsafe { read_inputs_into(api_ref, kernel_context, inputs) } {
                 return fail_status(&format!("Compute: {e}"));
@@ -2970,7 +2971,7 @@ unsafe extern "C" fn compute_execute(
                                     ));
                                 }
                                 if let Some(stale) = intermediates[buffer_index].take() {
-                                    recycle_host_intermediate(stale.data);
+                                    host_pool.recycle_intermediate(stale.data);
                                 }
                                 intermediates[buffer_index] = Some(buffer);
                             }
@@ -2978,7 +2979,7 @@ unsafe extern "C" fn compute_execute(
                                 &retire_items[retire_starts[node_idx]..retire_starts[node_idx + 1]]
                             {
                                 if let Some(dead) = intermediates[buffer_index].take() {
-                                    recycle_host_intermediate(dead.data);
+                                    host_pool.recycle_intermediate(dead.data);
                                 }
                             }
                             continue;
@@ -3078,7 +3079,7 @@ unsafe extern "C" fn compute_execute(
                                 ));
                             }
                             if let Some(stale) = intermediates[buf_idx].take() {
-                                recycle_host_intermediate(stale.data);
+                                host_pool.recycle_intermediate(stale.data);
                             }
                             intermediates[buf_idx] = Some(buf);
                         }
@@ -3086,7 +3087,7 @@ unsafe extern "C" fn compute_execute(
                             &retire_items[retire_starts[node_idx]..retire_starts[node_idx + 1]]
                         {
                             if let Some(dead) = intermediates[buf_idx].take() {
-                                recycle_host_intermediate(dead.data);
+                                host_pool.recycle_intermediate(dead.data);
                             }
                         }
                         continue;
@@ -3242,7 +3243,7 @@ unsafe extern "C" fn compute_execute(
                                     }
                                 }
                             }
-                            None => (take_host_intermediate(byte_len), std::ptr::null_mut()),
+                            None => (host_pool.take_intermediate(byte_len), std::ptr::null_mut()),
                         };
                         new_bufs.push((
                             buf_idx,
@@ -3366,7 +3367,7 @@ unsafe extern "C" fn compute_execute(
                             ));
                         }
                         if let Some(stale) = intermediates[buf_idx].take() {
-                            recycle_host_intermediate(stale.data);
+                            host_pool.recycle_intermediate(stale.data);
                         }
                         intermediates[buf_idx] = Some(buf);
                     }
@@ -3379,13 +3380,13 @@ unsafe extern "C" fn compute_execute(
                         &retire_items[retire_starts[node_idx]..retire_starts[node_idx + 1]]
                     {
                         if let Some(dead) = intermediates[buf_idx].take() {
-                            recycle_host_intermediate(dead.data);
+                            host_pool.recycle_intermediate(dead.data);
                         }
                     }
                 }
 
                 for slot in intermediates.drain(..).flatten() {
-                    recycle_host_intermediate(slot.data);
+                    host_pool.recycle_intermediate(slot.data);
                 }
             } else if exported.entries.len() == 1 {
                 // ── Fast path: single-kernel subgraph ─────────────────────────
@@ -4143,6 +4144,24 @@ pub(crate) struct RunScratch {
     /// Parking it with the rest of the scratch is what makes the fixed-`Run`
     /// cost fall too.
     shapes: Vec<crate::dim_vec::DimVec<usize>>,
+    /// Retired host intermediate storage, reused by later nodes and later
+    /// `Run`s on this thread.
+    ///
+    /// Lives here for exactly the reason given above this struct: it used to be
+    /// a thread-local of its own, so every take and every recycle paid a
+    /// separate `__tls_get_addr` and a separate `RefCell` borrow. Those are
+    /// **per buffer per node**, not per `Run`, so on a 100-node chain the
+    /// pooling machinery resolved the thread-local ~200 times to serve ~100
+    /// buffers. Sharing `RunScratch`'s single resolution makes it zero extra.
+    ///
+    /// **Deliberately not cleared by [`RunScratch::clear_and_bound`].** Every
+    /// other field here is per-`Run` state that would be a dangling borrow if
+    /// it outlived its `Run`; this one is the opposite -- it is owned, pointer
+    /// free `Vec<u8>` storage whose entire purpose is to outlive the `Run` that
+    /// retired it. Clearing it would silently turn every reuse back into a
+    /// `malloc`/`free` pair while leaving every test green, so
+    /// `a_pooled_buffer_survives_the_run_that_retired_it` pins it.
+    host_pool: HostPool,
 }
 
 /// Capacity, in elements, above which per-`Run` scratch is dropped instead of
@@ -4191,19 +4210,24 @@ fn absent_output_view<'a>() -> TensorMut<'a> {
 thread_local! {
     /// This thread's parked [`RunScratch`].
     ///
-    /// Thread-local for the same reason as `HOST_INTERMEDIATE_POOL`: `Compute`
-    /// runs on whichever thread ORT calls it from, and sharing would need a
-    /// lock on the hot path to buy nothing.
+    /// Thread-local because `Compute` runs on whichever thread ORT calls it
+    /// from, and sharing would need a lock on the hot path to buy nothing --
+    /// scratch and pooled storage are only ever reused by a later call on the
+    /// same thread.
     ///
-    /// Every vector is cleared when the `Run` that borrowed it leaves --
-    /// including by unwinding -- so no pointer into a finished `Run`'s ORT
-    /// values is ever retained here between calls.
+    /// Every field that can hold a pointer into a finished `Run`'s ORT values
+    /// is cleared when the `Run` that borrowed it leaves -- including by
+    /// unwinding -- so none is ever retained here between calls. `host_pool` is
+    /// the one field deliberately kept, and it is kept precisely because it
+    /// holds no pointers: only owned `Vec<u8>` storage for the next `Run` on
+    /// this thread to reuse. See [`RunScratch::clear_and_bound`].
     static RUN_SCRATCH: std::cell::RefCell<RunScratch> =
         const { std::cell::RefCell::new(RunScratch {
             inputs: Vec::new(),
             owned: Vec::new(),
             slots: Vec::new(),
             shapes: Vec::new(),
+            host_pool: HostPool { slots: Vec::new() },
         }) };
 }
 
@@ -4300,30 +4324,35 @@ impl RunScratch {
         if self.shapes.capacity() > SCRATCH_MAX_CAPACITY {
             self.shapes = Vec::new();
         }
+
+        // `host_pool` is *not* cleared, and is not judged against
+        // `SCRATCH_MAX_CAPACITY` either. It is not per-`Run` state: it holds
+        // retired tensor storage for the next `Run` on this thread to reuse,
+        // which is the entire point of pooling, and its own bound is
+        // `HOST_INTERMEDIATE_POOL_SLOTS` applied at recycle time. Clearing it
+        // here would be a pure pessimisation that no correctness test could
+        // see.
     }
 }
 
-/// How many retired host intermediates one thread keeps for reuse.
+/// How many retired host intermediates one [`RunScratch`] keeps for reuse.
 ///
 /// A routed subgraph's live set is bounded by its widest cut, which is small
 /// for the elementwise chains this path actually sees. Eight slots cover those
 /// without letting a pathological graph pin an unbounded amount of memory: past
 /// the cap, retired buffers are simply dropped.
+///
+/// This is the pool's *only* bound. `RunScratch::clear_and_bound` deliberately
+/// leaves `host_pool` alone, so nothing else will trim it.
 const HOST_INTERMEDIATE_POOL_SLOTS: usize = 8;
 
-thread_local! {
-    /// Retired host intermediate storage, per thread.
-    ///
-    /// Thread-local rather than shared: `Compute` runs on whichever thread ORT
-    /// calls it from, and a shared pool would need a lock on the hot path to
-    /// buy nothing — buffers are only ever reused by the call that retired
-    /// them or a later call on the same thread.
-    static HOST_INTERMEDIATE_POOL: std::cell::RefCell<Vec<Vec<u8>>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-}
-
 /// Storage for one host intermediate of `len` bytes, reusing a retired buffer
-/// when one is large enough.
+/// from this pool when one is large enough.
+///
+/// The pool is reached through `&mut self` rather than a thread-local of its
+/// own: this runs once per buffer per node, so a thread-local here cost a
+/// `__tls_get_addr` and a `RefCell` borrow on every call. It now shares the
+/// single resolution [`with_run_scratch`] already makes for the whole `Run`.
 ///
 /// The returned bytes are initialized but **not** guaranteed to be zero when a
 /// retired buffer is reused. That is deliberate, and it is not a weakening of
@@ -4339,9 +4368,23 @@ thread_local! {
 /// Debug builds do fill reused storage, with a poison pattern rather than
 /// zeros, so a kernel that leaves part of its output unwritten fails loudly in
 /// tests instead of inheriting something plausible.
-fn take_host_intermediate(len: usize) -> Vec<u8> {
-    HOST_INTERMEDIATE_POOL.with(|pool| {
-        let mut pool = pool.borrow_mut();
+/// Retired host intermediate storage belonging to one [`RunScratch`].
+///
+/// A newtype rather than a bare `Vec<Vec<u8>>` so that the pool a call site
+/// uses cannot be written by accident. The whole value of parking this in
+/// `RunScratch` is that *these particular* call sites reach *that particular*
+/// pool; with a bare vector, `take_intermediate(&mut Vec::new(), n)` type
+/// checks, silently reverts every reuse to a `malloc`/`free` pair, and leaves
+/// the suite green -- an independent review of this change found exactly that
+/// mutation. It no longer compiles.
+#[derive(Default)]
+pub(crate) struct HostPool {
+    slots: Vec<Vec<u8>>,
+}
+
+impl HostPool {
+    fn take_intermediate(&mut self, len: usize) -> Vec<u8> {
+        let pool = &mut self.slots;
         match pool.iter().position(|buf| buf.capacity() >= len) {
             Some(pos) => {
                 let mut buf = pool.swap_remove(pos);
@@ -4365,34 +4408,27 @@ fn take_host_intermediate(len: usize) -> Vec<u8> {
             }
             None => vec![0u8; len],
         }
-    })
-}
-
-/// Hand a dead host intermediate back for reuse.
-///
-/// Buffers backed by ORT scratch have an empty `data` vector — they carry a
-/// borrowed `scratch_ptr` instead — so they are dropped here rather than
-/// pooled.
-fn recycle_host_intermediate(buf: Vec<u8>) {
-    if buf.capacity() == 0 {
-        return;
     }
-    HOST_INTERMEDIATE_POOL.with(|pool| {
-        let mut pool = pool.borrow_mut();
-        if pool.len() < HOST_INTERMEDIATE_POOL_SLOTS {
-            pool.push(buf);
-        }
-    });
-}
 
-/// Empty this thread's pool.
-///
-/// Only for tests: the pool is per-thread, and libtest may run several tests on
-/// one thread, so a test that asserts *which* buffer comes back has to start
-/// from a known state rather than inherit whatever an earlier test retired.
-#[cfg(test)]
-fn drain_host_intermediate_pool() {
-    HOST_INTERMEDIATE_POOL.with(|pool| pool.borrow_mut().clear());
+    /// Hand a dead host intermediate back for reuse.
+    ///
+    /// Buffers backed by ORT scratch have an empty `data` vector — they carry a
+    /// borrowed `scratch_ptr` instead — so they are dropped here rather than
+    /// pooled.
+    fn recycle_intermediate(&mut self, buf: Vec<u8>) {
+        if buf.capacity() == 0 {
+            return;
+        }
+        if self.slots.len() < HOST_INTERMEDIATE_POOL_SLOTS {
+            self.slots.push(buf);
+        }
+    }
+
+    /// How many buffers are parked. Only the tests care.
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.slots.len()
+    }
 }
 
 /// For each intermediate buffer, the highest node index that reads it, or
@@ -8004,70 +8040,101 @@ fn after() {}
 
     #[test]
     fn recycled_intermediate_storage_is_reused_without_reallocating() {
-        super::drain_host_intermediate_pool();
+        // Each test owns its pool outright. That is not only isolation from
+        // libtest's thread reuse -- it is the same shape production uses now,
+        // so these tests exercise the real signature rather than a global the
+        // hot path no longer touches.
+        let pool = &mut super::HostPool::default();
         // The point of the pool is address reuse: a retired buffer must come
         // back on the next request of the same size, so a chain of nodes keeps
         // rewriting storage that is still in cache.
-        let first = super::take_host_intermediate(4096);
+        let first = pool.take_intermediate(4096);
         let addr = first.as_ptr() as usize;
-        super::recycle_host_intermediate(first);
-        let second = super::take_host_intermediate(4096);
+        pool.recycle_intermediate(first);
+        let second = pool.take_intermediate(4096);
         assert_eq!(second.as_ptr() as usize, addr);
         assert_eq!(second.len(), 4096);
-        super::recycle_host_intermediate(second);
     }
 
     #[test]
     fn a_recycled_buffer_serves_a_smaller_request_at_the_requested_length() {
-        super::drain_host_intermediate_pool();
-        let big = super::take_host_intermediate(8192);
+        let pool = &mut super::HostPool::default();
+        let big = pool.take_intermediate(8192);
         let addr = big.as_ptr() as usize;
-        super::recycle_host_intermediate(big);
-        let small = super::take_host_intermediate(64);
+        pool.recycle_intermediate(big);
+        let small = pool.take_intermediate(64);
         assert_eq!(small.as_ptr() as usize, addr);
         // Length is what the caller asked for — `byte_len` bounds every
         // `from_raw_parts` built from this buffer, so an over-long slice would
         // be a real out-of-bounds view.
         assert_eq!(small.len(), 64);
-        super::recycle_host_intermediate(small);
     }
 
     #[test]
     fn a_request_larger_than_every_pooled_buffer_allocates_fresh_zeroed_storage() {
-        super::drain_host_intermediate_pool();
-        let seed = super::take_host_intermediate(32);
-        super::recycle_host_intermediate(seed);
-        let big = super::take_host_intermediate(1 << 20);
+        let pool = &mut super::HostPool::default();
+        let seed = pool.take_intermediate(32);
+        pool.recycle_intermediate(seed);
+        let big = pool.take_intermediate(1 << 20);
         assert_eq!(big.len(), 1 << 20);
         assert!(big.iter().all(|b| *b == 0));
-        super::recycle_host_intermediate(big);
     }
 
     #[test]
     fn scratch_backed_buffers_are_not_pooled() {
-        super::drain_host_intermediate_pool();
+        let pool = &mut super::HostPool::default();
         // A scratch-backed IntermediateBuf carries an empty `data` vector and a
         // borrowed pointer it does not own. Pooling that empty vector would
         // fill a slot with nothing usable.
-        super::recycle_host_intermediate(Vec::new());
-        let taken = super::take_host_intermediate(16);
+        pool.recycle_intermediate(Vec::new());
+        assert_eq!(pool.len(), 0);
+        let taken = pool.take_intermediate(16);
         assert_eq!(taken.len(), 16);
         assert!(taken.capacity() >= 16);
-        super::recycle_host_intermediate(taken);
     }
 
     #[test]
     fn the_pool_is_bounded() {
-        super::drain_host_intermediate_pool();
+        let pool = &mut super::HostPool::default();
         let bufs: Vec<Vec<u8>> = (0..super::HOST_INTERMEDIATE_POOL_SLOTS * 4)
-            .map(|_| super::take_host_intermediate(128))
+            .map(|_| pool.take_intermediate(128))
             .collect();
         for b in bufs {
-            super::recycle_host_intermediate(b);
+            pool.recycle_intermediate(b);
         }
-        super::HOST_INTERMEDIATE_POOL.with(|pool| {
-            assert!(pool.borrow().len() <= super::HOST_INTERMEDIATE_POOL_SLOTS);
-        });
+        assert!(pool.len() <= super::HOST_INTERMEDIATE_POOL_SLOTS);
+    }
+
+    #[test]
+    fn a_pooled_buffer_survives_the_run_that_retired_it() {
+        // The pool now shares storage with per-`Run` scratch, every other field
+        // of which is cleared when the `Run` leaves *because* keeping it would
+        // be a dangling borrow. The pool is the one field where the opposite is
+        // true, and nothing else in the suite would notice it being cleared:
+        // reuse is invisible to every correctness assertion, so dropping it
+        // would leave the suite green and silently restore a `malloc`/`free`
+        // pair per node. This is the tripwire for that.
+        let mut scratch = super::RunScratch::default();
+        let buf = scratch.host_pool.take_intermediate(2048);
+        let addr = buf.as_ptr() as usize;
+        scratch.host_pool.recycle_intermediate(buf);
+
+        // Exactly what `ScratchGuard::drop` does at the end of a `Run`.
+        scratch.clear_and_bound();
+
+        assert_eq!(
+            scratch.host_pool.len(),
+            1,
+            "clear_and_bound discarded pooled storage that the next `Run` \
+             should have reused"
+        );
+        let after = scratch.host_pool.take_intermediate(2048);
+        assert_eq!(
+            after.as_ptr() as usize,
+            addr,
+            "the buffer survived the `Run` boundary but is no longer the one \
+             that was retired"
+        );
     }
 
     // ── CreateState / ReleaseState lifecycle ──────────────────────────────────
@@ -8900,6 +8967,51 @@ fn after() {}
         });
     }
 
+    /// Every pool operation must go through the `Run`'s own pool.
+    ///
+    /// An independent review of the change that moved this pool into
+    /// `RunScratch` found a mutation that survived the entire suite: redirect
+    /// the single `take` call site to a throwaway pool. Every buffer is then
+    /// freshly allocated on every node -- the exact cost the move existed to
+    /// remove -- while the seven `recycle` sites keep filling the real pool,
+    /// which is now read by nobody. It is correctness preserving, so no
+    /// behavioural test can see it, and the unit tests below cannot either
+    /// because they own their pools and never touch these call sites.
+    ///
+    /// A newtype makes the accidental form (`&mut Vec::new()`) fail to compile.
+    /// This pins the deliberate one: **no pool operation anywhere in this file
+    /// is performed on a pool other than the one destructured from
+    /// `RunScratch`.** Stated as a ratio rather than as fixed call counts, so
+    /// that adding or removing a legitimate call site does not trip it.
+    #[test]
+    fn every_pool_operation_goes_through_the_run_scratch_pool() {
+        let prod = production_source(include_str!("compute.rs"));
+        let prod = prod.as_str();
+
+        for method in ["take_intermediate", "recycle_intermediate"] {
+            let calls = prod.matches(&format!(".{method}(")).count();
+            let via_pool = prod.matches(&format!("host_pool.{method}(")).count();
+
+            // Anti-vacuity, and the reason it is not optional: if either method
+            // is renamed, both counts fall to zero and the equality below holds
+            // trivially. The guard has to be unconditional -- a check that
+            // itself skips when the thing it guards disappears is the failure
+            // it exists to prevent.
+            assert!(
+                calls > 0,
+                "no calls to `{method}` found; this test would pass vacuously"
+            );
+            assert_eq!(
+                calls,
+                via_pool,
+                "{} call(s) to `{method}` do not use the `RunScratch` pool; a \
+                 pool built at the call site allocates on every node and no \
+                 behavioural test can see it",
+                calls - via_pool
+            );
+        }
+    }
+
     /// The `Run` path must resolve the thread-local exactly **once**. Taking
     /// the scratch out and putting it back cost two resolutions; borrowing it
     /// costs one. That is not observable from a unit test, so it is asserted
@@ -8933,18 +9045,13 @@ fn after() {}
         declared.sort_unstable();
         assert_eq!(
             declared,
-            [
-                "ENABLED",
-                "ENABLED",
-                "HOST_INTERMEDIATE_POOL",
-                "RUN_SCRATCH"
-            ],
+            ["ENABLED", "ENABLED", "RUN_SCRATCH"],
             "the set of thread-locals in compute.rs changed; a new per-`Run` \
              pool costs another __tls_get_addr on the hot path"
         );
         assert_eq!(
             prod.matches(".with(").count() + prod.matches(".try_with(").count(),
-            3,
+            1,
             "the number of thread-local resolutions in compute.rs changed"
         );
 
