@@ -363,6 +363,31 @@ pub extern "C" fn nxrt_ep_reset_executed_node_count() {
 
 #[cfg(feature = "cuda")]
 #[unsafe(no_mangle)]
+pub extern "C" fn nxrt_ep_reset_allocator_teardown_stats() {
+    onnx_runtime_ep_cuda::provider::reset_allocator_release_observation();
+    onnx_runtime_ep_cuda::vmm_allocator::reset_global_vmm_stats();
+}
+
+#[cfg(feature = "cuda")]
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_ep_cuda_committed_bytes() -> u64 {
+    onnx_runtime_ep_cuda::vmm_allocator::global_vmm_stats().committed_bytes
+}
+
+#[cfg(feature = "cuda")]
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_ep_cuda_allocator_quarantined_releases() -> u64 {
+    onnx_runtime_ep_cuda::provider::allocator_release_observation().quarantined
+}
+
+#[cfg(feature = "cuda")]
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_ep_cuda_allocator_retained_releases() -> u64 {
+    onnx_runtime_ep_cuda::provider::allocator_release_observation().retained
+}
+
+#[cfg(feature = "cuda")]
+#[unsafe(no_mangle)]
 pub extern "C" fn nxrt_ep_reset_unique_execution_stats() {
     onnx_runtime_ep_cuda::reset_unique_execution_stats()
 }

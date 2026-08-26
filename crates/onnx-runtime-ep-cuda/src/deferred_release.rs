@@ -990,8 +990,9 @@ impl CudaDeferredReleaseQueue {
 
     /// Explicitly wait — with a deadline — until nothing is outstanding.
     ///
-    /// This is a diagnostic/test entry point, never used on a release path and
-    /// never called from `Drop`. It polls; it does not synchronize a stream.
+    /// This is an explicit lifecycle/test entry point used when an owning
+    /// adapter must prove its accepted releases settled before dropping the
+    /// provider reference. It polls; it does not synchronize a stream.
     pub fn wait_until_idle(&self, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         loop {
