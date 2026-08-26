@@ -569,6 +569,16 @@ pub struct CudaRuntime {
     teardown_section: Option<capture_gate::SynchronizingSection>,
 }
 
+/// Exact operation performed after a fence event is removed from the registry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StreamWaitOperation {
+    Enqueue,
+    #[cfg(test)]
+    Omit,
+}
+
+pub(crate) const PRODUCTION_STREAM_WAIT: StreamWaitOperation = StreamWaitOperation::Enqueue;
+
 impl std::fmt::Debug for CudaRuntime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CudaRuntime")
@@ -1975,7 +1985,8 @@ impl CudaRuntime {
     /// therefore ordered after the prefetch and observes the full transfer. Id
     /// `0` (an already-signalled fence) and an unknown id are no-ops.
     pub fn compute_wait_fence(&self, fence_id: u64) -> Result<()> {
-        self.wait_fence_on(&self.stream, fence_id)
+        self.wait_fence_on_with(&self.stream, fence_id, PRODUCTION_STREAM_WAIT)
+            .map(|_| ())
     }
 
     /// Make the transfer stream wait on the compute completion event named by
@@ -1983,7 +1994,8 @@ impl CudaRuntime {
     /// staging region so the incoming prefetch never overwrites bytes a prior
     /// wave's kernel is still reading (write-after-read hazard).
     pub fn copy_wait_fence(&self, fence_id: u64) -> Result<()> {
-        self.wait_fence_on(&self.copy_stream, fence_id)
+        self.wait_fence_on_with(&self.copy_stream, fence_id, PRODUCTION_STREAM_WAIT)
+            .map(|_| ())
     }
 
     /// Resolve a transfer-stream fence for a genuinely ahead-of-need prefetch
@@ -2055,9 +2067,28 @@ impl CudaRuntime {
         Ok(CopyCompleted::new())
     }
 
-    fn wait_fence_on(&self, waiter: &CudaStream, fence_id: u64) -> Result<()> {
+    fn apply_stream_wait(
+        operation: StreamWaitOperation,
+        waiter: &CudaStream,
+        event: &CudaEvent,
+    ) -> Result<()> {
+        match operation {
+            StreamWaitOperation::Enqueue => waiter
+                .wait(event)
+                .map_err(|error| driver_err("cuStreamWaitEvent", error)),
+            #[cfg(test)]
+            StreamWaitOperation::Omit => Ok(()),
+        }
+    }
+
+    fn wait_fence_on_with(
+        &self,
+        waiter: &CudaStream,
+        fence_id: u64,
+        operation: StreamWaitOperation,
+    ) -> Result<bool> {
         if fence_id == 0 {
-            return Ok(());
+            return Ok(false);
         }
         let event = self
             .fences
@@ -2065,14 +2096,28 @@ impl CudaRuntime {
             .expect("cuda fence registry poisoned")
             .remove(&fence_id);
         let Some(event) = event else {
-            return Ok(());
+            return Ok(false);
         };
         self.bind()?;
-        // The cross-stream dependency is captured by cuStreamWaitEvent here; the
-        // event may be released (dropped) immediately afterwards.
-        waiter
-            .wait(&event)
-            .map_err(|e| driver_err("cuStreamWaitEvent", e))
+        // Keep the exact CUDA operation isolated after registry removal so the
+        // test mutant changes no lookup, ownership, or event-drop behavior.
+        Self::apply_stream_wait(operation, waiter, &event)?;
+        Ok(true)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn compute_wait_fence_with_operation(
+        &self,
+        fence_id: u64,
+        operation: StreamWaitOperation,
+    ) -> Result<()> {
+        if self.wait_fence_on_with(&self.stream, fence_id, operation)? {
+            Ok(())
+        } else {
+            Err(EpError::KernelFailed(format!(
+                "cuda page-in test expected fresh fence {fence_id} to own a registered event"
+            )))
+        }
     }
 
     /// Block the host until every transfer queued on the copy stream completes.

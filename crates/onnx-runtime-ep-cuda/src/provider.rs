@@ -3878,6 +3878,7 @@ mod tests {
     use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, Tier};
 
     use crate::error::driver_err;
+    use crate::runtime::{PRODUCTION_STREAM_WAIT, StreamWaitOperation};
     use crate::test_support::EnvVarGuard;
 
     #[test]
@@ -5291,24 +5292,23 @@ extern "C" __global__ void copy_out(const float* in, float* out, unsigned long l
     }
 
     // Anti-regression lock for the async, fence-ordered weight page-in (#87,
-    // #1896). Both arms run the same progress protocol; the only ordering
-    // difference is whether the production `wait_fence` operation is invoked.
+    // #1896). Both arms remove and own the event through the production fence
+    // path. They differ only in the exact operation performed after removal:
+    // enqueue `cuStreamWaitEvent`, or deliberately omit that enqueue.
     //
-    // A transfer-stream gate precedes H2D and its event. The consumer publishes
-    // READY before its read and waits on a second host gate. A resolver submitted
-    // after the consumer distinguishes the two causal states without a clock:
+    // A transfer-stream gate precedes H2D and its event. A separate compute
+    // kernel publishes READY before the wait, proving that the consumer stream
+    // has reached the fence without making positive-arm progress depend on work
+    // behind that fence.
     //
-    //   * wait present: `wait_fence` consumed the event, so the resolver reports
-    //     RESOLVED while the consumer is still event-blocked. The host releases
-    //     H2D, observes READY, and releases the consumer; it reads PAYLOAD.
-    //   * wait absent: the resolver owns and host-waits the still-pending event,
-    //     while the earlier consumer reaches READY with H2D still gated. The host
-    //     releases the consumer, observes DONE, and only then releases H2D; it
-    //     deterministically reads POISON.
+    //   * wait present: READY -> release H2D -> E -> stream wait -> consumer
+    //     release -> consumer reads PAYLOAD -> DONE.
+    //   * wait omitted: READY -> consumer release -> consumer reads POISON ->
+    //     DONE -> release H2D -> E.
     //
-    // The no-wait arm is therefore both the mutation oracle and the apparatus
-    // control. It uses no duration, retry count, host sleep, stream priority, or
-    // reverse compute→copy fence.
+    // The arm schedule is fixed by the operation under test; it never inspects
+    // whether the event remains registered. Both arms issue the same transfer,
+    // event, READY/consumer kernels, gate releases, drains, and cleanup.
     #[test]
     fn async_pagein_fence_orders_weight_page_in_consumer() -> Result<()> {
         use std::ffi::c_void;
@@ -5321,19 +5321,17 @@ extern "C" __global__ void wait_for_release(const volatile unsigned int* release
     while (*release == 0u) { }
     __threadfence_system();
 }
+extern "C" __global__ void publish_ready(volatile unsigned int* ready) {
+    *ready = 1u;
+    __threadfence_system();
+}
 extern "C" __global__ void gated_copy_out(
     const float* in,
     float* out,
     unsigned long long n,
-    volatile unsigned int* ready,
     const volatile unsigned int* release,
     volatile unsigned int* done
 ) {
-    if (threadIdx.x == 0u) {
-        *ready = 1u;
-        __threadfence_system();
-    }
-    __syncthreads();
     while (*release == 0u) { }
     __threadfence_system();
 
@@ -5474,10 +5472,15 @@ extern "C" __global__ void gated_copy_out(
 
         #[derive(Debug)]
         enum Progress {
-            FenceResolved(std::result::Result<(), String>),
             ConsumerReady,
             ConsumerDone,
             ComputeFinished(std::result::Result<(), String>),
+        }
+
+        #[derive(Clone, Copy)]
+        enum ArmSchedule {
+            CopyThenConsumer,
+            ConsumerThenCopy,
         }
 
         struct ArmObservation {
@@ -5526,6 +5529,7 @@ extern "C" __global__ void gated_copy_out(
         };
         let runtime = ep.runtime().clone();
         let wait_for_release = runtime.nvrtc_function(MODULE, SOURCE, "wait_for_release")?;
+        let publish_ready = runtime.nvrtc_function(MODULE, SOURCE, "publish_ready")?;
         let copy_out = runtime.nvrtc_function(MODULE, SOURCE, "gated_copy_out")?;
 
         let n = 64usize;
@@ -5592,7 +5596,8 @@ extern "C" __global__ void gated_copy_out(
 
         let run_arm = |arm: &str,
                        dst: sys::CUdeviceptr,
-                       wait: &dyn Fn(&Fence) -> Result<()>|
+                       operation: StreamWaitOperation,
+                       schedule_override: Option<ArmSchedule>|
          -> Result<ArmObservation> {
             unsafe { runtime.htod(poison_bytes, dst) }?;
             gate.reset();
@@ -5605,14 +5610,27 @@ extern "C" __global__ void gated_copy_out(
 
             unsafe { runtime.htod_async(staging.as_slice(), dst) }?;
             let fence_id = runtime.record_copy_fence()?;
-            wait(&Fence::new(fence_id))?;
+
+            let mut ready = runtime.stream().launch_builder(&publish_ready);
+            ready.arg(&consumer_ready_device);
+            // SAFETY: the mapped READY word stays live until both streams drain.
+            unsafe { ready.launch(one_thread) }
+                .map_err(|error| driver_err("launch page-in READY publisher", error))?;
+
+            runtime.compute_wait_fence_with_operation(fence_id, operation)?;
+            let schedule = match schedule_override {
+                Some(schedule) => schedule,
+                None => match operation {
+                    StreamWaitOperation::Enqueue => ArmSchedule::CopyThenConsumer,
+                    StreamWaitOperation::Omit => ArmSchedule::ConsumerThenCopy,
+                },
+            };
 
             let mut consume = runtime.stream().launch_builder(&copy_out);
             consume
                 .arg(&dst)
                 .arg(&out_p)
                 .arg(&n_u64)
-                .arg(&consumer_ready_device)
                 .arg(&consumer_release_device)
                 .arg(&consumer_done_device);
             // SAFETY: all data and mapped protocol pointers cover this launch.
@@ -5626,19 +5644,6 @@ extern "C" __global__ void gated_copy_out(
                     cancelled: Arc::clone(&cancelled),
                 };
                 let (sender, receiver) = std::sync::mpsc::channel();
-
-                let resolve_runtime = Arc::clone(&runtime);
-                let resolve_sender = sender.clone();
-                scope.spawn(move || {
-                    let resolution = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        resolve_runtime
-                            .resolve_prefetch_fence(fence_id)
-                            .map(|_| ())
-                            .map_err(|error| error.to_string())
-                    }))
-                    .unwrap_or_else(|_| Err("fence resolver panicked".into()));
-                    let _ = resolve_sender.send(Progress::FenceResolved(resolution));
-                });
 
                 let ready_host = gate.word(CONSUMER_READY) as usize;
                 let ready_sender = sender.clone();
@@ -5680,23 +5685,28 @@ extern "C" __global__ void gated_copy_out(
                 });
                 drop(sender);
 
-                let first = recv_progress(&receiver, arm)?;
-                match first {
-                    Progress::FenceResolved(resolution) => {
-                        resolution.map_err(|error| progress_error(arm, error))?;
-                        // With the real wait, the consumer cannot publish READY
-                        // until E completes. Release and drain H2D first.
+                match recv_progress(&receiver, arm)? {
+                    Progress::ConsumerReady => {}
+                    Progress::ConsumerDone => {
+                        return Err(progress_error(
+                            arm,
+                            "consumer reported DONE before the host released its pre-read gate",
+                        ));
+                    }
+                    Progress::ComputeFinished(_) => {
+                        return Err(progress_error(
+                            arm,
+                            "internal progress filter returned a compute-completion message",
+                        ));
+                    }
+                }
+
+                match schedule {
+                    ArmSchedule::CopyThenConsumer => {
+                        // READY is before the stream wait. Releasing and draining
+                        // H2D completes E, so the real wait and consumer can run.
                         gate.release_copy();
                         runtime.sync_copy_stream()?;
-                        match recv_progress(&receiver, arm)? {
-                            Progress::ConsumerReady => {}
-                            other => {
-                                return Err(progress_error(
-                                    arm,
-                                    format!("expected consumer READY after H2D, got {other:?}"),
-                                ));
-                            }
-                        }
                         gate.release_consumer();
                         match recv_progress(&receiver, arm)? {
                             Progress::ConsumerDone => Ok(false),
@@ -5706,10 +5716,10 @@ extern "C" __global__ void gated_copy_out(
                             )),
                         }
                     }
-                    Progress::ConsumerReady => {
-                        // With no wait, the resolver cannot finish while H2D is
-                        // gated. Let the already-ready consumer read POISON and
-                        // observe DONE before making H2D runnable.
+                    ArmSchedule::ConsumerThenCopy => {
+                        // The omitted stream wait lets the consumer run while
+                        // H2D is still held. DONE is observed before releasing
+                        // the copy gate, so the stale read cannot race the DMA.
                         gate.release_consumer();
                         match recv_progress(&receiver, arm)? {
                             Progress::ConsumerDone => {}
@@ -5724,25 +5734,8 @@ extern "C" __global__ void gated_copy_out(
                         }
                         gate.release_copy();
                         runtime.sync_copy_stream()?;
-                        match recv_progress(&receiver, arm)? {
-                            Progress::FenceResolved(resolution) => {
-                                resolution.map_err(|error| progress_error(arm, error))?;
-                                Ok(true)
-                            }
-                            other => Err(progress_error(
-                                arm,
-                                format!("expected fence resolution after H2D, got {other:?}"),
-                            )),
-                        }
+                        Ok(true)
                     }
-                    Progress::ConsumerDone => Err(progress_error(
-                        arm,
-                        "consumer reported DONE before the host released its pre-read gate",
-                    )),
-                    Progress::ComputeFinished(_) => Err(progress_error(
-                        arm,
-                        "internal progress filter returned a compute-completion message",
-                    )),
                 }
             })?;
 
@@ -5768,7 +5761,7 @@ extern "C" __global__ void gated_copy_out(
 
         let primary = (|| -> Result<()> {
             for iteration in 0..8 {
-                let ordered = run_arm("ordered", pos_dst_p, &|fence| ep.wait_fence(fence))?;
+                let ordered = run_arm("ordered", pos_dst_p, PRODUCTION_STREAM_WAIT, None)?;
                 assert_eq!(
                     ordered.consumed, payload,
                     "iteration {iteration}: production wait did not order H2D before the \
@@ -5785,7 +5778,12 @@ extern "C" __global__ void gated_copy_out(
                     "iteration {iteration}: ordered-arm transfer did not land"
                 );
 
-                let bypass = run_arm("no-wait control", neg_dst_p, &|_| Ok(()))?;
+                let bypass = run_arm(
+                    "no-wait control",
+                    neg_dst_p,
+                    StreamWaitOperation::Omit,
+                    None,
+                )?;
                 assert_eq!(
                     bypass.consumed, poison,
                     "iteration {iteration}: no-wait consumer did not read POISON before the \
@@ -5800,6 +5798,29 @@ extern "C" __global__ void gated_copy_out(
                 assert_eq!(
                     bypass.destination, payload,
                     "iteration {iteration}: no-wait transfer did not land after release"
+                );
+
+                // Apparatus-vacuity control, independent of the production wait:
+                // deliberately make H2D complete before releasing the consumer.
+                // The same no-wait path must now read PAYLOAD, proving that the
+                // POISON oracle above is caused by its causal gate order rather
+                // than an output or transfer that never changes.
+                let vacuous = run_arm(
+                    "premature-copy vacuity control",
+                    neg_dst_p,
+                    StreamWaitOperation::Omit,
+                    Some(ArmSchedule::CopyThenConsumer),
+                )?;
+                assert_eq!(
+                    vacuous.consumed, payload,
+                    "iteration {iteration}: vacuity control did not expose the premature H2D; \
+                     left={:?}, right={payload:?}",
+                    vacuous.consumed
+                );
+                assert!(
+                    !vacuous.consumer_preceded_copy,
+                    "iteration {iteration}: vacuity control unexpectedly completed the consumer \
+                     before H2D"
                 );
 
                 // Real allocate+stage+copy+fence entry point.
@@ -5824,7 +5845,6 @@ extern "C" __global__ void gated_copy_out(
                     .arg(&page_p)
                     .arg(&out_p)
                     .arg(&n_u64)
-                    .arg(&consumer_ready_device)
                     .arg(&consumer_release_device)
                     .arg(&consumer_done_device);
                 unsafe { consume.launch(one_block) }
