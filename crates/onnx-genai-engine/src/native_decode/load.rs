@@ -413,8 +413,7 @@ impl NativeDecodeSession {
         )
     }
 
-    #[cfg(test)]
-    pub(crate) fn from_session_with_cuda_kv_max_len_and_io(
+    pub fn from_session_with_cuda_kv_max_len_and_io(
         session: InferenceSession,
         cuda_kv_max_len: Option<usize>,
         io: Option<&DecoderAbi>,
@@ -490,7 +489,7 @@ impl NativeDecodeSession {
         )
     }
 
-    pub(crate) fn from_session_with_cuda_options_and_io(
+    pub fn from_session_with_cuda_options_and_io(
         mut session: InferenceSession,
         cuda_options: NativeDecodeCudaOptions,
         io: Option<&DecoderAbi>,
@@ -665,6 +664,7 @@ impl NativeDecodeSession {
         // group per layer; absent means the graph threads no CSA state and
         // ordinary inference is byte-identical.
         let mut csa_record_pairs: Vec<(String, String)> = Vec::new();
+        let mut csa_record_bindings = Vec::new();
         let mut csa_record_presents: HashSet<String> = HashSet::new();
         let mut csa_record_pasts: HashSet<String> = HashSet::new();
         if let Some(groups) = io.and_then(|io| io.csa_state_groups.as_ref()) {
@@ -685,20 +685,18 @@ impl NativeDecodeSession {
                 if edge.role.is_record_buffer() {
                     csa_record_presents.insert(edge.present.clone());
                     csa_record_pasts.insert(edge.past.clone());
+                    csa_record_bindings.push(CsaRecordBindingSpec {
+                        past: edge.past.clone(),
+                        present: edge.present.clone(),
+                        role: edge.role,
+                        ratio: edge.ratio,
+                    });
                     csa_record_pairs.push((edge.present, edge.past));
                 } else {
                     state_pairs.push((edge.present, edge.past));
                 }
             }
         }
-        // Fail-closed: the CUDA persistent-state path cannot represent the rank-3,
-        // op-cursor-advanced record buffers yet. Refuse before any device
-        // allocation rather than mis-binding them to the fixed wholesale-swap
-        // path or dense-falling-back. The CPU path threads them correctly.
-        csa::refuse_csa_records_on_cuda(
-            !csa_record_pasts.is_empty(),
-            session.device_id().device_type == DeviceType::Cuda,
-        )?;
         // Only the fixed carries and hybrid recurrent states are wholesale-swap
         // "fixed" state; the growable CSA record buffers are explicitly excluded
         // so the CUDA/accounting/growth paths treat them as growable, matching
@@ -870,10 +868,14 @@ impl NativeDecodeSession {
                     .as_deref()
                     .context("native CUDA target decode is missing its token input binding")?
             };
+            let non_dense_state_inputs = fixed_state_inputs
+                .union(&csa_record_pasts)
+                .cloned()
+                .collect::<HashSet<_>>();
             let bytes_per_token = DecodeCudaState::kv_bytes_per_token(
                 &session,
                 &present_to_past,
-                &fixed_state_inputs,
+                &non_dense_state_inputs,
             )?;
             let device_memory = cuda_device_memory_snapshot(session.device_id().index as i32).ok();
             let max_len = match cuda_options.kv_max_len {
@@ -940,6 +942,7 @@ impl NativeDecodeSession {
                 },
                 &present_to_past,
                 &fixed_state_inputs,
+                &csa_record_bindings,
                 capacity,
                 graph_capture,
                 position_rank,

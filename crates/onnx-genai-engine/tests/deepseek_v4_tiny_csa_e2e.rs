@@ -34,22 +34,17 @@
 //! or corrupt fixture artifacts are hard failures: these tests must execute the
 //! real model rather than silently skip-pass.
 //!
-//! Scope: this is the **CPU** native-decode proof. The CUDA native-decode path
-//! (`DecodeCudaState`) does not yet support CSA/HCA compressed state — it sizes
-//! every declared state input as a fixed-geometry f32/f16/bf16 device buffer
-//! (`persistent_state_shapes`), so it rejects both the ratio-4 packed **uint8**
-//! record buffers and the **symbolic** compressed-record axis. Threading the
-//! growing compressed-record cache on-device (with capture/replay invalidation
-//! as the cursor advances and MemoryGovernor accounting for compressed state) is
-//! a separate slice; the CUDA legs (capture>=3 replays, fallbacks==0, governor
-//! baseline->resident->baseline) are deferred to it and are intentionally not
-//! asserted here. See the decision note
-//! `deckard-hca-c1-e2e-proof.md` for the exact typed blocker and the smallest
-//! owner-targeted fix.
+//! The CUDA legs use fixed-stride, session-owned record buffers: logical
+//! `[batch, records, width]` views retain a capacity-sized batch-row stride, so
+//! growing one row never relocates or aliases another. The long batch test
+//! crosses both ratio-128 boundaries at 128 and 256 tokens, while the capture
+//! test proves repeated capture/replay with zero fallback.
 #![cfg(feature = "native-backend")]
 
 use std::path::{Path, PathBuf};
 
+#[cfg(feature = "native-cuda")]
+use onnx_genai_engine::NativeDecodeCudaOptions;
 use onnx_genai_engine::NativeDecodeSession;
 use onnx_genai_metadata::{
     CsaCacheFormat, CsaCompressionRatio, CsaRecurrence, CsaStateEdge, CsaStateGroupAbi,
@@ -96,9 +91,6 @@ fn tiny_csa_io() -> DecoderAbi {
         attention_mask_input: Some("attention_mask".into()),
         position_ids_input: Some("position_ids".into()),
         logits_output: Some("logits".into()),
-        // The exporter still emits a dense KV cache per layer (a Concat of past
-        // and the current step's key/value), computed in parallel with the CSA
-        // attention output. Thread it as an ordinary owned KV pair.
         kv_inputs: Some(vec![
             "past_key_values.0.key".into(),
             "past_key_values.0.value".into(),
@@ -171,6 +163,15 @@ fn argmax(row: &[f32]) -> u32 {
         .expect("logits row must not be empty")
 }
 
+fn decode_argmax(session: &mut NativeDecodeSession, token: u32, past: usize) -> u32 {
+    let logits = session
+        .decode(&[token], past)
+        .expect("decode")
+        .pop()
+        .expect("decode logits");
+    argmax(&logits)
+}
+
 /// Build a native CPU decode session over the fixture with the explicit CSA ABI.
 /// A successful build is itself a proof: `from_session_with_io` resolves every
 /// declared CSA state group against the graph's real typed IO and returns a
@@ -185,6 +186,29 @@ fn build_cpu_session(dir: &Path) -> NativeDecodeSession {
         .expect("build native CPU session over the tiny CSA fixture");
     NativeDecodeSession::from_session_with_io(session, &tiny_csa_io())
         .expect("wrap native CSA/HCA decoder with the explicit compressed-state ABI")
+}
+
+#[cfg(feature = "native-cuda")]
+fn build_cuda_session(dir: &Path, batch: usize) -> NativeDecodeSession {
+    let session = InferenceSession::builder()
+        .model(dir.join("model.onnx"))
+        .device(DevicePreference::Gpu { index: Some(0) })
+        .option("optimization", "basic")
+        .build()
+        .expect("build native CUDA session over the tiny CSA fixture");
+    NativeDecodeSession::from_session_with_cuda_options_and_io(
+        session,
+        NativeDecodeCudaOptions {
+            kv_max_len: Some(512),
+            metadata_max_len: Some(512),
+            graph_capture: Some(true),
+            weight_offload_enabled: Some(false),
+            weight_offload_stable_va: None,
+            decode_batch: Some(batch),
+        },
+        Some(&tiny_csa_io()),
+    )
+    .expect("wrap CUDA CSA/HCA decoder with fixed-stride record state")
 }
 
 /// Core CPU proof: native load with compressed-state groups honored, prefill,
@@ -384,4 +408,157 @@ fn tiny_csa_hca_cpu_multi_request_isolation() {
     a.decode(&[1], pa).expect("a decode");
     assert_eq!(a.current_len(), 7);
     assert_eq!(b.current_len(), 2, "b's cursor is unaffected by a's decode");
+}
+
+#[cfg(feature = "native-cuda")]
+#[test]
+fn tiny_csa_hca_cuda_multi_request_buffers_are_disjoint_and_reset_isolated() {
+    if let Err(error) = onnx_runtime_ep_cuda::CudaExecutionProvider::new(0) {
+        eprintln!("skipping tiny CSA CUDA multi-request test: {error}");
+        return;
+    }
+    let dir = fixture_dir();
+    let mut a = build_cuda_session(&dir, 1);
+    let mut b = build_cuda_session(&dir, 1);
+    let a_ptrs = a.cuda_kv_debug_stats().unwrap().csa_record_device_ptrs;
+    let b_ptrs = b.cuda_kv_debug_stats().unwrap().csa_record_device_ptrs;
+    assert!(
+        a_ptrs.iter().all(|ptr| !b_ptrs.contains(ptr)),
+        "independent requests must own disjoint record allocations"
+    );
+    for step in 0..8 {
+        let pa = a.current_len();
+        decode_argmax(&mut a, 3 + step, pa);
+        let pb = b.current_len();
+        decode_argmax(&mut b, 41 + step, pb);
+    }
+    a.reset().expect("reset request a");
+    assert_eq!(a.current_len(), 0);
+    assert_eq!(b.current_len(), 8, "request b survives request a reset");
+    assert_eq!(
+        b.cuda_kv_debug_stats().unwrap().csa_record_device_ptrs,
+        b_ptrs,
+        "request b pointers remain stable"
+    );
+}
+
+#[cfg(feature = "native-cuda")]
+#[test]
+fn tiny_csa_hca_cuda_batch2_crosses_ratio128_boundaries_without_aliasing() {
+    if let Err(error) = onnx_runtime_ep_cuda::CudaExecutionProvider::new(0) {
+        eprintln!("skipping tiny CSA CUDA boundary test: {error}");
+        return;
+    }
+    let dir = fixture_dir();
+    let mut batch = build_cuda_session(&dir, 2);
+    let mut refs = [build_cpu_session(&dir), build_cpu_session(&dir)];
+    let token_cycle = [3_u32, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41];
+    let initial_ptrs = batch
+        .cuda_kv_debug_stats()
+        .expect("CUDA stats")
+        .csa_record_device_ptrs;
+    assert_eq!(initial_ptrs.len(), 3, "two ratio-4 records plus ratio-128");
+
+    for total in 1..=257 {
+        let past = total - 1;
+        let inputs = [
+            token_cycle[past % token_cycle.len()],
+            token_cycle[(past + 5) % token_cycle.len()],
+        ];
+        let expected = [
+            decode_argmax(&mut refs[0], inputs[0], past),
+            decode_argmax(&mut refs[1], inputs[1], past),
+        ];
+        let actual = batch
+            .decode_greedy_batch(&inputs, past)
+            .unwrap_or_else(|error| panic!("CUDA batch step {total} failed: {error:#}"));
+        assert_eq!(actual, expected, "CPU/CUDA batch parity at token {total}");
+
+        if matches!(total, 127 | 128 | 129 | 255 | 256 | 257) {
+            let stats = batch.cuda_kv_debug_stats().expect("CUDA stats");
+            assert_eq!(
+                stats.csa_record_device_ptrs, initial_ptrs,
+                "record pointers must stay stable at token {total}"
+            );
+            let mut logical_records = stats
+                .csa_record_logical_shapes
+                .iter()
+                .map(|shape| shape[1])
+                .collect::<Vec<_>>();
+            logical_records.sort_unstable();
+            let r4 = total / 4;
+            let r128 = total / 128;
+            let mut expected_records = vec![r4, r4, r128];
+            expected_records.sort_unstable();
+            assert_eq!(
+                logical_records, expected_records,
+                "record cursors at token {total}"
+            );
+        }
+    }
+
+    let stats = batch.cuda_kv_debug_stats().expect("CUDA stats");
+    assert!(
+        stats.csa_record_growth_events >= 64,
+        "ratio-4 record cursor must grow repeatedly, got {} events",
+        stats.csa_record_growth_events
+    );
+    assert_eq!(stats.graph.fallbacks, 0, "no capture fallback is allowed");
+    assert!(stats.graph.captures >= 1, "CUDA graph must capture");
+    assert!(
+        stats.graph.replays >= 7,
+        "CUDA graph must replay repeatedly"
+    );
+}
+
+#[cfg(feature = "native-cuda")]
+#[test]
+fn tiny_csa_hca_cuda_recaptures_after_reset_and_restores_snapshot() {
+    if let Err(error) = onnx_runtime_ep_cuda::CudaExecutionProvider::new(0) {
+        eprintln!("skipping tiny CSA CUDA capture test: {error}");
+        return;
+    }
+    let dir = fixture_dir();
+    let mut session = build_cuda_session(&dir, 1);
+    for generation in 0..4 {
+        let mut token = 3 + generation;
+        for _ in 0..8 {
+            let past = session.current_len();
+            token = decode_argmax(&mut session, token, past);
+        }
+        if generation != 3 {
+            session.reset().expect("reset generation");
+        }
+    }
+    let stats = session.cuda_kv_debug_stats().expect("CUDA stats");
+    assert!(
+        stats.graph.captures >= 4,
+        "four generations must produce at least four captures, got {}; decline={:?}",
+        stats.graph.captures,
+        stats.graph.decline_reason
+    );
+    assert!(
+        stats.graph.replays >= 7,
+        "capture state must replay at least seven times, got {}",
+        stats.graph.replays
+    );
+    assert_eq!(stats.graph.fallbacks, 0);
+
+    let snapshot = session
+        .snapshot_recurrent_state_public()
+        .expect("snapshot CUDA carries and record buffers");
+    let anchor = session.current_len();
+    let mut token = 11;
+    for _ in 0..6 {
+        let past = session.current_len();
+        token = decode_argmax(&mut session, token, past);
+    }
+    session
+        .rollback_recurrent_to_accepted(&snapshot, anchor, &[])
+        .expect("restore CUDA CSA snapshot");
+    assert_eq!(session.current_len(), anchor);
+    assert!(
+        session.rewind(anchor.saturating_sub(1)).is_err(),
+        "bare non-zero CSA rewind remains typed-refused"
+    );
 }

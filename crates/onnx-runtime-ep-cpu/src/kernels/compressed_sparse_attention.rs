@@ -1949,17 +1949,15 @@ fn select_ratio4_topk(
                 }
                 scores.push((record, score));
             }
-            for left in 0..scores.len() {
-                for right in left + 1..scores.len() {
-                    if scores[left].1 == scores[right].1 {
-                        return Err(unsupported(format!(
-                            "portable top-k tie ordering is unfrozen: equal score {} at [batch={b}, query={s}] for compressed records {} and {}",
-                            scores[left].1, scores[left].0, scores[right].0
-                        )));
-                    }
-                }
-            }
-            scores.sort_unstable_by(|left, right| right.1.total_cmp(&left.1));
+            // Match the CUDA kernel's frozen total order: descending score,
+            // then ascending record index. This makes quantized zero-score ties
+            // deterministic across providers.
+            scores.sort_unstable_by(|left, right| {
+                right
+                    .1
+                    .total_cmp(&left.1)
+                    .then_with(|| left.0.cmp(&right.0))
+            });
             let row = b
                 .checked_mul(sequence)
                 .and_then(|value| value.checked_add(s))
@@ -5168,8 +5166,8 @@ mod tests {
     }
 
     #[test]
-    fn ratio4_topk_ties_remain_explicitly_unsupported() {
-        let message = select_ratio4_topk(
+    fn ratio4_topk_ties_choose_lower_record_indices() {
+        let selected = select_ratio4_topk(
             &[0.0; 128],
             &[1.0],
             &[0.25; 256],
@@ -5179,10 +5177,8 @@ mod tests {
             2,
             64,
         )
-        .unwrap_err()
-        .to_string();
-        assert!(message.contains("Unsupported"));
-        assert!(message.contains("top-k tie ordering is unfrozen"));
+        .unwrap();
+        assert_eq!(selected, vec![0, 1]);
     }
 
     #[test]

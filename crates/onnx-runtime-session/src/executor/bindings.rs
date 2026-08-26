@@ -1041,6 +1041,7 @@ impl Executor {
     }
 
     pub(crate) fn reset_device_graph(&mut self) -> Result<bool> {
+        self.cache.captured_nodes.clear();
         let cap = self.cap_mut();
         cap.device_graph_signature = None;
         cap.capture_schedule = None;
@@ -1237,6 +1238,9 @@ impl Executor {
                         binding.kernel_input_shape().to_vec()
                     },
                     accepts_subshape: false,
+                    strides: binding
+                        .fixed_physical_strides()
+                        .then(|| compute_contiguous_strides(binding.physical_shape())),
                     ptr,
                     len,
                     alignment,
@@ -1282,6 +1286,9 @@ impl Executor {
                     shape: binding.physical_shape().to_vec(),
                     accepts_subshape: bind_input
                         && binding.logical_shape() != binding.physical_shape(),
+                    strides: binding
+                        .fixed_physical_strides()
+                        .then(|| compute_contiguous_strides(binding.physical_shape())),
                     ptr,
                     len,
                     alignment,

@@ -215,14 +215,11 @@ pub struct DecoderAbi {
     /// reason before allocating. Absent means the graph threads no CSA state and
     /// the historical behavior is preserved byte-for-byte.
     ///
-    /// Device support: the **CPU** native-decode path threads this state
-    /// end-to-end (prefill, decode, present->past progression, snapshot/rollback,
-    /// teardown). The **CUDA** path does not yet represent the rank-3,
-    /// op-cursor-advanced record buffers — its persistent-state machinery is
-    /// frozen to rank-4 f32/f16/bf16 BNSH KV — so a graph that declares CSA
-    /// record state is refused before any device allocation on CUDA (fail-closed;
-    /// no PagedAttention, no dense fallback), pending the dedicated CUDA CSA
-    /// record-cache slice.
+    /// Device support: CPU and CUDA native decode both thread these groups
+    /// end-to-end. CUDA owns fixed-capacity, fixed-row-stride record allocations
+    /// while exposing the current logical record cursor, so batch rows stay
+    /// disjoint and pointers remain stable across growth, capture/replay,
+    /// snapshot/rollback, reset, and teardown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub csa_state_groups: Option<Vec<CsaStateGroupAbi>>,
 }

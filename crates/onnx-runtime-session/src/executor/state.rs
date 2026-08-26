@@ -733,6 +733,7 @@ pub(super) struct ExternalValue {
     pub(super) dtype: DataType,
     pub(super) shape: Vec<usize>,
     pub(super) accepts_subshape: bool,
+    pub(super) strides: Option<Vec<i64>>,
     pub(super) ptr: *mut std::ffi::c_void,
     pub(super) len: usize,
     pub(super) alignment: usize,
@@ -804,8 +805,13 @@ pub(super) struct ExternalCaptureSig {
 
 impl ExternalBindings {
     pub(super) fn seed_capture_shapes(&self, resolved: &mut HashMap<ValueId, Vec<usize>>) {
-        for (&vid, value) in self.inputs.iter().chain(&self.outputs) {
+        for (&vid, value) in &self.inputs {
             resolved.entry(vid).or_insert_with(|| value.shape.clone());
+        }
+        for (&vid, value) in &self.outputs {
+            if !value.accepts_subshape {
+                resolved.entry(vid).or_insert_with(|| value.shape.clone());
+            }
         }
     }
 

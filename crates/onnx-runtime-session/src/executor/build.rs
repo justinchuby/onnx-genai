@@ -2238,6 +2238,33 @@ impl Executor {
                 logical_shape,
                 expose_logical_input_shape,
                 decode_freeze_safe_mask,
+                fixed_physical_strides: false,
+                allocation_bytes: None,
+                committed_ranges: None,
+            },
+        )
+    }
+
+    pub(crate) fn allocate_device_binding_fixed_strides(
+        &self,
+        input_name: String,
+        output_name: String,
+        dtype: DataType,
+        physical_shape: Vec<usize>,
+        logical_shape: Vec<usize>,
+    ) -> Result<DeviceIoBinding> {
+        DeviceIoBinding::allocate(
+            self.ep.clone(),
+            DeviceBindingSpec {
+                input_name,
+                bind_input: true,
+                output_name: Some(output_name),
+                dtype,
+                physical_shape,
+                logical_shape,
+                expose_logical_input_shape: true,
+                decode_freeze_safe_mask: false,
+                fixed_physical_strides: true,
                 allocation_bytes: None,
                 committed_ranges: None,
             },
@@ -2277,6 +2304,7 @@ impl Executor {
                 logical_shape,
                 expose_logical_input_shape,
                 decode_freeze_safe_mask,
+                fixed_physical_strides: false,
                 allocation_bytes: Some(allocation_bytes),
                 committed_ranges: Some(committed_ranges),
             },
@@ -2336,6 +2364,7 @@ impl Executor {
                     logical_shape,
                     expose_logical_input_shape,
                     decode_freeze_safe_mask,
+                    fixed_physical_strides: false,
                     allocation_bytes: None,
                     committed_ranges: None,
                 },
@@ -2363,6 +2392,7 @@ impl Executor {
                 logical_shape,
                 expose_logical_input_shape: false,
                 decode_freeze_safe_mask: false,
+                fixed_physical_strides: false,
                 allocation_bytes: None,
                 committed_ranges: None,
             },

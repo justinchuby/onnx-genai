@@ -175,19 +175,21 @@ extern "C" __global__ void csa_ratio128_compress(
     const float* kv, const float* gate, const float* ape, const float* norm,
     const float* past_carry, const unsigned char* past_cache,
     float* carry, unsigned char* cache,
-    int batch, int sequence, int dim, int past_records, int cache_records, int cache_fp8,
+    int batch, int sequence, int dim, int past_row_records, int cache_row_records, int cache_fp8,
     const long long* total_ptr)
 {
     const int b = blockIdx.x;
     if (b >= batch || threadIdx.x != 0) return;
     const long long start = *total_ptr - (long long)sequence;
+    const int past_records = (int)(start / 128);
+    const int cache_records = (int)(*total_ptr / 128);
     const int carry_stride = 2 * 128 * dim;
     const int cache_width = cache_fp8 ? 583 : dim * 4;
     // The graph outputs are the next state.  Copy only the old records/carry;
     // newly completed records are written below.
     for (int i = 0; i < carry_stride; ++i) carry[b * carry_stride + i] = past_carry[b * carry_stride + i];
     for (int i = 0; i < past_records * cache_width; ++i)
-        cache[b * cache_records * cache_width + i] = past_cache[b * past_records * cache_width + i];
+        cache[b * cache_row_records * cache_width + i] = past_cache[b * past_row_records * cache_width + i];
     if (start == 0) {
         // A completed ratio-128 block consumes every slot.  Clear the complete
         // block after finalizing it (the next token writes only its own slot).
@@ -241,7 +243,7 @@ extern "C" __global__ void csa_ratio128_compress(
         }
         const int out = past_records + emitted++;
         if (cache_fp8) {
-            unsigned char* dst = cache + (b * cache_records + out) * 583;
+            unsigned char* dst = cache + (b * cache_row_records + out) * 583;
             for (int block = 0; block < 7; ++block)
                 quantize_fp8_e4m3_block(record + block * 64, dst + block * 65, dst + block * 65 + 1);
             for (int d = 0; d < 64; ++d) {
@@ -250,7 +252,7 @@ extern "C" __global__ void csa_ratio128_compress(
                 dst[455 + 2 * d + 1] = (unsigned char)(bits >> 8);
             }
         } else {
-            float* dst = (float*)cache + (b * cache_records + out) * dim;
+            float* dst = (float*)cache + (b * cache_row_records + out) * dim;
             for (int d = 0; d < dim; ++d) dst[d] = record[d];
         }
         for (int reset_slot = 0; reset_slot < 128; ++reset_slot)
@@ -273,17 +275,18 @@ extern "C" __global__ void csa_ratio4_index_compress(
     const float* kv, const float* gate, const float* ape, const float* norm,
     const unsigned char* past_key, const float* past_carry,
     unsigned char* key, float* carry,
-    int batch, int sequence, int dim, int rope_dim, int past_records, int key_records,
+    int batch, int sequence, int dim, int rope_dim, int past_row_records, int key_row_records,
     const long long* total_ptr)
 {
     const int b = blockIdx.x;
     if (b >= batch || threadIdx.x != 0) return;
     const long long start = *total_ptr - (long long)sequence;
+    const int past_records = (int)(start / 4);
     const int source_width = 2 * dim;
     const int carry_stride = 8 * 2 * source_width;
     for (int i = 0; i < carry_stride; ++i) carry[b * carry_stride + i] = past_carry[b * carry_stride + i];
     for (int i = 0; i < past_records * 68; ++i)
-        key[(b * key_records) * 68 + i] = past_key[(b * past_records) * 68 + i];
+        key[(b * key_row_records) * 68 + i] = past_key[(b * past_row_records) * 68 + i];
     const float NEG = __int_as_float(0xff800000);
     if (start == 0) {
         for (int slot = 0; slot < 8; ++slot)
@@ -354,7 +357,7 @@ extern "C" __global__ void csa_ratio4_index_compress(
                 }
         const float hadamard_scale = __frcp_rn(__fsqrt_rn((float)dim));
         for (int d = 0; d < dim; ++d) record[d] = csa_index_bf16(__fmul_rn(record[d], hadamard_scale));
-        unsigned char* dst = key + (b * key_records + past_records + emitted++) * 68;
+        unsigned char* dst = key + (b * key_row_records + past_records + emitted++) * 68;
         for (int block = 0; block < 4; ++block)
             quantize_fp4_e2m1_block(record + 32 * block, dst + 17 * block, dst + 17 * block + 1);
 
@@ -381,12 +384,13 @@ extern "C" __global__ void csa_ratio4_main_compress(
     const float* kv, const float* gate, const float* ape, const float* norm,
     const unsigned char* past_cache, const float* past_carry,
     unsigned char* cache, float* carry,
-    int batch, int sequence, int dim, int rope_dim, int past_records, int cache_records,
+    int batch, int sequence, int dim, int rope_dim, int past_row_records, int cache_row_records,
     const long long* total_ptr)
 {
     const int b = blockIdx.x;
     if (b >= batch || threadIdx.x != 0) return;
     const long long start = *total_ptr - (long long)sequence;
+    const int past_records = (int)(start / 4);
     const int source_width = 2 * dim;
     const int carry_stride = 8 * 2 * source_width;
     const int cache_width = 583;
@@ -394,7 +398,7 @@ extern "C" __global__ void csa_ratio4_main_compress(
     // completed records are written below (stable-address, in-place update).
     for (int i = 0; i < carry_stride; ++i) carry[b * carry_stride + i] = past_carry[b * carry_stride + i];
     for (int i = 0; i < past_records * cache_width; ++i)
-        cache[(b * cache_records) * cache_width + i] = past_cache[(b * past_records) * cache_width + i];
+        cache[(b * cache_row_records) * cache_width + i] = past_cache[(b * past_row_records) * cache_width + i];
     const float NEG = __int_as_float(0xff800000);
     if (start == 0) {
         for (int slot = 0; slot < 8; ++slot)
@@ -459,7 +463,7 @@ extern "C" __global__ void csa_ratio4_main_compress(
             record[d] = csa_main4_bf16(__fsub_rn(__fmul_rn(re, cs), __fmul_rn(im, sn)));
             record[d + 1] = csa_main4_bf16(__fadd_rn(__fmul_rn(re, sn), __fmul_rn(im, cs)));
         }
-        unsigned char* dst = cache + (b * cache_records + past_records + emitted++) * cache_width;
+        unsigned char* dst = cache + (b * cache_row_records + past_records + emitted++) * cache_width;
         for (int block = 0; block < 7; ++block)
             quantize_fp8_e4m3_block(record + block * 64, dst + block * 65, dst + block * 65 + 1);
         for (int d = 0; d < rope_dim; ++d) {
@@ -535,7 +539,7 @@ extern "C" __global__ void csa_ratio4_index_select(
     float* scores,                   // [batch, sequence, records] scratch
     int* selected,                   // [batch, sequence, topk_width] scratch
     int batch, int sequence, int index_heads, int index_dim, int rope_dim,
-    int records, const long long* total_ptr, int topk_width)
+    int record_capacity, const long long* total_ptr, int topk_width)
 {
     const int bs = blockIdx.x;
     if (bs >= batch * sequence || threadIdx.x != 0) return;
@@ -545,7 +549,7 @@ extern "C" __global__ void csa_ratio4_index_select(
     const long long start = *total_ptr - (long long)sequence;
     const long long position = start + (long long)s;
     long long valid_ll = (position + 1) / 4;
-    int limit = records;
+    int limit = record_capacity;
     if (valid_ll < (long long)limit) limit = (int)valid_ll;
     if (limit < 0) limit = 0;
 
@@ -599,9 +603,9 @@ extern "C" __global__ void csa_ratio4_index_select(
 
     // Stage 4: score each causal candidate record.
     const int weight_row = (b * sequence + s) * index_heads;
-    float* row_scores = scores + ((long long)(b * sequence + s) * records);
+    float* row_scores = scores + ((long long)(b * sequence + s) * record_capacity);
     for (int record = 0; record < limit; ++record) {
-        const unsigned char* key = index_key + ((long long)b * records + record) * 68;
+        const unsigned char* key = index_key + ((long long)b * record_capacity + record) * 68;
         float score = 0.0f;
         for (int head = 0; head < index_heads; ++head) {
             const float* q = transformed + ((long long)bs * query_stride) + (long long)head * index_dim;
@@ -678,7 +682,7 @@ extern "C" __global__ void csa_ratio128_sink_attention(
     int batch, int sequence, int heads, int dim,
     int current_kv_len,
     const long long* total_ptr,
-    int compressed_records,
+    int compressed_capacity,
     int scratch_stride,
     int cache_fp8,
     int bias_present, int bias_b, int bias_h, int bias_s, int bias_k,
@@ -698,14 +702,14 @@ extern "C" __global__ void csa_ratio128_sink_attention(
     const long long current_kv_base = total - (long long)current_kv_len;
     int dense_candidates = 128;
     if (query_start == 0) dense_candidates = current_kv_len < 128 ? current_kv_len : 128;
-    const int candidate_count = dense_candidates + compressed_records;
     const long long position = query_start + (long long)s;
     long long window = position + 1 - 128;
     if (window < 0) window = 0;
     const long long dense_start = current_kv_base > window ? current_kv_base : window;
     const long long valid_compressed = (position + 1) / 128;
-    int comp_limit = compressed_records < (int)valid_compressed
-        ? compressed_records : (int)valid_compressed;
+    int comp_limit = compressed_capacity < (int)valid_compressed
+        ? compressed_capacity : (int)valid_compressed;
+    const int candidate_count = dense_candidates + comp_limit;
 
     float* row_scores = scores + (long long)row * scratch_stride;
     const long long q_base = ((long long)(b * sequence + s) * heads + h) * dim;
@@ -743,7 +747,7 @@ extern "C" __global__ void csa_ratio128_sink_attention(
             float acc = 0.0f;
             if (cache_fp8) {
                 const unsigned char* packed = compressed
-                    + ((long long)b * compressed_records + rec) * 583;
+                    + ((long long)b * compressed_capacity + rec) * 583;
                 for (int block = 0; block < 7; ++block) {
                     const float block_scale = e8m0_scale(packed[65 * block]);
                     for (int d = 0; d < 64; ++d)
@@ -759,7 +763,7 @@ extern "C" __global__ void csa_ratio128_sink_attention(
                 }
             } else {
                 const float* kv = (const float*)compressed
-                    + ((long long)b * compressed_records + rec) * dim;
+                    + ((long long)b * compressed_capacity + rec) * dim;
                 for (int d = 0; d < dim; ++d)
                     acc = __fadd_rn(acc, __fmul_rn(query[q_base + d], kv[d]));
             }
@@ -815,7 +819,7 @@ extern "C" __global__ void csa_ratio128_sink_attention(
                 const int rec = c - dense_candidates;
                 if (cache_fp8) {
                     const unsigned char* packed = compressed
-                        + ((long long)b * compressed_records + rec) * 583;
+                        + ((long long)b * compressed_capacity + rec) * 583;
                     if (d < 448) {
                         const int block = d / 64, in_block = d % 64;
                         val = decode_e4m3fn(packed[65 * block + 1 + in_block])
@@ -828,7 +832,7 @@ extern "C" __global__ void csa_ratio128_sink_attention(
                     }
                 } else {
                     val = ((const float*)compressed)
-                        [(((long long)b * compressed_records + rec) * dim) + d];
+                        [(((long long)b * compressed_capacity + rec) * dim) + d];
                 }
             }
             result = __fadd_rn(result, __fmul_rn(prob, val));
@@ -842,7 +846,7 @@ extern "C" __global__ void csa_ratio4_sink_attention(
     const float* query, const float* current_kv, const unsigned char* compressed,
     const int* selected, const float* sink, const float* bias, float* output, float* scores,
     int batch, int sequence, int heads, int dim, int current_kv_len,
-    const long long* total_ptr, int compressed_records,
+    const long long* total_ptr, int compressed_capacity,
     int index_heads, int topk_width, int scratch_stride,
     int bias_present, int bias_b, int bias_h, int bias_s, int bias_k, float scale)
 {
@@ -856,6 +860,7 @@ extern "C" __global__ void csa_ratio4_sink_attention(
     const float NEG = __int_as_float(0xff800000);
     // B6: derive the logical cursors on device from `total_sequence_length`.
     const long long total = *total_ptr;
+    const int valid_records = (int)(total / 4);
     const long long query_start = total - (long long)sequence;
     const long long current_kv_base = total - (long long)current_kv_len;
     int dense_candidates = 128;
@@ -895,8 +900,8 @@ extern "C" __global__ void csa_ratio4_sink_attention(
         }
         for (int slot = 0; slot < topk_width; ++slot) {
             const int record = selected[selected_base + slot];
-            if (record < 0 || record >= compressed_records) continue;
-            const unsigned char* packed = compressed + ((long long)b * compressed_records + record) * 583;
+            if (record < 0 || record >= valid_records) continue;
+            const unsigned char* packed = compressed + ((long long)b * compressed_capacity + record) * 583;
             float acc = 0.0f;
             for (int block = 0; block < 7; ++block) {
                 const float block_scale = e8m0_scale(packed[65 * block]);
@@ -949,7 +954,7 @@ extern "C" __global__ void csa_ratio4_sink_attention(
                 value = current_kv[((long long)b * current_kv_len + relative) * dim + d];
             } else {
                 const int record = selected[selected_base + c - dense_candidates];
-                const unsigned char* packed = compressed + ((long long)b * compressed_records + record) * 583;
+                const unsigned char* packed = compressed + ((long long)b * compressed_capacity + record) * 583;
                 if (d < 448) {
                     const int block = d / 64, in_block = d % 64;
                     value = decode_e4m3fn(packed[65 * block + 1 + in_block])
@@ -1039,8 +1044,9 @@ impl KernelFactory for CompressedSparseAttentionFactory {
         let device_index_scoring = ratio == 4;
         let device_attention =
             ratio == 128 && matches!(cache_format.as_str(), "f32" | "fp8_e4m3_block64");
-        let device_resident_ratio128 =
-            ratio == 128 && cache_format == "fp8_e4m3_block64" && node.outputs.len() == 3;
+        let device_resident_ratio128 = ratio == 128
+            && matches!(cache_format.as_str(), "f32" | "fp8_e4m3_block64")
+            && node.outputs.len() == 3;
         // B6: ratio-4 main KV compression (outputs 1/2) on device — the last
         // host-staged ratio-4 stage. With it the whole ratio-4 decode is
         // device-resident.
@@ -1181,6 +1187,24 @@ struct CompressedSparseAttentionKernel {
     golden_capture: CsaGoldenCapture,
 }
 
+fn record_row_capacity(shape: &[usize], strides: &[i64], name: &str) -> Result<usize> {
+    if shape.len() != 3 || strides.len() != 3 || shape[2] == 0 {
+        return Err(not_implemented(format!(
+            "{OP}: {name} must be rank-3 [batch, records, width], got shape {shape:?} strides {strides:?}"
+        )));
+    }
+    let row_stride = usize::try_from(strides[0])
+        .map_err(|_| not_implemented(format!("{OP}: {name} has negative row stride")))?;
+    let record_stride = usize::try_from(strides[1])
+        .map_err(|_| not_implemented(format!("{OP}: {name} has negative record stride")))?;
+    if record_stride != shape[2] || strides[2] != 1 || !row_stride.is_multiple_of(record_stride) {
+        return Err(not_implemented(format!(
+            "{OP}: {name} requires fixed contiguous record rows, got shape {shape:?} strides {strides:?}"
+        )));
+    }
+    Ok(row_stride / record_stride)
+}
+
 impl std::fmt::Debug for CompressedSparseAttentionKernel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CompressedSparseAttentionKernel").finish()
@@ -1318,7 +1342,11 @@ impl CompressedSparseAttentionKernel {
             ))
         })?;
         let current_kv_len = inputs[1].shape[1];
-        let compressed_records = outputs[1].shape[1];
+        let compressed_records = record_row_capacity(
+            outputs[1].shape,
+            outputs[1].strides,
+            "present_compressed_kv",
+        )?;
         let scratch_stride = RATIO4_DENSE_WINDOW
             .checked_add(compressed_records)
             .ok_or_else(|| not_implemented(format!("{OP}: ratio-128 scratch stride overflow")))?;
@@ -1441,7 +1469,11 @@ impl CompressedSparseAttentionKernel {
             ))
         })?;
         let current_kv_len = inputs[1].shape[1];
-        let compressed_records = outputs[1].shape[1];
+        let compressed_records = record_row_capacity(
+            outputs[1].shape,
+            outputs[1].strides,
+            "present_compressed_kv",
+        )?;
         let topk_width = outputs[5].shape[3];
         // B6: the per-row attention scratch is the pooled workspace with a fixed
         // stride bound (`RATIO4_DENSE_WINDOW + topk_width`). The kernel derives
@@ -1567,8 +1599,13 @@ impl CompressedSparseAttentionKernel {
     ) -> Result<()> {
         let shape = inputs[0].shape;
         let (batch, sequence, dim) = (shape[0], shape[1], shape[3]);
-        let past_records = inputs[6].shape[1];
-        let cache_records = outputs[1].shape[1];
+        let past_row_records =
+            record_row_capacity(inputs[6].shape, inputs[6].strides, "past_compressed_kv")?;
+        let cache_row_records = record_row_capacity(
+            outputs[1].shape,
+            outputs[1].strides,
+            "present_compressed_kv",
+        )?;
         if batch == 0 || sequence == 0 {
             return Ok(());
         }
@@ -1591,10 +1628,10 @@ impl CompressedSparseAttentionKernel {
         let sequence_i =
             i32::try_from(sequence).map_err(|_| not_implemented("CSA sequence exceeds i32"))?;
         let dim_i = i32::try_from(dim).map_err(|_| not_implemented("CSA dimension exceeds i32"))?;
-        let past_i =
-            i32::try_from(past_records).map_err(|_| not_implemented("CSA records exceed i32"))?;
-        let records_i =
-            i32::try_from(cache_records).map_err(|_| not_implemented("CSA records exceed i32"))?;
+        let past_i = i32::try_from(past_row_records)
+            .map_err(|_| not_implemented("CSA row capacity exceeds i32"))?;
+        let records_i = i32::try_from(cache_row_records)
+            .map_err(|_| not_implemented("CSA row capacity exceeds i32"))?;
         builder
             .arg(&kv)
             .arg(&gate)
@@ -1741,8 +1778,10 @@ impl CompressedSparseAttentionKernel {
             return Ok(());
         }
         let dim = inputs[16].shape[0];
-        let past_records = inputs[17].shape[1];
-        let key_records = outputs[3].shape[1];
+        let past_records =
+            record_row_capacity(inputs[17].shape, inputs[17].strides, "past_index_key")?;
+        let key_records =
+            record_row_capacity(outputs[3].shape, outputs[3].strides, "present_index_key")?;
         let source = format!("{}\n{}", block_quant::source(), INDEX_COMPRESSION_SOURCE);
         let func = self.runtime.nvrtc_function(
             INDEX_COMPRESSION_MODULE,
@@ -1818,8 +1857,13 @@ impl CompressedSparseAttentionKernel {
             return Ok(());
         }
         let dim = inputs[5].shape[0];
-        let past_records = inputs[6].shape[1];
-        let cache_records = outputs[1].shape[1];
+        let past_records =
+            record_row_capacity(inputs[6].shape, inputs[6].strides, "past_compressed_kv")?;
+        let cache_records = record_row_capacity(
+            outputs[1].shape,
+            outputs[1].strides,
+            "present_compressed_kv",
+        )?;
         let source = format!("{}\n{}", block_quant::source(), MAIN4_COMPRESSION_SOURCE);
         let func = self.runtime.nvrtc_function(
             MAIN4_COMPRESSION_MODULE,
@@ -1895,7 +1939,8 @@ impl CompressedSparseAttentionKernel {
         let (batch, sequence) = (inputs[0].shape[0], inputs[0].shape[1]);
         let index_heads = self.index_num_heads;
         let index_dim = self.index_head_dim;
-        let records = outputs[3].shape[1];
+        let records =
+            record_row_capacity(outputs[3].shape, outputs[3].strides, "present_index_key")?;
         // selected_indices is [batch, index_heads, sequence, topk_width].
         let topk_width = outputs[5].shape[3];
         // N1 (B6): the pooled `WS_SELECTED` scratch is sized to `max_topk`
@@ -2241,9 +2286,8 @@ impl Kernel for CompressedSparseAttentionKernel {
         self.runtime.synchronize()
     }
 
-    fn supports_strided_input(&self, _input_idx: usize) -> bool {
-        // The host-staging blit is dense; strided inputs are rejected in execute.
-        false
+    fn supports_strided_input(&self, input_idx: usize) -> bool {
+        !self.force_host && matches!(input_idx, 6 | 17)
     }
 
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {

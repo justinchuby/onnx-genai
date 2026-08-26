@@ -14,7 +14,7 @@
 //! is a typed refusal, never a partial allocation.
 
 use super::*;
-use onnx_genai_metadata::{CsaCacheFormat, CsaStateGroupAbi, CsaStateRole};
+use onnx_genai_metadata::{CsaCacheFormat, CsaCompressionRatio, CsaStateGroupAbi, CsaStateRole};
 use onnx_runtime_session::IoMeta;
 
 /// The frozen v1 element dtype each CSA state role carries, given the group's
@@ -48,6 +48,7 @@ pub(super) struct CsaResolvedEdge {
     pub past: String,
     pub present: String,
     pub role: CsaStateRole,
+    pub ratio: CsaCompressionRatio,
 }
 
 /// Resolve a declared CSA state group against the graph's typed IO into
@@ -108,6 +109,7 @@ pub(super) fn resolve_csa_state_edges(
             past,
             present,
             role,
+            ratio: group.ratio,
         });
     }
     Ok(resolved)
@@ -143,43 +145,6 @@ pub(super) fn resolve_csa_state_groups(
     Ok(all)
 }
 
-/// Fail-closed guard for the CUDA native-decode path.
-///
-/// CSA/HCA compressed-**record** buffers (`compressed_kv`, `index_key`) are
-/// rank-3 tensors that grow along a *backend-owned compressed-record cursor*
-/// (~tokens / ratio) and are byte-packed (`uint8`) for a block-quantized cache.
-/// The CUDA decoder's persistent-state machinery
-/// ([`DecodeCudaState::persistent_state_shapes`] /
-/// [`DecodeCudaState::kv_bytes_per_token`]) is frozen to rank-4 `f32`/`f16`/`bf16`
-/// **BNSH** KV growing on axis 2 — it cannot represent a rank-3 `uint8` record
-/// buffer, nor advance it on the op-owned cursor instead of the token rate. A
-/// dedicated CUDA CSA record-cache slice (device cursor, capture/replay
-/// invalidation, governor accounting, device snapshot/restore) is required and
-/// is tracked separately.
-///
-/// Until it exists, a graph that declares CSA record state must be **refused
-/// before any device allocation** when the target device is CUDA — never routed
-/// through PagedAttention, never silently mis-bound to the fixed wholesale-swap
-/// path, never dense-fallback. The CPU native-decode path threads this state
-/// correctly (records grow by the op's actual present extent), so the refusal
-/// names CPU as the supported device.
-pub(super) fn refuse_csa_records_on_cuda(
-    has_csa_record_state: bool,
-    device_is_cuda: bool,
-) -> anyhow::Result<()> {
-    if has_csa_record_state && device_is_cuda {
-        bail!(
-            "DeepSeek-V4 CompressedSparseAttention compressed-record state is not yet supported on \
-             the CUDA native-decode path: its record buffers (compressed_kv / index_key) are rank-3 \
-             and advance on a backend-owned compressed-record cursor, but the CUDA persistent-state \
-             path is frozen to rank-4 f32/f16/bf16 BNSH KV. Load this model on CPU, or wait for the \
-             dedicated CUDA CSA record-cache slice. Refused before any device allocation (no \
-             PagedAttention, no fixed wholesale-swap rebind, no dense fallback)."
-        );
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,6 +172,7 @@ mod tests {
             past: past.to_string(),
             present: present.to_string(),
             role,
+            ratio: CsaCompressionRatio::Ratio4,
         }
     }
 
@@ -508,26 +474,22 @@ mod tests {
     }
 
     #[test]
-    fn csa_records_are_refused_on_cuda_before_allocation() {
-        // A graph that threads CSA record state cannot load on CUDA yet: the
-        // refusal must fire (fail-closed) rather than mis-binding to the fixed
-        // wholesale-swap path or falling back.
-        let err = refuse_csa_records_on_cuda(true, true)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("CUDA"), "{err}");
-        assert!(err.contains("compressed-record"), "{err}");
+    fn resolved_record_edges_retain_their_group_ratio() {
+        let mut group = ratio128();
+        group.cache_format = CsaCacheFormat::F32;
+        let inputs = vec![
+            meta("past_ckv", DataType::Float32, &[2, 0, 512]),
+            meta("past_cc", DataType::Float32, &[2, 128, 2, 512]),
+        ];
+        let outputs = vec![
+            meta("present_ckv", DataType::Float32, &[2, 0, 512]),
+            meta("present_cc", DataType::Float32, &[2, 128, 2, 512]),
+        ];
+        let edges = resolve_csa_state_edges(&inputs, &outputs, &group, &HashSet::new()).unwrap();
         assert!(
-            err.contains("no dense fallback") || err.contains("no PagedAttention"),
-            "{err}"
+            edges
+                .iter()
+                .all(|edge| edge.ratio == CsaCompressionRatio::Ratio128)
         );
-    }
-
-    #[test]
-    fn csa_records_load_on_cpu_and_absent_state_never_refused() {
-        // CPU with CSA records: allowed. CUDA without CSA records: allowed.
-        refuse_csa_records_on_cuda(true, false).unwrap();
-        refuse_csa_records_on_cuda(false, true).unwrap();
-        refuse_csa_records_on_cuda(false, false).unwrap();
     }
 }

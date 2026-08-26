@@ -59,8 +59,6 @@ use onnx_runtime_memory_governor::{
     Tier,
 };
 
-use crate::kernels::csa_device_state::CsaBufferLayout;
-
 /// Process-unique identity for one CSA state-group holder of device memory, so
 /// each ledger instance charges the shared [`MemoryGovernor`] under a stable
 /// [`HolderId`].
@@ -375,22 +373,10 @@ pub(crate) struct CsaStateGroupBytes {
 }
 
 impl CsaStateGroupBytes {
-    /// Exactly the bytes [`CsaDeviceBufferManager::reserve`] physically
-    /// reserves for this layout: the seven fixed buffers folded into classes
-    /// plus the pooled workspaces as scratch. Keeping this in lockstep with the
-    /// reservation is what lets a test assert `ledger.resident == sum(reserved)`.
-    ///
-    /// [`CsaDeviceBufferManager::reserve`]: crate::kernels::csa_device_state::CsaDeviceBufferManager::reserve
-    pub(crate) fn from_layout(layout: &CsaBufferLayout, workspace_bytes: &[usize]) -> Self {
-        let scratch = workspace_bytes.iter().map(|&size| size.max(1) as u64).sum();
+    pub(crate) fn workspace_only(workspace_bytes: &[usize]) -> Self {
         Self {
-            compressed: layout.attention_r4_bytes as u64 + layout.attention_r128_bytes as u64,
-            carry: layout.attention_r4_carry_bytes as u64
-                + layout.attention_r128_carry_bytes as u64,
-            dense_ring: layout.dense_ring_bytes as u64,
-            index: layout.index_r4_bytes as u64,
-            index_carry: layout.index_r4_carry_bytes as u64,
-            scratch,
+            scratch: workspace_bytes.iter().map(|&size| size.max(1) as u64).sum(),
+            ..Self::default()
         }
     }
 

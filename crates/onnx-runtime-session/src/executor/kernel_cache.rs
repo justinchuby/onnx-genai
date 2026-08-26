@@ -736,6 +736,10 @@ pub(crate) struct KernelCache {
     /// Entries dropped by the per-node bound.
     pub(super) evictions: u64,
     pub(super) prebind_hits: AtomicU64,
+    /// Nodes whose current kernel variants are referenced by an installed
+    /// segmented device graph. Shape-varying eager seam nodes are deliberately
+    /// absent, so evicting their old variants cannot invalidate the graph.
+    pub(super) captured_nodes: HashSet<u32>,
 }
 
 /// How many shape variants of one node the cache keeps (issue #1362).
@@ -817,13 +821,10 @@ impl KernelCache {
         }
         variants.sort_by_key(|(used, _)| *used);
         let surplus = variants.len() - bound;
-        // Evicting kernel variants can retire kernels baked into a captured
-        // device graph in EITHER slot, so defensively reset both the Primary
-        // (M=1 decode) and Verify (M=K speculative) slots here — resetting an
-        // empty slot is a cheap no-op. This keeps the eviction path slot-correct
-        // without threading the caller's active slot through the whole cache API.
-        let _ = ep.reset_device_graph_in(DeviceGraphSlot::Primary);
-        let _ = ep.reset_device_graph_in(DeviceGraphSlot::Verify);
+        if self.captured_nodes.contains(&node) {
+            let _ = ep.reset_device_graph_in(DeviceGraphSlot::Primary);
+            let _ = ep.reset_device_graph_in(DeviceGraphSlot::Verify);
+        }
         for (_, key) in variants.into_iter().take(surplus) {
             self.entries.remove(&key);
             self.last_used.remove(&key);

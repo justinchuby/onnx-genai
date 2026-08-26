@@ -46,7 +46,8 @@
         "index_layout_version": 1,
         "sink_mode": "logit_only",
         "cache_format": "fp8_e4m3_block64",
-        "scale": 0.0
+        "scale": 0.0,
+        "max_seq_len": 512
       }
     },
     {
@@ -83,7 +84,8 @@
         "index_layout_version": 1,
         "sink_mode": "logit_only",
         "cache_format": "f32",
-        "scale": 0.0
+        "scale": 0.0,
+        "max_seq_len": 512
       }
     }
   ],

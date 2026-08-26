@@ -818,6 +818,13 @@ impl Executor {
                 if logging {
                     log_capture_segmentation(&schedule);
                 }
+                self.cache.captured_nodes = schedule
+                    .segments
+                    .iter()
+                    .filter(|segment| segment.captured)
+                    .flat_map(|segment| self.plan[segment.start..segment.end].iter())
+                    .map(|plan| plan.node_id.0)
+                    .collect();
                 let cap = self.cap_mut();
                 cap.capture_cf_shapes = cf_shapes;
                 cap.capture_segmentation = boundaries;
