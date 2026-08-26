@@ -90,6 +90,7 @@ fn cpu_dft_at(
 )]
 #[test]
 fn opset_defaults_and_explicit_axes_match_cpu_on_rank4_input() {
+    let _suite_lock = lock_dft_gpu();
     let ep = require_cuda();
     let tensor = float_input(DataType::Float32, &[1, 8, 6, 1], &[0.0; 48]);
     let onesided = [("onesided", Attribute::Int(1))];

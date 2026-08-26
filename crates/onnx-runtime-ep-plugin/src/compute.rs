@@ -107,8 +107,12 @@ pub enum ShapeInference {
     GatherBlockQuantized,
     /// Shape op — emits [len(dims[start:end])] as a 1-D int64 tensor.
     ShapeOp { start: i64, end: Option<i64> },
-    /// Squeeze: remove dims listed in `axes` (or all size-1 dims if empty).
+    /// Squeeze: remove dimensions listed in an explicitly provided axes list.
     Squeeze { axes: Vec<i64> },
+    /// Squeeze with absent axes: remove every unit dimension.
+    SqueezeAllUnitDims,
+    /// Opset-13+ Squeeze with present axes read from input[1].
+    SqueezeFromInput,
     /// Unsqueeze: insert unit dims at `axes`.
     Unsqueeze { axes: Vec<i64> },
     /// Reshape — output shape read from input[1] at Compute time.
@@ -519,16 +523,16 @@ impl ShapeInference {
 
             // ── Squeeze ───────────────────────────────────────────────────
             "Squeeze" => {
-                // opset 13+: axes from input[1]; earlier: attribute.
-                let axes = if opset >= 13 {
-                    // We can't read input[1] at compile time (data-dependent),
-                    // but we know input_shapes[0] and can remove all size-1 dims
-                    // if no axes input is provided.
-                    ints_attr("axes").unwrap_or_default()
+                // The graph reader injects constant opset-13 axes as an
+                // attribute. Otherwise a present input must be read at Compute;
+                // an absent input retains the schema default (all unit dims).
+                if let Some(axes) = ints_attr("axes") {
+                    Self::Squeeze { axes }
+                } else if opset >= 13 && node.inputs.get(1).is_some_and(Option::is_some) {
+                    Self::SqueezeFromInput
                 } else {
-                    ints_attr("axes").unwrap_or_default()
-                };
-                Self::Squeeze { axes }
+                    Self::SqueezeAllUnitDims
+                }
             }
 
             // ── Unsqueeze ─────────────────────────────────────────────────
@@ -2013,7 +2017,7 @@ unsafe fn mem_info_is_device(api: &ort::OrtApi, mem_info: *const ort::OrtMemoryI
 fn host_operand_indices(strategy: &ShapeInference) -> &'static [usize] {
     match strategy {
         ShapeInference::SharedNative { fallback, .. } => host_operand_indices(fallback),
-        ShapeInference::ReshapeData { .. } => &[1],
+        ShapeInference::ReshapeData { .. } | ShapeInference::SqueezeFromInput => &[1],
         ShapeInference::SliceData => &[1, 2, 3, 4],
         ShapeInference::ReductionFromInput { .. } => &[1],
         _ => &[],
@@ -5124,23 +5128,31 @@ fn infer_shapes(
             if inputs.is_empty() {
                 return Err("Squeeze: no inputs".into());
             }
-            let shape = inputs[0].shape;
-            let out: Vec<usize> = if axes.is_empty() {
-                shape.iter().filter(|&&d| d != 1).copied().collect()
-            } else {
-                let rank = shape.len();
-                let norm_axes: Vec<usize> = axes
+            Ok(vec![squeeze_axes_shape(inputs[0].shape, axes)?])
+        }
+
+        ShapeInference::SqueezeAllUnitDims => {
+            if inputs.is_empty() {
+                return Err("Squeeze: no inputs".into());
+            }
+            Ok(vec![
+                inputs[0]
+                    .shape
                     .iter()
-                    .map(|&a| normalise_axis(a, rank))
-                    .collect::<Result<_, _>>()?;
-                shape
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, _)| !norm_axes.contains(i))
-                    .map(|(_, &d)| d)
-                    .collect()
-            };
-            Ok(vec![out])
+                    .filter(|&&dim| dim != 1)
+                    .copied()
+                    .collect(),
+            ])
+        }
+
+        ShapeInference::SqueezeFromInput => {
+            if inputs.len() < 2 || inputs[1].is_absent() {
+                return Err(
+                    "Squeeze: axes input is present in the graph but absent at Compute".into(),
+                );
+            }
+            let axes = unsafe { read_i64_tensor(&inputs[1]) }?;
+            Ok(vec![squeeze_axes_shape(inputs[0].shape, &axes)?])
         }
 
         ShapeInference::Unsqueeze { axes } => {
@@ -5837,6 +5849,29 @@ fn matmul_output_shape(a: &[usize], b: &[usize]) -> Result<Vec<usize>, String> {
             Ok(batch_out)
         }
     }
+}
+
+/// Output shape for Squeeze with an explicit attribute- or input-carried axes list.
+fn squeeze_axes_shape(shape: &[usize], axes: &[i64]) -> Result<Vec<usize>, String> {
+    let rank = shape.len();
+    let norm_axes: Vec<usize> = axes
+        .iter()
+        .map(|&axis| normalise_axis(axis, rank))
+        .collect::<Result<_, _>>()?;
+    for &axis in &norm_axes {
+        if shape[axis] != 1 {
+            return Err(format!(
+                "Squeeze: axis {axis} has extent {}, expected 1",
+                shape[axis]
+            ));
+        }
+    }
+    Ok(shape
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !norm_axes.contains(index))
+        .map(|(_, &dim)| dim)
+        .collect())
 }
 
 /// Output shape for a reduction op.
@@ -7689,8 +7724,86 @@ fn after() {}
     fn squeeze_removes_ones() {
         let s = [1usize, 3, 1, 4];
         let st = [12i64, 4, 4, 1];
-        let res = infer(&ShapeInference::Squeeze { axes: vec![] }, &[view(&s, &st)]).unwrap();
+        let res = infer(&ShapeInference::SqueezeAllUnitDims, &[view(&s, &st)]).unwrap();
         assert_eq!(res, vec![vec![3, 4]]);
+    }
+
+    #[test]
+    fn squeeze_opset13_present_axes_are_read_from_input() {
+        use onnx_runtime_ir::{Node, NodeId, ValueId};
+
+        let mut node = Node::new(
+            NodeId(0),
+            "Squeeze",
+            vec![Some(ValueId(0)), Some(ValueId(1))],
+            vec![ValueId(2)],
+        );
+        node.version = Some(13);
+        let strategy =
+            ShapeInference::for_node(&node, &[vec![Some(1), Some(1), Some(3)], vec![Some(1)]], 1);
+        assert!(matches!(strategy, ShapeInference::SqueezeFromInput));
+
+        let shape = [1usize, 1, 3];
+        let strides = [3i64, 3, 1];
+        let axes = [0i64];
+        let axis_shape = [1usize];
+        let axis_strides = [1i64];
+        let result = infer(
+            &strategy,
+            &[
+                view(&shape, &strides),
+                i64_view(&axes, &axis_shape, &axis_strides),
+            ],
+        )
+        .unwrap();
+        assert_eq!(result, vec![vec![1, 3]]);
+
+        let empty_axes: [i64; 0] = [];
+        let empty_shape = [0usize];
+        let present_empty = infer(
+            &strategy,
+            &[
+                view(&shape, &strides),
+                i64_view(&empty_axes, &empty_shape, &axis_strides),
+            ],
+        )
+        .unwrap();
+        assert_eq!(present_empty, vec![shape.to_vec()]);
+    }
+
+    #[test]
+    fn squeeze_opset13_absent_axes_remove_every_unit_dimension() {
+        use onnx_runtime_ir::{Node, NodeId, ValueId};
+
+        let mut node = Node::new(
+            NodeId(0),
+            "Squeeze",
+            vec![Some(ValueId(0)), None],
+            vec![ValueId(2)],
+        );
+        node.version = Some(13);
+        let strategy =
+            ShapeInference::for_node(&node, &[vec![Some(1), Some(1), Some(3)], vec![]], 1);
+        assert!(matches!(strategy, ShapeInference::SqueezeAllUnitDims));
+
+        let shape = [1usize, 1, 3];
+        let strides = [3i64, 3, 1];
+        assert_eq!(
+            infer(&strategy, &[view(&shape, &strides)]).unwrap(),
+            vec![vec![3]]
+        );
+    }
+
+    #[test]
+    fn squeeze_explicit_empty_axes_is_a_noop() {
+        let shape = [1usize, 1, 3];
+        let strides = [3i64, 3, 1];
+        let result = infer(
+            &ShapeInference::Squeeze { axes: Vec::new() },
+            &[view(&shape, &strides)],
+        )
+        .unwrap();
+        assert_eq!(result, vec![shape.to_vec()]);
     }
 
     #[test]
@@ -7880,6 +7993,61 @@ fn after() {}
         )
         .unwrap();
         assert_eq!(res, vec![vec![1, 1, 1]]);
+    }
+
+    #[test]
+    fn reduction_from_absent_axes_uses_reduce_all_default() {
+        let shape = [2usize, 3, 4];
+        let strides = [12i64, 4, 1];
+        let result = infer(
+            &ShapeInference::ReductionFromInput {
+                keepdims: true,
+                noop_with_empty_axes: true,
+            },
+            &[view(&shape, &strides)],
+        )
+        .unwrap();
+        assert_eq!(result, vec![vec![1, 1, 1]]);
+        let scalar = infer(
+            &ShapeInference::ReductionFromInput {
+                keepdims: false,
+                noop_with_empty_axes: true,
+            },
+            &[view(&shape, &strides)],
+        )
+        .unwrap();
+        assert_eq!(scalar, vec![Vec::<usize>::new()]);
+    }
+
+    #[test]
+    fn reduction_from_present_empty_axes_honours_noop_flag() {
+        let shape = [2usize, 3, 4];
+        let strides = [12i64, 4, 1];
+        let axes: [i64; 0] = [];
+        let axis_shape = [0usize];
+        let axis_strides = [1i64];
+        let inputs = [
+            view(&shape, &strides),
+            i64_view(&axes, &axis_shape, &axis_strides),
+        ];
+        let no_op = infer(
+            &ShapeInference::ReductionFromInput {
+                keepdims: false,
+                noop_with_empty_axes: true,
+            },
+            &inputs,
+        )
+        .unwrap();
+        assert_eq!(no_op, vec![shape.to_vec()]);
+        let reduce_all = infer(
+            &ShapeInference::ReductionFromInput {
+                keepdims: false,
+                noop_with_empty_axes: false,
+            },
+            &inputs,
+        )
+        .unwrap();
+        assert_eq!(reduce_all, vec![Vec::<usize>::new()]);
     }
 
     #[test]

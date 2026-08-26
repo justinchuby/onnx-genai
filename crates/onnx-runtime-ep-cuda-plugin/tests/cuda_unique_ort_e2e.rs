@@ -251,6 +251,8 @@ unsafe fn session_with_fallback(
         .unwrap_or_else(|error| panic!("{model}: parse textproto: {error}"));
     if matches!(model, "dft_device_shape" | "stft_device_shape") {
         verify_signal_fixture(model, &parsed);
+    } else if model == "squeeze_device_axes" {
+        verify_squeeze_fixture(&parsed);
     } else {
         verify_fixture(model, &parsed);
     }
@@ -308,6 +310,28 @@ fn verify_signal_fixture(name: &str, model: &onnx_std::Model) {
         nodes.iter().any(|node| node.op_type == "Identity"),
         "{name}: scalar metadata must pass through a device-capable producer"
     );
+}
+
+fn verify_squeeze_fixture(model: &onnx_std::Model) {
+    use onnx_runtime_ir::DataType;
+
+    assert_eq!(model.metadata.ir_version, 11);
+    assert_eq!(model.graph.opset_imports.get("").copied(), Some(13));
+    assert!(model.graph.initializers.is_empty());
+    assert_eq!(model.graph.inputs.len(), 2);
+    assert_eq!(model.graph.outputs.len(), 1);
+    let input = model.graph.value(model.graph.inputs[0]);
+    let axes = model.graph.value(model.graph.inputs[1]);
+    let output = model.graph.value(model.graph.outputs[0]);
+    assert_eq!(input.name.as_deref(), Some("X"));
+    assert_eq!(input.dtype, DataType::Float32);
+    assert_eq!(axes.name.as_deref(), Some("axes_input"));
+    assert_eq!(axes.dtype, DataType::Int64);
+    assert_eq!(output.name.as_deref(), Some("Y"));
+    assert_eq!(output.dtype, DataType::Float32);
+    let nodes: Vec<_> = model.graph.nodes.iter().map(|(_, node)| node).collect();
+    assert!(nodes.iter().any(|node| node.op_type == "Identity"));
+    assert!(nodes.iter().any(|node| node.op_type == "Squeeze"));
 }
 
 fn ort_fixture_bytes(text: &str) -> Vec<u8> {
@@ -1037,6 +1061,12 @@ fn cuda_shape_value_ops_decline_before_device_scalar_host_reads() {
             vec![1i64, 8, 1],
             vec![1i64, 3, 3, 2],
         ),
+        (
+            "squeeze_device_axes",
+            "Squeeze",
+            vec![1i64, 1, 3],
+            vec![1i64, 3],
+        ),
     ] {
         let registration = format!("cuda_shape_{op_type}");
         let Some(session) = (unsafe { session_with_fallback(fixture, &registration, false) })
@@ -1071,31 +1101,31 @@ fn cuda_shape_value_ops_decline_before_device_scalar_host_reads() {
                 &input_shape,
                 ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
             );
-            let mut scalar_storage = if op_type == "DFT" {
-                vec![8i64]
-            } else {
-                vec![2i64, 4]
+            let mut scalar_storage = match op_type {
+                "DFT" => vec![8i64],
+                "STFT" => vec![2i64, 4],
+                "Squeeze" => vec![0i64],
+                other => panic!("unhandled device-shape fixture op {other}"),
             };
             let mut input_values = vec![input_value];
             for scalar in &mut scalar_storage {
+                let metadata_shape: &[i64] = if op_type == "Squeeze" { &[1] } else { &[] };
                 input_values.push(tensor(
                     session.api,
                     std::slice::from_mut(scalar),
-                    &[],
+                    metadata_shape,
                     ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64,
                 ));
             }
-            let input_names: Vec<CString> = if op_type == "DFT" {
-                ["X", "dft_length_input"]
-                    .into_iter()
-                    .map(|name| CString::new(name).unwrap())
-                    .collect()
-            } else {
-                ["X", "frame_step_input", "frame_length_input"]
-                    .into_iter()
-                    .map(|name| CString::new(name).unwrap())
-                    .collect()
-            };
+            let input_names: Vec<CString> = match op_type {
+                "DFT" => vec!["X", "dft_length_input"],
+                "STFT" => vec!["X", "frame_step_input", "frame_length_input"],
+                "Squeeze" => vec!["X", "axes_input"],
+                other => panic!("unhandled device-shape fixture op {other}"),
+            }
+            .into_iter()
+            .map(|name| CString::new(name).unwrap())
+            .collect();
             let input_name_ptrs: Vec<_> = input_names.iter().map(|name| name.as_ptr()).collect();
             let input_value_ptrs: Vec<_> = input_values
                 .iter()
@@ -1124,7 +1154,7 @@ fn cuda_shape_value_ops_decline_before_device_scalar_host_reads() {
                 bytes
                     .chunks_exact(4)
                     .all(|value| f32::from_ne_bytes(value.try_into().unwrap()) == 0.0),
-                "{fixture}: zero signal must produce a zero transform"
+                "{fixture}: zero input must produce zero output"
             );
             ((*session.api).ReleaseValue.unwrap())(output);
             for value in input_values {
