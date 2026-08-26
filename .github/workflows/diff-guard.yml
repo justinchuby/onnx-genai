@@ -90,7 +90,7 @@ jobs:
   #   .commitmsg     e42fa9470 -> 398cff8e5   19.8h   (#1881, removed by #1999)
   #   .pris_v4.log   589d48ffd -> 7a6482c83    1.3h   (#1951, removed by #1975)
   #   .body.md       79196f89d -> 54625db9d    2.7h   (#2026, removed by #2036)
-  #   .roy-scratch/  b054ff63e -> #2161        0.9h   (#2150, and a directory)
+  #   .roy-scratch/  b054ff63e -> 7c127897b    1.4h   (#2150, removed by #2156)
   #
   # Deliberately excluded, because their removal commits say what they were:
   # `site` (moved to onnx-genai-wiki, #1488), `third_party` (oneDNN backend
