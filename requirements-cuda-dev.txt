@@ -93,8 +93,9 @@ nvidia-cuda-runtime==13.1.80
 nvidia-cuda-cupti==13.1.115
 
 # cuDNN — required for advertised Conv/MaxPool/AveragePool execution. Softmax
-# and reductions have bounded fallbacks, but Conv and pooling decline placement
-# when cuDNN is unavailable, so a complete CUDA distribution must install it.
+# and reductions have bounded fallbacks. Conv and pooling are registered and
+# claimed before runtime-library discovery, then fail at execution if cuDNN is
+# unavailable, so a complete CUDA distribution must install it.
 # This one still uses the -cu13 suffix because the unsuffixed package is a
 # placeholder.
 nvidia-cudnn-cu13==9.24.0.43

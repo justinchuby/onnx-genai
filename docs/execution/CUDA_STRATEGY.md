@@ -113,6 +113,15 @@ Missing-library errors must name the component, attempted paths, and the exact
 CUDA 13 package that supplies it. Optional compatibility probes may fail
 quietly; executing an advertised kernel may not.
 
+Today, supported `Conv`, `MaxPool`, and `AveragePool` nodes are registered and
+claimed without probing cuDNN availability. Their execution paths then enter
+the lazy `cudnn().with_handle(...)` backend and return the actionable
+missing-library error if cuDNN is absent. Including cuDNN in the CUDA package
+set makes those advertised kernels executable; it does not make the
+claim-then-fail behavior an acceptable capability contract. Issue
+[#2198](https://github.com/justinchuby/onnx-genai/issues/2198) tracks moving
+that failure before execution.
+
 ## 5. Backend decision rules
 
 - **cuBLASLt/cuDNN/cuFFT first** for heavy primitives they implement with the

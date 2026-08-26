@@ -1894,9 +1894,9 @@ impl Engine {
     /// Process-global CUDA VMM arena counters, when this build has the native
     /// CUDA execution provider.
     ///
-    /// `None` means the build cannot have an arena. All-zero means no arena was
-    /// ever built, which is the normal state without `ONNX_GENAI_CUDA_VMM` --
-    /// and is distinguishable from an arena that was built and never committed
+    /// `None` means the build cannot have an arena. All-zero means no native
+    /// CUDA session has initialized the always-on arena in this process yet,
+    /// and is distinguishable from an initialized arena that never committed
     /// anything (`reserved_bytes > 0, commits == 0`), which is the bug #659 hid
     /// behind a log line for an entire release.
     pub fn vmm_arena_stats(&self) -> Option<crate::VmmArenaStats> {

@@ -34,9 +34,9 @@ bfloat16 = ["ml_dtypes"]
 # `.github/scripts/verify_cuda_runtime_dependencies.py` requires this extra and
 # the plugin wheel to match it exactly. This opt-in extra keeps CPU/macOS wheels
 # from pulling NVIDIA packages; the CUDA driver (`libcuda.so.1`) remains a host
-# prerequisite. cuDNN is required because the CUDA EP's advertised Conv and
-# pooling kernels decline placement without it. These wheels target
-# Linux/Windows.
+# prerequisite. cuDNN is required because the CUDA EP registers and claims its
+# supported Conv and pooling nodes before runtime-library discovery, then needs
+# cuDNN to execute those claimed kernels. These wheels target Linux/Windows.
 cuda = [
     "nvidia-cuda-runtime==13.1.80",
     "nvidia-cublas==13.1.1.3", # provides libcublas + libcublasLt
