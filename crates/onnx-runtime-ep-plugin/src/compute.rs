@@ -3344,34 +3344,34 @@ unsafe extern "C" fn compute_execute(
                         // doing this; the routed path is where it is paid per node.
                         let mut ort_iter = ort_outputs.iter_mut().map(|o| o.view_mut());
                         let mut buf_iter = new_bufs.iter_mut();
-                        let views = slot_kinds
-                            .iter()
-                            .enumerate()
-                            .map(|(slot_idx, kind)| match kind {
-                                RoutedSlotKind::Ort => ort_iter.next().unwrap(),
-                                RoutedSlotKind::Buffer => {
-                                    let (_, buf) = buf_iter.next().unwrap();
-                                    buf_view_mut(buf)
-                                }
-                                RoutedSlotKind::Absent(idx) => {
-                                    let (_, scratch_buf, dtype) = &mut absent_scratch[*idx];
-                                    let shape = &absent_shapes[slot_idx];
-                                    let strides = &absent_strides_storage[*idx];
-                                    TensorMut::new(
-                                        DevicePtrMut(scratch_buf.as_mut_ptr().cast()),
-                                        *dtype,
-                                        shape.as_slice(),
-                                        strides.as_slice(),
-                                        DeviceId::cpu(),
-                                    )
-                                    .mark_absent()
-                                }
-                            });
-                        if slot_kinds.len() <= INLINE_OPERANDS {
-                            inline_views =
-                                std::array::from_fn::<_, INLINE_OPERANDS, _>(|_| {
-                                    absent_output_view()
+                        let views =
+                            slot_kinds
+                                .iter()
+                                .enumerate()
+                                .map(|(slot_idx, kind)| match kind {
+                                    RoutedSlotKind::Ort => ort_iter.next().unwrap(),
+                                    RoutedSlotKind::Buffer => {
+                                        let (_, buf) = buf_iter.next().unwrap();
+                                        buf_view_mut(buf)
+                                    }
+                                    RoutedSlotKind::Absent(idx) => {
+                                        let (_, scratch_buf, dtype) = &mut absent_scratch[*idx];
+                                        let shape = &absent_shapes[slot_idx];
+                                        let strides = &absent_strides_storage[*idx];
+                                        TensorMut::new(
+                                            DevicePtrMut(scratch_buf.as_mut_ptr().cast()),
+                                            *dtype,
+                                            shape.as_slice(),
+                                            strides.as_slice(),
+                                            DeviceId::cpu(),
+                                        )
+                                        .mark_absent()
+                                    }
                                 });
+                        if slot_kinds.len() <= INLINE_OPERANDS {
+                            inline_views = std::array::from_fn::<_, INLINE_OPERANDS, _>(|_| {
+                                absent_output_view()
+                            });
                             // `zip` stops at the shorter side, which is `views`
                             // here -- the seeded tail past `slot_kinds.len()` is
                             // left alone and never handed to the kernel.
@@ -3381,14 +3381,17 @@ unsafe extern "C" fn compute_execute(
                             &mut inline_views[..slot_kinds.len()]
                         } else {
                             // Unreachable for every op this EP can currently
-                            // claim -- the widest in the shape table are
-                            // `SkipLayerNormalization` and `Unique` at four
-                            // outputs each, and a node whose shapes cannot be
-                            // inferred is declined before it ever reaches here.
-                            // Kept because that is a fact about today's table
-                            // rather than about this code, and because the
-                            // alternative to a heap arm is a panic on the first
-                            // op that adds a fifth output.
+                            // claim -- four is the widest any of them gets
+                            // (`SkipLayerNormalization` and `AttentionStd` are
+                            // the ones that reach it), and a node whose shapes
+                            // cannot be inferred is declined before it ever
+                            // reaches here. `Unique` is not a counter-example
+                            // despite also having four: kernel-sized outputs
+                            // take the branch above and never arrive. Kept
+                            // because that is a fact about today's table rather
+                            // than about this code, and because the alternative
+                            // to a heap arm is a panic on the first op that adds
+                            // a fifth output.
                             crate::dispatch_probe::count(
                                 crate::dispatch_probe::Event::DispatchAlloc,
                             );
