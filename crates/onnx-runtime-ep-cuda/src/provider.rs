@@ -43,9 +43,9 @@ use std::sync::{Arc, Mutex};
 
 use onnx_runtime_ep_api::{
     BoundBufferOwnership, Cost, DeviceBuffer, DeviceGraphSlot, EpConfig, EpError,
-    ExecutionProvider, ExecutionProviderCapabilities, ExpertWeightGroup, Fence, HostToDeviceCopier,
-    Kernel, KernelMatch, LazyWeight, OpRegistry, PagedWeight, Result, WorkspaceAllocation, deny,
-    structural_input_bytes,
+    ExecutionProvider, ExecutionProviderCapabilities, ExecutorArtifactFinalization,
+    ExecutorInstanceId, ExpertWeightGroup, Fence, HostToDeviceCopier, Kernel, KernelMatch,
+    LazyWeight, OpRegistry, PagedWeight, Result, WorkspaceAllocation, deny, structural_input_bytes,
 };
 use onnx_runtime_ir::{
     DataType, DeviceId, DeviceType, Graph, Node, NodeId, Shape, TensorLayout, ValueId,
@@ -70,6 +70,26 @@ use crate::route_residency::{
 };
 use crate::runtime::{CudaRuntime, cuptr};
 use crate::weight_paging::{CudaWeightResidency, DeviceOffloadPolicy, PrefillRoute};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RouteResidencyExecutorStatus {
+    pub finalization_attempts: u64,
+    pub drain_calls: u64,
+    pub drained: bool,
+    pub outcome: Option<RouteResidencyInstallOutcome>,
+    pub producer_nodes: usize,
+    pub retained_banks: usize,
+}
+
+#[derive(Default)]
+struct ExecutorRouteResidencyState {
+    finalization_attempts: u64,
+    drain_calls: u64,
+    drained: bool,
+    outcome: Option<RouteResidencyInstallOutcome>,
+    boundary: Option<Arc<RouteResidencyBoundary>>,
+    retained_artifacts: Option<Arc<Vec<ExpertWeightGroup>>>,
+}
 
 /// The provider-owned mapped-attribution zone.
 ///
@@ -772,13 +792,10 @@ pub struct CudaExecutionProvider {
     /// The context-owned queue that performs every final device release after
     /// both stream tails.
     release_queue: Arc<CudaDeferredReleaseQueue>,
-    /// Slice-7C boundary consumer wiring. `route_boundary` binds one expert
-    /// bank's producer window source + residency authorities for the coarse
-    /// safe-boundary consumer; it is `None` in production today (the reachable
-    /// seam has no live per-session registration yet, exactly like the 7A/7B
-    /// producer/consumer shipped) and is installed only by the Slice-7C tests.
-    /// `route_diag` carries the typed outcome of every boundary.
-    route_boundary: Mutex<Option<Arc<RouteResidencyBoundary>>>,
+    /// Executor-scoped route-residency lifecycle state. Sibling/base/MTP
+    /// executors may share this EP, but each owns an independent finalization
+    /// outcome, boundary, and retained bank artifacts.
+    route_executors: Mutex<HashMap<ExecutorInstanceId, ExecutorRouteResidencyState>>,
     route_diag: Arc<RouteResidencyDiagnostics>,
     /// EP-owned registry of live `QMoE` route-telemetry producer sources,
     /// keyed by call-site `NodeId` (issue #1810 Slice 7E). Shared with the
@@ -787,14 +804,6 @@ pub struct CudaExecutionProvider {
     /// producer instances instead of a controllable test double. Empty until a
     /// model with `QMoE` nodes is compiled; drained at teardown.
     route_telemetry_registry: Arc<crate::kernels::qmoe::RouteTelemetrySourceRegistry>,
-    /// Per-bank stable expert artifacts retained after the model's weights are
-    /// finalized (issue #1810 Slice 7E goal 1): the property-discovered
-    /// [`ExpertWeightGroup`]s (bank node identity + member `ValueId` ranges) the
-    /// build-time install seam bound against. `Some` only after a successful
-    /// discovery on the enabled path; `None` on the shipped default-off path
-    /// (nothing is retained). Read by diagnostics/tests to prove the EP retains
-    /// real bank metadata; cleared at teardown.
-    retained_route_artifacts: Mutex<Option<Arc<Vec<ExpertWeightGroup>>>>,
 }
 
 impl std::fmt::Debug for CudaExecutionProvider {
@@ -1049,10 +1058,9 @@ impl CudaExecutionProvider {
             retired_memory_mechanisms: Vec::new(),
             retired_allocator_teardown: Vec::new(),
             release_queue,
-            route_boundary: Mutex::new(None),
+            route_executors: Mutex::new(HashMap::new()),
             route_diag: Arc::new(RouteResidencyDiagnostics::default()),
             route_telemetry_registry,
-            retained_route_artifacts: Mutex::new(None),
         };
         if let Some(residency) = provider.residency.as_ref() {
             residency
@@ -1620,6 +1628,27 @@ impl CudaExecutionProvider {
         &self.runtime
     }
 
+    fn create_registered_kernel(
+        &self,
+        op: &Node,
+        shapes: &[Vec<usize>],
+        opset: u64,
+    ) -> Result<Box<dyn Kernel>> {
+        let factory = self
+            .registry
+            .lookup(&op.op_type, &op.domain, opset)
+            .ok_or_else(|| EpError::NoEpForOp {
+                domain: if op.domain.is_empty() {
+                    "ai.onnx".to_string()
+                } else {
+                    op.domain.clone()
+                },
+                op_type: op.op_type.clone(),
+                opset,
+            })?;
+        factory.create(op, shapes)
+    }
+
     /// Borrow the shared CSA observability surface (§8). Every CSA kernel this
     /// EP builds records per-layer attention mode, bytes avoided, cursor
     /// lengths, sink mass, and host/device byte counts here; speculative
@@ -1628,20 +1657,30 @@ impl CudaExecutionProvider {
         &self.csa_metrics
     }
 
-    /// Install the Slice-7C route-residency boundary binding for this EP.
+    /// Install the legacy unscoped Slice-7C route-residency test binding.
     ///
     /// Once installed, the coarse safe-boundary consumer (driven from
     /// [`ExecutionProvider::consume_route_residency_at_boundary`] at
     /// `Executor::finish_device_validation`) will, *when the default-off gate is
     /// enabled*, snapshot → consume → reset this bank's window exactly once per
-    /// request boundary. Production has no live per-session registration yet, so
-    /// this is `#[doc(hidden)]` and used only by the Slice-7C wiring tests.
+    /// request boundary. Production uses executor-scoped finalization instead;
+    /// this is `#[doc(hidden)]` and retained only for Slice-7C wiring tests.
     #[doc(hidden)]
     pub fn install_route_residency_boundary(&self, boundary: Arc<RouteResidencyBoundary>) {
-        *self
-            .route_boundary
+        self.install_route_residency_boundary_for_executor(ExecutorInstanceId::UNSCOPED, boundary);
+    }
+
+    fn install_route_residency_boundary_for_executor(
+        &self,
+        executor: ExecutorInstanceId,
+        boundary: Arc<RouteResidencyBoundary>,
+    ) {
+        self.route_executors
             .lock()
-            .expect("cuda_ep route-residency boundary poisoned") = Some(boundary);
+            .expect("cuda_ep route-residency executors poisoned")
+            .entry(executor)
+            .or_default()
+            .boundary = Some(boundary);
     }
 
     /// The typed reason/outcome surface for every route-residency boundary this
@@ -1651,8 +1690,8 @@ impl CudaExecutionProvider {
         &self.route_diag
     }
 
-    /// The EP-owned live route-telemetry producer sources for the currently
-    /// compiled model, keyed by call-site `NodeId` (issue #1810 Slice 7E).
+    /// The EP-owned live route-telemetry producer sources for one executor,
+    /// keyed by call-site `NodeId` (issue #1810 Slice 7E).
     ///
     /// These are the *actual executing* [`QMoEKernel`](crate::kernels::qmoe::QMoEKernel)
     /// instances the session's `KernelCache` runs — populated as those kernels
@@ -1666,9 +1705,10 @@ impl CudaExecutionProvider {
     /// [`RouteTelemetrySource`]: crate::route_residency::RouteTelemetrySource
     pub fn route_telemetry_sources(
         &self,
+        executor: ExecutorInstanceId,
     ) -> std::collections::HashMap<NodeId, Arc<dyn crate::route_residency::RouteTelemetrySource>>
     {
-        self.route_telemetry_registry.sources()
+        self.route_telemetry_registry.sources(executor)
     }
 
     /// The concrete registered `QMoE` producer for `node_id`, if any. Test and
@@ -1676,77 +1716,78 @@ impl CudaExecutionProvider {
     /// boundary so the real producer accumulates the routes the consumer reads.
     pub fn route_telemetry_producer(
         &self,
+        executor: ExecutorInstanceId,
         node_id: NodeId,
-    ) -> Option<Arc<crate::kernels::qmoe::QMoEKernel>> {
-        self.route_telemetry_registry.kernel(node_id)
+    ) -> Option<Arc<crate::kernels::qmoe::QMoERouteTelemetry>> {
+        self.route_telemetry_registry.source(executor, node_id)
     }
 
-    /// The per-bank expert artifacts this EP retained after the current model's
-    /// weights were finalized (issue #1810 Slice 7E goal 1), or `None` on the
-    /// default-off path (nothing retained). Read by diagnostics/tests to prove
-    /// the EP holds real property-discovered bank metadata (group node identity
-    /// + member `ValueId` ranges) rather than deriving it ad hoc per boundary.
-    pub fn retained_route_residency_artifacts(&self) -> Option<Arc<Vec<ExpertWeightGroup>>> {
-        self.retained_route_artifacts
-            .lock()
-            .expect("cuda_ep retained route artifacts poisoned")
-            .clone()
-    }
-
-    /// The real production model-build install seam (issue #1810 Slice 7E goal
-    /// 3): construct and install a [`RouteResidencyBoundary`] from the loaded
-    /// `graph`'s expert banks, binding this EP's **own** live route-telemetry
-    /// producer sources ([`Self::route_telemetry_sources`]) — no controllable
-    /// test double. Called once from the executor after weights/catalog are
-    /// finalized and before decode capture, via
-    /// [`ExecutionProvider::install_route_residency_boundary_after_build`].
-    ///
-    /// Fail-closed and default-off at every step, recording the typed outcome in
-    /// [`Self::route_residency_diagnostics`]:
-    ///
-    /// * Gate off → [`RouteResidencyInstallOutcome::GateDisabled`]. Retains and
-    ///   installs nothing; no telemetry/policy overhead. The shipped default.
-    /// * No coarse-residency authority (offload disabled) →
-    ///   [`RouteResidencyInstallOutcome::OffloadDisabled`]. Nothing retained.
-    /// * Property discovery fail-closes (no/many banks, no producer source) →
-    ///   [`RouteResidencyInstallOutcome::Rejected`] with the typed reason.
-    /// * The single discovered bank is structurally bindable and its members
-    ///   have live producer sources, but the shipped residency exposes no
-    ///   per-bank dedicated VMM reservation to remap →
-    ///   [`RouteResidencyInstallOutcome::Rejected`] carrying
-    ///   [`RouteResidencyBindingReject::NoPerBankReservation`]. Real bank
-    ///   artifacts are retained (goal 1) and the real producer sources are
-    ///   bound-ready (goal 2), but no physical binding is installed. This is the
-    ///   shipped enabled-path outcome today; the per-bank-reservation bridge is
-    ///   the disclosed residual, after which this same seam installs for real.
-    /// * Otherwise (a residency that provides per-bank reservations) a real
-    ///   binding is installed and [`RouteResidencyInstallOutcome::Installed`]
-    ///   returned.
-    pub fn install_route_residency_after_build(
+    pub fn retained_route_residency_artifacts(
         &self,
-        graph: &Graph,
-    ) -> RouteResidencyInstallOutcome {
-        // Default-off gate first. This is the shipped path, so it must be truly
-        // inert: no discovery, no retention, no telemetry, and no diagnostics
-        // bookkeeping — a pure early return that touches no shared state.
-        if !crate::coarse_residency::coarse_residency_profile_enabled() {
-            return RouteResidencyInstallOutcome::GateDisabled;
+        executor: ExecutorInstanceId,
+    ) -> Option<Arc<Vec<ExpertWeightGroup>>> {
+        self.route_executors
+            .lock()
+            .expect("cuda_ep route-residency executors poisoned")
+            .get(&executor)
+            .and_then(|state| state.retained_artifacts.clone())
+    }
+
+    pub fn route_residency_executor_status(
+        &self,
+        executor: ExecutorInstanceId,
+    ) -> RouteResidencyExecutorStatus {
+        let states = self
+            .route_executors
+            .lock()
+            .expect("cuda_ep route-residency executors poisoned");
+        let state = states.get(&executor);
+        RouteResidencyExecutorStatus {
+            finalization_attempts: state.map_or(0, |state| state.finalization_attempts),
+            drain_calls: state.map_or(0, |state| state.drain_calls),
+            drained: state.is_some_and(|state| state.drained),
+            outcome: state.and_then(|state| state.outcome.clone()),
+            producer_nodes: self.route_telemetry_registry.len(executor),
+            retained_banks: state
+                .and_then(|state| state.retained_artifacts.as_ref())
+                .map_or(0, |artifacts| artifacts.len()),
         }
+    }
+
+    /// Finalize one executor's real QMoE route-residency artifacts.
+    ///
+    /// `NoTelemetrySource` is readiness-dependent and returns `Pending` without
+    /// recording or latching a decline. Every structural outcome is terminal
+    /// and idempotent. The shipped default-off path returns before touching the
+    /// executor-state map.
+    pub fn finalize_route_residency_for_executor(
+        &self,
+        executor: ExecutorInstanceId,
+        graph: &Graph,
+    ) -> ExecutorArtifactFinalization {
+        if !crate::coarse_residency::coarse_residency_profile_enabled() {
+            return ExecutorArtifactFinalization::Complete;
+        }
+
+        let mut states = self
+            .route_executors
+            .lock()
+            .expect("cuda_ep route-residency executors poisoned");
+        let state = states.entry(executor).or_default();
+        if state.outcome.is_some() {
+            return ExecutorArtifactFinalization::Complete;
+        }
+        state.finalization_attempts += 1;
+
         let Some(residency) = self.residency.as_ref() else {
             self.route_diag
                 .record_decline("weight offload/coarse residency disabled");
-            return RouteResidencyInstallOutcome::OffloadDisabled;
+            state.outcome = Some(RouteResidencyInstallOutcome::OffloadDisabled);
+            return ExecutorArtifactFinalization::Complete;
         };
 
-        // Real producer sources this EP owns (Slice 7E goal 2): the actual
-        // executing `QMoEKernel` instances, not a test double.
-        let sources = self.route_telemetry_sources();
+        let sources = self.route_telemetry_sources(executor);
 
-        // Property-based structural validation over the real graph + real
-        // sources: surfaces NoExpertGroups / MultipleBanksUnsupported /
-        // NoTelemetrySource honestly. Catalog/allocator presence is not the
-        // gate here (the physical prerequisite is checked next), so both
-        // predicates are satisfied for the structural pass.
         let group = match crate::route_residency::validate_route_residency_binding(
             graph,
             |node| sources.contains_key(&node),
@@ -1754,47 +1795,33 @@ impl CudaExecutionProvider {
             |_value| true,
         ) {
             Ok(group) => group,
+            Err(RouteResidencyBindingReject::NoTelemetrySource { .. }) => {
+                return ExecutorArtifactFinalization::Pending;
+            }
             Err(reject) => {
                 self.route_diag.record_decline(&reject.reason());
-                return RouteResidencyInstallOutcome::Rejected(reject);
+                state.outcome = Some(RouteResidencyInstallOutcome::Rejected(reject));
+                return ExecutorArtifactFinalization::Complete;
             }
         };
 
-        // Retain the real per-bank expert artifacts now that discovery
-        // succeeded over the finalized graph (goal 1): bank node identity +
-        // member `ValueId` ranges, held in the EP after weights are finalized.
-        *self
-            .retained_route_artifacts
-            .lock()
-            .expect("cuda_ep retained route artifacts poisoned") =
-            Some(Arc::new(vec![group.clone()]));
+        state.retained_artifacts = Some(Arc::new(vec![group.clone()]));
 
-        // Physical prerequisite: the coarse plan remaps each bank at
-        // catalog-relative offsets, which needs a per-bank *dedicated* VMM
-        // reservation. The shipped residency packs banks into one shared
-        // reservation, so this fail-closes with the precise typed reason rather
-        // than binding against bytes the plan would misaddress. This is the
-        // shipped enabled-path terminal outcome; the per-bank-reservation
-        // bridge (plus per-bank catalog/pool retention) is the disclosed
-        // residual, after which this same seam constructs and installs a real
-        // binding from the retained artifacts + bound producer sources.
         for member in &group.members {
             if residency.coarse_route_bank_reservation(*member).is_none() {
                 let reject = RouteResidencyBindingReject::NoPerBankReservation { value: *member };
                 self.route_diag.record_decline(&reject.reason());
-                return RouteResidencyInstallOutcome::Rejected(reject);
+                state.outcome = Some(RouteResidencyInstallOutcome::Rejected(reject));
+                return ExecutorArtifactFinalization::Complete;
             }
         }
 
-        // A residency that provides per-bank reservations (a later slice) reaches
-        // here with the retained artifacts + real producer sources already
-        // validated. Unreachable on the shipped shared-reservation layout; the
-        // remaining per-bank catalog/pool retention is bound at that point.
         let reject = RouteResidencyBindingReject::NoPerBankReservation {
             value: group.members[0],
         };
         self.route_diag.record_decline(&reject.reason());
-        RouteResidencyInstallOutcome::Rejected(reject)
+        state.outcome = Some(RouteResidencyInstallOutcome::Rejected(reject));
+        ExecutorArtifactFinalization::Complete
     }
 
     /// Construct and install a production [`RouteResidencyBoundary`] from a
@@ -1883,29 +1910,79 @@ impl CudaExecutionProvider {
         }
     }
 
-    /// Remove any installed route-residency binding, releasing the producer
-    /// source/residency/pool handles it held. Called at request/model teardown
-    /// ([`ExecutionProvider::shutdown`]); idempotent and safe when nothing is
-    /// installed (the default). After draining, the boundary consumer is inert
-    /// again until a new binding is installed.
+    /// Drain the legacy unscoped test binding.
     pub fn drain_route_residency_boundary(&self) {
-        *self
-            .route_boundary
+        self.drain_route_residency_for_executor(ExecutorInstanceId::UNSCOPED);
+    }
+
+    pub fn drain_route_residency_for_executor(&self, executor: ExecutorInstanceId) {
+        let should_remove_sources = {
+            let mut states = self
+                .route_executors
+                .lock()
+                .expect("cuda_ep route-residency executors poisoned");
+            let has_sources = !self.route_telemetry_registry.is_empty(executor);
+            let Some(state) = states.get_mut(&executor) else {
+                if has_sources {
+                    let state = ExecutorRouteResidencyState {
+                        drain_calls: 1,
+                        drained: true,
+                        ..Default::default()
+                    };
+                    states.insert(executor, state);
+                }
+                return self.route_telemetry_registry.remove(executor);
+            };
+            if state.drained {
+                false
+            } else {
+                state.drain_calls += 1;
+                state.drained = true;
+                state.boundary = None;
+                state.retained_artifacts = None;
+                true
+            }
+        };
+        if should_remove_sources {
+            self.route_telemetry_registry.remove(executor);
+        }
+    }
+
+    fn drain_all_route_residency(&self) {
+        let mut states = self
+            .route_executors
             .lock()
-            .expect("cuda_ep route-residency boundary poisoned") = None;
-        // Drop the EP-owned producer source `Arc`s too (issue #1810 Slice 7E):
-        // they mirror the session `KernelCache`'s kernels, so retaining them
-        // past teardown would keep those instances (and their scratch/telemetry
-        // device memory) alive after the cache that owns the executing copy is
-        // gone. Clearing here keeps drain-on-teardown leak-free and returns the
-        // registry to its inert default-off state.
+            .expect("cuda_ep route-residency executors poisoned");
+        for state in states.values_mut() {
+            if !state.drained {
+                state.drain_calls += 1;
+                state.drained = true;
+            }
+            state.boundary = None;
+            state.retained_artifacts = None;
+        }
+        drop(states);
         self.route_telemetry_registry.clear();
-        // Release the retained per-bank artifacts (goal 1) too, so teardown
-        // returns the EP to its inert default-off state with nothing retained.
-        *self
-            .retained_route_artifacts
-            .lock()
-            .expect("cuda_ep retained route artifacts poisoned") = None;
+    }
+
+    fn consume_route_residency_for_executor(&self, executor: ExecutorInstanceId) -> Result<()> {
+        if !crate::coarse_residency::coarse_residency_profile_enabled() {
+            return Ok(());
+        }
+        let boundary = {
+            let states = self
+                .route_executors
+                .lock()
+                .expect("cuda_ep route-residency executors poisoned");
+            match states
+                .get(&executor)
+                .and_then(|state| state.boundary.as_ref())
+            {
+                Some(boundary) => Arc::clone(boundary),
+                None => return Ok(()),
+            }
+        };
+        crate::route_residency::run_route_residency_boundary(&boundary, &self.route_diag)
     }
 
     /// Test-only sibling of [`ExecutionProvider::consume_route_residency_at_boundary`]
@@ -1928,10 +2005,13 @@ impl CudaExecutionProvider {
         }
         let boundary = {
             let guard = self
-                .route_boundary
+                .route_executors
                 .lock()
-                .expect("cuda_ep route-residency boundary poisoned");
-            match guard.as_ref() {
+                .expect("cuda_ep route-residency executors poisoned");
+            match guard
+                .get(&ExecutorInstanceId::UNSCOPED)
+                .and_then(|state| state.boundary.as_ref())
+            {
                 Some(boundary) => Arc::clone(boundary),
                 None => return Ok(()),
             }
@@ -2583,7 +2663,7 @@ impl ExecutionProvider for CudaExecutionProvider {
         // Drain any installed route-residency binding first, so the boundary
         // consumer is inert during teardown and the producer source/residency
         // handles it held are released before residency retirement.
-        self.drain_route_residency_boundary();
+        self.drain_all_route_residency();
         // Retire residency so every page it holds enqueues its release behind
         // the stream fences recorded at this moment. Releases already accepted
         // finish afterwards, because the queue's worker, the binding's
@@ -2861,19 +2941,23 @@ impl ExecutionProvider for CudaExecutionProvider {
     }
 
     fn get_kernel(&self, op: &Node, shapes: &[Vec<usize>], opset: u64) -> Result<Box<dyn Kernel>> {
-        let factory = self
-            .registry
-            .lookup(&op.op_type, &op.domain, opset)
-            .ok_or_else(|| EpError::NoEpForOp {
-                domain: if op.domain.is_empty() {
-                    "ai.onnx".to_string()
-                } else {
-                    op.domain.clone()
-                },
-                op_type: op.op_type.clone(),
-                opset,
-            })?;
-        factory.create(op, shapes)
+        self.route_telemetry_registry
+            .with_executor_scope(ExecutorInstanceId::UNSCOPED, || {
+                self.create_registered_kernel(op, shapes, opset)
+            })
+    }
+
+    fn get_kernel_for_executor(
+        &self,
+        executor: ExecutorInstanceId,
+        op: &Node,
+        shapes: &[Vec<usize>],
+        opset: u64,
+    ) -> Result<Box<dyn Kernel>> {
+        self.route_telemetry_registry
+            .with_executor_scope(executor, || {
+                self.create_registered_kernel(op, shapes, opset)
+            })
     }
 
     fn custom_passes(&self) -> Vec<Box<dyn onnx_runtime_optimizer::OptimizationPass>> {
@@ -3747,34 +3831,26 @@ impl ExecutionProvider for CudaExecutionProvider {
     /// tests) does it drive snapshot → consume → reset exactly once, recording
     /// the typed outcome in [`route_residency_diagnostics`](Self::route_residency_diagnostics).
     fn consume_route_residency_at_boundary(&self) -> Result<()> {
-        if !crate::coarse_residency::coarse_residency_profile_enabled() {
-            return Ok(());
-        }
-        let boundary = {
-            let guard = self
-                .route_boundary
-                .lock()
-                .expect("cuda_ep route-residency boundary poisoned");
-            match guard.as_ref() {
-                Some(boundary) => Arc::clone(boundary),
-                None => return Ok(()),
-            }
-        };
-        crate::route_residency::run_route_residency_boundary(&boundary, &self.route_diag)
+        self.consume_route_residency_for_executor(ExecutorInstanceId::UNSCOPED)
     }
 
-    fn install_route_residency_boundary_after_build(&self, graph: &Graph) {
-        // Real Slice-7E model-build install seam: bind this EP's own live
-        // producer sources over the finalized graph's expert banks. Fail-closed,
-        // default-off, typed outcome recorded in `route_residency_diagnostics`.
-        let _ = self.install_route_residency_after_build(graph);
+    fn consume_route_residency_at_boundary_for_executor(
+        &self,
+        executor: ExecutorInstanceId,
+    ) -> Result<()> {
+        self.consume_route_residency_for_executor(executor)
     }
 
-    fn drain_route_residency_boundary_on_teardown(&self) {
-        // `&self` teardown path (the shared `Arc<dyn ExecutionProvider>` cannot
-        // reach `&mut self` `shutdown`): drop the installed boundary, the
-        // EP-owned producer sources, and the retained per-bank artifacts.
-        self.drain_route_residency_boundary();
+    fn finalize_executor_artifacts(
+        &self,
+        executor: ExecutorInstanceId,
+        graph: &Graph,
+    ) -> ExecutorArtifactFinalization {
+        self.finalize_route_residency_for_executor(executor, graph)
+    }
+
+    fn drain_executor_artifacts(&self, executor: ExecutorInstanceId) {
+        self.drain_route_residency_for_executor(executor);
     }
 
     fn device_allocation_counts(&self) -> Option<(u64, u64)> {

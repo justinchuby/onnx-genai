@@ -503,6 +503,7 @@ impl Executor {
         let has_lazy_inputs = in_infos.iter().any(|info| info.lazy_unresolved);
 
         let ep = self.ep.clone();
+        let instance_id = self.instance_id;
 
         // Bind the mutated fields as disjoint borrows so `self` is never borrowed
         // whole while the kernel (from `cache`) and the buffers/views are held.
@@ -585,6 +586,7 @@ impl Executor {
                         &constant_inputs,
                         opset,
                         node_capture_seq_independent(ctx.graph, node, capture_growing),
+                        instance_id,
                         ep.as_ref(),
                     )?;
                     kernel_bindings[pi] = Some(key);
@@ -613,6 +615,7 @@ impl Executor {
                     &constant_inputs,
                     opset,
                     node_capture_seq_independent(ctx.graph, node, capture_growing),
+                    instance_id,
                     ep.as_ref(),
                 )?;
                 kernel_bindings[pi] = Some(key);

@@ -611,6 +611,7 @@ impl Executor {
                 &constant_inputs,
                 opset,
                 seq_independent,
+                self.instance_id,
                 self.ep.as_ref(),
             )?;
             self.kernel_bindings[pi] = Some(key);
