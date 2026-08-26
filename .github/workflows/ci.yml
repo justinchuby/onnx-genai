@@ -321,15 +321,36 @@ jobs:
         run: >-
           cargo build --locked
           -p onnx-genai-bench --features bench-native --bin profile_native
+      # The package set is resolved into a variable before use, never
+      # substituted inline. As `cargo test $(resolver ...)` a resolver failure
+      # expands to nothing and leaves a bare `cargo test`, which exits 0 having
+      # tested cargo's `default-members` instead of this lane's set -- for this
+      # lane that silently drops 14 crates (the whole plugin/ABI surface) and
+      # pulls in `onnx-genai-ort-sys`, which the DENYLIST exists to keep out.
+      # The assignment makes a non-zero resolver exit fail the step under
+      # `set -e`; the `test -n` covers a resolver that succeeds but prints
+      # nothing. `verify` cannot catch this: it never reads this file, so a
+      # lane name here that the resolver does not know stays invisible to it.
+      # `shell: bash` is required, not cosmetic: these steps also run on the
+      # Windows lanes, where the default shell is pwsh, and `set -e` plus
+      # `test -n` are bash semantics. The inline form happened to work under
+      # both shells only because the resolver prints one token per line, which
+      # pwsh splats as an argument array -- an accident, not a contract. The
+      # resolver forces LF separators for the same reason: pwsh strips CRLF
+      # when it splits native output, bash does not, and a trailing "\r" on
+      # each token reaches cargo as part of the package name.
       - name: Test Linux offline crates
-        run: >-
-          cargo test --locked
-          $(python .github/scripts/workspace_test_packages.py cargo-args offline-linux)
+        shell: bash
+        run: |
+          packages="$(python .github/scripts/workspace_test_packages.py cargo-args offline-linux)"
+          test -n "$packages" || { echo "::error::lane 'offline-linux' resolved to an empty package set"; exit 1; }
+          cargo test --locked $packages
       - name: Clippy Linux offline crates
-        run: >-
-          cargo clippy --locked --all-targets
-          $(python .github/scripts/workspace_test_packages.py cargo-args lint)
-          -- -D warnings
+        shell: bash
+        run: |
+          packages="$(python .github/scripts/workspace_test_packages.py cargo-args lint)"
+          test -n "$packages" || { echo "::error::lane 'lint' resolved to an empty package set"; exit 1; }
+          cargo clippy --locked --all-targets $packages -- -D warnings
 
   rust-quality:
     name: Rust quality
@@ -491,10 +512,11 @@ jobs:
       # mlas-sys is also checked by the Windows ARM64 job so MSVC/native
       # build-script regressions do not hide behind the Linux quality lane.
       - name: Run clippy on all offline crates
-        run: >-
-          cargo clippy --locked --all-targets
-          $(python .github/scripts/workspace_test_packages.py cargo-args lint)
-          -- -D warnings
+        shell: bash
+        run: |
+          packages="$(python .github/scripts/workspace_test_packages.py cargo-args lint)"
+          test -n "$packages" || { echo "::error::lane 'lint' resolved to an empty package set"; exit 1; }
+          cargo clippy --locked --all-targets $packages -- -D warnings
 
       # Wrapped in `run_test_step` because the selector is a bare test NAME,
       # which libtest does not police: an exact-name filter that matches nothing
@@ -675,10 +697,11 @@ jobs:
       - name: Test ORT-backed workspace crates
         env:
           NXRT_REQUIRE_ORT_TESTS: "1"
-        run: >-
-          cargo test --locked
-          $(python .github/scripts/workspace_test_packages.py cargo-args ort-backed)
-          -- --test-threads=1
+        shell: bash
+        run: |
+          packages="$(python .github/scripts/workspace_test_packages.py cargo-args ort-backed)"
+          test -n "$packages" || { echo "::error::lane 'ort-backed' resolved to an empty package set"; exit 1; }
+          cargo test --locked $packages -- --test-threads=1
 
       # No shipped artifact links MLAS: the wheel builds it only when someone
       # opts in with NXRT_EP_CPU_RESEARCH_MLAS=1 on one of the platforms in
@@ -793,9 +816,11 @@ jobs:
         run: cargo build --locked -p onnx-runtime-ep-cpu-plugin --features mlas
 
       - name: Test cross-platform offline crates with coverage
-        run: >-
-          cargo llvm-cov --locked --codecov --output-path codecov-offline.json
-          $(python .github/scripts/workspace_test_packages.py cargo-args offline-cross-platform)
+        shell: bash
+        run: |
+          packages="$(python .github/scripts/workspace_test_packages.py cargo-args offline-cross-platform)"
+          test -n "$packages" || { echo "::error::lane 'offline-cross-platform' resolved to an empty package set"; exit 1; }
+          cargo llvm-cov --locked --codecov --output-path codecov-offline.json $packages
       - name: Upload offline coverage to Codecov
         if: always()
         uses: codecov/codecov-action@v4
@@ -808,9 +833,11 @@ jobs:
       # validates that the native build script stays MSVC-compatible.
       - name: Test Linux-only offline crates with coverage
         if: runner.os == 'Linux'
-        run: >-
-          cargo llvm-cov --locked --codecov --output-path codecov-mlas.json
-          $(python .github/scripts/workspace_test_packages.py cargo-args linux-only)
+        shell: bash
+        run: |
+          packages="$(python .github/scripts/workspace_test_packages.py cargo-args linux-only)"
+          test -n "$packages" || { echo "::error::lane 'linux-only' resolved to an empty package set"; exit 1; }
+          cargo llvm-cov --locked --codecov --output-path codecov-mlas.json $packages
       - name: Upload MLAS coverage to Codecov
         if: always() && runner.os == 'Linux'
         uses: codecov/codecov-action@v4
@@ -887,15 +914,17 @@ jobs:
       # offline crates is already reported by x64/macOS lanes, and ARM64
       # instrumentation owned the critical path.
       - name: Test cross-platform offline crates
-        run: >-
-          cargo test --locked
-          $(python .github/scripts/workspace_test_packages.py cargo-args offline-cross-platform)
+        shell: bash
+        run: |
+          packages="$(python .github/scripts/workspace_test_packages.py cargo-args offline-cross-platform)"
+          test -n "$packages" || { echo "::error::lane 'offline-cross-platform' resolved to an empty package set"; exit 1; }
+          cargo test --locked $packages
       - name: Clippy Windows ARM64 offline crates
-        run: >-
-          cargo clippy --locked --all-targets
-          --target aarch64-pc-windows-msvc
-          $(python .github/scripts/workspace_test_packages.py cargo-args offline-linux)
-          -- -D warnings
+        shell: bash
+        run: |
+          packages="$(python .github/scripts/workspace_test_packages.py cargo-args offline-linux)"
+          test -n "$packages" || { echo "::error::lane 'offline-linux' resolved to an empty package set"; exit 1; }
+          cargo clippy --locked --all-targets --target aarch64-pc-windows-msvc $packages -- -D warnings
 
   ep-conformance:
     name: EP conformance (Linux x86_64)
@@ -1094,10 +1123,11 @@ jobs:
       # remains the only place these tests run on Windows and stays here.
       - name: Test ORT-backed workspace crates
         if: runner.os == 'Windows'
-        run: >-
-          cargo test --locked
-          $(python .github/scripts/workspace_test_packages.py cargo-args ort-backed)
-          -- --test-threads=1
+        shell: bash
+        run: |
+          packages="$(python .github/scripts/workspace_test_packages.py cargo-args ort-backed)"
+          test -n "$packages" || { echo "::error::lane 'ort-backed' resolved to an empty package set"; exit 1; }
+          cargo test --locked $packages -- --test-threads=1
       - name: Execute checked-in Mobius workflow packages
         env:
           MOBIUS_WORKFLOW_CONFORMANCE_DIR: ${{ github.workspace }}/tests/fixtures/onnx_genai_workflows
