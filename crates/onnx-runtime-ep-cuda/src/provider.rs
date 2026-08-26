@@ -283,6 +283,34 @@ pub const DEFAULT_DEVICE_OFFLOAD_BUDGET_BYTES: u64 = 4 << 30;
 /// physical memory, so it cannot leak without bound.
 pub const DEFAULT_STANDALONE_PHYSICAL_POOL_BYTES: usize = 256 << 20;
 
+/// Last structured release-queue state observed at an allocator lifecycle
+/// boundary. The CUDA plugin exports this for teardown conformance tests.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AllocatorReleaseObservation {
+    pub quarantined: u64,
+    pub retained: u64,
+}
+
+static LAST_ALLOCATOR_RELEASE_QUARANTINED: AtomicU64 = AtomicU64::new(0);
+static LAST_ALLOCATOR_RELEASE_RETAINED: AtomicU64 = AtomicU64::new(0);
+
+pub fn allocator_release_observation() -> AllocatorReleaseObservation {
+    AllocatorReleaseObservation {
+        quarantined: LAST_ALLOCATOR_RELEASE_QUARANTINED.load(Ordering::Acquire),
+        retained: LAST_ALLOCATOR_RELEASE_RETAINED.load(Ordering::Acquire),
+    }
+}
+
+pub fn reset_allocator_release_observation() {
+    LAST_ALLOCATOR_RELEASE_QUARANTINED.store(0, Ordering::Release);
+    LAST_ALLOCATOR_RELEASE_RETAINED.store(0, Ordering::Release);
+}
+
+fn record_allocator_release_observation(stats: crate::deferred_release::DeferredReleaseStats) {
+    LAST_ALLOCATOR_RELEASE_QUARANTINED.fetch_max(stats.quarantined, Ordering::AcqRel);
+    LAST_ALLOCATOR_RELEASE_RETAINED.fetch_max(stats.retained as u64, Ordering::AcqRel);
+}
+
 /// How many times the device's own VRAM the VMM arena reserves in address
 /// space.
 ///
@@ -2155,9 +2183,11 @@ impl CudaExecutionProvider {
                 }
                 Err(
                     error @ AllocationTransactionError::Binding(
-                        BindingError::QuarantinedOwnership { .. },
+                        BindingError::QuarantinedOwnership { quarantined, .. },
                     ),
                 ) => {
+                    LAST_ALLOCATOR_RELEASE_QUARANTINED
+                        .fetch_max(quarantined as u64, Ordering::AcqRel);
                     eprintln!(
                         "cuda_ep: WARNING: CUDA memory mechanism teardown remains pinned by \
                          quarantined ownership: {error}"
@@ -3193,6 +3223,32 @@ impl ExecutionProvider for CudaExecutionProvider {
                 )))
             }
         }
+    }
+
+    fn wait_for_deferred_releases(&self) -> Result<()> {
+        // `deallocate` recorded completion events at both stream tails before
+        // enqueueing ownership. Wait on those structured fences; do not add an
+        // unrelated stream/device synchronization at teardown.
+        if !self
+            .release_queue
+            .wait_until_idle(std::time::Duration::from_secs(30))
+        {
+            let stats = self.release_queue.stats();
+            record_allocator_release_observation(stats);
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep: timed out waiting for deferred allocator releases to settle: {stats:?}"
+            )));
+        }
+        let stats = self.release_queue.stats();
+        record_allocator_release_observation(stats);
+        if stats.quarantined != 0 || stats.retained != 0 {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep: deferred allocator release reached idle with {} quarantined release(s) \
+                 and {} retained ownership record(s); device memory remains owned",
+                stats.quarantined, stats.retained
+            )));
+        }
+        Ok(())
     }
 
     fn copy(&self, src: &DeviceBuffer, dst: &mut DeviceBuffer, size: usize) -> Result<()> {
