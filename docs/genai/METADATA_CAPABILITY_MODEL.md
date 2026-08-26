@@ -23,6 +23,22 @@ The central rule is:
 | **Backend-derived execution plan** | An automatic optimizer plan computed after artifact inspection and resource admission. | Backend compiler/planner; never authored package metadata. | ORT execution islands, `IoBinding` groups, capture segments, buffer-reuse schedules. |
 | **Runtime evidence** | A result observed for one artifact and one runtime environment. | Generated admission, conformance, profile, or benchmark record. | ORT session loaded with no fallback, native operator coverage passed, capture replayed, concurrent `Run` was admitted, throughput met a threshold. |
 
+#### ONNX port ABI versus workflow contracts
+
+An ONNX artifact is the sole authority for its physical port ABI: port names,
+dtype, rank, shape, and opset imports. An ONNX-backed workflow component does
+not author a second copy of those port contracts. The workflow instead owns the
+facts the graph cannot state: semantic roles, request/package/upstream sources,
+cross-component bindings, state lifetime and recurrence, batching alignment,
+control flow, and effects.
+
+Workflow SSA values still carry contracts where the interpreter must validate a
+request boundary, connect several components, or type a native adapter/policy
+component that has no ONNX graph. For an ONNX-backed value those contracts are
+generated from the artifact and checked against it; they are not an independent
+human-authored answer. This division provides static whole-workflow validation
+without allowing metadata to contradict the graph.
+
 ### 1.2 Capability, support, readiness, and performance
 
 - A **requirement** is what correct execution needs.
