@@ -46,10 +46,25 @@ ALWAYS_RUN = frozenset({"suite_canary_gpu"})
 # only the libtest threads inside the named binary: that is where concurrent EP
 # construction exhausts VMM address reservations and process-global telemetry
 # deltas race. Keeping the lock local to each target makes that scope explicit.
+#
+# This set is the policy census, deliberately independent from the implementation
+# mapping below. MHA, DFT, and STFT were added after parallel execution reproduced
+# VMM/telemetry races; NMS already carried the same target-local isolation and is
+# therefore part of the policy too. A mapping cannot remove its own obligation:
+# the scanner first requires its keys to equal this non-empty set.
+EXPECTED_SUITE_ISOLATION_TARGETS = frozenset(
+    {
+        "multi_head_attention_gpu",
+        "dft_gpu",
+        "stft_gpu",
+        "nms_gpu",
+    }
+)
 SERIALIZED_TARGET_LOCKS = {
     "multi_head_attention_gpu": ("lock_mha_gpu", "MHA_GPU_LOCK"),
     "dft_gpu": ("lock_dft_gpu", "DFT_GPU_LOCK"),
     "stft_gpu": ("lock_stft_gpu", "STFT_GPU_LOCK"),
+    "nms_gpu": ("lock_nms_gpu", "NMS_GPU_LOCK"),
 }
 SUMMARY = re.compile(
     r"test result: (?:ok|FAILED)\. (?P<passed>\d+) passed; (?P<failed>\d+) failed; "
@@ -530,7 +545,8 @@ def function_body(source: str, name: str, start_line: int = 1) -> str | None:
 def tests_missing_suite_lock(source: str, lock_function: str) -> list[TestItem]:
     """Tests whose first code statement is not the target's suite lock."""
     first_statement = re.compile(
-        rf"\s*let\s+_suite_lock\s*=\s*{re.escape(lock_function)}\s*\(\s*\)\s*;"
+        rf"\s*let\s+(?:[A-Za-z][A-Za-z0-9_]*|_[A-Za-z0-9_]+)\s*=\s*"
+        rf"{re.escape(lock_function)}\s*\(\s*\)\s*;"
     )
     missing: list[TestItem] = []
     for item in test_items(source):
@@ -540,19 +556,48 @@ def tests_missing_suite_lock(source: str, lock_function: str) -> list[TestItem]:
     return missing
 
 
-def scan_source_for_suite_isolation() -> list[str]:
-    """Affected CUDA targets lock before EP construction, execution, or stats."""
+def suite_isolation_errors(
+    configured: Mapping[str, tuple[str, str]],
+    sources: Mapping[str, str],
+    expected: frozenset[str] = EXPECTED_SUITE_ISOLATION_TARGETS,
+) -> list[str]:
+    """Validate the independent target census and every configured source."""
     errors: list[str] = []
-    for target, (lock_function, lock_static) in SERIALIZED_TARGET_LOCKS.items():
-        path = TESTS / f"{target}.rs"
-        relative = path.relative_to(ROOT)
-        if not path.is_file():
+
+    if not expected:
+        return [
+            "suite-isolation policy target census is empty; the guard refuses to pass vacuously"
+        ]
+    if not configured:
+        return [
+            "suite-isolation lock configuration is empty; expected exactly "
+            + ", ".join(sorted(expected))
+        ]
+
+    actual = frozenset(configured)
+    if actual != expected:
+        missing = sorted(expected - actual)
+        unexpected = sorted(actual - expected)
+        details = []
+        if missing:
+            details.append(f"missing {missing}")
+        if unexpected:
+            details.append(f"unexpected {unexpected}")
+        errors.append(
+            "suite-isolation configured target census does not match policy: "
+            + "; ".join(details)
+        )
+
+    for target in sorted(expected & actual):
+        lock_function, lock_static = configured[target]
+        relative = Path("crates") / "onnx-runtime-ep-cuda" / "tests" / f"{target}.rs"
+        source = sources.get(target)
+        if source is None:
             errors.append(
                 f"{relative}: serialized CUDA target is missing; the suite-isolation "
                 "census cannot verify it"
             )
             continue
-        source = path.read_text(encoding="utf-8")
         blobs = source_blobs(source)
         if blobs is None:
             errors.append(
@@ -561,6 +606,12 @@ def scan_source_for_suite_isolation() -> list[str]:
             )
             continue
         masked, _ = blobs
+        items = test_items(source)
+        if not items:
+            errors.append(
+                f"{relative}: serialized CUDA target contains no #[test] items; "
+                "suite isolation would otherwise pass vacuously"
+            )
         static_declaration = re.compile(
             rf"\bstatic\s+{re.escape(lock_static)}\s*:\s*Mutex\s*<\s*\(\s*\)\s*>\s*="
         )
@@ -582,6 +633,16 @@ def scan_source_for_suite_isolation() -> list[str]:
                 "assertions share one critical section"
             )
     return errors
+
+
+def scan_source_for_suite_isolation() -> list[str]:
+    """Affected CUDA targets lock before EP construction, execution, or stats."""
+    sources: dict[str, str] = {}
+    for target in EXPECTED_SUITE_ISOLATION_TARGETS:
+        path = TESTS / f"{target}.rs"
+        if path.is_file():
+            sources[target] = path.read_text(encoding="utf-8")
+    return suite_isolation_errors(SERIALIZED_TARGET_LOCKS, sources)
 
 
 def un_ignored_tests(source: str) -> list[tuple[int, str]]:
@@ -1289,6 +1350,10 @@ def self_test() -> None:
             "#[test]\nfn second() {\n    run();\n}\n",
             ["second"],
         ),
+        (
+            "#[test]\nfn a() {\n    let _ = lock_gpu();\n    run();\n}\n",
+            ["a"],
+        ),
     ):
         names = [item.name for item in tests_missing_suite_lock(source, "lock_gpu")]
         if names != expected:
@@ -1304,6 +1369,76 @@ def self_test() -> None:
     helper = function_body(helper_fixture, "lock_gpu")
     if helper is None or not re.search(r"\bGPU_LOCK\s*\.\s*lock\s*\(\s*\)", helper):
         raise AssertionError("suite-lock helper scan cannot observe a known lock acquisition")
+
+    def isolated_target_fixture(lock_function: str, lock_static: str) -> str:
+        return (
+            f"static {lock_static}: Mutex<()> = Mutex::new(());\n"
+            f"fn {lock_function}() -> MutexGuard<'static, ()> {{\n"
+            f"    {lock_static}.lock().unwrap_or_else(|poisoned| poisoned.into_inner())\n"
+            "}\n"
+            "#[test]\n"
+            "fn exercises_gpu() {\n"
+            f"    let _lock = {lock_function}();\n"
+            "    run();\n"
+            "}\n"
+        )
+
+    healthy_isolation_sources = {
+        target: isolated_target_fixture(lock_function, lock_static)
+        for target, (lock_function, lock_static) in SERIALIZED_TARGET_LOCKS.items()
+    }
+    if suite_isolation_errors(SERIALIZED_TARGET_LOCKS, healthy_isolation_sources):
+        raise AssertionError("the complete suite-isolation census must pass")
+
+    empty_map_errors = suite_isolation_errors({}, {})
+    if len(empty_map_errors) != 1 or "configuration is empty" not in empty_map_errors[0]:
+        raise AssertionError("an empty isolation map must fail as an empty configuration")
+
+    removed_target = dict(SERIALIZED_TARGET_LOCKS)
+    removed_target.pop("dft_gpu")
+    removed_errors = suite_isolation_errors(removed_target, healthy_isolation_sources)
+    if not any(
+        "target census does not match policy" in error and "dft_gpu" in error
+        for error in removed_errors
+    ):
+        raise AssertionError(
+            "removing one configured target must fail the independent policy census"
+        )
+
+    zero_test_sources = dict(healthy_isolation_sources)
+    zero_test_sources["stft_gpu"] = helper_fixture.replace("GPU_LOCK", "STFT_GPU_LOCK").replace(
+        "lock_gpu", "lock_stft_gpu"
+    )
+    zero_test_errors = suite_isolation_errors(SERIALIZED_TARGET_LOCKS, zero_test_sources)
+    if not any(
+        "stft_gpu.rs" in error and "contains no #[test] items" in error
+        for error in zero_test_errors
+    ):
+        raise AssertionError(
+            "a mapped source with zero tests must fail instead of passing vacuously"
+        )
+
+    missing_acquisition_sources = dict(healthy_isolation_sources)
+    missing_acquisition_sources["multi_head_attention_gpu"] = missing_acquisition_sources[
+        "multi_head_attention_gpu"
+    ].replace("    let _lock = lock_mha_gpu();\n", "")
+    missing_acquisition_errors = suite_isolation_errors(
+        SERIALIZED_TARGET_LOCKS, missing_acquisition_sources
+    )
+    if not any(
+        "multi_head_attention_gpu.rs" in error
+        and "exercises_gpu must acquire lock_mha_gpu()" in error
+        for error in missing_acquisition_errors
+    ):
+        raise AssertionError("removing one test acquisition must name the unisolated test")
+
+    wrong_lock_map = dict(SERIALIZED_TARGET_LOCKS)
+    wrong_lock_map["nms_gpu"] = ("lock_nms_gpu", "NOT_THE_NMS_LOCK")
+    wrong_lock_errors = suite_isolation_errors(wrong_lock_map, healthy_isolation_sources)
+    if not any(
+        "nms_gpu.rs" in error and "NOT_THE_NMS_LOCK" in error for error in wrong_lock_errors
+    ):
+        raise AssertionError("a wrong configured lock name must fail the helper/static check")
 
     if mask_source('let s = "a // b"; // c\n')[0][0].rstrip() != 'let s = "______";':
         raise AssertionError("masking must blank literals and comments while preserving columns")
@@ -1495,7 +1630,7 @@ def main() -> int:
         print(
             f"CUDA test source scan passed over {len(policed)} CUDA test targets: "
             "every test carries an ignore and is present with gpu-tests off; "
-            f"{len(SERIALIZED_TARGET_LOCKS)} resource-sensitive targets acquire their "
+            f"{len(EXPECTED_SUITE_ISOLATION_TARGETS)} resource-sensitive targets acquire their "
             "suite lock before test work"
         )
         return 0
