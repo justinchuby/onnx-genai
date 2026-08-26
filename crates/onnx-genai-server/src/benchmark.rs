@@ -121,17 +121,18 @@ pub struct ConfigurationReport {
     pub synthetic_work_units: Option<usize>,
     pub provider: Option<String>,
     pub intra_op_threads: Option<i32>,
+    pub prefix_cache_policy: &'static str,
     pub raw_samples: bool,
     pub percentile_method: &'static str,
 }
 
 #[derive(Debug, Default, Serialize)]
 pub struct InvariantReport {
-    pub w1_output_parity: bool,
-    pub typed_same_session_conflict: bool,
-    pub distinct_session_execution_overlap: bool,
-    pub exact_completion_counts: bool,
-    pub no_counter_drift: bool,
+    pub w1_output_parity: Option<bool>,
+    pub typed_same_session_conflict: Option<bool>,
+    pub distinct_session_execution_overlap: Option<bool>,
+    pub exact_completion_counts: Option<bool>,
+    pub no_counter_drift: Option<bool>,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -154,6 +155,11 @@ pub struct BenchmarkRow {
     pub requested_iterations: usize,
     pub unit: String,
     pub prompt_tokens_per_request: Option<usize>,
+    pub prompt_tokens_submitted: usize,
+    pub prompt_tokens_computed: usize,
+    pub prefix_cache_hit_requests: usize,
+    pub prefix_cache_hit_tokens: usize,
+    pub max_prefix_cache_hit_len: usize,
     pub target_units_per_request: usize,
     pub completed: usize,
     pub errors: usize,
@@ -174,10 +180,23 @@ pub struct BenchmarkRow {
     pub worker_completions: BTreeMap<usize, usize>,
     pub rss_bytes_after: Option<u64>,
     pub peak_rss_bytes_after: Option<u64>,
-    pub governed_host_bytes: Option<u64>,
-    pub governed_vram_bytes: Option<u64>,
+    pub governed_resources: Option<GovernedResourcesReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw: Option<RawSamples>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GovernedResourcesReport {
+    pub host: ResourceTierReport,
+    pub disk: Option<ResourceTierReport>,
+    pub device: ResourceTierReport,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ResourceTierReport {
+    pub used_bytes: u64,
+    pub limit_bytes: u64,
+    pub headroom_bytes: u64,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -186,6 +205,7 @@ pub struct RawSamples {
     pub steady_state_us: Vec<u64>,
     pub total_us: Vec<u64>,
     pub conflict_ns: Vec<u64>,
+    pub prefix_cache_hit_len: Vec<usize>,
 }
 
 #[derive(Debug, Default, Clone, Serialize)]
@@ -204,6 +224,8 @@ struct TimedSample {
     started: Instant,
     first: Instant,
     finished: Instant,
+    prompt_tokens: usize,
+    prefix_cache_hit_len: usize,
     units: usize,
     worker: usize,
     checksum: u64,
@@ -218,8 +240,7 @@ struct Measurement {
     typed_conflicts: usize,
     wall: Duration,
     cpu_time: Option<Duration>,
-    governed_host_bytes: Option<u64>,
-    governed_vram_bytes: Option<u64>,
+    governed_resources: Option<GovernedResourcesReport>,
 }
 
 #[derive(Clone, Copy)]
@@ -248,7 +269,7 @@ pub async fn run(options: BenchmarkOptions) -> Result<BenchmarkReport> {
         }
     }
     Ok(BenchmarkReport {
-        schema_version: 2,
+        schema_version: 3,
         environment,
         configuration,
         invariants,
@@ -311,6 +332,11 @@ fn configuration_report(options: &BenchmarkOptions) -> ConfigurationReport {
         synthetic_work_units: work_units,
         provider,
         intra_op_threads,
+        prefix_cache_policy: if matches!(&options.mode, BenchmarkMode::Ort { .. }) {
+            "cold_start=true; every measured prefix_cache_hit_len must be zero"
+        } else {
+            "not applicable"
+        },
         raw_samples: options.include_raw_samples,
         percentile_method: "nearest-rank (ceil(q*n)-1), warmups excluded",
     }
@@ -401,11 +427,11 @@ async fn run_synthetic_matrix(
     let direct_p50 = direct_row.total_latency_ms.p50;
     let mut rows = vec![direct_row];
     let mut invariants = InvariantReport {
-        w1_output_parity: true,
-        typed_same_session_conflict: true,
-        distinct_session_execution_overlap: true,
-        exact_completion_counts: true,
-        no_counter_drift: true,
+        w1_output_parity: Some(true),
+        typed_same_session_conflict: None,
+        distinct_session_execution_overlap: None,
+        exact_completion_counts: Some(true),
+        no_counter_drift: Some(true),
     };
 
     for &workers in &options.worker_counts {
@@ -455,8 +481,12 @@ async fn run_synthetic_matrix(
             .await?;
             let expected_conflicts = options.iterations * concurrency.saturating_sub(1);
             verify_measurement(&conflict, options.iterations, expected_conflicts)?;
-            invariants.typed_same_session_conflict &=
-                conflict.typed_conflicts == expected_conflicts;
+            if workers > 1 && concurrency > 1 {
+                record_gate(
+                    &mut invariants.typed_same_session_conflict,
+                    conflict.typed_conflicts == expected_conflicts,
+                );
+            }
             rows.push(row_from_measurement(
                 "synthetic",
                 "same_session_conflict",
@@ -478,7 +508,10 @@ async fn run_synthetic_matrix(
             verify_measurement(&distinct, options.iterations, 0)?;
             let overlap = max_steady_overlap(&distinct.samples);
             if workers > 1 && concurrency > 1 && options.iterations > 1 {
-                invariants.distinct_session_execution_overlap &= overlap > 1;
+                record_gate(
+                    &mut invariants.distinct_session_execution_overlap,
+                    overlap > 1,
+                );
                 ensure!(
                     overlap > 1,
                     "synthetic distinct sessions did not overlap at W={workers}, C={concurrency}"
@@ -499,10 +532,13 @@ async fn run_synthetic_matrix(
                     .await?;
             verify_measurement(&stateless, options.iterations, 0)?;
             if workers == 1 {
-                invariants.w1_output_parity &= stateless
-                    .samples
-                    .iter()
-                    .all(|sample| sample.checksum == direct_checksum);
+                record_gate(
+                    &mut invariants.w1_output_parity,
+                    stateless
+                        .samples
+                        .iter()
+                        .all(|sample| sample.checksum == direct_checksum),
+                );
             }
             rows.push(row_from_measurement(
                 "synthetic",
@@ -563,23 +599,13 @@ async fn run_ort_matrix(
         options.iterations,
         options.max_new_tokens,
     )?;
+    verify_zero_prefix_cache_hits(&direct_model, "direct ORT decode")?;
     let direct_model_tokens = direct_model
         .samples
         .first()
         .context("direct decode produced no samples")?
         .token_ids
         .clone();
-    let direct_model_row = row_from_measurement(
-        "ort",
-        "direct_ort_decode",
-        0,
-        1,
-        options.warmups,
-        options.iterations,
-        direct_model,
-    );
-    let direct_model_p50 = direct_model_row.total_latency_ms.p50;
-
     let direct_engine = measure_direct_engine(
         model_dir,
         provider,
@@ -588,6 +614,8 @@ async fn run_ort_matrix(
         options.iterations,
         options.max_new_tokens,
     )?;
+    verify_zero_prefix_cache_hits(&direct_engine, "direct Engine workflow")?;
+    verify_equivalent_model_work(&direct_model, &direct_engine)?;
     let direct_engine_tokens = direct_engine
         .samples
         .first()
@@ -599,6 +627,16 @@ async fn run_ort_matrix(
         "direct DecodeSession and direct Engine token parity failed: decode={direct_model_tokens:?}, \
          engine={direct_engine_tokens:?}"
     );
+    let direct_model_row = row_from_measurement(
+        "ort",
+        "direct_ort_decode",
+        0,
+        1,
+        options.warmups,
+        options.iterations,
+        direct_model,
+    );
+    let direct_model_p50 = direct_model_row.total_latency_ms.p50;
     let direct_engine_row = row_from_measurement(
         "ort",
         "direct_engine_workflow",
@@ -611,11 +649,11 @@ async fn run_ort_matrix(
     let direct_engine_p50 = direct_engine_row.total_latency_ms.p50;
     let mut rows = vec![direct_model_row, direct_engine_row];
     let mut invariants = InvariantReport {
-        w1_output_parity: true,
-        typed_same_session_conflict: true,
-        distinct_session_execution_overlap: true,
-        exact_completion_counts: true,
-        no_counter_drift: true,
+        w1_output_parity: Some(true),
+        typed_same_session_conflict: None,
+        distinct_session_execution_overlap: None,
+        exact_completion_counts: Some(true),
+        no_counter_drift: Some(true),
     };
 
     for &workers in &options.worker_counts {
@@ -641,6 +679,11 @@ async fn run_ort_matrix(
             )
             .await?;
             ensure!(sample.units == options.max_new_tokens, "short ORT warmup");
+            ensure!(
+                sample.prefix_cache_hit_len == 0,
+                "ORT warmup reused {} prompt tokens despite cold_start",
+                sample.prefix_cache_hit_len
+            );
         }
         if workers == 1 {
             let parity = run_driver_request(
@@ -650,9 +693,17 @@ async fn run_ort_matrix(
                 Instant::now(),
             )
             .await?;
-            invariants.w1_output_parity &= parity.token_ids == direct_engine_tokens;
             ensure!(
-                invariants.w1_output_parity,
+                parity.prefix_cache_hit_len == 0,
+                "W=1 parity request reused {} prompt tokens despite cold_start",
+                parity.prefix_cache_hit_len
+            );
+            record_gate(
+                &mut invariants.w1_output_parity,
+                parity.token_ids == direct_engine_tokens,
+            );
+            ensure!(
+                invariants.w1_output_parity == Some(true),
                 "W=1 driver output differs from direct engine: driver={:?}, direct={:?}",
                 parity.token_ids,
                 direct_engine_tokens
@@ -669,6 +720,7 @@ async fn run_ort_matrix(
             )
             .await?;
             verify_measurement(&serialized, options.iterations, 0)?;
+            verify_zero_prefix_cache_hits(&serialized, "serialized ORT session")?;
             rows.push(row_from_measurement(
                 "ort",
                 "one_session_serialized",
@@ -685,12 +737,18 @@ async fn run_ort_matrix(
                 options.iterations,
                 concurrency,
                 options.max_new_tokens,
+                options.warmups,
             )
             .await?;
             let expected_conflicts = options.iterations * concurrency.saturating_sub(1);
             verify_measurement(&conflict, options.iterations, expected_conflicts)?;
-            invariants.typed_same_session_conflict &=
-                conflict.typed_conflicts == expected_conflicts;
+            verify_zero_prefix_cache_hits(&conflict, "same-session conflict owner")?;
+            if workers > 1 && concurrency > 1 {
+                record_gate(
+                    &mut invariants.typed_same_session_conflict,
+                    conflict.typed_conflicts == expected_conflicts,
+                );
+            }
             rows.push(row_from_measurement(
                 "ort",
                 "same_session_conflict",
@@ -707,12 +765,17 @@ async fn run_ort_matrix(
                 options.iterations,
                 concurrency,
                 options.max_new_tokens,
+                options.warmups,
             )
             .await?;
             verify_measurement(&distinct, options.iterations, 0)?;
+            verify_zero_prefix_cache_hits(&distinct, "distinct ORT sessions")?;
             let overlap = max_steady_overlap(&distinct.samples);
             if workers > 1 && concurrency > 1 && options.iterations > 1 {
-                invariants.distinct_session_execution_overlap &= overlap > 1;
+                record_gate(
+                    &mut invariants.distinct_session_execution_overlap,
+                    overlap > 1,
+                );
                 ensure!(
                     overlap > 1,
                     "real ORT distinct sessions did not overlap at W={workers}, C={concurrency}; \
@@ -734,9 +797,11 @@ async fn run_ort_matrix(
                 options.iterations,
                 concurrency,
                 options.max_new_tokens,
+                options.warmups,
             )
             .await?;
             verify_measurement(&stateless, options.iterations, 0)?;
+            verify_zero_prefix_cache_hits(&stateless, "stateless ORT requests")?;
             rows.push(row_from_measurement(
                 "ort",
                 "stateless_least_loaded",
@@ -843,6 +908,15 @@ fn serialized_request(index: usize) -> GenerateRequest {
     request
 }
 
+fn benchmark_prompt_tokens(request: &GenerateRequest) -> Result<usize> {
+    match &request.prompt {
+        GeneratePrompt::TokenIds(tokens) => Ok(tokens.len()),
+        GeneratePrompt::Text(_) | GeneratePrompt::TokenRows(_) => {
+            bail!("session-concurrency benchmark requires token-id prompts")
+        }
+    }
+}
+
 fn prompt(index: usize) -> Vec<u32> {
     vec![
         1 + (index % 29) as u32,
@@ -930,6 +1004,8 @@ fn direct_decode_sample(
         started,
         first,
         finished,
+        prompt_tokens: prompt.len(),
+        prefix_cache_hit_len: 0,
         units: token_ids.len(),
         worker: 0,
         checksum: token_checksum(&token_ids),
@@ -955,7 +1031,12 @@ fn measure_direct_engine(
         session_options(provider, intra_op_threads),
     )?;
     for index in 0..warmups {
-        engine.generate(request(index, max_new_tokens))?;
+        let result = engine.generate(request(index, max_new_tokens))?;
+        ensure!(
+            result.prefix_cache_hit_len == 0,
+            "direct Engine warmup reused {} prompt tokens despite cold_start",
+            result.prefix_cache_hit_len
+        );
     }
     let before_cpu = process_cpu_ticks();
     let wall_started = Instant::now();
@@ -972,11 +1053,14 @@ fn measure_direct_engine(
             Some(&mut callback),
         )?;
         let finished = Instant::now();
+        let prefix_cache_hit_len = result.prefix_cache_hit_len;
         let token_ids = result.token_ids;
         samples.push(TimedSample {
             started,
             first: first.context("direct engine emitted no token")?,
             finished,
+            prompt_tokens: prompt(warmups + index).len(),
+            prefix_cache_hit_len,
             units: token_ids.len(),
             worker: 0,
             checksum: token_checksum(&token_ids),
@@ -997,16 +1081,18 @@ async fn measure_driver_stateless(
     iterations: usize,
     concurrency: usize,
     max_new_tokens: usize,
+    prompt_start: usize,
 ) -> Result<Measurement> {
+    let driver_for_jobs = Arc::clone(&driver);
     let before_cpu = process_cpu_ticks();
     let started = Instant::now();
     let samples = run_jobs(iterations, concurrency, move |index| {
-        let driver = Arc::clone(&driver);
+        let driver = Arc::clone(&driver_for_jobs);
         async move {
             run_driver_request(
                 driver,
                 None,
-                request(10_000 + index, max_new_tokens),
+                request(prompt_start + index, max_new_tokens),
                 Instant::now(),
             )
             .await
@@ -1014,10 +1100,12 @@ async fn measure_driver_stateless(
     })
     .await?;
     let wall = started.elapsed();
+    let governed_resources = governed_resources(&driver).await;
     Ok(Measurement {
         samples,
         wall,
         cpu_time: cpu_duration(before_cpu, process_cpu_ticks()),
+        governed_resources,
         ..Measurement::default()
     })
 }
@@ -1028,6 +1116,7 @@ async fn measure_driver_distinct(
     iterations: usize,
     concurrency: usize,
     max_new_tokens: usize,
+    prompt_start: usize,
 ) -> Result<Measurement> {
     let mut sessions = Vec::with_capacity(iterations);
     for _ in 0..iterations {
@@ -1050,7 +1139,7 @@ async fn measure_driver_distinct(
             run_driver_request(
                 driver,
                 Some(lease),
-                request(20_000 + index, max_new_tokens),
+                request(prompt_start + index, max_new_tokens),
                 Instant::now(),
             )
             .await
@@ -1069,13 +1158,12 @@ async fn measure_driver_distinct(
             .context("acquire close lease")?;
         driver.close_session(lease).await?;
     }
-    let (host, vram) = governed_bytes(&driver).await;
+    let governed_resources = governed_resources(&driver).await;
     Ok(Measurement {
         samples,
         wall,
         cpu_time,
-        governed_host_bytes: host,
-        governed_vram_bytes: vram,
+        governed_resources,
         ..Measurement::default()
     })
 }
@@ -1130,13 +1218,12 @@ async fn measure_driver_serialized(
         driver.close_session(lease).await?;
         completed += turns;
     }
-    let (host, vram) = governed_bytes(&driver).await;
+    let governed_resources = governed_resources(&driver).await;
     Ok(Measurement {
         samples,
         wall,
         cpu_time: Some(cpu_time),
-        governed_host_bytes: host,
-        governed_vram_bytes: vram,
+        governed_resources,
         ..Measurement::default()
     })
 }
@@ -1147,6 +1234,7 @@ async fn measure_driver_conflicts(
     iterations: usize,
     concurrency: usize,
     max_new_tokens: usize,
+    prompt_start: usize,
 ) -> Result<Measurement> {
     let before_cpu = process_cpu_ticks();
     let wall_started = Instant::now();
@@ -1162,7 +1250,7 @@ async fn measure_driver_conflicts(
         let pending = submit_driver_request(
             Arc::clone(&driver),
             Some(owner_lease),
-            request(40_000 + index, max_new_tokens),
+            request(prompt_start + index, max_new_tokens),
             Instant::now(),
         )
         .await?;
@@ -1187,15 +1275,14 @@ async fn measure_driver_conflicts(
         driver.close_session(close).await?;
     }
     let wall = wall_started.elapsed();
-    let (host, vram) = governed_bytes(&driver).await;
+    let governed_resources = governed_resources(&driver).await;
     Ok(Measurement {
         samples,
         conflict_ns,
         typed_conflicts,
         wall,
         cpu_time: cpu_duration(before_cpu, process_cpu_ticks()),
-        governed_host_bytes: host,
-        governed_vram_bytes: vram,
+        governed_resources,
         ..Measurement::default()
     })
 }
@@ -1204,6 +1291,7 @@ struct PendingDriverRequest {
     worker: WorkerId,
     generation: DriverGeneration,
     started: Instant,
+    prompt_tokens: usize,
 }
 
 async fn submit_driver_request(
@@ -1212,6 +1300,7 @@ async fn submit_driver_request(
     request: GenerateRequest,
     started: Instant,
 ) -> Result<PendingDriverRequest> {
+    let prompt_tokens = benchmark_prompt_tokens(&request)?;
     let (worker, generation) = driver
         .benchmark_generate(lease, request)
         .await
@@ -1220,6 +1309,7 @@ async fn submit_driver_request(
         worker,
         generation,
         started,
+        prompt_tokens,
     })
 }
 
@@ -1249,6 +1339,8 @@ async fn finish_driver_request(mut pending: PendingDriverRequest) -> Result<Time
                     started: pending.started,
                     first,
                     finished,
+                    prompt_tokens: pending.prompt_tokens,
+                    prefix_cache_hit_len: result.prefix_cache_hit_len,
                     units: token_ids.len(),
                     worker: pending.worker.index(),
                     checksum: token_checksum(&token_ids),
@@ -1375,6 +1467,8 @@ fn direct_synthetic_sample(work_units: usize) -> TimedSample {
         started,
         first,
         finished,
+        prompt_tokens: 0,
+        prefix_cache_hit_len: 0,
         units: work_units,
         worker: 0,
         checksum: final_checksum,
@@ -1437,6 +1531,8 @@ async fn run_synthetic_request(
             started,
             first,
             finished,
+            prompt_tokens: 0,
+            prefix_cache_hit_len: 0,
             units: work_units,
             worker: worker.index(),
             checksum: final_checksum,
@@ -1662,6 +1758,58 @@ fn verify_measurement(
     Ok(())
 }
 
+fn verify_zero_prefix_cache_hits(measurement: &Measurement, label: &str) -> Result<()> {
+    let hit_requests = measurement
+        .samples
+        .iter()
+        .filter(|sample| sample.prefix_cache_hit_len > 0)
+        .count();
+    let hit_tokens = measurement
+        .samples
+        .iter()
+        .map(|sample| sample.prefix_cache_hit_len)
+        .sum::<usize>();
+    ensure!(
+        hit_requests == 0 && hit_tokens == 0,
+        "{label} reused cached prompt state in {hit_requests} requests ({hit_tokens} tokens); \
+         cold benchmark requests must recompute the full prompt"
+    );
+    Ok(())
+}
+
+fn verify_equivalent_model_work(direct: &Measurement, workflow: &Measurement) -> Result<()> {
+    ensure!(
+        direct.samples.len() == workflow.samples.len(),
+        "direct decode/workflow sample count differs: {} versus {}",
+        direct.samples.len(),
+        workflow.samples.len()
+    );
+    for (index, (direct, workflow)) in direct.samples.iter().zip(&workflow.samples).enumerate() {
+        ensure!(
+            direct.prompt_tokens == workflow.prompt_tokens
+                && direct.prefix_cache_hit_len == 0
+                && workflow.prefix_cache_hit_len == 0
+                && direct.units == workflow.units
+                && direct.token_ids == workflow.token_ids,
+            "direct decode/workflow work differs at sample {index}: prompt={}/{}, cache_hit={}/{}, \
+             units={}/{}, tokens={:?}/{:?}",
+            direct.prompt_tokens,
+            workflow.prompt_tokens,
+            direct.prefix_cache_hit_len,
+            workflow.prefix_cache_hit_len,
+            direct.units,
+            workflow.units,
+            direct.token_ids,
+            workflow.token_ids
+        );
+    }
+    Ok(())
+}
+
+fn record_gate(gate: &mut Option<bool>, passed: bool) {
+    *gate = Some(gate.unwrap_or(true) && passed);
+}
+
 fn assert_synthetic_counters(pool: &WorkerPool, leases: &SessionLeases) -> Result<()> {
     ensure!(leases.held() == 0, "synthetic lease counter drift");
     for status in pool.statuses() {
@@ -1690,12 +1838,24 @@ fn assert_driver_counters(driver: &EngineDriver, leases: &SessionLeases) -> Resu
     Ok(())
 }
 
-async fn governed_bytes(driver: &EngineDriver) -> (Option<u64>, Option<u64>) {
+async fn governed_resources(driver: &EngineDriver) -> Option<GovernedResourcesReport> {
     driver
         .resource_snapshot()
         .await
-        .map(|snapshot| (Some(snapshot.host_ram.used), Some(snapshot.vram.used)))
-        .unwrap_or((None, None))
+        .ok()
+        .map(|snapshot| GovernedResourcesReport {
+            host: resource_tier_report(&snapshot.host_ram),
+            disk: snapshot.disk_spill.as_ref().map(resource_tier_report),
+            device: resource_tier_report(&snapshot.vram),
+        })
+}
+
+fn resource_tier_report(snapshot: &onnx_genai::scheduler::TierSnapshot) -> ResourceTierReport {
+    ResourceTierReport {
+        used_bytes: snapshot.used,
+        limit_bytes: snapshot.limit,
+        headroom_bytes: snapshot.headroom,
+    }
 }
 
 fn row_from_measurement(
@@ -1727,6 +1887,36 @@ fn row_from_measurement(
         .iter()
         .map(|sample| sample.units)
         .sum::<usize>();
+    let prompt_tokens_submitted = measurement
+        .samples
+        .iter()
+        .map(|sample| sample.prompt_tokens)
+        .sum::<usize>();
+    let prefix_cache_hit_tokens = measurement
+        .samples
+        .iter()
+        .map(|sample| sample.prefix_cache_hit_len)
+        .sum::<usize>();
+    let prefix_cache_hit_requests = measurement
+        .samples
+        .iter()
+        .filter(|sample| sample.prefix_cache_hit_len > 0)
+        .count();
+    let prompt_tokens_computed = measurement
+        .samples
+        .iter()
+        .map(|sample| {
+            sample
+                .prompt_tokens
+                .saturating_sub(sample.prefix_cache_hit_len.min(sample.prompt_tokens))
+        })
+        .sum::<usize>();
+    let max_prefix_cache_hit_len = measurement
+        .samples
+        .iter()
+        .map(|sample| sample.prefix_cache_hit_len)
+        .max()
+        .unwrap_or(0);
     let steady_units = measurement
         .samples
         .iter()
@@ -1757,13 +1947,15 @@ fn row_from_measurement(
         } else {
             "generated_tokens".to_string()
         },
-        prompt_tokens_per_request: (mode == "ort").then_some(
-            if scenario == "one_session_serialized" {
-                1
-            } else {
-                3
-            },
-        ),
+        prompt_tokens_per_request: measurement
+            .samples
+            .first()
+            .and_then(|sample| (sample.prompt_tokens > 0).then_some(sample.prompt_tokens)),
+        prompt_tokens_submitted,
+        prompt_tokens_computed,
+        prefix_cache_hit_requests,
+        prefix_cache_hit_tokens,
+        max_prefix_cache_hit_len,
         target_units_per_request: measurement.samples.first().map_or(0, |sample| sample.units),
         completed: measurement.samples.len(),
         errors: measurement.errors,
@@ -1785,13 +1977,17 @@ fn row_from_measurement(
         worker_completions,
         rss_bytes_after: memory.rss,
         peak_rss_bytes_after: memory.peak_rss,
-        governed_host_bytes: measurement.governed_host_bytes,
-        governed_vram_bytes: measurement.governed_vram_bytes,
+        governed_resources: measurement.governed_resources,
         raw: Some(RawSamples {
             ttft_us,
             steady_state_us: steady_us,
             total_us,
             conflict_ns: measurement.conflict_ns,
+            prefix_cache_hit_len: measurement
+                .samples
+                .iter()
+                .map(|sample| sample.prefix_cache_hit_len)
+                .collect(),
         }),
     }
 }
@@ -2001,12 +2197,15 @@ mod tests {
         .await
         .expect("synthetic benchmark");
 
-        assert_eq!(report.schema_version, 2);
-        assert!(report.invariants.w1_output_parity);
-        assert!(report.invariants.typed_same_session_conflict);
-        assert!(report.invariants.distinct_session_execution_overlap);
-        assert!(report.invariants.exact_completion_counts);
-        assert!(report.invariants.no_counter_drift);
+        assert_eq!(report.schema_version, 3);
+        assert_eq!(report.invariants.w1_output_parity, Some(true));
+        assert_eq!(report.invariants.typed_same_session_conflict, Some(true));
+        assert_eq!(
+            report.invariants.distinct_session_execution_overlap,
+            Some(true)
+        );
+        assert_eq!(report.invariants.exact_completion_counts, Some(true));
+        assert_eq!(report.invariants.no_counter_drift, Some(true));
         let conflict = report
             .rows
             .iter()
@@ -2042,5 +2241,99 @@ mod tests {
             })
             .expect("distinct row");
         assert!(distinct.max_steady_state_overlap > 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn single_worker_single_request_matrix_serializes_untested_gates_as_null() {
+        let report = run(BenchmarkOptions {
+            mode: BenchmarkMode::Synthetic { work_units: 2_000 },
+            worker_counts: vec![1],
+            concurrency_levels: vec![1],
+            warmups: 0,
+            iterations: 2,
+            max_new_tokens: 1,
+            include_raw_samples: false,
+        })
+        .await
+        .expect("synthetic benchmark");
+
+        assert_eq!(report.invariants.typed_same_session_conflict, None);
+        assert_eq!(report.invariants.distinct_session_execution_overlap, None);
+        let json = serde_json::to_value(&report.invariants).expect("serialize invariants");
+        assert!(json["typed_same_session_conflict"].is_null());
+        assert!(json["distinct_session_execution_overlap"].is_null());
+        assert_eq!(json["w1_output_parity"], true);
+    }
+
+    #[test]
+    fn resource_report_preserves_used_limit_and_headroom_semantics() {
+        let host = onnx_genai::scheduler::TierSnapshot {
+            used: 8,
+            limit: 32,
+            headroom: 24,
+        };
+        let report = GovernedResourcesReport {
+            host: resource_tier_report(&host),
+            disk: Some(ResourceTierReport {
+                used_bytes: 3,
+                limit_bytes: 10,
+                headroom_bytes: 7,
+            }),
+            device: ResourceTierReport {
+                used_bytes: 5,
+                limit_bytes: 20,
+                headroom_bytes: 15,
+            },
+        };
+
+        let json = serde_json::to_value(report).expect("serialize resources");
+        assert_eq!(json["host"]["used_bytes"], 8);
+        assert_eq!(json["host"]["limit_bytes"], 32);
+        assert_eq!(json["host"]["headroom_bytes"], 24);
+        assert_eq!(json["disk"]["used_bytes"], 3);
+        assert_eq!(json["device"]["limit_bytes"], 20);
+        assert!(json["host"].get("budget_bytes").is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ort_cold_benchmark_recomputes_equivalent_work_without_prefix_hits() {
+        let model_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+        let report = run(BenchmarkOptions {
+            mode: BenchmarkMode::Ort {
+                model_dir,
+                provider: "cpu".to_string(),
+                intra_op_threads: 1,
+            },
+            worker_counts: vec![1],
+            concurrency_levels: vec![1],
+            warmups: 2,
+            iterations: 35,
+            max_new_tokens: 4,
+            include_raw_samples: true,
+        })
+        .await
+        .expect("ORT benchmark");
+
+        for row in &report.rows {
+            assert_eq!(
+                row.prefix_cache_hit_requests, 0,
+                "{} unexpectedly hit prefix cache",
+                row.scenario
+            );
+            assert_eq!(row.prefix_cache_hit_tokens, 0);
+            assert_eq!(row.max_prefix_cache_hit_len, 0);
+            assert_eq!(row.prompt_tokens_computed, row.prompt_tokens_submitted);
+            assert!(
+                row.raw
+                    .as_ref()
+                    .expect("raw samples")
+                    .prefix_cache_hit_len
+                    .iter()
+                    .all(|hit| *hit == 0)
+            );
+        }
+        assert_eq!(report.invariants.w1_output_parity, Some(true));
+        assert_eq!(report.invariants.typed_same_session_conflict, None);
+        assert_eq!(report.invariants.distinct_session_execution_overlap, None);
     }
 }

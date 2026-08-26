@@ -1266,6 +1266,9 @@ impl Engine {
         if !self.sessions.contains_key(&session_id) {
             anyhow::bail!("session {session_id} not found");
         }
+        if options.cold_start {
+            self.reset_session(session_id)?;
+        }
 
         let max_context = self.max_context_for_request(&options);
         let chain = build_processor_chain(
@@ -1292,8 +1295,12 @@ impl Engine {
         };
 
         let result = (|| -> anyhow::Result<GenerateResult> {
-            let prefix_cache_hit_len =
-                self.prepare_session_prefix(session_id, &mut state, &prompt_tokens)?;
+            let prefix_cache_hit_len = self.prepare_session_prefix(
+                session_id,
+                &mut state,
+                &prompt_tokens,
+                !options.cold_start,
+            )?;
             let mut loop_state =
                 DecodeLoopState::new(prefix_cache_hit_len, options.seed, options.top_logprobs);
             let has_custom_sampler = custom_sampler.is_some();
@@ -2020,6 +2027,7 @@ impl Engine {
         session_id: SessionId,
         state: &mut EngineSession,
         prompt_tokens: &[TokenId],
+        allow_cross_session_reuse: bool,
     ) -> anyhow::Result<usize> {
         if self.connector.is_active() {
             self.connector.reset_stats();
@@ -2035,7 +2043,10 @@ impl Engine {
         let mut loaded_prompt_prefix = 0;
         let mut cross_session_hit_len = 0;
 
-        if started_empty && state.decode_state.uses_token_prefix_cache() {
+        if allow_cross_session_reuse
+            && started_empty
+            && state.decode_state.uses_token_prefix_cache()
+        {
             cross_session_hit_len = self
                 .token_prefix_cache
                 .iter()
@@ -2043,7 +2054,8 @@ impl Engine {
                 .filter(|&len| len > 0)
                 .max()
                 .unwrap_or(0);
-        } else if started_empty
+        } else if allow_cross_session_reuse
+            && started_empty
             && state.decode_state.use_kv
             && self.kv_model.is_some()
             && self.kv_cache.page_table.tensor_config.is_some()
@@ -2118,7 +2130,7 @@ impl Engine {
         // absolute positions is byte-exact — proven token-identical by the gold
         // integration test. If injection is not possible we fall back to the
         // reporting-only `lookup_extension`, never claiming a hit we can't serve.
-        if self.connector.is_active() {
+        if allow_cross_session_reuse && self.connector.is_active() {
             let injected = self.try_connector_kv_injection(state, prompt_tokens, in_process_hit)?;
             if let Some(total) = injected {
                 return Ok(in_process_hit.max(total));
@@ -2216,6 +2228,9 @@ impl Engine {
         if !self.sessions.contains_key(&request.session_id) {
             anyhow::bail!("session {} not found", request.session_id);
         }
+        if options.cold_start {
+            self.reset_session(request.session_id)?;
+        }
         if self.should_use_speculative(&options) {
             anyhow::bail!(
                 "prioritized drive API currently supports the single-sequence non-speculative path; batched/speculative drive is future work"
@@ -2240,8 +2255,12 @@ impl Engine {
             .sessions
             .remove(&request.session_id)
             .with_context(|| format!("session {} not found", request.session_id))?;
-        let prefix_cache_hit_len =
-            self.prepare_session_prefix(request.session_id, &mut state, &prompt_tokens)?;
+        let prefix_cache_hit_len = self.prepare_session_prefix(
+            request.session_id,
+            &mut state,
+            &prompt_tokens,
+            !options.cold_start,
+        )?;
         let rng = SamplingRng::new(options.seed);
         let logprobs = options.top_logprobs.map(|_| Vec::new());
         self.scheduler.enqueue_generate_request(

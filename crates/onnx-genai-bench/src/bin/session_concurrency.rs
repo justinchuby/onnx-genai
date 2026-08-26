@@ -117,12 +117,12 @@ fn default_fixture() -> PathBuf {
 
 fn print_summary(report: &BenchmarkReport) {
     println!(
-        "| scenario | W | C | wall ms | speedup | TTFT p50/p95/p99 ms | total p50/p95/p99 ms | req/s | conflicts | overlap |"
+        "| scenario | W | C | wall ms | speedup | TTFT p50/p95/p99 ms | total p50/p95/p99 ms | req/s | prefix hits req/tok | conflicts | overlap |"
     );
-    println!("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
+    println!("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
     for row in &report.rows {
         println!(
-            "| {} | {} | {} | {:.3} | {} | {} | {} | {:.2} | {} | {} |",
+            "| {} | {} | {} | {:.3} | {} | {} | {} | {:.2} | {}/{} | {} | {} |",
             row.scenario,
             row.worker_count,
             row.concurrency,
@@ -131,6 +131,8 @@ fn print_summary(report: &BenchmarkReport) {
             latency(&row.ttft_ms),
             latency(&row.total_latency_ms),
             row.request_throughput_per_second,
+            row.prefix_cache_hit_requests,
+            row.prefix_cache_hit_tokens,
             row.conflicts,
             row.max_steady_state_overlap,
         );
