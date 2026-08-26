@@ -1334,12 +1334,34 @@ jobs:
       # reused for this crate (its dependency builds are). The Windows CUDA
       # lane deliberately keeps the narrower invocation -- it does not build
       # the gpu-tests binaries at all, so the same change there would be a
-      # full extra build for lints this Linux step already covers.
+      # full extra build for lints the two Linux steps below cover between
+      # them: `cuda,gpu-tests` for the device arms, `cuda` for the shim arms.
       - name: Clippy CUDA execution provider
         if: ${{ !cancelled() }}
         run: >-
           cargo clippy -p onnx-runtime-ep-cuda
           --all-targets --features cuda,gpu-tests -- -D warnings
+      # Features are additive, so the pass above cannot see this crate's
+      # `#[cfg(not(feature = "gpu-tests"))]` arms -- the shim bodies in
+      # coarse_residency_plan_gpu, content_preserving_transition_gpu,
+      # route_residency_boundary_gpu and route_residency_consume_gpu that stand
+      # in for device work when the feature is off. Until this step existed no
+      # lane compiled them: Linux always enables `gpu-tests`, and Windows omits
+      # `--all-targets`.
+      #
+      # Measured in both directions rather than argued, by injecting a
+      # `useless_format` into the `not(gpu-tests)` arm of
+      # content_preserving_transition_gpu.rs:
+      #   --features cuda           --all-targets  ->  error, rc=101  (caught)
+      #   --features cuda,gpu-tests --all-targets  ->  exit 0         (missed)
+      # So a defect confined to those arms was invisible to every check while
+      # the whole lane stayed green. Added while the configuration was clean,
+      # which is the only time a new gate costs nothing to land.
+      - name: Clippy CUDA execution provider without gpu-tests
+        if: ${{ !cancelled() }}
+        run: >-
+          cargo clippy -p onnx-runtime-ep-cuda
+          --all-targets --features cuda -- -D warnings
       # (it appeared in ci.yml only inside a comment). That left ~167 cfg sites
       # -- native_decode/{mod,load,cuda,tensor}.rs, memory_authority.rs,
       # pipeline/* -- never type-checked, linted, or tested, so a change could
