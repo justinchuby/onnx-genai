@@ -27,11 +27,13 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 /// Call sites, not mentions: the trailing `(` keeps prose, `use` lines and
 /// SAFETY comments that name the function from being counted as calls.
 const EAGER_ALLOC: &str = "malloc_sync(";
 const EAGER_FREE: &str = "free_sync(";
+const DELETED_VMM_FLAG: &str = "ONNX_GENAI_CUDA_VMM";
 
 fn crate_src(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -104,6 +106,107 @@ fn count_code(root: &Path, needle: &str) -> BTreeMap<String, usize> {
         }
     }
     counts
+}
+
+fn is_user_facing_path(path: &str) -> bool {
+    path.ends_with(".md")
+        || path.ends_with(".txt")
+        || path.ends_with(".toml")
+        || path.ends_with(".py")
+        || path.ends_with(".ps1")
+        || path.ends_with(".sh")
+        || path.ends_with(".yml")
+        || path.ends_with(".yaml")
+        || (path.ends_with(".rs") && path.contains("/src/") && !path.ends_with("/tests.rs"))
+}
+
+fn tracked_user_facing_files(root: &Path) -> Vec<(String, String)> {
+    let output = Command::new("git")
+        .args([
+            "grep",
+            "-l",
+            "-I",
+            DELETED_VMM_FLAG,
+            "--",
+            "*.md",
+            "*.txt",
+            "*.toml",
+            "*.py",
+            "*.ps1",
+            "*.sh",
+            "*.yml",
+            "*.yaml",
+            "*.rs",
+        ])
+        .current_dir(root)
+        .output()
+        .expect("git must be available to search user-facing repository text");
+    assert!(
+        output.status.success(),
+        "git grep found no deleted-flag history or failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let mut files = String::from_utf8(output.stdout)
+        .expect("git paths are UTF-8")
+        .lines()
+        .filter(|path| is_user_facing_path(path))
+        .filter(|path| root.join(path).is_file())
+        .map(|path| {
+            (
+                path.to_owned(),
+                std::fs::read_to_string(root.join(path))
+                    .unwrap_or_else(|error| panic!("cannot read {path}: {error}")),
+            )
+        })
+        .collect::<Vec<_>>();
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    files
+}
+
+fn deleted_vmm_mention_is_history(path: &str, lines: &[&str], index: usize) -> bool {
+    // Dated benchmark records preserve the command that produced their
+    // historical measurements; they are evidence, not current instructions.
+    if path.starts_with("docs/benchmarks/") {
+        return true;
+    }
+    let start = index.saturating_sub(2);
+    let end = (index + 3).min(lines.len());
+    let context = lines[start..end].join(" ").to_lowercase();
+    [
+        "deleted",
+        "removed",
+        "no longer",
+        "used to",
+        "formerly",
+        "historical",
+        "before phase",
+        "there used to be",
+        "now-deleted",
+        "删除",
+        "原先",
+    ]
+    .iter()
+    .any(|marker| context.contains(marker))
+}
+
+fn deleted_vmm_guidance_errors(files: &[(String, String)]) -> Vec<String> {
+    let mut errors = Vec::new();
+    for (path, text) in files {
+        let lines = text.lines().collect::<Vec<_>>();
+        for (index, line) in lines.iter().enumerate() {
+            if line.contains(DELETED_VMM_FLAG)
+                && !deleted_vmm_mention_is_history(path, &lines, index)
+            {
+                errors.push(format!(
+                    "{path}:{} presents deleted flag {DELETED_VMM_FLAG} outside an explicit \
+                     historical/deletion statement",
+                    index + 1
+                ));
+            }
+        }
+    }
+    errors
 }
 
 /// Both scans can see what they claim to see.
@@ -224,6 +327,150 @@ fn the_removed_type_and_flag_are_absent_from_production_code() {
             );
         }
     }
+}
+
+/// The deleted arena-selection flag has no parser left, and native decode must
+/// not offer it as an actionable recovery step.
+#[test]
+fn the_deleted_vmm_flag_has_no_parser_or_native_decode_guidance() {
+    let crates = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("crates/");
+    let parser_tokens = [
+        "env::var(\"ONNX_GENAI_CUDA_VMM\")",
+        "env::var_os(\"ONNX_GENAI_CUDA_VMM\")",
+        "var(\"ONNX_GENAI_CUDA_VMM\")",
+        "var_os(\"ONNX_GENAI_CUDA_VMM\")",
+    ];
+    for crate_name in [
+        "onnx-runtime-cuda-memory",
+        "onnx-runtime-ep-cuda",
+        "onnx-genai-engine",
+        "onnx-genai-cli",
+    ] {
+        let source = crates.join(crate_name).join("src");
+        for parser in parser_tokens {
+            let hits = count_code(&source, parser);
+            assert!(
+                hits.is_empty(),
+                "{crate_name} still parses the deleted ONNX_GENAI_CUDA_VMM flag via \
+                 {parser:?}: {hits:?}"
+            );
+        }
+    }
+
+    let native_decode = crates
+        .join("onnx-genai-engine")
+        .join("src")
+        .join("native_decode")
+        .join("cuda.rs");
+    let text = std::fs::read_to_string(&native_decode).expect("native CUDA decode source");
+    assert!(
+        !text.contains("ONNX_GENAI_CUDA_VMM"),
+        "{} still presents the deleted allocator-selection flag to users",
+        native_decode.display()
+    );
+}
+
+#[test]
+fn user_facing_repository_text_has_no_actionable_deleted_vmm_guidance() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("repository root");
+    let files = tracked_user_facing_files(root);
+    assert!(
+        is_user_facing_path("crates/onnx-genai-cli/src/profile.rs")
+            && root.join("crates/onnx-genai-cli/src/profile.rs").is_file(),
+        "the repository-wide guidance scan omitted the CLI profile output"
+    );
+    assert!(
+        files
+            .iter()
+            .any(|(path, _)| path == "docs/memory/MEMORY_MANAGEMENT_MODEL_DESIGN.md"),
+        "the repository-wide guidance scan omitted maintained documentation"
+    );
+
+    let errors = deleted_vmm_guidance_errors(&files);
+    assert!(
+        errors.is_empty(),
+        "deleted VMM flag appears as current/actionable guidance:\n{}",
+        errors.join("\n")
+    );
+}
+
+#[test]
+fn deleted_vmm_guidance_scan_rejects_raw_cli_advice() {
+    let files = vec![(
+        "crates/onnx-genai-cli/src/profile.rs".to_owned(),
+        "\"not installed (set ONNX_GENAI_CUDA_VMM=1)\"".to_owned(),
+    )];
+    let errors = deleted_vmm_guidance_errors(&files);
+    assert_eq!(
+        errors.len(),
+        1,
+        "reinserting raw CLI advice must fail the production guidance guard"
+    );
+    assert!(errors[0].contains("crates/onnx-genai-cli/src/profile.rs:1"));
+}
+
+#[test]
+fn deleted_vmm_guidance_scan_allows_explicit_deletion_history() {
+    let files = vec![(
+        "docs/memory/history.md".to_owned(),
+        "The ONNX_GENAI_CUDA_VMM flag was deleted, not deprecated.".to_owned(),
+    )];
+    assert!(
+        deleted_vmm_guidance_errors(&files).is_empty(),
+        "an explicit deletion statement is historical context, not actionable advice"
+    );
+}
+
+#[test]
+fn cudnn_package_rationale_matches_claim_then_execute_sources() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("repository root");
+    let read = |relative: &str| {
+        std::fs::read_to_string(root.join(relative))
+            .unwrap_or_else(|error| panic!("cannot read {relative}: {error}"))
+    };
+
+    let registry = read("crates/onnx-runtime-ep-cuda/src/kernels/mod.rs");
+    assert!(registry.contains("OpKey::new(\"Conv\", \"\", 1)"));
+    assert!(registry.contains("(\"MaxPool\", pooling::PoolKind::Max)"));
+    assert!(registry.contains("(\"AveragePool\", pooling::PoolKind::Average)"));
+
+    let compact = |text: &str| text.split_whitespace().collect::<String>();
+    let conv = read("crates/onnx-runtime-ep-cuda/src/kernels/conv.rs");
+    let pooling = read("crates/onnx-runtime-ep-cuda/src/kernels/pooling.rs");
+    assert!(compact(&conv).contains("self.runtime.cudnn().with_handle"));
+    assert!(compact(&pooling).contains("self.runtime.cudnn().with_handle"));
+
+    let requirements = read("requirements-cuda-dev.txt");
+    let pyproject = read("crates/onnx-runtime-python/pyproject.toml");
+    let strategy = read("docs/execution/CUDA_STRATEGY.md");
+    for (path, text) in [
+        ("requirements-cuda-dev.txt", requirements.as_str()),
+        (
+            "crates/onnx-runtime-python/pyproject.toml",
+            pyproject.as_str(),
+        ),
+        ("docs/execution/CUDA_STRATEGY.md", strategy.as_str()),
+    ] {
+        assert!(
+            !text.contains("decline placement"),
+            "{path} repeats the false claim that missing cuDNN declines placement"
+        );
+    }
+    assert!(requirements.contains("claimed before runtime-library discovery"));
+    assert!(pyproject.contains("registers and claims its"));
+    assert!(
+        pyproject.contains("supported Conv and pooling nodes before runtime-library discovery")
+    );
+    assert!(strategy.contains("claimed without probing cuDNN availability"));
+    assert!(strategy.contains("#2198"));
 }
 
 /// Criterion 12, and the non-vacuity anchor for the test above: the removed

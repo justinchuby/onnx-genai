@@ -9,8 +9,9 @@
 # data. A thin pure-Python `__init__` exposes `get_library_path()` and
 # `register()`.
 #
-# The CUDA EP is not yet hardware-validated (issue #768); this package is marked
-# pre-release. Building needs the CUDA 13 toolkit (nvcc) on the host, but no GPU.
+# The CUDA EP is hardware-validated but remains pre-release. Building needs
+# Rust and libclang/bindgen, not nvcc, a CUDA toolkit, or a GPU: CUDA libraries
+# are resolved dynamically and embedded kernels compile through NVRTC at run time.
 [build-system]
 requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
@@ -25,7 +26,7 @@ authors = [{ name = "Justin Chu" }]
 readme = "README.md"
 keywords = ["onnx", "onnxruntime", "execution-provider", "cuda", "plugin"]
 classifiers = [
-    # Pre-release: the CUDA EP is not yet validated on physical GPUs (#768).
+    # Pre-release: packaging and plugin APIs may still change.
     "Development Status :: 3 - Alpha",
     "Programming Language :: Python :: 3",
     "Programming Language :: Rust",
@@ -35,25 +36,26 @@ classifiers = [
     "Environment :: GPU :: NVIDIA CUDA :: 13",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
-# CUDA 13 runtime NVIDIA libraries (mirrors crates/onnx-runtime-python's [cuda]
-# set). REQUIRED deps (not an extra): `pip install nxrt-ep-cuda` must pull them
-# so the EP's dlopen'd libs (libcudart / libcublas(+Lt) / libcufft / libnvrtc / libcupti,
-# which auditwheel excludes from the wheel) resolve at runtime. The CUDA driver
-# (libcuda.so.1) remains a host prerequisite. These wheels target Linux/Windows.
+# CUDA 13 NVIDIA distribution set. `requirements-cuda-dev.txt` is the
+# authoritative lock; `.github/scripts/verify_cuda_runtime_dependencies.py`
+# requires this list and nxrt's [cuda] extra to match it exactly. These are
+# required dependencies (not an extra), so the EP's dlopen'd core libraries
+# resolve and the repository's standard CUDA diagnostics set stays available.
+# The CUDA driver (libcuda.so.1) remains a host prerequisite. These wheels
+# target Linux/Windows.
 #
-# Use the UNSUFFIXED names: as of 2026-08-12 they ARE the real CUDA 13 wheels
-# (nvidia-cuda-runtime 13.3.29, nvidia-cublas 13.6.1.10, nvidia-cuda-nvrtc
-# 13.3.33, nvidia-cuda-cupti 13.3.75). The `-cu13`-suffixed names are only 0.0.1
-# placeholder stubs — do NOT use them. `>=13,<14` locks the CUDA 13 major so a
-# future CUDA 14 release under the same rolling name can't be pulled against our
-# CUDA-13-built cdylib.
+# Use the unsuffixed names except for cuDNN. The other `-cu13` package names are
+# placeholder stubs rather than binary wheels. Pin the same CUDA 13.1 set as
+# requirements-cuda-dev.txt: the rolling unsuffixed names otherwise select a
+# newer toolkit line whose JIT output may exceed the validated driver line.
 dependencies = [
-    "nvidia-cuda-runtime>=13,<14",
-    "nvidia-cublas>=13,<14",       # libcublas + libcublasLt (cuBLASLt MatMul)
-    "nvidia-cufft>=12,<13",        # cuFFT 12.x shipped with the CUDA 13 line
-    "nvidia-nvjitlink>=13,<14",    # cuFFT JIT dependency
-    "nvidia-cuda-nvrtc>=13,<14",   # runtime NVRTC compilation of fused/pointwise kernels
-    "nvidia-cuda-cupti>=13,<14",   # GPU kernel tracing
+    "nvidia-cuda-runtime==13.1.80",
+    "nvidia-cublas==13.1.1.3",       # libcublas + libcublasLt (cuBLASLt MatMul)
+    "nvidia-cufft==12.1.0.78",       # cuFFT release paired with CUDA 13.1
+    "nvidia-nvjitlink==13.1.115",    # cuFFT JIT dependency, driver-line matched
+    "nvidia-cuda-nvrtc==13.1.115",   # runtime NVRTC compilation
+    "nvidia-cuda-cupti==13.1.115",   # standard CUDA diagnostics/tracing set
+    "nvidia-cudnn-cu13==9.24.0.43",  # required by advertised Conv/pooling
 ]
 
 [project.optional-dependencies]
