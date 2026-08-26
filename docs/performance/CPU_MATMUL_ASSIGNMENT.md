@@ -3173,10 +3173,19 @@ Full report:
   change read +0.28% on that row** — one against a main three commits earlier,
   one against the same main with `-Cllvm-args=-align-all-functions=5` applied
   identically to every arm. So the layout component of a source-level A/B here
-  reaches ~2%, is not stable across rebuilds, and **is structurally invisible
+  is not stable across rebuilds, and **is structurally invisible
   to an A/A**, which compares a file with itself. Every A/A in that document
-  brackets 1.000 while the 1.9% artifact sits in the same table.
-  Standing consequence: a sub-2% source-level A/B with no route-not-taken row
+  brackets 1.000 while the artifact sits in the same table.
+  **Magnitude revised down, 2026-08-26.** All three of those pairs were
+  measured through a gate blind to SMT-sibling contention. Re-taking that cell
+  on `533546095` through the gate #2216 added reads **0.9972
+  [0.9930, 0.9993]** against an A/A of 1.0000 [0.9958, 1.0021] — intervals that
+  do not overlap the original, so most of the 1.9% was a contended hyperthread
+  sibling and not layout. The route proof re-ran on the same rebuilt arms and
+  still reports `before == after == poison == 4cb1dcffe7454cff` at that cell,
+  so the *attribution* is untouched; only the size is. Treat ~2% as an upper
+  bound contaminated by contention until pairs A and C are re-taken.
+  Standing consequence: a small source-level A/B with no route-not-taken row
   is not confirmed. Where a route-not-taken row exists, prove it with a
   poisoned build and read it as the experiment's floor. Where it does not,
   **require the result to reproduce across independently built pairs of
