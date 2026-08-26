@@ -84,6 +84,7 @@ from __future__ import annotations
 import ast
 import contextlib
 import functools
+import io
 import os
 import re
 import subprocess
@@ -2765,19 +2766,43 @@ class SmtContention(unittest.TestCase):
         self.assertIn("active on cpus [5]", cols["smt_gate"])
         self.assertNotIn("INACTIVE", cols["smt_gate"])
 
-    def test_the_sibling_set_never_includes_the_cpus_being_measured(self):
-        """True on any host, SMT or not -- so this runs anywhere CI does.
+    def test_the_sibling_set_is_read_from_topology_and_excludes_the_pin(self):
+        """Against a synthetic topology, so it tests the parse on any runner.
 
-        If it did include them, the gate would read the benchmark's own busy
-        time as contention and discard every rep.
+        Review caught the first version of this test asserting only
+        `sibling_cpus(pin) & parse_cpu_list(pin) == set()` -- which is a
+        tautology of `return sorted(sibs - pinned)`, true by construction on
+        every host and doubly vacuous on a CI runner without SMT, where the
+        function returns `[]` for all inputs and the assertion still passes.
+        It change-detected the subtraction and proved nothing about reading
+        topology. This drives a fake sysfs instead, so a wrong path, a dropped
+        range expansion, or a lost subtraction all fail here rather than only
+        on an SMT host.
         """
         m = self._harness()
-        for pin in ("4", "0", "0,1", "2-5", "4,6,8"):
-            pinned = m.parse_cpu_list(pin)
-            self.assertEqual(set(m.sibling_cpus(pin)) & pinned, set(), pin)
-        every = ",".join(str(c) for c in range(os.cpu_count() or 1))
-        self.assertEqual(m.sibling_cpus(every), [],
-                         "a pin covering every cpu leaves no sibling to gate on")
+        # 4 physical cores, siblings paired as (0,1) (2,3) (4,5) (6,7)
+        topo = {f"/sys/devices/system/cpu/cpu{c}/topology/thread_siblings_list":
+                f"{c - c % 2}-{c - c % 2 + 1}\n" for c in range(8)}
+
+        def fake_open(path, *a, **k):
+            if str(path) in topo:
+                return io.StringIO(topo[str(path)])
+            raise OSError(f"unexpected path {path}")
+
+        with unittest.mock.patch("builtins.open", fake_open):
+            self.assertEqual(m.sibling_cpus("4"), [5], "must read the sibling")
+            self.assertEqual(m.sibling_cpus("5"), [4], "and in both directions")
+            self.assertEqual(m.sibling_cpus("4,5"), [],
+                             "a pin owning the whole core has no sibling left")
+            self.assertEqual(m.sibling_cpus("0-3"), [],
+                             "a range covering both pairs leaves nothing")
+            self.assertEqual(m.sibling_cpus("0,2"), [1, 3],
+                             "two pins contribute both their siblings")
+        # An unreadable topology must degrade to "no sibling" (gate reports
+        # INACTIVE), never raise -- CI containers do not always expose sysfs.
+        with unittest.mock.patch("builtins.open",
+                                 unittest.mock.Mock(side_effect=OSError)):
+            self.assertEqual(m.sibling_cpus("4"), [])
 
     def test_the_busy_fraction_subtracts_idle_and_survives_a_zero_span(self):
         m = self._harness()

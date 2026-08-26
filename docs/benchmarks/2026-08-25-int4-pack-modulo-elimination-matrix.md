@@ -334,8 +334,11 @@ consistency is what a null measures.
 
 Two things bound the damage to what is published here. Arms are **rotated
 within each round**, so a persistent sibling competitor lands on all three arms
-about equally and largely cancels in a *ratio*, which is what this document
-reports; it would corrupt absolute GFLOP/s, which it does not. And the
+about equally and largely cancels in a *ratio*, which is what the verdict here
+rests on. That protects the ratio, not every column: the **absolute `before ms`
+and `after ms` medians printed above are not immune**, and a persistent sibling
+competitor would inflate both. Read them as scale, not as this host's achievable
+throughput. And the
 mechanism argued above predicts the null at m≥64 independently of timing. What
 rotation does *not* cancel is a competitor correlated with the arms — one whose
 duty cycle happens to beat against a particular arm's launch length. **The
