@@ -254,6 +254,7 @@ impl<T> Drop for ThreadOwned<T> {
 mod tests {
     use std::cell::Cell;
     use std::convert::Infallible;
+    use std::marker::PhantomData;
     use std::rc::Rc;
     use std::sync::Arc;
     use std::sync::mpsc;
@@ -270,8 +271,34 @@ mod tests {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<ThreadOwned<Rc<Cell<i32>>>>();
 
-        fn assert_not_send<T>() {}
-        assert_not_send::<Rc<Cell<i32>>>();
+        // The negative half needs a probe rather than a bare turbofish:
+        // `fn assert_not_send<T>()` compiles for every `T`, so it would keep
+        // passing if the payload silently became `Send` -- it asserts nothing.
+        // `Probe<T>`'s inherent `is_send` exists only for `T: Send` and wins
+        // method resolution when it applies; otherwise the call falls through
+        // to the trait impl, which answers `false`.
+        struct Probe<T>(PhantomData<T>);
+        trait MaybeSend {
+            fn is_send(&self) -> bool {
+                false
+            }
+        }
+        impl<T> MaybeSend for Probe<T> {}
+        impl<T: Send> Probe<T> {
+            fn is_send(&self) -> bool {
+                true
+            }
+        }
+
+        assert!(
+            Probe::<u32>(PhantomData).is_send(),
+            "positive control: if a plainly-Send type reads as !Send the probe is broken, \
+             and every negative below is meaningless"
+        );
+        assert!(
+            !Probe::<Rc<Cell<i32>>>(PhantomData).is_send(),
+            "the payload must really be !Send or this test proves nothing about ThreadOwned"
+        );
     }
 
     #[test]
