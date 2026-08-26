@@ -5,13 +5,16 @@
 //! reference computed here in the test. Nothing below names a model or bakes in
 //! a fixed shape path — the executor is exercised as a generic Graph runner.
 
+use std::collections::HashMap;
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
 };
 
 use onnx_runtime_ep_api::{
-    DeviceBuffer, EpConfig, ExecutionProvider, Fence, Kernel, KernelMatch, Result as EpResult,
+    CaptureSupport, DeviceBuffer, EpConfig, ExecutionProvider, ExecutorArtifactFinalization,
+    ExecutorInstanceId, Fence, Kernel, KernelMatch, Result as EpResult, TensorMetadata, TensorMut,
+    TensorView, WorkspaceRequirement,
 };
 use onnx_runtime_ep_cpu::CpuExecutionProvider;
 use onnx_runtime_ir::{
@@ -109,9 +112,12 @@ fn i64_tensor(shape: &[usize], data: &[i64]) -> Tensor {
 struct HostDownloadCountingEp {
     cpu: CpuExecutionProvider,
     host_downloads: Arc<AtomicUsize>,
-    route_installs: Arc<AtomicUsize>,
-    route_drains: Arc<AtomicUsize>,
-    route_install_graph_nodes: Arc<AtomicUsize>,
+    kernel_compiles: Arc<Mutex<HashMap<ExecutorInstanceId, usize>>>,
+    route_finalizations: Arc<Mutex<HashMap<ExecutorInstanceId, usize>>>,
+    route_drains: Arc<Mutex<HashMap<ExecutorInstanceId, usize>>>,
+    route_install_graph_nodes: Arc<Mutex<HashMap<ExecutorInstanceId, usize>>>,
+    assert_finalized_before_execute: bool,
+    capture_checks: Arc<AtomicUsize>,
 }
 
 impl HostDownloadCountingEp {
@@ -121,28 +127,85 @@ impl HostDownloadCountingEp {
         Self {
             cpu,
             host_downloads,
-            route_installs: Arc::new(AtomicUsize::new(0)),
-            route_drains: Arc::new(AtomicUsize::new(0)),
-            route_install_graph_nodes: Arc::new(AtomicUsize::new(0)),
+            kernel_compiles: Arc::new(Mutex::new(HashMap::new())),
+            route_finalizations: Arc::new(Mutex::new(HashMap::new())),
+            route_drains: Arc::new(Mutex::new(HashMap::new())),
+            route_install_graph_nodes: Arc::new(Mutex::new(HashMap::new())),
+            assert_finalized_before_execute: false,
+            capture_checks: Arc::new(AtomicUsize::new(0)),
         }
     }
 
-    /// Counter incremented once every time the production build path invokes
-    /// [`ExecutionProvider::install_route_residency_boundary_after_build`].
-    fn route_installs(&self) -> Arc<AtomicUsize> {
-        Arc::clone(&self.route_installs)
+    fn new_lifecycle(host_downloads: Arc<AtomicUsize>) -> Self {
+        Self {
+            assert_finalized_before_execute: true,
+            ..Self::new(host_downloads)
+        }
     }
 
-    /// Counter incremented once every time executor teardown invokes
-    /// [`ExecutionProvider::drain_route_residency_boundary_on_teardown`].
-    fn route_drains(&self) -> Arc<AtomicUsize> {
+    fn kernel_compiles(&self) -> Arc<Mutex<HashMap<ExecutorInstanceId, usize>>> {
+        Arc::clone(&self.kernel_compiles)
+    }
+
+    fn route_finalizations(&self) -> Arc<Mutex<HashMap<ExecutorInstanceId, usize>>> {
+        Arc::clone(&self.route_finalizations)
+    }
+
+    fn route_drains(&self) -> Arc<Mutex<HashMap<ExecutorInstanceId, usize>>> {
         Arc::clone(&self.route_drains)
     }
 
-    /// Node count of the graph the last install hook received — proves the hook
-    /// is handed the finalized production graph, not an empty placeholder.
-    fn route_install_graph_nodes(&self) -> Arc<AtomicUsize> {
+    fn route_install_graph_nodes(&self) -> Arc<Mutex<HashMap<ExecutorInstanceId, usize>>> {
         Arc::clone(&self.route_install_graph_nodes)
+    }
+
+    fn capture_checks(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.capture_checks)
+    }
+}
+
+struct FinalizationCheckingKernel {
+    inner: Box<dyn Kernel>,
+    executor: ExecutorInstanceId,
+    finalizations: Arc<Mutex<HashMap<ExecutorInstanceId, usize>>>,
+    capture_checks: Arc<AtomicUsize>,
+}
+
+impl Kernel for FinalizationCheckingKernel {
+    fn set_constant_inputs(&mut self, constant_inputs: &[bool]) {
+        self.inner.set_constant_inputs(constant_inputs);
+    }
+
+    fn set_capture_seq_independent(&mut self, seq_independent: bool) {
+        self.inner.set_capture_seq_independent(seq_independent);
+    }
+
+    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> EpResult<()> {
+        assert!(
+            scoped_count(&self.finalizations, self.executor) > 0,
+            "kernel executed before provider artifacts finalized"
+        );
+        self.inner.execute(inputs, outputs)
+    }
+
+    fn workspace_requirement(
+        &self,
+        inputs: &[TensorMetadata<'_>],
+    ) -> EpResult<WorkspaceRequirement> {
+        self.inner.workspace_requirement(inputs)
+    }
+
+    fn supports_strided_input(&self, input_idx: usize) -> bool {
+        self.inner.supports_strided_input(input_idx)
+    }
+
+    fn capture_support(&self) -> CaptureSupport {
+        assert!(
+            scoped_count(&self.finalizations, self.executor) > 0,
+            "capture audit reached a kernel before provider artifacts finalized"
+        );
+        self.capture_checks.fetch_add(1, Ordering::Relaxed);
+        self.inner.capture_support()
     }
 }
 
@@ -151,14 +214,41 @@ impl ExecutionProvider for HostDownloadCountingEp {
         Ok(())
     }
 
-    fn install_route_residency_boundary_after_build(&self, graph: &Graph) {
-        self.route_installs.fetch_add(1, Ordering::Relaxed);
+    fn finalize_executor_artifacts(
+        &self,
+        executor: ExecutorInstanceId,
+        graph: &Graph,
+    ) -> ExecutorArtifactFinalization {
+        assert!(
+            self.kernel_compiles
+                .lock()
+                .unwrap()
+                .get(&executor)
+                .copied()
+                .unwrap_or(0)
+                > 0,
+            "provider artifacts finalized before this executor compiled a kernel"
+        );
+        *self
+            .route_finalizations
+            .lock()
+            .unwrap()
+            .entry(executor)
+            .or_default() += 1;
         self.route_install_graph_nodes
-            .store(graph.num_nodes(), Ordering::Relaxed);
+            .lock()
+            .unwrap()
+            .insert(executor, graph.num_nodes());
+        ExecutorArtifactFinalization::Complete
     }
 
-    fn drain_route_residency_boundary_on_teardown(&self) {
-        self.route_drains.fetch_add(1, Ordering::Relaxed);
+    fn drain_executor_artifacts(&self, executor: ExecutorInstanceId) {
+        *self
+            .route_drains
+            .lock()
+            .unwrap()
+            .entry(executor)
+            .or_default() += 1;
     }
 
     fn name(&self) -> &str {
@@ -200,6 +290,32 @@ impl ExecutionProvider for HostDownloadCountingEp {
         opset: u64,
     ) -> EpResult<Box<dyn Kernel>> {
         self.cpu.get_kernel(op, shapes, opset)
+    }
+
+    fn get_kernel_for_executor(
+        &self,
+        executor: ExecutorInstanceId,
+        op: &Node,
+        shapes: &[Vec<usize>],
+        opset: u64,
+    ) -> EpResult<Box<dyn Kernel>> {
+        let kernel = self.cpu.get_kernel(op, shapes, opset)?;
+        *self
+            .kernel_compiles
+            .lock()
+            .unwrap()
+            .entry(executor)
+            .or_default() += 1;
+        if self.assert_finalized_before_execute {
+            Ok(Box::new(FinalizationCheckingKernel {
+                inner: kernel,
+                executor,
+                finalizations: Arc::clone(&self.route_finalizations),
+                capture_checks: Arc::clone(&self.capture_checks),
+            }))
+        } else {
+            Ok(kernel)
+        }
     }
 
     fn allocate(&self, size: usize, alignment: usize) -> EpResult<DeviceBuffer> {
@@ -1690,27 +1806,38 @@ fn from_graph_rejects_initializer_reused_as_node_output() {
 }
 
 // ---------------------------------------------------------------------------
-// #1810 Slice 7E — the route-residency install/drain lifecycle hooks are
-// reachable from the REAL production build/teardown path, not a direct helper.
-//
-// `Executor::build_with_cuda_requirement` calls
-// `ExecutionProvider::install_route_residency_boundary_after_build` once, after
-// the static graph's kernels are compiled and buffers sized but before any
-// decode, handing the finalized graph to the EP. `Drop for Executor` calls
-// `drain_route_residency_boundary_on_teardown` on teardown. These tests drive a
-// real session build/drop and assert both hooks fire through the production
-// caller (the recording EP counts them); they never invoke the hooks directly.
+// #1810 Slice 7E — executor-scoped provider-artifact lifecycle.
 // ---------------------------------------------------------------------------
 
 fn static_gelu_model() -> Vec<u8> {
     encode_model(&Model::new(&standard_gelu_graph(20))).expect("encode static Gelu model")
 }
 
+fn symbolic_gelu_model() -> Vec<u8> {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 20);
+    let extent = graph.intern_symbol("dynamic_extent");
+    let shape = vec![Dim::Symbolic(extent)];
+    let x = input_shaped(&mut graph, "x", DataType::Float32, shape.clone());
+    let y = graph.create_named_value("y", DataType::Float32, shape);
+    graph.insert_node(Node::new(NodeId(0), "Gelu", vec![Some(x)], vec![y]));
+    graph.add_output(y);
+    encode_model(&Model::new(&graph)).expect("encode symbolic Gelu model")
+}
+
+fn scoped_count(
+    counts: &Mutex<HashMap<ExecutorInstanceId, usize>>,
+    executor: ExecutorInstanceId,
+) -> usize {
+    counts.lock().unwrap().get(&executor).copied().unwrap_or(0)
+}
+
 #[test]
-fn build_installs_route_residency_boundary_once_via_production_path() {
+fn static_build_finalizes_provider_artifacts_once_and_drains_owner_once() {
     let downloads = Arc::new(AtomicUsize::new(0));
-    let ep = HostDownloadCountingEp::new(Arc::clone(&downloads));
-    let installs = ep.route_installs();
+    let ep = HostDownloadCountingEp::new_lifecycle(Arc::clone(&downloads));
+    let compiles = ep.kernel_compiles();
+    let finalizations = ep.route_finalizations();
     let drains = ep.route_drains();
     let install_nodes = ep.route_install_graph_nodes();
     let ep = Arc::new(ep);
@@ -1721,43 +1848,142 @@ fn build_installs_route_residency_boundary_once_via_production_path() {
         .execution_provider(ep)
         .build()
         .expect("build static Gelu session");
+    let executor = session.executor_instance_id();
 
-    // A static graph materializes its executor during `build`, so the install
-    // hook fires before any run — exactly once, on the production build path.
     assert_eq!(
-        installs.load(Ordering::Relaxed),
+        scoped_count(&compiles, executor),
         1,
-        "install_route_residency_boundary_after_build must fire once during build"
+        "static build compiles its kernel before finalization"
     );
     assert_eq!(
-        install_nodes.load(Ordering::Relaxed),
+        scoped_count(&finalizations, executor),
         1,
-        "install hook must receive the finalized graph (1 Gelu node), not an empty placeholder"
+        "static build finalizes exactly once"
     );
     assert_eq!(
-        drains.load(Ordering::Relaxed),
-        0,
-        "no drain before teardown"
+        scoped_count(&install_nodes, executor),
+        1,
+        "finalization receives the finalized graph"
     );
+    assert_eq!(scoped_count(&drains, executor), 0);
 
-    // Running does not re-install: install is a once-per-build lifecycle event.
     let x = Tensor::from_f32(&[2], &[-1.0, 1.0]).unwrap();
     session.run(&[("x", &x)]).expect("run static Gelu");
+    assert_eq!(scoped_count(&finalizations, executor), 1);
+
+    drop(session);
+    assert_eq!(scoped_count(&drains, executor), 1);
+    assert_eq!(scoped_count(&finalizations, executor), 1);
+}
+
+#[test]
+fn symbolic_first_resolved_compile_finalizes_before_use_and_specialization_does_not_reinstall() {
+    let downloads = Arc::new(AtomicUsize::new(0));
+    let ep = HostDownloadCountingEp::new_lifecycle(downloads);
+    let compiles = ep.kernel_compiles();
+    let finalizations = ep.route_finalizations();
+    let drains = ep.route_drains();
+    let capture_checks = ep.capture_checks();
+    let ep = Arc::new(ep);
+
+    let model = symbolic_gelu_model();
+    let mut session = InferenceSession::builder()
+        .model_bytes(&model)
+        .execution_provider(ep)
+        .build()
+        .expect("build symbolic Gelu session");
+    let executor = session.executor_instance_id();
+    assert_eq!(scoped_count(&compiles, executor), 0);
     assert_eq!(
-        installs.load(Ordering::Relaxed),
+        scoped_count(&finalizations, executor),
+        0,
+        "symbolic build must not falsely finalize before resolved compilation"
+    );
+
+    let x2 = Tensor::from_f32(&[2], &[-1.0, 1.0]).unwrap();
+    session.run(&[("x", &x2)]).expect("first symbolic run");
+    assert_eq!(scoped_count(&compiles, executor), 1);
+    assert_eq!(scoped_count(&finalizations, executor), 1);
+    let mut binding = session
+        .allocate_device_binding("x", Some("y"), DataType::Float32, vec![2], vec![2])
+        .expect("allocate capture audit binding");
+    binding
+        .write_bytes(0, &f32_bytes(&[-1.0, 1.0]))
+        .expect("seed capture audit binding");
+    let _ = session
+        .try_capture_with_device_bindings(&[], std::slice::from_mut(&mut binding))
+        .expect("capture audit must run after finalization");
+    assert!(
+        capture_checks.load(Ordering::Relaxed) > 0,
+        "capture audit must inspect the finalized compiled kernel"
+    );
+
+    let x4 = Tensor::from_f32(&[4], &[-1.0, 0.0, 1.0, 2.0]).unwrap();
+    session
+        .run(&[("x", &x4)])
+        .expect("dynamic specialization run");
+    assert_eq!(
+        scoped_count(&compiles, executor),
+        2,
+        "new input shape compiles one new kernel specialization"
+    );
+    assert_eq!(
+        scoped_count(&finalizations, executor),
         1,
-        "install must not repeat on run"
+        "stable executor artifacts make dynamic specialization reinstall-free"
     );
 
     drop(session);
+    assert_eq!(scoped_count(&drains, executor), 1);
+}
+
+#[test]
+fn shared_provider_concurrent_symbolic_executors_finalize_and_drain_independently() {
+    let downloads = Arc::new(AtomicUsize::new(0));
+    let ep = Arc::new(HostDownloadCountingEp::new_lifecycle(downloads));
+    let finalizations = ep.route_finalizations();
+    let drains = ep.route_drains();
+    let model = symbolic_gelu_model();
+
+    let mut first = InferenceSession::builder()
+        .model_bytes(&model)
+        .execution_provider(ep.clone())
+        .build()
+        .expect("build first symbolic executor");
+    let mut second = InferenceSession::builder()
+        .model_bytes(&model)
+        .execution_provider(ep)
+        .build()
+        .expect("build second symbolic executor");
+    let first_id = first.executor_instance_id();
+    let second_id = second.executor_instance_id();
+    assert_ne!(first_id, second_id);
+
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let x = Tensor::from_f32(&[2], &[-1.0, 1.0]).unwrap();
+            first.run(&[("x", &x)]).expect("first concurrent run");
+        });
+        scope.spawn(|| {
+            let x = Tensor::from_f32(&[4], &[-1.0, 0.0, 1.0, 2.0]).unwrap();
+            second.run(&[("x", &x)]).expect("second concurrent run");
+        });
+    });
+    assert_eq!(scoped_count(&finalizations, first_id), 1);
+    assert_eq!(scoped_count(&finalizations, second_id), 1);
+
+    drop(first);
+    assert_eq!(scoped_count(&drains, first_id), 1);
     assert_eq!(
-        drains.load(Ordering::Relaxed),
-        1,
-        "drain_route_residency_boundary_on_teardown must fire once on executor teardown"
+        scoped_count(&drains, second_id),
+        0,
+        "dropping one executor must not drain its sibling"
     );
-    assert_eq!(
-        installs.load(Ordering::Relaxed),
-        1,
-        "teardown must not install"
-    );
+    let x = Tensor::from_f32(&[4], &[2.0, 1.0, 0.0, -1.0]).unwrap();
+    second
+        .run(&[("x", &x)])
+        .expect("surviving sibling still runs");
+    assert_eq!(scoped_count(&finalizations, second_id), 1);
+    drop(second);
+    assert_eq!(scoped_count(&drains, second_id), 1);
 }

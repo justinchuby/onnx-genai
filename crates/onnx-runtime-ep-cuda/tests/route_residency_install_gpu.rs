@@ -9,8 +9,8 @@
 //! telemetry double: they register the **actual** executing
 //! [`QMoEKernel`](onnx_runtime_ep_cuda) producer through the EP's own kernel
 //! factory (exactly as the session's `compile_all` pre-warm does), then invoke
-//! the **same trait method the session executor calls after build**
-//! (`ExecutionProvider::install_route_residency_boundary_after_build`) and
+//! the **same trait method the session executor calls after resolved compile**
+//! (`ExecutionProvider::finalize_executor_artifacts`) and
 //! assert the whole real seam:
 //!
 //! * the EP owns the real producer source for the compiled `QMoE` node,
@@ -38,7 +38,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use onnx_runtime_ep_api::ExecutionProvider;
+use onnx_runtime_ep_api::{ExecutionProvider, ExecutorArtifactFinalization, ExecutorInstanceId};
 use onnx_runtime_ep_cuda::CudaExecutionProvider;
 use onnx_runtime_ep_cuda::coarse_residency::COARSE_RESIDENCY_ENABLE_ENV;
 use onnx_runtime_ep_cuda::weight_paging::DeviceOffloadPolicy;
@@ -162,11 +162,12 @@ fn qmoe_graph() -> (Graph, NodeId, Vec<ValueId>) {
 /// boxed kernel so it (and thus the shared `Arc`) stays alive for the assertion.
 fn compile_qmoe_through_ep(
     provider: &CudaExecutionProvider,
+    executor: ExecutorInstanceId,
     graph: &Graph,
     node_id: NodeId,
 ) -> Box<dyn onnx_runtime_ep_api::Kernel> {
     provider
-        .get_kernel(graph.node(node_id), &[], 1)
+        .get_kernel_for_executor(executor, graph.node(node_id), &[], 1)
         .expect("EP constructs the real QMoE kernel from its attributes")
 }
 
@@ -189,33 +190,67 @@ fn enabled_build_binds_real_producer_and_declines_without_per_bank_reservation()
     };
 
     let (graph, node_id, members) = qmoe_graph();
+    let executor = ExecutorInstanceId::fresh();
 
     // Before compile the EP owns no producer source and has retained nothing.
     assert!(
-        provider.route_telemetry_sources().is_empty(),
+        provider.route_telemetry_sources(executor).is_empty(),
         "no producer registered before the QMoE node is compiled"
     );
     assert!(
-        provider.retained_route_residency_artifacts().is_none(),
+        provider
+            .retained_route_residency_artifacts(executor)
+            .is_none(),
         "nothing retained before an enabled build"
     );
 
     // Compile the QMoE node through the EP's factory: the executing kernel
     // registers itself as the EP-owned producer (goal 2, no test double).
-    let _kernel = compile_qmoe_through_ep(&provider, &graph, node_id);
-    let sources = provider.route_telemetry_sources();
+    let _kernel = compile_qmoe_through_ep(&provider, executor, &graph, node_id);
+    let sources = provider.route_telemetry_sources(executor);
     assert!(
         sources.contains_key(&node_id),
         "the actual executing QMoE kernel is the EP-owned producer for its node"
     );
     assert!(
-        provider.route_telemetry_producer(node_id).is_some(),
+        provider
+            .route_telemetry_producer(executor, node_id)
+            .is_some(),
         "the concrete QMoE producer is reachable by node id"
     );
 
-    // Invoke the exact trait method the session executor calls after build.
+    // Invoke the exact transition the session executor calls after resolved
+    // compilation.
     gate_on();
-    provider.install_route_residency_boundary_after_build(&graph);
+    assert_eq!(
+        provider.finalize_executor_artifacts(executor, &graph),
+        ExecutorArtifactFinalization::Complete
+    );
+    let status = provider.route_residency_executor_status(executor);
+    assert_eq!(status.finalization_attempts, 1);
+    let stable_source = provider
+        .route_telemetry_producer(executor, node_id)
+        .expect("compiled QMoE has a stable producer");
+    let _specialization = provider
+        .get_kernel_for_executor(executor, graph.node(node_id), &[vec![2]], 1)
+        .expect("dynamic QMoE specialization compiles");
+    assert!(Arc::ptr_eq(
+        &stable_source,
+        &provider
+            .route_telemetry_producer(executor, node_id)
+            .expect("specialization retains the source")
+    ));
+    assert_eq!(
+        provider.finalize_executor_artifacts(executor, &graph),
+        ExecutorArtifactFinalization::Complete
+    );
+    assert_eq!(
+        provider
+            .route_residency_executor_status(executor)
+            .finalization_attempts,
+        1,
+        "terminal structural outcome must latch exactly once"
+    );
     gate_off();
 
     let diag = provider.route_residency_diagnostics();
@@ -243,7 +278,7 @@ fn enabled_build_binds_real_producer_and_declines_without_per_bank_reservation()
 
     // Goal 1: the EP retained the real property-discovered per-bank artifacts.
     let retained = provider
-        .retained_route_residency_artifacts()
+        .retained_route_residency_artifacts(executor)
         .expect("enabled discovery retained the bank artifacts");
     assert_eq!(retained.len(), 1, "exactly one discovered expert bank");
     assert_eq!(retained[0].node, node_id, "retained the real bank node id");
@@ -251,6 +286,68 @@ fn enabled_build_binds_real_producer_and_declines_without_per_bank_reservation()
         retained[0].members, members,
         "retained the exact fc1/fc2/fc3 member ranges"
     );
+}
+
+#[test]
+#[ignore = "requires idle CUDA device; CUDA_VISIBLE_DEVICES=<idle> --ignored"]
+fn readiness_absence_does_not_latch_and_concurrent_finalize_is_idempotent() {
+    let _guard = GPU_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let provider = match offload_provider_or_skip("readiness") {
+        Some(provider) => Arc::new(provider),
+        None => return,
+    };
+    let (graph, node_id, _) = qmoe_graph();
+    let graph = Arc::new(graph);
+    let executor = ExecutorInstanceId::fresh();
+    gate_on();
+
+    let declines_before = provider.route_residency_diagnostics().declines();
+    assert_eq!(
+        provider.finalize_executor_artifacts(executor, &graph),
+        ExecutorArtifactFinalization::Pending
+    );
+    let pending = provider.route_residency_executor_status(executor);
+    assert_eq!(pending.finalization_attempts, 1);
+    assert!(pending.outcome.is_none());
+    assert_eq!(
+        provider.route_residency_diagnostics().declines(),
+        declines_before,
+        "readiness absence is not a structural decline"
+    );
+
+    let _kernel = compile_qmoe_through_ep(&provider, executor, &graph, node_id);
+    std::thread::scope(|scope| {
+        for _ in 0..2 {
+            let provider = Arc::clone(&provider);
+            let graph = Arc::clone(&graph);
+            scope.spawn(move || {
+                assert_eq!(
+                    provider.finalize_executor_artifacts(executor, &graph),
+                    ExecutorArtifactFinalization::Complete
+                );
+            });
+        }
+    });
+    let finalized = provider.route_residency_executor_status(executor);
+    assert_eq!(
+        finalized.finalization_attempts, 2,
+        "one pending epoch plus one terminal install attempt; concurrent duplicate is idempotent"
+    );
+    assert!(matches!(
+        finalized.outcome,
+        Some(onnx_runtime_ep_cuda::route_residency::RouteResidencyInstallOutcome::Rejected(
+            onnx_runtime_ep_cuda::route_residency::RouteResidencyBindingReject::NoPerBankReservation {
+                ..
+            }
+        ))
+    ));
+
+    provider.drain_executor_artifacts(executor);
+    provider.drain_executor_artifacts(executor);
+    let drained = provider.route_residency_executor_status(executor);
+    assert_eq!(drained.drain_calls, 1);
+    assert!(drained.drained);
+    gate_off();
 }
 
 // ---------------------------------------------------------------------------
@@ -274,14 +371,20 @@ fn disabled_build_installs_and_retains_nothing() {
     };
 
     let (graph, node_id, _members) = qmoe_graph();
-    let _kernel = compile_qmoe_through_ep(&provider, &graph, node_id);
+    let executor = ExecutorInstanceId::fresh();
+    let _kernel = compile_qmoe_through_ep(&provider, executor, &graph, node_id);
     assert!(
-        provider.route_telemetry_sources().contains_key(&node_id),
+        provider
+            .route_telemetry_sources(executor)
+            .contains_key(&node_id),
         "a real producer still exists; the disabled guarantee is about install/retain, not existence"
     );
 
     gate_off();
-    provider.install_route_residency_boundary_after_build(&graph);
+    assert_eq!(
+        provider.finalize_executor_artifacts(executor, &graph),
+        ExecutorArtifactFinalization::Complete
+    );
 
     let diag = provider.route_residency_diagnostics();
     assert_eq!(diag.installs(), 0, "default-off installs nothing");
@@ -296,19 +399,23 @@ fn disabled_build_installs_and_retains_nothing() {
         "default-off touches no install diagnostics"
     );
     assert!(
-        provider.retained_route_residency_artifacts().is_none(),
+        provider
+            .retained_route_residency_artifacts(executor)
+            .is_none(),
         "default-off retains no bank artifacts"
     );
 
     // Draining the (never-installed) boundary is a safe no-op that also clears
     // the EP-owned producer registry and any retained artifacts on teardown.
-    provider.drain_route_residency_boundary_on_teardown();
+    provider.drain_executor_artifacts(executor);
     assert!(
-        provider.route_telemetry_sources().is_empty(),
+        provider.route_telemetry_sources(executor).is_empty(),
         "teardown drains the EP-owned producer registry"
     );
     assert!(
-        provider.retained_route_residency_artifacts().is_none(),
+        provider
+            .retained_route_residency_artifacts(executor)
+            .is_none(),
         "teardown leaves nothing retained"
     );
 }

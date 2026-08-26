@@ -1761,6 +1761,12 @@ impl InferenceSession {
         self.exec.graph()
     }
 
+    /// Executor ownership identity used by provider lifecycle diagnostics.
+    #[doc(hidden)]
+    pub fn executor_instance_id(&self) -> onnx_runtime_ep_api::ExecutorInstanceId {
+        self.exec.instance_id()
+    }
+
     /// Export a `com.microsoft::EPContext` context-cache model for this session
     /// (§55.4 dump path), driven by the `ep.context_*` session options
     /// ([`Self::ep_context_config`]).

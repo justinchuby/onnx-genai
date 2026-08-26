@@ -63,6 +63,9 @@ pub(crate) struct SlotCaptureState {
 /// The compiled, runnable graph: buffers + plan + kernel cache. Owned by the
 /// public [`InferenceSession`](crate::InferenceSession).
 pub(crate) struct Executor {
+    /// Process-unique ownership scope for provider artifacts published while
+    /// this executor compiles kernels.
+    pub(super) instance_id: ExecutorInstanceId,
     pub(super) graph: Graph,
     /// Kept alive so external-weight memory maps outlive buffer population —
     /// **and**, since the weight-streaming change, so borrowed initializer
@@ -381,6 +384,10 @@ pub(crate) struct Executor {
     /// Control-flow and sequence nodes always have `None` (they don't use the
     /// kernel cache).
     pub(super) kernel_bindings: Vec<Option<KernelKey>>,
+    /// Set only after the provider reports that this executor's required
+    /// artifacts are complete. A readiness-dependent `Pending` result leaves it
+    /// false so a later resolved compilation epoch invokes the same transition.
+    pub(super) provider_artifacts_finalized: bool,
     pub(super) persistent_workspace: Option<PreparedWorkspace>,
     pub(super) step_workspace: Option<PreparedWorkspace>,
     /// When set, [`Executor::release_step_workspace`] is a no-op: the StepScoped
