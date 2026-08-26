@@ -152,6 +152,58 @@ WORKFLOW_JOB_INVENTORY: dict[str, tuple[str, ...]] = {
     ),
 }
 
+# Every workflow that reports a check on every pull request, mapped to the
+# job-level `if:` expressions its jobs are allowed to carry.
+#
+# `WORKFLOW_JOB_INVENTORY` proves a job is still *defined*. This proves the two
+# things that decide whether a defined job still *runs* on a pull request: the
+# workflow triggers on `pull_request` at all, and no job has been quietly gated
+# behind a condition. Both were measured blind before this table existed --
+# adding `if: false` to `root-files`, `miri` or the hostlock job, or swapping
+# `pull_request:` for `workflow_dispatch:`, left every gate returning 0 while
+# printing a line byte-identical to a clean tree. See #2210.
+#
+# An empty set means "these jobs run unconditionally", which is the right
+# default for a gate: a check that can decline to run is not a gate. `ci.yml` is
+# the sole exception and carries the repo's docs-only guard, which is reasoned
+# about at length above `_ALLOWED_JOB_IF`.
+#
+# The membership itself is the assertion, in both directions: a recorded file
+# that stops firing on `pull_request` is refused, and a file that *starts*
+# firing without being recorded is refused too, so the table cannot silently
+# fall behind the tree. Adding or retiring a PR check means editing this table
+# in the same commit -- a permanent record in the diff rather than a decision
+# nobody can later find.
+#
+# NOT covered, and deliberately: `ci.yml` losing `pull_request` in the very pull
+# request that does it. GitHub decides whether to run a workflow for a
+# `pull_request` event from the file on that PR's own merge ref, so `Rust
+# quality` -- which hosts this check -- would not run to report its absence. A
+# guard cannot witness the absence of the thing hosting it. Closing that needs a
+# required check in another workflow file, which is a ruleset change and so is
+# not fixable from inside the repository; the same boundary `REQUIRED_JOB_NAMES`
+# documents. This table still catches it on push-to-`main` and in any *other*
+# pull request, which is every route except the first.
+# The repo's docs-only guard, named once because two tables assert on it:
+# `_ALLOWED_JOB_IF` (which required jobs may carry) and `PR_TRIGGERED_WORKFLOWS`
+# (which jobs in a PR-triggered workflow may carry). Two spellings of one
+# expression would drift silently and each table would keep passing.
+_DOCS_ONLY_GUARD = "needs.changes.outputs.docs_only != 'true'"
+
+PR_TRIGGERED_WORKFLOWS: dict[str, frozenset[str]] = {
+    "audit.yml": frozenset(),
+    "ci.yml": frozenset({_DOCS_ONLY_GUARD}),
+    "diff-guard.yml": frozenset(),
+    "hostlock.yml": frozenset(),
+    "miri.yml": frozenset(),
+    "mobius-producer-conformance.yml": frozenset(),
+    "squad-ci.yml": frozenset(),
+    "squad-heartbeat.yml": frozenset(),
+    "visualizer-test.yml": frozenset(),
+    "weight-cache-guard.yml": frozenset(),
+    "wiki-lint.yml": frozenset(),
+}
+
 # Crates that are intentionally not selected by any CI cargo-test lane.
 # Every entry is a written exception to the default rule: workspace members are
 # tested unless they are listed here with a reason.
@@ -774,7 +826,7 @@ _JOB_COE = re.compile(r"^    continue-on-error:\s*(.+?)\s*$", re.MULTILINE)
 # So: the required jobs may carry the repo's known docs-only guard or no guard at
 # all, and anything else is refused rather than interpreted.
 _JOB_IF = re.compile(r"^    if:\s*(.+?)\s*$", re.MULTILINE)
-_ALLOWED_JOB_IF = frozenset({"needs.changes.outputs.docs_only != 'true'"})
+_ALLOWED_JOB_IF = frozenset({_DOCS_ONLY_GUARD})
 
 
 def job_condition(job_body: str) -> str | None:
@@ -1240,8 +1292,12 @@ def workflow_files() -> list[Path]:
     return sorted(WORKFLOWS.glob("*.yml")) + sorted(WORKFLOWS.glob("*.yaml"))
 
 
-def verify_workflow_integrity(simulate_deleted_job: str | None = None) -> int:
-    """Every workflow file parses, and defines exactly the jobs it is recorded as defining.
+def verify_workflow_integrity(
+    simulate_deleted_job: str | None = None,
+    simulate_dropped_trigger: str | None = None,
+    simulate_gated_job: str | None = None,
+) -> int:
+    """Every workflow parses, defines exactly the jobs it is recorded as defining, and still runs.
 
     `verify_required_tier` covers `ci.yml` because `REQUIRED_JOB_NAMES` is an
     inventory of it, and branch protection covers `ci.yml` again because a
@@ -1250,6 +1306,15 @@ def verify_workflow_integrity(simulate_deleted_job: str | None = None) -> int:
     `root-files` two spaces deeper leaves valid YAML, drops the root allowlist
     from what GitHub runs, and `verify`, `verify-required-tier` and `self-test`
     all still returned 0.
+
+    "Defined" was the whole claim until #2210. It is narrower than "runs", and
+    the gap was measured, not theorised: `if: false` on `root-files`, `miri` or
+    the hostlock job, and swapping `pull_request:` for `workflow_dispatch:` in
+    any workflow, each left all three gates returning 0 while printing a line
+    byte-identical to a clean tree. `verify_pr_trigger_integrity` closes both.
+    Matrix `include:` row removal is the one recorded vector still open --
+    renaming the matrix variable is caught, because the recorded display name
+    holds the unexpanded template and the template itself changes.
     """
     files = workflow_files()
     failures: list[str] = []
@@ -1269,6 +1334,10 @@ def verify_workflow_integrity(simulate_deleted_job: str | None = None) -> int:
     failures += _integrity_failures(
         {path.name for path in files}, parsed, WORKFLOW_JOB_INVENTORY
     )
+    failures += verify_pr_trigger_integrity(
+        simulate_dropped_trigger=simulate_dropped_trigger,
+        simulate_gated_job=simulate_gated_job,
+    )
     seen = sum(len(jobs) for jobs in parsed.values())
 
     if failures:
@@ -1283,7 +1352,18 @@ def verify_workflow_integrity(simulate_deleted_job: str | None = None) -> int:
             file=sys.stderr,
         )
         return 1
-    print(f"workflow job integrity ok: {len(files)} file(s), {seen} job(s) as recorded")
+    on_disk = {path.name for path in files}
+    if not (PR_TRIGGERED_WORKFLOWS.keys() & on_disk):
+        print(
+            "Workflow job integrity check failed: no PR-triggered workflow was "
+            "read, so the trigger half of this gate proved nothing.",
+            file=sys.stderr,
+        )
+        return 1
+    print(
+        f"workflow job integrity ok: {len(files)} file(s), {seen} job(s) as "
+        f"recorded, {len(PR_TRIGGERED_WORKFLOWS)} still reporting on pull requests"
+    )
     return 0
 
 
@@ -1330,9 +1410,175 @@ def _integrity_failures(
     return failures
 
 
+def _probe_trigger_forms() -> int:
+    """Every spelling GitHub accepts for `on:` reads back the same trigger set.
+
+    A parser that silently returns the empty set for a form it does not know
+    would report a PR-triggered workflow as no longer triggering -- a false red
+    on the recorded files, and a false green on the unrecorded ones, from the
+    same bug. So the unknown-form case refuses instead.
+    """
+    problems: list[str] = []
+    both = {"push", "pull_request"}
+    forms = {
+        "block keys": "name: W\non:\n  push:\n  pull_request:\n    branches: [main]\njobs:\n",
+        "block items": "name: W\non:\n  - push\n  - pull_request\njobs:\n",
+        "inline list": "name: W\non: [push, pull_request]\njobs:\n",
+        "double-quoted key": 'name: W\n"on":\n  push:\n  pull_request:\njobs:\n',
+        "single-quoted key": "name: W\n'on':\n  push:\n  pull_request:\njobs:\n",
+        "trailing comment": "name: W\non:\n  push:  # main only\n  pull_request:\njobs:\n",
+        "comment inside block": "name: W\non:\n  push:\n  # why\n  pull_request:\njobs:\n",
+    }
+    for label, text in forms.items():
+        got = workflow_triggers(text, source=label)
+        if got != both:
+            problems.append(f"{label} read as {sorted(got)}, expected {sorted(both)}")
+    if (scalar := workflow_triggers("on: push\njobs:\n")) != {"push"}:
+        problems.append(f"scalar form read as {sorted(scalar)}")
+    # `on_failure:` and `one:` both begin with the letters of `on` and neither is
+    # the triggers block; matching either would read a workflow's triggers off an
+    # unrelated key.
+    for label, text in (
+        ("no `on:` block", "name: W\njobs:\n"),
+        ("empty `on:` block", "name: W\non:\njobs:\n"),
+        ("`one:` is not `on:`", "name: W\none: x\njobs:\n"),
+    ):
+        try:
+            got = workflow_triggers(text, source=label)
+        except SystemExit:
+            continue
+        problems.append(f"{label} accepted, read as {sorted(got)}; should refuse")
+    for problem in problems:
+        print(f"  on: parse: {problem}", file=sys.stderr)
+    return 1 if problems else 0
+
+
 def _inventory_entry(name: str, jobs: Iterable[str]) -> str:
     body = "".join(f'            "{job}",\n' for job in jobs)
     return f'        "{name}": (\n{body}        ),'
+
+
+# Hand-parsed for the reason the rest of this file is: `ubuntu-latest` ships no
+# PyYAML and PEP 668 blocks installing it. Text parsing also sidesteps the YAML
+# 1.1 rule that makes a bare `on:` key parse as the boolean `True` -- a live
+# footgun for every PyYAML-based reader of these files, and the reason the
+# quoted spellings below are accepted too.
+_ON_KEY = re.compile(r"""^(?:"on"|'on'|on)\s*:\s*(?P<inline>.*?)\s*$""")
+_ON_CHILD = re.compile(
+    r"""^\ \ (?:"(?P<dq>[^"]+)"|'(?P<sq>[^']+)'|(?P<plain>[A-Za-z0-9_.-]+))\s*:"""
+)
+_ON_ITEM = re.compile(r"^\ \ -\s*(?P<value>.+?)\s*$")
+
+
+def workflow_triggers(text: str, source: str = "<workflow>") -> set[str]:
+    """The event names a workflow triggers on.
+
+    All three spellings GitHub accepts: `on: push`, `on: [push, pull_request]`,
+    and the block form with either `  push:` keys or `  - push` items.
+    """
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        if line.startswith(" ") or line.lstrip().startswith("#"):
+            continue
+        match = _ON_KEY.match(line)
+        if match is None:
+            continue
+        inline = _TRAILING_COMMENT.sub("", match.group("inline")).strip()
+        if inline:
+            return {
+                _scalar(part)
+                for part in inline.strip("[]").split(",")
+                if part.strip()
+            }
+        triggers: set[str] = set()
+        for follow in lines[index + 1 :]:
+            if (
+                follow.strip()
+                and not follow.startswith(" ")
+                and not follow.lstrip().startswith("#")
+            ):
+                break
+            if follow.lstrip().startswith("#"):
+                continue
+            if item := _ON_ITEM.match(follow):
+                triggers.add(_scalar(item.group("value")))
+            elif child := _ON_CHILD.match(follow):
+                triggers.add(
+                    child.group("dq") or child.group("sq") or child.group("plain")
+                )
+        if not triggers:
+            raise SystemExit(
+                f"{source}: `on:` block parsed to no triggers at all. Refusing to "
+                f"guess -- an empty read here would report every workflow as no "
+                f"longer running on pull requests, or none of them, depending on "
+                f"which way the caller leans."
+            )
+        return triggers
+    raise SystemExit(
+        f"{source}: no top-level `on:` block, so the gate cannot tell when this "
+        f"workflow runs."
+    )
+
+
+def verify_pr_trigger_integrity(
+    simulate_dropped_trigger: str | None = None,
+    simulate_gated_job: str | None = None,
+) -> list[str]:
+    """Every recorded PR check still fires on pull requests, and still unconditionally.
+
+    `_integrity_failures` proves a job is still defined. This proves it still
+    runs: the workflow triggers on `pull_request`, and no job hides behind a
+    condition that is not recorded for that file.
+    """
+    failures: list[str] = []
+    for path in workflow_files():
+        name = path.name
+        if name not in WORKFLOW_JOB_INVENTORY:
+            continue
+        text = path.read_text(encoding="utf-8")
+        try:
+            triggers = workflow_triggers(text, source=str(path))
+        except SystemExit as refusal:
+            failures.append(str(refusal))
+            continue
+        fires = "pull_request" in triggers
+        if simulate_dropped_trigger == name:
+            fires = False
+        recorded = name in PR_TRIGGERED_WORKFLOWS
+        if recorded and not fires:
+            failures.append(
+                f"{name}: recorded as reporting a check on every pull request, but "
+                f"its `on:` no longer includes `pull_request` (triggers: "
+                f"{sorted(triggers)}). A workflow that stops triggering removes its "
+                f"checks from the PR rather than failing them."
+            )
+        if fires and not recorded:
+            failures.append(
+                f"{name}: triggers on `pull_request` but is not recorded in "
+                f"PR_TRIGGERED_WORKFLOWS, so nothing would notice if it stopped. "
+                f"Add it with the conditions its jobs are allowed to carry."
+            )
+        if not recorded:
+            continue
+        allowed = PR_TRIGGERED_WORKFLOWS[name]
+        try:
+            jobs = parse_jobs(text, source=str(path))
+        except SystemExit:
+            continue  # already reported by _integrity_failures
+        for job, body in sorted(jobs.items()):
+            condition = job_condition(body)
+            if simulate_gated_job == name:
+                condition = "false"
+            if condition is None or condition in allowed:
+                continue
+            failures.append(
+                f"{name}: {job!r} carries `if: {condition}`, which is not recorded "
+                f"for this file. A skipped job reports conclusion \"skipped\", which "
+                f"is not a failure and does not appear as a red check -- so gating a "
+                f"PR check is indistinguishable from it passing. Allowed here: "
+                f"{sorted(allowed) or 'no condition at all'}."
+            )
+    return failures
 
 
 # Job bodies whose keys are written in the ways YAML allows. A key form this
@@ -2198,6 +2444,45 @@ def _self_test_arms() -> tuple[int, int]:
             1,
             ["Root file allowlist", "diff-guard.yml"],
         ),
+        # The trigger and condition arms below are the #2210 half. Each names a
+        # vector that was measured returning 0 from every gate before this
+        # existed, so an arm that stops failing here is a real regression rather
+        # than a tightened message.
+        (
+            "verify-workflow-integrity --simulate-dropped-trigger diff-guard.yml",
+            verify_workflow_integrity,
+            {"simulate_dropped_trigger": "diff-guard.yml"},
+            1,
+            ["diff-guard.yml", "pull_request"],
+        ),
+        (
+            "verify-workflow-integrity --simulate-dropped-trigger ci.yml",
+            verify_workflow_integrity,
+            {"simulate_dropped_trigger": "ci.yml"},
+            1,
+            ["ci.yml", "pull_request"],
+        ),
+        (
+            "verify-workflow-integrity --simulate-gated-job diff-guard.yml",
+            verify_workflow_integrity,
+            {"simulate_gated_job": "diff-guard.yml"},
+            1,
+            ["diff-guard.yml", "if: false"],
+        ),
+        (
+            "verify-workflow-integrity --simulate-gated-job ci.yml",
+            verify_workflow_integrity,
+            {"simulate_gated_job": "ci.yml"},
+            1,
+            ["ci.yml", "if: false"],
+        ),
+        (
+            "every `on:` spelling GitHub accepts reads back the same triggers",
+            _probe_trigger_forms,
+            {},
+            0,
+            [],
+        ),
         (
             "verify-required-tier --simulate-dropped-lane ort-backed",
             verify_required_tier,
@@ -2321,6 +2606,14 @@ def main() -> int:
         "--simulate-deleted-job",
         help="drop one job from what the workflows appear to define, to prove the guard fails",
     )
+    integrity_parser.add_argument(
+        "--simulate-dropped-trigger",
+        help="pretend one workflow stopped triggering on pull_request, to prove the guard fails",
+    )
+    integrity_parser.add_argument(
+        "--simulate-gated-job",
+        help="pretend one workflow's jobs carry `if: false`, to prove the guard fails",
+    )
     args = parser.parse_args()
 
     if args.command == "verify":
@@ -2330,7 +2623,11 @@ def main() -> int:
     if args.command == "verify-required-tier":
         return verify_required_tier(args.simulate_dropped_lane)
     if args.command == "verify-workflow-integrity":
-        return verify_workflow_integrity(args.simulate_deleted_job)
+        return verify_workflow_integrity(
+            args.simulate_deleted_job,
+            args.simulate_dropped_trigger,
+            args.simulate_gated_job,
+        )
     # Windows Python writes stdout in text mode and translates "\n" into
     # "\r\n". bash splits command substitution on IFS, which contains newline
     # but not carriage return, so each token would keep a trailing "\r" and
