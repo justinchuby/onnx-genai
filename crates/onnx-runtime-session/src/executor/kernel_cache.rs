@@ -777,6 +777,11 @@ fn variants_per_node() -> usize {
 }
 
 impl KernelCache {
+    #[inline]
+    pub(super) fn contains(&self, key: &KernelKey) -> bool {
+        self.entries.contains_key(key)
+    }
+
     /// Next logical tick.
     fn tick(&self) -> u64 {
         self.clock.fetch_add(1, Ordering::Relaxed)

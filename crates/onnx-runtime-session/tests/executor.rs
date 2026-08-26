@@ -12,7 +12,8 @@ use std::sync::{
 };
 
 use onnx_runtime_ep_api::{
-    CaptureSupport, DeviceBuffer, EpConfig, ExecutionProvider, ExecutorArtifactFinalization,
+    CaptureSupport, DeviceBuffer, EpConfig, EpError, ExecutionProvider,
+    ExecutorArtifactFinalization, ExecutorArtifactPending, ExecutorArtifactReadinessEpoch,
     ExecutorInstanceId, Fence, Kernel, KernelMatch, Result as EpResult, TensorMetadata, TensorMut,
     TensorView, WorkspaceRequirement,
 };
@@ -109,15 +110,27 @@ fn i64_tensor(shape: &[usize], data: &[i64]) -> Tensor {
     Tensor::from_raw(DataType::Int64, shape.to_vec(), &bytes).unwrap()
 }
 
+#[derive(Clone, Copy)]
+enum TestArtifactFinalization {
+    Complete,
+    PendingOnce,
+    StructuralDecline,
+    FailOnce,
+}
+
 struct HostDownloadCountingEp {
     cpu: CpuExecutionProvider,
     host_downloads: Arc<AtomicUsize>,
     kernel_compiles: Arc<Mutex<HashMap<ExecutorInstanceId, usize>>>,
+    kernel_executions: Arc<Mutex<HashMap<ExecutorInstanceId, usize>>>,
+    route_readiness_checks: Arc<Mutex<HashMap<ExecutorInstanceId, usize>>>,
     route_finalizations: Arc<Mutex<HashMap<ExecutorInstanceId, usize>>>,
+    route_terminal_outcomes: Arc<Mutex<HashMap<ExecutorInstanceId, usize>>>,
     route_drains: Arc<Mutex<HashMap<ExecutorInstanceId, usize>>>,
     route_install_graph_nodes: Arc<Mutex<HashMap<ExecutorInstanceId, usize>>>,
     assert_finalized_before_execute: bool,
     capture_checks: Arc<AtomicUsize>,
+    artifact_finalization: TestArtifactFinalization,
 }
 
 impl HostDownloadCountingEp {
@@ -128,11 +141,15 @@ impl HostDownloadCountingEp {
             cpu,
             host_downloads,
             kernel_compiles: Arc::new(Mutex::new(HashMap::new())),
+            kernel_executions: Arc::new(Mutex::new(HashMap::new())),
+            route_readiness_checks: Arc::new(Mutex::new(HashMap::new())),
             route_finalizations: Arc::new(Mutex::new(HashMap::new())),
+            route_terminal_outcomes: Arc::new(Mutex::new(HashMap::new())),
             route_drains: Arc::new(Mutex::new(HashMap::new())),
             route_install_graph_nodes: Arc::new(Mutex::new(HashMap::new())),
             assert_finalized_before_execute: false,
             capture_checks: Arc::new(AtomicUsize::new(0)),
+            artifact_finalization: TestArtifactFinalization::Complete,
         }
     }
 
@@ -143,12 +160,48 @@ impl HostDownloadCountingEp {
         }
     }
 
+    fn new_pending_once_lifecycle(host_downloads: Arc<AtomicUsize>) -> Self {
+        Self {
+            assert_finalized_before_execute: true,
+            artifact_finalization: TestArtifactFinalization::PendingOnce,
+            ..Self::new(host_downloads)
+        }
+    }
+
+    fn new_structural_decline_lifecycle(host_downloads: Arc<AtomicUsize>) -> Self {
+        Self {
+            assert_finalized_before_execute: true,
+            artifact_finalization: TestArtifactFinalization::StructuralDecline,
+            ..Self::new(host_downloads)
+        }
+    }
+
+    fn new_fail_once_lifecycle(host_downloads: Arc<AtomicUsize>) -> Self {
+        Self {
+            assert_finalized_before_execute: true,
+            artifact_finalization: TestArtifactFinalization::FailOnce,
+            ..Self::new(host_downloads)
+        }
+    }
+
     fn kernel_compiles(&self) -> Arc<Mutex<HashMap<ExecutorInstanceId, usize>>> {
         Arc::clone(&self.kernel_compiles)
     }
 
+    fn kernel_executions(&self) -> Arc<Mutex<HashMap<ExecutorInstanceId, usize>>> {
+        Arc::clone(&self.kernel_executions)
+    }
+
     fn route_finalizations(&self) -> Arc<Mutex<HashMap<ExecutorInstanceId, usize>>> {
         Arc::clone(&self.route_finalizations)
+    }
+
+    fn route_readiness_checks(&self) -> Arc<Mutex<HashMap<ExecutorInstanceId, usize>>> {
+        Arc::clone(&self.route_readiness_checks)
+    }
+
+    fn route_terminal_outcomes(&self) -> Arc<Mutex<HashMap<ExecutorInstanceId, usize>>> {
+        Arc::clone(&self.route_terminal_outcomes)
     }
 
     fn route_drains(&self) -> Arc<Mutex<HashMap<ExecutorInstanceId, usize>>> {
@@ -167,7 +220,8 @@ impl HostDownloadCountingEp {
 struct FinalizationCheckingKernel {
     inner: Box<dyn Kernel>,
     executor: ExecutorInstanceId,
-    finalizations: Arc<Mutex<HashMap<ExecutorInstanceId, usize>>>,
+    terminal_outcomes: Arc<Mutex<HashMap<ExecutorInstanceId, usize>>>,
+    executions: Arc<Mutex<HashMap<ExecutorInstanceId, usize>>>,
     capture_checks: Arc<AtomicUsize>,
 }
 
@@ -182,9 +236,15 @@ impl Kernel for FinalizationCheckingKernel {
 
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> EpResult<()> {
         assert!(
-            scoped_count(&self.finalizations, self.executor) > 0,
+            scoped_count(&self.terminal_outcomes, self.executor) > 0,
             "kernel executed before provider artifacts finalized"
         );
+        *self
+            .executions
+            .lock()
+            .unwrap()
+            .entry(self.executor)
+            .or_default() += 1;
         self.inner.execute(inputs, outputs)
     }
 
@@ -201,7 +261,7 @@ impl Kernel for FinalizationCheckingKernel {
 
     fn capture_support(&self) -> CaptureSupport {
         assert!(
-            scoped_count(&self.finalizations, self.executor) > 0,
+            scoped_count(&self.terminal_outcomes, self.executor) > 0,
             "capture audit reached a kernel before provider artifacts finalized"
         );
         self.capture_checks.fetch_add(1, Ordering::Relaxed);
@@ -219,7 +279,17 @@ impl ExecutionProvider for HostDownloadCountingEp {
         executor: ExecutorInstanceId,
         graph: &Graph,
         _finalized_banks: &[onnx_runtime_ep_api::FinalizedExpertBank],
-    ) -> ExecutorArtifactFinalization {
+        readiness: ExecutorArtifactReadinessEpoch,
+    ) -> EpResult<ExecutorArtifactFinalization> {
+        *self
+            .route_readiness_checks
+            .lock()
+            .unwrap()
+            .entry(executor)
+            .or_default() += 1;
+        if scoped_count(&self.route_terminal_outcomes, executor) > 0 {
+            return Ok(ExecutorArtifactFinalization::Complete);
+        }
         assert!(
             self.kernel_compiles
                 .lock()
@@ -230,17 +300,44 @@ impl ExecutionProvider for HostDownloadCountingEp {
                 > 0,
             "provider artifacts finalized before this executor compiled a kernel"
         );
-        *self
-            .route_finalizations
-            .lock()
-            .unwrap()
-            .entry(executor)
-            .or_default() += 1;
-        self.route_install_graph_nodes
-            .lock()
-            .unwrap()
-            .insert(executor, graph.num_nodes());
-        ExecutorArtifactFinalization::Complete
+        let attempt = {
+            let mut attempts = self.route_finalizations.lock().unwrap();
+            let attempt = attempts.entry(executor).or_default();
+            *attempt += 1;
+            *attempt
+        };
+        match self.artifact_finalization {
+            TestArtifactFinalization::PendingOnce if attempt == 1 => Ok(
+                ExecutorArtifactFinalization::Pending(ExecutorArtifactPending::ProviderReadiness {
+                    reason: format!(
+                        "test provider awaits a later compiled specialization after epoch {}",
+                        readiness.get()
+                    ),
+                }),
+            ),
+            TestArtifactFinalization::FailOnce if attempt == 1 => {
+                Err(EpError::KernelFailed(format!(
+                    "injected artifact finalization failure at epoch {}",
+                    readiness.get()
+                )))
+            }
+            TestArtifactFinalization::Complete
+            | TestArtifactFinalization::PendingOnce
+            | TestArtifactFinalization::FailOnce
+            | TestArtifactFinalization::StructuralDecline => {
+                *self
+                    .route_terminal_outcomes
+                    .lock()
+                    .unwrap()
+                    .entry(executor)
+                    .or_default() += 1;
+                self.route_install_graph_nodes
+                    .lock()
+                    .unwrap()
+                    .insert(executor, graph.num_nodes());
+                Ok(ExecutorArtifactFinalization::Complete)
+            }
+        }
     }
 
     fn drain_executor_artifacts(&self, executor: ExecutorInstanceId) {
@@ -311,7 +408,8 @@ impl ExecutionProvider for HostDownloadCountingEp {
             Ok(Box::new(FinalizationCheckingKernel {
                 inner: kernel,
                 executor,
-                finalizations: Arc::clone(&self.route_finalizations),
+                terminal_outcomes: Arc::clone(&self.route_terminal_outcomes),
+                executions: Arc::clone(&self.kernel_executions),
                 capture_checks: Arc::clone(&self.capture_checks),
             }))
         } else {
@@ -1833,11 +1931,34 @@ fn scoped_count(
     counts.lock().unwrap().get(&executor).copied().unwrap_or(0)
 }
 
+fn total_count(counts: &Mutex<HashMap<ExecutorInstanceId, usize>>) -> usize {
+    counts.lock().unwrap().values().sum()
+}
+
+fn assert_artifacts_pending(
+    error: SessionError,
+    executor: ExecutorInstanceId,
+    readiness_epoch: u64,
+) {
+    match error {
+        SessionError::ExecutionProviderArtifactsPending {
+            executor: actual_executor,
+            readiness_epoch: actual_epoch,
+            ..
+        } => {
+            assert_eq!(actual_executor, executor.get());
+            assert_eq!(actual_epoch, readiness_epoch);
+        }
+        other => panic!("expected typed provider-artifact pending error, got {other}"),
+    }
+}
+
 #[test]
 fn static_build_finalizes_provider_artifacts_once_and_drains_owner_once() {
     let downloads = Arc::new(AtomicUsize::new(0));
     let ep = HostDownloadCountingEp::new_lifecycle(Arc::clone(&downloads));
     let compiles = ep.kernel_compiles();
+    let readiness_checks = ep.route_readiness_checks();
     let finalizations = ep.route_finalizations();
     let drains = ep.route_drains();
     let install_nodes = ep.route_install_graph_nodes();
@@ -1861,6 +1982,7 @@ fn static_build_finalizes_provider_artifacts_once_and_drains_owner_once() {
         1,
         "static build finalizes exactly once"
     );
+    assert_eq!(scoped_count(&readiness_checks, executor), 1);
     assert_eq!(
         scoped_count(&install_nodes, executor),
         1,
@@ -1871,6 +1993,11 @@ fn static_build_finalizes_provider_artifacts_once_and_drains_owner_once() {
     let x = Tensor::from_f32(&[2], &[-1.0, 1.0]).unwrap();
     session.run(&[("x", &x)]).expect("run static Gelu");
     assert_eq!(scoped_count(&finalizations, executor), 1);
+    assert_eq!(
+        scoped_count(&readiness_checks, executor),
+        1,
+        "same static specialization needs no new provider readiness check"
+    );
 
     drop(session);
     assert_eq!(scoped_count(&drains, executor), 1);
@@ -1878,10 +2005,48 @@ fn static_build_finalizes_provider_artifacts_once_and_drains_owner_once() {
 }
 
 #[test]
+fn static_build_pending_fails_closed_and_drains_unpublished_executor() {
+    let downloads = Arc::new(AtomicUsize::new(0));
+    let ep = HostDownloadCountingEp::new_pending_once_lifecycle(downloads);
+    let compiles = ep.kernel_compiles();
+    let finalizations = ep.route_finalizations();
+    let terminal_outcomes = ep.route_terminal_outcomes();
+    let executions = ep.kernel_executions();
+    let drains = ep.route_drains();
+    let ep = Arc::new(ep);
+
+    let error = match InferenceSession::builder()
+        .model_bytes(&static_gelu_model())
+        .execution_provider(ep)
+        .build()
+    {
+        Err(error) => error,
+        Ok(_) => panic!("static build must not publish a pending executor"),
+    };
+    assert!(matches!(
+        error,
+        SessionError::ExecutionProviderArtifactsPending {
+            readiness_epoch: 1,
+            ..
+        }
+    ));
+    assert_eq!(total_count(&compiles), 1);
+    assert_eq!(total_count(&finalizations), 1);
+    assert_eq!(total_count(&terminal_outcomes), 0);
+    assert_eq!(total_count(&executions), 0);
+    assert_eq!(
+        total_count(&drains),
+        1,
+        "failed static build drains exactly its unpublished executor scope"
+    );
+}
+
+#[test]
 fn symbolic_first_resolved_compile_finalizes_before_use_and_specialization_does_not_reinstall() {
     let downloads = Arc::new(AtomicUsize::new(0));
     let ep = HostDownloadCountingEp::new_lifecycle(downloads);
     let compiles = ep.kernel_compiles();
+    let readiness_checks = ep.route_readiness_checks();
     let finalizations = ep.route_finalizations();
     let drains = ep.route_drains();
     let capture_checks = ep.capture_checks();
@@ -1904,6 +2069,7 @@ fn symbolic_first_resolved_compile_finalizes_before_use_and_specialization_does_
     let x2 = Tensor::from_f32(&[2], &[-1.0, 1.0]).unwrap();
     session.run(&[("x", &x2)]).expect("first symbolic run");
     assert_eq!(scoped_count(&compiles, executor), 1);
+    assert_eq!(scoped_count(&readiness_checks, executor), 1);
     assert_eq!(scoped_count(&finalizations, executor), 1);
     let mut binding = session
         .allocate_device_binding("x", Some("y"), DataType::Float32, vec![2], vec![2])
@@ -1933,16 +2099,215 @@ fn symbolic_first_resolved_compile_finalizes_before_use_and_specialization_does_
         1,
         "stable executor artifacts make dynamic specialization reinstall-free"
     );
+    assert_eq!(
+        scoped_count(&readiness_checks, executor),
+        2,
+        "a new compiled specialization re-confirms the executor terminal outcome"
+    );
 
     drop(session);
     assert_eq!(scoped_count(&drains, executor), 1);
 }
 
 #[test]
-fn shared_provider_concurrent_symbolic_executors_finalize_and_drain_independently() {
+fn pending_blocks_execution_and_capture_until_a_new_compilation_epoch_finalizes_once() {
     let downloads = Arc::new(AtomicUsize::new(0));
-    let ep = Arc::new(HostDownloadCountingEp::new_lifecycle(downloads));
+    let ep = HostDownloadCountingEp::new_pending_once_lifecycle(downloads);
+    let readiness_checks = ep.route_readiness_checks();
     let finalizations = ep.route_finalizations();
+    let terminal_outcomes = ep.route_terminal_outcomes();
+    let executions = ep.kernel_executions();
+    let capture_checks = ep.capture_checks();
+    let drains = ep.route_drains();
+    let ep = Arc::new(ep);
+
+    let mut session = InferenceSession::builder()
+        .model_bytes(&symbolic_gelu_model())
+        .execution_provider(ep)
+        .build()
+        .expect("build pending lifecycle session");
+    let executor = session.executor_instance_id();
+    let x2 = Tensor::from_f32(&[2], &[-1.0, 1.0]).unwrap();
+    let error = session
+        .run(&[("x", &x2)])
+        .expect_err("first readiness epoch must remain pending");
+    assert_artifacts_pending(error, executor, 1);
+    assert_eq!(scoped_count(&finalizations, executor), 1);
+    assert_eq!(scoped_count(&readiness_checks, executor), 1);
+    assert_eq!(scoped_count(&terminal_outcomes, executor), 0);
+    assert_eq!(scoped_count(&executions, executor), 0);
+    assert_eq!(capture_checks.load(Ordering::Relaxed), 0);
+
+    let mut binding = session
+        .allocate_device_binding("x", Some("y"), DataType::Float32, vec![2], vec![2])
+        .expect("allocate pending capture binding");
+    binding
+        .write_bytes(0, &f32_bytes(&[-1.0, 1.0]))
+        .expect("seed pending capture binding");
+    let error =
+        match session.try_capture_with_device_bindings(&[], std::slice::from_mut(&mut binding)) {
+            Err(error) => error,
+            Ok(_) => panic!("capture must not begin while artifacts are pending"),
+        };
+    assert_artifacts_pending(error, executor, 1);
+    assert_eq!(
+        scoped_count(&finalizations, executor),
+        1,
+        "the same readiness epoch must not busy-retry finalization"
+    );
+    assert_eq!(scoped_count(&readiness_checks, executor), 1);
+    assert_eq!(scoped_count(&executions, executor), 0);
+    assert_eq!(capture_checks.load(Ordering::Relaxed), 0);
+
+    let error = session
+        .run(&[("x", &x2)])
+        .expect_err("same-shape eager retry must remain pending");
+    assert_artifacts_pending(error, executor, 1);
+    assert_eq!(scoped_count(&finalizations, executor), 1);
+    assert_eq!(scoped_count(&executions, executor), 0);
+
+    let x4 = Tensor::from_f32(&[4], &[-1.0, 0.0, 1.0, 2.0]).unwrap();
+    session
+        .run(&[("x", &x4)])
+        .expect("new specialization advances readiness and finalizes");
+    assert_eq!(scoped_count(&finalizations, executor), 2);
+    assert_eq!(scoped_count(&readiness_checks, executor), 2);
+    assert_eq!(
+        scoped_count(&terminal_outcomes, executor),
+        1,
+        "provider installation reaches one terminal outcome"
+    );
+    assert_eq!(scoped_count(&executions, executor), 1);
+
+    session
+        .run(&[("x", &x2)])
+        .expect("completed executor reuses the installed producer identity");
+    assert_eq!(
+        scoped_count(&finalizations, executor),
+        2,
+        "later specializations must not reinstall executor-owned artifacts"
+    );
+    assert_eq!(scoped_count(&readiness_checks, executor), 2);
+    assert_eq!(scoped_count(&terminal_outcomes, executor), 1);
+    assert_eq!(scoped_count(&executions, executor), 2);
+
+    drop(session);
+    assert_eq!(scoped_count(&drains, executor), 1);
+}
+
+#[test]
+fn permanent_structural_decline_is_terminal_before_execution() {
+    let downloads = Arc::new(AtomicUsize::new(0));
+    let ep = HostDownloadCountingEp::new_structural_decline_lifecycle(downloads);
+    let finalizations = ep.route_finalizations();
+    let terminal_outcomes = ep.route_terminal_outcomes();
+    let executions = ep.kernel_executions();
+    let ep = Arc::new(ep);
+    let mut session = InferenceSession::builder()
+        .model_bytes(&symbolic_gelu_model())
+        .execution_provider(ep)
+        .build()
+        .expect("build structural-decline lifecycle session");
+    let executor = session.executor_instance_id();
+
+    let x = Tensor::from_f32(&[2], &[-1.0, 1.0]).unwrap();
+    session
+        .run(&[("x", &x)])
+        .expect("honest terminal structural decline permits execution");
+    assert_eq!(scoped_count(&finalizations, executor), 1);
+    assert_eq!(scoped_count(&terminal_outcomes, executor), 1);
+    assert_eq!(scoped_count(&executions, executor), 1);
+
+    let x = Tensor::from_f32(&[4], &[-1.0, 0.0, 1.0, 2.0]).unwrap();
+    session
+        .run(&[("x", &x)])
+        .expect("later specialization reuses terminal decline");
+    assert_eq!(scoped_count(&finalizations, executor), 1);
+    assert_eq!(scoped_count(&executions, executor), 2);
+}
+
+#[test]
+fn failed_finalization_is_cached_until_readiness_advances() {
+    let downloads = Arc::new(AtomicUsize::new(0));
+    let ep = HostDownloadCountingEp::new_fail_once_lifecycle(downloads);
+    let finalizations = ep.route_finalizations();
+    let terminal_outcomes = ep.route_terminal_outcomes();
+    let executions = ep.kernel_executions();
+    let ep = Arc::new(ep);
+    let mut session = InferenceSession::builder()
+        .model_bytes(&symbolic_gelu_model())
+        .execution_provider(ep)
+        .build()
+        .expect("build failed-finalization lifecycle session");
+    let executor = session.executor_instance_id();
+
+    let x2 = Tensor::from_f32(&[2], &[-1.0, 1.0]).unwrap();
+    for _ in 0..2 {
+        let error = session
+            .run(&[("x", &x2)])
+            .expect_err("failed readiness epoch must not execute");
+        assert!(matches!(
+            error,
+            SessionError::ExecutionProviderArtifactFinalizationFailed {
+                readiness_epoch: 1,
+                ..
+            }
+        ));
+    }
+    assert_eq!(
+        scoped_count(&finalizations, executor),
+        1,
+        "same failed epoch must not re-enter the provider"
+    );
+    assert_eq!(scoped_count(&terminal_outcomes, executor), 0);
+    assert_eq!(scoped_count(&executions, executor), 0);
+
+    let x4 = Tensor::from_f32(&[4], &[-1.0, 0.0, 1.0, 2.0]).unwrap();
+    session
+        .run(&[("x", &x4)])
+        .expect("new compilation epoch retries failed finalization");
+    assert_eq!(scoped_count(&finalizations, executor), 2);
+    assert_eq!(scoped_count(&terminal_outcomes, executor), 1);
+    assert_eq!(scoped_count(&executions, executor), 1);
+}
+
+#[test]
+fn cancellation_while_pending_drains_without_execution() {
+    let downloads = Arc::new(AtomicUsize::new(0));
+    let ep = HostDownloadCountingEp::new_pending_once_lifecycle(downloads);
+    let finalizations = ep.route_finalizations();
+    let terminal_outcomes = ep.route_terminal_outcomes();
+    let executions = ep.kernel_executions();
+    let drains = ep.route_drains();
+    let ep = Arc::new(ep);
+    let mut session = InferenceSession::builder()
+        .model_bytes(&symbolic_gelu_model())
+        .execution_provider(ep)
+        .build()
+        .expect("build cancellable pending session");
+    let executor = session.executor_instance_id();
+    let x = Tensor::from_f32(&[2], &[-1.0, 1.0]).unwrap();
+    let error = session
+        .run(&[("x", &x)])
+        .expect_err("run remains pending before cancellation");
+    assert_artifacts_pending(error, executor, 1);
+
+    drop(session);
+    assert_eq!(scoped_count(&finalizations, executor), 1);
+    assert_eq!(scoped_count(&terminal_outcomes, executor), 0);
+    assert_eq!(scoped_count(&executions, executor), 0);
+    assert_eq!(scoped_count(&drains, executor), 1);
+}
+
+#[test]
+fn shared_provider_concurrent_pending_executors_finalize_and_drain_independently() {
+    let downloads = Arc::new(AtomicUsize::new(0));
+    let ep = Arc::new(HostDownloadCountingEp::new_pending_once_lifecycle(
+        downloads,
+    ));
+    let finalizations = ep.route_finalizations();
+    let terminal_outcomes = ep.route_terminal_outcomes();
+    let executions = ep.kernel_executions();
     let drains = ep.route_drains();
     let model = symbolic_gelu_model();
 
@@ -1963,15 +2328,44 @@ fn shared_provider_concurrent_symbolic_executors_finalize_and_drain_independentl
     std::thread::scope(|scope| {
         scope.spawn(|| {
             let x = Tensor::from_f32(&[2], &[-1.0, 1.0]).unwrap();
-            first.run(&[("x", &x)]).expect("first concurrent run");
+            first
+                .run(&[("x", &x)])
+                .expect_err("first executor initially pending");
         });
         scope.spawn(|| {
             let x = Tensor::from_f32(&[4], &[-1.0, 0.0, 1.0, 2.0]).unwrap();
-            second.run(&[("x", &x)]).expect("second concurrent run");
+            second
+                .run(&[("x", &x)])
+                .expect_err("second executor initially pending");
         });
     });
     assert_eq!(scoped_count(&finalizations, first_id), 1);
     assert_eq!(scoped_count(&finalizations, second_id), 1);
+    assert_eq!(scoped_count(&terminal_outcomes, first_id), 0);
+    assert_eq!(scoped_count(&terminal_outcomes, second_id), 0);
+    assert_eq!(scoped_count(&executions, first_id), 0);
+    assert_eq!(scoped_count(&executions, second_id), 0);
+
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let x = Tensor::from_f32(&[4], &[-1.0, 0.0, 1.0, 2.0]).unwrap();
+            first
+                .run(&[("x", &x)])
+                .expect("first executor finalizes independently");
+        });
+        scope.spawn(|| {
+            let x = Tensor::from_f32(&[8], &[-1.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+            second
+                .run(&[("x", &x)])
+                .expect("second executor finalizes independently");
+        });
+    });
+    assert_eq!(scoped_count(&finalizations, first_id), 2);
+    assert_eq!(scoped_count(&finalizations, second_id), 2);
+    assert_eq!(scoped_count(&terminal_outcomes, first_id), 1);
+    assert_eq!(scoped_count(&terminal_outcomes, second_id), 1);
+    assert_eq!(scoped_count(&executions, first_id), 1);
+    assert_eq!(scoped_count(&executions, second_id), 1);
 
     drop(first);
     assert_eq!(scoped_count(&drains, first_id), 1);
@@ -1984,7 +2378,8 @@ fn shared_provider_concurrent_symbolic_executors_finalize_and_drain_independentl
     second
         .run(&[("x", &x)])
         .expect("surviving sibling still runs");
-    assert_eq!(scoped_count(&finalizations, second_id), 1);
+    assert_eq!(scoped_count(&finalizations, second_id), 2);
+    assert_eq!(scoped_count(&terminal_outcomes, second_id), 1);
     drop(second);
     assert_eq!(scoped_count(&drains, second_id), 1);
 }

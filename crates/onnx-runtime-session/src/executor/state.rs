@@ -60,6 +60,23 @@ pub(crate) struct SlotCaptureState {
     pub(super) capture_quarantine_ops: HashSet<(String, String)>,
 }
 
+#[derive(Clone, Debug, Default)]
+pub(super) enum ProviderArtifactState {
+    #[default]
+    Unfinalized,
+    Pending {
+        attempted_epoch: ExecutorArtifactReadinessEpoch,
+        pending: ExecutorArtifactPending,
+    },
+    Failed {
+        attempted_epoch: ExecutorArtifactReadinessEpoch,
+        reason: String,
+    },
+    Complete {
+        finalized_epoch: ExecutorArtifactReadinessEpoch,
+    },
+}
+
 /// The compiled, runnable graph: buffers + plan + kernel cache. Owned by the
 /// public [`InferenceSession`](crate::InferenceSession).
 pub(crate) struct Executor {
@@ -388,10 +405,14 @@ pub(crate) struct Executor {
     /// Control-flow and sequence nodes always have `None` (they don't use the
     /// kernel cache).
     pub(super) kernel_bindings: Vec<Option<KernelKey>>,
-    /// Set only after the provider reports that this executor's required
-    /// artifacts are complete. A readiness-dependent `Pending` result leaves it
-    /// false so a later resolved compilation epoch invokes the same transition.
-    pub(super) provider_artifacts_finalized: bool,
+    /// Readiness/finalization state for this executor's provider-owned
+    /// artifacts. `Pending` and `Failed` are fail-closed: neither permits
+    /// execution or capture, and the provider is not retried until compilation
+    /// advances `provider_artifact_readiness_epoch`.
+    pub(super) provider_artifact_state: ProviderArtifactState,
+    /// Monotonic generation advanced only when pre-execution compilation creates
+    /// at least one new concrete kernel specialization.
+    pub(super) provider_artifact_readiness_epoch: ExecutorArtifactReadinessEpoch,
     pub(super) persistent_workspace: Option<PreparedWorkspace>,
     pub(super) step_workspace: Option<PreparedWorkspace>,
     /// When set, [`Executor::release_step_workspace`] is a no-op: the StepScoped
