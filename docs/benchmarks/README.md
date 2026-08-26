@@ -94,7 +94,10 @@ there: a kernel can get 8× faster and still be 3× slower than ORT.
 **Every saturating benchmark and every full EP test matrix must hold
 [`scripts/hostlock.sh`](../../scripts/hostlock.sh).** Run `scripts/hostlock.sh --help`
 for the full options; it has its own CI lane (`.github/workflows/hostlock.yml`)
-and a conformance suite in `scripts/hostlock_test.sh`.
+and a conformance suite in `scripts/hostlock_test.sh`. `--help` is answered
+before any validation runs, so it still works on a host the tool refuses to lock
+on (no `/proc`, exit 8) or from a misconfigured `lock_dir` — the states in which
+you are most likely to want it.
 
 ```sh
 scripts/hostlock.sh status

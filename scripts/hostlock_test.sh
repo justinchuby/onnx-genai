@@ -60,7 +60,7 @@ HL=scripts/hostlock.sh
 pass=0
 fail=0
 
-cleanup() { rm -rf "$LOCK" "$LOCK".cpuself "$LOCK".reaper "$LOCK".reaper.stage.* "$LOCK".reaper.dead.* "$LOCK".reaper.rel.* "$LOCK".dead.* "$LOCK".stage.* "$LOCK".gate "$LOCK".warn "$LOCK".zombie.* "$LOCK".zpid "$LOCK".ttlmarker "$LOCK".ran "$LOCK".conf "$LOCK".legacy "$LOCK".box "$LOCK".sourced "$LOCK".legacyran "$LOCK".owner "$LOCK".nested "$LOCK".ro "$LOCK".deep "$LOCK".file "$LOCK".nox "$LOCK".conf2 2>/dev/null; }
+cleanup() { rm -rf "$LOCK" "$LOCK".cpuself "$LOCK".reaper "$LOCK".reaper.stage.* "$LOCK".reaper.dead.* "$LOCK".reaper.rel.* "$LOCK".dead.* "$LOCK".stage.* "$LOCK".gate "$LOCK".warn "$LOCK".zombie.* "$LOCK".zpid "$LOCK".ttlmarker "$LOCK".ran "$LOCK".conf "$LOCK".legacy "$LOCK".box "$LOCK".sourced "$LOCK".legacyran "$LOCK".owner "$LOCK".nested "$LOCK".ro "$LOCK".deep "$LOCK".file "$LOCK".nox "$LOCK".conf2 "$LOCK".helpconf "$LOCK".helppoison 2>/dev/null; }
 trap cleanup EXIT
 
 chk() {
@@ -2581,13 +2581,65 @@ chk "help leaves the comment markers behind" "$(echo "$help_out" | grep -c '^# '
 chk "asking for help takes no lock" \
     "$([ -e "$LOCK" ] && echo created || echo none)" "none"
 
+# Help must outrank the two gates that run at LOAD time, before the dispatch
+# `case` is even reached. Neither is reachable from the suite's normal cells,
+# because this file exports HOSTLOCK_DIR -- which takes the `env` branch and
+# skips config resolution entirely -- so both were wholly untested.
+#
+# Each pair below asserts the gate is LIVE before asserting help survives it.
+# A cell that only checked `--help` returning 0 would pass just as happily if
+# the gate had been deleted, which tests nothing and is the vacuous-arm failure
+# this file's count pin exists to catch one level up.
+
+# Gate 1: a relative lock_dir. This is the mistake made by someone following
+# the header's own instructions for relocating the lock -- who then could not
+# read those instructions to find it, because every command including --help
+# died on the config first.
+mkdir -p "$LOCK.helpconf"
+printf 'lock_dir=relative/bad\n' >"$LOCK.helpconf/conf"
+hl_badconf() { env -u HOSTLOCK_DIR HOSTLOCK_CONF="$LOCK.helpconf/conf" scripts/hostlock.sh "$@"; }
+chk "a relative lock_dir is still a hard configuration error" \
+    "$(hl_badconf status >/dev/null 2>&1; echo $?)" "1"
+chk "help answers anyway, from the broken config that refuses every command" \
+    "$(hl_badconf --help >/dev/null 2>&1; echo $?)" "0"
+chk "and it is the real usage, not a truncated stub" \
+    "$(hl_badconf --help 2>/dev/null | grep -c '^Usage:')" "1"
+
+# Gate 2: an unsupported platform. `require_supported_platform` exits 8 on a
+# host without /proc -- macOS, native Windows, a stripped container. "What does
+# this tool need?" is the question those users have and the header is where it
+# is answered, so exiting 8 without printing it is precisely backwards. It
+# cannot be provoked on a Linux runner, so provoke it the way this workstream
+# proves any route claim: poison the gate in a copy and show the behaviour
+# moves. If the interception were below the call, help would exit 8 here.
+sed '/^require_supported_platform() {$/a\    exit 8' "$HL" >"$LOCK.helppoison"
+chmod +x "$LOCK.helppoison"
+chk "the poisoned copy really does refuse ordinary subcommands" \
+    "$("$LOCK.helppoison" status >/dev/null 2>&1; echo $?)" "8"
+chk "help answers from a host this script refuses to run on" \
+    "$("$LOCK.helppoison" --help >/dev/null 2>&1; echo $?)" "0"
+chk "and that help is the real usage too" \
+    "$("$LOCK.helppoison" --help 2>/dev/null | grep -c '^Usage:')" "1"
+
+# Pin the ORDER as well as the behaviour. The two cells above can only fail
+# once someone has already moved the interception; this fails on the diff that
+# moves it, and names which gate it fell behind.
+help_at=$(grep -n 'help|-h|--help) cmd_help' "$HL" | head -1 | cut -d: -f1)
+platform_at=$(grep -n '^require_supported_platform$' "$HL" | head -1 | cut -d: -f1)
+conf_die_at=$(grep -n 'lock_dir must be a non-empty absolute path' "$HL" | head -1 | cut -d: -f1)
+chk "the help interception precedes the platform gate" \
+    "$([ -n "$help_at" ] && [ -n "$platform_at" ] && [ "$help_at" -lt "$platform_at" ] && echo yes || echo no)" "yes"
+chk "the help interception precedes the lock_dir config gate" \
+    "$([ -n "$help_at" ] && [ -n "$conf_die_at" ] && [ "$help_at" -lt "$conf_die_at" ] && echo yes || echo no)" "yes"
+rm -rf "$LOCK.helpconf" "$LOCK.helppoison"
+
 # Finally, pin the assertion count itself. Several of the checks in this file
 # sit behind environment probes, and an assertion that quietly stops running is
 # indistinguishable from one that passes -- which is the same failure mode as
 # the inert R1 block and the vacuous STALE arm that this PR exists to fix.
 # Every probe branch asserts something, so the total is invariant across
 # environments; if a refactor drops a check, this fails and says so.
-chk "every assertion in this file ran" "$((pass + fail + 1))" "398"
+chk "every assertion in this file ran" "$((pass + fail + 1))" "406"
 
 echo
 echo "passed=${pass} failed=${fail}"
