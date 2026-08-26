@@ -3,9 +3,12 @@
 use std::path::Path;
 
 use crate::{OrtError, Result};
+use serde_json::Value;
+
 /// Thin wrapper around `tokenizers::Tokenizer` for prompt/token id conversion.
 pub struct Tokenizer {
     inner: tokenizers::Tokenizer,
+    legacy_eos_token_ids: Vec<u32>,
 }
 
 impl Tokenizer {
@@ -14,7 +17,11 @@ impl Tokenizer {
         let path = path.as_ref();
         let inner = tokenizers::Tokenizer::from_file(path)
             .map_err(|err| OrtError::Tokenizer(err.to_string()))?;
-        Ok(Self { inner })
+        let legacy_eos_token_ids = load_legacy_eos_token_ids(path, &inner)?;
+        Ok(Self {
+            inner,
+            legacy_eos_token_ids,
+        })
     }
 
     /// Encode a prompt to token ids, including model-defined special tokens.
@@ -94,8 +101,87 @@ impl Tokenizer {
         self.inner.token_to_id(token)
     }
 
+    /// EOS ids inferred for inference-metadata documents predating v1.2.
+    ///
+    /// New packages declare numeric token facts in inference metadata. This
+    /// compatibility value exists only so older packages retain their original
+    /// generation behavior while they are migrated.
+    pub fn legacy_eos_token_ids(&self) -> &[u32] {
+        &self.legacy_eos_token_ids
+    }
+
     /// Access the underlying tokenizer for advanced callers.
     pub fn inner(&self) -> &tokenizers::Tokenizer {
         &self.inner
+    }
+}
+
+fn load_legacy_eos_token_ids(path: &Path, tokenizer: &tokenizers::Tokenizer) -> Result<Vec<u32>> {
+    let mut ids = Vec::new();
+    let model_dir = path.parent().unwrap_or_else(|| Path::new("."));
+
+    let generation_config = model_dir.join("generation_config.json");
+    if generation_config.is_file() {
+        let value = read_json_file(&generation_config)?;
+        collect_generation_eos_ids(value.get("eos_token_id"), &mut ids);
+    }
+
+    let tokenizer_config = model_dir.join("tokenizer_config.json");
+    if tokenizer_config.is_file() {
+        let value = read_json_file(&tokenizer_config)?;
+        if let Some(token) = value.get("eos_token").and_then(eos_token_string) {
+            push_unique_token_id(&mut ids, tokenizer, token);
+        }
+    }
+
+    if ids.is_empty() {
+        for token in ["<|endoftext|>", "</s>", "<eos>", "[EOS]"] {
+            push_unique_token_id(&mut ids, tokenizer, token);
+        }
+    }
+
+    Ok(ids)
+}
+
+fn read_json_file(path: &Path) -> Result<Value> {
+    let text = std::fs::read_to_string(path)?;
+    serde_json::from_str(&text).map_err(|err| {
+        OrtError::InvalidArgument(format!("invalid JSON in {}: {err}", path.display()))
+    })
+}
+
+fn collect_generation_eos_ids(value: Option<&Value>, ids: &mut Vec<u32>) {
+    match value {
+        Some(Value::Number(number)) => {
+            if let Some(id) = number.as_u64().and_then(|id| u32::try_from(id).ok()) {
+                push_unique_id(ids, id);
+            }
+        }
+        Some(Value::Array(values)) => {
+            for value in values {
+                collect_generation_eos_ids(Some(value), ids);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn eos_token_string(value: &Value) -> Option<&str> {
+    match value {
+        Value::String(token) => Some(token),
+        Value::Object(map) => map.get("content").and_then(Value::as_str),
+        _ => None,
+    }
+}
+
+fn push_unique_token_id(ids: &mut Vec<u32>, tokenizer: &tokenizers::Tokenizer, token: &str) {
+    if let Some(id) = tokenizer.token_to_id(token) {
+        push_unique_id(ids, id);
+    }
+}
+
+fn push_unique_id(ids: &mut Vec<u32>, id: u32) {
+    if !ids.contains(&id) {
+        ids.push(id);
     }
 }

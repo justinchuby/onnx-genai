@@ -324,11 +324,22 @@ impl Engine {
     /// tokenizer supplies spellings and chat templates, never an additional
     /// numeric stop set.
     pub(crate) fn default_eos_token_ids(&self) -> anyhow::Result<Vec<TokenId>> {
-        self.metadata
-            .tokens
-            .as_ref()
-            .map(|tokens| tokens.eos_token_id.clone())
-            .map_or_else(|| Ok(Vec::new()), Ok)
+        if let Some(tokens) = &self.metadata.tokens {
+            return Ok(tokens.eos_token_id.clone());
+        }
+
+        let version =
+            onnx_genai_metadata::version::normalize(self.metadata.schema_version.as_deref())
+                .map_err(anyhow::Error::msg)?;
+        if version < onnx_genai_metadata::version::TOKEN_AUTHORITY_SCHEMA_VERSION {
+            return Ok(self
+                .tokenizer
+                .as_deref()
+                .map(|tokenizer| tokenizer.legacy_eos_token_ids().to_vec())
+                .unwrap_or_default());
+        }
+
+        Ok(Vec::new())
     }
 
     /// Apply the model's stop condition to a request.
