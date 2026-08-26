@@ -34,13 +34,14 @@
 //!
 //! ## Reserved-code contract
 //!
-//! [`validate_planar_linear`] admits immutable host weight/scale bytes through
-//! the CPU planar oracle before upload. It rejects E4M3FN `0x7f`/`0xff`, UE8M0
-//! `0xff`, and every finite code×scale pair whose decoded `f32` product
-//! overflows. The returned [`ValidatedPlanarLinear`] is the cached proof required
-//! by [`launch_planar_linear`], so eager launch and graph replay never rescan,
-//! copy, allocate, or synchronize for validation and malformed banks cannot
-//! reach the device arithmetic.
+//! [`admit_planar_linear`] validates immutable host weight/scale bytes through
+//! the CPU planar oracle and uploads those exact bytes into private owned
+//! allocations. It rejects E4M3FN `0x7f`/`0xff`, UE8M0 `0xff`, and every finite
+//! code×scale pair whose decoded `f32` product overflows. The returned
+//! [`AdmittedPlanarLinear`] is the only safe source of bank pointers for
+//! [`launch_planar_linear`], so eager launch and graph replay never rescan, copy,
+//! allocate, or synchronize for validation and malformed/substituted banks
+//! cannot reach the device arithmetic.
 //!
 //! ## Formats
 //!
@@ -56,9 +57,11 @@
 //! Both decode to the runtime's `[K = in, N = out]` (`in`-major) orientation so
 //! `C[M, N] = A[M, K] * W[K, N]`.
 
+use std::sync::Arc;
+
 use cudarc::driver::sys::CUdeviceptr;
 use cudarc::driver::{LaunchConfig, PushKernelArg};
-use onnx_runtime_ep_api::{EpError, Result};
+use onnx_runtime_ep_api::{DeviceBuffer, EpError, ExecutionProvider, Result};
 use onnx_runtime_ep_cpu::kernels::planar_block_quant::{
     FP4_MICROSCALE_BLOCK as CPU_FP4_MICROSCALE_BLOCK, PlanarBankIdentity, PlanarBlockFormat,
     PlanarLayout, validate_planar_values,
@@ -66,7 +69,8 @@ use onnx_runtime_ep_cpu::kernels::planar_block_quant::{
 use onnx_runtime_ir::DataType;
 
 use crate::error::driver_err;
-use crate::runtime::CudaRuntime;
+use crate::provider::CudaExecutionProvider;
+use crate::runtime::{CudaRuntime, cuptr};
 
 /// Logical input elements per UE8M0 micro-scale in `fp4_planar` (MXFP4 block-32).
 pub(crate) const FP4_MICROSCALE_BLOCK: usize = 32;
@@ -216,6 +220,13 @@ impl PlanarActivationDtype {
         ]
     }
 
+    fn byte_size(self) -> usize {
+        match self {
+            PlanarActivationDtype::F32 => 4,
+            PlanarActivationDtype::F16 | PlanarActivationDtype::Bf16 => 2,
+        }
+    }
+
     /// Map an IR activation dtype onto a planar kernel precision, or typed-reject.
     pub fn from_data_type(dtype: DataType) -> Result<PlanarActivationDtype> {
         match dtype {
@@ -353,7 +364,7 @@ pub struct PlanarTensorLengths {
 /// exact extents its geometry requires. This is the host-side aux/OOB guard
 /// plus the one-time CPU-authoritative value admission (reserved encodings and
 /// decoded-product overflow) that must pass before upload or launch.
-pub fn validate_planar_linear(
+fn validate_planar_linear_host(
     dims: &PlanarLinearDims,
     activation_elems: usize,
     packed: &[u8],
@@ -398,19 +409,140 @@ pub fn validate_planar_linear(
 /// Cached proof that one immutable planar linear bank passed the CPU oracle's
 /// exact geometry and value contract.
 #[derive(Clone, Copy, Debug)]
-pub struct ValidatedPlanarLinear {
+struct ValidatedPlanarLinear {
     dims: PlanarLinearDims,
     bank_identity: PlanarBankIdentity,
 }
 
 impl ValidatedPlanarLinear {
-    pub fn dims(&self) -> &PlanarLinearDims {
+    fn dims(&self) -> &PlanarLinearDims {
         &self.dims
     }
+}
 
-    pub fn bank_identity(&self) -> PlanarBankIdentity {
-        self.bank_identity
+pub(crate) struct ImmutablePlanarDeviceBuffer {
+    provider: Arc<CudaExecutionProvider>,
+    buffer: Option<DeviceBuffer>,
+}
+
+impl ImmutablePlanarDeviceBuffer {
+    pub(crate) fn upload(
+        provider: &Arc<CudaExecutionProvider>,
+        bytes: &[u8],
+        label: &str,
+    ) -> Result<Self> {
+        let buffer = provider
+            .allocate(bytes.len(), 256)
+            .map_err(|err| kernel_err(format!("allocate immutable {label}: {err}")))?;
+        let owned = Self {
+            provider: Arc::clone(provider),
+            buffer: Some(buffer),
+        };
+        // SAFETY: the fresh allocation is exactly `bytes.len()` bytes and remains
+        // exclusively owned by `owned`; no public API exposes mutable access.
+        unsafe {
+            provider
+                .runtime()
+                .htod(bytes, owned.ptr())
+                .map_err(|err| kernel_err(format!("upload immutable {label}: {err}")))?;
+        }
+        Ok(owned)
     }
+
+    pub(crate) fn buffer(&self) -> &DeviceBuffer {
+        self.buffer
+            .as_ref()
+            .expect("immutable planar buffer is taken only during drop")
+    }
+
+    pub(crate) fn ptr(&self) -> CUdeviceptr {
+        cuptr(self.buffer().as_ptr())
+    }
+}
+
+impl Drop for ImmutablePlanarDeviceBuffer {
+    fn drop(&mut self) {
+        if let Some(buffer) = self.buffer.take() {
+            let _ = self.provider.deallocate(buffer);
+        }
+    }
+}
+
+/// Sealed admission for one planar linear bank.
+///
+/// The handle owns the exact packed-weight and aux-scale device allocations
+/// populated from the bytes that passed the CPU oracle. Its fields and device
+/// buffers are private, it is neither `Clone` nor `Copy`, and the safe launch
+/// surface has no independent weight pointers to substitute or overwrite.
+///
+/// The 64-bit [`PlanarBankIdentity`] is exposed only for diagnostics; launch
+/// trust comes from allocation ownership and immutability, never hash equality.
+/// There is deliberately no content-addressed admission cache. Provider-internal
+/// stable-VA remapping may retain an admission only when allocation ownership
+/// and immutable content identity are preserved; replacing or mutating backing
+/// storage invalidates the handle and requires a fresh atomic admission.
+///
+/// ```
+/// fn accepts(_: &onnx_runtime_ep_cuda::AdmittedPlanarLinear) {}
+/// ```
+///
+/// ```compile_fail,E0451
+/// # use onnx_runtime_ep_cuda::AdmittedPlanarLinear;
+/// let forged = AdmittedPlanarLinear {
+///     runtime: todo!(),
+/// };
+/// ```
+///
+/// ```compile_fail
+/// # use onnx_runtime_ep_cuda::AdmittedPlanarLinear;
+/// fn requires_clone<T: Clone>() {}
+/// requires_clone::<AdmittedPlanarLinear>();
+/// ```
+pub struct AdmittedPlanarLinear {
+    runtime: Arc<CudaRuntime>,
+    device: onnx_runtime_ir::DeviceId,
+    validation: ValidatedPlanarLinear,
+    packed: ImmutablePlanarDeviceBuffer,
+    scale: ImmutablePlanarDeviceBuffer,
+}
+
+impl AdmittedPlanarLinear {
+    pub fn dims(&self) -> &PlanarLinearDims {
+        self.validation.dims()
+    }
+
+    pub fn diagnostic_bank_identity(&self) -> PlanarBankIdentity {
+        self.validation.bank_identity
+    }
+}
+
+/// Validate exact host bytes, then atomically upload them into sealed,
+/// provider-owned device allocations. Admission is illegal during capture
+/// because it allocates and performs synchronous H2D exactly once.
+pub fn admit_planar_linear(
+    provider: &Arc<CudaExecutionProvider>,
+    dims: &PlanarLinearDims,
+    activation_elems: usize,
+    packed: &[u8],
+    scale: &[u8],
+    output_elems: usize,
+) -> Result<AdmittedPlanarLinear> {
+    if provider.runtime().is_capturing()? {
+        return Err(kernel_err(
+            "cannot admit a planar bank during CUDA graph capture",
+        ));
+    }
+    let validation =
+        validate_planar_linear_host(dims, activation_elems, packed, scale, output_elems)?;
+    let packed = ImmutablePlanarDeviceBuffer::upload(provider, packed, "packed weights")?;
+    let scale = ImmutablePlanarDeviceBuffer::upload(provider, scale, "aux scales")?;
+    Ok(AdmittedPlanarLinear {
+        runtime: Arc::clone(provider.runtime()),
+        device: provider.device_id(),
+        validation,
+        packed,
+        scale,
+    })
 }
 
 /// Warm-compile every planar linear entry point on `runtime`.
@@ -427,14 +559,12 @@ pub fn warm_planar_linear(runtime: &CudaRuntime) -> Result<()> {
     Ok(())
 }
 
-/// Device pointers for one planar linear launch. Every pointer is a live device
-/// allocation the caller owns for the launch's duration.
-#[derive(Clone, Copy, Debug)]
-pub struct PlanarLinearPtrs {
-    pub activation: CUdeviceptr,
-    pub packed: CUdeviceptr,
-    pub scale: CUdeviceptr,
-    pub output: CUdeviceptr,
+#[derive(Clone, Copy)]
+struct PlanarLinearRawPtrs {
+    activation: CUdeviceptr,
+    packed: CUdeviceptr,
+    scale: CUdeviceptr,
+    output: CUdeviceptr,
 }
 
 /// Threads per block for the one-thread-per-output planar linear kernel.
@@ -442,18 +572,63 @@ const PLANAR_LINEAR_BLOCK: u32 = 256;
 
 /// Launch the planar linear kernel on `runtime`'s EP stream for `dtype`.
 ///
-/// The admission proof carries geometry and immutable-bank validation from
-/// [`validate_planar_linear`]. The launch issues **no** host synchronization and
+/// The admission owns the exact bank allocations populated by
+/// [`admit_planar_linear`]. The launch issues **no** host synchronization and
 /// allocates nothing, so a warmed signature records cleanly into a CUDA-graph
 /// capture. Ordering with a later device→host read is guaranteed by the single
 /// in-order EP stream.
 pub fn launch_planar_linear(
-    runtime: &CudaRuntime,
+    admission: &AdmittedPlanarLinear,
     dtype: PlanarActivationDtype,
-    admission: &ValidatedPlanarLinear,
-    ptrs: &PlanarLinearPtrs,
+    activation: &DeviceBuffer,
+    output: &mut DeviceBuffer,
 ) -> Result<()> {
     let dims = admission.dims();
+    let activation_bytes = dims
+        .m_rows
+        .checked_mul(dims.in_features)
+        .and_then(|elems| elems.checked_mul(dtype.byte_size()))
+        .ok_or_else(|| kernel_err("activation byte count overflow"))?;
+    let output_bytes = dims
+        .m_rows
+        .checked_mul(dims.out_features)
+        .and_then(|elems| elems.checked_mul(dtype.byte_size()))
+        .ok_or_else(|| kernel_err("output byte count overflow"))?;
+    for (label, buffer, expected) in [
+        ("activation", activation, activation_bytes),
+        ("output", &*output, output_bytes),
+    ] {
+        if buffer.device() != admission.device {
+            return Err(kernel_err(format!(
+                "{label} device {:?} does not match admitted bank device {:?}",
+                buffer.device(),
+                admission.device
+            )));
+        }
+        if buffer.len() != expected {
+            return Err(kernel_err(format!(
+                "{label} has {} bytes, expected {expected}",
+                buffer.len()
+            )));
+        }
+    }
+    let ptrs = PlanarLinearRawPtrs {
+        activation: cuptr(activation.as_ptr()),
+        packed: admission.packed.ptr(),
+        scale: admission.scale.ptr(),
+        output: cuptr(output.as_mut_ptr()),
+    };
+    // SAFETY: the sealed admission owns the exact immutable bank allocations;
+    // activation/output device and extents were checked above.
+    unsafe { launch_planar_linear_raw(&admission.runtime, dtype, dims, &ptrs) }
+}
+
+unsafe fn launch_planar_linear_raw(
+    runtime: &CudaRuntime,
+    dtype: PlanarActivationDtype,
+    dims: &PlanarLinearDims,
+    ptrs: &PlanarLinearRawPtrs,
+) -> Result<()> {
     let function =
         runtime.nvrtc_function(PLANAR_LINEAR_MODULE, PLANAR_BLOCK_DECODE_CUH, dtype.entry())?;
 
@@ -501,6 +676,22 @@ pub fn launch_planar_linear(
         })
     }
     .map_err(|err| driver_err(&format!("launch {}", dtype.entry()), err))?;
+    Ok(())
+}
+
+#[cfg(any(test, feature = "gpu-tests"))]
+pub fn test_reject_planar_linear_bank_substitution(
+    admission: &AdmittedPlanarLinear,
+    packed: &DeviceBuffer,
+    scale: &DeviceBuffer,
+) -> Result<()> {
+    if cuptr(packed.as_ptr()) != admission.packed.ptr()
+        || cuptr(scale.as_ptr()) != admission.scale.ptr()
+    {
+        return Err(kernel_err(
+            "raw packed/scale substitution does not match the sealed admitted allocations",
+        ));
+    }
     Ok(())
 }
 

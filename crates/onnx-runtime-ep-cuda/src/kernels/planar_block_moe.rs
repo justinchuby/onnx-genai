@@ -59,13 +59,13 @@
 //! until then. This primitive is the runtime capability the exporter probes
 //! before it may emit a planar MoE node.
 
-use std::sync::OnceLock;
 #[cfg(any(test, feature = "gpu-tests"))]
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use cudarc::driver::sys::CUdeviceptr;
 use cudarc::driver::{LaunchConfig, PushKernelArg};
-use onnx_runtime_ep_api::{EpError, Result};
+use onnx_runtime_ep_api::{DeviceBuffer, EpError, ExecutionProvider, Result};
 use onnx_runtime_ep_cpu::kernels::moe::{Activation, validate_moe_activation_attributes};
 use onnx_runtime_ep_cpu::kernels::planar_block_quant::{
     FP4_MICROSCALE_BLOCK as CPU_FP4_MICROSCALE_BLOCK, PlanarBankIdentity, PlanarBlockFormat,
@@ -77,8 +77,11 @@ use crate::kernels::block_quantized_matmul::decoder_prelude;
 use crate::kernels::block_quantized_moe::{
     MOE_ACTIVATE_ENTRY, MOE_COMBINE_ENTRY, MOE_MODULE, MOE_ROUTE_ENTRY, moe_module_source,
 };
-use crate::kernels::planar_block_decode::{PLANAR_BLOCK_DECODE_CUH, PlanarLinearDims};
-use crate::runtime::CudaRuntime;
+use crate::kernels::planar_block_decode::{
+    ImmutablePlanarDeviceBuffer, PLANAR_BLOCK_DECODE_CUH, PlanarLinearDims,
+};
+use crate::provider::CudaExecutionProvider;
+use crate::runtime::{CudaRuntime, cuptr};
 
 /// NVRTC module cache key for the planar routed-MoE linear kernel.
 pub(crate) const PLANAR_MOE_MODULE: &str = "planar_block_moe_v1";
@@ -327,36 +330,19 @@ struct ValidatedPlanarMoeProjection {
     projection: PlanarMoeProjection,
     packed_expert_stride: usize,
     scale_expert_stride: usize,
+    bias_elems: Option<usize>,
     identity: PlanarBankIdentity,
 }
 
 /// Cached admission proof for an immutable planar routed-MoE bank set.
 #[derive(Clone, Copy, Debug)]
-pub struct ValidatedPlanarMoe {
+struct ValidatedPlanarMoe {
     dims: PlanarMoeDims,
     buffers: PlanarMoeBufferLengths,
     routes: usize,
     fc1: ValidatedPlanarMoeProjection,
     fc2: ValidatedPlanarMoeProjection,
     fc3: Option<ValidatedPlanarMoeProjection>,
-}
-
-impl ValidatedPlanarMoe {
-    pub fn dims(&self) -> &PlanarMoeDims {
-        &self.dims
-    }
-
-    pub fn buffers(&self) -> &PlanarMoeBufferLengths {
-        &self.buffers
-    }
-
-    pub fn bank_identities(&self) -> [Option<PlanarBankIdentity>; 3] {
-        [
-            Some(self.fc1.identity),
-            Some(self.fc2.identity),
-            self.fc3.map(|projection| projection.identity),
-        ]
-    }
 }
 
 impl PlanarMoeBufferLengths {
@@ -411,7 +397,7 @@ impl PlanarMoeBufferLengths {
 /// decoded-overflow, and aux/OOB guard that must pass before upload or launch.
 /// Any mismatch is a typed rejection — never a dense-expert fallback.
 #[allow(clippy::too_many_arguments)]
-pub fn validate_planar_moe(
+fn validate_planar_moe_host(
     dims: &PlanarMoeDims,
     fc1_bank: PlanarMoeBank<'_>,
     fc2_bank: PlanarMoeBank<'_>,
@@ -639,60 +625,343 @@ fn validate_projection_bank(
         projection: *projection,
         packed_expert_stride: per_packed,
         scale_expert_stride: per_scale,
+        bias_elems: bank.bias_elems,
         identity,
     })
 }
 
-/// Device pointers for one planar routed-MoE launch. Every pointer is a live
-/// device allocation the caller owns for the launch's duration; the workspace
-/// pointers are caller-allocated so the launch itself allocates nothing (a
-/// prerequisite for capture safety). A `0` bias/router-weight/fc3 pointer means
-/// "absent" and is treated as inert by the kernels.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct PlanarMoePtrs {
+struct AdmittedPlanarMoeProjection {
+    validation: ValidatedPlanarMoeProjection,
+    packed: ImmutablePlanarDeviceBuffer,
+    scale: ImmutablePlanarDeviceBuffer,
+}
+
+impl AdmittedPlanarMoeProjection {
+    fn upload(
+        provider: &Arc<CudaExecutionProvider>,
+        validation: ValidatedPlanarMoeProjection,
+        bank: PlanarMoeBank<'_>,
+        label: &str,
+    ) -> Result<Self> {
+        Ok(Self {
+            validation,
+            packed: ImmutablePlanarDeviceBuffer::upload(
+                provider,
+                bank.packed,
+                &format!("{label} packed weights"),
+            )?,
+            scale: ImmutablePlanarDeviceBuffer::upload(
+                provider,
+                bank.scale,
+                &format!("{label} aux scales"),
+            )?,
+        })
+    }
+}
+
+/// Sealed admission for all planar routed-MoE projection banks.
+///
+/// FC1, FC2, and optional FC3 each own their exact immutable packed-weight and
+/// aux-scale device allocations together with their independent
+/// format/geometry/stride validation. The type is not constructible, cloneable,
+/// or mutable through safe external APIs. Diagnostic hashes never authorize a
+/// launch; ownership of these allocations does.
+///
+/// No content-addressed admission cache participates in correctness. A
+/// provider-internal stable-VA remap may preserve this handle only while the
+/// same immutable content and allocation ownership remain bound to its runtime
+/// and device. Destructive movement or replacement must invalidate/drop the
+/// handle and atomically re-admit the new bytes.
+///
+/// ```
+/// fn accepts(_: &onnx_runtime_ep_cuda::AdmittedPlanarMoe) {}
+/// ```
+///
+/// ```compile_fail,E0451
+/// # use onnx_runtime_ep_cuda::AdmittedPlanarMoe;
+/// let forged = AdmittedPlanarMoe { runtime: todo!() };
+/// ```
+///
+/// ```compile_fail
+/// # use onnx_runtime_ep_cuda::AdmittedPlanarMoe;
+/// fn requires_clone<T: Clone>() {}
+/// requires_clone::<AdmittedPlanarMoe>();
+/// ```
+pub struct AdmittedPlanarMoe {
+    runtime: Arc<CudaRuntime>,
+    device: onnx_runtime_ir::DeviceId,
+    dims: PlanarMoeDims,
+    buffers: PlanarMoeBufferLengths,
+    routes: usize,
+    fc1: AdmittedPlanarMoeProjection,
+    fc2: AdmittedPlanarMoeProjection,
+    fc3: Option<AdmittedPlanarMoeProjection>,
+}
+
+impl AdmittedPlanarMoe {
+    pub fn dims(&self) -> &PlanarMoeDims {
+        &self.dims
+    }
+
+    pub fn buffers(&self) -> &PlanarMoeBufferLengths {
+        &self.buffers
+    }
+
+    pub fn diagnostic_bank_identities(&self) -> [Option<PlanarBankIdentity>; 3] {
+        [
+            Some(self.fc1.validation.identity),
+            Some(self.fc2.validation.identity),
+            self.fc3
+                .as_ref()
+                .map(|projection| projection.validation.identity),
+        ]
+    }
+}
+
+/// Validate every projection and workspace extent before uploading anything,
+/// then mint one sealed owner for the exact immutable device banks.
+pub fn admit_planar_moe(
+    provider: &Arc<CudaExecutionProvider>,
+    dims: &PlanarMoeDims,
+    fc1_bank: PlanarMoeBank<'_>,
+    fc2_bank: PlanarMoeBank<'_>,
+    fc3_bank: Option<PlanarMoeBank<'_>>,
+    buffers: &PlanarMoeBufferLengths,
+) -> Result<AdmittedPlanarMoe> {
+    if provider.runtime().is_capturing()? {
+        return Err(kernel_err(
+            "cannot admit planar MoE banks during CUDA graph capture",
+        ));
+    }
+    let validation = validate_planar_moe_host(dims, fc1_bank, fc2_bank, fc3_bank, buffers)?;
+    let fc1 = AdmittedPlanarMoeProjection::upload(provider, validation.fc1, fc1_bank, "fc1")?;
+    let fc2 = AdmittedPlanarMoeProjection::upload(provider, validation.fc2, fc2_bank, "fc2")?;
+    let fc3 = match (validation.fc3, fc3_bank) {
+        (Some(validation), Some(bank)) => Some(AdmittedPlanarMoeProjection::upload(
+            provider, validation, bank, "fc3",
+        )?),
+        (None, None) => None,
+        _ => {
+            return Err(kernel_err(
+                "internal fc3 admission mismatch after host validation",
+            ));
+        }
+    };
+    Ok(AdmittedPlanarMoe {
+        runtime: Arc::clone(provider.runtime()),
+        device: provider.device_id(),
+        dims: validation.dims,
+        buffers: validation.buffers,
+        routes: validation.routes,
+        fc1,
+        fc2,
+        fc3,
+    })
+}
+
+/// Borrowed non-weight inputs, optional biases, workspaces, and output for one
+/// launch. Packed weights and aux scales are deliberately absent: the sealed
+/// [`AdmittedPlanarMoe`] is their only safe owner/source.
+pub struct PlanarMoeBuffers<'a> {
     /// `f32 [rows, hidden]` token activations.
-    pub input: CUdeviceptr,
+    pub input: &'a DeviceBuffer,
     /// `f32 [rows, experts]` router logits.
-    pub router_logits: CUdeviceptr,
-    /// `f32 [rows, experts]` pre-aggregated router weights, or `0` for softmax.
-    pub router_weights: CUdeviceptr,
-
-    /// `fc1` expert-major packed weight bank.
-    pub fc1_packed: CUdeviceptr,
-    /// `fc1` expert-major UE8M0 scale bank.
-    pub fc1_scale: CUdeviceptr,
-    /// `f32 [experts, fc1_out]` bias, or `0`.
-    pub fc1_bias: CUdeviceptr,
-
-    /// `fc2` expert-major packed weight bank.
-    pub fc2_packed: CUdeviceptr,
-    /// `fc2` expert-major UE8M0 scale bank.
-    pub fc2_scale: CUdeviceptr,
-    /// `f32 [experts, hidden]` bias, or `0`.
-    pub fc2_bias: CUdeviceptr,
-
-    /// `fc3` expert-major packed weight bank, or `0`.
-    pub fc3_packed: CUdeviceptr,
-    /// `fc3` expert-major UE8M0 scale bank, or `0`.
-    pub fc3_scale: CUdeviceptr,
-    /// `f32 [experts, inter]` bias, or `0`.
-    pub fc3_bias: CUdeviceptr,
+    pub router_logits: &'a DeviceBuffer,
+    /// `f32 [rows, experts]` pre-aggregated router weights, or `None` for softmax.
+    pub router_weights: Option<&'a DeviceBuffer>,
+    /// Optional immutable projection biases.
+    pub fc1_bias: Option<&'a DeviceBuffer>,
+    pub fc2_bias: Option<&'a DeviceBuffer>,
+    pub fc3_bias: Option<&'a DeviceBuffer>,
 
     /// `i32 [routes]` selected expert scratch.
-    pub route_indices: CUdeviceptr,
+    pub route_indices: &'a mut DeviceBuffer,
     /// `f32 [routes]` selected weight scratch.
-    pub route_weights: CUdeviceptr,
+    pub route_weights: &'a mut DeviceBuffer,
     /// `f32 [routes, fc1_out]` fc1 output scratch.
-    pub fc1_output: CUdeviceptr,
-    /// `f32 [routes, inter]` fc3 output scratch, or `0`.
-    pub fc3_output: CUdeviceptr,
+    pub fc1_output: &'a mut DeviceBuffer,
+    /// `f32 [routes, inter]` fc3 output scratch, or `None`.
+    pub fc3_output: Option<&'a mut DeviceBuffer>,
     /// `f32 [routes, inter]` activated scratch.
-    pub activated: CUdeviceptr,
+    pub activated: &'a mut DeviceBuffer,
     /// `f32 [routes, hidden]` per-route output scratch.
-    pub route_output: CUdeviceptr,
+    pub route_output: &'a mut DeviceBuffer,
 
     /// `f32 [rows, hidden]` final combined output.
-    pub output: CUdeviceptr,
+    pub output: &'a mut DeviceBuffer,
+}
+
+#[derive(Clone, Copy)]
+struct PlanarMoeRawPtrs {
+    input: CUdeviceptr,
+    router_logits: CUdeviceptr,
+    router_weights: CUdeviceptr,
+    fc1_bias: CUdeviceptr,
+    fc2_bias: CUdeviceptr,
+    fc3_bias: CUdeviceptr,
+    route_indices: CUdeviceptr,
+    route_weights: CUdeviceptr,
+    fc1_output: CUdeviceptr,
+    fc3_output: CUdeviceptr,
+    activated: CUdeviceptr,
+    route_output: CUdeviceptr,
+    output: CUdeviceptr,
+}
+
+fn exact_f32_bytes(elements: usize, label: &str) -> Result<usize> {
+    elements
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| kernel_err(format!("{label} byte count overflow")))
+}
+
+fn require_buffer(
+    device: onnx_runtime_ir::DeviceId,
+    label: &str,
+    buffer: &DeviceBuffer,
+    bytes: usize,
+) -> Result<()> {
+    if buffer.device() != device {
+        return Err(kernel_err(format!(
+            "{label} device {:?} does not match admitted bank device {device:?}",
+            buffer.device()
+        )));
+    }
+    if buffer.len() != bytes {
+        return Err(kernel_err(format!(
+            "{label} has {} bytes, expected {bytes}",
+            buffer.len()
+        )));
+    }
+    Ok(())
+}
+
+fn require_optional_buffer(
+    device: onnx_runtime_ir::DeviceId,
+    label: &str,
+    buffer: Option<&DeviceBuffer>,
+    elements: Option<usize>,
+) -> Result<CUdeviceptr> {
+    match (buffer, elements) {
+        (Some(buffer), Some(elements)) => {
+            require_buffer(device, label, buffer, exact_f32_bytes(elements, label)?)?;
+            Ok(cuptr(buffer.as_ptr()))
+        }
+        (None, None) => Ok(0),
+        (Some(_), None) => Err(kernel_err(format!(
+            "{label} was supplied but the admitted projection has no bias/output"
+        ))),
+        (None, Some(_)) => Err(kernel_err(format!(
+            "{label} is required by the admitted projection"
+        ))),
+    }
+}
+
+fn validate_planar_moe_buffers(
+    admission: &AdmittedPlanarMoe,
+    buffers: &mut PlanarMoeBuffers<'_>,
+) -> Result<PlanarMoeRawPtrs> {
+    let device = admission.device;
+    let lengths = admission.buffers();
+    require_buffer(
+        device,
+        "input",
+        buffers.input,
+        exact_f32_bytes(lengths.input_elems, "input")?,
+    )?;
+    require_buffer(
+        device,
+        "router_logits",
+        buffers.router_logits,
+        exact_f32_bytes(lengths.router_logits_elems, "router_logits")?,
+    )?;
+    let router_weights = require_optional_buffer(
+        device,
+        "router_weights",
+        buffers.router_weights,
+        lengths.router_weights_elems,
+    )?;
+    let fc1_bias = require_optional_buffer(
+        device,
+        "fc1_bias",
+        buffers.fc1_bias,
+        admission.fc1.validation.bias_elems,
+    )?;
+    let fc2_bias = require_optional_buffer(
+        device,
+        "fc2_bias",
+        buffers.fc2_bias,
+        admission.fc2.validation.bias_elems,
+    )?;
+    let fc3_bias = require_optional_buffer(
+        device,
+        "fc3_bias",
+        buffers.fc3_bias,
+        admission
+            .fc3
+            .as_ref()
+            .and_then(|projection| projection.validation.bias_elems),
+    )?;
+    require_buffer(
+        device,
+        "route_indices",
+        buffers.route_indices,
+        lengths
+            .route_indices_elems
+            .checked_mul(std::mem::size_of::<i32>())
+            .ok_or_else(|| kernel_err("route_indices byte count overflow"))?,
+    )?;
+    require_buffer(
+        device,
+        "route_weights",
+        buffers.route_weights,
+        exact_f32_bytes(lengths.route_weights_elems, "route_weights")?,
+    )?;
+    require_buffer(
+        device,
+        "fc1_output",
+        buffers.fc1_output,
+        exact_f32_bytes(lengths.fc1_output_elems, "fc1_output")?,
+    )?;
+    let fc3_output = require_optional_buffer(
+        device,
+        "fc3_output",
+        buffers.fc3_output.as_deref(),
+        lengths.fc3_output_elems,
+    )?;
+    require_buffer(
+        device,
+        "activated",
+        buffers.activated,
+        exact_f32_bytes(lengths.activated_elems, "activated")?,
+    )?;
+    require_buffer(
+        device,
+        "route_output",
+        buffers.route_output,
+        exact_f32_bytes(lengths.route_output_elems, "route_output")?,
+    )?;
+    require_buffer(
+        device,
+        "output",
+        buffers.output,
+        exact_f32_bytes(lengths.output_elems, "output")?,
+    )?;
+
+    Ok(PlanarMoeRawPtrs {
+        input: cuptr(buffers.input.as_ptr()),
+        router_logits: cuptr(buffers.router_logits.as_ptr()),
+        router_weights,
+        fc1_bias,
+        fc2_bias,
+        fc3_bias,
+        route_indices: cuptr(buffers.route_indices.as_mut_ptr()),
+        route_weights: cuptr(buffers.route_weights.as_mut_ptr()),
+        fc1_output: cuptr(buffers.fc1_output.as_mut_ptr()),
+        fc3_output,
+        activated: cuptr(buffers.activated.as_mut_ptr()),
+        route_output: cuptr(buffers.route_output.as_mut_ptr()),
+        output: cuptr(buffers.output.as_mut_ptr()),
+    })
 }
 
 /// Threads-per-block ceiling preference, mirroring `BlockQuantizedMoEKernel`.
@@ -757,18 +1026,16 @@ fn as_i32(label: &str, value: usize) -> Result<i32> {
 #[allow(clippy::too_many_arguments)]
 fn launch_planar_linear(
     runtime: &CudaRuntime,
-    admission: &ValidatedPlanarMoeProjection,
+    admission: &AdmittedPlanarMoeProjection,
     input: CUdeviceptr,
     route_indices: CUdeviceptr,
-    packed: CUdeviceptr,
-    scale: CUdeviceptr,
     bias: CUdeviceptr,
     output: CUdeviceptr,
     routes: usize,
     top_k: usize,
     input_rows_are_routes: bool,
 ) -> Result<()> {
-    let projection = &admission.projection;
+    let projection = &admission.validation.projection;
     let function = runtime.nvrtc_function(
         PLANAR_MOE_MODULE,
         planar_moe_module_source(),
@@ -789,8 +1056,10 @@ fn launch_planar_linear(
     let format = projection.format;
     let bs0 = as_i32("bs0", projection.bs0)?;
     let bs1 = as_i32("bs1", projection.bs1)?;
-    let packed_stride = admission.packed_expert_stride as u64;
-    let scale_stride = admission.scale_expert_stride as u64;
+    let packed_stride = admission.validation.packed_expert_stride as u64;
+    let scale_stride = admission.validation.scale_expert_stride as u64;
+    let packed = admission.packed.ptr();
+    let scale = admission.scale.ptr();
 
     let stream = runtime.stream();
     let mut builder = stream.launch_builder(&function);
@@ -813,7 +1082,7 @@ fn launch_planar_linear(
         .arg(&scale_stride);
     // SAFETY: the scalar ABI matches `pbmoe_planar_linear_f32`; packed/scale
     // banks cover experts*per_expert bytes and the scratch buffers cover
-    // routes*out_features, all validated by `validate_planar_moe`.
+    // routes*out_features, all validated by `admit_planar_moe`.
     unsafe { builder.launch(config) }
         .map(|_| ())
         .map_err(|err| driver_err("launch planar MoE expert GEMV", err))
@@ -822,15 +1091,16 @@ fn launch_planar_linear(
 /// Launch the full planar routed top-k MoE pipeline on `runtime`'s EP stream:
 /// `route → fc1 (+ fc3) → activate → fc2 → combine`.
 ///
-/// The admission proof carries geometry, workspace extents, and immutable-bank
-/// validation from [`validate_planar_moe`]. The launch issues **no** allocation,
-/// host→device copy, compile, or host synchronization, so a warmed signature
-/// (see [`warm_planar_moe`]) records cleanly into a CUDA-graph capture.
+/// The admission owns the exact FC1/FC2/FC3 bank allocations populated by
+/// [`admit_planar_moe`]. The launch issues **no** allocation, host→device copy,
+/// compile, or host synchronization, so a warmed signature (see
+/// [`warm_planar_moe`]) records cleanly into a CUDA-graph capture.
 pub fn launch_planar_moe(
-    runtime: &CudaRuntime,
-    admission: &ValidatedPlanarMoe,
-    ptrs: &PlanarMoePtrs,
+    admission: &AdmittedPlanarMoe,
+    buffers: &mut PlanarMoeBuffers<'_>,
 ) -> Result<()> {
+    let ptrs = validate_planar_moe_buffers(admission, buffers)?;
+    let runtime = &admission.runtime;
     let dims = admission.dims();
     let routes = admission.routes;
 
@@ -870,8 +1140,6 @@ pub fn launch_planar_moe(
         &admission.fc1,
         ptrs.input,
         ptrs.route_indices,
-        ptrs.fc1_packed,
-        ptrs.fc1_scale,
         ptrs.fc1_bias,
         ptrs.fc1_output,
         routes,
@@ -884,8 +1152,6 @@ pub fn launch_planar_moe(
             fc3,
             ptrs.input,
             ptrs.route_indices,
-            ptrs.fc3_packed,
-            ptrs.fc3_scale,
             ptrs.fc3_bias,
             ptrs.fc3_output,
             routes,
@@ -940,8 +1206,6 @@ pub fn launch_planar_moe(
         &admission.fc2,
         ptrs.activated,
         ptrs.route_indices,
-        ptrs.fc2_packed,
-        ptrs.fc2_scale,
         ptrs.fc2_bias,
         ptrs.route_output,
         routes,
@@ -973,6 +1237,36 @@ pub fn launch_planar_moe(
         unsafe { builder.launch(config) }
             .map(|_| ())
             .map_err(|err| driver_err("launch planar MoE weighted combine", err))?;
+    }
+    Ok(())
+}
+
+#[cfg(any(test, feature = "gpu-tests"))]
+pub fn test_reject_planar_moe_bank_substitution(
+    admission: &AdmittedPlanarMoe,
+    projection: usize,
+    packed: &DeviceBuffer,
+    scale: &DeviceBuffer,
+) -> Result<()> {
+    let admitted = match projection {
+        0 => &admission.fc1,
+        1 => &admission.fc2,
+        2 => admission
+            .fc3
+            .as_ref()
+            .ok_or_else(|| kernel_err("fc3 substitution requested without admitted fc3"))?,
+        other => {
+            return Err(kernel_err(format!(
+                "unknown planar MoE projection index {other}"
+            )));
+        }
+    };
+    if cuptr(packed.as_ptr()) != admitted.packed.ptr()
+        || cuptr(scale.as_ptr()) != admitted.scale.ptr()
+    {
+        return Err(kernel_err(
+            "raw packed/scale substitution does not match the sealed admitted projection",
+        ));
     }
     Ok(())
 }
@@ -1071,7 +1365,7 @@ mod tests {
                 scale,
                 bias_elems: *bias_elems,
             });
-        super::validate_planar_moe(
+        super::validate_planar_moe_host(
             dims,
             PlanarMoeBank {
                 packed: &fc1_packed,
@@ -1157,7 +1451,7 @@ mod tests {
         let fc1_scale = vec![127u8; fc1s];
         let fc2_packed = vec![0u8; fc2p];
         let fc2_scale = vec![127u8; fc2s];
-        let err = super::validate_planar_moe(
+        let err = super::validate_planar_moe_host(
             &dims,
             PlanarMoeBank {
                 packed: &fc1_packed,
@@ -1317,7 +1611,7 @@ mod tests {
 
         fc1_packed[0] = 0x7f;
         assert!(
-            super::validate_planar_moe(
+            super::validate_planar_moe_host(
                 &dims,
                 PlanarMoeBank {
                     packed: &fc1_packed,
@@ -1338,7 +1632,7 @@ mod tests {
         fc1_packed[0] = 0x7e;
         fc1_scale[0] = 247;
         assert!(
-            super::validate_planar_moe(
+            super::validate_planar_moe_host(
                 &dims,
                 PlanarMoeBank {
                     packed: &fc1_packed,
@@ -1360,7 +1654,7 @@ mod tests {
         fc1_scale[0] = 127;
         fc2_scale[0] = 0xff;
         assert!(
-            super::validate_planar_moe(
+            super::validate_planar_moe_host(
                 &dims,
                 PlanarMoeBank {
                     packed: &fc1_packed,
@@ -1387,7 +1681,7 @@ mod tests {
         let fc2_packed = vec![0u8; fc2p];
         let fc2_scale = vec![127u8; fc2s];
         assert!(
-            super::validate_planar_moe(
+            super::validate_planar_moe_host(
                 &dims,
                 PlanarMoeBank {
                     packed: &fc1_packed,

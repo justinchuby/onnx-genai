@@ -426,17 +426,20 @@ fn block_fp8_length_validation() {
     assert_eq!(lengths.scale_bytes, 1);
     let packed = vec![0u8; lengths.packed_bytes];
     let scale = vec![127u8; lengths.scale_bytes];
-    validate_planar_linear(&dims, 3 * 128, &packed, &scale, lengths.output_elems).unwrap();
+    validate_planar_linear_host(&dims, 3 * 128, &packed, &scale, lengths.output_elems).unwrap();
 
     // Truncated aux scale is rejected.
-    assert!(validate_planar_linear(&dims, 3 * 128, &packed, &[], lengths.output_elems).is_err());
+    assert!(
+        validate_planar_linear_host(&dims, 3 * 128, &packed, &[], lengths.output_elems).is_err()
+    );
     // Under-sized output buffer is rejected.
     assert!(
-        validate_planar_linear(&dims, 3 * 128, &packed, &scale, lengths.output_elems - 1).is_err()
+        validate_planar_linear_host(&dims, 3 * 128, &packed, &scale, lengths.output_elems - 1)
+            .is_err()
     );
     // Wrong packed length is rejected.
     assert!(
-        validate_planar_linear(
+        validate_planar_linear_host(
             &dims,
             3 * 128,
             &packed[..packed.len() - 1],
@@ -447,7 +450,8 @@ fn block_fp8_length_validation() {
     );
     // Wrong activation length is rejected.
     assert!(
-        validate_planar_linear(&dims, 3 * 128 + 1, &packed, &scale, lengths.output_elems).is_err()
+        validate_planar_linear_host(&dims, 3 * 128 + 1, &packed, &scale, lengths.output_elems)
+            .is_err()
     );
 
     // Zero block size is rejected.
@@ -504,7 +508,7 @@ fn fp4_planar_length_validation() {
     assert_eq!(lengths.scale_bytes, 16 * (64 / 32));
     let packed = vec![0u8; lengths.packed_bytes];
     let scale = vec![127u8; lengths.scale_bytes];
-    validate_planar_linear(&dims, 2 * 64, &packed, &scale, lengths.output_elems).unwrap();
+    validate_planar_linear_host(&dims, 2 * 64, &packed, &scale, lengths.output_elems).unwrap();
 
     // Odd contraction (not packable into nibbles) is rejected.
     let odd = PlanarLinearDims {
@@ -532,13 +536,13 @@ fn value_admission_rejects_reserved_and_overflowing_matmul_banks() {
     };
     for reserved in [0x7fu8, 0xff] {
         assert!(
-            validate_planar_linear(&fp8, 1, &[reserved], &[127], 1).is_err(),
+            validate_planar_linear_host(&fp8, 1, &[reserved], &[127], 1).is_err(),
             "E4M3FN reserved code 0x{reserved:02x} must fail admission"
         );
     }
-    assert!(validate_planar_linear(&fp8, 1, &[0x38], &[0xff], 1).is_err());
-    validate_planar_linear(&fp8, 1, &[0x7e], &[246], 1).unwrap();
-    assert!(validate_planar_linear(&fp8, 1, &[0x7e], &[247], 1).is_err());
+    assert!(validate_planar_linear_host(&fp8, 1, &[0x38], &[0xff], 1).is_err());
+    validate_planar_linear_host(&fp8, 1, &[0x7e], &[246], 1).unwrap();
+    assert!(validate_planar_linear_host(&fp8, 1, &[0x7e], &[247], 1).is_err());
 
     let fp4 = PlanarLinearDims {
         format: PLANAR_FORMAT_FP4_PLANAR,
@@ -549,9 +553,9 @@ fn value_admission_rejects_reserved_and_overflowing_matmul_banks() {
         bs1: 0,
     };
     let max_codes = [0x77u8; 16];
-    assert!(validate_planar_linear(&fp4, 32, &max_codes, &[0xff], 1).is_err());
-    let first = validate_planar_linear(&fp4, 32, &max_codes, &[252], 1).unwrap();
-    let second = validate_planar_linear(&fp4, 32, &max_codes, &[252], 1).unwrap();
-    assert_eq!(first.bank_identity(), second.bank_identity());
-    assert!(validate_planar_linear(&fp4, 32, &max_codes, &[253], 1).is_err());
+    assert!(validate_planar_linear_host(&fp4, 32, &max_codes, &[0xff], 1).is_err());
+    let first = validate_planar_linear_host(&fp4, 32, &max_codes, &[252], 1).unwrap();
+    let second = validate_planar_linear_host(&fp4, 32, &max_codes, &[252], 1).unwrap();
+    assert_eq!(first.bank_identity, second.bank_identity);
+    assert!(validate_planar_linear_host(&fp4, 32, &max_codes, &[253], 1).is_err());
 }

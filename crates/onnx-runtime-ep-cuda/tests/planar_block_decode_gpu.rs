@@ -39,17 +39,18 @@ use onnx_runtime_ep_cpu::kernels::planar_block_quant::{
 use onnx_runtime_ep_cuda::runtime::cuptr;
 use onnx_runtime_ep_cuda::{
     CudaExecutionProvider, PLANAR_FORMAT_BLOCK_FP8, PLANAR_FORMAT_FP4_PLANAR,
-    PlanarActivationDtype, PlanarLinearDims, PlanarLinearPtrs, launch_planar_linear,
-    planar_matmul_capable_formats, validate_planar_linear, warm_planar_linear,
+    PlanarActivationDtype, PlanarLinearDims, admit_planar_linear, launch_planar_linear,
+    planar_matmul_capable_formats, test_reject_planar_linear_bank_substitution, warm_planar_linear,
 };
+use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // Harness
 // ---------------------------------------------------------------------------
 
-fn require_cuda() -> CudaExecutionProvider {
+fn require_cuda() -> Arc<CudaExecutionProvider> {
     match std::panic::catch_unwind(|| CudaExecutionProvider::new(selected_cuda_ordinal())) {
-        Ok(Ok(ep)) => ep,
+        Ok(Ok(ep)) => Arc::new(ep),
         Ok(Err(error)) => panic!(
             "CUDA test requires CUDA device/runtime; CPU-only runs must leave this test ignored: {error}"
         ),
@@ -225,7 +226,7 @@ fn download(ep: &CudaExecutionProvider, buffer: &DeviceBuffer, len: usize) -> Ve
 
 /// Run the planar linear on device and return the decoded f32 output.
 fn run_planar_gpu(
-    ep: &CudaExecutionProvider,
+    ep: &Arc<CudaExecutionProvider>,
     dtype: PlanarActivationDtype,
     dims: &PlanarLinearDims,
     a_bytes: &[u8],
@@ -233,7 +234,8 @@ fn run_planar_gpu(
     scale: &[u8],
 ) -> Vec<f32> {
     let out_elems = dims.m_rows * dims.out_features;
-    let admission = validate_planar_linear(
+    let admission = admit_planar_linear(
+        ep,
         dims,
         dims.m_rows * dims.in_features,
         packed,
@@ -245,26 +247,16 @@ fn run_planar_gpu(
     let out_bytes = out_elems * dtype_bytes(dtype);
 
     let a_buf = upload(ep, a_bytes);
-    let packed_buf = upload(ep, packed);
-    let scale_buf = upload(ep, scale);
-    let out_buf = ep.allocate(out_bytes.max(1), 256).unwrap();
+    let mut out_buf = ep.allocate(out_bytes.max(1), 256).unwrap();
 
     // Warm-compile every entry outside any capture, then launch (no sync).
     warm_planar_linear(ep.runtime()).unwrap();
-    let ptrs = PlanarLinearPtrs {
-        activation: cuptr(a_buf.as_ptr()),
-        packed: cuptr(packed_buf.as_ptr()),
-        scale: cuptr(scale_buf.as_ptr()),
-        output: cuptr(out_buf.as_ptr()),
-    };
-    launch_planar_linear(ep.runtime(), dtype, &admission, &ptrs).unwrap();
+    launch_planar_linear(&admission, dtype, &a_buf, &mut out_buf).unwrap();
     ep.runtime().synchronize().unwrap();
 
     let out = decode_output(&download(ep, &out_buf, out_bytes), dtype);
 
     ep.deallocate(a_buf).unwrap();
-    ep.deallocate(packed_buf).unwrap();
-    ep.deallocate(scale_buf).unwrap();
     ep.deallocate(out_buf).unwrap();
     out
 }
@@ -297,7 +289,7 @@ fn assert_parity(label: &str, dtype: PlanarActivationDtype, got: &[f32], want: &
 
 /// One end-to-end parity assertion for a `block_fp8` shape across all dtypes.
 fn check_block_fp8(
-    ep: &CudaExecutionProvider,
+    ep: &Arc<CudaExecutionProvider>,
     m: usize,
     out: usize,
     in_features: usize,
@@ -337,7 +329,7 @@ fn check_block_fp8(
 }
 
 /// One end-to-end parity assertion for an `fp4_planar` shape across all dtypes.
-fn check_fp4_planar(ep: &CudaExecutionProvider, m: usize, out: usize, in_features: usize) {
+fn check_fp4_planar(ep: &Arc<CudaExecutionProvider>, m: usize, out: usize, in_features: usize) {
     let (packed, scale) = fp4_fixture(out, in_features, 0xc0ffee ^ (out as u64));
     let a = activations(m, in_features, 0xd00d ^ (in_features as u64));
     let dims = PlanarLinearDims {
@@ -571,7 +563,7 @@ fn multi_request_shape_change_is_stable() {
     ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
 )]
 fn invalid_geometry_is_typed_rejected() {
-    let _ep = require_cuda();
+    let ep = require_cuda();
     // Odd fp4 contraction cannot produce an admission proof.
     let odd = PlanarLinearDims {
         format: PLANAR_FORMAT_FP4_PLANAR,
@@ -581,7 +573,7 @@ fn invalid_geometry_is_typed_rejected() {
         bs0: 0,
         bs1: 0,
     };
-    assert!(validate_planar_linear(&odd, 63, &[], &[], 16).is_err());
+    assert!(admit_planar_linear(&ep, &odd, 63, &[], &[], 16).is_err());
 
     // Truncated aux scale: length validation must refuse.
     let dims = PlanarLinearDims {
@@ -593,10 +585,10 @@ fn invalid_geometry_is_typed_rejected() {
         bs1: 128,
     };
     let packed = vec![0u8; 64 * 128];
-    assert!(validate_planar_linear(&dims, 2 * 128, &packed, &[], 2 * 64).is_err());
+    assert!(admit_planar_linear(&ep, &dims, 2 * 128, &packed, &[], 2 * 64).is_err());
     // Zero block size.
     let bad_block = PlanarLinearDims { bs1: 0, ..dims };
-    assert!(validate_planar_linear(&bad_block, 2 * 128, &packed, &[], 2 * 64).is_err());
+    assert!(admit_planar_linear(&ep, &bad_block, 2 * 128, &packed, &[], 2 * 64).is_err());
 }
 
 #[test]
@@ -625,7 +617,7 @@ fn malformed_values_reject_before_device_activity() {
         ([0x7eu8], [247u8], "finite E4M3 product overflow"),
     ] {
         assert!(
-            validate_planar_linear(&fp8, 1, &packed, &scale, 1).is_err(),
+            admit_planar_linear(&ep, &fp8, 1, &packed, &scale, 1).is_err(),
             "{label} must reject before upload"
         );
     }
@@ -639,11 +631,129 @@ fn malformed_values_reject_before_device_activity() {
         bs1: 0,
     };
     let max_codes = [0x77u8; 16];
-    assert!(validate_planar_linear(&fp4, 32, &max_codes, &[0xff], 1).is_err());
-    assert!(validate_planar_linear(&fp4, 32, &max_codes, &[253], 1).is_err());
+    assert!(admit_planar_linear(&ep, &fp4, 32, &max_codes, &[0xff], 1).is_err());
+    assert!(admit_planar_linear(&ep, &fp4, 32, &max_codes, &[253], 1).is_err());
 
     assert_eq!(runtime.allocation_counts(), allocations);
     assert_eq!(runtime.transfer_counts(), transfers);
+}
+
+/// Admission owns the exact immutable device bank populated from validated
+/// bytes. Neither host mutation nor any same-shaped external allocation can
+/// replace that bank at the private raw-launch boundary.
+#[test]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+fn sealed_admission_rejects_bank_substitution() {
+    let ep = require_cuda();
+    let runtime = ep.runtime();
+    let dims = PlanarLinearDims {
+        format: PLANAR_FORMAT_BLOCK_FP8,
+        m_rows: 1,
+        in_features: 32,
+        out_features: 2,
+        bs0: 32,
+        bs1: 32,
+    };
+    let mut packed = vec![0x38u8; dims.out_features * dims.in_features];
+    let mut scale = vec![127u8; dims.out_features.div_ceil(dims.bs0)];
+    let activation = vec![1.0f32; dims.in_features];
+    let (activation_bytes, _) = quantize_activation(&activation, PlanarActivationDtype::F32);
+    let activation_buffer = upload(&ep, &activation_bytes);
+    let mut output = ep.allocate(dims.out_features * 4, 256).unwrap();
+    let admission = admit_planar_linear(
+        &ep,
+        &dims,
+        dims.in_features,
+        &packed,
+        &scale,
+        dims.out_features,
+    )
+    .unwrap();
+    warm_planar_linear(runtime).unwrap();
+    launch_planar_linear(
+        &admission,
+        PlanarActivationDtype::F32,
+        &activation_buffer,
+        &mut output,
+    )
+    .unwrap();
+    runtime.synchronize().unwrap();
+    let admitted_output = download(&ep, &output, dims.out_features * 4);
+
+    // Mutating the source vectors after admission cannot mutate the sealed
+    // allocations used by launch or replay.
+    packed.fill(0x7f);
+    scale.fill(0xff);
+    launch_planar_linear(
+        &admission,
+        PlanarActivationDtype::F32,
+        &activation_buffer,
+        &mut output,
+    )
+    .unwrap();
+    runtime.synchronize().unwrap();
+    assert_eq!(
+        download(&ep, &output, dims.out_features * 4),
+        admitted_output
+    );
+
+    let same_packed = upload(&ep, &vec![0x38; packed.len()]);
+    let same_scale = upload(&ep, &vec![127; scale.len()]);
+    let reserved_packed = upload(&ep, &packed);
+    let reserved_scale = upload(&ep, &scale);
+    let mut overflow_packed_bytes = vec![0x38; packed.len()];
+    overflow_packed_bytes[0] = 0x7e;
+    let overflow_packed = upload(&ep, &overflow_packed_bytes);
+    let mut overflow_scale_bytes = vec![127; scale.len()];
+    overflow_scale_bytes[0] = 247;
+    let overflow_scale = upload(&ep, &overflow_scale_bytes);
+
+    let before = (runtime.allocation_counts(), runtime.transfer_counts());
+    for (candidate_packed, candidate_scale, attack) in [
+        (&same_packed, &same_scale, "same geometry and contents"),
+        (&reserved_packed, &reserved_scale, "reserved codes"),
+        (
+            &overflow_packed,
+            &overflow_scale,
+            "finite inputs with non-finite decoded product",
+        ),
+        (
+            &activation_buffer,
+            &output,
+            "captured activation/output storage overwrite",
+        ),
+    ] {
+        assert!(
+            test_reject_planar_linear_bank_substitution(
+                &admission,
+                candidate_packed,
+                candidate_scale,
+            )
+            .is_err(),
+            "{attack} must reject before kernel launch"
+        );
+    }
+    assert_eq!(
+        (runtime.allocation_counts(), runtime.transfer_counts()),
+        before,
+        "substitution rejection must not allocate or transfer"
+    );
+
+    for buffer in [
+        activation_buffer,
+        output,
+        same_packed,
+        same_scale,
+        reserved_packed,
+        reserved_scale,
+        overflow_packed,
+        overflow_scale,
+    ] {
+        ep.deallocate(buffer).unwrap();
+    }
 }
 
 /// A warmed fixed-shape planar linear records into a CUDA-graph capture and
@@ -672,17 +782,9 @@ fn capture_replay_parity() {
     let out_bytes = m * out * 4;
 
     let a_buf = upload(&ep, &a_bytes);
-    let packed_buf = upload(&ep, &packed);
-    let scale_buf = upload(&ep, &scale);
-    let out_buf = ep.allocate(out_bytes, 256).unwrap();
-    let ptrs = PlanarLinearPtrs {
-        activation: cuptr(a_buf.as_ptr()),
-        packed: cuptr(packed_buf.as_ptr()),
-        scale: cuptr(scale_buf.as_ptr()),
-        output: cuptr(out_buf.as_ptr()),
-    };
+    let mut out_buf = ep.allocate(out_bytes, 256).unwrap();
     let admission =
-        validate_planar_linear(&dims, m * in_features, &packed, &scale, m * out).unwrap();
+        admit_planar_linear(&ep, &dims, m * in_features, &packed, &scale, m * out).unwrap();
 
     // Warm compile BEFORE capture (compile synchronizes the device).
     warm_planar_linear(runtime).unwrap();
@@ -691,7 +793,7 @@ fn capture_replay_parity() {
     let warmed_allocations = runtime.allocation_counts();
     let warmed_transfers = runtime.transfer_counts();
     for _ in 0..2 {
-        launch_planar_linear(runtime, PlanarActivationDtype::F32, &admission, &ptrs).unwrap();
+        launch_planar_linear(&admission, PlanarActivationDtype::F32, &a_buf, &mut out_buf).unwrap();
     }
     assert_eq!(runtime.allocation_counts(), warmed_allocations);
     assert_eq!(runtime.transfer_counts(), warmed_transfers);
@@ -702,7 +804,11 @@ fn capture_replay_parity() {
     let capture_allocations = runtime.allocation_counts();
     let capture_transfers = runtime.transfer_counts();
     runtime.begin_graph_capture(&[]).unwrap();
-    launch_planar_linear(runtime, PlanarActivationDtype::F32, &admission, &ptrs).unwrap();
+    assert!(
+        admit_planar_linear(&ep, &dims, m * in_features, &packed, &scale, m * out).is_err(),
+        "admission must reject before allocating or uploading during capture"
+    );
+    launch_planar_linear(&admission, PlanarActivationDtype::F32, &a_buf, &mut out_buf).unwrap();
     runtime.end_graph_capture().unwrap();
     assert_eq!(runtime.allocation_counts(), capture_allocations);
     assert_eq!(runtime.transfer_counts(), capture_transfers);
@@ -739,8 +845,6 @@ fn capture_replay_parity() {
 
     runtime.reset_graph().unwrap();
     ep.deallocate(a_buf).unwrap();
-    ep.deallocate(packed_buf).unwrap();
-    ep.deallocate(scale_buf).unwrap();
     ep.deallocate(out_buf).unwrap();
 }
 
@@ -892,24 +996,17 @@ fn planar_matmul_measurement() {
     };
     let out_bytes = m * out * dtype_bytes(PlanarActivationDtype::F16);
     let a_buf = upload(&ep, &a_bytes);
-    let packed_buf = upload(&ep, &packed);
-    let scale_buf = upload(&ep, &scale);
-    let out_buf = ep.allocate(out_bytes, 256).unwrap();
-    let ptrs = PlanarLinearPtrs {
-        activation: cuptr(a_buf.as_ptr()),
-        packed: cuptr(packed_buf.as_ptr()),
-        scale: cuptr(scale_buf.as_ptr()),
-        output: cuptr(out_buf.as_ptr()),
-    };
+    let mut out_buf = ep.allocate(out_bytes, 256).unwrap();
     let admission =
-        validate_planar_linear(&dims, m * in_features, &packed, &scale, m * out).unwrap();
+        admit_planar_linear(&ep, &dims, m * in_features, &packed, &scale, m * out).unwrap();
     warm_planar_linear(runtime).unwrap();
 
     // 8 s ramp: keep the SMs busy so clocks reach steady state before timing.
     let ramp = Instant::now();
     while ramp.elapsed().as_secs_f32() < 8.0 {
         for _ in 0..32 {
-            launch_planar_linear(runtime, PlanarActivationDtype::F16, &admission, &ptrs).unwrap();
+            launch_planar_linear(&admission, PlanarActivationDtype::F16, &a_buf, &mut out_buf)
+                .unwrap();
         }
         runtime.synchronize().unwrap();
     }
@@ -918,14 +1015,14 @@ fn planar_matmul_measurement() {
     let enqueue_n = 200;
     let host = Instant::now();
     for _ in 0..enqueue_n {
-        launch_planar_linear(runtime, PlanarActivationDtype::F16, &admission, &ptrs).unwrap();
+        launch_planar_linear(&admission, PlanarActivationDtype::F16, &a_buf, &mut out_buf).unwrap();
     }
     let host_enqueue = host.elapsed();
     runtime.synchronize().unwrap();
 
     // Batched kernel window: median of n≥3 batches of `batch` launches each.
     let batch = 64usize;
-    let sample_shape = |samples: &mut Vec<f64>| {
+    let mut sample_shape = |samples: &mut Vec<f64>| {
         for _ in 0..5 {
             assert!(
                 !foreign_compute_present(),
@@ -933,7 +1030,7 @@ fn planar_matmul_measurement() {
             );
             let t = Instant::now();
             for _ in 0..batch {
-                launch_planar_linear(runtime, PlanarActivationDtype::F16, &admission, &ptrs)
+                launch_planar_linear(&admission, PlanarActivationDtype::F16, &a_buf, &mut out_buf)
                     .unwrap();
             }
             runtime.synchronize().unwrap();
@@ -970,7 +1067,5 @@ fn planar_matmul_measurement() {
     );
 
     ep.deallocate(a_buf).unwrap();
-    ep.deallocate(packed_buf).unwrap();
-    ep.deallocate(scale_buf).unwrap();
     ep.deallocate(out_buf).unwrap();
 }
