@@ -489,10 +489,14 @@ jobs:
       # manifest `required-features`) deletes the test from the base-config
       # inventory, so the lane is green because the tests are not there. #1927
       # lost thirteen that way and nothing reported it.
+      #
+      # The same source scan also pins the resource-sensitive MHA/DFT/STFT
+      # targets: every test must acquire its target-local process mutex before
+      # constructing an EP or reading process-global telemetry.
       - name: Check CUDA test source scan can still detect (self-test)
         run: python3 .github/scripts/verify_cuda_test_honesty.py --self-test
 
-      - name: Check CUDA tests are ignored, not deleted by a cfg
+      - name: Check CUDA test source contracts
         run: python3 .github/scripts/verify_cuda_test_honesty.py --source-scan
 
       # Rust warnings are errors: clippy is blocking for every crate CI tests.

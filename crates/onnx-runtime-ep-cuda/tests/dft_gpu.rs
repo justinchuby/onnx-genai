@@ -1,5 +1,7 @@
 mod common;
 
+use std::sync::{Mutex, MutexGuard};
+
 use common::{
     Tensor, build_graph, decode_floats, float_input, input, require_cuda, run_cpu, run_cuda,
 };
@@ -7,6 +9,18 @@ use onnx_runtime_ep_api::{ExecutionProvider, KernelMatch};
 use onnx_runtime_ep_cuda::{CUDA_COVERED_OPS, cufft_plan_cache_stats};
 use onnx_runtime_ir::{Attribute, DataType, TensorLayout, static_shape};
 use onnx_runtime_loader::Model;
+
+static DFT_GPU_LOCK: Mutex<()> = Mutex::new(());
+
+fn lock_dft_gpu() -> MutexGuard<'static, ()> {
+    DFT_GPU_LOCK.lock().unwrap_or_else(|poisoned| {
+        eprintln!(
+            "WARNING: DFT_GPU_LOCK was poisoned by a prior test panic — recovering. \
+             Investigate the original failure above."
+        );
+        poisoned.into_inner()
+    })
+}
 
 fn assert_close(actual: &[f32], expected: &[f32], tolerance: f32) {
     assert_eq!(actual.len(), expected.len());
@@ -55,6 +69,7 @@ fn cpu_dft(
 )]
 #[test]
 fn forward_complex_n4_pins_sign_convention() {
+    let _suite_lock = lock_dft_gpu();
     let ep = require_cuda();
     let input = float_input(
         DataType::Float32,
@@ -73,6 +88,7 @@ fn forward_complex_n4_pins_sign_convention() {
 )]
 #[test]
 fn inverse_complex_n4_applies_exactly_one_over_n() {
+    let _suite_lock = lock_dft_gpu();
     let ep = require_cuda();
     let spectrum = float_input(
         DataType::Float32,
@@ -91,6 +107,7 @@ fn inverse_complex_n4_applies_exactly_one_over_n() {
 )]
 #[test]
 fn real_full_has_conjugate_tail_and_onesided_has_n_over_two_plus_one() {
+    let _suite_lock = lock_dft_gpu();
     let ep = require_cuda();
     let input = float_input(DataType::Float32, &[1, 4, 1], &[1.0, 2.0, 3.0, 4.0]);
     let full = dft(&ep, input.clone(), &[1, 4, 2], &[], &[]);
@@ -114,6 +131,7 @@ fn real_full_has_conjugate_tail_and_onesided_has_n_over_two_plus_one() {
 )]
 #[test]
 fn dft_length_truncates_and_zero_pads() {
+    let _suite_lock = lock_dft_gpu();
     let ep = require_cuda();
     let input_tensor = float_input(DataType::Float32, &[1, 4, 1], &[1.0, -2.0, 0.5, 3.0]);
     for length in [2_i64, 7] {
@@ -142,6 +160,7 @@ fn dft_length_truncates_and_zero_pads() {
 )]
 #[test]
 fn batched_non_default_axis_matches_cpu() {
+    let _suite_lock = lock_dft_gpu();
     let ep = require_cuda();
     let values = (0..2 * 3 * 4)
         .map(|index| (index as f32 - 7.0) * 0.25)
@@ -161,6 +180,7 @@ fn batched_non_default_axis_matches_cpu() {
 )]
 #[test]
 fn claim_gates_decline_unsupported_dtype_layout_and_complex_onesided() {
+    let _suite_lock = lock_dft_gpu();
     let ep = require_cuda();
     assert!(CUDA_COVERED_OPS.contains(&"DFT"));
 
@@ -236,6 +256,7 @@ fn claim_gates_decline_unsupported_dtype_layout_and_complex_onesided() {
 )]
 #[test]
 fn repeated_geometry_reuses_bounded_cufft_plan_and_declares_capture_unsupported() {
+    let _suite_lock = lock_dft_gpu();
     let ep = require_cuda();
     let values = (0..13)
         .map(|index| index as f32 * 0.125)
