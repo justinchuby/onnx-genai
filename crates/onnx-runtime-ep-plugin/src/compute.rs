@@ -2554,6 +2554,7 @@ unsafe extern "C" fn compute_execute(
                 inputs,
                 owned: owned_outputs,
                 slots: slot_map,
+                shapes,
             } = scratch;
             if let Err(e) = unsafe { read_inputs_into(api_ref, kernel_context, inputs) } {
                 return fail_status(&format!("Compute: {e}"));
@@ -3084,12 +3085,12 @@ unsafe extern "C" fn compute_execute(
 
                     // Infer output shapes.
                     let shape_probe = crate::dispatch_probe::Phase::DispatchLookup.enter();
-                    let output_shapes = match infer_shapes(&entry.shape_inference, &kernel_inputs) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            return fail_status(&format!("Compute: shape inference failed: {e}"));
-                        }
-                    };
+                    if let Err(e) =
+                        infer_shapes_into(&entry.shape_inference, &kernel_inputs, shapes)
+                    {
+                        return fail_status(&format!("Compute: shape inference failed: {e}"));
+                    }
+                    let output_shapes = &*shapes;
                     shape_probe.end();
 
                     // Execute — dispatch based on sinks.
@@ -3239,7 +3240,11 @@ unsafe extern "C" fn compute_execute(
                             IntermediateBuf {
                                 data,
                                 scratch_ptr,
-                                shape: shape.clone(),
+                                // `shape` is now borrowed from the reusable
+                                // buffer, which the next node overwrites, so
+                                // the buf owns a copy. Same allocation the
+                                // `Vec` clone made here before.
+                                shape: shape.to_vec(),
                                 strides,
                                 dtype,
                             },
@@ -3248,7 +3253,7 @@ unsafe extern "C" fn compute_execute(
 
                     // Collect all output views using the per-slot view map so
                     // positions stay aligned even when absent slots are present.
-                    let absent_shapes: &[Vec<usize>] = &output_shapes;
+                    let absent_shapes: &[crate::dim_vec::DimVec<usize>] = output_shapes;
                     // One entry per *absent* slot, not per output slot. Only
                     // absent slots read these, and a node with an absent output is
                     // the exception, so building them for every output cost an
@@ -3588,12 +3593,10 @@ unsafe extern "C" fn compute_execute(
                     return ok_status();
                 }
                 let lookup_probe = crate::dispatch_probe::Phase::DispatchLookup.enter();
-                let output_shapes = match infer_shapes(&entry.shape_inference, kernel_inputs) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        return fail_status(&format!("Compute: shape inference failed: {e}"));
-                    }
-                };
+                if let Err(e) = infer_shapes_into(&entry.shape_inference, kernel_inputs, shapes) {
+                    return fail_status(&format!("Compute: shape inference failed: {e}"));
+                }
+                let output_shapes = &*shapes;
                 lookup_probe.end();
                 // Allocate outputs. Absent slots get a local scratch buffer so the
                 // kernel sees the full output arity and can index by position,
@@ -3683,7 +3686,7 @@ unsafe extern "C" fn compute_execute(
                 // `TensorMut`s. `absent_slot_strides` builds one entry per *absent*
                 // slot, so a node with no absent outputs -- every elementwise op,
                 // which is most of what reaches this path -- allocates nothing here.
-                let absent_shapes: &[Vec<usize>] = &output_shapes;
+                let absent_shapes: &[crate::dim_vec::DimVec<usize>] = output_shapes;
                 // See the routed path. `slot_map` pushes `Absent(idx)` with
                 // increasing `idx`, so filtering it in slot order yields the strides
                 // in absent-index order.
@@ -4115,6 +4118,22 @@ pub(crate) struct RunScratch {
     owned: Vec<crate::kernel_ctx::OwnedOutput>,
     /// Which output slots are ORT-allocated and which are absent scratch.
     slots: Vec<SlotKind>,
+    /// Inferred output shapes for the node being executed.
+    ///
+    /// Lives here so the storage outlives the node *and* the `Run`.
+    /// [`infer_shapes`] returns a fresh `Vec<Vec<usize>>` per node per `Run`,
+    /// and at depth 100 that measured 277.2 Ir/node: 57.4 for the inner
+    /// `to_vec`, 63.0 for the one-element `vec![_]` (which lowers to
+    /// `box_new_uninit`), and 78.4 each for the drop glue and the `free`. On
+    /// top of that sits a proportional share of glibc's `_int_free`, the
+    /// single largest allocator line in the profile at 482.4 Ir/node
+    /// aggregated over every Rust deallocation.
+    ///
+    /// A per-`Run` local would leave depth 1 exactly where it started, since
+    /// there the buffer would be allocated and dropped for its single node.
+    /// Parking it with the rest of the scratch is what makes the fixed-`Run`
+    /// cost fall too.
+    shapes: Vec<crate::dim_vec::DimVec<usize>>,
 }
 
 /// Capacity, in elements, above which per-`Run` scratch is dropped instead of
@@ -4175,6 +4194,7 @@ thread_local! {
             inputs: Vec::new(),
             owned: Vec::new(),
             slots: Vec::new(),
+            shapes: Vec::new(),
         }) };
 }
 
@@ -4247,6 +4267,7 @@ impl RunScratch {
         self.inputs.clear();
         self.owned.clear();
         self.slots.clear();
+        self.shapes.clear();
 
         if self.inputs.capacity() > SCRATCH_MAX_CAPACITY {
             self.inputs = Vec::new();
@@ -4260,6 +4281,15 @@ impl RunScratch {
         {
             self.owned = Vec::new();
             self.slots = Vec::new();
+        }
+
+        // Judged on its own, for the same spine-capacity reason as the pair
+        // above. Any heap a spilled `DimVec` (rank > INLINE_RANK) owned is
+        // already gone: `clear()` drops the elements, and that is where the
+        // out-of-line buffer is released. What this bounds is only the outer
+        // Vec's own capacity.
+        if self.shapes.capacity() > SCRATCH_MAX_CAPACITY {
+            self.shapes = Vec::new();
         }
     }
 }
@@ -4434,7 +4464,7 @@ fn retirements_per_node(
 /// in, so the two agree by construction.
 fn absent_slot_strides(
     absent_slots: impl Iterator<Item = usize>,
-    shapes: &[Vec<usize>],
+    shapes: &[crate::dim_vec::DimVec<usize>],
 ) -> Vec<Vec<i64>> {
     absent_slots
         .map(|slot| match shapes.get(slot) {
@@ -4627,6 +4657,83 @@ pub fn shared_native_rule_names_for_test() -> Vec<&'static str> {
         .iter()
         .map(|rule| rule.op_type())
         .collect()
+}
+
+/// Infer output shapes into reusable storage, allocating nothing on the
+/// elementwise paths the dispatch grid actually measures.
+///
+/// Not on *every* path: the shared-native arm still receives an owned
+/// `Vec<Vec<usize>>` from `infer_shared_node` and copies it in, which is
+/// strictly more work than returning it would have been. That arm is here to
+/// route a *declining* rule's fallback through the fast arms, not to save an
+/// allocation on resolve, and it is off the measured path.
+///
+/// [`infer_shapes`] hands back a fresh `Vec<Vec<usize>>` for every node of
+/// every `Run`. Callers only ever read it as a slice and drop it a few hundred
+/// instructions later, so the container is pure overhead: measured at depth
+/// 100, 277.2 Ir/node across the two allocations and their frees, plus a share
+/// of the `_int_free` line that dominates the allocator profile.
+///
+/// Only the strategies confirmed hot in that profile are reimplemented here;
+/// everything else delegates to [`infer_shapes`] verbatim and merely copies the
+/// result in. Two reasons for keeping the split that narrow. The inference
+/// rules are the correctness-critical part and there are forty of them, so
+/// duplicating them wholesale to save an allocation on a cold path would be a
+/// bad trade. And the arms that *are* duplicated are each a bounds check plus a
+/// copy, small enough to audit by eye — with
+/// `infer_shapes_into_matches_infer_shapes` standing behind them as a
+/// differential oracle so the two paths cannot drift apart silently.
+fn infer_shapes_into(
+    strategy: &ShapeInference,
+    inputs: &[TensorView<'_>],
+    out: &mut Vec<crate::dim_vec::DimVec<usize>>,
+) -> Result<(), String> {
+    use crate::dim_vec::DimVec;
+    match strategy {
+        // `Ok(vec![inputs[idx].shape.to_vec()])`, without the two allocations.
+        ShapeInference::SameAsInput(idx) => {
+            let idx = *idx;
+            if idx >= inputs.len() {
+                return Err(format!(
+                    "SameAsInput({idx}): only {} inputs present",
+                    inputs.len()
+                ));
+            }
+            out.clear();
+            out.push(DimVec::from_slice(inputs[idx].shape));
+            Ok(())
+        }
+
+        // A single operand broadcasts against nothing, so the fold in
+        // `infer_shapes` runs zero times and the answer is that operand's own
+        // shape. Two or more still have to go through `broadcast_shapes`, which
+        // allocates a fresh shape per step regardless of who calls it.
+        ShapeInference::ElementwiseBroadcast if inputs.len() == 1 => {
+            out.clear();
+            out.push(DimVec::from_slice(inputs[0].shape));
+            Ok(())
+        }
+
+        // Recurse rather than delegate, so a shared-native rule that declines
+        // still reaches the fast arms through its own fallback.
+        ShapeInference::SharedNative { node, fallback } => match infer_shared_node(node, inputs) {
+            SharedShapeResult::Resolved(shapes) => {
+                out.clear();
+                out.extend(shapes.iter().map(|s| DimVec::from_slice(s)));
+                Ok(())
+            }
+            SharedShapeResult::SymbolicOrUnknown | SharedShapeResult::Rejected(_) => {
+                infer_shapes_into(fallback, inputs, out)
+            }
+        },
+
+        other => {
+            let shapes = infer_shapes(other, inputs)?;
+            out.clear();
+            out.extend(shapes.iter().map(|s| DimVec::from_slice(s)));
+            Ok(())
+        }
+    }
 }
 
 /// Infer output shapes from the shape inference strategy and input views.
@@ -6216,6 +6323,214 @@ fn after() {}
         infer_shapes(strategy, inputs)
     }
 
+    /// Differential oracle for the allocation-free path.
+    ///
+    /// `infer_shapes_into` reimplements a handful of hot arms and delegates the
+    /// rest. That split is only safe while the two agree, and the arms it
+    /// reimplements are exactly the ones the dispatch benchmark drives -- so a
+    /// divergence would show up as wrong output shapes on the most common ops
+    /// in the suite, not on an exotic one. Asserting equality on both the `Ok`
+    /// shapes and the `Err` text keeps the fast path honest about failures too,
+    /// since a fast arm that skipped a bounds check would still "work" until it
+    /// indexed out of range.
+    #[track_caller]
+    fn assert_paths_agree(strategy: &ShapeInference, inputs: &[TensorView<'_>]) {
+        let slow = infer_shapes(strategy, inputs);
+        let mut buf = Vec::new();
+        let fast = infer_shapes_into(strategy, inputs, &mut buf);
+        match (&slow, &fast) {
+            (Ok(want), Ok(())) => {
+                let got: Vec<Vec<usize>> = buf.iter().map(|d| d.as_slice().to_vec()).collect();
+                assert_eq!(&got, want, "fast path disagreed for {strategy:?}");
+            }
+            (Err(want), Err(got)) => {
+                assert_eq!(
+                    got, want,
+                    "fast path gave a different error for {strategy:?}"
+                );
+            }
+            _ => panic!("fast/slow disagreed on success for {strategy:?}: {slow:?} vs {fast:?}"),
+        }
+    }
+
+    // ── The allocation-free path agrees with the allocating one ─────────────
+
+    /// The arms `infer_shapes_into` reimplements, including their failures.
+    #[test]
+    fn infer_shapes_into_matches_infer_shapes_on_the_fast_arms() {
+        let a = view(&[2, 3, 4], &[12, 4, 1]);
+        let b = view(&[2, 3, 4], &[12, 4, 1]);
+        let scalar = view(&[], &[]);
+
+        assert_paths_agree(&ShapeInference::SameAsInput(0), &[a, b]);
+        assert_paths_agree(&ShapeInference::SameAsInput(1), &[a, b]);
+        // Rank 0 is not a degenerate case for a buffer that stores a length.
+        assert_paths_agree(&ShapeInference::SameAsInput(0), &[scalar]);
+        // Out of range must fail identically, not index out of bounds.
+        assert_paths_agree(&ShapeInference::SameAsInput(1), &[a]);
+        assert_paths_agree(&ShapeInference::SameAsInput(0), &[]);
+
+        assert_paths_agree(&ShapeInference::ElementwiseBroadcast, &[a]);
+        assert_paths_agree(&ShapeInference::ElementwiseBroadcast, &[scalar]);
+        // Two operands fall through to the shared fold rather than the fast arm.
+        assert_paths_agree(&ShapeInference::ElementwiseBroadcast, &[a, b]);
+        assert_paths_agree(&ShapeInference::ElementwiseBroadcast, &[]);
+    }
+
+    /// A rank past `INLINE_RANK`, where `DimVec` stops being inline and starts
+    /// owning a heap buffer. The fast path must be correct on both sides of
+    /// that boundary, and the buffer must survive being reused across the
+    /// transition in either direction.
+    #[test]
+    fn infer_shapes_into_handles_ranks_that_spill_out_of_line() {
+        let wide_shape: Vec<usize> = vec![2; crate::dim_vec::INLINE_RANK + 3];
+        let wide_strides: Vec<i64> = vec![1; wide_shape.len()];
+        let wide = view(&wide_shape, &wide_strides);
+        let narrow = view(&[7], &[1]);
+
+        assert_paths_agree(&ShapeInference::SameAsInput(0), &[wide]);
+
+        // Reuse one buffer across wide -> narrow -> wide. A buffer that kept a
+        // stale length or a stale spilled allocation shows up here.
+        let mut buf = Vec::new();
+        for expect in [&wide_shape[..], &[7][..], &wide_shape[..]] {
+            let input = if expect.len() == 1 { narrow } else { wide };
+            infer_shapes_into(&ShapeInference::SameAsInput(0), &[input], &mut buf).unwrap();
+            assert_eq!(buf.len(), 1, "one output slot");
+            assert_eq!(buf[0].as_slice(), expect, "stale storage leaked through");
+        }
+    }
+
+    /// A *shorter* result after a longer one must not leave the tail of the
+    /// previous node visible.
+    ///
+    /// Every arm that writes the buffer needs its own case here, because each
+    /// one clears it separately. Driving only the `SameAsInput` arm proves only
+    /// that `SameAsInput` clears: deleting the `out.clear()` from the
+    /// delegating arm, or from the shared-native arm, survived an earlier
+    /// version of this test. Both are load-bearing in production, where the
+    /// routed path reads `output_shapes.iter().enumerate()` as the node's
+    /// output arity — a stale tail becomes a phantom output slot.
+    #[test]
+    fn every_arm_truncates_when_a_node_has_fewer_outputs() {
+        let a = view(&[2, 3], &[3, 1]);
+        assert_paths_agree(&ShapeInference::MatMul, &[a, a]);
+
+        // Two outputs, via the delegating arm, to leave a tail behind.
+        let input = view(&[1, 2, 5], &[10, 5, 1]);
+        let weight = view(&[2, 1, 3], &[3, 3, 1]);
+        let fill_two = |buf: &mut Vec<crate::dim_vec::DimVec<usize>>| {
+            infer_shapes_into(&ShapeInference::CausalConvWithState, &[input, weight], buf).unwrap();
+            assert_eq!(buf.len(), 2, "two outputs");
+        };
+
+        // Fast arm.
+        let mut buf = Vec::new();
+        fill_two(&mut buf);
+        infer_shapes_into(&ShapeInference::SameAsInput(0), &[input], &mut buf).unwrap();
+        assert_eq!(buf.len(), 1, "SameAsInput left the second slot behind");
+
+        // Delegating arm: a one-output strategy that is NOT reimplemented.
+        fill_two(&mut buf);
+        infer_shapes_into(&ShapeInference::MatMul, &[a, a], &mut buf).unwrap();
+        assert_eq!(
+            buf.len(),
+            1,
+            "the delegating arm left the second slot behind"
+        );
+
+        // Shared-native arm, resolving.
+        fill_two(&mut buf);
+        let (strategy, ins) = resolving_shared_native();
+        infer_shapes_into(&strategy, &ins, &mut buf).unwrap();
+        assert_eq!(
+            buf.len(),
+            1,
+            "the shared-native arm left the second slot behind"
+        );
+    }
+
+    /// A `SharedNative` node that resolves natively, plus its operands.
+    fn resolving_shared_native() -> (ShapeInference, [TensorView<'static>; 2]) {
+        static DATA: [f32; 3] = [0.0; 3];
+        static WANT: [i64; 2] = [1, 4];
+        static DSHAPE: [usize; 2] = [3, 1];
+        static DSTRIDE: [i64; 2] = [1, 1];
+        static WSHAPE: [usize; 1] = [2];
+        static WSTRIDE: [i64; 1] = [1];
+        let data = TensorView::new(
+            DevicePtr(DATA.as_ptr().cast()),
+            DataType::Float32,
+            &DSHAPE,
+            &DSTRIDE,
+            DeviceId::cpu(),
+        );
+        let shape_in = TensorView::new(
+            DevicePtr(WANT.as_ptr().cast()),
+            DataType::Int64,
+            &WSHAPE,
+            &WSTRIDE,
+            DeviceId::cpu(),
+        );
+        let mut node = Node::new(
+            onnx_runtime_ir::NodeId(0),
+            "Expand",
+            vec![
+                Some(onnx_runtime_ir::ValueId(0)),
+                Some(onnx_runtime_ir::ValueId(1)),
+            ],
+            vec![onnx_runtime_ir::ValueId(2)],
+        );
+        node.version = Some(8);
+        (
+            ShapeInference::SharedNative {
+                node: Box::new(node),
+                fallback: Box::new(ShapeInference::SameAsInput(0)),
+            },
+            [data, shape_in],
+        )
+    }
+
+    /// The shared-native arm is reimplemented too, so it needs the oracle just
+    /// as much as the others -- on both sides of its branch. The `Resolved`
+    /// side is the one production actually takes for `Expand`/`Tile` with
+    /// concrete shape operands; the declining side is what routes a rule's
+    /// fallback back through the fast arms.
+    #[test]
+    fn infer_shapes_into_matches_infer_shapes_on_shared_native() {
+        let (resolving, ins) = resolving_shared_native();
+        assert_paths_agree(&resolving, &ins);
+
+        // A node no native rule knows: SymbolicOrUnknown, so the fallback runs.
+        let unknown = Node::new(
+            onnx_runtime_ir::NodeId(0),
+            "NotRegisteredAnywhere",
+            vec![Some(onnx_runtime_ir::ValueId(0))],
+            vec![onnx_runtime_ir::ValueId(1)],
+        );
+        let input = view(&[2, 3], &[3, 1]);
+        assert_eq!(
+            infer_shared_node(&unknown, &[input]),
+            SharedShapeResult::SymbolicOrUnknown,
+            "this test is vacuous unless the rule really declines"
+        );
+        assert_paths_agree(
+            &ShapeInference::SharedNative {
+                node: Box::new(unknown.clone()),
+                fallback: Box::new(ShapeInference::SameAsInput(0)),
+            },
+            &[input],
+        );
+        // A fallback that itself fails must surface the fallback's own error.
+        assert_paths_agree(
+            &ShapeInference::SharedNative {
+                node: Box::new(unknown),
+                fallback: Box::new(ShapeInference::SameAsInput(9)),
+            },
+            &[input],
+        );
+    }
+
     // ── Shapes carried in input values ───────────────────────────────────────
 
     #[test]
@@ -7624,6 +7939,14 @@ fn after() {}
         assert_eq!(starts[sources.len()], items.len());
     }
 
+    /// Build the reusable shape storage `absent_slot_strides` now reads.
+    fn dim_shapes(shapes: &[&[usize]]) -> Vec<crate::dim_vec::DimVec<usize>> {
+        shapes
+            .iter()
+            .map(|s| crate::dim_vec::DimVec::from_slice(s))
+            .collect()
+    }
+
     /// Absent strides are keyed by absent index, not slot index.
     ///
     /// Getting this wrong is invisible for a node with a single absent output
@@ -7633,12 +7956,7 @@ fn after() {}
     /// mis-key produces a different answer rather than the same one twice.
     #[test]
     fn absent_strides_are_keyed_by_absent_index_not_slot_index() {
-        let shapes = vec![
-            vec![2usize, 3, 4],
-            vec![5usize, 6],
-            vec![7usize, 8, 9],
-            vec![10usize],
-        ];
+        let shapes = dim_shapes(&[&[2, 3, 4], &[5, 6], &[7, 8, 9], &[10]]);
         // Slots 1 and 3 are absent, so absent index 0 is slot 1 and absent
         // index 1 is slot 3.
         let got = super::absent_slot_strides([1usize, 3].into_iter(), &shapes);
@@ -7654,7 +7972,7 @@ fn after() {}
 
     #[test]
     fn a_node_with_no_absent_outputs_builds_no_absent_strides() {
-        let shapes = vec![vec![2usize, 3], vec![4usize, 5]];
+        let shapes = dim_shapes(&[&[2, 3], &[4, 5]]);
         assert!(super::absent_slot_strides(std::iter::empty(), &shapes).is_empty());
     }
 
@@ -7663,7 +7981,7 @@ fn after() {}
     /// where a panic crosses an FFI boundary.
     #[test]
     fn an_out_of_range_absent_slot_yields_empty_strides() {
-        let shapes = vec![vec![2usize, 3]];
+        let shapes = dim_shapes(&[&[2, 3]]);
         let got = super::absent_slot_strides([9usize].into_iter(), &shapes);
         assert_eq!(got, vec![Vec::<i64>::new()]);
     }

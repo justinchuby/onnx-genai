@@ -704,16 +704,70 @@ SHELL_PREFIX_WORDS = frozenset(
 )
 
 # The heredoc operator, and only that. `(?<!<)` and `(?!<)` keep a `<<<`
-# herestring out, which would otherwise register a phantom heredoc whose
-# delimiter never arrives -- `hostlock.sh` and the test suites both use `<<<`.
+# herestring out, which would otherwise register a phantom heredoc.
 # `<<-` is captured rather than matched away, because the two forms terminate
 # differently: `<<` wants the delimiter alone on the line, `<<-` allows
 # leading **tabs** and nothing else.
-_HEREDOC = re.compile(r"(?<!<)(<<-?)(?!<)\s*(['\"]?)(\w+)")
+#
+# The delimiter is captured whole, as the *word* it is: one run of `\x`
+# escapes, quoted segments and ordinary characters. `\w+` was a silent
+# exemption -- `<<'EO-F'` captured `EO`, whose terminator never arrives, so
+# the body (usage text with a `hostlock.sh run` in it) was read as code --
+# and matching only a fully quoted *or* fully bare delimiter was the same
+# mistake one notch narrower: `<<\EOF` captured `\EOF` and `<<E"O"F`
+# captured `E`, neither of which is the terminator the shell will look for.
+# Those two fail *closed* rather than open, but `<<\EOF` is a perfectly
+# ordinary way to write `<<'EOF'`, and a check that demands a lock from a
+# file that already takes one gets deleted rather than obeyed.
+_HEREDOC = re.compile(
+    r"(?<!<)(<<-?)(?!<)\s*((?:\\.|'[^']*'|\"[^\"]*\"|[^\s;&|<>()])+)"
+)
 
-# A quoted word directly after the operator is the delimiter -- `<<'EOF'` --
-# and is the one quoted region that has to survive into the heredoc scan.
-_HEREDOC_OPEN = re.compile(r"<<-?\s*$")
+# The word after the operator, in the same shape, used to decide which quoted
+# regions have to survive into the heredoc scan: the delimiter's own quotes
+# do, everything else is blanked so a `<<` inside a string cannot open a
+# body. Anchored at the end and searched from the start of the line rather
+# than through a fixed lookback -- `\s*` is unbounded, so any fixed window is
+# defeated by enough whitespace -- and it spans a partial word so the inner
+# quotes of `<<E"O"F` are kept too.
+_HEREDOC_OPEN = re.compile(
+    r"<<-?\s*(?:\\.|'[^']*'|\"[^\"]*\"|[^\s;&|<>()])*$"
+)
+
+
+def _heredoc_delimiter(word: str) -> str:
+    """The terminator `sh` will compare against, from the word as written.
+
+    Quote removal, which the shell does before it ever looks for the
+    terminator: `'EOF'`, `"EOF"`, `\\EOF` and `E"O"F` all name `EOF`. Doing
+    this rather than special-casing a wholly quoted delimiter is what keeps
+    the two mixed forms from blanking to end of file and swallowing a real
+    acquisition below them.
+    """
+    out: list[str] = []
+    i, n = 0, len(word)
+    while i < n:
+        ch = word[i]
+        if ch == "\\" and i + 1 < n:
+            out.append(word[i + 1])
+            i += 2
+        elif ch in "'\"":
+            close = word.find(ch, i + 1)
+            if close < 0:
+                out.append(word[i + 1 :])
+                break
+            out.append(word[i + 1 : close])
+            i = close + 1
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
+
+# Arithmetic is not a redirection. `$(( 1 << k ))` and `(( n = 1 << k ))`
+# would otherwise open a heredoc whose delimiter is the shift's right-hand
+# word -- and since an unterminated heredoc blanks to end of file, that would
+# swallow a real acquisition below it and report a gated harness as ungated.
+_ARITH = re.compile(r"\$\(\(|\(\(")
 
 _ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
@@ -733,8 +787,8 @@ _TO_SPACE = str.maketrans({c: " " for c in "\"';|&(){}`"})
 SHELL_SEPARATORS = " \t\n;|&(){}`"
 
 
-def _heredoc_body_end(source: str, start: int, dash: bool, delim: str) -> int | None:
-    """Where the body opened by `<<delim` ends, or None if it never does.
+def _heredoc_body_end(source: str, start: int, dash: bool, delim: str) -> int:
+    """Where the body opened by `<<delim` ends -- end of file if it never does.
 
     The terminator must be the delimiter **alone** on its line -- `<<-` also
     allows leading tabs, and nothing else does. Matching it with `.strip()`
@@ -742,22 +796,25 @@ def _heredoc_body_end(source: str, start: int, dash: bool, delim: str) -> int | 
     early and exposed the rest of it as code, which for a usage block is
     precisely the false custody this scanner exists to refuse.
 
-    Returning None for a delimiter that never arrives is deliberate, and it
-    is the fail-closed direction made cheap. A `<<` that is not a heredoc at
-    all -- `$(( 1 << k ))`, or one inside a construct this scanner does not
-    model -- would otherwise blank the whole rest of the file and lose a real
-    acquisition below it, reporting somebody else's gated harness as ungated.
+    A delimiter that never arrives consumes the rest of the file, which is
+    what `sh` does: the body is fed to the command, and a warning is all
+    `bash` says about it (`dash` says nothing). The file *runs*; what it does
+    not do is execute its heredoc. Blanking to end of file is therefore the
+    faithful reading, and it is also the fail-closed one -- the cost is a
+    ledger line if this scanner ever mistakes something else for a heredoc
+    operator, which is why `<<<`, arithmetic and quoted `<<` are excluded
+    before we get here rather than after.
     """
     n = len(source)
     probe = start
     while probe < n:
         end = source.find("\n", probe)
         end = n if end < 0 else end
-        line = source[probe:end]
+        line = source[probe:end].rstrip("\r")
         if (line.lstrip("\t") if dash else line) == delim:
             return end
         probe = end + 1
-    return None
+    return n
 
 
 def strip_shell_comments(source: str) -> str:
@@ -802,19 +859,23 @@ def strip_shell_comments(source: str) -> str:
     The heredoc scan runs over a **second** blanking of the same text in
     which every quoted region is blanked, so `echo "x << 2"` cannot register
     a heredoc; the sole exception is a quoted word directly after the
-    operator, which is the delimiter (`<<'EOF'`).
+    operator, which is the delimiter (`<<'EOF'`). Arithmetic on one line
+    (`$(( 1 << k ))`, `(( n = 1 << k ))`) is blanked there too, because a
+    shift is not a redirection and its right-hand word is not a delimiter.
+    A heredoc whose delimiter never arrives consumes the rest of the file,
+    which is what `sh` does with it.
 
     What it does not model, each with the direction it fails in:
 
       * Deliberate indirection -- `eval`, a subcommand held in a variable, a
         `$LOCK` alias. **Fail-open**, exactly as the Python side cannot see
         `getattr(subprocess, "run")`, and not closable by reading source.
-      * A heredoc whose delimiter never arrives, i.e. a script the shell
-        would reject: its body is read as code. **Fail-open**, on a file
-        that does not run.
-      * `<<` that is not a heredoc, in a construct not modelled here, where
-        the shift's right-hand word later appears alone on a line.
-        **Fail-closed**, and it costs a ledger line rather than a pass.
+      * A `<<` this scanner still mistakes for a heredoc operator -- one
+        inside a construct not modelled above -- whose delimiter then never
+        arrives, blanking the rest of the file. **Fail-closed**: it costs a
+        ledger line in somebody else's lane rather than a silent pass, which
+        is the direction to fail in but not a free one, because a check that
+        cries wolf gets deleted rather than obeyed.
     """
     out: list[str] = []
     # A parallel copy in which *every* quoted region is blanked. `out` keeps
@@ -833,14 +894,13 @@ def strip_shell_comments(source: str) -> str:
         """Blank the bodies of any heredocs the finished line opened."""
         nonlocal i, chunk
         for m in _HEREDOC.finditer("".join(scan[chunk:])):
-            pending.append((m.group(1).endswith("-"), m.group(3)))
+            pending.append(
+                (m.group(1).endswith("-"), _heredoc_delimiter(m.group(2)))
+            )
         i += 1
         while pending and i < n:
             dash, delim = pending.pop(0)
             end = _heredoc_body_end(source, i, dash, delim)
-            if end is None:
-                pending.clear()
-                break
             emit("".join(c if c == "\n" else " " for c in source[i:end]))
             i = end
             if i < n:
@@ -854,6 +914,30 @@ def strip_shell_comments(source: str) -> str:
             emit(source[i : i + 2])
             i += 2
             continue
+        arith = _ARITH.match(source, i)
+        if arith:
+            # Arithmetic, kept in `out` (it is code) and blanked in `scan`
+            # (it is not a redirection). Only when the whole thing sits on
+            # one line: a `((` spanning lines is far more likely to be two
+            # subshells, and blanking those in the scan would hide a real
+            # heredoc opened inside them.
+            depth, probe = 0, arith.start()
+            while probe < n:
+                if source[probe] == "(":
+                    depth += 1
+                elif source[probe] == ")":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                elif source[probe] == "\n":
+                    break
+                probe += 1
+            if probe < n and depth == 0:
+                region = source[i : probe + 1]
+                out.append(region)
+                scan.append(" " * len(region))
+                i = probe + 1
+                continue
         if ch in "'\"":
             # `$'...'` is the one single-quoted form that processes `\'`.
             escapes = ch == '"' or source[i - 1 : i] == "$"
@@ -868,7 +952,7 @@ def strip_shell_comments(source: str) -> str:
                 out.append(region)
             scan.append(
                 region
-                if _HEREDOC_OPEN.search(source[max(0, i - 8) : i])
+                if _HEREDOC_OPEN.search(source[source.rfind("\n", 0, i) + 1 : i])
                 else " " * len(region)
             )
             i = close + 1
@@ -1922,6 +2006,43 @@ class EpShellHarnesses(unittest.TestCase):
         # the normal case under `hostlock.sh run` inside another harness.
         self.assertRegex(code, r"while \[.*\$_p.*\]")
 
+    def test_the_census_parses_the_status_line_the_lock_actually_prints(self):
+        # Naming `HELD by` is not parsing it. This runs the census's own
+        # `sed` -- lifted out of the file, not restated -- over a line built
+        # from `hostlock.sh`'s own `echo`, so a format change on either side
+        # is a failure here rather than a census that silently degrades to
+        # "always re-acquire" and quietly stops nesting.
+        census = ep_shell_sources()["decode_placement_census.sh"]
+        script = re.search(r"sed -n '([^']*HELD by[^']*)'", census)
+        self.assertIsNotNone(script, "the status parse moved or changed shape")
+
+        lock = (ORT_AB.parents[1] / "scripts" / "hostlock.sh").read_text()
+        template = re.search(r'echo "(HELD by \$\{[^"]*)"', lock)
+        self.assertIsNotNone(template, "hostlock.sh's HELD line moved")
+        line = (
+            template.group(1)
+            .replace("${owner}", "justinchu")
+            .replace("${pid}", "31337")
+            .replace("${age}", "12")
+            .replace("${at}", "2026-08-25T20:46:18Z")
+        )
+        self.assertNotIn("${", line, line)
+
+        def parsed(text: str) -> str:
+            return subprocess.run(
+                ["sed", "-n", script.group(1)],
+                input=text,
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip()
+
+        self.assertEqual(parsed(line + "\n  reason: x\n"), "31337")
+        # And the states that are not custody yield nothing, so the census
+        # re-execs rather than reading somebody's expired claim as its own.
+        for other in ("FREE  (runnable=3)", "STALE by u pid=1 (holder gone)"):
+            self.assertEqual(parsed(other + "\n"), "")
+
     def test_a_new_ungated_shell_harness_there_is_a_failure(self):
         fail = ep_shell_failures({"knee.sh": "#!/bin/sh\ncargo bench --bench x\n"})
         self.assertEqual(len(fail), 1)
@@ -2010,6 +2131,21 @@ class EpShellHarnesses(unittest.TestCase):
             "printf 'intro\\ninvoke: %s %s\\n' scripts/hostlock.sh run\n",
             'echo "a\nb" ./scripts/hostlock.sh run\n',
             "cat <<EOF\n  EOF\n./scripts/hostlock.sh run -- x\nEOF\n",
+            # Delimiters that are not `\w+`. `<<'EO-F'` captured `EO`, whose
+            # terminator never arrives, and the body was then read as code --
+            # an undocumented silent exemption, and `<<'END-OF-USAGE'` is an
+            # ordinary thing to write.
+            "cat <<'EO-F'\nscripts/hostlock.sh run -- x\nEO-F\n",
+            "cat <<END.TXT\nscripts/hostlock.sh run -- x\nEND.TXT\n",
+            # Enough whitespace to defeat a fixed-width lookback in front of
+            # the quoted delimiter, which is why that search runs from the
+            # start of the line.
+            "cat <<       'EOF'\nscripts/hostlock.sh run -- x\nEOF\n",
+            # A heredoc whose delimiter never arrives. `sh` feeds the rest of
+            # the file to `cat` and the script exits 0 -- it runs, and it
+            # holds nothing.
+            "cat <<EOF\nscripts/hostlock.sh run -- x\n",
+            "cat <<EOF\r\nscripts/hostlock.sh run -- x\r\nEOF\r\n",
         ):
             self.assertFalse(shell_holds_the_lock(source), source)
 
@@ -2029,6 +2165,35 @@ class EpShellHarnesses(unittest.TestCase):
             "cat <<<word\n./scripts/hostlock.sh run -- x\n",
             "msg=$'can\\'t'\n./scripts/hostlock.sh run -- x\n",
             "cat <<EOF\nhello\nEOF\n./scripts/hostlock.sh run -- x\n",
+            # A heredoc that *does* end has to give the rest of the file
+            # back, and these are the two shapes where a narrower terminator
+            # rule silently does not: a bare delimiter that is not `\w+`
+            # (`\w+` captured `END`, which never arrives), and CRLF line
+            # endings (the terminator line is `EOF\r`). Both fail closed, so
+            # only a positive case can see them -- the false-cases above
+            # pass either way, which is exactly why they were not enough.
+            "cat <<END.TXT\nhi\nEND.TXT\n./scripts/hostlock.sh run -- x\n",
+            "cat <<EOF\r\nhi\r\nEOF\r\n./scripts/hostlock.sh run -- x\r\n",
+            # The quoted delimiter, positively. Every other cell for
+            # `<<'EOF'` is a false-case, and review showed they all still
+            # pass with the quoted handling removed entirely -- because the
+            # bare path then captures `'EO-F'` *with* its quotes, which also
+            # never terminates, and over-blanking hides an over-blanking bug.
+            # Only a real acquisition below the terminator can tell the two
+            # apart.
+            "cat <<'EOF'\nhi\nEOF\n./scripts/hostlock.sh run -- x\n",
+            # Delimiters the shell quote-removes but that are neither wholly
+            # quoted nor wholly bare. `<<\\EOF` is an ordinary way to write
+            # `<<'EOF'`; matching it as `\\EOF` left the terminator unfound.
+            "cat <<\\EOF\nhi\nEOF\n./scripts/hostlock.sh run -- x\n",
+            'cat <<E"O"F\nhi\nEOF\n./scripts/hostlock.sh run -- x\n',
+            # The delimiter word ends at a shell metacharacter, so what
+            # follows the operator on the same line is not part of it. Found
+            # by mutation: widening the bare class to `[^\s]` captured
+            # `EOF;` and `EOF>out`, neither of which ever terminates, and
+            # the acquisition below was blanked with the rest of the file.
+            "cat <<EOF; echo hi\nbody\nEOF\n./scripts/hostlock.sh run -- x\n",
+            "(cat <<EOF)\nbody\nEOF\n./scripts/hostlock.sh run -- x\n",
             # The last two discriminate the two *narrower* guards from the
             # broad one above them: excluding `<<<`, and running the heredoc
             # scan over a copy in which quoted regions are blanked. Both are
@@ -2040,6 +2205,15 @@ class EpShellHarnesses(unittest.TestCase):
             # distinguish is a guard that gets deleted as dead weight.
             "cat <<<word\n./scripts/hostlock.sh run -- x\nword\n",
             'echo "x << 2"\n./scripts/hostlock.sh run -- x\n2\n',
+            # Arithmetic is not a redirection. Both forms, and with the
+            # shift's right-hand word later alone on a line, which is what
+            # makes the exclusion load-bearing rather than incidental: an
+            # unterminated heredoc consumes the rest of the file.
+            "(( n = 1 << k ))\n./scripts/hostlock.sh run -- x\n",
+            "n=$(( 1 << k ))\n./scripts/hostlock.sh run -- x\nk\n",
+            # A `((` spanning lines is two subshells, not arithmetic, and a
+            # heredoc opened inside it still has to be seen.
+            "( (cat <<EOF\nhi\nEOF\n) )\n./scripts/hostlock.sh run -- x\n",
         ):
             self.assertTrue(shell_holds_the_lock(source), source)
 
@@ -2124,8 +2298,8 @@ class EpShellHarnesses(unittest.TestCase):
         def sentence(name: str) -> str:
             at = doc.index(name)
             start = max(doc.rfind(". ", 0, at), doc.rfind("\n\n", 0, at)) + 1
-            end = doc.find(". ", at + len(name))
-            text = doc[start : end if end > 0 else len(doc)].lower()
+            ends = [e for e in (doc.find(". ", at), doc.find("\n\n", at)) if e > 0]
+            text = doc[start : min(ends) if ends else len(doc)].lower()
             # Emphasis and line wrapping are formatting, not claims: `**takes
             # the lock**` split across two lines is the same sentence.
             return " ".join(text.replace("*", "").replace("`", "").split())
@@ -2133,15 +2307,42 @@ class EpShellHarnesses(unittest.TestCase):
         census = sentence("decode_placement_census.sh")
         # "takes the lock", not the bare token `lock` -- which "hostlock.sh"
         # contains, so the weaker assertion held even for a sentence saying
-        # the opposite.
+        # the opposite. Substring matching still cannot see a negation, so
+        # the ones a rewrite would plausibly reach for are named.
         self.assertIn("takes the lock", census)
+        for negation in ("no longer", "does not", "used to", "should", "never"):
+            self.assertNotIn(negation, census, census)
         self.assertNotIn("known-gap", census)
         self.assertTrue(shell_holds_the_lock(sources["decode_placement_census.sh"]))
 
         modulo = sentence("int4_modulo_arms.sh")
         self.assertIn("known-gap", modulo)
+        # The mirror of the assertion above. It does not discriminate against
+        # today's prose -- the paragraph after this sentence happens not to
+        # say "takes the lock" -- so it is a drift guard for a rewrite that
+        # moves the two descriptions adjacent, not a control that proves the
+        # boundary is tight.
+        self.assertNotIn("takes the lock", modulo)
         self.assertTrue(EP_SHELL_LEDGER["int4_modulo_arms.sh"].startswith(EP_GAP))
         self.assertFalse(shell_holds_the_lock(sources["int4_modulo_arms.sh"]))
+
+    def test_the_readme_does_not_still_describe_a_rule_that_was_replaced(self):
+        # This file's own recurring defect, applied to its own prose: the
+        # README described an unterminated heredoc as blanking nothing long
+        # after that had become the opposite -- and it was fail-open besides,
+        # since a body read as code is exactly the false custody the pass
+        # exists to refuse. So the behaviour is asserted here, and the doc is
+        # required to state the rule that actually holds.
+        #
+        # Stated positively rather than as a banned phrase: the retraction a
+        # few lines further down the README quotes the old wording verbatim,
+        # and a check that cannot tell a claim from a correction of it would
+        # have to be satisfied by deleting the correction.
+        unterminated = "cat <<EOF\n./scripts/hostlock.sh run -- x\n"
+        self.assertNotIn("hostlock", strip_shell_comments(unterminated))
+        self.assertFalse(shell_holds_the_lock(unterminated))
+        doc = " ".join((ORT_AB / "README.md").read_text().split())
+        self.assertIn("a delimiter that never arrives consumes the rest of", doc)
 
     def test_the_shell_ledger_is_checked_in_both_directions(self):
         self.assertEqual(dead_shell_records(ep_shell_sources()), [])

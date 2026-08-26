@@ -79,7 +79,7 @@ jobs:
   # not too large to read, but a single added line in a diff of hundreds, and the
   # root is exactly where `git add -A` in a working tree picks up scratch.
   #
-  # Seven entries, in six incidents, found by walking every root path ever added
+  # Eight entries, in seven incidents, found by walking every root path ever added
   # and subtracting what is still here -- not by collecting what people reported:
   #
   #   .msg.txt       39675330b -> bbc193117    1.6h
@@ -90,12 +90,13 @@ jobs:
   #   .commitmsg     e42fa9470 -> 398cff8e5   19.8h   (#1881, removed by #1999)
   #   .pris_v4.log   589d48ffd -> 7a6482c83    1.3h   (#1951, removed by #1975)
   #   .body.md       79196f89d -> 54625db9d    2.7h   (#2026, removed by #2036)
+  #   .roy-scratch/  b054ff63e -> 7c127897b    1.4h   (#2150, removed by #2156)
   #
   # Deliberately excluded, because their removal commits say what they were:
   # `site` (moved to onnx-genai-wiki, #1488), `third_party` (oneDNN backend
   # removal) and `abresults` (added by a `docs(benchmarks):` commit that says it
   # is recording a result, reconsidered 5.5 days later -- intentional when added,
-  # which is what separates it from the seven).
+  # which is what separates it from the eight).
   #
   # Each repair added one more pattern to .gitignore, and each time the next name
   # fell outside every pattern written for the previous one -- .body.md landed
@@ -114,7 +115,7 @@ jobs:
   #
   # The cost of comparing first segments: this sees root children only. Scratch
   # dropped under an already-blessed directory (scripts/tmp/junk.log) is invisible
-  # to it. That is the correct trade -- the six incidents were all at the root --
+  # to it. That is the correct trade -- the seven incidents were all at the root --
   # but "clean root" means the root's own entries, not the tree beneath them.
   root-files:
     name: Root file allowlist
