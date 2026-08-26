@@ -37,7 +37,16 @@ use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, TryLockError};
 use std::thread::JoinHandle;
 
-type Job<T> = Box<dyn FnOnce(&mut T) + Send + 'static>;
+/// What a job did, reported to the worker loop so it can decide whether to
+/// keep going. The panic *message* also travels back to the caller on its own
+/// reply channel — see [`ThreadOwned::with`] — so that the call that caused the
+/// panic never has to race the worker to read it.
+enum JobOutcome {
+    Completed,
+    Panicked(Option<String>),
+}
+
+type Job<T> = Box<dyn FnOnce(&mut T) -> JobOutcome + Send + 'static>;
 
 /// Why a call could not reach the owned value.
 ///
@@ -65,8 +74,12 @@ pub(crate) enum CallError {
 pub(crate) enum SpawnError<E> {
     /// The OS refused a thread.
     Thread(std::io::Error),
-    /// The value's own constructor failed.
+    /// The value's own constructor returned an error.
     Build(E),
+    /// The value's own constructor panicked. Distinct from [`Self::Thread`]
+    /// because the thread did start — reporting a construction panic as a
+    /// spawn failure would name the wrong subsystem and discard the payload.
+    BuildPanicked(Option<String>),
 }
 
 /// A value that lives on, and only on, a thread of its own.
@@ -127,18 +140,19 @@ impl<T: 'static> ThreadOwned<T> {
                     }
                 };
                 while let Ok(job) = jobs_rx.recv() {
-                    // `AssertUnwindSafe` is honest here rather than convenient:
-                    // a panicking job ends this loop, so the possibly-inconsistent
-                    // value is dropped immediately below and is never observed
-                    // again. That is the same bargain a poisoned `Mutex` strikes.
-                    let outcome = catch_unwind(AssertUnwindSafe(|| job(&mut value)));
-                    if let Err(payload) = outcome {
+                    // The job catches its own panic and reports it here, so the
+                    // caller reads the message from its own reply channel
+                    // rather than racing this write.
+                    if let JobOutcome::Panicked(message) = job(&mut value) {
                         if let Ok(mut slot) = worker_panic.lock() {
-                            *slot = panic_message(payload.as_ref());
+                            *slot = message;
                         }
                         break;
                     }
                 }
+                // Reached on both exits: the channel closing, and the `break`
+                // above. A panicking job's possibly-inconsistent value is
+                // released here, on the only thread allowed to release it.
                 drop(value);
             })
             .map_err(SpawnError::Thread)?;
@@ -150,15 +164,15 @@ impl<T: 'static> ThreadOwned<T> {
                 worker: Some(worker),
             }),
             Ok(Err(err)) => Err(SpawnError::Build(err)),
-            // The worker panicked inside `build`. Surface it as a build
-            // failure with the panic payload the thread already printed.
-            Err(_) => {
-                let panic = worker.join().err();
-                Err(SpawnError::Thread(std::io::Error::other(match panic {
-                    Some(_) => "the owning thread panicked while constructing the value",
-                    None => "the owning thread exited before constructing the value",
-                })))
-            }
+            // The worker died inside `build`. Almost always a panic; join to
+            // recover the payload rather than reporting a spawn failure the
+            // thread plainly did not have.
+            Err(_) => match worker.join() {
+                Err(payload) => Err(SpawnError::BuildPanicked(panic_message(payload.as_ref()))),
+                Ok(()) => Err(SpawnError::Thread(std::io::Error::other(
+                    "the owning thread exited before constructing the value",
+                ))),
+            },
         }
     }
 
@@ -178,17 +192,41 @@ impl<T: 'static> ThreadOwned<T> {
         })?;
         let sender = guard.as_ref().ok_or_else(|| self.worker_lost())?;
 
-        let (result_tx, result_rx) = mpsc::channel::<R>();
+        let (result_tx, result_rx) = mpsc::channel::<Result<R, Option<String>>>();
         let boxed: Job<T> = Box::new(move |value| {
-            let _ = result_tx.send(job(value));
+            // `AssertUnwindSafe` is honest rather than convenient: a panicking
+            // job ends the worker loop, so the possibly-inconsistent value is
+            // dropped and never observed again. That is the bargain a poisoned
+            // `Mutex` strikes, and it is why the caller's answer must be sent
+            // from inside this frame — the reply and the panic message then
+            // travel together instead of through two unordered paths.
+            match catch_unwind(AssertUnwindSafe(|| job(value))) {
+                Ok(result) => {
+                    let _ = result_tx.send(Ok(result));
+                    JobOutcome::Completed
+                }
+                Err(payload) => {
+                    let message = panic_message(payload.as_ref());
+                    let _ = result_tx.send(Err(message.clone()));
+                    JobOutcome::Panicked(message)
+                }
+            }
         });
         sender.send(boxed).map_err(|_| self.worker_lost())?;
-        // A panic inside the job unwinds the worker, dropping `result_tx`, so
-        // this returns rather than blocking forever.
-        result_rx.recv().map_err(|_| self.worker_lost())
+        match result_rx.recv() {
+            Ok(Ok(result)) => Ok(result),
+            Ok(Err(panic)) => Err(CallError::WorkerLost { panic }),
+            // The worker died without answering — it was already gone, or it
+            // unwound somewhere this frame does not cover.
+            Err(_) => Err(self.worker_lost()),
+        }
     }
 
     /// The lost-worker error, carrying the panic message if there was one.
+    ///
+    /// Only for callers that did *not* cause the panic: the worker's write to
+    /// `last_panic` happens before it drops the job channel, which is what makes
+    /// their `send` fail, so they observe it.
     fn worker_lost(&self) -> CallError {
         CallError::WorkerLost {
             panic: self.last_panic.lock().ok().and_then(|slot| slot.clone()),
@@ -346,8 +384,29 @@ mod tests {
         let result = ThreadOwned::<Rc<()>>::new("probe", || Err("no model there"));
         match result {
             Err(SpawnError::Build(err)) => assert_eq!(err, "no model there"),
-            Err(SpawnError::Thread(err)) => panic!("wrong variant: {err}"),
+            Err(other) => panic!("wrong variant: {other:?}"),
             Ok(_) => panic!("a failing constructor produced a handle"),
+        }
+    }
+
+    /// A constructor that panics is not a failure to start a thread — the
+    /// thread started fine. Reporting it as one would name the wrong subsystem
+    /// and throw away the only useful detail.
+    #[test]
+    fn a_panicking_constructor_is_reported_separately_and_keeps_its_message() {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = ThreadOwned::<Rc<()>>::new("probe", || -> Result<Rc<()>, Infallible> {
+            panic!("metadata said 0 layers")
+        });
+        std::panic::set_hook(previous);
+
+        match result {
+            Err(SpawnError::BuildPanicked(panic)) => {
+                assert_eq!(panic.as_deref(), Some("metadata said 0 layers"));
+            }
+            Err(other) => panic!("wrong variant: {other:?}"),
+            Ok(_) => panic!("a panicking constructor produced a handle"),
         }
     }
 }

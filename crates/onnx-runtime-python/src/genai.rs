@@ -193,7 +193,7 @@ impl Engine {
         // Built on the worker, because the sessions, allocators and bindings it
         // creates belong to whichever thread creates them.
         let owned_path = path.clone();
-        let inner = ThreadOwned::new("nxrt-genai-engine", move || {
+        let inner = ThreadOwned::new("nxrt-genai", move || {
             RustEngine::from_dir(Path::new(&owned_path), config).map_err(|err| err.to_string())
         })
         .map_err(|err| match err {
@@ -201,6 +201,12 @@ impl Engine {
                 "failed to load genai model from {path:?}: {err}. Verify the directory \
                  contains compatible ONNX graph(s), tokenizer.json, and \
                  inference_metadata.yaml or genai_config.json."
+            )),
+            SpawnError::BuildPanicked(panic) => PyValueError::new_err(format!(
+                "loading the genai model from {path:?} panicked: {}. This is a bug in \
+                 the engine rather than a problem with the model directory; please \
+                 report it with the model's metadata/config.",
+                panic.as_deref().unwrap_or("no message")
             )),
             SpawnError::Thread(err) => PyRuntimeError::new_err(format!(
                 "failed to start the thread that owns the genai engine: {err}. Each \
