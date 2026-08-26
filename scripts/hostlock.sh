@@ -1447,6 +1447,27 @@ name_is_safe() {
     return 0
 }
 
+# The token a rejected value is replaced with.
+#
+# It carries an `@` for one reason: `@` is outside the safe-name class, so no
+# value this guard ACCEPTS can ever equal it. A bare `malformed` would be in
+# the class it polices -- an agent legitimately named `malformed` would render
+# `held_by=malformed`, byte-identical to a row where junk was thrown away, and
+# the reader could not tell "this agent holds the box" from "we discarded what
+# the file said". A sentinel drawn from the set it is meant to stand outside
+# of is the same collapse this guard exists to prevent, one level up.
+#
+# `@` and not `<`, `(` or `!`: these rows get pasted into shells and issue
+# comments, and the other three are redirection, subshell and history syntax.
+#
+# `unknown` and `none` remain in-class, and that is a knowing exception rather
+# than an oversight. They are `meta_get`'s absence defaults, used across this
+# whole script, and they degrade rather than invert: a foreign `owner=unknown`
+# makes a claimed box report an unnamed holder, which is still claimed. The
+# malformed sentinel is the one that has to be unforgeable, because it is the
+# one that says the row itself is not trustworthy.
+FLAT_MALFORMED='@malformed'
+
 # Guard for a value about to be placed in the space-separated `key=value` row.
 #
 # Write-time validation covers the owners THIS script writes. It cannot cover
@@ -1472,7 +1493,12 @@ name_is_safe() {
 # agent. And `unknown` already means "the key is absent", which is a different
 # fact; collapsing the two is what `meta_get` is written to avoid.
 flat_field() {
-    if name_is_safe "$1"; then printf '%s' "$1"; else printf 'malformed'; fi
+    if name_is_safe "$1"; then
+        printf '%s' "$1"
+        return 0
+    fi
+    printf '%s' "$FLAT_MALFORMED"
+    return 1
 }
 
 # The same guard for a value that is not a name.
@@ -1491,9 +1517,81 @@ flat_field() {
 # this reason.
 flat_value() {
     case "$1" in
-        '' | *[[:space:]]*) printf 'malformed' ;;
-        *) printf '%s' "$1" ;;
+        '' | *[[:space:]]* | "$FLAT_MALFORMED")
+            printf '%s' "$FLAT_MALFORMED"
+            return 1
+            ;;
     esac
+    printf '%s' "$1"
+    return 0
+}
+
+# The same guard again, for the OTHER machine-readable grammar.
+#
+# `status --porcelain` is one `key=value` per LINE, so its delimiter is the
+# newline and its rule is narrower than the flat row's: a space in a value
+# forges nothing there, which is why `reason`, `worktree` and `cmd` are
+# emitted raw and should stay that way. A newline does forge, and one is
+# reachable -- `lock_dir` and `legacy_dir` come from `HOSTLOCK_DIR`,
+# `HOSTLOCK_CONF` and `HOSTLOCK_LEGACY_DIR`, which are environment strings and
+# not metadata, so `meta_get`'s one-line read does not bound them.
+#
+# Demonstrated before this existed: with `HOSTLOCK_LEGACY_DIR` set to
+# `a<newline>state=FREE`, `status --porcelain` emitted `legacy_dir=a` followed
+# by a whole forged `state=FREE` line, and a last-wins parse of the porcelain
+# takes it. Same defect as the flat row, sibling emitter, and it would have
+# survived fixing only the one that was reported.
+#
+# `*$'\n'*`, not `*"$(printf '\n')"*`. Command substitution strips trailing
+# newlines, so the second spells the EMPTY string, the pattern degenerates to
+# `**`, and the guard rejects every value it is ever shown. It was written
+# that way first. It passed `bash -n`, passed `shellcheck`, and passed the
+# hand-check -- because the hand-check used a value that was supposed to be
+# rejected, so a guard that rejects everything answered it correctly. The
+# cry-wolf negative control is what caught it, which is the whole reason a
+# guard needs one.
+flat_line() {
+    case "$1" in
+        *$'\n'*)
+            printf '%s' "$FLAT_MALFORMED"
+            return 1
+            ;;
+    esac
+    printf '%s' "$1"
+    return 0
+}
+
+# Record one field of the provenance row, and its original text if the guard
+# rejected it.
+#
+# Every field goes through here, and the KIND is named at the call site, so a
+# field added later cannot reach the row without someone choosing one of
+# `name`, `value` or `trusted` for it. That is the point: the previous shape
+# applied the guard by remembering to wrap each value, and the same defect
+# comes back the first time somebody appends a line without wrapping.
+#
+# Rejection is signalled by the guard's EXIT STATUS, not by comparing its
+# output to its input. The two are not the same test -- a stored value that is
+# literally the sentinel would compare equal and look accepted -- and the
+# recovery line has to follow what the guard decided, not what the row
+# happens to look like afterwards.
+prov_add() {
+    local kind=$1 key=$2 val=$3 out rc
+    case "$kind" in
+        name) out=$(flat_field "$val") ;;
+        value) out=$(flat_value "$val") ;;
+        # Computed here from an enum, a loadavg read or `date` -- never read
+        # back out of the metadata file, so there is no foreign writer in the
+        # path and nothing to guard against.
+        trusted)
+            PROV_FIELDS+=("${key}=${val}")
+            return 0
+            ;;
+        *) die "prov_add: unknown field kind: ${kind}" ;;
+    esac
+    rc=$?
+    PROV_FIELDS+=("${key}=${out}")
+    [ "$rc" -eq 0 ] || PROV_RAWS+=("${key}_raw=${val}")
 }
 
 cmd_provenance() {
@@ -1553,39 +1651,57 @@ cmd_provenance() {
     # hidden -- it is in hostlock_state.
     local declared=no
     case "$state" in HELD | EXPIRED) declared=yes ;; esac
-    # Every value below that came out of the metadata file goes through
-    # `flat_field`, not just `owner`. `owner` is the one an operator types, so
+    # Every value below that came out of the metadata file is declared `name`
+    # or `value`, not just `owner`. `owner` is the one an operator types, so
     # it is the one that gets injected by accident -- but `takeover`, `gate`,
     # `held_uid` and `runnable_at_acquire` are read from the same file by the
     # same `meta_get`, and a row is corrupted by whichever of them a foreign
     # writer got wrong, not by the one we happened to think of. Fixing only
     # the reported symptom is how the same defect returns wearing a different
     # field name.
-    local fields=(
-        "hostlock_state=${state}"
-        "declared=${declared}"
-        "held_by=$(flat_field "${owner:-none}")"
-        "held_uid=$(flat_field "${uid:-unknown}")"
-        "held_pid=$(flat_field "${pid:-none}")"
-        "held_secs=$(flat_field "${age}")"
-        "takeover=$(flat_value "${takeover:-none}")"
-        "gate=$(flat_value "${gate:-none}")"
-        "runnable_at_acquire=$(flat_field "${r_acq:-unknown}")"
-        "runnable=${r}"
-        "contended=${contended}"
-        # WHICH lock this row is about. Without it a private lock's row is
-        # byte-identical to a shared one, so a table of measurements taken
-        # with HOSTLOCK_DIR set -- coordinating with nobody -- reads exactly
-        # like a table taken under the real host lock. `declared=yes` is a
-        # claim about a host; it is only checkable if the row says which
-        # directory the claim was made in.
-        "lock_dir=$(flat_value "${LOCK_DIR}")"
-        "lock_scope=${LOCK_SCOPE}"
-        "lock_dir_source=${LOCK_DIR_SOURCE}"
-        "legacy_dir=$(flat_value "$(legacy_consult_path)")"
-        "legacy_held_by=$(flat_field "${legacy:-none}")"
-        "sampled_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    )
+    #
+    # `trusted` is a claim, and it is the one to read sceptically in review:
+    # it asserts the value is computed here and never round-tripped through
+    # the metadata file. Every one of them is an enum, a `/proc` read or
+    # `date`.
+    PROV_FIELDS=()
+    PROV_RAWS=()
+    prov_add trusted hostlock_state "${state}"
+    prov_add trusted declared "${declared}"
+    prov_add name held_by "${owner:-none}"
+    prov_add name held_uid "${uid:-unknown}"
+    prov_add name held_pid "${pid:-none}"
+    # `trusted`, and this one is worth justifying because it looks like the
+    # others. `held_secs` is not the stored `acquired_epoch`; it is
+    # `lock_age`, which is `$((now - epoch))` after `num_or` has forced the
+    # operand to a number. Arithmetic output cannot contain whitespace, so
+    # there is nothing for the guard to reject. Verified rather than assumed
+    # -- `acquired_epoch` was set to `1 hostlock_state=FREE`, to `abc`, to
+    # empty and to `99 x`, and the field read back a plain integer and the row
+    # stayed 17 fields wide in every case. Classifying it `name` would have
+    # been a guard on a value that cannot be malformed, which reads as
+    # coverage and is not. The cell below is what fails if `lock_age` ever
+    # starts echoing what it read.
+    prov_add trusted held_secs "${age}"
+    prov_add value takeover "${takeover:-none}"
+    prov_add value gate "${gate:-none}"
+    prov_add name runnable_at_acquire "${r_acq:-unknown}"
+    prov_add trusted runnable "${r}"
+    prov_add trusted contended "${contended}"
+    # WHICH lock this row is about. Without it a private lock's row is
+    # byte-identical to a shared one, so a table of measurements taken with
+    # HOSTLOCK_DIR set -- coordinating with nobody -- reads exactly like a
+    # table taken under the real host lock. `declared=yes` is a claim about a
+    # host; it is only checkable if the row says which directory the claim
+    # was made in -- which is also why `lock_dir` needs a recovery line and
+    # not just the sentinel: a path this script cannot print flat is exactly
+    # the case where the reader most needs to know what it was.
+    prov_add value lock_dir "${LOCK_DIR}"
+    prov_add trusted lock_scope "${LOCK_SCOPE}"
+    prov_add trusted lock_dir_source "${LOCK_DIR_SOURCE}"
+    prov_add value legacy_dir "$(legacy_consult_path)"
+    prov_add name legacy_held_by "${legacy:-none}"
+    prov_add trusted sampled_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     if [ "$ONELINE" = 1 ]; then
         # `reason` is deliberately NOT in the one-line form. It is free text
         # written by whoever held the lock, it is unquoted and unterminated
@@ -1593,26 +1709,28 @@ cmd_provenance() {
         # text comes from a peer. A two-word reason silently truncates the
         # field; anything shell-active is worse. Multi-line output carries it
         # on its own line, where a newline is the delimiter.
-        echo "${fields[*]}"
+        echo "${PROV_FIELDS[*]}"
     else
-        printf '%s\n' "${fields[@]}"
+        printf '%s\n' "${PROV_FIELDS[@]}"
         printf 'reason=%s\n' "${reason:-}"
         # Same rule as `reason`, for the same reason: a path can contain
         # spaces and a command almost always does, so neither is safe among
         # space-separated fields. One per line, newline-delimited.
         printf 'held_worktree=%s\n' "${holder_wt:-unknown}"
         printf 'held_cmd=%s\n' "${holder_cl:-unknown}"
-        # `malformed` above says a stored value cannot travel in the flat
-        # grammar. It does not say what the value was, and whoever is
-        # debugging a malformed row is exactly the person who needs to know --
-        # a lock written by an older peer is a fact about that peer's
-        # checkout, not noise. Emitted only when it differs, so an ordinary
-        # row does not grow a field, and only here, where the newline is the
-        # delimiter and the text cannot forge anything.
-        [ "$(flat_field "${owner:-none}")" = "${owner:-none}" ] ||
-            printf 'held_by_raw=%s\n' "${owner}"
-        [ "$(flat_field "${legacy:-none}")" = "${legacy:-none}" ] ||
-            printf 'legacy_held_by_raw=%s\n' "${legacy}"
+        # The sentinel says a stored value cannot travel in the flat grammar.
+        # It does not say what the value was, and whoever is debugging a
+        # malformed row is exactly the person who needs to know -- a lock
+        # written by an older peer is a fact about that peer's checkout, not
+        # noise. Emitted only for the fields the guard actually rejected, so
+        # an ordinary row does not grow a field, and only here, where the
+        # newline is the delimiter and the text cannot forge anything.
+        #
+        # Every guarded field gets one, not just the two owners. `lock_dir`
+        # and `gate` are as unrecoverable as a name once the flat form has
+        # eaten them, and `lock_dir` in particular is what makes `declared`
+        # checkable at all.
+        [ "${#PROV_RAWS[@]}" -eq 0 ] || printf '%s\n' "${PROV_RAWS[@]}"
     fi
 }
 
@@ -1660,16 +1778,21 @@ cmd_status() {
     if [ "$PORCELAIN" = 1 ]; then
         echo "state=$(lock_state)"
         echo "runnable=$(runnable_now)"
-        echo "lock_dir=${LOCK_DIR}"
+        echo "lock_dir=$(flat_line "${LOCK_DIR}")"
         echo "lock_scope=${LOCK_SCOPE}"
         echo "lock_dir_source=${LOCK_DIR_SOURCE}"
         # Always emitted, empty when there is none, so the key set does not
         # change shape between hosts -- a consumer that has to test for a key's
         # PRESENCE to learn the state is one `grep` away from reading absence
         # as "fine", which is the failure this whole field exists to report.
-        echo "lock_dir_problem=$(lock_dir_problem || true)"
-        echo "legacy_dir=$(legacy_consult_path)"
-        echo "legacy_held_by=${legacy%% *}"
+        echo "lock_dir_problem=$(flat_line "$(lock_dir_problem || true)")"
+        echo "legacy_dir=$(flat_line "$(legacy_consult_path)")"
+        # `${legacy% *}`, not `${legacy%% *}`: `legacy_holder` returns
+        # "<owner> <pid>", so stripping the FIRST field renames a multi-word
+        # owner -- "sebastian helper" becomes "sebastian", a different real
+        # agent. Strip the last field instead. Same bug as the one fixed in
+        # `cmd_provenance`; it was in both emitters and only one was reported.
+        echo "legacy_held_by=$(flat_line "${legacy% *}")"
         if [ -d "$LOCK_DIR" ]; then
             echo "owner=$(meta_get owner || echo '?')"
             echo "anchor_pid=$(meta_get anchor_pid || echo '?')"

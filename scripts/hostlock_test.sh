@@ -2185,6 +2185,21 @@ chk "with the state field the row physically carries" \
 $HL release >/dev/null 2>&1
 cleanup
 
+# The token a rejected value is replaced with. Read from the script rather
+# than spelled out here, so this suite pins the PROPERTY (a real name can
+# never equal it) instead of one particular spelling of it -- and so the cell
+# below is what fails if the sentinel is ever moved back inside the name
+# class, rather than fifteen unrelated cells failing for a reason none of
+# their names mention.
+MALFORMED=$(sed -n "s/^FLAT_MALFORMED='\(.*\)'$/\1/p" "$HL")
+chk "the suite found the sentinel the script actually uses" \
+    "$([ -n "$MALFORMED" ] && echo found || echo missing)" "found"
+# The property, asserted directly: the sentinel is not a legal name, so no
+# accepted value can ever collide with it. A bare `malformed` fails this.
+chk "the malformed sentinel is outside the class it polices" \
+    "$(printf '%s' "$MALFORMED" | grep -Eq '^[A-Za-z0-9_.-]+$' && echo in-class || echo outside)" \
+    "outside"
+
 # THE FOREIGN WRITER -- every cell above goes through `acquire`, which now
 # refuses these strings. That is exactly why none of them covers the defect
 # that is still reachable.
@@ -2208,7 +2223,7 @@ sed -i 's|^owner=leon$|owner=gaff hostlock_state=FREE declared=no|' "$LOCK/meta"
 
 fw_row=$($HL provenance --oneline 2>/dev/null)
 chk "a foreign owner in the metadata is reported malformed, not published" \
-    "$(echo "$fw_row" | tr ' ' '\n' | sed -n 's/^held_by=//p')" "malformed"
+    "$(echo "$fw_row" | tr ' ' '\n' | sed -n 's/^held_by=//p')" "$MALFORMED"
 # The assertion that matters is on the PARSE, not on the string: the defect
 # was never that the text appeared, it was that a consumer's reading of the
 # row inverted. This row physically says HELD; before the fix it parsed FREE.
@@ -2231,7 +2246,7 @@ chk "the multi-line form still carries the original text" \
 # REAL AGENT rather than toward nonsense.
 sed -i 's|^owner=gaff.*$|owner=sebastian helper|' "$LOCK/meta"
 chk "a foreign multi-word owner is not truncated to another agent's name" \
-    "$($HL provenance --oneline 2>/dev/null | tr ' ' '\n' | sed -n 's/^held_by=//p')" "malformed"
+    "$($HL provenance --oneline 2>/dev/null | tr ' ' '\n' | sed -n 's/^held_by=//p')" "$MALFORMED"
 
 # The negative control for the guard itself. A guard that reports every owner
 # malformed would pass all four cells above and be useless, and this is the
@@ -2253,7 +2268,7 @@ chk "so the clean field count the injection cell pins is the real one" \
 # stricter class and not merely the no-whitespace one.
 sed -i 's|^owner=gaff-cpu.2$|owner=roy=2|' "$LOCK/meta"
 chk "an owner that would truncate rather than forge is malformed too" \
-    "$($HL provenance --oneline 2>/dev/null | tr ' ' '\n' | sed -n 's/^held_by=//p')" "malformed"
+    "$($HL provenance --oneline 2>/dev/null | tr ' ' '\n' | sed -n 's/^held_by=//p')" "$MALFORMED"
 sed -i 's|^owner=roy=2$|owner=gaff-cpu.2|' "$LOCK/meta"
 
 # A field this script always writes itself is still read back from a file a
@@ -2263,6 +2278,63 @@ printf 'gate=satisfied:3 declared=no\n' >>"$LOCK/meta"
 sed -i '0,/^gate=/{/^gate=$/d}' "$LOCK/meta"
 chk "a foreign gate value with whitespace is malformed, not a new field" \
     "$($HL provenance --oneline 2>/dev/null | awk '{print NF}')" "$fw_clean_nf"
+
+
+# EVERY GUARDED FIELD, NOT JUST THE ONE THAT WAS REPORTED.
+#
+# The comment on `prov_add` argues the guard has to cover `takeover`,
+# `held_uid`, `held_pid` and `runnable_at_acquire` as well as `owner`. Until
+# these cells existed that argument was undefended: an independent review
+# reverted each of those four guards to raw in turn and the suite passed
+# 440/0 every time. The guards were load-bearing -- each revert re-opens the
+# same HELD-reads-FREE inversion -- and nothing would have said so.
+#
+# That is this lane's own rule, broken in the change that was enforcing it:
+# a guard applied broadly and exercised narrowly is a guard that a later
+# refactor drops in silence. One cell per field, each with the injection in
+# that field and nowhere else.
+for fw_field in anchor_uid anchor_pid takeover runnable_at_acquire; do
+    sed -i "/^${fw_field}=/d" "$LOCK/meta"
+    printf '%s=1 hostlock_state=FREE declared=no\n' "$fw_field" >>"$LOCK/meta"
+    fw_r=$($HL provenance --oneline 2>/dev/null)
+    chk "a foreign ${fw_field} cannot add fields to the row" \
+        "$(echo "$fw_r" | awk '{print NF}')" "$fw_clean_nf"
+    # Self-consistency, not a fixed verdict. Injecting into `anchor_pid`
+    # legitimately moves the state to STALE -- the pid IS the liveness check,
+    # so a corrupted one means the holder cannot be found, and that is the
+    # row telling the truth rather than being forged. Pinning "HELD yes" here
+    # would have been pinning the verdict instead of the mechanism, which is
+    # the error this whole block exists to stop making. What must hold for
+    # every field is that the parse agrees with what the row physically says
+    # in its first position -- that is the inversion, stated categorically.
+    chk "and a foreign ${fw_field} cannot make the row parse as something else" \
+        "$(echo "$fw_r" | awk '{p=index($1,"="); phys=substr($1,p+1); for(i=1;i<=NF;i++){q=index($i,"="); m[substr($i,1,q-1)]=substr($i,q+1)} print (m["hostlock_state"]==phys ? "consistent" : "inverted")}')" \
+        "consistent"
+    chk "and the foreign ${fw_field} value itself is reported as rejected" \
+        "$($HL provenance 2>/dev/null | grep -c "^[a-z_]*_raw=1 hostlock_state=FREE declared=no$")" "1"
+    sed -i "/^${fw_field}=/d" "$LOCK/meta"
+done
+
+# `gate` was already covered for field count; this is the other half -- that
+# the guard REPLACES the value rather than merely refusing to widen the row.
+printf 'gate=satisfied:3 declared=no\n' >>"$LOCK/meta"
+chk "a rejected structured value is replaced by the sentinel, not passed through" \
+    "$($HL provenance --oneline 2>/dev/null | tr ' ' '\n' | sed -n 's/^gate=//p')" "$MALFORMED"
+chk "and a rejected structured value is recoverable in the multi-line form" \
+    "$($HL provenance 2>/dev/null | sed -n 's/^gate_raw=//p')" "satisfied:3 declared=no"
+sed -i '/^gate=satisfied:3 declared=no$/d' "$LOCK/meta"
+
+# The sentinel is in-band data: a foreign writer can store the literal
+# sentinel itself. If rejection were detected by comparing the guard's output
+# to its input -- which is the obvious implementation -- this value would
+# compare equal, look accepted, and print with no recovery line. It is
+# rejected on the guard's exit status instead, so it is reported AND
+# recoverable, and the reader can tell it apart from a genuine rejection by
+# reading the raw line.
+printf 'gate=%s\n' "$MALFORMED" >>"$LOCK/meta"
+chk "a stored sentinel is treated as rejected, not as an accepted value" \
+    "$($HL provenance 2>/dev/null | sed -n 's/^gate_raw=//p')" "$MALFORMED"
+sed -i "/^gate=${MALFORMED}\$/d" "$LOCK/meta"
 
 # `malformed` and `unknown` are different facts and must not collapse: absent
 # means this lock predates the field, malformed means the value cannot travel.
@@ -2300,11 +2372,225 @@ chk "and the naive split really does drop it, which is why the header says so" \
 $HL release >/dev/null 2>&1
 cleanup
 
+# THE `trusted` CLASSIFICATION IS A CLAIM, SO IT GETS A CELL.
+#
+# `held_secs` is declared `trusted` on the grounds that it is arithmetic --
+# `lock_age` is `$((now - epoch))` after `num_or` has forced the operand -- and
+# arithmetic output has no whitespace to reject. That reasoning is correct
+# today and it is exactly the kind of reasoning that stops being correct after
+# a refactor nobody connected to this file. Drive the stored epoch with the
+# same hostile values the guarded fields get: if `lock_age` ever echoes what
+# it read instead of computing from it, `trusted` becomes wrong and this says
+# so, in the words of the property rather than the words of the bug.
+cleanup
+$HL acquire --owner leon --ttl 600 >/dev/null 2>&1
+for ep_v in '1 hostlock_state=FREE declared=no' 'abc' '' '99 x'; do
+    sed -i "s|^acquired_epoch=.*|acquired_epoch=${ep_v}|" "$LOCK/meta"
+    ep_row=$($HL provenance --oneline 2>/dev/null)
+    chk "a stored epoch of '${ep_v}' still yields a plain integer age" \
+        "$(echo "$ep_row" | tr ' ' '\n' | sed -n 's/^held_secs=//p' \
+            | grep -Eq '^-?[0-9]+$' && echo integer || echo other)" "integer"
+    chk "and a stored epoch of '${ep_v}' cannot widen the row" \
+        "$(echo "$ep_row" | awk '{print NF}')" "$fw_clean_nf"
+done
+$HL release >/dev/null 2>&1
+cleanup
+
+# A LEGACY PATH THAT CANNOT TRAVEL FLAT.
+#
+# `legacy_dir` is `$HOSTLOCK_LEGACY_DIR` when set, so it is operator-supplied
+# and reaches the row exactly like `lock_dir` does. It survived a mutation
+# that dropped its guard entirely, because every cell about the legacy path
+# used a path without spaces in it.
+hl_lg="$(pwd)/.hostlock-selftest-lg dir"
+lg_conf="$LOCK.lgconf"
+mkdir -p "$hl_lg"
+# `legacy_consult_path` only names a path when the lock dir came from a
+# CONFIG -- an env-set HOSTLOCK_DIR means the operator addressed this lock
+# directly and no consult applies. So the config route is the one that has to
+# be driven here; using the env route is why the first version of this cell
+# read `none` and would have passed against a guard that was not there.
+printf 'lock_dir=%s\n' "$LOCK.lgbox" >"$lg_conf"
+lg_run() { env -u HOSTLOCK_DIR HOSTLOCK_CONF="$lg_conf" HOSTLOCK_LEGACY_DIR="$hl_lg" \
+    HOSTLOCK_PRIVATE_OK=1 "$HL" "$@"; }
+lg_row=$(lg_run status --porcelain 2>/dev/null)
+chk "the legacy consult really is on the config route, not skipped" \
+    "$(echo "$lg_row" | grep -c '^legacy_dir=')" "1"
+# THE TWO EMITTERS HAVE DIFFERENT GRAMMARS AND SO DIFFERENT RULES, and this
+# pair is the cell that says so. `status --porcelain` is one key per LINE, so
+# a space forges nothing and the path must arrive INTACT -- guarding it there
+# would be the cry-wolf direction, and would break every consumer reading a
+# path with a space in it. The flat row is space-separated, so the same value
+# must be rejected. A single predicate for the whole file gets one of these
+# two wrong whichever way it is written.
+chk "a spaced legacy path arrives intact in the newline-delimited grammar" \
+    "$(echo "$lg_row" | sed -n 's/^legacy_dir=//p')" "$hl_lg"
+chk "and the porcelain does not gain a line from the space" \
+    "$(echo "$lg_row" | grep -c '=')" "$(echo "$lg_row" | wc -l)"
+lg_prow=$(lg_run provenance --oneline 2>/dev/null)
+chk "and the same value IS rejected in the space-separated grammar" \
+    "$(echo "$lg_prow" | tr ' ' '\n' | sed -n 's/^legacy_dir=//p')" "$MALFORMED"
+chk "and does not widen the provenance row" \
+    "$(echo "$lg_prow" | awk '{print NF}')" "$fw_clean_nf"
+chk "and the multi-line form can still say which legacy path was consulted" \
+    "$(lg_run provenance 2>/dev/null | sed -n 's|^legacy_dir_raw=||p')" "$hl_lg"
+# The negative control, so this block cannot pass by the guard rejecting
+# every legacy path it is ever shown.
+lg_ok="$LOCK.lgplain"
+mkdir -p "$lg_ok"
+chk "an ordinary legacy path is NOT reported as rejected" \
+    "$(env -u HOSTLOCK_DIR HOSTLOCK_CONF="$lg_conf" HOSTLOCK_LEGACY_DIR="$lg_ok" \
+        HOSTLOCK_PRIVATE_OK=1 "$HL" status --porcelain 2>/dev/null \
+        | sed -n 's/^legacy_dir=//p')" "$lg_ok"
+
+# A NEWLINE, WHICH IS THE THING THAT DOES FORGE IN THIS GRAMMAR.
+#
+# `lock_dir` and `legacy_dir` come from `HOSTLOCK_DIR`, `HOSTLOCK_CONF` and
+# `HOSTLOCK_LEGACY_DIR` -- environment strings, not metadata, so `meta_get`'s
+# one-line read does not bound them and a newline really can arrive. Before
+# `flat_line` existed this emitted `legacy_dir=a` followed by an entire forged
+# `state=FREE` line, and the porcelain grew from 8 lines to 9.
+lg_nl=$(printf 'a\nstate=FREE')
+nl_row=$(env -u HOSTLOCK_DIR HOSTLOCK_CONF="$lg_conf" HOSTLOCK_LEGACY_DIR="$lg_nl" \
+    HOSTLOCK_PRIVATE_OK=1 "$HL" status --porcelain 2>/dev/null)
+chk "a newline in a legacy path cannot add a line to the porcelain" \
+    "$(echo "$nl_row" | grep -c '^state=')" "1"
+chk "and the offending value is reported as rejected" \
+    "$(echo "$nl_row" | sed -n 's/^legacy_dir=//p')" "$MALFORMED"
+# The negative control for `flat_line` specifically: it must reject ONLY the
+# newline, or it would break the spaced-path cell above.
+chk "and a space is still not a newline, so a spaced path is untouched" \
+    "$(env -u HOSTLOCK_DIR HOSTLOCK_CONF="$lg_conf" HOSTLOCK_LEGACY_DIR="$hl_lg" \
+        HOSTLOCK_PRIVATE_OK=1 "$HL" status --porcelain 2>/dev/null \
+        | sed -n 's/^legacy_dir=//p')" "$hl_lg"
+
+# The first-word truncation, in the emitter where it was still live. The
+# provenance copy of this was fixed and the porcelain copy was not, which is
+# what "fix the reported symptom" looks like from the inside.
+lg_leg="$LOCK.lgbox.legacy"
+mkdir -p "$lg_leg"
+# Same fixture shape the legacy section uses: `start_time` is part of the
+# liveness identity, and a holder without it is judged dead and reads
+# `unknown` -- which would have made this cell pass for the wrong reason if
+# the truncation were still there.
+lg_leg_start=$(sed 's/.*) //' "/proc/$$/stat" | awk '{print $20}')
+printf 'owner=sebastian helper\nanchor_pid=%s\nstart_time=%s\nacquired_epoch=%s\nttl=0\n' \
+    "$$" "$lg_leg_start" "$(date +%s)" >"$lg_leg/meta"
+chk "a multi-word legacy owner is not renamed to another agent by the porcelain" \
+    "$(env -u HOSTLOCK_DIR HOSTLOCK_CONF="$lg_conf" HOSTLOCK_LEGACY_DIR="$lg_leg" \
+        HOSTLOCK_PRIVATE_OK=1 "$HL" status --porcelain 2>/dev/null \
+        | sed -n 's/^legacy_held_by=//p')" "sebastian helper"
+rm -rf "$lg_leg"
+
+rm -rf "$hl_lg" "$lg_ok" "$lg_conf"
+cleanup
+
+# EVERY CALL SITE NAMES A KIND THAT EXISTS.
+#
+# `prov_add`'s `*)` arm calls `die`, and no cell can reach it: every call site
+# in the file names a valid kind, so the branch is unreachable through the
+# public interface and a mutation that replaces it with "publish unguarded"
+# cannot be caught behaviourally. Declared EQUIVALENT in the battery rather
+# than covered by a cell that does not exist.
+#
+# What CAN be checked is the property that keeps it unreachable -- that no
+# call site has drifted to a kind the dispatcher does not know. This one is
+# structural on purpose: the property is about the text of the call sites,
+# not about behaviour, so there is nothing to observe at runtime. That is the
+# opposite of a structural check standing in for a behavioural one.
+chk "every prov_add call site names a kind the dispatcher handles" \
+    "$(grep -oE '^ *prov_add [a-z]+' "$HL" | awk '{print $2}' \
+        | grep -vcE '^(name|value|trusted)$')" "0"
+# ... and the dispatcher handles no kind that nobody passes, which is the
+# other way the two can drift apart.
+chk "and the dispatcher handles no kind that no call site passes" \
+    "$(for k in name value trusted; do grep -qE "^ *prov_add $k " "$HL" || echo "$k"; done | wc -l)" "0"
+cleanup
+
+# A REAL AGENT NAMED LIKE THE SENTINEL.
+#
+# `malformed` is a legal owner: it is in the safe-name class, so `require_name`
+# accepts it and `flat_field` passes it through. If the sentinel were the bare
+# word, this row and a row whose owner was thrown away would be byte-identical
+# in the one-line form -- the machine-parsed one -- and no recovery line would
+# be emitted to tell them apart, because nothing was rejected. The sentinel
+# carrying a character the name class forbids is what makes these two rows
+# distinguishable at all.
+cleanup
+$HL acquire --owner malformed --ttl 600 >/dev/null 2>&1
+chk "an agent legitimately named like the sentinel is not mistaken for one" \
+    "$($HL provenance --oneline 2>/dev/null | tr ' ' '\n' | sed -n 's/^held_by=//p')" "malformed"
+chk "and is not equal to the sentinel a rejected value would print" \
+    "$([ "malformed" = "$MALFORMED" ] && echo collides || echo distinct)" "distinct"
+chk "and carries no recovery line, because nothing was rejected" \
+    "$($HL provenance 2>/dev/null | grep -c '^held_by_raw=')" "0"
+$HL release >/dev/null 2>&1
+cleanup
+
+# A PATH THAT CANNOT TRAVEL FLAT, WHICH NEEDS NO FOREIGN WRITER AT ALL.
+#
+# `lock_dir` is the field that makes `declared` checkable: `declared=yes` is a
+# claim about a host, and it can only be re-checked if the row says which
+# directory the claim was made in. A directory with a space in it is an
+# operator typing one, not an attack -- and before the recovery line existed
+# the row said `@malformed` with no way back, quietly destroying the one field
+# the header promises makes the rest verifiable.
+hl_sp="$(pwd)/.hostlock-selftest-sp dir"
+mkdir -p "$hl_sp"
+sp_row=$(HOSTLOCK_DIR="$hl_sp/lk" HOSTLOCK_PRIVATE_OK=1 sh -c \
+    "\"$HL\" acquire --owner leon --ttl 600 >/dev/null 2>&1; \"$HL\" provenance --oneline 2>/dev/null")
+chk "a lock path that cannot travel flat does not widen the row" \
+    "$(echo "$sp_row" | awk '{print NF}')" "$fw_clean_nf"
+chk "and is reported as rejected rather than silently truncated" \
+    "$(echo "$sp_row" | tr ' ' '\n' | sed -n 's/^lock_dir=//p')" "$MALFORMED"
+chk "and the multi-line form can still say which lock the row is about" \
+    "$(HOSTLOCK_DIR="$hl_sp/lk" HOSTLOCK_PRIVATE_OK=1 "$HL" provenance 2>/dev/null \
+        | sed -n 's|^lock_dir_raw=||p')" "$hl_sp/lk"
+HOSTLOCK_DIR="$hl_sp/lk" HOSTLOCK_PRIVATE_OK=1 "$HL" release >/dev/null 2>&1
+rm -rf "$hl_sp"
+cleanup
+
 # The write gate and the read gate must share one character class. If they
 # drift, the reader accepts something the writer refuses -- which is the whole
 # argument for validating at write time, running backwards.
-chk "the write gate and the read gate share one predicate" \
-    "$(grep -c 'name_is_safe' "$HL")" "3"
+#
+# Asserted BEHAVIOURALLY. The previous form of this cell counted occurrences
+# of `name_is_safe` in the file, which passes on the string being present and
+# says nothing about it being called -- a review broke the delegation while
+# keeping the literal in a comment and the count held. Drive both gates with
+# the same strings instead and require them to agree on every one; that is
+# the property, and it cannot be satisfied by text.
+# The empty string is deliberately absent from this table. It is the one
+# input on which the two gates SHOULD disagree: the writer refuses it, and the
+# reader turns it into `none`, because an absent owner is a different fact
+# from an unprintable one -- the `malformed`/`unknown`/`none` distinction
+# pinned above. A table demanding agreement there would be demanding the
+# guard collapse them.
+for wr_s in leon gaff-cpu.2 roy_2 a.b-c_1 malformed "roy=2" "a b" "a	tab" "x;y"; do
+    cleanup
+    $HL acquire --owner "$wr_s" --ttl 600 >/dev/null 2>&1 && wr_w=accept || wr_w=reject
+    $HL release >/dev/null 2>&1
+    cleanup
+    # The read side, driven directly: hold the lock under a name the writer
+    # certainly accepts, then overwrite the stored owner with the string under
+    # test, which is exactly what a peer at an older commit does.
+    $HL run --owner leon --reason drift -- sleep 20 >/dev/null 2>&1 &
+    wr_bg=$!
+    for _ in $(seq 1 40); do [ -f "$LOCK/meta" ] && break; sleep 0.25; done
+    python3 - "$LOCK/meta" "$wr_s" <<'PYWR'
+import sys
+path, val = sys.argv[1], sys.argv[2]
+lines = [ln for ln in open(path).read().split("\n") if not ln.startswith("owner=")]
+lines.insert(0, "owner=" + val)
+open(path, "w").write("\n".join(lines))
+PYWR
+    wr_got=$($HL provenance --oneline 2>/dev/null | tr ' ' '\n' | sed -n 's/^held_by=//p')
+    [ "$wr_got" = "$MALFORMED" ] && wr_r=reject || wr_r=accept
+    kill "$wr_bg" 2>/dev/null
+    wait "$wr_bg" 2>/dev/null
+    chk "write and read gates agree on '$(printf '%s' "$wr_s" | cat -v)'" "$wr_r" "$wr_w"
+done
+cleanup
 
 echo "== which lock is this: path resolution, and saying so =="
 #
@@ -2473,7 +2759,7 @@ chk "and who was found there" \
 sed -i 's|^owner=roy$|owner=roy prefill sweep|' "$LOCK.legacy/meta"
 chk "a multi-word legacy owner is reported malformed, not renamed" \
     "$(hl_legacy "$CONF" provenance --oneline 2>/dev/null | tr ' ' '\n' | sed -n 's/^legacy_held_by=//p')" \
-    "malformed"
+    "$MALFORMED"
 chk "and the multi-line form carries what was actually in the old file" \
     "$(hl_legacy "$CONF" provenance 2>/dev/null | sed -n 's/^legacy_held_by_raw=//p')" \
     "roy prefill sweep"
@@ -3220,7 +3506,7 @@ cleanup
 # the inert R1 block and the vacuous STALE arm that this PR exists to fix.
 # Every probe branch asserts something, so the total is invariant across
 # environments; if a refactor drops a check, this fails and says so.
-chk "every assertion in this file ran" "$((pass + fail + 1))" "478"
+chk "every assertion in this file ran" "$((pass + fail + 1))" "530"
 
 echo
 echo "passed=${pass} failed=${fail}"
