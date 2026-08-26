@@ -2497,7 +2497,7 @@ impl ExecutionProvider for CudaExecutionProvider {
         if op.op_type == "DFT"
             && (op.domain.is_empty() || op.domain == "ai.onnx")
             && let Some(reason) =
-                crate::kernels::dft::unsupported_reason(op, shapes, input_dtypes, layouts)
+                crate::kernels::dft::unsupported_reason(op, opset, shapes, input_dtypes, layouts)
         {
             return KernelMatch::unsupported(reason);
         }
@@ -2721,7 +2721,11 @@ impl ExecutionProvider for CudaExecutionProvider {
                 op_type: op.op_type.clone(),
                 opset,
             })?;
-        factory.create(op, shapes)
+        let mut versioned = op.clone();
+        if versioned.version.is_none() {
+            versioned.version = i64::try_from(opset).ok();
+        }
+        factory.create(&versioned, shapes)
     }
 
     fn custom_passes(&self) -> Vec<Box<dyn onnx_runtime_optimizer::OptimizationPass>> {

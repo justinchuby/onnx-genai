@@ -233,6 +233,7 @@ pub enum ShapeInference {
     Dft {
         onesided: bool,
         axis_attr: Option<i64>,
+        default_axis: i64,
     },
     /// `ai.onnx::Compress`: select along `axis` (or over the flattened input
     /// when absent) using a 1-D Bool `condition`.
@@ -310,6 +311,17 @@ impl ShapeInference {
         if let Some(rule) = SharedNativeShapeRule::for_node(node) {
             let fallback = match rule {
                 SharedNativeShapeRule::ConstantOfShape => Self::ConstantOfShape,
+                SharedNativeShapeRule::Dft => Self::Dft {
+                    onesided: node
+                        .attr("onesided")
+                        .and_then(onnx_runtime_ir::Attribute::as_int)
+                        .unwrap_or(0)
+                        != 0,
+                    axis_attr: node
+                        .attr("axis")
+                        .and_then(onnx_runtime_ir::Attribute::as_int),
+                    default_axis: if opset >= 20 { -2 } else { 1 },
+                },
                 SharedNativeShapeRule::Expand => Self::Expand,
                 SharedNativeShapeRule::Stft => Self::Declined {
                     op_type: "STFT".into(),
@@ -654,6 +666,7 @@ impl ShapeInference {
             "DFT" => Self::Dft {
                 onesided: int_attr("onesided").unwrap_or(0) != 0,
                 axis_attr: int_attr("axis"),
+                default_axis: if opset >= 20 { -2 } else { 1 },
             },
 
             // ── Compress ──────────────────────────────────────────────────
@@ -868,6 +881,7 @@ pub(crate) struct IntermediateBuf {
     pub(crate) shape: crate::dim_vec::DimVec<usize>,
     pub(crate) strides: crate::dim_vec::DimVec<i64>,
     pub(crate) dtype: DataType,
+    pub(crate) device: DeviceId,
 }
 
 impl IntermediateBuf {
@@ -896,7 +910,7 @@ impl IntermediateBuf {
             self.dtype,
             &self.shape,
             &self.strides,
-            onnx_runtime_ir::DeviceId::cpu(),
+            self.device,
         )
     }
 }
@@ -2913,6 +2927,18 @@ unsafe extern "C" fn compute_execute(
                                                 ));
                                             }
                                         };
+                                        let device = match unsafe {
+                                            crate::kernel_ctx::device_from_memory_info(
+                                                api_ref,
+                                                mem_info,
+                                                format_args!(
+                                                    "node {node_idx} dynamic intermediate"
+                                                ),
+                                            )
+                                        } {
+                                            Ok(device) => device,
+                                            Err(error) => return fail_status(&error),
+                                        };
                                         new_bufs.push((
                                             *buffer_index,
                                             IntermediateBuf {
@@ -2923,6 +2949,7 @@ unsafe extern "C" fn compute_execute(
                                                 ),
                                                 strides: contiguous_strides(&output.shape),
                                                 dtype: output.dtype,
+                                                device,
                                             },
                                         ));
                                         slot_kinds.push(RoutedSlotKind::Buffer);
@@ -3058,6 +3085,7 @@ unsafe extern "C" fn compute_execute(
                                             ),
                                             strides,
                                             dtype: output.dtype,
+                                            device: DeviceId::cpu(),
                                         },
                                     ));
                                 }
@@ -3230,12 +3258,24 @@ unsafe extern "C" fn compute_execute(
                         let numel: usize = shape.iter().product();
                         let byte_len = dtype.byte_size() * numel;
                         let strides = contiguous_strides(shape);
-                        let (data, scratch_ptr) = match intermediate_scratch {
+                        let (data, scratch_ptr, device) = match intermediate_scratch {
                             Some(mem_info) => {
                                 match unsafe {
                                     alloc_scratch(api_ref, kernel_context, mem_info, byte_len)
                                 } {
-                                    Ok(ptr) => (Vec::new(), ptr.cast::<u8>()),
+                                    Ok(ptr) => {
+                                        let device = match unsafe {
+                                            crate::kernel_ctx::device_from_memory_info(
+                                                api_ref,
+                                                mem_info,
+                                                format_args!("node {node_idx} intermediate output"),
+                                            )
+                                        } {
+                                            Ok(device) => device,
+                                            Err(error) => return fail_status(&error),
+                                        };
+                                        (Vec::new(), ptr.cast::<u8>(), device)
+                                    }
                                     Err(e) => {
                                         return fail_status(&format!(
                                             "Compute: intermediate scratch alloc failed: {e}"
@@ -3243,7 +3283,11 @@ unsafe extern "C" fn compute_execute(
                                     }
                                 }
                             }
-                            None => (host_pool.take_intermediate(byte_len), std::ptr::null_mut()),
+                            None => (
+                                host_pool.take_intermediate(byte_len),
+                                std::ptr::null_mut(),
+                                DeviceId::cpu(),
+                            ),
                         };
                         new_bufs.push((
                             buf_idx,
@@ -3257,6 +3301,7 @@ unsafe extern "C" fn compute_execute(
                                 shape: (*shape).clone(),
                                 strides,
                                 dtype,
+                                device,
                             },
                         ));
                     }
@@ -4546,7 +4591,7 @@ fn buf_view_mut(buf: &mut IntermediateBuf) -> onnx_runtime_ep_api::tensor::Tenso
         buf.dtype,
         &buf.shape,
         &buf.strides,
-        onnx_runtime_ir::DeviceId::cpu(),
+        buf.device,
     )
 }
 
@@ -5615,6 +5660,7 @@ fn infer_shapes(
         ShapeInference::Dft {
             onesided,
             axis_attr,
+            default_axis,
         } => {
             if inputs.is_empty() {
                 return Err("DFT: expected at least 1 input".into());
@@ -5638,8 +5684,10 @@ fn infer_shapes(
             // opset 20 moves `axis` into input 2; before that it is an
             // attribute defaulting to -2.
             let axis_raw = match inputs.get(2) {
-                Some(t) if !t.shape.is_empty() => read_scalar_i64(t, "DFT axis")?,
-                _ => axis_attr.unwrap_or(-2),
+                Some(t) if !t.is_absent() && t.shape.iter().product::<usize>() > 0 => {
+                    read_scalar_i64(t, "DFT axis")?
+                }
+                _ => axis_attr.unwrap_or(*default_axis),
             };
             let axis = normalize_axis(axis_raw, rank, "DFT axis")?;
             if axis == last {
@@ -5650,7 +5698,7 @@ fn infer_shapes(
 
             // `dft_length` (input 1) overrides the signal extent when present.
             let signal_len = match inputs.get(1) {
-                Some(t) if t.shape.iter().product::<usize>() > 0 => {
+                Some(t) if !t.is_absent() && t.shape.iter().product::<usize>() > 0 => {
                     let n = read_scalar_i64(t, "DFT dft_length")?;
                     usize::try_from(n)
                         .map_err(|_| format!("DFT: dft_length must be non-negative, got {n}"))?
@@ -5839,6 +5887,14 @@ fn reduce_shape(
 /// `view.data` must point to a valid, readable region of `view.shape.iter().product()`
 /// `i64` elements.
 unsafe fn read_i64_tensor(view: &TensorView<'_>) -> Result<Vec<i64>, String> {
+    if !view.device.is_host_accessible() {
+        return Err(format!(
+            "shape operand is on {:?}, which the plugin host cannot dereference; \
+             the device EP must decline this value-driven shape rule or provide \
+             an explicit bounded metadata transfer",
+            view.device
+        ));
+    }
     if view.dtype != DataType::Int64 {
         return Err(format!("expected Int64 tensor, got {:?}", view.dtype));
     }
@@ -6843,6 +6899,107 @@ fn after() {}
     }
 
     #[test]
+    fn dft_shared_and_plugin_defaults_agree_across_opsets() {
+        let data = vec![0.0f32; 48];
+        let x = f32_data(&[1, 8, 6, 1], &[48, 6, 1, 1], &data);
+        let make_node = |version| {
+            let mut node = Node::new(
+                onnx_runtime_ir::NodeId(0),
+                "DFT",
+                vec![Some(onnx_runtime_ir::ValueId(0))],
+                vec![onnx_runtime_ir::ValueId(1)],
+            );
+            node.version = Some(version);
+            node.attributes
+                .insert("onesided".into(), onnx_runtime_ir::Attribute::Int(1));
+            node
+        };
+
+        for (version, expected) in [(17, vec![1, 5, 6, 2]), (20, vec![1, 8, 4, 2])] {
+            let node = make_node(version);
+            let strategy =
+                ShapeInference::for_node(&node, &[vec![Some(1), Some(8), Some(6), Some(1)]], 1);
+            assert!(matches!(strategy, ShapeInference::SharedNative { .. }));
+            assert_eq!(infer(&strategy, &[x]).unwrap(), vec![expected]);
+            if version == 17 {
+                let ShapeInference::SharedNative { fallback, .. } = &strategy else {
+                    unreachable!()
+                };
+                assert_eq!(
+                    infer(fallback, &[x]).unwrap(),
+                    vec![vec![1, 5, 6, 2]],
+                    "the compatibility fallback must preserve the opset-17 axis=1 default"
+                );
+            }
+        }
+
+        let mut attr_node = make_node(17);
+        attr_node
+            .attributes
+            .insert("axis".into(), onnx_runtime_ir::Attribute::Int(2));
+        let strategy =
+            ShapeInference::for_node(&attr_node, &[vec![Some(1), Some(8), Some(6), Some(1)]], 1);
+        assert_eq!(infer(&strategy, &[x]).unwrap(), vec![vec![1, 8, 4, 2]]);
+
+        let mut input_node = make_node(20);
+        input_node.inputs = vec![
+            Some(onnx_runtime_ir::ValueId(0)),
+            None,
+            Some(onnx_runtime_ir::ValueId(2)),
+        ];
+        let axis_value = [1i64];
+        let axis = i64_scalar(&axis_value, &[], &[]);
+        let absent_length = TensorView::absent(DataType::Int64);
+        let strategy = ShapeInference::for_node(
+            &input_node,
+            &[vec![Some(1), Some(8), Some(6), Some(1)], vec![], vec![]],
+            1,
+        );
+        assert_eq!(
+            infer(&strategy, &[x, absent_length, axis]).unwrap(),
+            vec![vec![1, 5, 6, 2]]
+        );
+    }
+
+    #[test]
+    fn dft_device_axis_is_symbolic_and_never_dereferenced() {
+        let data = vec![0.0f32; 48];
+        let x = f32_data(&[1, 8, 6, 1], &[48, 6, 1, 1], &data);
+        let absent_length = TensorView::absent(DataType::Int64);
+        let device_axis = TensorView::new(
+            DevicePtr(std::ptr::dangling::<i64>().cast()),
+            DataType::Int64,
+            &[],
+            &[],
+            DeviceId::cuda(0),
+        );
+        let mut node = Node::new(
+            onnx_runtime_ir::NodeId(0),
+            "DFT",
+            vec![
+                Some(onnx_runtime_ir::ValueId(0)),
+                None,
+                Some(onnx_runtime_ir::ValueId(2)),
+            ],
+            vec![onnx_runtime_ir::ValueId(3)],
+        );
+        node.version = Some(20);
+        node.attributes
+            .insert("onesided".into(), onnx_runtime_ir::Attribute::Int(1));
+        assert_eq!(
+            infer_shared_node(&node, &[x, absent_length, device_axis]),
+            SharedShapeResult::SymbolicOrUnknown
+        );
+        let strategy = ShapeInference::for_node(
+            &node,
+            &[vec![Some(1), Some(8), Some(6), Some(1)], vec![], vec![]],
+            1,
+        );
+        let error = infer(&strategy, &[x, absent_length, device_axis]).unwrap_err();
+        assert!(error.contains("host cannot read"), "{error}");
+    }
+
+    #[test]
     fn dft_real_input_produces_a_complex_last_dim() {
         // [batch=2, signal=8, real=1] -> [2, 8, 2]. The last dim must become 2
         // even though the input is real; a rule that copied it through would
@@ -6853,7 +7010,8 @@ fn after() {}
             infer(
                 &ShapeInference::Dft {
                     onesided: false,
-                    axis_attr: Some(1)
+                    axis_attr: Some(1),
+                    default_axis: 1,
                 },
                 &[x]
             )
@@ -6872,7 +7030,8 @@ fn after() {}
             infer(
                 &ShapeInference::Dft {
                     onesided: true,
-                    axis_attr: Some(1)
+                    axis_attr: Some(1),
+                    default_axis: 1,
                 },
                 &[x]
             )
@@ -6893,7 +7052,8 @@ fn after() {}
             infer(
                 &ShapeInference::Dft {
                     onesided: false,
-                    axis_attr: Some(1)
+                    axis_attr: Some(1),
+                    default_axis: 1,
                 },
                 &[x, len]
             )
@@ -6916,7 +7076,8 @@ fn after() {}
             infer(
                 &ShapeInference::Dft {
                     onesided: true,
-                    axis_attr: Some(1)
+                    axis_attr: Some(1),
+                    default_axis: 1,
                 },
                 &[x, no_len, axis_in]
             )
@@ -6934,6 +7095,7 @@ fn after() {}
             &ShapeInference::Dft {
                 onesided: false,
                 axis_attr: Some(-1),
+                default_axis: 1,
             },
             &[x],
         )
@@ -7806,10 +7968,27 @@ fn after() {}
             shape: crate::dim_vec::DimVec::from_slice(&shape),
             strides: crate::dim_vec::DimVec::from_slice(&strides),
             dtype: DataType::Float32,
+            device: DeviceId::cpu(),
         };
         let v = buf.view();
         assert_eq!(v.shape, &shape[..]);
         assert_eq!(v.dtype, DataType::Float32);
+        assert_eq!(v.device, DeviceId::cpu());
+    }
+
+    #[test]
+    fn device_intermediate_view_preserves_residency() {
+        let buf = IntermediateBuf {
+            data: Vec::new(),
+            scratch_ptr: std::ptr::dangling_mut(),
+            shape: crate::dim_vec::DimVec::new(),
+            strides: crate::dim_vec::DimVec::new(),
+            dtype: DataType::Int64,
+            device: DeviceId::cuda(2),
+        };
+        let view = buf.view();
+        assert_eq!(view.device, DeviceId::cuda(2));
+        assert!(!view.device.is_host_accessible());
     }
 
     #[test]
@@ -8432,6 +8611,7 @@ fn after() {}
             shape: crate::dim_vec::DimVec::from_slice(&dims),
             strides,
             dtype: DataType::Float32,
+            device: DeviceId::cpu(),
         };
 
         let v = buf.view();
@@ -8648,6 +8828,7 @@ fn after() {}
             dtype: DataType::Float32,
             shape: crate::dim_vec::DimVec::zeroed(1),
             strides: crate::dim_vec::DimVec::zeroed(1),
+            device: DeviceId::cpu(),
         }
     }
 

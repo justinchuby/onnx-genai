@@ -18,16 +18,15 @@
 //! CPU EP can accept. Deckard's `ep.rs` uses it to populate `GetKernelRegistry`
 //! type constraints — **do not duplicate this list** in `ep.rs`; import it here.
 //!
-//! # Deferred
-//!
-//! Device (non-host) memory access is not supported in v1. Fail closed if a
-//! tensor's data pointer is null or device-only.
+//! Input residency is preserved from ORT's `OrtMemoryInfo`. Device pointers are
+//! never labelled as CPU merely because `GetTensorData` returned a non-null
+//! address.
 
-use std::ffi::c_void;
+use std::ffi::{CStr, c_void};
 
 use onnx_genai_ort_sys as ort;
 use onnx_runtime_ep_api::tensor::{DevicePtr, DevicePtrMut, TensorMut, TensorView};
-use onnx_runtime_ir::{DataType, DeviceId};
+use onnx_runtime_ir::{DataType, DeviceId, DeviceType};
 
 use crate::dim_vec::DimVec;
 
@@ -146,6 +145,7 @@ pub(crate) struct OwnedInput {
     pub dtype: DataType,
     pub shape: DimVec<usize>,
     pub strides: DimVec<i64>,
+    pub device: DeviceId,
 }
 
 impl OwnedInput {
@@ -156,9 +156,87 @@ impl OwnedInput {
             self.dtype,
             &self.shape,
             &self.strides,
-            DeviceId::cpu(),
+            self.device,
         )
     }
+}
+
+/// Resolve one ORT tensor's actual allocator residency.
+///
+/// ORT's legacy `CreateMemoryInfo` can report a CPU device type for a CUDA
+/// allocation, so the allocator name remains authoritative for known device
+/// allocators. Unknown non-CPU kinds stay non-host-accessible via `Custom`;
+/// guessing CPU would make a later shape-data read undefined behavior.
+unsafe fn value_device(
+    api: &ort::OrtApi,
+    value: *const ort::OrtValue,
+    input_index: usize,
+) -> Result<DeviceId, String> {
+    let get_memory_info = api
+        .GetTensorMemoryInfo
+        .ok_or("OrtApi.GetTensorMemoryInfo is null")?;
+    let mut memory_info = std::ptr::null();
+    crate::dispatch_probe::ort_call();
+    let status = unsafe { get_memory_info(value, &mut memory_info) };
+    if !status.is_null() || memory_info.is_null() {
+        return Err(format!(
+            "GetTensorMemoryInfo failed for input {input_index}"
+        ));
+    }
+    unsafe { device_from_memory_info(api, memory_info, format_args!("input {input_index}")) }
+}
+
+pub(crate) unsafe fn device_from_memory_info(
+    api: &ort::OrtApi,
+    memory_info: *const ort::OrtMemoryInfo,
+    context: impl std::fmt::Display + Copy,
+) -> Result<DeviceId, String> {
+    let get_device_type = api
+        .MemoryInfoGetDeviceType
+        .ok_or("OrtApi.MemoryInfoGetDeviceType is null")?;
+    let get_name = api
+        .MemoryInfoGetName
+        .ok_or("OrtApi.MemoryInfoGetName is null")?;
+    let get_id = api
+        .MemoryInfoGetId
+        .ok_or("OrtApi.MemoryInfoGetId is null")?;
+    if memory_info.is_null() {
+        return Err(format!("{context} has null OrtMemoryInfo"));
+    }
+    let mut raw_device_type = ort::OrtMemoryInfoDeviceType_CPU;
+    crate::dispatch_probe::ort_call();
+    unsafe { get_device_type(memory_info, &mut raw_device_type) };
+
+    let mut name_ptr = std::ptr::null();
+    crate::dispatch_probe::ort_call();
+    let status = unsafe { get_name(memory_info, &mut name_ptr) };
+    if !status.is_null() || name_ptr.is_null() {
+        return Err(format!("MemoryInfoGetName failed for {context}"));
+    }
+    let name = unsafe { CStr::from_ptr(name_ptr) }.to_string_lossy();
+
+    let mut raw_id = 0i32;
+    crate::dispatch_probe::ort_call();
+    let status = unsafe { get_id(memory_info, &mut raw_id) };
+    if !status.is_null() || raw_id < 0 {
+        return Err(format!(
+            "MemoryInfoGetId failed for {context} or returned invalid id {raw_id}"
+        ));
+    }
+    let index = raw_id as u32;
+    let normalized = name.trim().to_ascii_lowercase();
+    let device_type = match normalized.as_str() {
+        "cuda" => DeviceType::Cuda,
+        "rocm" => DeviceType::Rocm,
+        "coreml" => DeviceType::CoreMl,
+        "mlx" | "metal" => DeviceType::Mlx,
+        "webgpu" | "webgpu_buffer" => DeviceType::WebGpu,
+        "qnn" => DeviceType::Qnn,
+        "openvino" => DeviceType::OpenVino,
+        _ if raw_device_type == ort::OrtMemoryInfoDeviceType_CPU => DeviceType::Cpu,
+        _ => DeviceType::Custom(raw_device_type as u32),
+    };
+    Ok(DeviceId::new(device_type, index))
 }
 
 /// Owned output tensor data allocated via `KernelContext_GetOutput`.
@@ -263,6 +341,7 @@ pub(crate) unsafe fn read_inputs_into(
                 dtype: DataType::Float32,
                 shape: DimVec::new(),
                 strides: DimVec::new(),
+                device: DeviceId::cpu(),
             });
             continue;
         }
@@ -368,12 +447,14 @@ pub(crate) unsafe fn read_inputs_into(
                 "input {i} data pointer is null (device-only memory not supported)"
             ));
         }
+        let device = unsafe { value_device(api, value, i) }?;
 
         inputs.push(OwnedInput {
             data_ptr: data,
             dtype,
             shape,
             strides,
+            device,
         });
     }
 
@@ -683,6 +764,60 @@ mod tests {
         std::ptr::null_mut()
     }
 
+    unsafe extern "C" fn fake_get_tensor_memory_info(
+        _value: *const ort::OrtValue,
+        out: *mut *const ort::OrtMemoryInfo,
+    ) -> ort::OrtStatusPtr {
+        unsafe { *out = std::ptr::dangling::<ort::OrtMemoryInfo>() };
+        std::ptr::null_mut()
+    }
+
+    unsafe extern "C" fn fake_memory_device_type(
+        _memory_info: *const ort::OrtMemoryInfo,
+        out: *mut ort::OrtMemoryInfoDeviceType,
+    ) {
+        unsafe { *out = ort::OrtMemoryInfoDeviceType_CPU };
+    }
+
+    unsafe extern "C" fn fake_gpu_memory_device_type(
+        _memory_info: *const ort::OrtMemoryInfo,
+        out: *mut ort::OrtMemoryInfoDeviceType,
+    ) {
+        unsafe { *out = ort::OrtMemoryInfoDeviceType_GPU };
+    }
+
+    unsafe extern "C" fn fake_memory_name(
+        _memory_info: *const ort::OrtMemoryInfo,
+        out: *mut *const std::ffi::c_char,
+    ) -> ort::OrtStatusPtr {
+        unsafe { *out = c"Cpu".as_ptr() };
+        std::ptr::null_mut()
+    }
+
+    unsafe extern "C" fn fake_cuda_memory_name(
+        _memory_info: *const ort::OrtMemoryInfo,
+        out: *mut *const std::ffi::c_char,
+    ) -> ort::OrtStatusPtr {
+        unsafe { *out = c"Cuda".as_ptr() };
+        std::ptr::null_mut()
+    }
+
+    unsafe extern "C" fn fake_memory_id(
+        _memory_info: *const ort::OrtMemoryInfo,
+        out: *mut i32,
+    ) -> ort::OrtStatusPtr {
+        unsafe { *out = 0 };
+        std::ptr::null_mut()
+    }
+
+    unsafe extern "C" fn fake_cuda_memory_id(
+        _memory_info: *const ort::OrtMemoryInfo,
+        out: *mut i32,
+    ) -> ort::OrtStatusPtr {
+        unsafe { *out = 3 };
+        std::ptr::null_mut()
+    }
+
     /// Stands in for ORT's API-24 one-call type+shape reference, counting uses
     /// and lending the value's *own* dims array exactly as ORT documents.
     ///
@@ -786,6 +921,10 @@ mod tests {
         api.KernelContext_GetInputCount = Some(fake_get_input_count);
         api.KernelContext_GetInput = Some(fake_get_input);
         api.GetTensorData = Some(fake_get_tensor_data);
+        api.GetTensorMemoryInfo = Some(fake_get_tensor_memory_info);
+        api.MemoryInfoGetDeviceType = Some(fake_memory_device_type);
+        api.MemoryInfoGetName = Some(fake_memory_name);
+        api.MemoryInfoGetId = Some(fake_memory_id);
         api.GetTensorElementTypeAndShapeDataReference = Some(counting_shape_reference);
         api.GetTensorTypeAndShape = Some(counting_get_type_shape);
         api.GetTensorElementType = Some(legacy_get_elem_type);
@@ -824,6 +963,25 @@ mod tests {
         assert_eq!(inputs[0].shape, vec![2, 3, 4]);
         assert_eq!(inputs[0].strides, vec![12, 4, 1]);
         assert_eq!(inputs[0].dtype, DataType::Float32);
+        assert_eq!(inputs[0].device, DeviceId::cpu());
+    }
+
+    #[test]
+    fn input_view_preserves_cuda_residency_from_ort_memory_info() {
+        let mut api = api_with_both_shape_routes();
+        api.MemoryInfoGetDeviceType = Some(fake_gpu_memory_device_type);
+        api.MemoryInfoGetName = Some(fake_cuda_memory_name);
+        api.MemoryInfoGetId = Some(fake_cuda_memory_id);
+        let ctx = std::ptr::dangling_mut::<ort::OrtKernelContext>();
+
+        let inputs = unsafe { read_inputs(&api, ctx) }.expect("the fake CUDA input is readable");
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].device, DeviceId::cuda(3));
+        assert_eq!(inputs[0].view().device, DeviceId::cuda(3));
+        assert!(
+            !inputs[0].view().device.is_host_accessible(),
+            "a non-null CUDA pointer must never be inferred to be host memory"
+        );
     }
 
     /// The route test above proves *which* family runs; these pin what it
@@ -1124,10 +1282,26 @@ mod tests {
             dtype: DataType::Float32,
             shape: DimVec::from([2, 2]),
             strides: DimVec::from([2, 1]),
+            device: DeviceId::cpu(),
         };
         let view = input.view();
         assert_eq!(view.shape, &[2, 2]);
         assert_eq!(view.dtype, DataType::Float32);
+        assert_eq!(view.device, DeviceId::cpu());
+    }
+
+    #[test]
+    fn owned_input_dangling_device_pointer_stays_non_host_accessible() {
+        let input = OwnedInput {
+            data_ptr: std::ptr::dangling(),
+            dtype: DataType::Int64,
+            shape: DimVec::new(),
+            strides: DimVec::new(),
+            device: DeviceId::cuda(7),
+        };
+        let view = input.view();
+        assert_eq!(view.device, DeviceId::cuda(7));
+        assert!(!view.device.is_host_accessible());
     }
 
     #[test]
@@ -1186,6 +1360,7 @@ mod tests {
             dtype: DataType::Float32,
             shape: DimVec::new(),
             strides: DimVec::new(),
+            device: DeviceId::cpu(),
         };
         let view = input.view();
         assert_eq!(view.shape, &[] as &[usize]);

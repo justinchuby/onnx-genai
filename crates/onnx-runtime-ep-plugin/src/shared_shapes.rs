@@ -15,13 +15,20 @@ use onnx_runtime_shape_inference::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SharedNativeShapeRule {
     ConstantOfShape,
+    Dft,
     Expand,
     Stft,
     Tile,
 }
 
 impl SharedNativeShapeRule {
-    const ALL: [Self; 4] = [Self::ConstantOfShape, Self::Expand, Self::Stft, Self::Tile];
+    const ALL: [Self; 5] = [
+        Self::ConstantOfShape,
+        Self::Dft,
+        Self::Expand,
+        Self::Stft,
+        Self::Tile,
+    ];
 
     /// Every rule currently routed through the shared adapter.
     #[cfg(feature = "testutil")]
@@ -33,6 +40,7 @@ impl SharedNativeShapeRule {
     pub(crate) const fn op_type(self) -> &'static str {
         match self {
             Self::ConstantOfShape => "ConstantOfShape",
+            Self::Dft => "DFT",
             Self::Expand => "Expand",
             Self::Stft => "STFT",
             Self::Tile => "Tile",
@@ -220,6 +228,32 @@ mod tests {
             ),
             view(
                 target.as_ptr().cast(),
+                DataType::Int64,
+                &[2],
+                &[1],
+                DeviceId::cuda(0),
+            ),
+        ];
+
+        assert_eq!(
+            infer_shared_node(&node("Expand", 2), &inputs),
+            SharedShapeResult::SymbolicOrUnknown
+        );
+    }
+
+    #[test]
+    fn dangling_device_shape_pointer_is_never_host_dereferenced() {
+        let data = [0.0f32; 3];
+        let inputs = [
+            view(
+                data.as_ptr().cast(),
+                DataType::Float32,
+                &[3, 1],
+                &[1, 1],
+                DeviceId::cpu(),
+            ),
+            view(
+                std::ptr::dangling::<u8>(),
                 DataType::Int64,
                 &[2],
                 &[1],
