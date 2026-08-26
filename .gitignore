@@ -148,3 +148,16 @@ roy_validate.log
 /.mutate*
 /.suite.log
 /.selftest.log
+
+# Local-only working directories. These are not "files someone might add by
+# accident" but directories every agent on a shared box creates by convention:
+# throwaway worktrees for validating a PR against latest main, and a vendored
+# upstream checkout. Measured before adding: `git add -A` in a primary checkout
+# staged 69 files from .validation-worktrees alone. The root-file allowlist job
+# does catch this once committed -- it reports the root segment, not the leaf --
+# so this is the layer that stops it reaching a commit at all, not a substitute.
+# Root-anchored, because a crate could legitimately hold a nested fixture dir of
+# any of these names and only the repository root is scratch.
+/.validation-worktrees/
+/.worktrees/
+/.ort_upstream/
