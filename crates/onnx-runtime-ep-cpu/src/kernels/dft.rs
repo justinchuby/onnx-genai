@@ -91,10 +91,16 @@ impl KernelFactory for DftFactory {
         // Opset < 20: axis is an attribute (default 1).
         // Opset >= 20: axis is an input, handled at execute time.
         let axis_attr = node.attr("axis").and_then(|a| a.as_int());
+        let default_axis = if node.local_opset().unwrap_or(17) >= 20 {
+            -2
+        } else {
+            1
+        };
         Ok(Box::new(DftKernel {
             inverse,
             onesided,
             axis_attr,
+            default_axis,
         }))
     }
 }
@@ -103,6 +109,7 @@ struct DftKernel {
     inverse: bool,
     onesided: bool,
     axis_attr: Option<i64>,
+    default_axis: i64,
 }
 
 impl Kernel for DftKernel {
@@ -127,7 +134,7 @@ impl Kernel for DftKernel {
             let axis_data = super::to_dense_i64(&inputs[2])?;
             axis_data[0]
         } else {
-            self.axis_attr.unwrap_or(-2)
+            self.axis_attr.unwrap_or(self.default_axis)
         };
 
         let axis = normalize_axis(axis_raw, rank)?;
@@ -587,6 +594,57 @@ mod tests {
         node.attributes
             .insert("onesided".into(), Attribute::Int(onesided));
         node
+    }
+
+    fn versioned_dft_node(version: i64, axis: Option<i64>) -> Node {
+        let mut node = Node::new(NodeId(0), "DFT", vec![], vec![]);
+        node.version = Some(version);
+        node.attributes.insert("onesided".into(), Attribute::Int(1));
+        if let Some(axis) = axis {
+            node.attributes.insert("axis".into(), Attribute::Int(axis));
+        }
+        node
+    }
+
+    #[test]
+    fn versioned_default_axis_and_explicit_overrides_are_discriminating() {
+        let input = Owned::f32(&[1, 8, 6, 1], &[0.0; 48]);
+
+        let mut opset17_output = Owned::zeros_f32(&[1, 5, 6, 2]);
+        DftFactory
+            .create(&versioned_dft_node(17, None), &[vec![1, 8, 6, 1]])
+            .unwrap()
+            .execute(&[input.view()], &mut [opset17_output.view_mut()])
+            .unwrap();
+
+        let mut opset20_output = Owned::zeros_f32(&[1, 8, 4, 2]);
+        DftFactory
+            .create(&versioned_dft_node(20, None), &[vec![1, 8, 6, 1]])
+            .unwrap()
+            .execute(&[input.view()], &mut [opset20_output.view_mut()])
+            .unwrap();
+
+        let mut attr_output = Owned::zeros_f32(&[1, 8, 4, 2]);
+        DftFactory
+            .create(&versioned_dft_node(17, Some(2)), &[vec![1, 8, 6, 1]])
+            .unwrap()
+            .execute(&[input.view()], &mut [attr_output.view_mut()])
+            .unwrap();
+
+        let axis = Owned::i64(&[], &[1]);
+        let mut input_axis_output = Owned::zeros_f32(&[1, 5, 6, 2]);
+        DftFactory
+            .create(&versioned_dft_node(20, None), &[vec![1, 8, 6, 1]])
+            .unwrap()
+            .execute(
+                &[
+                    input.view(),
+                    TensorView::absent(onnx_runtime_ir::DataType::Int64),
+                    axis.view(),
+                ],
+                &mut [input_axis_output.view_mut()],
+            )
+            .unwrap();
     }
 
     /// Verify the radix-2 FFT matches the naive DFT within tolerance.
