@@ -12,16 +12,44 @@
 # `gh pr checks | grep -v fail` because there is no row to grep.
 
 set -uo pipefail
-cd "$(dirname "$0")/.." || exit 1
 
-MW=scripts/merge_when_green.sh
-WORK=${CARGO_TARGET_TMPDIR:-target}/mwg-test.$$
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P) || exit 1
+ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd -P) || exit 1
+cd "$ROOT" || exit 1
+
+MW="$ROOT/scripts/merge_when_green.sh"
 REPO=acme/widget
 
 pass=0
 fail=0
 
-cleanup() { rm -rf "$WORK"; }
+resolve_work_root() {
+    local candidate=${CARGO_TARGET_TMPDIR:-"$ROOT/target"}
+    case "$candidate" in
+        [A-Za-z]:[\\/]*)
+            command -v cygpath >/dev/null 2>&1 || {
+                echo "merge_when_green_test.sh: Windows temp path requires cygpath: $candidate" >&2
+                return 1
+            }
+            candidate=$(cygpath -u "$candidate") || return 1
+            ;;
+        /*) ;;
+        *) candidate="$ROOT/$candidate" ;;
+    esac
+    mkdir -p "$candidate" || return 1
+    CDPATH= cd -- "$candidate" && pwd -P
+}
+
+WORK_ROOT=$(resolve_work_root) || exit 1
+WORK=$(mktemp -d "$WORK_ROOT/mwg-test.XXXXXX") || exit 1
+case "$WORK" in
+    "" | / | "$ROOT")
+        echo "merge_when_green_test.sh: refusing unsafe work root: $WORK" >&2
+        exit 1
+        ;;
+esac
+
+cleanup() { rm -rf -- "$WORK"; }
 trap cleanup EXIT
 
 chk() {
@@ -66,19 +94,21 @@ case "$args" in
         if [ "$from" -gt 0 ] && [ "$n" -ge "$from" ] && { [ "$to" = 0 ] || [ "$n" -le "$to" ]; }; then
             exit 1
         fi
-        if [ -f "$FIX/pr.$n.json" ]; then cat "$FIX/pr.$n.json"; else cat "$FIX/pr.json"; fi
-        exit 0
+        if [ -f "$FIX/pr.$n.json" ]; then
+            cat "$FIX/pr.$n.json" || exit 90
+        else
+            cat "$FIX/pr.json" || exit 90
+        fi
         ;;
     *rulesets/*)
         case "$args" in
-            *bypass_actors*) cat "$FIX/bypass" 2>/dev/null; exit 0 ;;
-            *) cat "$FIX/contexts" 2>/dev/null; exit 0 ;;
+            *bypass_actors*) cat "$FIX/bypass" || exit 90 ;;
+            *) cat "$FIX/contexts" || exit 90 ;;
         esac
         ;;
     *rulesets*)
         if [ -f "$FIX/ruleset_ids.fail" ]; then exit 1; fi
-        cat "$FIX/ruleset_ids" 2>/dev/null
-        exit 0
+        cat "$FIX/ruleset_ids" || exit 90
         ;;
 esac
 exit 0
@@ -99,6 +129,7 @@ fixture() {
     rollup "$FIX/pr.json" OPEN deadbeef \
         '{"name":"Fast (Linux x86_64)","status":"COMPLETED","conclusion":"SUCCESS"}' \
         '{"name":"Rust quality","status":"COMPLETED","conclusion":"SUCCESS"}'
+    require_fixture "$FIX" || exit 1
 }
 
 rollup() {
@@ -106,10 +137,48 @@ rollup() {
     shift 3
     local checks=""
     for c in "$@"; do checks="${checks:+$checks,}$c"; done
-    cat >"$out" <<EOF
+    if ! cat >"$out" <<EOF
 {"state":"$state","headRefOid":"$head","isDraft":false,
  "mergeStateStatus":"BLOCKED","statusCheckRollup":[$checks]}
 EOF
+    then
+        echo "merge_when_green_test.sh: HARNESS ERROR: could not write $out" >&2
+        exit 1
+    fi
+}
+
+set_merge_state() {
+    local path=$1 value=$2
+    if ! python3 - "$path" "$value" <<'PY'
+import json
+import sys
+
+path, value = sys.argv[1:]
+with open(path, encoding="utf-8") as source:
+    document = json.load(source)
+if value == "__MISSING__":
+    document.pop("mergeStateStatus", None)
+else:
+    document["mergeStateStatus"] = value
+with open(path, "w", encoding="utf-8", newline="\n") as output:
+    json.dump(document, output, separators=(",", ":"))
+    output.write("\n")
+PY
+    then
+        echo "merge_when_green_test.sh: HARNESS ERROR: could not update $path" >&2
+        exit 1
+    fi
+}
+
+require_fixture() {
+    local root=$1 file missing=0
+    for file in ruleset_ids contexts bypass merge_rc argv.log pr.json; do
+        if [ ! -f "$root/$file" ]; then
+            echo "merge_when_green_test.sh: HARNESS ERROR: fixture '$root' is missing $file" >&2
+            missing=1
+        fi
+    done
+    [ "$missing" -eq 0 ]
 }
 
 # `wc -l <missing` prints a shell error that looks like a suite fault; the
@@ -117,6 +186,10 @@ EOF
 merges() { [ -f "$FIX/merge.log" ] && wc -l <"$FIX/merge.log" || echo 0; }
 
 run_mw() {
+    if ! require_fixture "$FIX" >"$FIX/out" 2>&1; then
+        echo 99
+        return
+    fi
     MWG_FIX="$FIX" PATH="$WORK/bin:$PATH" \
         bash "$MW" 7 --repo "$REPO" --timeout "${T:-0}" --poll 1 "$@" \
         >"$FIX/out" 2>&1
@@ -125,6 +198,15 @@ run_mw() {
 
 make_shim
 
+echo "== harness integrity =="
+fixture missing_pr_json
+rm "$FIX/pr.json"
+chk "a missing pr.json is a harness error, never a gate verdict" "$(run_mw)" "99"
+chk "and a broken fixture cannot record a merge" "$(merges)" "0"
+chk "and the harness error names the missing contract file" \
+    "$(grep -c 'HARNESS ERROR:.*missing pr.json' "$FIX/out")" "1"
+
+echo
 echo "== the green path =="
 fixture green
 chk "all required checks green merges" "$(run_mw)" "0"
@@ -356,7 +438,8 @@ skipped_fixture() {
         '{"name":"Rust quality","status":"COMPLETED","conclusion":"SKIPPED"}'
     # `rollup` writes BLOCKED; a repository that accepts the skip reports
     # UNSTABLE, and that difference is the gate two cells below.
-    sed -i 's/"mergeStateStatus":"BLOCKED"/"mergeStateStatus":"UNSTABLE"/' "$FIX/pr.json"
+    set_merge_state "$FIX/pr.json" UNSTABLE
+    require_fixture "$FIX" || exit 1
 }
 
 skipped_fixture skip_default
@@ -376,7 +459,7 @@ chk "and still without --admin" "$(grep -c -- '--admin' "$FIX/argv.log")" "0"
 # NOT permission to overrule the repository. BLOCKED means GitHub does not
 # accept the skip as satisfying the requirement.
 skipped_fixture skip_blocked
-sed -i 's/"mergeStateStatus":"UNSTABLE"/"mergeStateStatus":"BLOCKED"/' "$FIX/pr.json"
+set_merge_state "$FIX/pr.json" BLOCKED
 chk "--allow-skipped does not merge a pull request GitHub reports BLOCKED" \
     "$(run_mw --allow-skipped)" "6"
 chk "and nothing was merged" "$(merges)" "0"
@@ -387,7 +470,7 @@ chk "and nothing was merged" "$(merges)" "0"
 fixture skip_not_absent
 rollup "$FIX/pr.json" OPEN deadbeef \
     '{"name":"Fast (Linux x86_64)","status":"COMPLETED","conclusion":"SKIPPED"}'
-sed -i 's/"mergeStateStatus":"BLOCKED"/"mergeStateStatus":"UNSTABLE"/' "$FIX/pr.json"
+set_merge_state "$FIX/pr.json" UNSTABLE
 chk "--allow-skipped does not excuse a required check with no row at all" \
     "$(run_mw --allow-skipped)" "3"
 chk "and nothing was merged" "$(merges)" "0"
@@ -396,7 +479,7 @@ fixture skip_not_pending
 rollup "$FIX/pr.json" OPEN deadbeef \
     '{"name":"Fast (Linux x86_64)","status":"COMPLETED","conclusion":"SKIPPED"}' \
     '{"name":"Rust quality","status":"IN_PROGRESS","conclusion":null}'
-sed -i 's/"mergeStateStatus":"BLOCKED"/"mergeStateStatus":"UNSTABLE"/' "$FIX/pr.json"
+set_merge_state "$FIX/pr.json" UNSTABLE
 chk "--allow-skipped does not excuse a required check still running" \
     "$(run_mw --allow-skipped)" "3"
 chk "and nothing was merged" "$(merges)" "0"
@@ -405,7 +488,7 @@ fixture skip_not_failure
 rollup "$FIX/pr.json" OPEN deadbeef \
     '{"name":"Fast (Linux x86_64)","status":"COMPLETED","conclusion":"SKIPPED"}' \
     '{"name":"Rust quality","status":"COMPLETED","conclusion":"FAILURE"}'
-sed -i 's/"mergeStateStatus":"BLOCKED"/"mergeStateStatus":"UNSTABLE"/' "$FIX/pr.json"
+set_merge_state "$FIX/pr.json" UNSTABLE
 chk "--allow-skipped does not excuse a required check that failed" \
     "$(run_mw --allow-skipped)" "2"
 chk "and nothing was merged" "$(merges)" "0"
@@ -433,7 +516,8 @@ dup_fixture() {
     rollup "$FIX/pr.json" OPEN deadbeef \
         '{"name":"Fast (Linux x86_64)","status":"COMPLETED","conclusion":"SUCCESS"}' \
         "$2" "$3"
-    sed -i 's/"mergeStateStatus":"BLOCKED"/"mergeStateStatus":"UNSTABLE"/' "$FIX/pr.json"
+    set_merge_state "$FIX/pr.json" UNSTABLE
+    require_fixture "$FIX" || exit 1
 }
 
 RQ_SKIP='{"name":"Rust quality","status":"COMPLETED","conclusion":"SKIPPED"}'
@@ -468,9 +552,12 @@ echo "== the merge state is an allowlist, not a BLOCKED denylist =="
 # saying it has not worked out mergeability yet, and including the field
 # vanishing in an API change -- count as the repository accepting the skip.
 state_fixture() {
-    skipped_fixture "$1"
-    sed -i "s/\"mergeStateStatus\":\"UNSTABLE\"/\"mergeStateStatus\":\"$2\"/" \
-        "$FIX/pr.json"
+    fixture "$1"
+    rollup "$FIX/pr.json" OPEN deadbeef \
+        '{"name":"Fast (Linux x86_64)","status":"COMPLETED","conclusion":"SKIPPED"}' \
+        '{"name":"Rust quality","status":"COMPLETED","conclusion":"SKIPPED"}'
+    set_merge_state "$FIX/pr.json" "$2"
+    require_fixture "$FIX" || exit 1
 }
 
 state_fixture state_dirty DIRTY
@@ -488,7 +575,7 @@ chk "an uncomputed merge state is not an accepting one -- it waits" \
 chk "and nothing was merged" "$(merges)" "0"
 
 skipped_fixture state_missing
-sed -i 's/"mergeStateStatus":"UNSTABLE",//' "$FIX/pr.json"
+set_merge_state "$FIX/pr.json" __MISSING__
 chk "and the field being absent altogether waits too, not merges" \
     "$(run_mw --allow-skipped)" "3"
 chk "and nothing was merged" "$(merges)" "0"
@@ -503,7 +590,7 @@ echo
 # An assertion that quietly stops running is indistinguishable from one that
 # passes. Both branches of the probe above assert, so this total is invariant
 # across environments.
-chk "every assertion in this file ran" "$((pass + fail + 1))" "72"
+chk "every assertion in this file ran" "$((pass + fail + 1))" "75"
 
 echo
 echo "passed=${pass} failed=${fail}"
