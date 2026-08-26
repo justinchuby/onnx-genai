@@ -1178,36 +1178,45 @@ fn supports_op_claims_valid_and_low_precision_storage() {
     ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
 )]
 #[test]
-fn native_provider_accepts_only_exact_opset_v1() {
+fn native_provider_resolves_opset_1_and_2_to_the_v1_schema() {
     let ep = require_cuda();
     let case = glm_case(1, 4);
     let inputs = glm_inputs(case, 0x0A57);
-    let (graph, node, _specs) = build_node(&inputs, case);
+    let (graph, node, specs) = build_node(&inputs, case);
     let model = Model::new(&graph);
     let node_ref = model.graph.node(node);
     let (shapes, dtypes) = shapes_and_dtypes(&inputs);
 
-    assert!(matches!(
-        ep.supports_op(node_ref, 1, &shapes, &dtypes, &[]),
-        KernelMatch::Supported { .. }
-    ));
+    for opset in [1, 2] {
+        assert!(
+            matches!(
+                ep.supports_op(node_ref, opset, &shapes, &dtypes, &[]),
+                KernelMatch::Supported { .. }
+            ),
+            "the v1 schema must serve domain import opset {opset}"
+        );
+    }
     assert!(
         matches!(
-            ep.supports_op(node_ref, 2, &shapes, &dtypes, &[]),
+            ep.supports_op(node_ref, 0, &shapes, &dtypes, &[]),
             KernelMatch::Unsupported { .. }
         ),
-        "the frozen DsaIndexSelect ABI must not inherit since-version v2 support"
+        "no schema is registered at opset zero"
     );
-    assert!(
-        ep.get_kernel(node_ref, &concrete_shapes(&inputs), 1)
-            .is_ok(),
-        "native provider must create the v1 kernel"
-    );
-    assert!(
-        ep.get_kernel(node_ref, &concrete_shapes(&inputs), 2)
-            .is_err(),
-        "native provider must reject direct v2 kernel creation"
-    );
+
+    let v1 = ep
+        .get_kernel(node_ref, &concrete_shapes(&inputs), 1)
+        .expect("domain import 1 must resolve the v1 kernel");
+    let v2 = ep
+        .get_kernel(node_ref, &concrete_shapes(&inputs), 2)
+        .expect("domain import 2 must continue resolving the v1 kernel");
+    let v1_output =
+        run_gpu_with_kernel(&ep, v1.as_ref(), &inputs, &specs).expect("execute import 1");
+    let v2_output =
+        run_gpu_with_kernel(&ep, v2.as_ref(), &inputs, &specs).expect("execute import 2");
+    let cpu = run_cpu(&graph, node, &inputs, &specs).expect("CPU v1 oracle");
+    assert_indices_bit_exact(&v1_output[0], &cpu[0], "domain import 1");
+    assert_indices_bit_exact(&v2_output[0], &cpu[0], "domain import 2");
 }
 
 #[cfg_attr(

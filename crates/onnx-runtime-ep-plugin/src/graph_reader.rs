@@ -65,7 +65,6 @@ impl OutboundGraphReader {
 
         let mut ir_graph = Graph::new();
         let mut ort_index_to_node_id = Vec::new();
-        ir_graph.opset_imports = unsafe { Self::graph_operator_sets(api, graph_ptr)? };
 
         // Get nodes.
         let num_nodes = unsafe { Self::graph_num_nodes(api, graph_ptr)? };
@@ -232,13 +231,8 @@ impl OutboundGraphReader {
             let mut node = Node::new(NodeId(0), &op_type, inputs, outputs);
             node.name = name;
             node.domain = domain.clone();
-            let effective_opset = ir_graph
-                .opset_imports
-                .get(&domain)
-                .copied()
-                .or_else(|| (since_version > 0).then_some(since_version as u64));
-            if let Some(version) = effective_opset {
-                node.version = i64::try_from(version).ok();
+            if since_version > 0 {
+                node.version = Some(since_version as i64);
             }
 
             // Read node attributes from ORT and populate IR node.
@@ -250,7 +244,7 @@ impl OutboundGraphReader {
             // input[1] is a constant initializer, inject it as an attribute so
             // ShapeInference::for_node can use it.
             if (op_type == "Unsqueeze" || op_type == "Squeeze")
-                && effective_opset.is_some_and(|version| version >= 13)
+                && since_version >= 13
                 && !node.attributes.contains_key("axes")
                 && let Some(axes_input_name) = node_input_names[i].get(1)
                 && let Some(axes_data) = initializer_int64.get(axes_input_name)
@@ -274,11 +268,10 @@ impl OutboundGraphReader {
             }
         }
 
-        if ir_graph.opset_imports.is_empty() {
-            ir_graph
-                .opset_imports
-                .insert(String::new(), ort::ORT_API_VERSION as u64);
-        }
+        // Set default opset.
+        ir_graph
+            .opset_imports
+            .insert(String::new(), ort::ORT_API_VERSION as u64);
 
         Ok(Self {
             graph: ir_graph,
@@ -334,38 +327,6 @@ impl OutboundGraphReader {
     }
 
     // ─── ORT API wrappers ───────────────────────────────────────────────
-
-    unsafe fn graph_operator_sets(
-        api: *const ort::OrtApi,
-        graph: *const ort::OrtGraph,
-    ) -> Result<HashMap<String, u64>, String> {
-        let get_count = unsafe { (*api).Graph_GetNumOperatorSets }
-            .ok_or("OrtApi.Graph_GetNumOperatorSets is null")?;
-        let get_sets = unsafe { (*api).Graph_GetOperatorSets }
-            .ok_or("OrtApi.Graph_GetOperatorSets is null")?;
-        let mut count = 0usize;
-        Self::check(unsafe { get_count(graph, &mut count) })?;
-        let mut domains = vec![ptr::null(); count];
-        let mut versions = vec![0i64; count];
-        if count != 0 {
-            Self::check(unsafe {
-                get_sets(graph, domains.as_mut_ptr(), versions.as_mut_ptr(), count)
-            })?;
-        }
-        let mut out = HashMap::with_capacity(count);
-        for (domain, version) in domains.into_iter().zip(versions) {
-            if domain.is_null() || version < 0 {
-                return Err("Graph_GetOperatorSets returned an invalid domain/version".into());
-            }
-            let domain = unsafe { CStr::from_ptr(domain) }
-                .to_string_lossy()
-                .into_owned();
-            let version = u64::try_from(version)
-                .map_err(|_| "Graph_GetOperatorSets returned a negative version")?;
-            out.insert(domain, version);
-        }
-        Ok(out)
-    }
 
     unsafe fn graph_num_nodes(
         api: *const ort::OrtApi,

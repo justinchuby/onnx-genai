@@ -51,7 +51,8 @@ const TOP_K: i64 = 4;
 /// baseline; callers mutate one field to construct exactly one violation.
 struct DsaSpec {
     domain: String,
-    version: i64,
+    imported_version: u64,
+    resolved_schema_version: Option<i64>,
     query_dtype: DataType,
     key_dtype: DataType,
     weights_dtype: DataType,
@@ -72,7 +73,8 @@ impl DsaSpec {
     fn valid(storage: DataType) -> Self {
         Self {
             domain: "pkg.nxrt".into(),
-            version: 1,
+            imported_version: 1,
+            resolved_schema_version: Some(1),
             query_dtype: storage,
             key_dtype: storage,
             weights_dtype: storage,
@@ -97,7 +99,7 @@ impl DsaSpec {
         graph.opset_imports.insert(String::new(), 17);
         graph
             .opset_imports
-            .insert(self.domain.clone(), self.version as u64);
+            .insert(self.domain.clone(), self.imported_version);
 
         let query =
             graph.create_named_value("query", self.query_dtype, Self::shape(&self.query_shape));
@@ -125,7 +127,7 @@ impl DsaSpec {
             vec![output],
         );
         node.domain = self.domain.clone();
-        node.version = Some(self.version);
+        node.version = self.resolved_schema_version;
         node.attributes.insert("top_k".into(), self.top_k.clone());
         if let Some(scale) = &self.scale {
             node.attributes.insert("scale".into(), scale.clone());
@@ -184,8 +186,9 @@ fn evaluate(spec: &DsaSpec) -> Capability {
     let node_idx = view.nodes().next().unwrap();
     let node = view.node(node_idx);
 
-    // Trait half: the CPU EP claim gate, driven at the node's effective opset —
-    // the same opset `query_capabilities` derives from `opset_imports`.
+    // Trait half: the CPU EP claim gate, driven at the node's resolved schema
+    // since-version. ORT's graph reader stores Node_GetSinceVersion here, so a
+    // domain import of 2 still reaches both trait and shape halves as schema 1.
     let opset = graph.effective_opset(node).unwrap_or(0);
     let trait_supported = ep.supports_node(&view, node_idx, opset).is_supported();
 
@@ -220,26 +223,30 @@ fn evaluate(spec: &DsaSpec) -> Capability {
 /// the merged #2053 revision advertises; a catch-all `Float32`-only constraint
 /// would have wrongly dropped the low-precision GLM storage path.
 #[test]
-fn dsa_index_select_session_load_claims_f32_f16_bf16_storage() {
-    for storage in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
-        let cap = evaluate(&DsaSpec::valid(storage));
-        assert!(
-            cap.trait_supported,
-            "CPU claim gate must claim {storage:?} storage DsaIndexSelect at capability time"
-        );
-        assert!(
-            !cap.shape_declined,
-            "plugin shape rule must not decline valid {storage:?} storage DsaIndexSelect"
-        );
-        assert!(
-            matches!(cap.shape, ShapeInference::DsaIndexSelect { top_k } if top_k == TOP_K as usize),
-            "shape rule must infer DsaIndexSelect {{ top_k = {TOP_K} }} for {storage:?}, got {:?}",
-            cap.shape
-        );
-        assert!(
-            cap.cabi_claimed,
-            "full session-load capability path must keep valid {storage:?} storage DsaIndexSelect"
-        );
+fn dsa_index_select_session_load_claims_imports_1_and_2_for_all_storage() {
+    for imported_version in [1, 2] {
+        for storage in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
+            let mut spec = DsaSpec::valid(storage);
+            spec.imported_version = imported_version;
+            let cap = evaluate(&spec);
+            assert!(
+                cap.trait_supported,
+                "CPU claim gate must claim {storage:?} storage at domain import {imported_version}"
+            );
+            assert!(
+                !cap.shape_declined,
+                "plugin shape rule must accept resolved v1 for domain import {imported_version}"
+            );
+            assert!(
+                matches!(cap.shape, ShapeInference::DsaIndexSelect { top_k } if top_k == TOP_K as usize),
+                "shape rule must infer the v1 fixed width for domain import {imported_version}, got {:?}",
+                cap.shape
+            );
+            assert!(
+                cap.cabi_claimed,
+                "full session-load path must claim domain import {imported_version}"
+            );
+        }
     }
 }
 
@@ -343,30 +350,6 @@ fn dsa_index_select_capability_rejects_inconsistent_static_dims() {
     assert!(
         !cap.cabi_claimed,
         "full capability path must exclude the inconsistent-dims node at session load"
-    );
-}
-
-/// A wrong opset (v2) must be excluded from the session-load claim set. The CPU
-/// registry follows ONNX since-version semantics (an op registered since v1 is
-/// claimable at any opset ≥ 1), so the **plugin shape rule** is the half that
-/// pins the exact `pkg.nxrt` v1 dispatch and declines v2 — keeping the node out
-/// of the combined C-ABI claim set at capability time.
-#[test]
-fn dsa_index_select_capability_rejects_wrong_opset() {
-    let mut spec = DsaSpec::valid(DataType::Float32);
-    spec.version = 2;
-    let cap = evaluate(&spec);
-    assert!(
-        cap.trait_supported,
-        "CPU registry follows ONNX since-version semantics, so it still claims DsaIndexSelect at opset 2 — the shape half is the gate here"
-    );
-    assert!(
-        cap.shape_declined,
-        "plugin shape rule dispatches only pkg.nxrt v1, so opset 2 must decline"
-    );
-    assert!(
-        !cap.cabi_claimed,
-        "full capability path must exclude the wrong-opset node at session load"
     );
 }
 

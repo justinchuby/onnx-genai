@@ -197,11 +197,13 @@ parity is byte-exact, not tolerance-based). Design as landed:
   `warmed` flips true only after a non-capturing eager pass has NVRTC-compiled
   the kernel and sized the workspace; `capture_support()` reports `Supported`
   only once warmed, so a captured region performs no host alloc / sync / compile.
-- **Exact v1 claim gate.** Native `supports_op`/`get_kernel` and the plugin
-  registry accept only `pkg.nxrt::DsaIndexSelect` v1. The plugin graph reader
-  preserves the model's real domain-opset imports rather than substituting the
-  schema since-version, and the CUDA plugin contributes the `pkg.nxrt` schema
-  needed for a real ORT session. Shape/dtype validation delegates to the shared CPU
+- **Single v1 schema.** `pkg.nxrt::DsaIndexSelect` has one registered schema
+  with `since_version = 1`. Normal ONNX resolution therefore maps domain imports
+  1, 2, and later to that v1 schema until a newer schema is actually registered;
+  opset 0 has no match. Native dispatch selects the highest registered
+  `since_version <= import`, while ORT gives plugin shape inference the resolved
+  schema version from `Node_GetSinceVersion`. The CUDA plugin contributes the
+  `pkg.nxrt` schema needed for a real ORT session. Shape/dtype validation delegates to the shared CPU
   `unsupported_reason`, first projecting the query/key/weights float dtypes to f32
   (CUDA supports f16/bf16 storage) while leaving `attention_bias` untouched, so
   the oracle's strict f32-only bias reject still fires. Quantized cache modes,

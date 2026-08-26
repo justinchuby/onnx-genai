@@ -2618,11 +2618,6 @@ impl ExecutionProvider for CudaExecutionProvider {
         input_dtypes: &[DataType],
         layouts: &[TensorLayout],
     ) -> KernelMatch {
-        if op.op_type == "DsaIndexSelect" && op.domain == "pkg.nxrt" && opset != 1 {
-            deny!(
-                "pkg.nxrt::DsaIndexSelect has a frozen exact v1 ABI; opset {opset} is unsupported"
-            );
-        }
         // Keyed on (op_type, domain, opset) via the registry, the same single
         // source of truth the CPU EP uses.
         if !self.registry.supports(&op.op_type, &op.domain, opset) {
@@ -2879,13 +2874,6 @@ impl ExecutionProvider for CudaExecutionProvider {
     }
 
     fn get_kernel(&self, op: &Node, shapes: &[Vec<usize>], opset: u64) -> Result<Box<dyn Kernel>> {
-        if op.op_type == "DsaIndexSelect" && op.domain == "pkg.nxrt" && opset != 1 {
-            return Err(EpError::NoEpForOp {
-                domain: op.domain.clone(),
-                op_type: op.op_type.clone(),
-                opset,
-            });
-        }
         let factory = self
             .registry
             .lookup(&op.op_type, &op.domain, opset)

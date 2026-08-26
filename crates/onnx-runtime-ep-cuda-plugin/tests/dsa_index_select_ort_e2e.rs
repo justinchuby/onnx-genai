@@ -6,7 +6,7 @@ use std::process::Command;
     ignore = "requires CUDA, Python ONNX packages, and the gpu-tests feature"
 )]
 #[test]
-fn real_ort_session_executes_captures_and_rejects_v2() {
+fn real_ort_session_executes_captures_and_resolves_newer_imports() {
     let plugin = onnx_runtime_ort_testkit::find_plugin_cdylib_with_features(
         "onnx-runtime-ep-cuda-plugin",
         &["gpu-tests"],

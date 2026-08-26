@@ -109,7 +109,7 @@ mod cuda_impl {
     }
 
     unsafe extern "C" fn dsa_end_version(_op: *const ort::OrtCustomOp) -> i32 {
-        1
+        i32::MAX
     }
 
     unsafe extern "C" fn dsa_required_input(
@@ -222,24 +222,37 @@ mod cuda_impl {
     pub(crate) fn build_kernel_registry_entries(
         runtime: std::sync::Arc<onnx_runtime_ep_cuda::CudaRuntime>,
     ) -> Vec<KernelRegistryEntry> {
-        onnx_runtime_ep_cuda::build_cuda_registry_descriptors(runtime)
-            .into_iter()
-            .map(|d| KernelRegistryEntry {
+        let descriptors = onnx_runtime_ep_cuda::build_cuda_registry_descriptors(runtime);
+        descriptors
+            .iter()
+            .enumerate()
+            .map(|(index, d)| KernelRegistryEntry {
                 op_type: leak_str(&d.op_type),
                 domain: leak_str(&d.domain),
-                since_version: d.since_version as i32,
-                // Custom frozen ABIs are exact-version contracts. Standard ONNX
-                // and contrib kernels retain normal since-version semantics.
-                end_version: if d.op_type == "DsaIndexSelect" && d.domain == "pkg.nxrt" {
-                    1
-                } else {
-                    i32::MAX
-                },
+                since_version: i32::try_from(d.since_version)
+                    .expect("registered CUDA opset must fit ORT's i32 version ABI"),
+                end_version: schema_end_version(&descriptors, index),
                 supported_dtypes: d.supported_dtypes,
                 input_dtype_constraints: &[],
                 output_dtype_constraints: &[],
             })
             .collect()
+    }
+
+    fn schema_end_version(
+        descriptors: &[onnx_runtime_ep_cuda::CudaOpDescriptor],
+        index: usize,
+    ) -> i32 {
+        let descriptor = &descriptors[index];
+        descriptors
+            .get(index + 1)
+            .filter(|next| next.op_type == descriptor.op_type && next.domain == descriptor.domain)
+            .map(|next| {
+                i32::try_from(next.since_version)
+                    .expect("registered CUDA opset must fit ORT's i32 version ABI")
+                    - 1
+            })
+            .unwrap_or(i32::MAX)
     }
 
     /// Leak a string to get a `&'static str` (entries must live for the EP
@@ -272,6 +285,37 @@ mod cuda_impl {
         let stream_handle = ep.runtime().stream_ptr() as *mut std::os::raw::c_void;
         let entries = build_kernel_registry_entries(ep.runtime().clone());
         Ok((Box::new(ep), stream_handle, entries))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn descriptor(
+            op_type: &str,
+            domain: &str,
+            since_version: u64,
+        ) -> onnx_runtime_ep_cuda::CudaOpDescriptor {
+            onnx_runtime_ep_cuda::CudaOpDescriptor {
+                op_type: op_type.into(),
+                domain: domain.into(),
+                since_version,
+                supported_dtypes: &[],
+            }
+        }
+
+        #[test]
+        fn advertised_schema_ranges_end_before_the_next_registered_version() {
+            let descriptors = vec![
+                descriptor("DsaIndexSelect", "pkg.nxrt", 1),
+                descriptor("DsaIndexSelect", "pkg.nxrt", 3),
+                descriptor("Other", "pkg.nxrt", 1),
+            ];
+
+            assert_eq!(schema_end_version(&descriptors, 0), 2);
+            assert_eq!(schema_end_version(&descriptors, 1), i32::MAX);
+            assert_eq!(schema_end_version(&descriptors, 2), i32::MAX);
+        }
     }
 }
 

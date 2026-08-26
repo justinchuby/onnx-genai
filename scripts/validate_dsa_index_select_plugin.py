@@ -140,6 +140,7 @@ def main() -> int:
     options.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
     options.add_provider_for_devices([devices[0]], {})
     session = ort.InferenceSession(model_bytes(1), sess_options=options)
+    assert session.get_outputs()[0].shape == [1, 1, 2, 2]
 
     feeds = {
         "query": np.array([[[[1.0, 0.0]], [[0.0, 1.0]]]], dtype=np.float32),
@@ -207,21 +208,27 @@ def main() -> int:
     del bf16_session, bf16_options
     gc.collect()
 
-    bad_options = ort.SessionOptions()
-    bad_options.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
-    bad_options.add_provider_for_devices([devices[0]], {})
-    try:
-        ort.InferenceSession(model_bytes(2), sess_options=bad_options)
-    except Exception:
-        pass
-    else:
-        raise AssertionError("frozen DsaIndexSelect v2 unexpectedly loaded in a real session")
+    newer_import_options = ort.SessionOptions()
+    newer_import_options.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
+    newer_import_options.add_provider_for_devices([devices[0]], {})
+    compiled_before_newer_import = compiled_nodes()
+    newer_import_session = ort.InferenceSession(
+        model_bytes(2), sess_options=newer_import_options
+    )
+    assert newer_import_session.get_outputs()[0].shape == [1, 1, 2, 2]
+    (newer_import_output,) = newer_import_session.run(None, feeds)
+    np.testing.assert_array_equal(newer_import_output, expected)
+    assert compiled_nodes() == compiled_before_newer_import + 1
+    del newer_import_output, newer_import_session, newer_import_options
+    gc.collect()
+    assert workspace_live_bytes() == 0
+    assert workspace_allocations() == workspace_releases() == 3
 
     print(
         "PASS: real CUDA-plugin session ran f32/f16 v1 with CPU-reference parity, "
         "claimed bf16 v1 without fallback, "
         "captured once, replayed 3x, reused one 512-byte workspace pointer, "
-        "released it at teardown, and rejected v2"
+        "released it at teardown, and resolved an opset-2 domain import to v1 semantics"
     )
     return 0
 
