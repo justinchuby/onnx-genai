@@ -73,6 +73,40 @@ pub struct BenchmarkReport {
     pub rows: Vec<BenchmarkRow>,
 }
 
+impl BenchmarkReport {
+    pub fn ensure_correctness_gates_passed(&self) -> Result<()> {
+        let failed = failed_gate_names(&self.invariants);
+        ensure!(
+            failed.is_empty(),
+            "benchmark correctness gates failed: {}",
+            failed.join(", ")
+        );
+        Ok(())
+    }
+}
+
+fn failed_gate_names(invariants: &InvariantReport) -> Vec<&'static str> {
+    [
+        ("w1_output_parity", invariants.w1_output_parity),
+        (
+            "typed_same_session_conflict",
+            invariants.typed_same_session_conflict,
+        ),
+        (
+            "distinct_session_execution_overlap",
+            invariants.distinct_session_execution_overlap,
+        ),
+        (
+            "exact_completion_counts",
+            invariants.exact_completion_counts,
+        ),
+        ("no_counter_drift", invariants.no_counter_drift),
+    ]
+    .into_iter()
+    .filter_map(|(name, value)| (value == Some(false)).then_some(name))
+    .collect()
+}
+
 #[derive(Debug, Serialize)]
 pub struct EnvironmentReport {
     pub timestamp_utc: String,
@@ -453,13 +487,16 @@ async fn run_synthetic_matrix(
                 work_units,
             )
             .await?;
-            verify_measurement(&serialized, options.iterations, 0)?;
-            ensure!(
+            record_result_gate(
+                &mut invariants.exact_completion_counts,
+                verify_measurement(&serialized, options.iterations, 0),
+            );
+            record_gate(
+                &mut invariants.w1_output_parity,
                 serialized
                     .samples
                     .iter()
                     .all(|sample| sample.checksum == direct_checksum),
-                "W={workers} serialized checksum drift"
             );
             rows.push(row_from_measurement(
                 "synthetic",
@@ -480,7 +517,10 @@ async fn run_synthetic_matrix(
             )
             .await?;
             let expected_conflicts = options.iterations * concurrency.saturating_sub(1);
-            verify_measurement(&conflict, options.iterations, expected_conflicts)?;
+            record_result_gate(
+                &mut invariants.exact_completion_counts,
+                verify_measurement(&conflict, options.iterations, expected_conflicts),
+            );
             if workers > 1 && concurrency > 1 {
                 record_gate(
                     &mut invariants.typed_same_session_conflict,
@@ -505,16 +545,15 @@ async fn run_synthetic_matrix(
                 work_units,
             )
             .await?;
-            verify_measurement(&distinct, options.iterations, 0)?;
+            record_result_gate(
+                &mut invariants.exact_completion_counts,
+                verify_measurement(&distinct, options.iterations, 0),
+            );
             let overlap = max_steady_overlap(&distinct.samples);
             if workers > 1 && concurrency > 1 && options.iterations > 1 {
                 record_gate(
                     &mut invariants.distinct_session_execution_overlap,
                     overlap > 1,
-                );
-                ensure!(
-                    overlap > 1,
-                    "synthetic distinct sessions did not overlap at W={workers}, C={concurrency}"
                 );
             }
             rows.push(row_from_measurement(
@@ -530,7 +569,10 @@ async fn run_synthetic_matrix(
             let stateless =
                 measure_synthetic_stateless(&pool, options.iterations, concurrency, work_units)
                     .await?;
-            verify_measurement(&stateless, options.iterations, 0)?;
+            record_result_gate(
+                &mut invariants.exact_completion_counts,
+                verify_measurement(&stateless, options.iterations, 0),
+            );
             if workers == 1 {
                 record_gate(
                     &mut invariants.w1_output_parity,
@@ -550,7 +592,10 @@ async fn run_synthetic_matrix(
                 stateless,
             ));
 
-            assert_synthetic_counters(&pool, &leases)?;
+            record_result_gate(
+                &mut invariants.no_counter_drift,
+                assert_synthetic_counters(&pool, &leases),
+            );
         }
         pool.shutdown();
     }
@@ -702,12 +747,6 @@ async fn run_ort_matrix(
                 &mut invariants.w1_output_parity,
                 parity.token_ids == direct_engine_tokens,
             );
-            ensure!(
-                invariants.w1_output_parity == Some(true),
-                "W=1 driver output differs from direct engine: driver={:?}, direct={:?}",
-                parity.token_ids,
-                direct_engine_tokens
-            );
         }
 
         let leases = SessionLeases::with_shards(8);
@@ -719,7 +758,10 @@ async fn run_ort_matrix(
                 concurrency,
             )
             .await?;
-            verify_measurement(&serialized, options.iterations, 0)?;
+            record_result_gate(
+                &mut invariants.exact_completion_counts,
+                verify_measurement(&serialized, options.iterations, 0),
+            );
             verify_zero_prefix_cache_hits(&serialized, "serialized ORT session")?;
             rows.push(row_from_measurement(
                 "ort",
@@ -741,7 +783,10 @@ async fn run_ort_matrix(
             )
             .await?;
             let expected_conflicts = options.iterations * concurrency.saturating_sub(1);
-            verify_measurement(&conflict, options.iterations, expected_conflicts)?;
+            record_result_gate(
+                &mut invariants.exact_completion_counts,
+                verify_measurement(&conflict, options.iterations, expected_conflicts),
+            );
             verify_zero_prefix_cache_hits(&conflict, "same-session conflict owner")?;
             if workers > 1 && concurrency > 1 {
                 record_gate(
@@ -768,18 +813,16 @@ async fn run_ort_matrix(
                 options.warmups,
             )
             .await?;
-            verify_measurement(&distinct, options.iterations, 0)?;
+            record_result_gate(
+                &mut invariants.exact_completion_counts,
+                verify_measurement(&distinct, options.iterations, 0),
+            );
             verify_zero_prefix_cache_hits(&distinct, "distinct ORT sessions")?;
             let overlap = max_steady_overlap(&distinct.samples);
             if workers > 1 && concurrency > 1 && options.iterations > 1 {
                 record_gate(
                     &mut invariants.distinct_session_execution_overlap,
                     overlap > 1,
-                );
-                ensure!(
-                    overlap > 1,
-                    "real ORT distinct sessions did not overlap at W={workers}, C={concurrency}; \
-                     increase --max-new-tokens or inspect provider serialization"
                 );
             }
             rows.push(row_from_measurement(
@@ -800,7 +843,10 @@ async fn run_ort_matrix(
                 options.warmups,
             )
             .await?;
-            verify_measurement(&stateless, options.iterations, 0)?;
+            record_result_gate(
+                &mut invariants.exact_completion_counts,
+                verify_measurement(&stateless, options.iterations, 0),
+            );
             verify_zero_prefix_cache_hits(&stateless, "stateless ORT requests")?;
             rows.push(row_from_measurement(
                 "ort",
@@ -812,7 +858,10 @@ async fn run_ort_matrix(
                 stateless,
             ));
 
-            assert_driver_counters(&driver, &leases)?;
+            record_result_gate(
+                &mut invariants.no_counter_drift,
+                assert_driver_counters(&driver, &leases),
+            );
         }
         let shutdown = Arc::try_unwrap(driver)
             .map_err(|_| anyhow::anyhow!("benchmark retained an EngineDriver clone"))?;
@@ -1810,6 +1859,10 @@ fn record_gate(gate: &mut Option<bool>, passed: bool) {
     *gate = Some(gate.unwrap_or(true) && passed);
 }
 
+fn record_result_gate(gate: &mut Option<bool>, result: Result<()>) {
+    record_gate(gate, result.is_ok());
+}
+
 fn assert_synthetic_counters(pool: &WorkerPool, leases: &SessionLeases) -> Result<()> {
     ensure!(leases.held() == 0, "synthetic lease counter drift");
     for status in pool.statuses() {
@@ -2182,6 +2235,26 @@ fn path_text(path: &Path) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_correctness_gates_remain_serializable() {
+        let invariants = InvariantReport {
+            w1_output_parity: Some(false),
+            typed_same_session_conflict: None,
+            distinct_session_execution_overlap: Some(true),
+            exact_completion_counts: Some(false),
+            no_counter_drift: Some(true),
+        };
+
+        assert_eq!(
+            failed_gate_names(&invariants),
+            vec!["w1_output_parity", "exact_completion_counts"]
+        );
+        let json = serde_json::to_value(invariants).expect("serialize invariants");
+        assert_eq!(json["w1_output_parity"], false);
+        assert_eq!(json["typed_same_session_conflict"], serde_json::Value::Null);
+        assert_eq!(json["exact_completion_counts"], false);
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn synthetic_fixture_proves_concurrency_invariants_without_timing_thresholds() {

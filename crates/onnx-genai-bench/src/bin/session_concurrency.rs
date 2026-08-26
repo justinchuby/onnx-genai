@@ -91,6 +91,7 @@ async fn main() -> Result<()> {
     } else {
         println!("{json}");
     }
+    report.ensure_correctness_gates_passed()?;
     Ok(())
 }
 

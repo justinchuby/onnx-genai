@@ -125,6 +125,11 @@ Gate values are now tri-state:
 - `false`: a qualifying cell ran and failed; and
 - `null`: the requested matrix did not exercise the gate.
 
+The CLI writes the JSON report before returning a nonzero status for any
+`false` gate. This preserves the failed measurement and makes the tri-state
+contract observable instead of discarding the report on the first failed
+invariant.
+
 Typed conflict and distinct overlap require a W>1/C>1 cell. A W=1/C=1-only regression test
 therefore serializes both as `null`, rather than vacuously reporting success. Both full
 artifacts report all five gates `true`: W1 output parity, typed conflict, distinct overlap,
