@@ -321,6 +321,20 @@ jobs:
         run: >-
           cargo build --locked
           -p onnx-genai-bench --features bench-native --bin profile_native
+      # The broad offline package run below includes this target, but a
+      # dedicated guarded step keeps the repository-wide fixture census visible
+      # in a required check and refuses a zero-test target. The guard checks a
+      # positive textproto floor plus sentinels rooted in unrelated fixture
+      # trees, as well as the zero-binary invariant.
+      - name: Verify checked-in ONNX fixture census
+        shell: bash
+        run: |
+          # shellcheck source=scripts/test_step.sh
+          . ./scripts/test_step.sh
+          run_test_step "checked-in ONNX fixture census" \
+            cargo test --locked \
+            -p onnx-genai-metadata \
+            --test textproto_fixtures
       # The package set is resolved into a variable before use, never
       # substituted inline. As `cargo test $(resolver ...)` a resolver failure
       # expands to nothing and leaves a bare `cargo test`, which exits 0 having
@@ -1275,9 +1289,11 @@ jobs:
       # CUDA uses dynamic loading, so compile coverage needs no GPU or toolkit.
       # The CUDA integration tests are compiled and reported as ignored unless
       # the `gpu-tests` feature is enabled on a real CUDA runner. ORT-linked
-      # crates stay out of portable tests because onnx-genai-ort-sys downloads
-      # native ORT; onnx-runtime-python's feature check here provides compile
-      # coverage for that integration path.
+      # crates stay out of portable execution because onnx-genai-ort-sys
+      # downloads native ORT; the inventory step below deliberately pays that
+      # setup cost to compile (but not execute) the CUDA plugin E2E target.
+      # onnx-runtime-python's feature check here provides compile coverage for
+      # that integration path.
       - name: Check CUDA execution provider and Python feature
         run: >-
           cargo check --locked
@@ -1299,7 +1315,14 @@ jobs:
       #
       # The job still fails if any of them fails; this only stops one step's
       # failure from silencing gates that have nothing to do with it.
-      - name: Verify CUDA test inventory and skip honesty
+      # Besides the broad EP/memory inventory, this compiles and lists the
+      # exact production targets that had been absent from CI:
+      # onnx-runtime-ep-cuda-plugin/cuda_unique_ort_e2e with `cuda`, and
+      # onnx-runtime-session/hetero_cuda_gpu both without and with `gpu-tests`.
+      # The base hetero inventory is executed only to prove its device test is
+      # ignored; both feature-enabled GPU paths are compile/list-only because
+      # GitHub-hosted runners have no CUDA device.
+      - name: Verify CUDA and production feature test inventories
         if: ${{ !cancelled() }}
         run: python .github/scripts/verify_cuda_test_honesty.py
 
