@@ -169,6 +169,12 @@
 #     directory is not the problem, the host is. No lock is ever taken on this
 #     path, so the caller can treat it as "this box cannot participate" rather
 #     than as contention. See require_supported_platform.
+#   9 nested against our own holder -- this process is already inside a `run`
+#     holding THIS lock, so the holder we would wait for cannot release until
+#     we return. Separate from 2 and 3 for the same reason 7 is: those say a
+#     peer has the box, and reporting contention for a lock we ourselves hold
+#     sends the caller looking for a co-tenant who does not exist (#1977).
+#     See nested_under_own_run.
 #
 # `run` otherwise does NOT use this table: it returns the wrapped command's
 # own status, so a command exiting 5 is indistinguishable from a gate failure.
@@ -879,6 +885,35 @@ holder_alive() {
     anchor_alive "$pid" "$start"
 }
 
+# Are we running INSIDE a `run` that holds this very lock?
+#
+# `run` always sets DO_WAIT, so a nested acquire against the same lock path
+# waits for a holder that is its own ancestor: the parent cannot release until
+# the wrapped command returns, and the wrapped command is the thing waiting.
+# That is not contention, it is a cycle, and it burns the full --timeout
+# (default 3600s) before reporting a peer that was never there (#1977).
+#
+# Both halves are load-bearing. The path alone is not enough: a `run` whose
+# wrapped command daemonises leaves the variable set in a process that outlives
+# the lock, and refusing that process's later, legitimate acquire would be a
+# fail-closed bug of our own making. So the live lock's own anchor must still
+# be the one we exported -- if the parent released, or was reaped and the lock
+# republished by somebody else, the anchors differ and this is an ordinary
+# acquire against an ordinary peer.
+#
+# Deliberately NOT a pid-ancestry walk. /proc/<pid>/stat ppid chains break the
+# moment anything reparents (a daemonised harness, a subreaper, an agent whose
+# shell exits), and the failure direction there is to stop recognising our own
+# holder -- back to the hang. The exported pair is exact for the case that
+# actually deadlocks, and silent for every case that does not.
+nested_under_own_run() {
+    [ -n "${HOSTLOCK_HELD_DIR:-}" ] || return 1
+    [ -n "${HOSTLOCK_HELD_ANCHOR:-}" ] || return 1
+    [ "$HOSTLOCK_HELD_DIR" = "$LOCK_DIR" ] || return 1
+    [ "$(meta_get anchor_pid 2>/dev/null || echo "")" = "$HOSTLOCK_HELD_ANCHOR" ] || return 1
+    return 0
+}
+
 lock_age() {
     local epoch now
     epoch=$(num_or "$(meta_get acquired_epoch || echo 0)" 0)
@@ -1524,7 +1559,7 @@ abandon_lock() {
 }
 
 cmd_acquire() {
-    local deadline=$((SECONDS + TIMEOUT)) rc problem
+    local deadline=$((SECONDS + TIMEOUT)) rc problem announced_wait=0
     # Refuse BEFORE anything else, including the legacy consult. An acquire
     # that cannot possibly publish must not spend --timeout looking busy: with
     # --wait (which `run` always sets) the unusable host reported "timed out
@@ -1535,6 +1570,19 @@ cmd_acquire() {
     if problem=$(lock_dir_problem); then
         explain_unusable "$problem"
         return 7
+    fi
+    # Refuse a cycle before refusing a peer, and before waiting for either.
+    # The order matters for the same reason the unusable-host check comes
+    # first: a nested acquire that falls through to the wait loop spends
+    # --timeout (3600s by default under `run`) and then reports code 3, which
+    # says a co-tenant held the box. There was no co-tenant. See #1977.
+    if nested_under_own_run; then
+        echo "hostlock: outcome=nested by ${OWNER}" >&2
+        echo "hostlock: this process is already inside a \`run\` holding ${LOCK_DIR} (anchor pid ${HOSTLOCK_HELD_ANCHOR})." >&2
+        echo "hostlock: that holder cannot release until this command returns, so waiting for it can only time out." >&2
+        echo "hostlock: run the inner command directly -- the host is already held for it -- or give the inner lock its own path via HOSTLOCK_DIR." >&2
+        cmd_status >&2
+        return 9
     fi
     refuse_if_legacy_held || return $?
     while :; do
@@ -1605,6 +1653,30 @@ cmd_acquire() {
             echo "hostlock: BUSY" >&2
             cmd_status >&2
             return 2
+        fi
+        # Say so, once, on the first pass that finds the lock held.
+        #
+        # A silent wait is indistinguishable from a slow build, which is the
+        # worst way for a lock to fail on a box where "is this wedged?" is the
+        # question people are already asking (#1977). The holder's identity is
+        # the answer, and it is already printed by two other paths (BUSY and
+        # timeout); the wait path was the only one that withheld it. Once, not
+        # per iteration: a line every 5s for an hour is how a message gets
+        # filtered out.
+        #
+        # This sits BEFORE the deadline check on purpose, and the ordering is
+        # not cosmetic. With it after, whether you were told who held the lock
+        # depended on whether the first pass happened to cross the deadline --
+        # so on a loaded box, the one condition that makes a wait worth
+        # explaining is the one that silences the explanation. It was measured:
+        # the cell below failed 1 run in 4 at --timeout 1 until the
+        # announcement moved above the check. It is deliberately not gated on
+        # the timeout value either, so that the ordering is observable at
+        # --timeout 0 without waiting for a clock.
+        if [ "$announced_wait" != 1 ]; then
+            announced_wait=1
+            echo "hostlock: waiting up to ${TIMEOUT}s for the lock" >&2
+            cmd_status >&2
         fi
         if [ "$SECONDS" -ge "$deadline" ]; then
             echo "hostlock: timed out after ${TIMEOUT}s waiting for the lock" >&2
@@ -1742,6 +1814,18 @@ cmd_run() {
     if [ "$OWNER_DECLARED" = 1 ]; then
         export HOSTLOCK_OWNER="$OWNER"
     fi
+
+    # Tell the wrapped command which lock we are holding for it, and with which
+    # anchor. A harness that calls back into hostlock.sh would otherwise wait
+    # on its own parent until --timeout expires (#1977); nested_under_own_run
+    # reads exactly this pair. Unconditional, unlike HOSTLOCK_OWNER above: that
+    # export is withheld on the default path because a $USER-derived owner
+    # would manufacture an attribution nobody made (#1929), whereas the lock
+    # path and the anchor pid are facts about this invocation, attribute
+    # nothing to anybody, and are wrong to withhold -- the deadlock does not
+    # care whether --owner was passed.
+    export HOSTLOCK_HELD_DIR="$LOCK_DIR"
+    export HOSTLOCK_HELD_ANCHOR="$ANCHOR_PID"
 
     # Run the command in the BACKGROUND and wait for it, rather than inline.
     #
