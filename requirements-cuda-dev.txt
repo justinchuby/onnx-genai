@@ -78,8 +78,9 @@ nvidia-nvjitlink==13.1.115
 # compile at runtime with "require cuda_fp16.h and cuda_bf16.h". Required.
 nvidia-cuda-runtime==13.1.80
 
-# cuDNN — only needed for the cuDNN-backed softmax/reduce/conv/pool path. The
-# EP dlopens it lazily and runs without it, so this is optional; uncomment if
-# you are exercising those kernels. Note this one still uses the -cu13 suffix,
-# because the unsuffixed `nvidia-cudnn` is a placeholder with no real release.
-# nvidia-cudnn-cu13==9.24.0.43
+# CUPTI — profiling/tracing dependency declared by CUDA Python packages.
+nvidia-cuda-cupti==13.1.115
+
+# cuDNN — required for the advertised softmax/reduce/conv/pool paths. This one
+# still uses the -cu13 suffix because the unsuffixed package is a placeholder.
+nvidia-cudnn-cu13==9.24.0.43
