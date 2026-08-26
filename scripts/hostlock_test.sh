@@ -2393,6 +2393,37 @@ for ep_v in '1 hostlock_state=FREE declared=no' 'abc' '' '99 x'; do
     chk "and a stored epoch of '${ep_v}' cannot widen the row" \
         "$(echo "$ep_row" | awk '{print NF}')" "$fw_clean_nf"
 done
+# Two data-quality properties of the same column. Neither forges -- `num_or`
+# has already sent every non-digit to the default, so no injection is
+# reachable -- but `held_secs` is a column harnesses AGGREGATE, and a mean
+# taken over a wrong number is silently wrong rather than visibly wrong.
+#
+# A leading zero is the one shape `num_or` passes and `$(( ))` misreads:
+# it is all digits, so it is accepted, and then read as OCTAL.
+# `0100` rather than `010`: this cell reads the clock a second time and can
+# lose a race with the one inside `lock_age`, so it needs a tolerance -- and a
+# tolerance wide enough to absorb the race must still be narrower than the
+# defect. Decimal 100 against octal 64 is a gap of 36 against a slack of 3.
+# `010` gave a gap of 2, which the tolerance would have swallowed whole: the
+# cell would have passed either way.
+sed -i "s|^acquired_epoch=.*|acquired_epoch=0100|" "$LOCK/meta"
+oct_d=$(( $($HL provenance --oneline 2>/dev/null | tr ' ' '\n' \
+    | sed -n 's/^held_secs=//p') - $(date +%s) + 100 ))
+chk "a stored epoch with a leading zero is read as base 10, not octal" \
+    "$([ "${oct_d#-}" -le 3 ] && echo base10 || echo other)" "base10"
+# A lock stamped in the future reported a NEGATIVE age, which no consumer of
+# a duration column expects and which poisons a mean without tripping a
+# range check that only tests an upper bound.
+sed -i "s|^acquired_epoch=.*|acquired_epoch=$(( $(date +%s) + 3600 ))|" "$LOCK/meta"
+chk "a future epoch clamps to zero rather than reporting a negative age" \
+    "$($HL provenance --oneline 2>/dev/null | tr ' ' '\n' \
+        | sed -n 's/^held_secs=//p')" "0"
+# The cry-wolf control: an ordinary epoch must still produce a real age, or
+# the clamp above could pass by pinning the whole column to zero.
+sed -i "s|^acquired_epoch=.*|acquired_epoch=$(( $(date +%s) - 42 ))|" "$LOCK/meta"
+chk "and an ordinary epoch still reports the true elapsed age" \
+    "$($HL provenance --oneline 2>/dev/null | tr ' ' '\n' \
+        | sed -n 's/^held_secs=//p')" "42"
 $HL release >/dev/null 2>&1
 cleanup
 
@@ -2464,6 +2495,63 @@ chk "and a space is still not a newline, so a spaced path is untouched" \
         HOSTLOCK_PRIVATE_OK=1 "$HL" status --porcelain 2>/dev/null \
         | sed -n 's/^legacy_dir=//p')" "$hl_lg"
 
+# THE RECOVERY LINE UNDID THE GUARD IT RECOVERS FROM, which is the defect
+# this block exists for and the one every cell above walked straight past.
+#
+# `flat_value` correctly rejected a newline-bearing `legacy_dir` and printed
+# `legacy_dir=@malformed` -- and then the `_raw` affordance, added so a
+# rejected value stays debuggable, printed the ORIGINAL text verbatim into
+# the newline-delimited multi-line form. The comment above it asserted the
+# raw text "cannot forge anything" there "where the newline is the
+# delimiter". That has the logic exactly backwards: the newline BEING the
+# delimiter is precisely why a newline forges there. Metadata-derived raws
+# were safe only because `meta_get`'s one-line read bounds them, which is a
+# property of those fields and not of the emitter.
+#
+# The cells above missed it because every existing `_raw` cell used a value
+# containing a SPACE -- the case the affordance was written for -- and the
+# field-injection block only drove metadata-derived fields, which cannot
+# carry a newline in the first place.
+#
+# A HELD lock is required or this whole block is vacuous: a forged
+# `hostlock_state=FREE` line on a box that is genuinely FREE agrees with the
+# truth and inverts nothing.
+# ACQUIRING THROUGH `lg_run` DOES NOT WORK, and the non-vacuity cell below is
+# how that was found rather than guessed. `$hl_lg` exists but has no `meta`,
+# so `legacy_holder` cannot parse it, falls through to the unparseable-mtime
+# grace, and reports `unknown ?` -- a freshly created empty directory reads as
+# a LIVE legacy holder, and `refuse_if_legacy_held` then refuses the acquire.
+# Every cell in this block would have run against a FREE lock, where a forged
+# `hostlock_state=FREE` line agrees with the truth and inverts nothing.
+#
+# So acquire with the legacy consult pointed at a path that does not exist,
+# and read provenance with it pointed wherever the cell needs. The HELD state
+# comes from the config lock dir; the legacy path only decorates the row.
+lg_take() { env -u HOSTLOCK_DIR HOSTLOCK_CONF="$lg_conf" \
+    HOSTLOCK_LEGACY_DIR="$LOCK.lg-absent" HOSTLOCK_PRIVATE_OK=1 "$HL" "$@"; }
+lg_take acquire --owner leon-nlraw --ttl 600 >/dev/null 2>&1
+chk "the raw-line block really is driving a HELD lock, not a free one" \
+    "$(lg_run provenance --oneline 2>/dev/null | tr ' ' '\n' \
+        | sed -n 's/^hostlock_state=//p')" "HELD"
+nlraw=$(env -u HOSTLOCK_DIR HOSTLOCK_CONF="$lg_conf" HOSTLOCK_LEGACY_DIR="$lg_nl" \
+    HOSTLOCK_PRIVATE_OK=1 "$HL" provenance 2>/dev/null)
+chk "a newline in a legacy path cannot add a state line via the raw form" \
+    "$(printf '%s\n' "$nlraw" | grep -c '^hostlock_state=')" "1"
+# The cell that states the harm in the reader's own terms. Pre-fix this read
+# FREE against a lock that was physically held.
+chk "and a last-wins parse of the multi-line form still reads HELD" \
+    "$(printf '%s\n' "$nlraw" | awk -F= '/^hostlock_state=/{v=$2} END{print v}')" "HELD"
+chk "and the unrecoverable value says so rather than printing itself" \
+    "$(printf '%s\n' "$nlraw" | sed -n 's/^legacy_dir_raw=//p')" "$MALFORMED"
+# The negative control, under the SAME held-lock conditions as the cells
+# above, so the fix cannot pass by refusing every raw value it is shown.
+# This is the case the affordance exists for and it must still work.
+chk "a spaced legacy path still recovers intact through the raw line" \
+    "$(lg_run provenance 2>/dev/null | sed -n 's|^legacy_dir_raw=||p')" "$hl_lg"
+chk "and a spaced path adds no state line either" \
+    "$(lg_run provenance 2>/dev/null | grep -c '^hostlock_state=')" "1"
+lg_take release >/dev/null 2>&1
+
 # The first-word truncation, in the emitter where it was still live. The
 # provenance copy of this was fixed and the porcelain copy was not, which is
 # what "fix the reported symptom" looks like from the inside.
@@ -2480,7 +2568,36 @@ chk "a multi-word legacy owner is not renamed to another agent by the porcelain"
     "$(env -u HOSTLOCK_DIR HOSTLOCK_CONF="$lg_conf" HOSTLOCK_LEGACY_DIR="$lg_leg" \
         HOSTLOCK_PRIVATE_OK=1 "$HL" status --porcelain 2>/dev/null \
         | sed -n 's/^legacy_held_by=//p')" "sebastian helper"
+# AND THE THIRD EMITTER, which had the identical truncation and no cell at
+# all. `status_lock_dir_note` is the HUMAN line, which is why it was missed
+# twice and why it matters most: a machine row that says `sebastian` gets
+# parsed, but a person who reads "still held by sebastian" walks over and
+# asks the wrong peer. Two emitters fixed and a third left live is the same
+# "fix the reported symptom" failure one layer out.
+chk "nor by the human status line, which is the third copy of this" \
+    "$(env -u HOSTLOCK_DIR HOSTLOCK_CONF="$lg_conf" HOSTLOCK_LEGACY_DIR="$lg_leg" \
+        HOSTLOCK_PRIVATE_OK=1 "$HL" status 2>/dev/null \
+        | sed -n 's/.*is still held by \(.*\) (pid.*/\1/p')" "sebastian helper"
+# The negative control: the pid must still be the pid, so the cell above
+# cannot pass by the note simply printing the whole string.
+chk "and the human line still recovers the holder pid correctly" \
+    "$(env -u HOSTLOCK_DIR HOSTLOCK_CONF="$lg_conf" HOSTLOCK_LEGACY_DIR="$lg_leg" \
+        HOSTLOCK_PRIVATE_OK=1 "$HL" status 2>/dev/null \
+        | sed -n 's/.*(pid \([0-9]*\)).*/\1/p')" "$$"
 rm -rf "$lg_leg"
+
+# `flat_line` must refuse a value that IS the sentinel, for the same reason
+# `flat_value` does. Without this a legitimate path named `@malformed` is
+# indistinguishable from a discarded one -- and in the raw-recovery line
+# that ambiguity is the whole point of the field.
+chk "flat_line treats an incoming literal sentinel as rejected" \
+    "$(env -u HOSTLOCK_DIR HOSTLOCK_CONF="$lg_conf" HOSTLOCK_LEGACY_DIR="$MALFORMED" \
+        HOSTLOCK_PRIVATE_OK=1 "$HL" status --porcelain 2>/dev/null \
+        | sed -n 's/^legacy_dir=//p')" "$MALFORMED"
+chk "and still does not reject an ordinary path (cry-wolf control)" \
+    "$(env -u HOSTLOCK_DIR HOSTLOCK_CONF="$lg_conf" HOSTLOCK_LEGACY_DIR="$lg_ok" \
+        HOSTLOCK_PRIVATE_OK=1 "$HL" status --porcelain 2>/dev/null \
+        | sed -n 's/^legacy_dir=//p')" "$lg_ok"
 
 rm -rf "$hl_lg" "$lg_ok" "$lg_conf"
 cleanup
@@ -3506,7 +3623,7 @@ cleanup
 # the inert R1 block and the vacuous STALE arm that this PR exists to fix.
 # Every probe branch asserts something, so the total is invariant across
 # environments; if a refactor drops a check, this fails and says so.
-chk "every assertion in this file ran" "$((pass + fail + 1))" "530"
+chk "every assertion in this file ran" "$((pass + fail + 1))" "543"
 
 echo
 echo "passed=${pass} failed=${fail}"

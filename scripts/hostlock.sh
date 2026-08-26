@@ -1004,10 +1004,20 @@ nested_under_own_run() {
 }
 
 lock_age() {
-    local epoch now
+    local epoch now age
     epoch=$(num_or "$(meta_get acquired_epoch || echo 0)" 0)
     now=$(date +%s)
-    echo $((now - epoch))
+    # `10#` because `num_or` guarantees digits but NOT the absence of a
+    # leading zero, and `$(( 010 ))` is 8, not 10. Neither this nor the
+    # clamp below can forge anything -- `num_or` already sent every
+    # non-digit to the default, so no arithmetic injection is reachable.
+    # They are data quality, in a column harnesses aggregate: a lock
+    # stamped one second into the future currently reports a NEGATIVE age,
+    # and a mean over a column containing one is silently wrong rather
+    # than visibly wrong.
+    age=$(( now - 10#$epoch ))
+    [ "$age" -lt 0 ] && age=0
+    echo "$age"
 }
 
 # 0 if the lock has outlived its declared TTL. ttl=0 means never expires,
@@ -1551,8 +1561,16 @@ flat_value() {
 # cry-wolf negative control is what caught it, which is the whole reason a
 # guard needs one.
 flat_line() {
+    # A newline is this grammar's delimiter, so a value carrying one cannot
+    # travel. A space CAN, and must -- a worktree path with a space in it is
+    # ordinary, and rejecting it here would be cry-wolf.
+    #
+    # The literal sentinel is rejected too, for the same reason `flat_value`
+    # rejects it: if a real value were allowed to BE the sentinel, a reader
+    # could not tell "this field was discarded" from "this field's value is
+    # that string", which is the one distinction these rows exist to make.
     case "$1" in
-        *$'\n'*)
+        *$'\n'* | "$FLAT_MALFORMED")
             printf '%s' "$FLAT_MALFORMED"
             return 1
             ;;
@@ -1723,14 +1741,44 @@ cmd_provenance() {
         # malformed row is exactly the person who needs to know -- a lock
         # written by an older peer is a fact about that peer's checkout, not
         # noise. Emitted only for the fields the guard actually rejected, so
-        # an ordinary row does not grow a field, and only here, where the
-        # newline is the delimiter and the text cannot forge anything.
+        # an ordinary row does not grow a field.
         #
         # Every guarded field gets one, not just the two owners. `lock_dir`
         # and `gate` are as unrecoverable as a name once the flat form has
         # eaten them, and `lock_dir` in particular is what makes `declared`
         # checkable at all.
-        [ "${#PROV_RAWS[@]}" -eq 0 ] || printf '%s\n' "${PROV_RAWS[@]}"
+        #
+        # THROUGH `flat_line`, and this is the part that was wrong first. An
+        # earlier version of this comment said the raw text "cannot forge
+        # anything" here because the newline is the delimiter. That has it
+        # backwards: the newline BEING the delimiter is exactly why a newline
+        # in the value forges, and `lock_dir` and `legacy_dir` are env-derived,
+        # so `meta_get`'s one-line read does not bound them. The recovery
+        # affordance was undoing the guard it exists to recover from --
+        # `flat_value` correctly rejected `legacy_dir`, and then the raw line
+        # printed the newline anyway and a last-wins parse of the multi-line
+        # form read FREE for a held box.
+        #
+        # A value carrying a newline is therefore not recoverable in EITHER
+        # grammar this script emits, and saying so is the honest answer. The
+        # case that motivated these lines -- a path with a SPACE in it -- is
+        # unaffected, because a space is not a delimiter here.
+        if [ "${#PROV_RAWS[@]}" -ne 0 ]; then
+            local prov_raw prov_key prov_val prov_rc
+            for prov_raw in "${PROV_RAWS[@]}"; do
+                prov_key=${prov_raw%%=*}
+                prov_val=${prov_raw#*=}
+                # Status, not output. A stored value that is literally the
+                # sentinel prints as the sentinel and would compare equal to
+                # a rejection, which is how the write side got this wrong.
+                prov_val=$(flat_line "$prov_val") && prov_rc=0 || prov_rc=$?
+                if [ "$prov_rc" -eq 0 ]; then
+                    printf '%s=%s\n' "$prov_key" "$prov_val"
+                else
+                    printf '%s=%s\n' "$prov_key" "$FLAT_MALFORMED"
+                fi
+            done
+        fi
     fi
 }
 
@@ -1752,7 +1800,13 @@ legacy_consult_path() {
 status_lock_dir_note() {
     local legacy=$1
     [ "$LOCK_DIR_SOURCE" = default ] || echo "  lock: ${LOCK_DIR} (${LOCK_DIR_SOURCE}, ${LOCK_SCOPE})"
-    [ "$legacy" != none ] && echo "  legacy: ${HOSTLOCK_LEGACY_PATH} is still held by ${legacy%% *} (pid ${legacy##* }); acquire will refuse"
+    # `${legacy% *}`, not `${legacy%% *}`: `legacy_holder` returns
+    # "<owner> <pid>", so stripping the LAST field leaves an owner that
+    # contains spaces intact. The greedy form renamed "sebastian helper"
+    # to "sebastian" -- a DIFFERENT REAL AGENT on this team. This is the
+    # human-readable line rather than a machine row, which makes it worse,
+    # not better: a person reads it and goes to ask the wrong peer.
+    [ "$legacy" != none ] && echo "  legacy: ${HOSTLOCK_LEGACY_PATH} is still held by ${legacy% *} (pid ${legacy##* }); acquire will refuse"
     return 0
 }
 
