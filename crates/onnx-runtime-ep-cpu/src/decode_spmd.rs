@@ -528,13 +528,37 @@ fn dispatcher_yields_before_park() -> u32 {
     })
 }
 
-/// Default number of dynamic tiles per resident worker in work-stealing mode.
+/// Default dynamic tiles per resident worker when the **MLAS** work-stealing
+/// pool is the executor.
+///
 /// One tile per worker preserves the coarse MLAS QNBit shard size that made
 /// fixed-SPMD fast, while Deckard's pool can still steal a not-yet-claimed tile
 /// from a delayed worker. Finer 2x/3x tiling improved theoretical steal
 /// opportunities but split Qwen3 projection shards too narrowly and regressed
-/// measured throughput.
-const DEFAULT_STEAL_TILES_PER_WORKER: usize = 1;
+/// measured throughput. That result was measured on this executor and is
+/// preserved here; it does not transfer to the native cursor below, which
+/// dispatches through our own pinned SPMD pool rather than MLAS's.
+#[cfg(feature = "mlas")]
+const DEFAULT_STEAL_TILES_PER_WORKER_MLAS: usize = 1;
+/// Default dynamic tiles per resident worker when the **native** atomic cursor
+/// is the executor (every build without `--features mlas`).
+///
+/// Deliberately not one. With one tile per worker `target <= total_workers`, so
+/// [`SpmdDecodePools::work_stealing_segments_aligned`] returns the fixed split
+/// and every lane claims exactly one tile -- the cursor runs but can never
+/// rebalance, because there is no unclaimed tile for an early lane to take.
+/// `steal` was therefore *numerically identical* to `fixed` on this executor: a
+/// knob that reported a schedule it did not implement.
+///
+/// Four is measured, not assumed (#2017, 20 paired launches at width 16 on a
+/// 16-core host, interleaved with an A/A null of 0.998): 1.293x throughput at
+/// 0.789x CPU against the fixed split, bit-identical outputs, and no effect
+/// outside the noise band at widths 2/4/8 on either llama or qwen shapes. Two
+/// tiles per worker measured 1.00x -- with a straggler at ~1.67x a lane's share,
+/// coarse tiles let the slow lane claim a second one and overshoot, so the grain
+/// has to be finer than the imbalance to absorb it. Eight measured 1.17x, below
+/// four, as per-tile cursor traffic starts to cost more than it recovers.
+const DEFAULT_STEAL_TILES_PER_WORKER_NATIVE: usize = 4;
 /// Minimum output columns in one dynamic tile. Keeps MLAS/KAI/hand GEMV calls
 /// coarse enough that the extra atomic `fetch_add` scheduling is amortized.
 const MIN_STEAL_OUTPUTS_PER_TASK: usize = 32;
@@ -1836,28 +1860,61 @@ fn chunk_permutation() -> ChunkPermutation {
     chunk_permutation_from_raw(std::env::var(CHUNK_PERMUTATION_ENV).ok().as_deref())
 }
 
-fn decode_schedule_from_raw(raw: Option<&str>) -> DecodeSchedule {
+fn decode_schedule_from_raw(raw: Option<&str>) -> Option<DecodeSchedule> {
     match raw.map(str::trim) {
-        Some(value) if value.eq_ignore_ascii_case("fixed") => DecodeSchedule::Fixed,
-        Some(value) if value.eq_ignore_ascii_case("spmd") => DecodeSchedule::Fixed,
-        Some(value) if value.eq_ignore_ascii_case("steal") => DecodeSchedule::Steal,
-        Some(value) if value.eq_ignore_ascii_case("work-stealing") => DecodeSchedule::Steal,
-        _ => DecodeSchedule::Fixed,
+        Some(value) if value.eq_ignore_ascii_case("fixed") => Some(DecodeSchedule::Fixed),
+        Some(value) if value.eq_ignore_ascii_case("spmd") => Some(DecodeSchedule::Fixed),
+        Some(value) if value.eq_ignore_ascii_case("steal") => Some(DecodeSchedule::Steal),
+        Some(value) if value.eq_ignore_ascii_case("work-stealing") => Some(DecodeSchedule::Steal),
+        _ => None,
     }
 }
 
-fn decode_schedule() -> DecodeSchedule {
-    decode_schedule_from_raw(std::env::var(DECODE_SCHEDULE_ENV).ok().as_deref())
+/// The schedule to build with: an explicit [`DECODE_SCHEDULE_ENV`] value if it
+/// names one, else the default for this executor and topology.
+///
+/// The default is the dynamic cursor on a **single-node native** pool, and the
+/// fixed split everywhere else. Both exclusions are deliberate:
+///
+/// - **Multi-node.** [`SpmdDecodePools::place_rows`] first-touches each lane's
+///   row range on that lane's node, so under a fixed split a lane only ever
+///   streams node-local weights. A dynamic cursor breaks that pairing: a lane
+///   can claim a tile another node first-touched and read it across the
+///   interconnect. On one node there is no remote memory to reach and the
+///   locality argument is vacuous, which is the only case measured here.
+/// - **`--features mlas`.** There, `Steal` does not tile our pool at all -- it
+///   substitutes MLAS's own executor, which spawns and places its own threads,
+///   has no dispatcher shard, no pinning of ours and no barrier counters. That
+///   is a different change with a different risk profile, and none of the
+///   evidence for this default was collected on it.
+///
+/// An explicit value keeps its exact current meaning in every configuration, so
+/// `=fixed` is a complete escape hatch and `=steal` still selects MLAS's pool
+/// where that is what it selects today.
+fn resolve_decode_schedule(raw: Option<&str>, node_count: usize) -> DecodeSchedule {
+    if let Some(explicit) = decode_schedule_from_raw(raw) {
+        return explicit;
+    }
+    if cfg!(feature = "mlas") || node_count != 1 {
+        return DecodeSchedule::Fixed;
+    }
+    DecodeSchedule::Steal
 }
 
-fn steal_tiles_per_worker() -> usize {
-    static TILES: OnceLock<usize> = OnceLock::new();
+fn decode_schedule(node_count: usize) -> DecodeSchedule {
+    resolve_decode_schedule(
+        std::env::var(DECODE_SCHEDULE_ENV).ok().as_deref(),
+        node_count,
+    )
+}
+
+fn steal_tiles_per_worker_override() -> Option<usize> {
+    static TILES: OnceLock<Option<usize>> = OnceLock::new();
     *TILES.get_or_init(|| {
         std::env::var("ONNX_GENAI_CPU_DECODE_STEAL_TILES_PER_WORKER")
             .ok()
             .and_then(|value| value.trim().parse::<usize>().ok())
             .filter(|&value| value > 0)
-            .unwrap_or(DEFAULT_STEAL_TILES_PER_WORKER)
     })
 }
 
@@ -1869,7 +1926,7 @@ impl SpmdDecodePools {
     /// `dispatcher_shard` adds one compute shard, owned by the dispatcher rather
     /// than by a spawned thread. See [`SpmdDecodePools::dispatcher_shard`].
     fn build(shards: &[NodeShard], dispatcher_shard: bool) -> Self {
-        Self::build_with_schedule(shards, decode_schedule(), dispatcher_shard)
+        Self::build_with_schedule(shards, decode_schedule(shards.len()), dispatcher_shard)
     }
 
     fn build_with_schedule(
@@ -2518,6 +2575,20 @@ impl SpmdDecodePools {
         self.schedule == DecodeSchedule::Steal
     }
 
+    /// Tiles per worker to cut the output into when no explicit override is set.
+    ///
+    /// Keyed off the executor that will actually run the tiles rather than off
+    /// the `mlas` feature, because the two are not the same question: a build
+    /// with the feature on still runs the native cursor whenever the MLAS pool
+    /// was not the one constructed.
+    fn default_steal_tiles_per_worker(&self) -> usize {
+        #[cfg(feature = "mlas")]
+        if self.work_stealing_pool.is_some() {
+            return DEFAULT_STEAL_TILES_PER_WORKER_MLAS;
+        }
+        DEFAULT_STEAL_TILES_PER_WORKER_NATIVE
+    }
+
     /// Signal every worker to stop and **join** them. Idempotent: the join
     /// handles are drained on the first call, so a second call (e.g. `Drop`
     /// after an explicit [`shutdown_pools`]) is a no-op.
@@ -2997,7 +3068,10 @@ impl SpmdDecodePools {
         let max_by_size = n.div_ceil(min_tile).max(1);
         let target = self
             .total_workers
-            .saturating_mul(steal_tiles_per_worker())
+            .saturating_mul(
+                steal_tiles_per_worker_override()
+                    .unwrap_or_else(|| self.default_steal_tiles_per_worker()),
+            )
             .max(1)
             .min(max_by_size)
             .min(n);
@@ -4543,7 +4617,19 @@ fn report_spmd_fallback(message: &str) {
 /// otherwise. See `docs/architecture/ERROR_AND_LOGGING_CONVENTIONS.md` for level guidance.
 fn report_pool_built(mode: PersistenceMode) {
     let label = match mode {
-        PersistenceMode::On if decode_schedule() == DecodeSchedule::Steal => "work-stealing-pool",
+        // Names the *executor*, not the schedule. Only the MLAS build swaps the
+        // pool out for a foreign one; the native dynamic cursor is still this
+        // pool, with our threads, our pinning and our barrier, so it must keep
+        // reporting `spmd-pool`. Keying this off the schedule alone would
+        // relabel every default single-node native build and break the callers
+        // that assert an exact path.
+        PersistenceMode::On
+            if cfg!(feature = "mlas")
+                && decode_schedule_from_raw(std::env::var(DECODE_SCHEDULE_ENV).ok().as_deref())
+                    == Some(DecodeSchedule::Steal) =>
+        {
+            "work-stealing-pool"
+        }
         PersistenceMode::On => "spmd-pool",
         PersistenceMode::Adaptive => "adaptive",
         PersistenceMode::Off => "flat",
@@ -5131,11 +5217,11 @@ mod tests {
 
     #[test]
     fn decode_schedule_parses_env_values() {
-        assert_eq!(decode_schedule_from_raw(None), DecodeSchedule::Fixed);
-        assert_eq!(decode_schedule_from_raw(Some("")), DecodeSchedule::Fixed);
+        assert_eq!(decode_schedule_from_raw(None), None);
+        assert_eq!(decode_schedule_from_raw(Some("")), None);
         assert_eq!(
             decode_schedule_from_raw(Some("fixed")),
-            DecodeSchedule::Fixed
+            Some(DecodeSchedule::Fixed)
         );
         // The scheduling *policy* has no MLAS dependency -- the dynamic claim is
         // an atomic cursor over the tile table dispatched on the native SPMD
@@ -5145,16 +5231,116 @@ mod tests {
         // is what let the selector go inert in production unnoticed.
         assert_eq!(
             decode_schedule_from_raw(Some("steal")),
-            DecodeSchedule::Steal
+            Some(DecodeSchedule::Steal)
         );
         assert_eq!(
             decode_schedule_from_raw(Some(" work-stealing ")),
-            DecodeSchedule::Steal
+            Some(DecodeSchedule::Steal)
         );
-        assert_eq!(
-            decode_schedule_from_raw(Some("bogus")),
-            DecodeSchedule::Fixed
-        );
+        assert_eq!(decode_schedule_from_raw(Some("bogus")), None);
+    }
+
+    /// An unrecognised value must be indistinguishable from an unset one, so a
+    /// typo takes the default rather than silently selecting the other schedule.
+    #[test]
+    fn an_unset_or_unparseable_schedule_takes_the_same_default() {
+        for raw in [None, Some(""), Some("   "), Some("bogus"), Some("stealing")] {
+            assert_eq!(
+                resolve_decode_schedule(raw, 1),
+                resolve_decode_schedule(None, 1),
+                "{raw:?} must resolve exactly like an unset variable"
+            );
+            assert_eq!(
+                resolve_decode_schedule(raw, 2),
+                resolve_decode_schedule(None, 2)
+            );
+        }
+    }
+
+    /// The default is topology- and executor-dependent, and both exclusions are
+    /// load-bearing rather than conservative decoration: a multi-node pool would
+    /// break the `place_rows` first-touch pairing a fixed split guarantees, and
+    /// an MLAS build would substitute a foreign executor instead of tiling ours.
+    #[test]
+    fn the_default_schedule_steals_only_on_a_single_node_native_pool() {
+        let single = resolve_decode_schedule(None, 1);
+        if cfg!(feature = "mlas") {
+            assert_eq!(single, DecodeSchedule::Fixed);
+        } else {
+            assert_eq!(single, DecodeSchedule::Steal);
+        }
+        for nodes in [0, 2, 4] {
+            assert_eq!(
+                resolve_decode_schedule(None, nodes),
+                DecodeSchedule::Fixed,
+                "a {nodes}-node pool must keep the node-local fixed split"
+            );
+        }
+        // An explicit value still means exactly what it means today, in every
+        // configuration -- this is the escape hatch, so it must not be topology
+        // dependent.
+        for nodes in [1, 2] {
+            assert_eq!(
+                resolve_decode_schedule(Some("fixed"), nodes),
+                DecodeSchedule::Fixed
+            );
+            assert_eq!(
+                resolve_decode_schedule(Some("steal"), nodes),
+                DecodeSchedule::Steal
+            );
+        }
+    }
+
+    /// The regression guard for the defect this default fixes. One tile per
+    /// worker makes `target <= total_workers`, so the tile table *is* the fixed
+    /// split and no lane can ever claim a second tile: `steal` and `fixed`
+    /// produce byte-identical segments. The knob reported a schedule it did not
+    /// implement, and every measurement of it was measuring the fixed split.
+    #[test]
+    fn one_tile_per_worker_degenerates_to_the_fixed_split() {
+        let pool = single_group_pool_with_schedule(8, DecodeSchedule::Steal);
+        let n = 8192;
+        let align = 64;
+        let fixed = pool.worker_row_segments_aligned(n, align);
+        let degenerate = {
+            let target = pool.total_workers.saturating_mul(1).max(1);
+            assert!(
+                target <= pool.total_workers,
+                "one tile per worker cannot out-number the workers"
+            );
+            fixed.clone()
+        };
+        assert_eq!(degenerate, fixed);
+
+        // And the shipped default does not: strictly more tiles than lanes is
+        // the whole mechanism, since a straggler is only absorbed if there is an
+        // unclaimed tile left for a lane that finished early.
+        let tiles = pool.default_steal_tiles_per_worker();
+        let dynamic = pool.work_stealing_segments_aligned(n, align);
+        #[cfg(feature = "mlas")]
+        assert_eq!(tiles, DEFAULT_STEAL_TILES_PER_WORKER_MLAS);
+        if cfg!(feature = "mlas") {
+            // The MLAS executor keeps its coarse one-tile grain, so there is
+            // nothing to steal and no tile-count assertion to make.
+        } else {
+            assert_eq!(tiles, DEFAULT_STEAL_TILES_PER_WORKER_NATIVE);
+            assert!(
+                dynamic.len() > pool.total_workers,
+                "{} tiles for {} lanes leaves nothing to steal",
+                dynamic.len(),
+                pool.total_workers
+            );
+        }
+        // Whatever the grain, the tiles must still cover every output exactly
+        // once and in order -- a rebalance that drops or duplicates a row is a
+        // wrong answer, not a slow one.
+        let mut covered = 0;
+        for &(start, len) in &dynamic {
+            assert_eq!(start, covered, "tiles must tile `0..n` in order");
+            covered += len;
+        }
+        assert_eq!(covered, n);
+        pool.shutdown();
     }
 
     /// The dynamic claim must be reachable *and correct* in a default,
@@ -5168,7 +5354,7 @@ mod tests {
     /// one tile.
     #[test]
     fn work_stealing_is_reachable_from_the_env_string_without_mlas() {
-        let schedule = decode_schedule_from_raw(Some("steal"));
+        let schedule = decode_schedule_from_raw(Some("steal")).expect("`steal` names a schedule");
         assert_eq!(
             schedule,
             DecodeSchedule::Steal,
