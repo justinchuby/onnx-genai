@@ -355,14 +355,13 @@ fn expand_image_placeholders(
     prompt_token_ids: &mut Vec<u32>,
 ) -> anyhow::Result<()> {
     let placeholder = spec.placeholder_token_id.with_context(|| {
-        format!(
-            "What: this package accepts an image but cannot place it in the prompt. \
-             Why: it declares no numeric image placeholder token, so there is no \
-             token for the image's features to replace, and the encoded image would be \
-             preprocessed and then ignored. \
-             How: declare `package.tokenizer.special_tokens.image_token_id`; keep its text \
-             spelling only in tokenizer assets."
-        )
+        "What: this package accepts an image but cannot place it in the prompt. \
+         Why: it declares no numeric image placeholder token, so there is no \
+         token for the image's features to replace, and the encoded image would be \
+         preprocessed and then ignored. \
+         How: declare `package.tokenizer.special_tokens.image_token_id`; keep its text \
+         spelling only in tokenizer assets."
+            .to_string()
     })?;
     let program = spec
         .program
