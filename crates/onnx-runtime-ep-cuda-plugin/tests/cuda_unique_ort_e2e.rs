@@ -288,12 +288,13 @@ fn verify_signal_fixture(name: &str, model: &onnx_std::Model) {
     use onnx_runtime_ir::DataType;
 
     assert_eq!(model.metadata.ir_version, 11);
-    assert_eq!(model.graph.opset_imports.get("").copied(), Some(17));
+    assert_eq!(model.graph.opset_imports.get("").copied(), Some(24));
     assert!(model.graph.initializers.is_empty());
-    assert_eq!(
-        model.graph.inputs.len(),
-        if name == "dft_device_shape" { 2 } else { 3 }
-    );
+    // Three device-resident scalars either way: STFT takes frame_step and
+    // frame_length, and DFT takes dft_length plus the `axis` that became an
+    // input at opset 20. Pinning the count keeps a dropped metadata producer
+    // from turning this fixture into a plain single-input graph.
+    assert_eq!(model.graph.inputs.len(), 3);
     assert_eq!(model.graph.outputs.len(), 1);
     let input = model.graph.value(model.graph.inputs[0]);
     let output = model.graph.value(model.graph.outputs[0]);
@@ -318,7 +319,7 @@ fn verify_squeeze_fixture(model: &onnx_std::Model) {
     use onnx_runtime_ir::DataType;
 
     assert_eq!(model.metadata.ir_version, 11);
-    assert_eq!(model.graph.opset_imports.get("").copied(), Some(13));
+    assert_eq!(model.graph.opset_imports.get("").copied(), Some(24));
     assert!(model.graph.initializers.is_empty());
     assert_eq!(model.graph.inputs.len(), 2);
     assert_eq!(model.graph.outputs.len(), 1);
@@ -340,7 +341,7 @@ fn verify_reduce_sum_fixture(model: &onnx_std::Model) {
     use onnx_runtime_ir::DataType;
 
     assert_eq!(model.metadata.ir_version, 11);
-    assert_eq!(model.graph.opset_imports.get("").copied(), Some(13));
+    assert_eq!(model.graph.opset_imports.get("").copied(), Some(24));
     assert!(model.graph.initializers.is_empty());
     assert_eq!(model.graph.inputs.len(), 2);
     assert_eq!(model.graph.outputs.len(), 1);
@@ -1141,7 +1142,11 @@ fn cuda_shape_value_ops_decline_before_device_scalar_host_reads() {
                 ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
             );
             let mut scalar_storage = match op_type {
-                "DFT" => vec![8i64],
+                // dft_length, then the axis DFT-20 moved from attribute to
+                // input. Feeding axis=1 is what keeps this fixture measuring
+                // the same transform it measured under opset 17, whose default
+                // axis was 1; the opset-24 default is -2.
+                "DFT" => vec![8i64, 1i64],
                 "STFT" => vec![2i64, 4],
                 "Squeeze" => vec![0i64],
                 "ReduceSum" => vec![1i64],
@@ -1162,7 +1167,7 @@ fn cuda_shape_value_ops_decline_before_device_scalar_host_reads() {
                 ));
             }
             let input_names: Vec<CString> = match op_type {
-                "DFT" => vec!["X", "dft_length_input"],
+                "DFT" => vec!["X", "dft_length_input", "axis_input"],
                 "STFT" => vec!["X", "frame_step_input", "frame_length_input"],
                 "Squeeze" => vec!["X", "axes_input"],
                 "ReduceSum" => vec!["X", "axes_input"],
