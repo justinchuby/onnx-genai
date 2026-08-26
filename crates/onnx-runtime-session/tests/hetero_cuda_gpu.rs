@@ -1,4 +1,4 @@
-#![cfg(feature = "gpu-tests")]
+#![cfg(feature = "cuda")]
 
 use std::sync::Arc;
 
@@ -120,6 +120,10 @@ fn graph() -> Graph {
     graph
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires a CUDA device; enable gpu-tests to execute"
+)]
 #[test]
 fn cuda_cpu_cuda_chain_executes_on_both_real_providers() {
     let mut cuda = CudaExecutionProvider::new(0).expect("CUDA device 0");
