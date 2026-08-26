@@ -89,6 +89,63 @@ there: a kernel can get 8× faster and still be 3× slower than ORT.
   counts, crash/no-crash ratios, and token byte-identity are unaffected by a
   loaded box, and several conclusions in this corpus rest on them for that reason.
 
+### Take the host lock — probing for quiet cannot be made correct
+
+**Every saturating benchmark and every full EP test matrix must hold
+[`scripts/hostlock.sh`](../../scripts/hostlock.sh).** Run `scripts/hostlock.sh --help`
+for the full options; it has its own CI lane (`.github/workflows/hostlock.yml`)
+and a conformance suite in `scripts/hostlock_test.sh`.
+
+```sh
+scripts/hostlock.sh status
+scripts/hostlock.sh run --reason "int4 prefill A/B, m=8..512" -- cargo bench ...
+```
+
+`run` acquires, runs, and always releases, so it cannot leak the lock if your
+command dies.
+
+Three flags people get wrong:
+
+- `--reason TEXT` is **mandatory** for `run` and refuses an empty string. It is
+  the only channel that tells whoever you block what they are waiting for, and
+  unlike an announcement it survives its author's death.
+- `--wait` is a **bare flag**. Seconds go to `--timeout S`. `--wait 1200` is an
+  error.
+- `--gate N` waits for the runnable count to fall *after* acquiring. It is a
+  **secondary** signal — the lock, being declared intent, is the primary one. A
+  bounded good citizen on 4 of 32 cpus reads runnable 4–5 and trips `--gate 3`,
+  while a single-threaded 100% hog reads ~1 and sails through.
+
+The preceding bullets tell you to probe carefully and distrust a single probe.
+That is necessary and **still not sufficient**, because point-in-time probing
+has a hole that no amount of care closes. On 2026-08-25 three of us lost runs to
+three structurally different failures of announce-before/announce-after, none of
+which a better probe would have caught:
+
+1. The announcement was correct and sent, and **never arrived** — messages
+   between two agents were repeatedly delivered to a third.
+2. The announcement arrived but the **attribution was wrong** — a busy host was
+   ascribed to the wrong agent from a worktree path, so one agent waited on
+   another who was not running anything, and a third actually held the box.
+3. The pre-flight probe was **sampled into a gap**. An interleaved A/B runs
+   `before`, then `after`; a `ps` between the two arms shows neither and reads
+   as "finished". A point-in-time check is only valid if it outlives a full arm
+   transition, which by construction it cannot guarantee.
+
+A lock is immune to all three: it cannot be misdelivered, misattributed, or
+sampled into a gap, because the holder writes a declaration and waiters read
+that declaration rather than inferring occupancy from CPU state. Liveness is
+established from the owner's pid **and** its `/proc/<pid>/stat` start time, so a
+crashed holder is reaped and a recycled pid cannot impersonate one.
+
+One consequence worth stating, because it has already been rediscovered the hard
+way in a hand-rolled gate: **a gate that times out and proceeds anyway labels
+contaminated rows as gated.** `hostlock.sh` defaults `--on-gate-timeout` to
+`fail` (exit 5, releasing) for exactly that reason. If you write your own
+waiting loop, make expiry distinguishable from satisfaction — otherwise the
+rows are indistinguishable from clean ones downstream, which is worse than not
+gating at all.
+
 ## Primary GPU-to-GPU comparison
 
 The intended 1:1 path uses:

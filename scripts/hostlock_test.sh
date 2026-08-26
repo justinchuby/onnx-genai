@@ -2522,13 +2522,72 @@ chk "and no lock directory was created by the refused acquire" \
 rm -rf "$shim"
 cleanup
 
+# --help must work, and must keep working. The header it prints is the only
+# documentation anyone reads, and `--help` answering "unknown subcommand" is
+# why four agents spent a night arguing to build a tool that already existed.
+#
+# The self-extracting form has one real failure mode, and it is this suite's
+# own recurring theme: if the sed range breaks -- someone renames the section
+# that bounds it -- help prints nothing at all, exits 0, and looks fine. So
+# these pin the CONTENT, not just the exit status.
+help_out=$("$HL" --help 2>/dev/null)
+"$HL" --help >/dev/null 2>&1; rc_help=$?
+"$HL" -h >/dev/null 2>&1; rc_h=$?
+"$HL" help >/dev/null 2>&1; rc_word=$?
+"$HL" not-a-subcommand >/dev/null 2>&1; rc_bogus=$?
+chk "--help exits 0" "$rc_help" "0"
+chk "-h is the same" "$rc_h" "0"
+chk "the bare help subcommand is the same" "$rc_word" "0"
+chk "help still refuses a genuinely unknown subcommand" "$rc_bogus" "1"
+chk "help prints the usage line" "$(echo "$help_out" | grep -c '^Usage:')" "1"
+# The self-extracting form has one real failure mode, and poisoning it taught
+# me I had guarded the wrong direction. If the sed range breaks -- someone
+# renames the section that bounds it -- sed does NOT print nothing. An
+# unmatched end address runs to end of file, so help prints 1964 lines,
+# including the script's own source, and exits 0. A lower bound alone passes
+# that happily. So bound it from ABOVE as well, and assert no source leaks.
+help_lines=$(echo "$help_out" | wc -l)
+chk "help is not silently empty -- the sed range still matches" \
+    "$([ "$help_lines" -gt 60 ] && echo wide || echo truncated)" "wide"
+chk "help does not run off the end of the file when the range breaks" \
+    "$([ "$help_lines" -lt 400 ] && echo bounded || echo ranaway)" "bounded"
+chk "help leaks no source -- no esac from the dispatch" \
+    "$(echo "$help_out" | grep -c -- 'esac')" "0"
+chk "help leaks no source -- no internal function names" \
+    "$(echo "$help_out" | grep -c -- 'warn_if_private')" "0"
+
+# Help must answer from a BROKEN environment, because that is the environment
+# someone is in when they reach for it. Both of these aborted with a validation
+# error before the help arm was hoisted above `require_name` and the anchor-pid
+# check -- so `--help` failed exactly for the misconfigured user it exists to
+# serve. Regression tests for that, not decoration.
+HOSTLOCK_OWNER="cpu team" "$HL" --help >/dev/null 2>&1; rc_badowner=$?
+"$HL" --help --pid 999999 >/dev/null 2>&1; rc_badpid=$?
+chk "help answers despite an owner name it would refuse to lock with" "$rc_badowner" "0"
+chk "help answers despite a dead --pid anchor" "$rc_badpid" "0"
+
+# Same idiom as the no-argument help test above, and for the same reason: a
+# line-count bound cannot notice that the header grew a flag the help never
+# mentions. Pin the flags people actually get wrong.
+for flag in --reason --wait --timeout --gate --on-gate-timeout; do
+    chk "--help mentions $flag" \
+        "$(echo "$help_out" | grep -c -- "$flag" | awk '{print ($1>0)?1:0}')" "1"
+done
+chk "help names --reason as REQUIRED, the flag that refuses run" \
+    "$(echo "$help_out" | grep -c 'REQUIRED')" "1"
+chk "help documents --wait, which is a bare flag people pass seconds to" \
+    "$(echo "$help_out" | grep -cE '^  --wait ')" "1"
+chk "help leaves the comment markers behind" "$(echo "$help_out" | grep -c '^# ')" "0"
+chk "asking for help takes no lock" \
+    "$([ -e "$LOCK" ] && echo created || echo none)" "none"
+
 # Finally, pin the assertion count itself. Several of the checks in this file
 # sit behind environment probes, and an assertion that quietly stops running is
 # indistinguishable from one that passes -- which is the same failure mode as
 # the inert R1 block and the vacuous STALE arm that this PR exists to fix.
 # Every probe branch asserts something, so the total is invariant across
 # environments; if a refactor drops a check, this fails and says so.
-chk "every assertion in this file ran" "$((pass + fail + 1))" "378"
+chk "every assertion in this file ran" "$((pass + fail + 1))" "398"
 
 echo
 echo "passed=${pass} failed=${fail}"

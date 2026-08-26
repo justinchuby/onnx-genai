@@ -1390,6 +1390,26 @@ print_free_or_unusable() {
     return 0
 }
 
+# The options are already documented, exhaustively, in this file's header --
+# but only to someone who opens a 2000-line shell script. Four agents spent a
+# night arguing to build this tool while it sat in scripts/ with a test suite,
+# and `--help` answering "unknown subcommand" is a large part of why. So print
+# the header rather than a second copy of it: a curated duplicate would drift,
+# and the drift would land on exactly the flags people get wrong (`--wait` is
+# a bare flag, `--reason` is mandatory for `run`).
+#
+# The end anchor is `# (end of usage summary)`, the same one the no-argument
+# path uses -- deliberately not a second boundary of my own. That marker exists
+# because an earlier `sed -n '3,50p'` here silently stopped covering the header
+# as it grew, so flags added by a change were absent from that change's own
+# help. A private anchor would reintroduce exactly that drift, one copy along.
+# Both anchor lines are load-bearing; renaming either breaks help, loudly, in
+# the conformance suite.
+cmd_help() {
+    sed -n '/^# Usage:/,/^# (end of usage summary)/p' "$0" | sed '$d' | sed 's/^#\{1\} \{0,1\}//'
+    echo "Full notes, including how to read a gated row: $0"
+}
+
 cmd_status() {
     local legacy
     legacy=$(legacy_holder) || legacy="none"
@@ -1782,6 +1802,16 @@ CPU_TICKS=""
 }
 SUB=$1
 shift
+
+# Answer help before anything is validated. Everything below this point can
+# refuse: `require_name` rejects a $HOSTLOCK_OWNER or $USER containing a space,
+# and the anchor-pid check rejects a stale --pid. Both would abort `--help`
+# with an error instead of printing it -- and a misconfigured environment is
+# precisely the state someone is in when they reach for `--help`. Asking how
+# the tool works must never depend on holding it correctly.
+case "$SUB" in
+    help|-h|--help) cmd_help; exit 0 ;;
+esac
 
 # Every flag that takes a value must be given one, and numeric flags must be
 # numeric.
