@@ -1804,11 +1804,29 @@ cleanup
 # A `run` holds the host while its owner is elsewhere. The reason is the only
 # thing the lock can tell whoever it blocks, and unlike an announcement it
 # survives the announcer's death -- so an empty one must fail, not default.
+#
+# `env -u HOSTLOCK_REASON`, for the same reason the sibling variables are
+# scrubbed above: this is the one `run` in the file that deliberately passes no
+# reason, so it is the one assertion an ambient value can satisfy. The docs
+# tell people to "set it once" in automation, so the recommended usage is
+# exactly what makes these two assertions fail -- and in a lane that exports it
+# globally they instead pass green with the refusal path never exercised.
 rm -f "$LOCK.ran"
-out=$($HL run --owner leon -- touch "$LOCK.ran" 2>&1); rc=$?
+out=$(env -u HOSTLOCK_REASON $HL run --owner leon -- touch "$LOCK.ran" 2>&1); rc=$?
 chk "a run with no reason is a usage error" "$rc" "1"
 chk "and that run's command never ran" "$([ -e "$LOCK.ran" ] && echo ran || echo no)" "no"
 chk "and no lock was left behind" "$(st state)" "FREE"
+
+# The scrub above is load-bearing, so pin it rather than trusting the tester's
+# environment to be empty. Without this, deleting `env -u` leaves the suite
+# green for anyone who has not set the variable -- which is every CI run today,
+# and not the automation that follows the documented advice to set it once.
+rm -f "$LOCK.ran"
+out=$(HOSTLOCK_REASON="ambient value that must not satisfy the guard" \
+    env -u HOSTLOCK_REASON $HL run --owner leon -- touch "$LOCK.ran" 2>&1); rc=$?
+chk "an ambient \$HOSTLOCK_REASON does not satisfy a run that passes none" "$rc" "1"
+chk "and that scrubbed run's command never ran either" \
+    "$([ -e "$LOCK.ran" ] && echo ran || echo no)" "no"
 rm -f "$LOCK.ran"
 out=$($HL run --owner leon --reason "   " -- touch "$LOCK.ran" 2>&1); rc=$?
 chk "a whitespace-only reason is refused too, not treated as text" "$rc" "1"
@@ -3042,7 +3060,7 @@ cleanup
 # the inert R1 block and the vacuous STALE arm that this PR exists to fix.
 # Every probe branch asserts something, so the total is invariant across
 # environments; if a refactor drops a check, this fails and says so.
-chk "every assertion in this file ran" "$((pass + fail + 1))" "454"
+chk "every assertion in this file ran" "$((pass + fail + 1))" "456"
 
 echo
 echo "passed=${pass} failed=${fail}"
