@@ -6,7 +6,7 @@ import vm from "node:vm";
 const htmlPath = new URL("../examples/inference_metadata/visualizer.html", import.meta.url);
 const html = readFileSync(htmlPath, "utf8");
 const script = id => {
-  const match = html.match(new RegExp(`<script id="${id}">([\\s\\S]*?)<\\/script>`));
+  const match = html.match(new RegExp(`<script\\b[^>]*\\bid="${id}"[^>]*>([\\s\\S]*?)<\\/script>`));
   assert.ok(match, `missing ${id}`);
   return match[1];
 };
@@ -125,20 +125,19 @@ test("diagnostics identify missing image value range without claiming schema val
 test("HTML exposes all purpose-built views and user actions", () => {
   for (const text of ["Document & capabilities", "Model, package & execution", "Workflow control-flow graph",
     "Nested loop & conditional timeline", "Serving state groups & K/V aliases", "Preprocessing, tokenizer & media",
-    "Policy component help", "Adapters, speculative execution & deployment", "Export JSON", "Print", "Reset"]) {
+    "Policy component help", "Adapters, speculative execution & deployment", "Capability catalogue",
+    "Workflow quick reference", "Export", "Print", "Reset"]) {
     assert.ok(html.includes(text), text);
   }
 });
 
 // --- Blocker 1: Mermaid labels must never let metadata inject graph/HTML syntax.
 const decodeMermaidLabel = quoted => {
-  assert.match(quoted, /^"(?:#\d+;)*"$/, `label is not pure numeric entities: ${quoted}`);
-  const inner = quoted.slice(1, -1);
-  const codes = inner ? inner.split(";").filter(Boolean).map(t => Number(t.slice(1))) : [];
-  return String.fromCodePoint(...codes);
+  assert.match(quoted, /^"[^"]*"$/, `label is not safely quoted: ${quoted}`);
+  return quoted.slice(1, -1);
 };
 
-test("mermaidText encodes every character as a numeric entity and round-trips exactly", () => {
+test("mermaidText produces readable, bounded, sanitized quoted labels", () => {
   const adversarial = [
     'A] --> Evil[pwn]',            // bracket + edge-arrow node injection
     'a{b}c|d',                     // rhombus braces + edge-label pipe
@@ -157,19 +156,16 @@ test("mermaidText encodes every character as a numeric entity and round-trips ex
   ];
   for (const payload of adversarial) {
     const label = H.mermaidText(payload);
-    // Only viewer-generated digits/#/; survive; no metadata glyph reaches Mermaid.
-    assert.match(label, /^"(?:#\d+;)*"$/, payload);
-    assert.doesNotMatch(label.slice(1, -1), /[\[\]{}()|<>&"`]/, payload);
-    assert.doesNotMatch(label, /-->|---|==>|javascript:|onerror|<script|<img|alert/i, payload);
-    // The security path is lossless: it never normalizes whitespace and never
-    // truncates, so decoding reproduces the exact original value byte-for-byte.
-    assert.equal(decodeMermaidLabel(label), payload, payload);
+    const decoded = decodeMermaidLabel(label);
+    assert.equal(decoded, H.safeLabel(payload).replace(/\\/g, " "), payload);
+    assert.doesNotMatch(decoded, /[\u0000-\u001f\u007f<>"`{}|\\]/, payload);
+    assert.doesNotMatch(decoded, /javascript:|onerror|<script|<img|alert\s*\(/i, payload);
+    assert.ok([...decoded].length <= 76, payload);
   }
-  // Explicitly pin the no-truncation guarantee for a >80 code-point value.
+  // Graph labels remain compact; the full metadata value remains available in
+  // the timeline and recursive document views.
   const long = "🧬".repeat(130); // 130 astral code points
-  assert.equal([...decodeMermaidLabel(H.mermaidText(long))].length, 130);
-  assert.equal(decodeMermaidLabel(H.mermaidText(long)), long);
-  // Empty / nullish labels degrade to a safe placeholder, still fully encoded.
+  assert.equal([...decodeMermaidLabel(H.mermaidText(long))].length, 76);
   assert.equal(decodeMermaidLabel(H.mermaidText("")), "unnamed");
   assert.equal(decodeMermaidLabel(H.mermaidText(null)), "unnamed");
 });
@@ -181,19 +177,21 @@ test("adversarial workflow labels inject no Mermaid nodes, edges, or markup", ()
     pipeline: {workflow: {steps: [{kind: "invoke", component: payload}]}},
   }));
   const graph = H.workflowGraph(value);
-  // A single declared step must yield exactly one node and zero edges.
-  assert.equal(graph.nodes.length, 1);
-  assert.equal(graph.edges.length, 0);
+  // A single declared step plus the viewer-built terminal yields one edge.
+  assert.equal(graph.nodes.length, 2);
+  assert.equal(graph.edges.length, 1);
+  const step = nodeId(graph, "1. invoke");
+  const end = nodeId(graph, "End");
+  assert.ok(hasEdge(graph, step, end, null));
   const src = H.buildMermaid(value);
   assert.match(src, /^flowchart TD/);
-  // Exactly one node line, no viewer or injected edge lines.
-  assert.equal(src.split("\n").filter(l => /-->/.test(l)).length, 0);
-  assert.doesNotMatch(src, /pwned|onerror|<img|alert\(1\)|javascript:/i);
-  // The only bracket/brace/pipe characters are the viewer-built node wrapper.
+  // Exactly one viewer-built edge line; arrows inside a quoted label are inert.
+  assert.equal(src.split("\n").filter(l => /^\s*s\d+\s+-->/.test(l)).length, 1);
+  assert.doesNotMatch(src, /onerror|<img|alert\(1\)|javascript:/i);
   const nodeLine = src.split("\n").find(l => /^\s*s0/.test(l));
-  const label = nodeLine.match(/^\s*s0\[("(?:#\d+;)*")\]$/);
+  const label = nodeLine.match(/^\s*s0\[("[^"]*")\]$/);
   assert.ok(label, nodeLine);
-  assert.equal(decodeMermaidLabel(label[1]), '1. invoke · ' + payload);
+  assert.equal(decodeMermaidLabel(label[1]), H.safeLabel("1. invoke · " + payload));
 });
 
 // --- Blocker 2: structured control-flow graph with correct edges, not a linear chain.
@@ -222,14 +220,16 @@ pipeline:
   const thenN = nodeId(g, "ThenComponent");
   const elseN = nodeId(g, "ElseComponent");
   const after = nodeId(g, "AfterComponent");
+  const end = nodeId(g, "End");
   // Decision fans out to both arms, and both arms converge on the next sibling.
   assert.ok(hasEdge(g, cond, thenN, "then"));
   assert.ok(hasEdge(g, cond, elseN, "else"));
   assert.ok(hasEdge(g, thenN, after, null));
   assert.ok(hasEdge(g, elseN, after, null));
+  assert.ok(hasEdge(g, after, end, null));
   // No misleading straight-line chain: the decision never links directly to next.
   assert.ok(!hasEdge(g, cond, after, null));
-  assert.equal(g.edges.length, 4);
+  assert.equal(g.edges.length, 5);
 });
 
 test("on_true/on_false conditionals branch and an absent arm falls through", () => {
@@ -246,11 +246,13 @@ pipeline:
   const cond = nodeId(g, "1. if");
   const truth = nodeId(g, "TrueBranch");
   const join = nodeId(g, "JoinComponent");
+  const end = nodeId(g, "End");
   assert.ok(hasEdge(g, cond, truth, "on_true"));
   assert.ok(hasEdge(g, truth, join, null));
   // The missing false arm falls through directly to the join step, labelled "else".
   assert.ok(hasEdge(g, cond, join, "else"));
-  assert.equal(g.edges.length, 3);
+  assert.ok(hasEdge(g, join, end, null));
+  assert.equal(g.edges.length, 4);
 });
 
 test("loop steps emit body, back-edge, and exit edges around the loop node", () => {
@@ -270,13 +272,15 @@ pipeline:
   const init = nodeId(g, "InitComponent");
   const body = nodeId(g, "BodyComponent");
   const exit = nodeId(g, "ExitComponent");
+  const end = nodeId(g, "End");
   // Setup runs once into the loop; body carries a back-edge; exit leaves the loop.
   assert.equal(g.entry, init);
   assert.ok(hasEdge(g, init, loop, null));
   assert.ok(hasEdge(g, loop, body, "body"));
   assert.ok(hasEdge(g, body, loop, "repeat"));
-  assert.ok(hasEdge(g, loop, exit, "exit"));
+  assert.ok(hasEdge(g, loop, exit, "predicate false / limit"));
+  assert.ok(hasEdge(g, exit, end, null));
   // The loop must not be flattened into a straight line through its body.
   assert.ok(!hasEdge(g, body, exit, null));
-  assert.equal(g.edges.length, 4);
+  assert.equal(g.edges.length, 5);
 });
