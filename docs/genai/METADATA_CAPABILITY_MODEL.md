@@ -172,9 +172,10 @@ contradict its source.
 
 ### 2.3 Hosted Hugging Face examples
 
-The 2026-08-25 audit searched current documentation, fixtures, scripts, tests,
-Git history, pull-request publication records, and every model owned by
-`justinchuby` whose exact Hub revision contains `inference_metadata.yaml`.
+The 2026-08-26 audit searched current documentation, fixtures, scripts, tests,
+Git history, pull-request publication records, and the live Hugging Face
+collection API. It also checked every model owned by `justinchuby` whose exact
+Hub revision contains `inference_metadata.yaml`.
 Upstream Hugging Face sources that contain no inference metadata are provenance,
 not hosted metadata examples. The resulting fleet is 28 packages.
 
@@ -189,34 +190,34 @@ that can silently skip does not independently upgrade that claim.
 
 | Hosted package and exact metadata revision | Model form | Normalized schema | Validation and evidence status |
 | --- | --- | --- | --- |
-| [`qwen2.5-0.5b-instruct-onnx-genai`](https://huggingface.co/justinchuby/qwen2.5-0.5b-instruct-onnx-genai/blob/a61ca2e7e7a41db4c310b6a24479d768d6ab20ae/inference_metadata.yaml) `a61ca2e7e7a41db4c310b6a24479d768d6ab20ae` | Decoder plus ten semantic policy graphs | v1.0 | Valid; card records generic workflow CPU output. No accepted performance record. |
-| [`qwen3-0.6b-onnx-genai`](https://huggingface.co/justinchuby/qwen3-0.6b-onnx-genai/blob/38714511f57e01df01808b930168459a8e7aa9a3/inference_metadata.yaml) `38714511f57e01df01808b930168459a8e7aa9a3` | Decoder plus policy graphs and session conversation state | v1.0 | Valid; card records generic workflow CPU output and multi-turn use. |
-| [`deepseek-r1-distill-qwen-1.5b-onnx-genai`](https://huggingface.co/justinchuby/deepseek-r1-distill-qwen-1.5b-onnx-genai/blob/1427c4896f798893e58ffec91aef65c34de4503a/inference_metadata.yaml) `1427c4896f798893e58ffec91aef65c34de4503a` | Decoder plus policy graphs | v1.0 | Valid; card records generic workflow CPU output. |
-| [`Muse-Glimmer-30B-ONNX-INT4-CUDA`](https://huggingface.co/justinchuby/Muse-Glimmer-30B-ONNX-INT4-CUDA/blob/85a1f4b4ac24f1076be51a52e6c934aff4b9e40c/inference_metadata.yaml) `85a1f4b4ac24f1076be51a52e6c934aff4b9e40c` | Image multimodal decoder with full/sliding KV and policy graphs | v1.0 | Valid; card records generic workflow ORT CUDA execution on H200. It does not prove this repository's native backend. |
-| [`qwen2.5-14b-instruct-int4-zp-onnx`](https://huggingface.co/justinchuby/qwen2.5-14b-instruct-int4-zp-onnx/blob/753817320d232b0205a7971e8ea25068453fb393/inference_metadata.yaml) `753817320d232b0205a7971e8ea25068453fb393` | INT4 decoder plus policy graphs | v1.0 | Valid; card gives a run recipe and explicitly declines to treat one run as evidence. |
-| [`onnx-genai-example-gemma4-e2b`](https://huggingface.co/justinchuby/onnx-genai-example-gemma4-e2b/blob/79ca25afe326719e4daab79430c90195dfd28f3b/inference_metadata.yaml) `79ca25afe326719e4daab79430c90195dfd28f3b` | Dense hybrid full/sliding decoder | v1.0 | Valid; direct ORT CUDA parity/timing evidence, and this exact target revision participates in the recorded generic speculative run. No exact native-package record. |
-| [`onnx-genai-example-qwen-image-edit-2509`](https://huggingface.co/justinchuby/onnx-genai-example-qwen-image-edit-2509/blob/e859aef2289ad02e64812c43fd5e73b5e1c36a2f/inference_metadata.yaml) `e859aef2289ad02e64812c43fd5e73b5e1c36a2f` | Image-conditioned flow-matching workflow | v1.0 | Valid; generic workflow ORT CUDA and HTTP API image-edit evidence. Timings are artifact records, not a general performance proof. |
-| [`pangu-weather-1h-onnx-catalogue`](https://huggingface.co/justinchuby/pangu-weather-1h-onnx-catalogue/blob/82beb24f24169b88bb0f108e40fc35840d4a8d57/inference_metadata.yaml) `82beb24f24169b88bb0f108e40fc35840d4a8d57` | Stateless weather forecast graph | v1.0 | Valid; card records a direct ORT CUDA deterministic request. Generic workflow and native execution are not recorded. |
-| [`onnx-genai-example-whisper-tiny`](https://huggingface.co/justinchuby/onnx-genai-example-whisper-tiny/blob/a37efd017b049d697d690824618c0cded5cffa78/inference_metadata.yaml) `a37efd017b049d697d690824618c0cded5cffa78` | Audio encoder-decoder with cross-attention state and policy graphs | v1.0 | Valid; direct ORT load/output evidence. General profile-driven or native execution is not established. |
-| [`onnx-genai-example-wav2vec2-base-960h-ctc`](https://huggingface.co/justinchuby/onnx-genai-example-wav2vec2-base-960h-ctc/blob/28480e393ad1b8fa2e0bb6939e5daded02f24014/inference_metadata.yaml) `28480e393ad1b8fa2e0bb6939e5daded02f24014` | Audio preprocessing plus encoder-only CTC | v1.0 | **Refreshed and valid**; direct ORT evidence. No `batch_capacity`, so grouped execution is not claimed; no engine CTC-profile dispatcher is proved. |
-| [`onnx-genai-example-esm2-t6-8m`](https://huggingface.co/justinchuby/onnx-genai-example-esm2-t6-8m/blob/d1e2ada5086f6ef0d1bfffb4099a5292104dbc1b/inference_metadata.yaml) `d1e2ada5086f6ef0d1bfffb4099a5292104dbc1b` | Protein encoder with embedding profile | v1.0 | **Canonical-producer parity restored and valid.** [`provenance.json`](https://huggingface.co/justinchuby/onnx-genai-example-esm2-t6-8m/blob/d1e2ada5086f6ef0d1bfffb4099a5292104dbc1b/provenance.json) pins `onnxruntime/mobius@8e3ab921a`; request-aligned layouts are preserved and `batch_capacity` is correctly absent. Direct ORT evidence remains; profile-driven execution and cross-request grouping remain unproved. |
-| [`onnx-genai-example-prot-bert`](https://huggingface.co/justinchuby/onnx-genai-example-prot-bert/blob/17942612a34372dc4191251455ebcb9f854a9db3/inference_metadata.yaml) `17942612a34372dc4191251455ebcb9f854a9db3` | Protein encoder with embedding profile | v1.0 | **Canonical-producer parity restored and valid.** [`provenance.json`](https://huggingface.co/justinchuby/onnx-genai-example-prot-bert/blob/17942612a34372dc4191251455ebcb9f854a9db3/provenance.json) pins `onnxruntime/mobius@8e3ab921a`; request-aligned layouts are preserved and `batch_capacity` is correctly absent. Direct ORT evidence remains; profile-driven execution and cross-request grouping remain unproved. |
-| [`onnx-genai-example-qwen2-5-0-5b-portable-f32`](https://huggingface.co/justinchuby/onnx-genai-example-qwen2-5-0-5b-portable-f32/blob/65ef8d35466d402f5bfa5330bb48477e0b330415/inference_metadata.yaml) `65ef8d35466d402f5bfa5330bb48477e0b330415` | Portable f32 decoder plus policy graphs | v1.0 | Valid; direct ORT smoke/output records. Exact native readiness is not recorded. |
-| [`onnx-genai-example-qwen2-5-0-5b-cuda-gqa-f16`](https://huggingface.co/justinchuby/onnx-genai-example-qwen2-5-0-5b-cuda-gqa-f16/blob/ec8046b051a8f11e6d339a7d9d85dd1235053989/inference_metadata.yaml) `ec8046b051a8f11e6d339a7d9d85dd1235053989` | CUDA GQA f16 decoder plus policy graphs | v1.0 | Valid; direct ORT CUDA smoke/output records. Provider-specific execution is not interchangeability evidence. |
-| [`onnx-genai-example-qwen2-5-0-5b-static-cache-f32`](https://huggingface.co/justinchuby/onnx-genai-example-qwen2-5-0-5b-static-cache-f32/blob/bc6b427cbba8db42a1ec3616002a5efab87f6fd0/inference_metadata.yaml) `bc6b427cbba8db42a1ec3616002a5efab87f6fd0` | Fixed-capacity indexed-scatter decoder plus policy graphs | v1.0 | Valid; direct ORT static-cache records. No portable performance claim follows. |
-| [`onnx-genai-example-qwen3-5-0-8b-hybrid-vlm-f32`](https://huggingface.co/justinchuby/onnx-genai-example-qwen3-5-0-8b-hybrid-vlm-f32/blob/88352734dc2d8c352c58be5450cc5c2dd7521aef/inference_metadata.yaml) `88352734dc2d8c352c58be5450cc5c2dd7521aef` | Image VLM with hybrid decoder and policy graphs | v1.0 | Valid; direct ORT graph evidence. A full generic multimodal or native package run is not recorded. |
-| [`onnx-genai-example-qwen2-5-1-5b-lora-selection`](https://huggingface.co/justinchuby/onnx-genai-example-qwen2-5-1-5b-lora-selection/blob/5ca5336b04f0c778f83c0083ee41203dd36961d2/inference_metadata.yaml) `5ca5336b04f0c778f83c0083ee41203dd36961d2` | Decoder with LoRA selection and policy graphs | v1.0 | Valid; direct ORT CUDA adapter evidence. Heterogeneous logical rows ran separately; accelerated heterogeneous workflow batching is not proved. |
-| [`onnx-genai-example-mistral-7b-v0-1-sliding-window`](https://huggingface.co/justinchuby/onnx-genai-example-mistral-7b-v0-1-sliding-window/blob/9d1e328848ab57e665d29ad4acb1182621775143/inference_metadata.yaml) `9d1e328848ab57e665d29ad4acb1182621775143` | Sliding-window decoder plus policy graphs | v1.0 | Valid; direct ORT CUDA boundary-crossing evidence. |
-| [`onnx-genai-example-qwen3-0-6b-eagle3`](https://huggingface.co/justinchuby/onnx-genai-example-qwen3-0-6b-eagle3/blob/0341cd47a8882c1fcbae0840613972321a007371/inference_metadata.yaml) `0341cd47a8882c1fcbae0840613972321a007371` | EAGLE-3 proposer/target workflow | v1.0 | Valid. The card reports ORT CUDA correctness/acceptance, but the maintained real-package gate returns success without executing when its environment variable is absent; this proposal therefore records implementation but no accepted project execution evidence. Native request admission rejects EAGLE-3. |
-| [`onnx-genai-stable-diffusion-bk-sdm-small`](https://huggingface.co/justinchuby/onnx-genai-stable-diffusion-bk-sdm-small/blob/2d30ae2ebfacf5c071693836d70ebd14d8fd84d3/inference_metadata.yaml) `2d30ae2ebfacf5c071693836d70ebd14d8fd84d3` | Text-to-image diffusion workflow | v1.0 | Valid; generic workflow ORT CUDA and A1111 API evidence. No accepted end-to-end performance gate. |
-| [`onnx-genai-cogvideox-2b`](https://huggingface.co/justinchuby/onnx-genai-cogvideox-2b/blob/29da9103c4517f8026155c0d97e195c26ee56758/inference_metadata.yaml) `29da9103c4517f8026155c0d97e195c26ee56758` | Text-to-video diffusion workflow with temporal recurrence | v1.0 | Valid; generic workflow ORT CUDA video evidence. No native video proof. |
-| [`act-aloha-policy-onnx-catalogue`](https://huggingface.co/justinchuby/act-aloha-policy-onnx-catalogue/blob/ebe2b9485d9f2e4ae9d0b181654e2d6d844fda57/inference_metadata.yaml) `ebe2b9485d9f2e4ae9d0b181654e2d6d844fda57` | Action-rollout policy graph | v1.0 | Valid; direct ORT CUDA/PyTorch parity and timing record. Generic workflow/native readiness is not separately keyed. |
-| [`moshiko-full-duplex-onnx-catalogue`](https://huggingface.co/justinchuby/moshiko-full-duplex-onnx-catalogue/blob/426253a5a5822eb405e4ac214d6895427c64ef0c/inference_metadata.yaml) `426253a5a5822eb405e4ac214d6895427c64ef0c` | Full-duplex audio workflow with temporal and codec state | v1.0 | Valid; card records direct CUDA duplex output/timing. Generic workflow/native evidence is not separately keyed. |
-| [`sensenova-u1.5-8b-mot-onnx-canonical`](https://huggingface.co/justinchuby/sensenova-u1.5-8b-mot-onnx-canonical/blob/541afaea12e85222766b694cccc30153ea6dd3c1/inference_metadata.yaml) `541afaea12e85222766b694cccc30153ea6dd3c1` | Shared-prefix multimodal pixel-flow workflow | v1.0 | Valid; generic workflow ORT CUDA text, image generation, and image-edit evidence. Full autoregressive text decode remains absent. |
-| [`onnx-genai-example-gemma4-e2b-assistant`](https://huggingface.co/justinchuby/onnx-genai-example-gemma4-e2b-assistant/blob/4b6f1533fec1475ade9e3fa3d401ae00a2d7be67/inference_metadata.yaml) `4b6f1533fec1475ade9e3fa3d401ae00a2d7be67` | Target plus cacheless shared-KV assistant | v1.0 | Valid; direct ORT CUDA drafter parity/assisted evidence. The separately packaged composite carries the current generic real-package run. |
-| [`onnx-genai-example-minimax-music3`](https://huggingface.co/justinchuby/onnx-genai-example-minimax-music3/blob/5f95fbbfa01956626fc3170fc90a467666aebdd6/inference_metadata.yaml) `5f95fbbfa01956626fc3170fc90a467666aebdd6` | Hierarchical text-to-music/audio workflow | v1.0 | Valid; card records component L4 and audio L5 artifacts. Backend and performance claims are not keyed as project conformance records. |
-| [`onnx-genai-example-gemma4-26b-a4b`](https://huggingface.co/justinchuby/onnx-genai-example-gemma4-26b-a4b/blob/63e02e455bd835f75b096694ec31d5ad91800299/inference_metadata.yaml) `63e02e455bd835f75b096694ec31d5ad91800299` | MoE hybrid full/sliding decoder | v1.0 | Valid; direct ORT CUDA parity/generation/timing evidence. The card describes an ORT/native deterministic fixture, not an exact keyed portability certificate. |
-| [`onnx-genai-example-gemma4-e2b-speculative`](https://huggingface.co/justinchuby/onnx-genai-example-gemma4-e2b-speculative/blob/77a8161bc2a2c9de478dae50307f60e2a0c6beff/inference_metadata.yaml) `77a8161bc2a2c9de478dae50307f60e2a0c6beff` | Self-contained chained shared-KV speculative workflow | v1.0 | Valid; exact generic workflow ORT CUDA target-equivalence, acceptance, rejection, rollback, and residency evidence. No accepted speedup or exact native-package record. |
+| [`qwen2.5-0.5b-instruct-onnx-genai`](https://huggingface.co/justinchuby/qwen2.5-0.5b-instruct-onnx-genai/blob/56f6964bea748533cd544f6c451a9527307d4e79/inference_metadata.yaml) `56f6964bea748533cd544f6c451a9527307d4e79` | Decoder plus ten semantic policy graphs | v1.0 | Valid; card records generic workflow CPU output. No accepted performance record. |
+| [`qwen3-0.6b-onnx-genai`](https://huggingface.co/justinchuby/qwen3-0.6b-onnx-genai/blob/4913b5e5b485bf62c5254fe41acd91d01db5a21c/inference_metadata.yaml) `4913b5e5b485bf62c5254fe41acd91d01db5a21c` | Decoder plus policy graphs and session conversation state | v1.0 | Valid; card records generic workflow CPU output and multi-turn use. |
+| [`deepseek-r1-distill-qwen-1.5b-onnx-genai`](https://huggingface.co/justinchuby/deepseek-r1-distill-qwen-1.5b-onnx-genai/blob/f48fcc47c9b75bfab8369075855c1d8f5e1a9428/inference_metadata.yaml) `f48fcc47c9b75bfab8369075855c1d8f5e1a9428` | Decoder plus policy graphs | v1.0 | Valid; card records generic workflow CPU output. |
+| [`Muse-Glimmer-30B-ONNX-INT4-CUDA`](https://huggingface.co/justinchuby/Muse-Glimmer-30B-ONNX-INT4-CUDA/blob/ddbb787663ca0c5dd05eec93d0514284db7dd787/inference_metadata.yaml) `ddbb787663ca0c5dd05eec93d0514284db7dd787` | Image multimodal decoder with full/sliding KV and policy graphs | v1.0 | Valid; card records generic workflow ORT CUDA execution on H200. It does not prove this repository's native backend. |
+| [`qwen2.5-14b-instruct-int4-zp-onnx`](https://huggingface.co/justinchuby/qwen2.5-14b-instruct-int4-zp-onnx/blob/2c4311ae4ee87bb7c5976fe26268cb28986fd898/inference_metadata.yaml) `2c4311ae4ee87bb7c5976fe26268cb28986fd898` | INT4 decoder plus policy graphs | v1.0 | Valid; card gives a run recipe and explicitly declines to treat one run as evidence. |
+| [`onnx-genai-example-gemma4-e2b`](https://huggingface.co/justinchuby/onnx-genai-example-gemma4-e2b/blob/a74c3ad0209c4f04251f0c1d48a3796fc63a4a8f/inference_metadata.yaml) `a74c3ad0209c4f04251f0c1d48a3796fc63a4a8f` | Dense hybrid full/sliding decoder | v1.0 | Valid; direct ORT CUDA parity/timing evidence. Its canonical package bytes are unchanged from the target revision in the recorded generic speculative run. No exact native-package record. |
+| [`onnx-genai-example-qwen-image-edit-2509`](https://huggingface.co/justinchuby/onnx-genai-example-qwen-image-edit-2509/blob/69544173de85fe785b1dfd7e1f5f1795c23bafb1/inference_metadata.yaml) `69544173de85fe785b1dfd7e1f5f1795c23bafb1` | Image-conditioned flow-matching workflow | v1.0 | Valid; generic workflow ORT CUDA and HTTP API image-edit evidence. Timings are artifact records, not a general performance proof. |
+| [`pangu-weather-1h-onnx-catalogue`](https://huggingface.co/justinchuby/pangu-weather-1h-onnx-catalogue/blob/36baa7a9b345c3accf6f9e5a0303d9b6960dea34/inference_metadata.yaml) `36baa7a9b345c3accf6f9e5a0303d9b6960dea34` | Stateless weather forecast graph | v1.0 | Valid; card records a direct ORT CUDA deterministic request. Generic workflow and native execution are not recorded. |
+| [`onnx-genai-example-whisper-tiny`](https://huggingface.co/justinchuby/onnx-genai-example-whisper-tiny/blob/f1a67225928c21b926bd2ee87940aed3d582b8ef/inference_metadata.yaml) `f1a67225928c21b926bd2ee87940aed3d582b8ef` | Audio encoder-decoder with cross-attention state and policy graphs | v1.0 | Valid; direct ORT load/output evidence. General profile-driven or native execution is not established. |
+| [`onnx-genai-example-wav2vec2-base-960h-ctc`](https://huggingface.co/justinchuby/onnx-genai-example-wav2vec2-base-960h-ctc/blob/820a7c59ad73e088858230d567395d625c3fac04/inference_metadata.yaml) `820a7c59ad73e088858230d567395d625c3fac04` | Audio preprocessing plus encoder-only CTC | v1.0 | **Refreshed and valid**; direct ORT evidence. No `batch_capacity`, so grouped execution is not claimed; no engine CTC-profile dispatcher is proved. |
+| [`onnx-genai-example-esm2-t6-8m`](https://huggingface.co/justinchuby/onnx-genai-example-esm2-t6-8m/blob/1954e4b60aa939a8220c884c3408d06ffa34e494/inference_metadata.yaml) `1954e4b60aa939a8220c884c3408d06ffa34e494` | Protein encoder with embedding profile | v1.0 | **Canonical-producer parity restored and valid.** [`provenance.json`](https://huggingface.co/justinchuby/onnx-genai-example-esm2-t6-8m/blob/1954e4b60aa939a8220c884c3408d06ffa34e494/provenance.json) pins `onnxruntime/mobius@8e3ab921a`; request-aligned layouts are preserved and `batch_capacity` is correctly absent. Direct ORT evidence remains; profile-driven execution and cross-request grouping remain unproved. |
+| [`onnx-genai-example-prot-bert`](https://huggingface.co/justinchuby/onnx-genai-example-prot-bert/blob/83d5acc54a7b0eb9f3cd33b668fa8b1fe80e701d/inference_metadata.yaml) `83d5acc54a7b0eb9f3cd33b668fa8b1fe80e701d` | Protein encoder with embedding profile | v1.0 | **Canonical-producer parity restored and valid.** [`provenance.json`](https://huggingface.co/justinchuby/onnx-genai-example-prot-bert/blob/83d5acc54a7b0eb9f3cd33b668fa8b1fe80e701d/provenance.json) pins `onnxruntime/mobius@8e3ab921a`; request-aligned layouts are preserved and `batch_capacity` is correctly absent. Direct ORT evidence remains; profile-driven execution and cross-request grouping remain unproved. |
+| [`onnx-genai-example-qwen2-5-0-5b-portable-f32`](https://huggingface.co/justinchuby/onnx-genai-example-qwen2-5-0-5b-portable-f32/blob/c9958924d55d71965e811e38c9123e39cbae4adc/inference_metadata.yaml) `c9958924d55d71965e811e38c9123e39cbae4adc` | Portable f32 decoder plus policy graphs | v1.0 | Valid; direct ORT smoke/output records. Exact native readiness is not recorded. |
+| [`onnx-genai-example-qwen2-5-0-5b-cuda-gqa-f16`](https://huggingface.co/justinchuby/onnx-genai-example-qwen2-5-0-5b-cuda-gqa-f16/blob/874f622bcce62d9beb01b10a1211a287eedbf3c2/inference_metadata.yaml) `874f622bcce62d9beb01b10a1211a287eedbf3c2` | CUDA GQA f16 decoder plus policy graphs | v1.0 | Valid; direct ORT CUDA smoke/output records. Provider-specific execution is not interchangeability evidence. |
+| [`onnx-genai-example-qwen2-5-0-5b-static-cache-f32`](https://huggingface.co/justinchuby/onnx-genai-example-qwen2-5-0-5b-static-cache-f32/blob/33724b837d9ddd2eb5fc078bf5185c847df6df7d/inference_metadata.yaml) `33724b837d9ddd2eb5fc078bf5185c847df6df7d` | Fixed-capacity indexed-scatter decoder plus policy graphs | v1.0 | Valid; direct ORT static-cache records. No portable performance claim follows. |
+| [`onnx-genai-example-qwen3-5-0-8b-hybrid-vlm-f32`](https://huggingface.co/justinchuby/onnx-genai-example-qwen3-5-0-8b-hybrid-vlm-f32/blob/b180af9a81e249895ff900368fdc0df29d83c516/inference_metadata.yaml) `b180af9a81e249895ff900368fdc0df29d83c516` | Image VLM with hybrid decoder and policy graphs | v1.0 | Valid; direct ORT graph evidence. A full generic multimodal or native package run is not recorded. |
+| [`onnx-genai-example-qwen2-5-1-5b-lora-selection`](https://huggingface.co/justinchuby/onnx-genai-example-qwen2-5-1-5b-lora-selection/blob/e0f35d893a21fd1d188ea2f5d38d51a0bbeffa43/inference_metadata.yaml) `e0f35d893a21fd1d188ea2f5d38d51a0bbeffa43` | Decoder with LoRA selection and policy graphs | v1.0 | Valid; direct ORT CUDA adapter evidence. Heterogeneous logical rows ran separately; accelerated heterogeneous workflow batching is not proved. |
+| [`onnx-genai-example-mistral-7b-v0-1-sliding-window`](https://huggingface.co/justinchuby/onnx-genai-example-mistral-7b-v0-1-sliding-window/blob/02ea2ae40ef5abad7872c4777a883306bec307e5/inference_metadata.yaml) `02ea2ae40ef5abad7872c4777a883306bec307e5` | Sliding-window decoder plus policy graphs | v1.0 | Valid; direct ORT CUDA boundary-crossing evidence. |
+| [`onnx-genai-example-qwen3-0-6b-eagle3`](https://huggingface.co/justinchuby/onnx-genai-example-qwen3-0-6b-eagle3/blob/10385b7b8f1a3066d4ff15a72ec2194cce324f19/inference_metadata.yaml) `10385b7b8f1a3066d4ff15a72ec2194cce324f19` | EAGLE-3 proposer/target workflow | v1.0 | Valid. The card reports ORT CUDA correctness/acceptance, but the maintained real-package gate returns success without executing when its environment variable is absent; this proposal therefore records implementation but no accepted project execution evidence. Native request admission rejects EAGLE-3. |
+| [`onnx-genai-stable-diffusion-bk-sdm-small`](https://huggingface.co/justinchuby/onnx-genai-stable-diffusion-bk-sdm-small/blob/dd7ecd9d50a2210aa796a2efedb5489125f8be37/inference_metadata.yaml) `dd7ecd9d50a2210aa796a2efedb5489125f8be37` | Text-to-image diffusion workflow | v1.0 | Valid; generic workflow ORT CUDA and A1111 API evidence. No accepted end-to-end performance gate. |
+| [`onnx-genai-cogvideox-2b`](https://huggingface.co/justinchuby/onnx-genai-cogvideox-2b/blob/27e85b66e91a2be33be53ec44d0247a9b232220d/inference_metadata.yaml) `27e85b66e91a2be33be53ec44d0247a9b232220d` | Text-to-video diffusion workflow with temporal recurrence | v1.0 | Valid; generic workflow ORT CUDA video evidence. No native video proof. |
+| [`act-aloha-policy-onnx-catalogue`](https://huggingface.co/justinchuby/act-aloha-policy-onnx-catalogue/blob/8428f02d75fb029407e3b699dd81842d7e9bb3ff/inference_metadata.yaml) `8428f02d75fb029407e3b699dd81842d7e9bb3ff` | Action-rollout policy graph | v1.0 | Valid; direct ORT CUDA/PyTorch parity and timing record. Generic workflow/native readiness is not separately keyed. |
+| [`moshiko-full-duplex-onnx-catalogue`](https://huggingface.co/justinchuby/moshiko-full-duplex-onnx-catalogue/blob/4114e4103f0e9458a2917ecb3048e33b06577891/inference_metadata.yaml) `4114e4103f0e9458a2917ecb3048e33b06577891` | Full-duplex audio workflow with temporal and codec state | v1.0 | Valid; card records direct CUDA duplex output/timing. Generic workflow/native evidence is not separately keyed. |
+| [`sensenova-u1.5-8b-mot-onnx-canonical`](https://huggingface.co/justinchuby/sensenova-u1.5-8b-mot-onnx-canonical/blob/a57ae0a765ac6ec55ddefaa8af12fdf3c9e670d5/inference_metadata.yaml) `a57ae0a765ac6ec55ddefaa8af12fdf3c9e670d5` | Shared-prefix multimodal pixel-flow workflow | v1.0 | Valid; generic workflow ORT CUDA text, image generation, and image-edit evidence. Full autoregressive text decode remains absent. |
+| [`onnx-genai-example-gemma4-e2b-assistant`](https://huggingface.co/justinchuby/onnx-genai-example-gemma4-e2b-assistant/blob/0778733e00713fad71c858553939817a273b7114/inference_metadata.yaml) `0778733e00713fad71c858553939817a273b7114` | Target plus cacheless shared-KV assistant | v1.0 | Valid; direct ORT CUDA drafter parity/assisted evidence. The separately packaged composite carries the current generic real-package run. |
+| [`onnx-genai-example-minimax-music3`](https://huggingface.co/justinchuby/onnx-genai-example-minimax-music3/blob/2c7c9f57c42eb7953a01750d51adb724b3181223/inference_metadata.yaml) `2c7c9f57c42eb7953a01750d51adb724b3181223` | Hierarchical text-to-music/audio workflow | v1.0 | Valid; card records component L4 and audio L5 artifacts. Backend and performance claims are not keyed as project conformance records. |
+| [`onnx-genai-example-gemma4-26b-a4b`](https://huggingface.co/justinchuby/onnx-genai-example-gemma4-26b-a4b/blob/e3336a2baea76d6a759fd32347927ca6ec85fbd1/inference_metadata.yaml) `e3336a2baea76d6a759fd32347927ca6ec85fbd1` | MoE hybrid full/sliding decoder | v1.0 | Valid; direct ORT CUDA parity/generation/timing evidence. The card describes an ORT/native deterministic fixture, not an exact keyed portability certificate. |
+| [`onnx-genai-example-gemma4-e2b-speculative`](https://huggingface.co/justinchuby/onnx-genai-example-gemma4-e2b-speculative/blob/6a6d111c877c0b395aff022efa7374de77be2e00/inference_metadata.yaml) `6a6d111c877c0b395aff022efa7374de77be2e00` | Self-contained chained shared-KV speculative workflow | v1.0 | Valid; canonical package bytes remain identical to the exact generic workflow ORT CUDA target-equivalence, acceptance, rejection, rollback, and residency record. No accepted speedup or exact native-package record. |
 
 Fleet-wide findings:
 
@@ -249,13 +250,84 @@ regenerated after
 Their canonical republish changed exactly `inference_metadata.yaml` and
 `provenance.json`. The provenance records the producer repository/commit and
 file hashes, removing the prior divergence between corrected deployed metadata
-and its canonical source. The generated YAML is intentionally described as
-comment-free: it preserves request-aligned layouts, contains no retired
-batching fields, and omits `batch_capacity`, so current fail-closed behavior is
-per item. The cited Mobius fixtures are deliberately tiny contract examples
+and its canonical source. The generated canonical YAML remains comment-free,
+while the adjacent annotated companion carries review prose. Both preserve
+request-aligned layouts, contain no retired batching fields, and omit
+`batch_capacity`, so current fail-closed behavior is per item. The cited Mobius
+fixtures are deliberately tiny contract examples
 (hidden widths 64 rather than the hosted models' 320 and 1024), so producer
 parity does not mean those fixture bytes equal the real-model hosted bytes;
 provenance instead hashes the exact generated deployment files.
+
+#### Published collection annotations
+
+The collection API resolved
+[`justinchuby/onnx-genai-inference-metadata-examples`](https://huggingface.co/collections/justinchuby/onnx-genai-inference-metadata-examples)
+to 29 items at publication time: 28 model repositories plus the
+[`onnx-genai-inference-metadata-catalogue`](https://huggingface.co/datasets/justinchuby/onnx-genai-inference-metadata-catalogue/tree/6df78ce20485fbe41c807186ec554c18f7575554)
+dataset. Every model now publishes `inference_metadata.annotated.yaml` beside
+an unchanged canonical `inference_metadata.yaml`, and its README links the
+companion. Comments are tailored to the actual model form and cover top-level
+sections, policy graphs, profiles, preprocessing, tensor contracts,
+cache/state/batching semantics, adapter/speculative contracts, and the absence
+of backend-readiness or performance evidence.
+
+The publication inserted 26,657 comment lines across the 28 companions. Parsed
+canonical and annotated YAML objects compare equal for all 28 repositories, and
+all 56 exact-revision files pass current metadata-only shape validation. The
+automated check is
+[`scripts/validate_hf_metadata_annotations.py`](../../scripts/validate_hf_metadata_annotations.py).
+The catalogue dataset publishes the same check plus a machine-readable
+[`annotation_inventory.json`](https://huggingface.co/datasets/justinchuby/onnx-genai-inference-metadata-catalogue/blob/6df78ce20485fbe41c807186ec554c18f7575554/annotation_inventory.json).
+
+Canonical producer provenance remains authoritative:
+
+- eight exhaustive distribution manifests were refreshed for the changed
+  README hash and new annotated-file hash, and their canonical metadata entries
+  were reverified; producer/source identity and canonical bytes were preserved;
+- eight scoped asset provenance files did not cover README/metadata and were
+  left unchanged;
+- twelve repositories had no `provenance.json`, so publication did not fabricate
+  producer identity;
+- Wav2Vec2's exhaustive manifest exposed a pre-existing stale canonical
+  metadata hash from its earlier correction. The annotation publication fixed
+  that hash while leaving source identity and canonical bytes unchanged.
+
+Because every annotation commit left canonical metadata, graphs, and weights
+byte-identical, it does not manufacture new runtime evidence. Existing
+artifact-backed records remain applicable only to those unchanged bytes and
+their originally recorded runtime/provider/result.
+
+| Collection model repo | Pre-annotation revision | Annotated revision | Uploaded files | Verification / provenance |
+| --- | --- | --- | --- | --- |
+| [`qwen2.5-0.5b-instruct-onnx-genai`](https://huggingface.co/justinchuby/qwen2.5-0.5b-instruct-onnx-genai/blob/56f6964bea748533cd544f6c451a9527307d4e79/inference_metadata.annotated.yaml) | `a61ca2e7e7a41db4c310b6a24479d768d6ab20ae` | `56f6964bea748533cd544f6c451a9527307d4e79` | `inference_metadata.annotated.yaml`, `README.md` | Parsed equality and current-schema validation passed; no `provenance.json` existed; none was fabricated. |
+| [`qwen3-0.6b-onnx-genai`](https://huggingface.co/justinchuby/qwen3-0.6b-onnx-genai/blob/4913b5e5b485bf62c5254fe41acd91d01db5a21c/inference_metadata.annotated.yaml) | `38714511f57e01df01808b930168459a8e7aa9a3` | `4913b5e5b485bf62c5254fe41acd91d01db5a21c` | `inference_metadata.annotated.yaml`, `README.md` | Parsed equality and current-schema validation passed; no `provenance.json` existed; none was fabricated. |
+| [`deepseek-r1-distill-qwen-1.5b-onnx-genai`](https://huggingface.co/justinchuby/deepseek-r1-distill-qwen-1.5b-onnx-genai/blob/f48fcc47c9b75bfab8369075855c1d8f5e1a9428/inference_metadata.annotated.yaml) | `1427c4896f798893e58ffec91aef65c34de4503a` | `f48fcc47c9b75bfab8369075855c1d8f5e1a9428` | `inference_metadata.annotated.yaml`, `README.md` | Parsed equality and current-schema validation passed; no `provenance.json` existed; none was fabricated. |
+| [`onnx-genai-example-qwen2-5-0-5b-portable-f32`](https://huggingface.co/justinchuby/onnx-genai-example-qwen2-5-0-5b-portable-f32/blob/c9958924d55d71965e811e38c9123e39cbae4adc/inference_metadata.annotated.yaml) | `65ef8d35466d402f5bfa5330bb48477e0b330415` | `c9958924d55d71965e811e38c9123e39cbae4adc` | `inference_metadata.annotated.yaml`, `README.md`, `provenance.json` | Parsed equality and current-schema validation passed; hashes verified: inference_metadata.yaml,inference_metadata.annotated.yaml,README.md. |
+| [`onnx-genai-example-qwen2-5-0-5b-cuda-gqa-f16`](https://huggingface.co/justinchuby/onnx-genai-example-qwen2-5-0-5b-cuda-gqa-f16/blob/874f622bcce62d9beb01b10a1211a287eedbf3c2/inference_metadata.annotated.yaml) | `ec8046b051a8f11e6d339a7d9d85dd1235053989` | `874f622bcce62d9beb01b10a1211a287eedbf3c2` | `inference_metadata.annotated.yaml`, `README.md`, `provenance.json` | Parsed equality and current-schema validation passed; hashes verified: inference_metadata.yaml,inference_metadata.annotated.yaml,README.md. |
+| [`onnx-genai-example-qwen2-5-0-5b-static-cache-f32`](https://huggingface.co/justinchuby/onnx-genai-example-qwen2-5-0-5b-static-cache-f32/blob/33724b837d9ddd2eb5fc078bf5185c847df6df7d/inference_metadata.annotated.yaml) | `bc6b427cbba8db42a1ec3616002a5efab87f6fd0` | `33724b837d9ddd2eb5fc078bf5185c847df6df7d` | `inference_metadata.annotated.yaml`, `README.md`, `provenance.json` | Parsed equality and current-schema validation passed; hashes verified: inference_metadata.yaml,inference_metadata.annotated.yaml,README.md. |
+| [`onnx-genai-example-qwen3-5-0-8b-hybrid-vlm-f32`](https://huggingface.co/justinchuby/onnx-genai-example-qwen3-5-0-8b-hybrid-vlm-f32/blob/b180af9a81e249895ff900368fdc0df29d83c516/inference_metadata.annotated.yaml) | `88352734dc2d8c352c58be5450cc5c2dd7521aef` | `b180af9a81e249895ff900368fdc0df29d83c516` | `inference_metadata.annotated.yaml`, `README.md`, `provenance.json` | Parsed equality and current-schema validation passed; hashes verified: inference_metadata.yaml,inference_metadata.annotated.yaml,README.md. |
+| [`onnx-genai-example-esm2-t6-8m`](https://huggingface.co/justinchuby/onnx-genai-example-esm2-t6-8m/blob/1954e4b60aa939a8220c884c3408d06ffa34e494/inference_metadata.annotated.yaml) | `d1e2ada5086f6ef0d1bfffb4099a5292104dbc1b` | `1954e4b60aa939a8220c884c3408d06ffa34e494` | `inference_metadata.annotated.yaml`, `README.md`, `provenance.json` | Parsed equality and current-schema validation passed; hashes verified: inference_metadata.yaml,inference_metadata.annotated.yaml,README.md. |
+| [`onnx-genai-example-prot-bert`](https://huggingface.co/justinchuby/onnx-genai-example-prot-bert/blob/83d5acc54a7b0eb9f3cd33b668fa8b1fe80e701d/inference_metadata.annotated.yaml) | `17942612a34372dc4191251455ebcb9f854a9db3` | `83d5acc54a7b0eb9f3cd33b668fa8b1fe80e701d` | `inference_metadata.annotated.yaml`, `README.md`, `provenance.json` | Parsed equality and current-schema validation passed; hashes verified: inference_metadata.yaml,inference_metadata.annotated.yaml,README.md. |
+| [`onnx-genai-example-whisper-tiny`](https://huggingface.co/justinchuby/onnx-genai-example-whisper-tiny/blob/f1a67225928c21b926bd2ee87940aed3d582b8ef/inference_metadata.annotated.yaml) | `a37efd017b049d697d690824618c0cded5cffa78` | `f1a67225928c21b926bd2ee87940aed3d582b8ef` | `inference_metadata.annotated.yaml`, `README.md`, `provenance.json` | Parsed equality and current-schema validation passed; hashes verified: inference_metadata.yaml,inference_metadata.annotated.yaml,README.md. |
+| [`onnx-genai-example-wav2vec2-base-960h-ctc`](https://huggingface.co/justinchuby/onnx-genai-example-wav2vec2-base-960h-ctc/blob/820a7c59ad73e088858230d567395d625c3fac04/inference_metadata.annotated.yaml) | `28480e393ad1b8fa2e0bb6939e5daded02f24014` | `820a7c59ad73e088858230d567395d625c3fac04` | `inference_metadata.annotated.yaml`, `README.md`, `provenance.json` | Parsed equality and current-schema validation passed; hashes verified: inference_metadata.yaml,inference_metadata.annotated.yaml,README.md; stale pre-existing canonical hash corrected. |
+| [`onnx-genai-example-qwen2-5-1-5b-lora-selection`](https://huggingface.co/justinchuby/onnx-genai-example-qwen2-5-1-5b-lora-selection/blob/e0f35d893a21fd1d188ea2f5d38d51a0bbeffa43/inference_metadata.annotated.yaml) | `5ca5336b04f0c778f83c0083ee41203dd36961d2` | `e0f35d893a21fd1d188ea2f5d38d51a0bbeffa43` | `inference_metadata.annotated.yaml`, `README.md` | Parsed equality and current-schema validation passed; present; scoped asset manifest unchanged. |
+| [`onnx-genai-example-mistral-7b-v0-1-sliding-window`](https://huggingface.co/justinchuby/onnx-genai-example-mistral-7b-v0-1-sliding-window/blob/02ea2ae40ef5abad7872c4777a883306bec307e5/inference_metadata.annotated.yaml) | `9d1e328848ab57e665d29ad4acb1182621775143` | `02ea2ae40ef5abad7872c4777a883306bec307e5` | `inference_metadata.annotated.yaml`, `README.md` | Parsed equality and current-schema validation passed; present; scoped asset manifest unchanged. |
+| [`onnx-genai-example-qwen3-0-6b-eagle3`](https://huggingface.co/justinchuby/onnx-genai-example-qwen3-0-6b-eagle3/blob/10385b7b8f1a3066d4ff15a72ec2194cce324f19/inference_metadata.annotated.yaml) | `0341cd47a8882c1fcbae0840613972321a007371` | `10385b7b8f1a3066d4ff15a72ec2194cce324f19` | `inference_metadata.annotated.yaml`, `README.md` | Parsed equality and current-schema validation passed; no `provenance.json` existed; none was fabricated. |
+| [`onnx-genai-stable-diffusion-bk-sdm-small`](https://huggingface.co/justinchuby/onnx-genai-stable-diffusion-bk-sdm-small/blob/dd7ecd9d50a2210aa796a2efedb5489125f8be37/inference_metadata.annotated.yaml) | `2d30ae2ebfacf5c071693836d70ebd14d8fd84d3` | `dd7ecd9d50a2210aa796a2efedb5489125f8be37` | `inference_metadata.annotated.yaml`, `README.md` | Parsed equality and current-schema validation passed; present; scoped asset manifest unchanged. |
+| [`onnx-genai-example-qwen-image-edit-2509`](https://huggingface.co/justinchuby/onnx-genai-example-qwen-image-edit-2509/blob/69544173de85fe785b1dfd7e1f5f1795c23bafb1/inference_metadata.annotated.yaml) | `e859aef2289ad02e64812c43fd5e73b5e1c36a2f` | `69544173de85fe785b1dfd7e1f5f1795c23bafb1` | `inference_metadata.annotated.yaml`, `README.md` | Parsed equality and current-schema validation passed; present; scoped asset manifest unchanged. |
+| [`onnx-genai-cogvideox-2b`](https://huggingface.co/justinchuby/onnx-genai-cogvideox-2b/blob/27e85b66e91a2be33be53ec44d0247a9b232220d/inference_metadata.annotated.yaml) | `29da9103c4517f8026155c0d97e195c26ee56758` | `27e85b66e91a2be33be53ec44d0247a9b232220d` | `inference_metadata.annotated.yaml`, `README.md` | Parsed equality and current-schema validation passed; present; scoped asset manifest unchanged. |
+| [`pangu-weather-1h-onnx-catalogue`](https://huggingface.co/justinchuby/pangu-weather-1h-onnx-catalogue/blob/36baa7a9b345c3accf6f9e5a0303d9b6960dea34/inference_metadata.annotated.yaml) | `82beb24f24169b88bb0f108e40fc35840d4a8d57` | `36baa7a9b345c3accf6f9e5a0303d9b6960dea34` | `inference_metadata.annotated.yaml`, `README.md` | Parsed equality and current-schema validation passed; present; scoped asset manifest unchanged. |
+| [`act-aloha-policy-onnx-catalogue`](https://huggingface.co/justinchuby/act-aloha-policy-onnx-catalogue/blob/8428f02d75fb029407e3b699dd81842d7e9bb3ff/inference_metadata.annotated.yaml) | `ebe2b9485d9f2e4ae9d0b181654e2d6d844fda57` | `8428f02d75fb029407e3b699dd81842d7e9bb3ff` | `inference_metadata.annotated.yaml`, `README.md` | Parsed equality and current-schema validation passed; present; scoped asset manifest unchanged. |
+| [`moshiko-full-duplex-onnx-catalogue`](https://huggingface.co/justinchuby/moshiko-full-duplex-onnx-catalogue/blob/4114e4103f0e9458a2917ecb3048e33b06577891/inference_metadata.annotated.yaml) | `426253a5a5822eb405e4ac214d6895427c64ef0c` | `4114e4103f0e9458a2917ecb3048e33b06577891` | `inference_metadata.annotated.yaml`, `README.md` | Parsed equality and current-schema validation passed; present; scoped asset manifest unchanged. |
+| [`onnx-genai-example-gemma4-e2b`](https://huggingface.co/justinchuby/onnx-genai-example-gemma4-e2b/blob/a74c3ad0209c4f04251f0c1d48a3796fc63a4a8f/inference_metadata.annotated.yaml) | `79ca25afe326719e4daab79430c90195dfd28f3b` | `a74c3ad0209c4f04251f0c1d48a3796fc63a4a8f` | `inference_metadata.annotated.yaml`, `README.md` | Parsed equality and current-schema validation passed; no `provenance.json` existed; none was fabricated. |
+| [`onnx-genai-example-gemma4-e2b-assistant`](https://huggingface.co/justinchuby/onnx-genai-example-gemma4-e2b-assistant/blob/0778733e00713fad71c858553939817a273b7114/inference_metadata.annotated.yaml) | `4b6f1533fec1475ade9e3fa3d401ae00a2d7be67` | `0778733e00713fad71c858553939817a273b7114` | `inference_metadata.annotated.yaml`, `README.md` | Parsed equality and current-schema validation passed; no `provenance.json` existed; none was fabricated. |
+| [`onnx-genai-example-gemma4-26b-a4b`](https://huggingface.co/justinchuby/onnx-genai-example-gemma4-26b-a4b/blob/e3336a2baea76d6a759fd32347927ca6ec85fbd1/inference_metadata.annotated.yaml) | `63e02e455bd835f75b096694ec31d5ad91800299` | `e3336a2baea76d6a759fd32347927ca6ec85fbd1` | `inference_metadata.annotated.yaml`, `README.md` | Parsed equality and current-schema validation passed; no `provenance.json` existed; none was fabricated. |
+| [`onnx-genai-example-minimax-music3`](https://huggingface.co/justinchuby/onnx-genai-example-minimax-music3/blob/2c7c9f57c42eb7953a01750d51adb724b3181223/inference_metadata.annotated.yaml) | `5f95fbbfa01956626fc3170fc90a467666aebdd6` | `2c7c9f57c42eb7953a01750d51adb724b3181223` | `inference_metadata.annotated.yaml`, `README.md` | Parsed equality and current-schema validation passed; no `provenance.json` existed; none was fabricated. |
+| [`onnx-genai-example-gemma4-e2b-speculative`](https://huggingface.co/justinchuby/onnx-genai-example-gemma4-e2b-speculative/blob/6a6d111c877c0b395aff022efa7374de77be2e00/inference_metadata.annotated.yaml) | `77a8161bc2a2c9de478dae50307f60e2a0c6beff` | `6a6d111c877c0b395aff022efa7374de77be2e00` | `inference_metadata.annotated.yaml`, `README.md` | Parsed equality and current-schema validation passed; no `provenance.json` existed; none was fabricated. |
+| [`qwen2.5-14b-instruct-int4-zp-onnx`](https://huggingface.co/justinchuby/qwen2.5-14b-instruct-int4-zp-onnx/blob/2c4311ae4ee87bb7c5976fe26268cb28986fd898/inference_metadata.annotated.yaml) | `753817320d232b0205a7971e8ea25068453fb393` | `2c4311ae4ee87bb7c5976fe26268cb28986fd898` | `inference_metadata.annotated.yaml`, `README.md` | Parsed equality and current-schema validation passed; no `provenance.json` existed; none was fabricated. |
+| [`sensenova-u1.5-8b-mot-onnx-canonical`](https://huggingface.co/justinchuby/sensenova-u1.5-8b-mot-onnx-canonical/blob/a57ae0a765ac6ec55ddefaa8af12fdf3c9e670d5/inference_metadata.annotated.yaml) | `541afaea12e85222766b694cccc30153ea6dd3c1` | `a57ae0a765ac6ec55ddefaa8af12fdf3c9e670d5` | `inference_metadata.annotated.yaml`, `README.md` | Parsed equality and current-schema validation passed; no `provenance.json` existed; none was fabricated. |
+| [`Muse-Glimmer-30B-ONNX-INT4-CUDA`](https://huggingface.co/justinchuby/Muse-Glimmer-30B-ONNX-INT4-CUDA/blob/ddbb787663ca0c5dd05eec93d0514284db7dd787/inference_metadata.annotated.yaml) | `85a1f4b4ac24f1076be51a52e6c934aff4b9e40c` | `ddbb787663ca0c5dd05eec93d0514284db7dd787` | `inference_metadata.annotated.yaml`, `README.md` | Parsed equality and current-schema validation passed; no `provenance.json` existed; none was fabricated. |
 
 #### Hosted-example governance
 
@@ -279,9 +351,11 @@ provenance instead hashes the exact generated deployment files.
 7. A publisher **MUST NOT** add `batch_capacity` merely to replace a removed
    boolean. It must author exact component ports, padding/length provenance,
    ownership, uniform dimensions, and budgets needed for safe grouping.
-8. Human review examples SHOULD retain explanatory YAML comments. When a
-   production serializer strips them, publish an adjacent annotated reference
-   and validate typed semantic equality instead of claiming comments survived.
+8. Every hosted example **MUST** publish an adjacent
+   `inference_metadata.annotated.yaml` with useful model-specific comments and a
+   README link. Automation must prove parsed equality with the canonical YAML
+   and validate both files. A serializer-stripped canonical file remains the
+   authority; comments never create a second semantic contract.
 9. When generic capability lists are removed, the hosted fleet should be
    regenerated from the canonical workflow source in one migration, validated,
    and repinned here; hosted copies must not preserve obsolete fields as a
@@ -289,10 +363,9 @@ provenance instead hashes the exact generated deployment files.
 
 #### Annotated generated encoder companion
 
-The following review-only companion annotates the common ESM-2/ProtBERT
-contract. The production serializer does not retain these comments; the pinned
-metadata plus `provenance.json` are the deployed bytes, while this snippet is
-the human-readable reference:
+The following compact companion illustrates the common ESM-2/ProtBERT contract.
+The hosted repositories now contain their full model-specific annotated files;
+this shorter snippet remains a review pattern:
 
 ```yaml
 # v1 is sufficient because this package deliberately makes no grouping claim.
@@ -386,19 +459,25 @@ Ordered annotated references:
 
 1. the compact decoder policy-graph example in
    [§1.4](#14-policy-graph-means-executable-semantics);
-2. the in-tree [catalogue](../../examples/inference_metadata/catalogue/README.md),
+2. the complete [published annotation inventory](#published-collection-annotations)
+   and its machine-readable
+   [catalogue record](https://huggingface.co/datasets/justinchuby/onnx-genai-inference-metadata-catalogue/blob/6df78ce20485fbe41c807186ec554c18f7575554/annotation_inventory.json);
+3. the in-tree [catalogue](../../examples/inference_metadata/catalogue/README.md),
    especially decoder/static cache examples 1 and 18, multimodal/diffusion
    examples 3 and 7–9, adapters/speculation examples 10–11 and 20–24, and
    encoder/task examples 4–5 and 12–13;
-3. the refreshed, inline-annotated
-   [Wav2Vec2](https://huggingface.co/justinchuby/onnx-genai-example-wav2vec2-base-960h-ctc/blob/28480e393ad1b8fa2e0bb6939e5daded02f24014/inference_metadata.yaml),
-   production file;
-4. the generated, comment-free
-   [ESM-2](https://huggingface.co/justinchuby/onnx-genai-example-esm2-t6-8m/blob/d1e2ada5086f6ef0d1bfffb4099a5292104dbc1b/inference_metadata.yaml)
+4. hosted annotated representatives in this order: baseline
+   [decoder/policy graphs](https://huggingface.co/justinchuby/qwen2.5-0.5b-instruct-onnx-genai/blob/56f6964bea748533cd544f6c451a9527307d4e79/inference_metadata.annotated.yaml),
+   [static KV](https://huggingface.co/justinchuby/onnx-genai-example-qwen2-5-0-5b-static-cache-f32/blob/33724b837d9ddd2eb5fc078bf5185c847df6df7d/inference_metadata.annotated.yaml),
+   [vision-language](https://huggingface.co/justinchuby/onnx-genai-example-qwen3-5-0-8b-hybrid-vlm-f32/blob/b180af9a81e249895ff900368fdc0df29d83c516/inference_metadata.annotated.yaml),
+   [audio encoder-decoder](https://huggingface.co/justinchuby/onnx-genai-example-whisper-tiny/blob/f1a67225928c21b926bd2ee87940aed3d582b8ef/inference_metadata.annotated.yaml),
+   [encoder/profile](https://huggingface.co/justinchuby/onnx-genai-example-esm2-t6-8m/blob/1954e4b60aa939a8220c884c3408d06ffa34e494/inference_metadata.annotated.yaml),
+   [LoRA](https://huggingface.co/justinchuby/onnx-genai-example-qwen2-5-1-5b-lora-selection/blob/e0f35d893a21fd1d188ea2f5d38d51a0bbeffa43/inference_metadata.annotated.yaml),
+   [EAGLE-3](https://huggingface.co/justinchuby/onnx-genai-example-qwen3-0-6b-eagle3/blob/10385b7b8f1a3066d4ff15a72ec2194cce324f19/inference_metadata.annotated.yaml),
+   [diffusion](https://huggingface.co/justinchuby/onnx-genai-stable-diffusion-bk-sdm-small/blob/dd7ecd9d50a2210aa796a2efedb5489125f8be37/inference_metadata.annotated.yaml),
    and
-   [ProtBERT](https://huggingface.co/justinchuby/onnx-genai-example-prot-bert/blob/17942612a34372dc4191251455ebcb9f854a9db3/inference_metadata.yaml)
-   production files, their adjacent provenance, the annotated companion above,
-   and the canonical Mobius
+   [full-duplex audio](https://huggingface.co/justinchuby/moshiko-full-duplex-onnx-catalogue/blob/4114e4103f0e9458a2917ecb3048e33b06577891/inference_metadata.annotated.yaml);
+5. the canonical Mobius
    [ESM-2](https://github.com/onnxruntime/mobius/blob/8e3ab921a48c0f57eb0b6d24782335c32da3ea4f/tests/fixtures/onnx_genai_workflows/esm2_protein_embeddings/inference_metadata.yaml)
    and
    [ProtBERT](https://github.com/onnxruntime/mobius/blob/8e3ab921a48c0f57eb0b6d24782335c32da3ea4f/tests/fixtures/onnx_genai_workflows/protbert_protein_embeddings/inference_metadata.yaml)
@@ -1074,10 +1153,10 @@ Read in this order:
     [the dated workflow evidence](../benchmarks/2026-08-21-mobius-workflow-conformance.md)
     — represented versus executed versus measured status.
 12. The pinned [hosted-example inventory](#23-hosted-hugging-face-examples),
-    followed by the compact annotated policy graph, inline-commented Wav2Vec2
-    example, generated ESM-2/ProtBERT files and provenance records, their Mobius
-    source fixtures, and the annotated encoder companion above — deployed
-    instances versus their authoritative producer, schema, and evidence.
+    [publication revisions](#published-collection-annotations), collection
+    validator, model-specific annotated sidecars, exhaustive/scoped/absent
+    provenance cases, and Mobius source fixtures — deployed instances versus
+    their authoritative producer, schema, and evidence.
 
 ### Invariants to scrutinize
 
@@ -1102,6 +1181,8 @@ Read in this order:
 - Could an adapter or speculative fallback silently change output semantics?
 - Is every hosted example pinned, validated at that revision, and prevented from
   becoming a schema or readiness authority?
+- Does every collection model publish a README-linked annotated sidecar whose
+  parsed object equals the unchanged canonical metadata?
 
 ### Short review checklist
 
@@ -1116,3 +1197,4 @@ Read in this order:
 - [ ] Migration deletions have one replacement authority and no compatibility alias.
 - [ ] Acceptance tests include negative and decline paths, not only successful execution.
 - [ ] Hosted revisions, producer provenance, comments/annotated references, and evidence labels match exact bytes.
+- [ ] Canonical and annotated hosted YAML parse equally and both pass the current validator.
