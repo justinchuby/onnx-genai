@@ -36,7 +36,17 @@ REQUIRED_JOB_NAMES = frozenset({"Fast (Linux x86_64)", "Rust quality"})
 # `workflow_jobs()`, which reads `ci.yml` alone; the other 23 files were
 # unguarded until #2206. Scope and host are separate choices, and only the host
 # has to be required: this inventory is checked from `rust-quality`, so a job
-# that vanishes anywhere blocks a merge everywhere.
+# that stops being *defined* anywhere blocks a merge.
+#
+# "Defined" is the whole claim, and it is narrower than "runs". Reviewed and
+# measured, this gate is blind to three ways a job stops running while every
+# name it records is still present: a workflow whose `on:`/`paths:` no longer
+# fires on pull requests, a job carrying `if: false`, and a `strategy.matrix`
+# emptied or renamed -- the inventory holds the unexpanded template
+# `CLI ORT (${{ matrix.name }})`, not the check names GitHub actually reports.
+# `if: false` on a *required* job is already refused by
+# `verify_required_job_conditions`; on a non-required job nothing refuses it.
+# See #2210. Do not read a pass here as "these checks ran".
 #
 # The names are display names -- `name:` when a job sets one, otherwise the job
 # key -- because that is what GitHub reports as the status check and what a
