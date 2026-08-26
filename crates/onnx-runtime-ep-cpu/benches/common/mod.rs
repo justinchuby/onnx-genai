@@ -370,8 +370,14 @@ pub fn report_decode_width() {
     // visible disagreement rather than a silent one.
     let chunk_perm = onnx_runtime_ep_cpu::decode_spmd::decode_chunk_permutation()
         .map_or_else(|| "none".to_string(), |perm| perm.label());
+    // Same rule applied to the row schedule. `path` names the executor, so a
+    // native pool reports `spmd-pool` whether it tiles dynamically or not --
+    // and the schedule is a *default*, so it can change under a results table
+    // without anyone setting a variable. Read from the built pool.
+    let schedule = onnx_runtime_ep_cpu::decode_spmd::decode_schedule_label();
     println!(
-        "decode_width requested={} realized={} path={} chunk_perm={chunk_perm} {verdict}",
+        "decode_width requested={} realized={} path={} schedule={schedule} \
+         chunk_perm={chunk_perm} {verdict}",
         show(width.requested),
         show(width.realized),
         width.path,
