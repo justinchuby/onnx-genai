@@ -124,11 +124,13 @@ fn allowlisted_unconditional_syncs() -> BTreeSet<String> {
         // returning it to the pool. Same shape as packed_varlen_attention below.
         "multi_head_attention.rs::execute".to_string(),
         "nary.rs::run".to_string(),
+        "non_max_suppression.rs::materialize".to_string(),
         "nonzero.rs::execute".to_string(),
         "packed_varlen_attention.rs::execute".to_string(),
         "pooling.rs::execute".to_string(),
         "pooling.rs::run".to_string(),
         "sparse_kv_gather.rs::execute".to_string(),
+        "unique.rs::materialize".to_string(),
         "varlen_attention.rs::execute".to_string(),
     ])
 }

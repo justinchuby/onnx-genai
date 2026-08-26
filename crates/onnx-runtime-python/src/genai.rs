@@ -1,5 +1,8 @@
 use std::path::Path;
-use std::sync::{Mutex, MutexGuard, TryLockError};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Sender};
+use std::thread::{self, JoinHandle, ThreadId};
 
 use onnx_genai_engine::{
     Engine as RustEngine, EngineConfig, FinishReason, GenerateOptions, GenerateRequest,
@@ -122,22 +125,141 @@ fn generation_error(err: impl std::fmt::Display) -> PyErr {
     ))
 }
 
-const ENGINE_IN_USE: &str = "engine is in use by another thread — nxrt genai Engine is not \
-re-entrant; serialize calls or use one Engine per thread";
+const ENGINE_IN_USE: &str = "nxrt genai Engine cannot be re-entered from its generation \
+callback; return from the callback before calling the same Engine again";
 
-fn try_lock_engine<T>(inner: &Mutex<T>) -> PyResult<MutexGuard<'_, T>> {
-    inner.try_lock().map_err(|err| match err {
-        TryLockError::WouldBlock => PyRuntimeError::new_err(ENGINE_IN_USE),
-        TryLockError::Poisoned(_) => PyRuntimeError::new_err(
-            "nxrt genai Engine state is unavailable because a previous generation panicked; \
-             create a new Engine instance",
-        ),
-    })
+fn reject_owner_thread(owner_thread: ThreadId) -> PyResult<()> {
+    if thread::current().id() == owner_thread {
+        return Err(PyRuntimeError::new_err(ENGINE_IN_USE));
+    }
+    Ok(())
 }
+
+type EngineTask = Box<dyn FnOnce(&mut RustEngine) + Send + 'static>;
 
 #[pyclass(module = "nxrt.genai", name = "Engine")]
 struct Engine {
-    inner: Mutex<RustEngine>,
+    tasks: Option<Sender<EngineTask>>,
+    owner_thread: ThreadId,
+    callback_active: Arc<AtomicBool>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl Engine {
+    fn start(path: String, config: EngineConfig) -> PyResult<Self> {
+        let (tasks, task_rx) = mpsc::channel::<EngineTask>();
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let worker = thread::Builder::new()
+            .name("nxrt-python-genai".to_string())
+            .spawn(move || {
+                let owner_thread = thread::current().id();
+                let mut engine = match RustEngine::from_dir(Path::new(&path), config) {
+                    Ok(engine) => {
+                        let _ = ready_tx.send(Ok(owner_thread));
+                        engine
+                    }
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(format!(
+                            "failed to load genai model from {path:?}: {error}. Verify the \
+                             directory contains compatible ONNX graph(s), tokenizer.json, and \
+                             inference_metadata.yaml or genai_config.json."
+                        )));
+                        return;
+                    }
+                };
+                for task in task_rx {
+                    task(&mut engine);
+                }
+            })
+            .map_err(|error| {
+                PyRuntimeError::new_err(format!(
+                    "failed to start the nxrt genai engine owner thread: {error}"
+                ))
+            })?;
+
+        let owner_thread = ready_rx
+            .recv()
+            .map_err(|_| {
+                PyRuntimeError::new_err(
+                    "nxrt genai engine owner thread exited before initialization completed",
+                )
+            })?
+            .map_err(PyValueError::new_err)?;
+        Ok(Self {
+            tasks: Some(tasks),
+            owner_thread,
+            callback_active: Arc::new(AtomicBool::new(false)),
+            worker: Some(worker),
+        })
+    }
+
+    fn dispatch<T, F>(&self, py: Python<'_>, operation: F) -> PyResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut RustEngine) -> PyResult<T> + Send + 'static,
+    {
+        reject_owner_thread(self.owner_thread)?;
+        if self.callback_active.load(Ordering::Acquire) {
+            return Err(PyRuntimeError::new_err(ENGINE_IN_USE));
+        }
+        self.dispatch_unchecked(py, operation)
+    }
+
+    fn dispatch_stream<T, F>(&self, py: Python<'_>, operation: F) -> PyResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut RustEngine) -> PyResult<T> + Send + 'static,
+    {
+        reject_owner_thread(self.owner_thread)?;
+        self.callback_active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| PyRuntimeError::new_err(ENGINE_IN_USE))?;
+        let result = self.dispatch_unchecked(py, operation);
+        self.callback_active.store(false, Ordering::Release);
+        result
+    }
+
+    fn dispatch_unchecked<T, F>(&self, py: Python<'_>, operation: F) -> PyResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut RustEngine) -> PyResult<T> + Send + 'static,
+    {
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        self.tasks
+            .as_ref()
+            .ok_or_else(|| {
+                PyRuntimeError::new_err(
+                    "nxrt genai engine is shutting down; create a new Engine instance",
+                )
+            })?
+            .send(Box::new(move |engine| {
+                let _ = result_tx.send(operation(engine));
+            }))
+            .map_err(|_| {
+                PyRuntimeError::new_err(
+                    "nxrt genai engine owner thread exited; create a new Engine instance",
+                )
+            })?;
+        py.detach(move || {
+            result_rx.recv().map_err(|_| {
+                PyRuntimeError::new_err(
+                    "nxrt genai engine owner thread exited before returning a result",
+                )
+            })?
+        })
+    }
+}
+
+impl Drop for Engine {
+    fn drop(&mut self) {
+        self.tasks.take();
+        if thread::current().id() == self.owner_thread {
+            return;
+        }
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
 }
 
 #[pymethods]
@@ -176,16 +298,7 @@ impl Engine {
             }
             config.page_size = value;
         }
-        let engine = RustEngine::from_dir(path_ref, config).map_err(|err| {
-            PyValueError::new_err(format!(
-                "failed to load genai model from {path:?}: {err}. Verify the directory \
-                 contains compatible ONNX graph(s), tokenizer.json, and \
-                 inference_metadata.yaml or genai_config.json."
-            ))
-        })?;
-        Ok(Self {
-            inner: Mutex::new(engine),
-        })
+        Self::start(path, config)
     }
 
     #[pyo3(signature = (prompt, *, max_tokens=128, temperature=1.0, top_p=1.0, top_k=0, seed=None, stop=None))]
@@ -203,8 +316,7 @@ impl Engine {
         stop: Option<Vec<String>>,
     ) -> PyResult<GenerateResult> {
         let request = request(prompt, max_tokens, temperature, top_p, top_k, seed, stop)?;
-        py.detach(|| {
-            let mut engine = try_lock_engine(&self.inner)?;
+        self.dispatch(py, move |engine| {
             engine
                 .generate(request)
                 .map(GenerateResult::from)
@@ -233,7 +345,7 @@ impl Engine {
             ));
         }
         let request = request(prompt, max_tokens, temperature, top_p, top_k, seed, stop)?;
-        py.detach(|| {
+        self.dispatch_stream(py, move |engine| {
             let mut callback_error: Option<PyErr> = None;
             let mut callback_fn = |token: GenerateToken| {
                 let call = Python::attach(|py| {
@@ -257,10 +369,6 @@ impl Engine {
                     }
                 }
             };
-            // The guard remains held while Rust generates, including callback
-            // invocations. Re-entry is safe because every method uses try_lock
-            // and therefore fails immediately instead of waiting on this mutex.
-            let mut engine = try_lock_engine(&self.inner)?;
             let callback_fn: &mut onnx_genai_engine::GenerateTokenCallback<'_> = &mut callback_fn;
             let result = engine.generate_with_callback(request, Some(callback_fn));
             if let Some(err) = callback_error {
@@ -271,9 +379,9 @@ impl Engine {
     }
 
     fn tokenize(&self, py: Python<'_>, text: &str) -> PyResult<Vec<u32>> {
-        py.detach(|| {
-            let engine = try_lock_engine(&self.inner)?;
-            engine.tokenize(text).map_err(|err| {
+        let text = text.to_string();
+        self.dispatch(py, move |engine| {
+            engine.tokenize(&text).map_err(|err| {
                 PyValueError::new_err(format!(
                     "failed to tokenize input text: {err}. Verify the model directory contains \
                      a valid tokenizer.json compatible with the loaded model."
@@ -302,9 +410,7 @@ pub(crate) fn register(parent: &Bound<'_, PyModule>) -> PyResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
-
-    use super::{ENGINE_IN_USE, Engine, build_options, try_lock_engine};
+    use super::{ENGINE_IN_USE, Engine, build_options, reject_owner_thread};
 
     #[test]
     fn generation_options_match_python_arguments() {
@@ -325,16 +431,17 @@ mod tests {
     }
 
     #[test]
-    fn engine_lock_contention_returns_actionable_python_error() {
+    fn engine_owner_thread_reentry_returns_actionable_python_error() {
         pyo3::Python::initialize();
-        let inner = Arc::new(Mutex::new(()));
-        let guard = inner.lock().unwrap();
-        let contender = Arc::clone(&inner);
-        let error = std::thread::spawn(move || try_lock_engine(&contender).unwrap_err())
-            .join()
-            .expect("contending thread panicked");
-        drop(guard);
-
+        let error = reject_owner_thread(std::thread::current().id()).unwrap_err();
         assert_eq!(error.to_string(), format!("RuntimeError: {ENGINE_IN_USE}"));
+    }
+
+    #[test]
+    fn another_thread_may_dispatch_to_the_owner() {
+        let owner = std::thread::current().id();
+        std::thread::spawn(move || reject_owner_thread(owner).unwrap())
+            .join()
+            .expect("client thread panicked");
     }
 }
