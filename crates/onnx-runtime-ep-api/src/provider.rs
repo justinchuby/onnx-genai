@@ -805,6 +805,20 @@ pub trait ExecutionProvider: Send + Sync {
         Ok(None)
     }
 
+    /// Executor-scoped lazy-weight paging.
+    ///
+    /// Providers with executor-owned stable reservations override this method;
+    /// stock providers preserve the historical unscoped path.
+    fn page_lazy_weight_for_executor(
+        &self,
+        _executor: ExecutorInstanceId,
+        key: u64,
+        weight: &crate::LazyWeight,
+        source: &dyn crate::MmapRegionSource,
+    ) -> Result<Option<crate::PagedWeight>> {
+        self.page_lazy_weight(key, weight, source)
+    }
+
     /// Prove routed-bank residency for a QMoE-family dispatch and mint a
     /// guard the executor keeps alive for the kernel's lifetime, exactly like
     /// [`Self::page_lazy_weight`]'s `PagedWeight`.
@@ -828,6 +842,17 @@ pub trait ExecutionProvider: Send + Sync {
         Ok(None)
     }
 
+    /// Executor-scoped routed-residency proof acquisition.
+    fn acquire_routed_residency_for_executor(
+        &self,
+        _executor: ExecutorInstanceId,
+        key: u64,
+        requirement: crate::RoutedResidencyRequirement,
+        catalog: &onnx_runtime_loader::WeightRegionCatalog,
+    ) -> Result<Option<Box<dyn crate::RoutedResidencyGuardHandle>>> {
+        self.acquire_routed_residency(key, requirement, catalog)
+    }
+
     /// Best-effort lookahead page-in for a lazy weight the executor knows will be
     /// needed by a later node. Returns `true` only when a transfer was actually
     /// enqueued, so callers can distinguish a real prefetch from a no-op or
@@ -841,6 +866,17 @@ pub trait ExecutionProvider: Send + Sync {
     ) -> Result<bool> {
         let _ = (key, weight, source);
         Ok(false)
+    }
+
+    /// Executor-scoped lazy-weight prefetch.
+    fn prefetch_lazy_weight_for_executor(
+        &self,
+        _executor: ExecutorInstanceId,
+        key: u64,
+        weight: &crate::LazyWeight,
+        source: &dyn crate::MmapRegionSource,
+    ) -> Result<bool> {
+        self.prefetch_lazy_weight(key, weight, source)
     }
 
     /// Initialize device resources / load libraries.
@@ -1444,6 +1480,15 @@ pub trait ExecutionProvider: Send + Sync {
         self.consume_route_residency_at_boundary()
     }
 
+    /// Whether the session should retain finalized expert-bank descriptors for
+    /// this provider's executor-artifact finalization transition.
+    ///
+    /// The default is false, so non-participating providers and the shipped
+    /// default-off CUDA path allocate and retain no route-residency metadata.
+    fn wants_finalized_route_residency_banks(&self) -> bool {
+        false
+    }
+
     /// Authoritative transition for "all provider artifacts required by this
     /// executor's resolved compilation are finalized."
     ///
@@ -1457,6 +1502,7 @@ pub trait ExecutionProvider: Send + Sync {
         &self,
         _executor: ExecutorInstanceId,
         _graph: &Graph,
+        _banks: &[crate::FinalizedExpertBank],
     ) -> ExecutorArtifactFinalization {
         ExecutorArtifactFinalization::Complete
     }

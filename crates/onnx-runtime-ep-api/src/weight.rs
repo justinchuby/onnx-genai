@@ -218,6 +218,25 @@ impl ExpertWeightGroup {
     }
 }
 
+/// One externally backed expert tensor whose lazy identity and expert-region
+/// catalog were both finalized by the session loader.
+#[derive(Clone, Debug)]
+pub struct FinalizedExpertWeight {
+    pub value: ValueId,
+    /// Exact external-data property that produced the live mmap identity.
+    pub external_path: std::path::PathBuf,
+    pub weight: LazyWeight,
+    pub catalog: onnx_runtime_loader::WeightRegionCatalog,
+}
+
+/// One graph-structural routed expert bank and the exact finalized tensors that
+/// may back it.
+#[derive(Clone, Debug)]
+pub struct FinalizedExpertBank {
+    pub group: ExpertWeightGroup,
+    pub members: Vec<FinalizedExpertWeight>,
+}
+
 /// Derive every [`ExpertWeightGroup`] in `graph`: one group per node whose
 /// `op_type`/`domain` binds a fused-routing [`LazyWeightBoundary`]
 /// (`QMoe`/`BlockQuantizedMoe`) and which consumes at least one initializer
