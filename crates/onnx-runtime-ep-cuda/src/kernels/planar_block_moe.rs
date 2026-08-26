@@ -293,11 +293,13 @@ impl PlanarMoeDims {
 
     /// Full `fc1` output width: `2 * inter` when SwiGLU is fused (gate + linear
     /// interleaved), else `inter`.
-    pub fn fc1_out(&self) -> usize {
+    pub fn fc1_out(&self) -> Result<usize> {
         if self.swiglu_fusion != 0 {
-            self.inter * 2
-        } else {
             self.inter
+                .checked_mul(2)
+                .ok_or_else(|| kernel_err("fused fc1 width overflow"))
+        } else {
+            Ok(self.inter)
         }
     }
 }
@@ -341,6 +343,7 @@ struct ValidatedPlanarMoe {
     dims: PlanarMoeDims,
     buffers: PlanarMoeBufferLengths,
     routes: usize,
+    fc1_out: usize,
     fc1: ValidatedPlanarMoeProjection,
     fc2: ValidatedPlanarMoeProjection,
     fc3: Option<ValidatedPlanarMoeProjection>,
@@ -350,6 +353,15 @@ impl PlanarMoeBufferLengths {
     /// Compute the exact buffer extents for `dims`, rejecting any multiplication
     /// overflow before allocation or launch.
     pub fn for_dims(dims: &PlanarMoeDims, has_router_weights: bool) -> Result<Self> {
+        let fc1_out = dims.fc1_out()?;
+        Self::for_dims_with_fc1_out(dims, has_router_weights, fc1_out)
+    }
+
+    fn for_dims_with_fc1_out(
+        dims: &PlanarMoeDims,
+        has_router_weights: bool,
+        fc1_out: usize,
+    ) -> Result<Self> {
         let routes = dims
             .rows
             .checked_mul(dims.top_k)
@@ -362,13 +374,6 @@ impl PlanarMoeBufferLengths {
             .rows
             .checked_mul(dims.experts)
             .ok_or_else(|| kernel_err("router element count overflow"))?;
-        let fc1_out = if dims.swiglu_fusion == 0 {
-            dims.inter
-        } else {
-            dims.inter
-                .checked_mul(2)
-                .ok_or_else(|| kernel_err("fused fc1 width overflow"))?
-        };
         let fc1_output_elems = routes
             .checked_mul(fc1_out)
             .ok_or_else(|| kernel_err("fc1 output element count overflow"))?;
@@ -417,6 +422,7 @@ fn validate_planar_moe_host(
             dims.top_k, dims.experts
         )));
     }
+    let fc1_out = dims.fc1_out()?;
     let activation = Activation::from_kernel_id(dims.activation)
         .ok_or_else(|| kernel_err(format!("unknown activation id {}", dims.activation)))?;
     validate_moe_activation_attributes(
@@ -449,13 +455,10 @@ fn validate_planar_moe_host(
             dims.fc1.in_features, dims.hidden
         )));
     }
-    if dims.fc1.out_features != dims.fc1_out() {
+    if dims.fc1.out_features != fc1_out {
         return Err(kernel_err(format!(
             "fc1 out={} must equal fc1_out={} (inter={}, swiglu_fusion={})",
-            dims.fc1.out_features,
-            dims.fc1_out(),
-            dims.inter,
-            dims.swiglu_fusion
+            dims.fc1.out_features, fc1_out, dims.inter, dims.swiglu_fusion
         )));
     }
     if dims.fc2.in_features != dims.inter {
@@ -510,7 +513,11 @@ fn validate_planar_moe_host(
         }
     };
 
-    let expected = PlanarMoeBufferLengths::for_dims(dims, buffers.router_weights_elems.is_some())?;
+    let expected = PlanarMoeBufferLengths::for_dims_with_fc1_out(
+        dims,
+        buffers.router_weights_elems.is_some(),
+        fc1_out,
+    )?;
     for (label, supplied, required) in [
         ("input", buffers.input_elems, expected.input_elems),
         (
@@ -573,6 +580,7 @@ fn validate_planar_moe_host(
         dims: *dims,
         buffers: *buffers,
         routes: expected.route_indices_elems,
+        fc1_out,
         fc1,
         fc2,
         fc3,
@@ -697,6 +705,32 @@ struct PlanarMoeBanks {
 /// fn requires_clone<T: Clone>() {}
 /// requires_clone::<AdmittedPlanarMoe>();
 /// ```
+///
+/// Safe upload and VMM APIs require a `DeviceBuffer`; an admission cannot be
+/// converted to one, so admitted bytes cannot be overwritten or remapped.
+///
+/// ```compile_fail
+/// # use onnx_runtime_ep_api::ExecutionProvider;
+/// # use onnx_runtime_ep_cuda::{AdmittedPlanarMoe, CudaExecutionProvider};
+/// # fn overwrite(ep: &CudaExecutionProvider, bank: &mut AdmittedPlanarMoe) {
+/// ep.copy_from_host(&[0xff], bank);
+/// # }
+/// ```
+///
+/// ```compile_fail
+/// # use onnx_runtime_ep_api::ExecutionProvider;
+/// # use onnx_runtime_ep_cuda::{AdmittedPlanarMoe, CudaExecutionProvider};
+/// # fn remap(ep: &CudaExecutionProvider, bank: &AdmittedPlanarMoe) {
+/// ep.decommit_allocation_range(bank, 0, 1);
+/// # }
+/// ```
+///
+/// ```compile_fail
+/// # use onnx_runtime_ep_cuda::AdmittedPlanarMoe;
+/// # fn escape(bank: &AdmittedPlanarMoe) {
+/// let _ = bank.as_ptr();
+/// # }
+/// ```
 pub struct AdmittedPlanarMoe {
     // See `AdmittedPlanarLinear`: graphs retain only these sealed allocations,
     // never the provider/runtime that owns the graph registry.
@@ -707,6 +741,7 @@ pub struct AdmittedPlanarMoe {
     dims: PlanarMoeDims,
     buffers: PlanarMoeBufferLengths,
     routes: usize,
+    fc1_out: usize,
 }
 
 impl AdmittedPlanarMoe {
@@ -767,6 +802,7 @@ pub fn admit_planar_moe(
         dims: validation.dims,
         buffers: validation.buffers,
         routes: validation.routes,
+        fc1_out: validation.fc1_out,
     })
 }
 
@@ -1084,15 +1120,22 @@ fn launch_planar_linear(
     routes: usize,
     top_k: usize,
     input_rows_are_routes: bool,
+    admitted_out_features: usize,
 ) -> Result<()> {
     let projection = &admission.validation.projection;
+    if projection.out_features != admitted_out_features {
+        return Err(kernel_err(format!(
+            "sealed projection out={} does not match admitted launch width {admitted_out_features}",
+            projection.out_features
+        )));
+    }
     let function = runtime.nvrtc_function(
         PLANAR_MOE_MODULE,
         planar_moe_module_source(),
         PLANAR_MOE_LINEAR_ENTRY,
     )?;
     let tasks = (routes as u64)
-        .checked_mul(projection.out_features as u64)
+        .checked_mul(admitted_out_features as u64)
         .ok_or_else(|| kernel_err("linear task count overflow"))?;
     let grid_x = saturating_grid(runtime, tasks);
     let config =
@@ -1101,15 +1144,16 @@ fn launch_planar_linear(
     let routes_u64 = routes as u64;
     let input_rows_are_routes = i32::from(input_rows_are_routes);
     let top_k = as_i32("top_k", top_k)?;
-    let out_features = as_i32("out_features", projection.out_features)?;
+    let out_features = as_i32("out_features", admitted_out_features)?;
     let in_features = as_i32("in_features", projection.in_features)?;
     let format = projection.format;
     let bs0 = as_i32("bs0", projection.bs0)?;
     let bs1 = as_i32("bs1", projection.bs1)?;
     let packed_stride = admission.validation.packed_expert_stride as u64;
     let scale_stride = admission.validation.scale_expert_stride as u64;
-    let packed = admission.packed.ptr();
-    let scale = admission.scale.ptr();
+    let access = super::SealedLaunchAccess::new();
+    let packed = admission.packed.ptr(&access);
+    let scale = admission.scale.ptr(&access);
 
     let stream = runtime.stream();
     let mut builder = stream.launch_builder(&function);
@@ -1200,6 +1244,7 @@ pub fn launch_planar_moe(
         routes,
         dims.top_k,
         false,
+        admission.fc1_out,
     )?;
     if let Some(fc3) = admission.banks.fc3.as_ref() {
         launch_planar_linear(
@@ -1212,6 +1257,7 @@ pub fn launch_planar_moe(
             routes,
             dims.top_k,
             false,
+            dims.inter,
         )?;
     }
 
@@ -1266,6 +1312,7 @@ pub fn launch_planar_moe(
         routes,
         dims.top_k,
         true,
+        dims.hidden,
     )?;
 
     // 5. Combine: weighted sum over each token's top_k routes.
@@ -1294,57 +1341,6 @@ pub fn launch_planar_moe(
             .map_err(|err| driver_err("launch planar MoE weighted combine", err))?;
     }
     Ok(())
-}
-
-#[doc(hidden)]
-pub fn test_reject_planar_moe_bank_substitution(
-    admission: &AdmittedPlanarMoe,
-    projection: usize,
-    packed: &DeviceBuffer,
-    scale: &DeviceBuffer,
-) -> Result<()> {
-    let admitted = match projection {
-        0 => &admission.banks.fc1,
-        1 => &admission.banks.fc2,
-        2 => admission
-            .banks
-            .fc3
-            .as_ref()
-            .ok_or_else(|| kernel_err("fc3 substitution requested without admitted fc3"))?,
-        other => {
-            return Err(kernel_err(format!(
-                "unknown planar MoE projection index {other}"
-            )));
-        }
-    };
-    if cuptr(packed.as_ptr()) != admitted.packed.ptr()
-        || cuptr(scale.as_ptr()) != admitted.scale.ptr()
-    {
-        return Err(kernel_err(
-            "raw packed/scale substitution does not match the sealed admitted projection",
-        ));
-    }
-    Ok(())
-}
-
-#[doc(hidden)]
-pub fn test_planar_moe_bank_addresses(admission: &AdmittedPlanarMoe) -> Vec<CUdeviceptr> {
-    let mut addresses = vec![
-        admission.banks.fc1.packed.ptr(),
-        admission.banks.fc1.scale.ptr(),
-        admission.banks.fc2.packed.ptr(),
-        admission.banks.fc2.scale.ptr(),
-    ];
-    if let Some(fc3) = admission.banks.fc3.as_ref() {
-        addresses.push(fc3.packed.ptr());
-        addresses.push(fc3.scale.ptr());
-    }
-    addresses
-}
-
-#[doc(hidden)]
-pub fn test_planar_moe_bank_owner_count(admission: &AdmittedPlanarMoe) -> usize {
-    Arc::strong_count(&admission.banks)
 }
 
 /// Planar weight formats with a proven, launched routed top-k MoE kernel on this
@@ -1563,13 +1559,51 @@ mod tests {
         dims.activation = 3;
         dims.swiglu_fusion = 1;
         // fc1 out must be 2*inter for fused SwiGLU.
-        assert_eq!(dims.fc1_out(), dims.inter * 2);
+        assert_eq!(dims.fc1_out().unwrap(), dims.inter * 2);
         dims.fc1 = fp8(256, 128); // wrong: only inter wide
         let (fc1p, fc1s) = banks(&dims, &dims.fc1);
         let (fc2p, fc2s) = banks(&dims, &dims.fc2);
         let err = validate_planar_moe(&dims, fc1p, fc1s, None, fc2p, fc2s, None, None)
             .expect_err("fused SwiGLU with inter-wide fc1 must be rejected");
         assert!(format!("{err:?}").contains("fc1 out"));
+    }
+
+    #[test]
+    fn fused_width_overflow_is_typed_rejected_before_bank_validation() {
+        let mut dims = base_dims();
+        dims.activation = 3;
+        dims.swiglu_fusion = 1;
+        dims.inter = usize::MAX / 2 + 1;
+        dims.fc1.out_features = 0;
+        let err = dims
+            .fc1_out()
+            .expect_err("an unrepresentable fused width must be rejected");
+        assert!(format!("{err:?}").contains("fused fc1 width overflow"));
+
+        let err = PlanarMoeBufferLengths::for_dims(&dims, false)
+            .expect_err("buffer sizing must reuse the checked fused width");
+        assert!(format!("{err:?}").contains("fused fc1 width overflow"));
+
+        let empty = PlanarMoeBank {
+            packed: &[],
+            scale: &[],
+            bias_elems: None,
+        };
+        let zero_buffers = PlanarMoeBufferLengths {
+            input_elems: 0,
+            router_logits_elems: 0,
+            router_weights_elems: None,
+            route_indices_elems: 0,
+            route_weights_elems: 0,
+            fc1_output_elems: 0,
+            fc3_output_elems: None,
+            activated_elems: 0,
+            route_output_elems: 0,
+            output_elems: 0,
+        };
+        let err = super::validate_planar_moe_host(&dims, empty, empty, None, &zero_buffers)
+            .expect_err("admission validation must reject overflow without panicking");
+        assert!(format!("{err:?}").contains("fused fc1 width overflow"));
     }
 
     #[test]

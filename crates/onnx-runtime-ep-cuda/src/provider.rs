@@ -227,10 +227,16 @@ pub(crate) struct CudaSealedAllocation {
 }
 
 impl CudaSealedAllocation {
-    pub(crate) fn buffer(&self) -> &DeviceBuffer {
-        self.buffer
-            .as_ref()
-            .expect("sealed CUDA allocation is taken only during drop")
+    pub(crate) fn launch_ptr(
+        &self,
+        _access: &crate::kernels::SealedLaunchAccess,
+    ) -> cudarc::driver::sys::CUdeviceptr {
+        cuptr(
+            self.buffer
+                .as_ref()
+                .expect("sealed CUDA allocation is taken only during drop")
+                .as_ptr(),
+        )
     }
 
     fn release(&mut self) -> Result<()> {
@@ -1970,12 +1976,16 @@ impl CudaExecutionProvider {
         self.memory_binding.context.identity()
     }
 
-    pub(crate) fn allocate_sealed(
-        &self,
-        bytes: usize,
-        align: usize,
-    ) -> Result<CudaSealedAllocation> {
-        let buffer = <Self as ExecutionProvider>::allocate(self, bytes, align)?;
+    pub(crate) fn upload_sealed(&self, bytes: &[u8], align: usize) -> Result<CudaSealedAllocation> {
+        if matches!(self.memory, CudaMemory::Injected(_)) {
+            return Err(EpError::KernelFailed(
+                "cuda_ep: sealed planar admission requires the provider-owned CUDA allocator; \
+                 an injected allocator remains externally controlled and cannot prove that \
+                 admitted content is immutable"
+                    .into(),
+            ));
+        }
+        let mut buffer = <Self as ExecutionProvider>::allocate(self, bytes.len(), align)?;
         let identity = buffer
             .bound_owner()
             .ok_or_else(|| {
@@ -1984,6 +1994,17 @@ impl CudaExecutionProvider {
                 )
             })?
             .identity();
+        if let Err(upload_error) =
+            <Self as ExecutionProvider>::copy_from_host(self, bytes, &mut buffer)
+        {
+            return match <Self as ExecutionProvider>::deallocate(self, buffer) {
+                Ok(()) => Err(upload_error),
+                Err(release_error) => Err(EpError::KernelFailed(format!(
+                    "cuda_ep: sealed allocation upload failed ({upload_error}); releasing the \
+                     rejected allocation also failed ({release_error})"
+                ))),
+            };
+        }
         Ok(CudaSealedAllocation {
             buffer: Some(buffer),
             runtime: Arc::downgrade(&self.runtime),

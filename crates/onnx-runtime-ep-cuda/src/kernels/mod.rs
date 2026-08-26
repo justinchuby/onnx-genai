@@ -21,6 +21,21 @@ use onnx_runtime_ep_api::{OpKey, OpRegistry};
 
 use crate::runtime::CudaRuntime;
 
+/// Capability required to extract a sealed allocation's device address for a
+/// kernel launch.
+///
+/// The type is visible to the provider module so it can constrain the sealed
+/// allocation API, but only descendants of `kernels` can mint a value. Safe
+/// external callers therefore cannot turn an admitted bank back into a mutable
+/// `DeviceBuffer` or raw address.
+pub(crate) struct SealedLaunchAccess(());
+
+impl SealedLaunchAccess {
+    fn new() -> Self {
+        Self(())
+    }
+}
+
 pub mod activations;
 pub mod argreduce;
 pub mod attention;

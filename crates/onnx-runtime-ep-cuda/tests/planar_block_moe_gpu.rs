@@ -42,9 +42,7 @@ use onnx_runtime_ep_cuda::runtime::cuptr;
 use onnx_runtime_ep_cuda::{
     AdmittedPlanarMoe, CudaExecutionProvider, PLANAR_FORMAT_BLOCK_FP8, PLANAR_FORMAT_FP4_PLANAR,
     PlanarMoeBank, PlanarMoeBufferLengths, PlanarMoeBuffers, PlanarMoeDims, PlanarMoeProjection,
-    admit_planar_moe, launch_planar_moe, planar_moe_capable_formats,
-    test_planar_moe_bank_addresses, test_planar_moe_bank_owner_count,
-    test_reject_planar_moe_bank_substitution, warm_planar_moe,
+    admit_planar_moe, launch_planar_moe, planar_moe_capable_formats, warm_planar_moe,
 };
 use std::sync::Arc;
 
@@ -465,7 +463,7 @@ fn stage_moe(
     fc3: Option<&Projection>,
 ) -> MoeDeviceBuffers {
     let routes = dims.routes();
-    let fc1_out = dims.fc1_out();
+    let fc1_out = dims.fc1_out().unwrap();
     MoeDeviceBuffers {
         input: upload_f32(ep, input),
         router_logits: upload_f32(ep, router_logits),
@@ -1107,14 +1105,14 @@ fn malformed_values_and_attributes_reject_before_device_activity() {
 }
 
 /// Every projection bank is sealed independently. Safe routed-MoE launch has no
-/// raw packed/scale arguments, and the private unsafe boundary rejects all
-/// external allocations regardless of matching geometry or malicious contents.
+/// raw packed/scale arguments, so mutating every caller-owned source after
+/// admission cannot affect the admitted content.
 #[test]
 #[cfg_attr(
     not(feature = "gpu-tests"),
     ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
 )]
-fn sealed_moe_admission_rejects_projection_substitution() {
+fn sealed_moe_admission_outlives_mutated_sources() {
     let ep = require_cuda();
     let runtime = ep.runtime();
     let (hidden, inter, experts, top_k) = (32usize, 32usize, 2usize, 1usize);
@@ -1177,73 +1175,7 @@ fn sealed_moe_admission_rejects_projection_substitution() {
     runtime.synchronize().unwrap();
     assert_eq!(download_f32(&ep, &buffers.output, hidden), admitted_output);
 
-    let originals = [
-        (
-            vec![0x38; fc1.packed_bank.len()],
-            vec![127; fc1.scale_bank.len()],
-        ),
-        (
-            vec![0x11; fc2.packed_bank.len()],
-            vec![127; fc2.scale_bank.len()],
-        ),
-        (
-            vec![0x38; fc3.packed_bank.len()],
-            vec![127; fc3.scale_bank.len()],
-        ),
-    ];
-    let mut candidates = Vec::new();
-    for (packed, scale) in &originals {
-        candidates.push((upload(&ep, packed), upload(&ep, scale)));
-    }
-    let reserved = (upload(&ep, &[0x7f]), upload(&ep, &[0xff]));
-    let overflow = (upload(&ep, &[0x7e]), upload(&ep, &[247]));
-    let before = (runtime.allocation_counts(), runtime.transfer_counts());
-    for (projection, (packed, scale)) in candidates.iter().enumerate() {
-        assert!(
-            test_reject_planar_moe_bank_substitution(&admission, projection, packed, scale)
-                .is_err(),
-            "same-geometry projection {projection} substitution must reject"
-        );
-        assert!(
-            test_reject_planar_moe_bank_substitution(
-                &admission,
-                projection,
-                &reserved.0,
-                &reserved.1
-            )
-            .is_err(),
-            "reserved-code projection {projection} substitution must reject"
-        );
-        assert!(
-            test_reject_planar_moe_bank_substitution(
-                &admission,
-                projection,
-                &overflow.0,
-                &overflow.1
-            )
-            .is_err(),
-            "non-finite-product projection {projection} substitution must reject"
-        );
-    }
-    assert!(
-        test_reject_planar_moe_bank_substitution(&admission, 0, &buffers.input, &buffers.output)
-            .is_err(),
-        "capture input/output storage cannot replace an admitted bank"
-    );
-    assert_eq!(
-        (runtime.allocation_counts(), runtime.transfer_counts()),
-        before,
-        "substitution rejection must not allocate or transfer"
-    );
-
-    for (packed, scale) in candidates {
-        ep.deallocate(packed).unwrap();
-        ep.deallocate(scale).unwrap();
-    }
-    ep.deallocate(reserved.0).unwrap();
-    ep.deallocate(reserved.1).unwrap();
-    ep.deallocate(overflow.0).unwrap();
-    ep.deallocate(overflow.1).unwrap();
+    drop(admission);
     free_moe(&ep, buffers);
 }
 
@@ -1259,8 +1191,8 @@ fn capture_replay_parity() {
     let runtime = ep.runtime();
     let accounting_baseline = ep.device_allocation_counts().unwrap();
     let (hidden, inter, experts, top_k) = (256usize, 128usize, 4usize, 2usize);
-    let fc1 = Projection::build(PLANAR_FORMAT_BLOCK_FP8, hidden, inter, experts, 0x40, true);
-    let fc2 = Projection::build(PLANAR_FORMAT_FP4_PLANAR, inter, hidden, experts, 0x41, true);
+    let mut fc1 = Projection::build(PLANAR_FORMAT_BLOCK_FP8, hidden, inter, experts, 0x40, true);
+    let mut fc2 = Projection::build(PLANAR_FORMAT_FP4_PLANAR, inter, hidden, experts, 0x41, true);
     let dims = dims_relu(3, hidden, inter, experts, top_k, &fc1, &fc2);
 
     let mut rng = Lcg::new(0x7777);
@@ -1306,19 +1238,20 @@ fn capture_replay_parity() {
         .is_err(),
         "admission must reject before allocating or uploading during capture"
     );
+    // Destroy every caller-owned weight source after admission and before
+    // capture. The safe external API has no DeviceBuffer or pointer escape for
+    // the sealed projections, so these writes cannot reach captured content.
+    for projection in [&mut fc1, &mut fc2] {
+        projection.packed_bank.fill(0x7f);
+        projection.scale_bank.fill(0xff);
+    }
     launch_planar_moe(&admission, &mut buffers.launch_buffers()).unwrap();
     runtime.end_graph_capture().unwrap();
-    assert_eq!(
-        test_planar_moe_bank_owner_count(&admission),
-        2,
-        "the installed graph must hold exactly one strong MoE bank pin"
-    );
     #[cfg(feature = "gpu-tests")]
     assert_eq!(planar_moe_source_build_count(), 1);
     assert_eq!(runtime.allocation_counts(), capture_allocations);
     assert_eq!(runtime.transfer_counts(), capture_transfers);
 
-    let bank_addresses = test_planar_moe_bank_addresses(&admission);
     let pinned_frees = ep.device_allocation_counts().unwrap().1;
     drop(admission);
     assert_eq!(
@@ -1326,25 +1259,12 @@ fn capture_replay_parity() {
         pinned_frees,
         "dropping the caller handle must not free graph-embedded MoE banks"
     );
-    let probes = [
-        ep.allocate(fc1.packed_bank.len(), 256).unwrap(),
-        ep.allocate(fc1.scale_bank.len(), 256).unwrap(),
-        ep.allocate(fc2.packed_bank.len(), 256).unwrap(),
-        ep.allocate(fc2.scale_bank.len(), 256).unwrap(),
-    ];
-    for probe in &probes {
-        assert!(
-            !bank_addresses.contains(&cuptr(probe.as_ptr())),
-            "allocator reused a graph-pinned MoE bank address"
-        );
-    }
-    for probe in probes {
-        ep.deallocate(probe).unwrap();
-    }
-    ep.wait_for_deferred_releases().unwrap();
-
     let zeros = vec![0u8; dims.rows * hidden * 4];
     for replay in 0..3 {
+        fc1.packed_bank.fill(replay as u8);
+        fc1.scale_bank.fill(255 - replay as u8);
+        fc2.packed_bank.fill((replay as u8).wrapping_add(17));
+        fc2.scale_bank.fill(253 - replay as u8);
         let before_allocations = runtime.allocation_counts();
         let before_transfers = runtime.transfer_counts();
         // SAFETY: output is rows*hidden*4 bytes wide.

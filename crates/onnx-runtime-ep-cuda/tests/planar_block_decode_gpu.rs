@@ -37,13 +37,13 @@ use onnx_runtime_ep_cpu::kernels::planar_block_quant::{
     FP4_MICROSCALE_BLOCK, FP4_PACK_FACTOR, PlanarBlockFormat, PlanarLayout, planar_block_matmul,
 };
 use onnx_runtime_ep_cuda::runtime::cuptr;
+use onnx_runtime_ep_cuda::vmm_allocator::CudaVmmAllocator;
 use onnx_runtime_ep_cuda::{
     CudaExecutionProvider, PLANAR_FORMAT_BLOCK_FP8, PLANAR_FORMAT_FP4_PLANAR,
     PlanarActivationDtype, PlanarLinearDims, admit_planar_linear, launch_planar_linear,
-    planar_matmul_capable_formats, test_planar_linear_bank_addresses,
-    test_planar_linear_bank_owner_count, test_reject_planar_linear_bank_substitution,
-    warm_planar_linear,
+    planar_matmul_capable_formats, warm_planar_linear,
 };
+use onnx_runtime_memory_governor::{DeviceKey, HolderId, LeaseLedger, LedgerGovernor, MemoryRole};
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
@@ -641,14 +641,14 @@ fn malformed_values_reject_before_device_activity() {
 }
 
 /// Admission owns the exact immutable device bank populated from validated
-/// bytes. Neither host mutation nor any same-shaped external allocation can
-/// replace that bank at the private raw-launch boundary.
+/// bytes. The supported external surface accepts no bank buffer or pointer, so
+/// mutating the only caller-owned source after admission cannot affect launch.
 #[test]
 #[cfg_attr(
     not(feature = "gpu-tests"),
     ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
 )]
-fn sealed_admission_rejects_bank_substitution() {
+fn sealed_admission_outlives_mutated_sources() {
     let ep = require_cuda();
     let runtime = ep.runtime();
     let dims = PlanarLinearDims {
@@ -702,60 +702,73 @@ fn sealed_admission_rejects_bank_substitution() {
         admitted_output
     );
 
-    let same_packed = upload(&ep, &vec![0x38; packed.len()]);
-    let same_scale = upload(&ep, &vec![127; scale.len()]);
-    let reserved_packed = upload(&ep, &packed);
-    let reserved_scale = upload(&ep, &scale);
-    let mut overflow_packed_bytes = vec![0x38; packed.len()];
-    overflow_packed_bytes[0] = 0x7e;
-    let overflow_packed = upload(&ep, &overflow_packed_bytes);
-    let mut overflow_scale_bytes = vec![127; scale.len()];
-    overflow_scale_bytes[0] = 247;
-    let overflow_scale = upload(&ep, &overflow_scale_bytes);
-
-    let before = (runtime.allocation_counts(), runtime.transfer_counts());
-    for (candidate_packed, candidate_scale, attack) in [
-        (&same_packed, &same_scale, "same geometry and contents"),
-        (&reserved_packed, &reserved_scale, "reserved codes"),
-        (
-            &overflow_packed,
-            &overflow_scale,
-            "finite inputs with non-finite decoded product",
-        ),
-        (
-            &activation_buffer,
-            &output,
-            "captured activation/output storage overwrite",
-        ),
-    ] {
-        assert!(
-            test_reject_planar_linear_bank_substitution(
-                &admission,
-                candidate_packed,
-                candidate_scale,
-            )
-            .is_err(),
-            "{attack} must reject before kernel launch"
-        );
-    }
-    assert_eq!(
-        (runtime.allocation_counts(), runtime.transfer_counts()),
-        before,
-        "substitution rejection must not allocate or transfer"
-    );
-
-    for buffer in [
-        activation_buffer,
-        output,
-        same_packed,
-        same_scale,
-        reserved_packed,
-        reserved_scale,
-        overflow_packed,
-        overflow_scale,
-    ] {
+    drop(admission);
+    for buffer in [activation_buffer, output] {
         ep.deallocate(buffer).unwrap();
     }
+}
+
+/// An externally retained allocator exposes mutation/remap capabilities outside
+/// the provider's ownership domain. Sealed admission must reject it before any
+/// allocation or upload rather than minting an "immutable" handle it cannot
+/// enforce.
+#[test]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+fn sealed_admission_rejects_externally_controlled_allocator() {
+    let provider = CudaExecutionProvider::new(selected_cuda_ordinal()).unwrap();
+    let runtime = Arc::clone(provider.runtime());
+    let device = DeviceKey::device(runtime.ordinal());
+    let governor = LedgerGovernor::new(LeaseLedger::new(u64::MAX, 0, 0));
+    let external = Arc::new(
+        CudaVmmAllocator::new(
+            runtime.cuda_context(),
+            device,
+            runtime.ordinal() as i32,
+            32 * 1024 * 1024,
+            &governor,
+            HolderId::new(2107),
+            MemoryRole::Weights,
+        )
+        .unwrap(),
+    );
+    let provider = Arc::new(
+        provider
+            .with_memory(Arc::clone(&external) as Arc<_>)
+            .unwrap(),
+    );
+    let before = (
+        external.committed_and_reserved().0,
+        runtime.allocation_counts(),
+        runtime.transfer_counts(),
+    );
+    let dims = PlanarLinearDims {
+        format: PLANAR_FORMAT_BLOCK_FP8,
+        m_rows: 1,
+        in_features: 1,
+        out_features: 1,
+        bs0: 1,
+        bs1: 1,
+    };
+    let error = match admit_planar_linear(&provider, &dims, 1, &[0x38], &[127], 1) {
+        Ok(_) => panic!("externally controlled memory cannot back a sealed admission"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("externally controlled"),
+        "{error}"
+    );
+    assert_eq!(
+        (
+            external.committed_and_reserved().0,
+            runtime.allocation_counts(),
+            runtime.transfer_counts(),
+        ),
+        before,
+        "rejection must happen before allocation, mapping, or upload"
+    );
 }
 
 /// A warmed fixed-shape planar linear records into a CUDA-graph capture and
@@ -771,7 +784,7 @@ fn capture_replay_parity() {
     let accounting_baseline = ep.device_allocation_counts().unwrap();
 
     let (m, out, in_features, bs) = (4usize, 64usize, 128usize, 128usize);
-    let (packed, scale) = block_fp8_fixture(out, in_features, bs, 0x5eed);
+    let (mut packed, mut scale) = block_fp8_fixture(out, in_features, bs, 0x5eed);
     let a = activations(m, in_features, 0x1234);
     let dims = PlanarLinearDims {
         format: PLANAR_FORMAT_BLOCK_FP8,
@@ -811,17 +824,16 @@ fn capture_replay_parity() {
         admit_planar_linear(&ep, &dims, m * in_features, &packed, &scale, m * out).is_err(),
         "admission must reject before allocating or uploading during capture"
     );
+    // These are the only weight bytes still owned by the external caller. Make
+    // them invalid after admission and before capture: the supported API has no
+    // route from either source back to the sealed device allocation.
+    packed.fill(0x7f);
+    scale.fill(0xff);
     launch_planar_linear(&admission, PlanarActivationDtype::F32, &a_buf, &mut out_buf).unwrap();
     runtime.end_graph_capture().unwrap();
-    assert_eq!(
-        test_planar_linear_bank_owner_count(&admission),
-        2,
-        "the installed graph must hold exactly one strong bank pin"
-    );
     assert_eq!(runtime.allocation_counts(), capture_allocations);
     assert_eq!(runtime.transfer_counts(), capture_transfers);
 
-    let bank_addresses = test_planar_linear_bank_addresses(&admission);
     let pinned_frees = ep.device_allocation_counts().unwrap().1;
     drop(admission);
     assert_eq!(
@@ -830,23 +842,10 @@ fn capture_replay_parity() {
         "dropping the caller handle must not free graph-embedded banks"
     );
 
-    // Attempt allocator VA reuse with the exact bank sizes. Both admitted
-    // addresses remain live while the graph owns them, so neither fresh
-    // allocation may alias either captured address.
-    let packed_probe = ep.allocate(packed.len(), 256).unwrap();
-    let scale_probe = ep.allocate(scale.len(), 256).unwrap();
-    for probe in [&packed_probe, &scale_probe] {
-        assert!(
-            !bank_addresses.contains(&cuptr(probe.as_ptr())),
-            "allocator reused a graph-pinned bank address"
-        );
-    }
-    ep.deallocate(packed_probe).unwrap();
-    ep.deallocate(scale_probe).unwrap();
-    ep.wait_for_deferred_releases().unwrap();
-
     let zeros = vec![0u8; out_bytes];
     for replay in 0..3 {
+        packed.fill(replay as u8);
+        scale.fill(255 - replay as u8);
         let before_allocations = runtime.allocation_counts();
         let before_transfers = runtime.transfer_counts();
         // SAFETY: `out_buf` is `out_bytes` wide; clear it so a stale result can't
@@ -921,22 +920,11 @@ fn graph_bank_pins_are_per_graph_and_abort_safe() {
     runtime.begin_graph_capture(&[]).unwrap();
     launch_planar_linear(&admission, PlanarActivationDtype::F32, &a_buf, &mut out_buf).unwrap();
     runtime.abort_graph_capture().unwrap();
-    assert_eq!(
-        test_planar_linear_bank_owner_count(&admission),
-        1,
-        "aborted capture must unwind its provisional bank pin"
-    );
-
     for slot in [DeviceGraphSlot::Primary, DeviceGraphSlot::Verify] {
         runtime.begin_graph_capture_in(slot, &[]).unwrap();
         launch_planar_linear(&admission, PlanarActivationDtype::F32, &a_buf, &mut out_buf).unwrap();
         runtime.end_graph_capture_in(slot).unwrap();
     }
-    assert_eq!(
-        test_planar_linear_bank_owner_count(&admission),
-        3,
-        "two graphs sharing one bank require two independent pins"
-    );
     let before_drop_frees = ep.device_allocation_counts().unwrap().1;
     drop(admission);
     assert_eq!(ep.device_allocation_counts().unwrap().1, before_drop_frees);
