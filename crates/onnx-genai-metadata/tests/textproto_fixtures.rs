@@ -255,7 +255,12 @@ fn change_scope_keeps_docs_textproto_in_fast_census() {
                 .arg(path)
                 .output()
                 .expect("bash must run the CI classifier parity check");
-            assert!(output.status.success(), "bash classifier failed");
+            assert!(
+                output.status.success(),
+                "bash classifier failed for {path:?}: status={:?} stderr={}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
             let bash_docs_only = output.stdout == b"docs";
             assert_eq!(
                 bash_docs_only, expected_docs_only,
@@ -310,5 +315,138 @@ fn fixture_census_rejects_sentinel_path_drift() {
             .iter()
             .any(|error| error.contains(SENTINEL_FIXTURES[0])),
         "renaming or removing a sentinel path must fail even above the count floor"
+    );
+}
+
+/// Substring expansions that pass a negative *length* -- `${var::-1}` and the
+/// non-empty-offset spelling `${var:1:-1}` alike -- reported as `(line number,
+/// trimmed line)`.
+///
+/// Deliberately not reported, because every bash this repository runs on accepts
+/// them: negative *offsets* (`${var: -1}`), suffix removal (`${var%?}`), length
+/// (`${#var}`), and the `${var:-word}` / `:=` / `:?` / `:+` word operators. Those
+/// are separated from a substring expansion exactly as bash separates them -- an
+/// operator character immediately after the first colon, with no space.
+///
+/// Two known imprecisions, both chosen so the check over-reports rather than
+/// under-reports: an expansion nested inside another (`${x:${y}:-1}`) or split
+/// across a line continuation is not parsed, and an inert `${var::-1}` inside a
+/// single-quoted string would still be flagged. Over-reporting is a rewordable
+/// build failure; under-reporting re-reddens a lane nobody is required to look at.
+fn negative_length_substring_expansions(source: &str) -> Vec<(usize, String)> {
+    let mut hits = Vec::new();
+    for (index, line) in source.lines().enumerate() {
+        // A whole-line comment cannot be expanded, so it is not a hit. Anything
+        // after code on the same line still is: deciding where a trailing `#`
+        // starts a comment needs a shell lexer.
+        if line.trim_start().starts_with('#') {
+            continue;
+        }
+        if line
+            .match_indices("${")
+            .any(|(open, _)| expansion_has_negative_length(&line[open + 2..]))
+        {
+            hits.push((index + 1, line.trim().to_owned()));
+        }
+    }
+    hits
+}
+
+/// `body` starts just past a `${`. Reads up to the first `}` and decides whether
+/// that expansion supplies a negative substring length.
+fn expansion_has_negative_length(body: &str) -> bool {
+    let body = match body.find('}') {
+        Some(end) => &body[..end],
+        None => return false,
+    };
+    let Some(first) = body.find(':') else {
+        return false;
+    };
+    // `${var:-word}`, `:=`, `:?`, `:+` are word operators, not substring bounds.
+    // Bash requires the operator to abut the colon, so `${var: -1}` is a substring
+    // expansion with a negative offset and is left alone.
+    if matches!(
+        body[first + 1..].chars().next(),
+        Some('-' | '=' | '?' | '+')
+    ) {
+        return false;
+    }
+    let Some(second) = body[first + 1..].find(':') else {
+        return false;
+    };
+    body[first + 1 + second + 1..].trim_start().starts_with('-')
+}
+
+/// macOS ships bash 3.2 -- the `macos-*-arm64` runner images publish
+/// `Bash 3.2.57(1)-release` -- and a negative length in substring expansion needs
+/// bash >= 4.2. On 3.2, `${var::-1}` aborts with `substring expression < 0` and
+/// exits 1, which surfaces as a classifier that failed rather than a classifier
+/// that disagreed. The parity loop in
+/// `change_scope_keeps_docs_textproto_in_fast_census` cannot see this: it runs
+/// whatever `bash` is on `PATH`, and every Linux lane has bash >= 4.2. The only
+/// lane that observed it is `Rust coverage (macOS arm64)`, which is not a required
+/// check, so it sat red on `main`. This keeps the one construct that has actually
+/// broken that lane visible from Linux. It checks that construct only; it is not a
+/// bash 3.2 conformance proof for the script.
+#[test]
+fn ci_change_scope_avoids_bash_4_only_substring_expansion() {
+    // Non-vacuity. Every fatal spelling must be flagged: the one that reddened the
+    // lane, the non-empty-offset spelling that carries no `::-` at all, a spaced
+    // variant, and a computed length. `${var:1:-1}` is the arm that matters most --
+    // a matcher keyed on the literal `::-` passes this test while missing it, and
+    // the required Linux lane never executes the script under bash 3.2 to notice.
+    // Each was checked against both shells before being listed here: exit 1 with
+    // `substring expression < 0` on 3.2, exit 0 on 5.2. `${arr[@]:1:-1}` is not in
+    // the list despite being flagged -- a negative length on an array subscript is
+    // an error on every bash, so it discriminates nothing.
+    for fatal in [
+        "x=\"${extension_path::-1}\"",
+        "x=\"${extension_path:1:-1}\"",
+        "x=\"${extension_path: 0: -1}\"",
+        "x=\"${extension_path::-$n}\"",
+        "x=\"${p::-1}\" # code carrying a trailing comment is still code",
+    ] {
+        assert_eq!(
+            negative_length_substring_expansions(fatal)
+                .into_iter()
+                .map(|(line, _)| line)
+                .collect::<Vec<_>>(),
+            vec![1],
+            "must flag a negative substring length: {fatal}"
+        );
+    }
+
+    // ...and every neighbour bash 3.2 accepts must be left alone. A build-blocking
+    // check in a required lane earns its false positives one at a time.
+    for benign in [
+        "case \"${extension_path: -1}\" in",
+        "x=\"${extension_path%?}\"",
+        "local embedded=\"${2-}\"",
+        "y=\"${target:-fallback}\"",
+        "y=\"${target:-a:-1}\"",
+        "echo \"${first}: ${second}: -1\"",
+        "y=\"${target:=default}\"",
+        "y=\"${target:?must be set}\"",
+        "y=\"${target:+present}\"",
+        "n=\"${#extension_path}\"",
+        "x=\"${extension_path:1:2}\"",
+        "x=\"${path//\\\\//}\"",
+        "  # prose naming ${var::-1} is inert",
+    ] {
+        assert!(
+            negative_length_substring_expansions(benign).is_empty(),
+            "bash 3.2 accepts this, so it must not be flagged: {benign}"
+        );
+    }
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let classifier = root.join(".github/scripts/ci_change_scope.sh");
+    let source = std::fs::read_to_string(&classifier)
+        .unwrap_or_else(|error| panic!("cannot read {}: {error}", classifier.display()));
+    let hits = negative_length_substring_expansions(&source);
+    assert!(
+        hits.is_empty(),
+        "{} uses a bash >= 4.2 negative substring length, which exits 1 under macOS bash 3.2: {hits:?}",
+        classifier.display()
     );
 }
