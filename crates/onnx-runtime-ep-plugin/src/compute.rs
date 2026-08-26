@@ -855,14 +855,19 @@ pub struct SubgraphRouting {
 /// an illegal host-pointer dereference. ORT owns scratch memory for the
 /// duration of the `Compute` call, which exactly matches an intermediate's
 /// lifetime, so `IntermediateBuf` never frees `scratch_ptr`.
-pub struct IntermediateBuf {
-    pub data: Vec<u8>,
+pub(crate) struct IntermediateBuf {
+    pub(crate) data: Vec<u8>,
     /// When non-null, the buffer is backed by ORT scratch memory (possibly on
     /// device) instead of the host `data` vector. Not owned — never freed here.
-    pub scratch_ptr: *mut u8,
-    pub shape: Vec<usize>,
-    pub strides: Vec<i64>,
-    pub dtype: DataType,
+    pub(crate) scratch_ptr: *mut u8,
+    /// Inline rather than `Vec` because every buffer-sink output built one of
+    /// each per node, and a rank that fits inline needs no allocator at all.
+    /// The struct is wider as a result and is moved twice on the routed path
+    /// (staged, then installed), so this trades two `malloc`/`free` pairs for a
+    /// larger `memcpy`; see the PR for the measured net.
+    pub(crate) shape: crate::dim_vec::DimVec<usize>,
+    pub(crate) strides: crate::dim_vec::DimVec<i64>,
+    pub(crate) dtype: DataType,
 }
 
 impl IntermediateBuf {
@@ -885,7 +890,7 @@ impl IntermediateBuf {
     }
 
     /// Immutable view backed by this buffer.
-    pub fn view(&self) -> TensorView<'_> {
+    pub(crate) fn view(&self) -> TensorView<'_> {
         TensorView::new(
             DevicePtr(self.ptr().cast()),
             self.dtype,
@@ -2912,7 +2917,9 @@ unsafe extern "C" fn compute_execute(
                                             IntermediateBuf {
                                                 data: Vec::new(),
                                                 scratch_ptr: scratch,
-                                                shape: output.shape.clone(),
+                                                shape: crate::dim_vec::DimVec::from_slice(
+                                                    &output.shape,
+                                                ),
                                                 strides: contiguous_strides(&output.shape),
                                                 dtype: output.dtype,
                                             },
@@ -3045,7 +3052,9 @@ unsafe extern "C" fn compute_execute(
                                         IntermediateBuf {
                                             data: output.bytes,
                                             scratch_ptr: std::ptr::null_mut(),
-                                            shape: output.shape,
+                                            shape: crate::dim_vec::DimVec::from_slice(
+                                                &output.shape,
+                                            ),
                                             strides,
                                             dtype: output.dtype,
                                         },
@@ -3240,11 +3249,11 @@ unsafe extern "C" fn compute_execute(
                             IntermediateBuf {
                                 data,
                                 scratch_ptr,
-                                // `shape` is now borrowed from the reusable
-                                // buffer, which the next node overwrites, so
-                                // the buf owns a copy. Same allocation the
-                                // `Vec` clone made here before.
-                                shape: shape.to_vec(),
+                                // `shape` is borrowed from the reusable buffer,
+                                // which the next node overwrites, so the buf
+                                // owns a copy. Now an inline copy rather than
+                                // an allocation, for a rank that fits.
+                                shape: (*shape).clone(),
                                 strides,
                                 dtype,
                             },
@@ -4465,17 +4474,24 @@ fn retirements_per_node(
 fn absent_slot_strides(
     absent_slots: impl Iterator<Item = usize>,
     shapes: &[crate::dim_vec::DimVec<usize>],
-) -> Vec<Vec<i64>> {
+) -> Vec<crate::dim_vec::DimVec<i64>> {
     absent_slots
         .map(|slot| match shapes.get(slot) {
             Some(shape) => contiguous_strides(shape),
-            None => Vec::new(),
+            None => crate::dim_vec::DimVec::new(),
         })
         .collect()
 }
 
-fn contiguous_strides(shape: &[usize]) -> Vec<i64> {
-    let mut strides = vec![1i64; shape.len()];
+fn contiguous_strides(shape: &[usize]) -> crate::dim_vec::DimVec<i64> {
+    // `zeroed` then set the last element, rather than filling with 1: every
+    // element except the last is overwritten by the loop below, so seeding all
+    // of them costs a pass that is immediately thrown away. A rank-0 shape has
+    // no last element and correctly yields an empty result.
+    let mut strides = crate::dim_vec::DimVec::<i64>::zeroed(shape.len());
+    if let Some(last) = strides.last_mut() {
+        *last = 1;
+    }
     for i in (0..shape.len().saturating_sub(1)).rev() {
         strides[i] = strides[i + 1] * shape[i + 1] as i64;
     }
@@ -7751,8 +7767,8 @@ fn after() {}
         let buf = IntermediateBuf {
             data,
             scratch_ptr: std::ptr::null_mut(),
-            shape: shape.clone(),
-            strides,
+            shape: crate::dim_vec::DimVec::from_slice(&shape),
+            strides: crate::dim_vec::DimVec::from_slice(&strides),
             dtype: DataType::Float32,
         };
         let v = buf.view();
@@ -8241,6 +8257,85 @@ fn after() {}
     fn contiguous_strides_scalar() {
         let s = super::contiguous_strides(&[1]);
         assert_eq!(s, vec![1i64]);
+    }
+
+    /// The strides now live in a `DimVec`, which changes representation at
+    /// `INLINE_RANK`. `onnx_runtime_ir::compute_contiguous_strides` is the same
+    /// algorithm in a crate this change did not touch, so it is a genuine
+    /// oracle rather than a restatement: this walks ranks either side of the
+    /// spill boundary and demands agreement on every one.
+    #[test]
+    fn contiguous_strides_matches_the_ir_oracle_across_the_inline_boundary() {
+        let mut saw_inline = false;
+        let mut saw_spilled = false;
+        for rank in 0..=(crate::dim_vec::INLINE_RANK + 3) {
+            // Distinct, non-uniform extents so a transposed or off-by-one
+            // stride cannot coincide with the right answer.
+            let shape: Vec<usize> = (0..rank).map(|i| i + 2).collect();
+            let got = super::contiguous_strides(&shape);
+            let want = onnx_runtime_ir::compute_contiguous_strides(&shape);
+            assert_eq!(
+                got.as_slice(),
+                want.as_slice(),
+                "rank {rank} disagrees with the IR oracle"
+            );
+            assert_eq!(got.len(), rank, "rank {rank} changed length");
+            if rank > crate::dim_vec::INLINE_RANK {
+                saw_spilled = true;
+            } else if rank > 0 {
+                saw_inline = true;
+            }
+        }
+        assert!(
+            saw_inline && saw_spilled,
+            "the sweep must cover both representations or it proves nothing \
+             about the boundary"
+        );
+    }
+
+    /// A shape that spills must keep every dimension. Truncating at
+    /// `INLINE_RANK` would still produce a plausible-looking stride vector for
+    /// the leading dimensions, so this pins the length and the last element
+    /// separately from the oracle comparison above.
+    #[test]
+    fn contiguous_strides_spills_rather_than_truncating() {
+        let rank = crate::dim_vec::INLINE_RANK + 2;
+        let shape: Vec<usize> = vec![2; rank];
+        let got = super::contiguous_strides(&shape);
+        assert_eq!(got.len(), rank, "a spilled shape lost dimensions");
+        assert_eq!(got[rank - 1], 1, "the innermost stride must be 1");
+        assert_eq!(got[0], 1i64 << (rank - 1), "outermost stride is wrong");
+    }
+
+    /// `IntermediateBuf` must own its shape: the caller's copy is a slot in the
+    /// reusable scratch that the next node overwrites. For a rank that spills,
+    /// owning means a deep copy of the heap vector, not a shared one — so this
+    /// mutates the source after the buf is built and demands the buf is
+    /// unaffected.
+    #[test]
+    fn an_intermediate_buf_owns_its_shape_past_the_inline_rank() {
+        let rank = crate::dim_vec::INLINE_RANK + 2;
+        let original: Vec<usize> = (0..rank).map(|i| i + 2).collect();
+        let mut source = crate::dim_vec::DimVec::<usize>::from_slice(&original);
+        let strides = super::contiguous_strides(&source);
+        let numel: usize = original.iter().product();
+        let buf = IntermediateBuf {
+            data: vec![0u8; numel * 4],
+            scratch_ptr: std::ptr::null_mut(),
+            shape: source.clone(),
+            strides,
+            dtype: DataType::Float32,
+        };
+
+        for d in source.iter_mut() {
+            *d = 999;
+        }
+
+        assert_eq!(
+            buf.view().shape,
+            &original[..],
+            "the buf's shape moved when the scratch slot it was copied from did"
+        );
     }
 
     // ── S2: axis bounds check ─────────────────────────────────────────────────
