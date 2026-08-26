@@ -74,5 +74,5 @@ graph {
 }
 opset_import {
   domain: ""
-  version: 17
+  version: 24
 }
