@@ -312,6 +312,49 @@ reader to assume this one's. A gate that discards every launch of an arm now
 says so by name instead of failing inside the ratio with `no median for empty
 data`.
 
+**That gate was blind to SMT contention, and these numbers were taken under
+it.** `(utime + stime) / wall` measures time spent *on a logical cpu*. A
+competitor on the pinned cpu's hyperthread sibling shares the physical core's
+execution units, so it takes throughput without taking time: the run keeps its
+timeslice, scores a perfect 1.000, and is admitted. Measured directly on this
+host, `PIN=4` with a spinner on its sibling cpu5:
+
+| cell | throughput | `eff` | gate verdict |
+|---|---|---|---|
+| quiet | 1.000x | 1.000 | KEPT |
+| competitor on cpu5 (SMT sibling) | **0.536x** | **1.000** | **KEPT** |
+| competitor on cpu8 (other physical core) | 0.976x | 1.000 | KEPT |
+
+The third row is the control: the same load on a different physical core costs
+2.4%, so the 46% is SMT specifically and not load in general. A rep delivering
+half its work was indistinguishable from a clean one, and the reps worth
+discarding were exactly the ones the gate kept. A tight A/A null does not rule
+this out — a *persistent* competitor produces a consistently wrong number, and
+consistency is what a null measures.
+
+Two things bound the damage to what is published here. Arms are **rotated
+within each round**, so a persistent sibling competitor lands on all three arms
+about equally and largely cancels in a *ratio*, which is what this document
+reports; it would corrupt absolute GFLOP/s, which it does not. And the
+mechanism argued above predicts the null at m≥64 independently of timing. What
+rotation does *not* cancel is a competitor correlated with the arms — one whose
+duty cycle happens to beat against a particular arm's launch length. **The
+unresolved m=1 `0.981x` is a signature consistent with exactly that**, as well
+as with the code-layout reading given there, and the two have not been
+separated. The discriminator is cheap and is not yet run: swap which core each
+arm is pinned to and see whether the 1.9% follows the arm or the core. Until
+then m=1 stays open, and it is now open for two reasons rather than one.
+
+The harness has since grown the second gate this needs: it samples the pinned
+cpu's SMT siblings from `/proc/stat` across each launch and discards a rep
+whose sibling was busy, recording those discards separately from efficiency
+discards because they are different contention modes. Where no sibling exists —
+no SMT, or a pin already covering both — it reports the gate `INACTIVE` rather
+than reporting zero discards, because a gate that cannot fire reads exactly
+like a gate that passed. The driver also parks itself off the measured core and
+its sibling: unpinned it was measured contending with its own benchmark, at
+0.040 sibling-busy versus 0.007 parked.
+
 **The null arm is a separate file**, not a second run of the same path, so it
 is a genuinely independent launch that pays every per-launch cost the real arms
 pay. And `int4_modulo_arms.sh` fails hard if any two arms come out
