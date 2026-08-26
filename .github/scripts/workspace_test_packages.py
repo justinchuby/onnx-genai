@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import os
 import re
 import subprocess
 import sys
@@ -29,6 +30,117 @@ WORKFLOWS = ROOT / ".github" / "workflows"
 # edit that *drops* a required check is not observable from inside the repo and
 # is the one drift this gate cannot see.
 REQUIRED_JOB_NAMES = frozenset({"Fast (Linux x86_64)", "Rust quality"})
+
+# Every job this repository's workflows define, by file. `_stray_job_attribute`
+# refuses a job key indented one level too far, but it is reached through
+# `workflow_jobs()`, which reads `ci.yml` alone; the other 23 files were
+# unguarded until #2206. Scope and host are separate choices, and only the host
+# has to be required: this inventory is checked from `rust-quality`, so a job
+# that vanishes anywhere blocks a merge everywhere.
+#
+# The names are display names -- `name:` when a job sets one, otherwise the job
+# key -- because that is what GitHub reports as the status check and what a
+# branch ruleset matches on.
+#
+# A stray-key rule fires on the *mechanism* of accidental nesting, so it cannot
+# see a job deleted outright: the file simply has fewer jobs, and nothing about
+# it is malformed. That is why this is an inventory and not another rule. The
+# cost is that adding or renaming a job means editing this table, and the
+# failure message prints the exact replacement block to paste.
+WORKFLOW_JOB_INVENTORY: dict[str, tuple[str, ...]] = {
+    "audit.yml": (
+        "audit",
+    ),
+    "benchmark.yml": (
+        "Kernel micro-benchmarks",
+    ),
+    "ci.yml": (
+        "CLI ORT (${{ matrix.name }})",
+        "CUDA compile (Linux x86_64)",
+        "CUDA compile (Windows x86_64)",
+        "Detect change scope",
+        "EP conformance (Linux x86_64)",
+        "Fast (Linux x86_64)",
+        "Rust (Windows ARM64)",
+        "Rust coverage (${{ matrix.name }})",
+        "Rust quality",
+    ),
+    "diff-guard.yml": (
+        "Deletion ratio",
+        "Root file allowlist",
+    ),
+    "hostlock.yml": (
+        "Host lock conformance",
+    ),
+    "miri.yml": (
+        "Miri unsafe-crate soundness",
+    ),
+    "mobius-producer-conformance.yml": (
+        "Mobius metadata packages (signal)",
+    ),
+    "publish-ep-plugins.yml": (
+        "Publish nxrt-ep-cpu",
+        "Publish nxrt-ep-cuda",
+        "nxrt-ep-cpu wheel (${{ matrix.name }})",
+        "nxrt-ep-cuda wheel (${{ matrix.name }})",
+    ),
+    "publish.yml": (
+        "Build ${{ matrix.package }} (${{ matrix.platform.name }})",
+        "Publish nxrt sdist to PyPI",
+        "Publish onnx-genai sdists to PyPI",
+        "Publish onnx-genai wheels to PyPI",
+        "publish",
+    ),
+    "squad-ci.yml": (
+        "test",
+    ),
+    "squad-docs.yml": (
+        "build",
+    ),
+    "squad-heartbeat.yml": (
+        "heartbeat",
+    ),
+    "squad-insider-release.yml": (
+        "release",
+    ),
+    "squad-issue-assign.yml": (
+        "assign-work",
+    ),
+    "squad-label-enforce.yml": (
+        "enforce",
+    ),
+    "squad-preview.yml": (
+        "validate",
+    ),
+    "squad-promote.yml": (
+        "Promote dev → preview",
+        "Promote preview → main (release)",
+    ),
+    "squad-release.yml": (
+        "release",
+    ),
+    "squad-triage.yml": (
+        "triage",
+    ),
+    "sync-squad-labels.yml": (
+        "sync-labels",
+    ),
+    "visualizer-test.yml": (
+        "Node security and leaf-accounting tests",
+    ),
+    "weight-cache-guard.yml": (
+        "A per-thread buffer needs a per-process bound",
+        "New weight-derived caches must be governed",
+    ),
+    "wheels.yml": (
+        "CPU wheel (${{ matrix.name }})",
+        "CUDA wheel scaffold",
+        "Publish nxrt CPU wheels",
+    ),
+    "wiki-lint.yml": (
+        "Notes stand on their own",
+    ),
+}
 
 # Crates that are intentionally not selected by any CI cargo-test lane.
 # Every entry is a written exception to the default rule: workspace members are
@@ -915,6 +1027,106 @@ def verify_required_tier(simulate_dropped_lane: str | None = None) -> int:
     return verify_windows_ort_coverage()
 
 
+def workflow_files() -> list[Path]:
+    """Every file GitHub will read as a workflow, both extensions it accepts."""
+    return sorted(WORKFLOWS.glob("*.yml")) + sorted(WORKFLOWS.glob("*.yaml"))
+
+
+def verify_workflow_integrity(simulate_deleted_job: str | None = None) -> int:
+    """Every workflow file parses, and defines exactly the jobs it is recorded as defining.
+
+    `verify_required_tier` covers `ci.yml` because `REQUIRED_JOB_NAMES` is an
+    inventory of it, and branch protection covers `ci.yml` again because a
+    required check that stops reporting blocks the merge. Neither reaches a file
+    that contains no required job. Measured on `diff-guard.yml`: nesting
+    `root-files` two spaces deeper leaves valid YAML, drops the root allowlist
+    from what GitHub runs, and `verify`, `verify-required-tier` and `self-test`
+    all still returned 0.
+    """
+    files = workflow_files()
+    failures: list[str] = []
+    parsed: dict[str, list[str]] = {}
+    for path in files:
+        if path.name not in WORKFLOW_JOB_INVENTORY:
+            continue
+        try:
+            found = sorted(parse_jobs(path.read_text(encoding="utf-8"), source=str(path)))
+        except SystemExit as refusal:
+            failures.append(str(refusal))
+            continue
+        if simulate_deleted_job and simulate_deleted_job in found:
+            found.remove(simulate_deleted_job)
+        parsed[path.name] = found
+
+    failures += _integrity_failures(
+        {path.name for path in files}, parsed, WORKFLOW_JOB_INVENTORY
+    )
+    seen = sum(len(jobs) for jobs in parsed.values())
+
+    if failures:
+        print("Workflow job integrity check failed.", file=sys.stderr)
+        for failure in failures:
+            print(f"  - {failure}", file=sys.stderr)
+        return 1
+    if not seen:
+        print(
+            "Workflow job integrity check failed: no jobs were read at all, so this "
+            "gate proved nothing.",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"workflow job integrity ok: {len(files)} file(s), {seen} job(s) as recorded")
+    return 0
+
+
+def _integrity_failures(
+    on_disk: set[str],
+    parsed: dict[str, list[str]],
+    inventory: dict[str, tuple[str, ...]],
+) -> list[str]:
+    """Every difference between what the workflows define and what is recorded."""
+    failures: list[str] = []
+    for name in sorted(set(inventory) - on_disk):
+        failures.append(
+            f"{name}: recorded in WORKFLOW_JOB_INVENTORY but not on disk. Deleting a "
+            "workflow file deletes its checks silently; remove the entry in the same "
+            "commit if that is intended."
+        )
+    for name in sorted(on_disk - set(inventory)):
+        failures.append(
+            f"{name}: on disk but absent from WORKFLOW_JOB_INVENTORY, so its jobs are "
+            "unguarded. Add it with the block this gate prints."
+        )
+    for name, found in sorted(parsed.items()):
+        expected = list(inventory[name])
+        if not found:
+            failures.append(
+                f"{name}: defines no jobs at all. A workflow that runs nothing reports "
+                "no checks, which is indistinguishable from one that passed."
+            )
+            continue
+        if found == expected:
+            continue
+        if gone := sorted(set(expected) - set(found)):
+            failures.append(
+                f"{name}: job(s) GitHub will no longer run: {gone}. A job key indented "
+                "one level too far, or a block deleted outright, removes the check "
+                "rather than failing it."
+            )
+        if added := sorted(set(found) - set(expected)):
+            failures.append(f"{name}: job(s) not recorded in the inventory: {added}.")
+        failures.append(
+            f"{name}: if this change is intended, replace its entry with:\n"
+            + _inventory_entry(name, found)
+        )
+    return failures
+
+
+def _inventory_entry(name: str, jobs: Iterable[str]) -> str:
+    body = "".join(f'            "{job}",\n' for job in jobs)
+    return f'        "{name}": (\n{body}        ),'
+
+
 # Job bodies whose keys are written in the ways YAML allows. A key form this
 # parser fails to recognise does not degrade to "unknown job": the body is
 # appended to whatever job came last, so an advisory job's steps are credited to
@@ -1155,6 +1367,96 @@ def _clippy_block_arms() -> int:
             print(f"        blocks: {blocks}", file=sys.stderr)
         else:
             print(f"  ok    {label} -> credited {got}")
+    return failures
+
+
+_WORKFLOW_INTEGRITY_ARMS = (
+    "an inventoried file that vanished from disk",
+    "a workflow file nobody recorded",
+    "a file whose jobs all disappeared",
+    "an exact match is accepted (control)",
+    "a renamed job is reported in both directions",
+    "every workflow file on disk is actually read",
+)
+
+
+def _workflow_integrity_arms() -> int:
+    """Prove the inventory refuses each way a job can stop running, and only those."""
+    failures = 0
+    inventory = {"a.yml": ("Alpha", "Beta"), "b.yml": ("Gamma",)}
+
+    def arm(label: str, on_disk: set[str], parsed: dict[str, list[str]], expect: list[str]) -> int:
+        found = _integrity_failures(on_disk, parsed, inventory)
+        text = "\n".join(found)
+        missing = [needle for needle in expect if needle not in text]
+        if expect and not found:
+            print(f"  FAIL  {label}: accepted; expected it to name {expect}", file=sys.stderr)
+            return 1
+        if not expect and found:
+            print(f"  FAIL  {label}: refused a correct inventory: {found}", file=sys.stderr)
+            return 1
+        if missing:
+            print(f"  FAIL  {label}: refused without naming {missing}", file=sys.stderr)
+            return 1
+        print(f"  ok    {label} -> {'refused' if found else 'accepted'}")
+        return 0
+
+    both = {"a.yml", "b.yml"}
+    failures += arm(
+        "an inventoried file that vanished from disk",
+        {"a.yml"},
+        {"a.yml": ["Alpha", "Beta"]},
+        ["b.yml", "not on disk"],
+    )
+    failures += arm(
+        "a workflow file nobody recorded",
+        both | {"c.yml"},
+        {"a.yml": ["Alpha", "Beta"], "b.yml": ["Gamma"]},
+        ["c.yml", "unguarded"],
+    )
+    failures += arm(
+        "a file whose jobs all disappeared",
+        both,
+        {"a.yml": ["Alpha", "Beta"], "b.yml": []},
+        ["b.yml", "defines no jobs at all"],
+    )
+    # Without this the suite would be passed perfectly by a gate that refuses
+    # every input, which is the same defect one sign flipped.
+    failures += arm(
+        "an exact match is accepted (control)",
+        both,
+        {"a.yml": ["Alpha", "Beta"], "b.yml": ["Gamma"]},
+        [],
+    )
+    failures += arm(
+        "a renamed job is reported in both directions",
+        both,
+        {"a.yml": ["Alpha", "Beta renamed"], "b.yml": ["Gamma"]},
+        ["no longer run", "not recorded in the inventory", "Beta renamed"],
+    )
+
+    # `verify_workflow_integrity` derives both sides of its file comparison from
+    # `workflow_files()`, so a file that helper silently skipped would be absent
+    # from `on_disk` *and* from `parsed`, and would read as agreement. This is
+    # the only arm that resolves the file list against something else.
+    label = "every workflow file on disk is actually read"
+    independently = {
+        name
+        for name in os.listdir(WORKFLOWS)
+        if name.endswith((".yml", ".yaml")) and (WORKFLOWS / name).is_file()
+    }
+    read = {path.name for path in workflow_files()}
+    if not independently:
+        failures += 1
+        print(
+            f"  FAIL  {label}: found no workflow files, so this arm proved nothing",
+            file=sys.stderr,
+        )
+    elif skipped := sorted(independently - read):
+        failures += 1
+        print(f"  FAIL  {label}: workflow_files() never opened {skipped}", file=sys.stderr)
+    else:
+        print(f"  ok    {label} -> {len(read)} file(s), none skipped")
     return failures
 
 
@@ -1448,6 +1750,17 @@ def self_test() -> int:
             ["onnx-runtime-ep-cpu"],
         ),
         ("verify-required-tier (control)", verify_required_tier, {}, 0, []),
+        # Driven through the real entry point, not the helper: the defect this
+        # gate exists for lives in *which files get read*, and a helper handed
+        # the right dict by hand cannot see a file that was never opened.
+        ("verify-workflow-integrity (control)", verify_workflow_integrity, {}, 0, []),
+        (
+            'verify-workflow-integrity --simulate-deleted-job "Root file allowlist"',
+            verify_workflow_integrity,
+            {"simulate_deleted_job": "Root file allowlist"},
+            1,
+            ["Root file allowlist", "diff-guard.yml"],
+        ),
         (
             "verify-required-tier --simulate-dropped-lane ort-backed",
             verify_required_tier,
@@ -1531,12 +1844,14 @@ def self_test() -> int:
     failures += _conditional_arms()
     failures += _job_condition_arms()
     failures += _clippy_block_arms()
+    failures += _workflow_integrity_arms()
     total = (
         len(arms)
         + _PARSER_ARM_COUNT
         + len(_CONDITIONAL_ARMS)
         + len(_JOB_CONDITION_ARMS)
         + len(_CLIPPY_BLOCK_ARMS)
+        + len(_WORKFLOW_INTEGRITY_ARMS)
     )
     if failures:
         print(f"workspace test package self-test: {failures} arm(s) failed", file=sys.stderr)
@@ -1568,6 +1883,11 @@ def main() -> int:
         "--simulate-dropped-lane",
         help="ignore required-job steps that run this lane, to prove the guard fails",
     )
+    integrity_parser = subparsers.add_parser("verify-workflow-integrity")
+    integrity_parser.add_argument(
+        "--simulate-deleted-job",
+        help="drop one job from what the workflows appear to define, to prove the guard fails",
+    )
     args = parser.parse_args()
 
     if args.command == "verify":
@@ -1576,6 +1896,8 @@ def main() -> int:
         return self_test()
     if args.command == "verify-required-tier":
         return verify_required_tier(args.simulate_dropped_lane)
+    if args.command == "verify-workflow-integrity":
+        return verify_workflow_integrity(args.simulate_deleted_job)
     # Windows Python writes stdout in text mode and translates "\n" into
     # "\r\n". bash splits command substitution on IFS, which contains newline
     # but not carriage return, so each token would keep a trailing "\r" and
