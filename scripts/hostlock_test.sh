@@ -1993,6 +1993,25 @@ chk "the signal target is the led group or the child pid, and nothing else" \
 chk "the only wait in the tree stop is the guarded one" \
     "$(awk '/^stop_wrapped_tree\(\) \{/,/^\}/' "$HL" | grep -cE '^[[:space:]]*wait\b')" "1"
 
+# Every /proc read here races the exits it is reading about -- the group scan
+# globs /proc and then opens each entry, so any pid that ends mid-pass fails
+# its open. That is expected and handled; what must not happen is the failure
+# being ANNOUNCED, because the lock's stderr is what a caller reads to decide
+# whether a teardown worked. bash applies redirections left to right and
+# reports a failed open on the stderr in force at that instant, so
+# `<file 2>/dev/null` prints the error and `2>/dev/null <file` does not. The
+# two orders look identical at a glance and only differ under the race, which
+# is the one condition no green test run reproduces on demand -- so pin the
+# order rather than hope a reviewer spots it. Exact count, not a floor: a new
+# unguarded read must fail here rather than be absorbed. Six today: three
+# pre-existing /proc/PID/stat readers that already had the order right --
+# which is what makes this a convention being restored rather than invented
+# -- plus the holder's cmdline read and the two liveness reads.
+chk "every /proc read silences its own failed open" \
+    "$(grep -cE '2>/dev/null[[:space:]]+<"' "$HL")" "6"
+chk "and none of them applies that guard too late to work" \
+    "$(grep -cE '<"[^"]*"[[:space:]]+2>/dev/null' "$HL")" "0"
+
 # ...and the group is only ever recorded when the child genuinely leads it.
 # Dropping this one line leaves every golden above byte-identical while
 # `-$RUN_CHILD_PGID` on the normal-exit path silently becomes this script's own
@@ -3023,7 +3042,7 @@ cleanup
 # the inert R1 block and the vacuous STALE arm that this PR exists to fix.
 # Every probe branch asserts something, so the total is invariant across
 # environments; if a refactor drops a check, this fails and says so.
-chk "every assertion in this file ran" "$((pass + fail + 1))" "452"
+chk "every assertion in this file ran" "$((pass + fail + 1))" "454"
 
 echo
 echo "passed=${pass} failed=${fail}"

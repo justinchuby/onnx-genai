@@ -799,7 +799,13 @@ holder_cmd() {
     fi
     local c=""
     if [ -n "${ANCHOR_PID:-}" ] && [ -r "/proc/${ANCHOR_PID}/cmdline" ]; then
-        c=$(tr '\000' ' ' <"/proc/${ANCHOR_PID}/cmdline" 2>/dev/null)
+        # `2>/dev/null` FIRST: redirections are applied left to right, and a
+        # failure to open the input file is reported on whatever stderr is
+        # current at that moment. Written the other way round the guard is
+        # applied too late to silence the thing it exists to silence. The
+        # `-r` test above does not close the window -- the holder can exit
+        # between the test and the read, which is exactly when this runs.
+        c=$(tr '\000' ' ' 2>/dev/null <"/proc/${ANCHOR_PID}/cmdline")
     fi
     printf '%s' "$c"
 }
@@ -1824,7 +1830,14 @@ live_pids() {
         pgid=${t#-}
         for d in /proc/[0-9]*; do
             p=${d#/proc/}
-            read -r line <"$d/stat" 2>/dev/null || continue
+            # `2>/dev/null` precedes the input redirect deliberately: bash
+            # applies redirections left to right and reports a failed open on
+            # the stderr in force at that point, so the other order silences
+            # nothing. This scan races every exit on the host by construction
+            # -- it globs /proc and then reads each entry -- so with the guard
+            # mis-ordered a teardown poll prints one "No such file" per pid
+            # that ends mid-pass, onto the lock's own stderr.
+            read -r line 2>/dev/null <"$d/stat" || continue
             # Longest match, as everywhere else here: the comm field is the
             # only parenthesised one, so this lands on state ($1) and pgrp
             # ($3) even for a command name containing a bracket.
@@ -1834,7 +1847,7 @@ live_pids() {
             [ "${3:-}" = "$pgid" ] && [ "${1:-Z}" != Z ] && out="${out}${p} "
         done
     else
-        read -r line <"/proc/${t}/stat" 2>/dev/null || { printf ''; return 0; }
+        read -r line 2>/dev/null <"/proc/${t}/stat" || { printf ''; return 0; }
         rest=${line##*") "}
         # shellcheck disable=SC2086  # deliberate splitting of stat fields
         set -- $rest
