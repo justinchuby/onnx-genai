@@ -348,9 +348,6 @@ package:
     byte_level: true
     artifacts:
     - location: tokenizer.json
-    special_tokens:
-      bos: {id: 1, content: <s>}
-      eos: {id: 2, content: </s>}
 "#;
 
 /// The shape a real exporter emits: a port ABI beside the workflow that binds it.
@@ -710,9 +707,6 @@ package:
     byte_level: true
     artifacts:
     - location: tokenizer.json
-    special_tokens:
-      bos: {id: 1, content: <s>}
-      eos: {id: 2, content: </s>}
 "#;
 
 fn workflow(dtype: &str) -> String {

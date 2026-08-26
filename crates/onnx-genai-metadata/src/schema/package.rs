@@ -12,7 +12,7 @@ use std::collections::BTreeSet;
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PackageFacts {
-    /// Exact tokenizer, vocabulary, and special-token facts.
+    /// Exact tokenizer and vocabulary facts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tokenizer: Option<TokenizerFacts>,
 
@@ -29,12 +29,14 @@ pub struct PackageFacts {
 #[serde(deny_unknown_fields)]
 pub struct TokenizerFacts {
     /// Tokenizer algorithm identifier, e.g. `bpe`, `unigram`, `wordpiece`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(min = 1))]
-    pub algorithm: String,
+    pub algorithm: Option<String>,
 
     /// Number of entries in the vocabulary, including added tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
-    pub vocab_size: usize,
+    pub vocab_size: Option<usize>,
 
     /// Whether the tokenizer operates on raw bytes rather than Unicode scalars.
     #[serde(default)]
@@ -45,9 +47,13 @@ pub struct TokenizerFacts {
     #[schemars(length(min = 1))]
     pub artifacts: Vec<TokenizerArtifact>,
 
-    /// Special tokens by semantic role, e.g. `bos`, `eos`, `pad`.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub special_tokens: BTreeMap<String, SpecialTokenFact>,
+    /// Numeric model and control-token facts for this tokenizer vocabulary.
+    ///
+    /// Token strings, added-token mappings, and chat templates remain in the
+    /// tokenizer assets. Request EOS inputs may override these defaults, but
+    /// workflow literals and termination components do not own another copy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub special_tokens: Option<TokenFacts>,
 }
 
 /// One package-relative tokenizer artifact.
@@ -59,15 +65,40 @@ pub struct TokenizerArtifact {
     pub location: String,
 }
 
-/// One special token, pinned by id and exact surface bytes.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+/// Numeric model and control-token facts.
+///
+/// These ids are model/package facts. Token spellings, added-token maps, and
+/// chat templates remain in tokenizer assets and are not repeated here.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct SpecialTokenFact {
-    /// Vocabulary id of the token.
-    pub id: u32,
-    /// Exact UTF-8 surface form of the token.
-    #[schemars(length(min = 1))]
-    pub content: String,
+pub struct TokenFacts {
+    /// Padding token used by package-authored tensor contracts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pad_token_id: Option<u32>,
+    /// Beginning-of-sequence token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bos_token_id: Option<u32>,
+    /// Every token id that terminates package-default autoregressive generation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub eos_token_id: Vec<u32>,
+    /// Separator token used by sequence-pair models.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sep_token_id: Option<u32>,
+    /// First token fed to an encoder-decoder's autoregressive decoder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decoder_start_token_id: Option<u32>,
+    /// Prompt placeholder replaced by image features.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_token_id: Option<u32>,
+    /// Prompt placeholder replaced by video features.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_token_id: Option<u32>,
+    /// Prompt placeholder replaced by audio features.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_token_id: Option<u32>,
+    /// Token that opens a vision segment in a multimodal prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision_start_token_id: Option<u32>,
 }
 
 /// A constraint language the package's parser accepts.

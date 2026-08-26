@@ -3940,13 +3940,61 @@ fn workflow_request_value(
         RuntimeInputRole::MaxIterations | RuntimeInputRole::MaxOutputTokens => {
             scalar_i64(request.options.max_new_tokens as i64).map(Some)
         }
-        // A request may narrow the package's EOS set; when it says nothing the
-        // package's own declared literal stands, which is why this yields
-        // `None` rather than an empty tensor that would mean "nothing stops".
-        RuntimeInputRole::EosTokenIds => match request.options.eos_token_id {
-            Some(id) => Ok(Some(Value::from_slice_i64(&[i64::from(id)], &[1])?)),
-            None => Ok(None),
-        },
+        RuntimeInputRole::EosTokenIds => {
+            let ids = if request.options.eos_token_ids.is_empty() {
+                request.options.eos_token_id.into_iter().collect::<Vec<_>>()
+            } else {
+                request.options.eos_token_ids.clone()
+            };
+            if ids.is_empty() {
+                return Ok(None);
+            }
+            let rows = match &request.prompt {
+                GeneratePrompt::TokenRows(rows) => rows.len(),
+                GeneratePrompt::Text(_) | GeneratePrompt::TokenIds(_) => 1,
+            };
+            let ids = ids.into_iter().map(i64::from).collect::<Vec<_>>();
+            match contract.rank {
+                1 => Ok(Some(Value::from_slice_i64(
+                    &ids,
+                    &[i64::try_from(ids.len())?],
+                )?)),
+                2 => {
+                    let data = (0..rows)
+                        .flat_map(|_| ids.iter().copied())
+                        .collect::<Vec<_>>();
+                    Ok(Some(Value::from_slice_i64(
+                        &data,
+                        &[i64::try_from(rows)?, i64::try_from(ids.len())?],
+                    )?))
+                }
+                rank => {
+                    anyhow::bail!("EOS token-id workflow input must have rank 1 or 2, got {rank}")
+                }
+            }
+        }
+        RuntimeInputRole::EosTokenLengths => {
+            let count = if !request.options.stop_on_eos {
+                0
+            } else if request.options.eos_token_ids.is_empty() {
+                usize::from(request.options.eos_token_id.is_some())
+            } else {
+                request.options.eos_token_ids.len()
+            };
+            let rows = match &request.prompt {
+                GeneratePrompt::TokenRows(rows) => rows.len(),
+                GeneratePrompt::Text(_) | GeneratePrompt::TokenIds(_) => 1,
+            };
+            anyhow::ensure!(
+                contract.rank == 1,
+                "EOS length workflow input must have rank 1, got {}",
+                contract.rank
+            );
+            Ok(Some(Value::from_slice_i64(
+                &vec![i64::try_from(count)?; rows],
+                &[i64::try_from(rows)?],
+            )?))
+        }
         RuntimeInputRole::Seed => {
             scalar_i64(request.options.seed.unwrap_or_default() as i64).map(Some)
         }
@@ -6122,6 +6170,60 @@ mod workflow_sampling_binding_tests {
                 Err(error) => error,
             };
         assert!(error.to_string().contains("equal lengths"));
+    }
+
+    #[test]
+    fn eos_roles_materialize_one_effective_set_for_policy_graphs() {
+        let mut request = request(|options| {
+            options.eos_token_ids = vec![2, 3];
+        });
+        request.prompt = GeneratePrompt::TokenRows(vec![vec![1], vec![4]]);
+        let rank_two = TensorContract {
+            dtype: "int64".to_string(),
+            rank: 2,
+            shape: None,
+            optional: false,
+            batch_layout: BatchLayout::default(),
+            padding: Vec::new(),
+        };
+        let ids = workflow_request_value(&RuntimeInputRole::EosTokenIds, &request, &rank_two)
+            .expect("EOS binding")
+            .expect("EOS ids");
+        assert_eq!(ids.shape(), &[2, 2]);
+        assert_eq!(ids.to_vec_i64().expect("EOS rows"), [2, 3, 2, 3]);
+
+        let lengths_contract = TensorContract {
+            rank: 1,
+            ..rank_two.clone()
+        };
+        let lengths = workflow_request_value(
+            &RuntimeInputRole::EosTokenLengths,
+            &request,
+            &lengths_contract,
+        )
+        .expect("EOS-length binding")
+        .expect("EOS lengths");
+        assert_eq!(lengths.to_vec_i64().expect("EOS lengths"), [2, 2]);
+
+        request.options.stop_on_eos = false;
+        let lengths = workflow_request_value(
+            &RuntimeInputRole::EosTokenLengths,
+            &request,
+            &lengths_contract,
+        )
+        .expect("disabled EOS binding")
+        .expect("disabled EOS lengths");
+        assert_eq!(lengths.to_vec_i64().expect("EOS lengths"), [0, 0]);
+
+        let rank_one = TensorContract {
+            rank: 1,
+            ..rank_two
+        };
+        let ids = workflow_request_value(&RuntimeInputRole::EosTokenIds, &request, &rank_one)
+            .expect("shared EOS binding")
+            .expect("shared EOS ids");
+        assert_eq!(ids.shape(), &[2]);
+        assert_eq!(ids.to_vec_i64().expect("EOS ids"), [2, 3]);
     }
 
     #[test]

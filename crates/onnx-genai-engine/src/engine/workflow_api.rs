@@ -128,6 +128,7 @@ impl Engine {
         &mut self,
         request: PipelineGenerateRequest,
     ) -> anyhow::Result<PipelineTensors> {
+        let request = self.apply_pipeline_request_defaults(request)?;
         self.workflow_runtime_mut().run_pipeline(request)
     }
 
@@ -135,6 +136,7 @@ impl Engine {
         &mut self,
         request: PipelineGenerateRequest,
     ) -> anyhow::Result<PipelineOutputs> {
+        let request = self.apply_pipeline_request_defaults(request)?;
         self.workflow_runtime_mut().run_pipeline_outputs(request)
     }
 
@@ -142,6 +144,7 @@ impl Engine {
         &mut self,
         request: PipelineGenerateRequest,
     ) -> anyhow::Result<PipelineTensors> {
+        let request = self.apply_pipeline_request_defaults(request)?;
         self.workflow_runtime_mut().run_pipeline_retained(request)
     }
 
@@ -218,6 +221,7 @@ impl Engine {
         )?;
         let mut request = request;
         request.request.options.max_new_tokens = max_new_tokens;
+        self.apply_eos_defaults(&mut request.request.options)?;
         if let Some(on_admitted) = on_admitted.as_mut() {
             on_admitted();
         }
@@ -301,7 +305,16 @@ impl Engine {
         &self,
         request: PipelineGenerateRequest,
     ) -> anyhow::Result<crate::pipeline::WorkflowExecutionPlan<'_>> {
+        let request = self.apply_pipeline_request_defaults(request)?;
         self.workflow_runtime().prepare_workflow_execution(request)
+    }
+
+    fn apply_pipeline_request_defaults(
+        &self,
+        mut request: PipelineGenerateRequest,
+    ) -> anyhow::Result<PipelineGenerateRequest> {
+        self.apply_eos_defaults(&mut request.request.options)?;
+        Ok(request)
     }
 
     /// Group request-local component inputs under the package's symbol-keyed

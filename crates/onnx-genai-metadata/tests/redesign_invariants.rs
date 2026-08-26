@@ -6,8 +6,8 @@
 //! so the fact under test is the only thing that varies.
 
 use onnx_genai_metadata::{
-    InferenceMetadata, WorkflowOutputRole, cache_dependencies, semantic_identity_of_str,
-    validate_metadata,
+    InferenceMetadata, LiteralValue, ScalarValue, WorkflowOutputRole, cache_dependencies,
+    parse_metadata, semantic_identity_of_str, validate_metadata,
 };
 
 fn parse(document: &str) -> InferenceMetadata {
@@ -766,16 +766,19 @@ pipeline:
 #[test]
 fn constraint_dialect_and_tokenizer_artifact_are_representable() {
     let document = r#"
+schema_version: v1.2
 package:
   tokenizer:
     algorithm: bpe
     vocab_size: 32000
     byte_level: true
+    special_tokens:
+      pad_token_id: 0
+      bos_token_id: 1
+      eos_token_id: [2]
+      audio_token_id: 32001
     artifacts:
       - location: tokenizer.json
-    special_tokens:
-      bos: { id: 1, content: "<s>" }
-      eos: { id: 2, content: "</s>" }
   constraint_languages:
     - dialect: gbnf
       version: "1"
@@ -798,10 +801,25 @@ pipeline:
     validate_metadata(&metadata).expect("package facts are valid");
     let package = metadata.package.as_ref().expect("package facts");
     let tokenizer = package.tokenizer.as_ref().expect("tokenizer facts");
-    assert_eq!(tokenizer.vocab_size, 32000);
+    assert_eq!(tokenizer.vocab_size, Some(32000));
     assert!(tokenizer.byte_level);
     assert_eq!(tokenizer.artifacts[0].location, "tokenizer.json");
-    assert_eq!(tokenizer.special_tokens["eos"].content, "</s>");
+    assert_eq!(
+        tokenizer
+            .special_tokens
+            .as_ref()
+            .expect("numeric token facts")
+            .eos_token_id,
+        vec![2]
+    );
+    assert_eq!(
+        tokenizer
+            .special_tokens
+            .as_ref()
+            .expect("numeric token facts")
+            .audio_token_id,
+        Some(32001)
+    );
     assert_eq!(package.constraint_languages[0].dialect, "gbnf");
 
     // The dialect must name a component that actually parses it.
@@ -811,6 +829,130 @@ pipeline:
         reported.iter().any(|error| error.contains("absent")),
         "{reported:?}"
     );
+}
+
+#[test]
+fn retired_top_level_tokens_have_an_actionable_migration() {
+    let error = parse_metadata(
+        r#"
+tokens:
+  eos_token_id: [2]
+"#,
+        Some("yaml"),
+    )
+    .expect_err("top-level token authority is retired")
+    .to_string();
+    assert!(
+        error.contains("package.tokenizer.special_tokens"),
+        "{error}"
+    );
+    assert!(error.contains("tokenizer.json"), "{error}");
+}
+
+#[test]
+fn generation_requires_one_token_authority_and_an_executable_stop_policy() {
+    let document = include_str!(
+        "../../../tests/fixtures/onnx_genai_workflows/decoder/inference_metadata.yaml"
+    );
+    let metadata = parse(document);
+    validate_metadata(&metadata).expect("the canonical generation fixture is valid");
+
+    let mut no_tokens = metadata.clone();
+    no_tokens
+        .package
+        .as_mut()
+        .and_then(|package| package.tokenizer.as_mut())
+        .expect("tokenizer facts")
+        .special_tokens = None;
+    let reported = validate_metadata(&no_tokens).expect_err("generation needs package EOS facts");
+    assert!(
+        reported
+            .iter()
+            .any(|error| error.contains("package.tokenizer.special_tokens.eos_token_id")),
+        "{reported:?}"
+    );
+
+    let mut no_policy = metadata.clone();
+    no_policy
+        .pipeline
+        .as_mut()
+        .expect("pipeline")
+        .workflow
+        .components
+        .get_mut("termination")
+        .expect("termination component")
+        .contract = None;
+    let reported = validate_metadata(&no_policy).expect_err("generation needs stop semantics");
+    assert!(
+        reported
+            .iter()
+            .any(|error| error.contains("must invoke a component")),
+        "{reported:?}"
+    );
+}
+
+#[test]
+fn eos_authority_rejects_duplicates_and_workflow_literals() {
+    let document = include_str!(
+        "../../../tests/fixtures/onnx_genai_workflows/decoder/inference_metadata.yaml"
+    );
+    let mut metadata = parse(document);
+    metadata
+        .package
+        .as_mut()
+        .and_then(|package| package.tokenizer.as_mut())
+        .and_then(|tokenizer| tokenizer.special_tokens.as_mut())
+        .expect("special token facts")
+        .eos_token_id
+        .push(127);
+    let reported = validate_metadata(&metadata).expect_err("duplicate EOS ids are ambiguous");
+    assert!(
+        reported
+            .iter()
+            .any(|error| error.contains("repeats id 127")),
+        "{reported:?}"
+    );
+
+    let mut metadata = parse(document);
+    let workflow = &mut metadata.pipeline.as_mut().expect("pipeline").workflow;
+    workflow
+        .inputs
+        .get_mut("request.eos_ids")
+        .expect("runtime EOS input")
+        .default = Some(LiteralValue::Elements(vec![ScalarValue::Integer(127)]));
+    let duplicate = workflow
+        .inputs
+        .get("request.eos_ids")
+        .expect("runtime EOS input")
+        .clone();
+    workflow
+        .inputs
+        .insert("package.eos_ids".to_string(), duplicate);
+    let reported =
+        validate_metadata(&metadata).expect_err("workflow literals cannot own package EOS ids");
+    assert!(
+        reported
+            .iter()
+            .any(|error| error.contains("retired duplicate")),
+        "{reported:?}"
+    );
+    assert!(
+        reported
+            .iter()
+            .any(|error| error.contains("request EOS override")),
+        "{reported:?}"
+    );
+}
+
+#[test]
+fn numeric_token_facts_reject_non_numeric_or_negative_ids() {
+    for document in [
+        "schema_version: v1.2\ntokens:\n  eos_token_id: [-1]\n",
+        "schema_version: v1.2\ntokens:\n  eos_token_id: [eos]\n",
+    ] {
+        parse_metadata(document, Some("yaml"))
+            .expect_err("token ids must be non-negative integers");
+    }
 }
 
 #[test]

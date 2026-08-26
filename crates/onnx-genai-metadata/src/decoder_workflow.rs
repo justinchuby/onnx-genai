@@ -118,13 +118,6 @@ impl std::error::Error for BuildError {}
 pub struct DecoderFacts {
     /// Upper bound on generated tokens the workflow's loop declares.
     pub max_sequence_length: Option<usize>,
-    /// Token ids that end generation, in the model's own order.
-    ///
-    /// A set, because a model may end a turn with one token and a message with
-    /// another. Declared on the workflow so the package states its stop
-    /// condition where it states everything else, rather than leaving a runtime
-    /// to rediscover it from tokenizer side-files the package may not ship.
-    pub eos_token_ids: Vec<i64>,
     /// Real dtype and rank of the graph's ports, keyed by port name.
     ///
     /// State tensors have no shape this builder could know: a growing KV cache
@@ -208,9 +201,6 @@ pub fn decoder_workflow(
         true,
         None,
     );
-    if !facts.eos_token_ids.is_empty() {
-        builder.eos_input(&facts.eos_token_ids);
-    }
     builder.request_input(
         REQUEST_MAX_ITERATIONS,
         scalar_contract(),
@@ -964,41 +954,6 @@ impl Builder {
         self.bind_invoke_input(port, &input);
     }
 
-    /// The package's declared end-of-generation token ids.
-    ///
-    /// A `[eos_count]` shape rather than `[1]`: the extent is however many end
-    /// tokens the model has, and the element list is what states it.
-    fn eos_input(&mut self, ids: &[i64]) {
-        self.inputs.insert(
-            PACKAGE_EOS_TOKEN_IDS.to_string(),
-            WorkflowInput {
-                contract: TensorContract {
-                    dtype: "int64".to_string(),
-                    rank: 1,
-                    shape: Some(vec![crate::schema::TensorDimension::Symbol(
-                        "eos_count".to_string(),
-                    )]),
-                    optional: false,
-                    batch_layout: BatchLayout::Shared,
-                    padding: Vec::new(),
-                },
-                role: SemanticInputRole::Runtime {
-                    version: CONTRACT_VERSION.to_string(),
-                    role: RuntimeInputRole::EosTokenIds,
-                },
-                source: WorkflowInputSource::Literal,
-                required: false,
-                default: Some(crate::schema::LiteralValue::Elements(
-                    ids.iter()
-                        .map(|id| crate::schema::ScalarValue::Integer(*id))
-                        .collect(),
-                )),
-                present_as: None,
-                externally_suppliable: true,
-            },
-        );
-    }
-
     /// A package-level literal input with no state cell of its own.
     fn package_literal(
         &mut self,
@@ -1249,8 +1204,6 @@ fn static_update(abi: &DecoderAbi) -> Option<StateUpdate> {
 const REQUEST_TOKENS: &str = "request.input_ids";
 /// Workflow input bounding the generation loop.
 const REQUEST_MAX_ITERATIONS: &str = "request.max_iterations";
-/// Workflow input carrying the package's end-of-generation token ids.
-pub const PACKAGE_EOS_TOKEN_IDS: &str = "package.eos_token_ids";
 /// Package input every state cell is seeded from.
 const STATE_SEED_INPUT: &str = "package.state_seed";
 /// Iteration bound used when the package declares no sequence limit.
