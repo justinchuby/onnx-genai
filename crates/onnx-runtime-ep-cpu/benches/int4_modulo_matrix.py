@@ -491,8 +491,50 @@ def route_proof(m_list, shape):
         ok = ok and identical and moved == expect_move
         note = "" if moved == expect_move else "  <-- UNEXPECTED"
         print(f"{block:>6} {m:>5} {str(identical):>14} {str(moved):>13}{note}")
+    ok = ok and _gebp_off_control(m_list, shape, rows)
     print("route proof:", "PASS" if ok else "FAIL")
     return {"rows": {f"{b}/{m}": g for (b, m), g in rows.items()}, "pass": ok}
+
+
+def _gebp_off_control(m_list, shape, rows):
+    """Assert that `ONNX_GENAI_CPU_MM_INT4_GEBP=0` really does take the pack off
+    the route, instead of documenting that it does.
+
+    `--env`'s help calls this "verified", and for a long time that word rested on
+    a run nobody had repeated and nothing re-checked. A claim that only exists in
+    a docstring is indistinguishable from one that was never true: the env var is
+    the control used to argue that a sub-2% residual is layout rather than the
+    change, so if it ever stopped removing the pack, every argument leaning on it
+    would keep reading exactly the same.
+
+    The observable: at a row that *does* move with the pack on, turning the pack
+    off must collapse `poison` onto `after`, because the poisoned line is then
+    unreachable. Checksums only -- no timing, so this is contention-independent.
+
+    Also assert the pack-off output *differs* from the pack-on output at that
+    row. Without it the control passes vacuously if the flag were ignored
+    entirely: an ignored flag leaves poison != after, which fails the collapse,
+    but a flag that silently disabled *both* kernels' output would not.
+    """
+    block, m = 32, 8
+    if m not in m_list:
+        print(f"  gebp-off control: skipped, m = {m} not in --m-list")
+        return True
+    env = {"PROBE_BITS": "4", "PROBE_BLOCK": str(block), "PROBE_SHAPE": shape,
+           "PROBE_M_LIST": str(m), "ONNX_GENAI_CPU_MM_INT4_GEBP": "0"}
+    off = {}
+    for arm in ("after", "poison"):
+        got, _, _ = launch(os.path.join(BIN, f"prefill_{arm}"), env)
+        off[arm] = got[m]["fnv"]
+    collapsed = off["after"] == off["poison"]
+    on_moves = rows[(block, m)]["poison"] != rows[(block, m)]["after"]
+    changed_route = off["after"] != rows[(block, m)]["after"]
+    good = collapsed and on_moves and changed_route
+    print(f"  gebp-off control, block {block} m {m}: "
+          f"pack-on moves={on_moves} pack-off collapses={collapsed} "
+          f"pack-off differs from pack-on={changed_route}"
+          f"{'' if good else '  <-- UNEXPECTED'}")
+    return good
 
 
 def park_driver_off_measured_core():
@@ -536,12 +578,17 @@ def main():
     ap.add_argument(
         "--env", action="append", default=[], metavar="K=V",
         help="extra env for prefill launches. `--env ONNX_GENAI_CPU_MM_INT4_GEBP=0` "
-             "is the layout control: it takes the pack off the route entirely "
-             "(verified -- the poisoned arm goes bit-identical under it), so any "
-             "difference left between `before` and `after` is code layout and not "
-             "the change. That control has to be run on the *same* rows as the "
+             "is the layout control: it takes the pack off the route entirely, "
+             "so any difference left between `before` and `after` is code layout "
+             "and not the change. That it really does remove the pack is not "
+             "taken on trust -- `--route-proof` asserts it, by checking the "
+             "poisoned arm collapses onto `after` at a row that moves with the "
+             "pack on. That control has to be run on the *same* rows as the "
              "claim; a different row can be a different kernel with different "
-             "layout sensitivity.")
+             "layout sensitivity. Note the flag's *timing* delta is "
+             "unattributable by construction -- it swaps a whole algorithm and "
+             "moves cache behaviour and layout with it -- so route claims rest "
+             "on the poisoned checksum, never on this.")
     ap.add_argument("--out", default=os.path.join(BIN, "modulo_matrix.json"))
     args = ap.parse_args()
 
