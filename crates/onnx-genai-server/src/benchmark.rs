@@ -1302,6 +1302,23 @@ async fn measure_driver_conflicts(
         let owner_lease = leases
             .acquire(binding.clone(), "conflict")
             .context("owner conflict lease")?;
+        // The lease is the production pre-enqueue exclusion boundary. Probe
+        // contenders while the owner guard is definitely live so this gate
+        // cannot depend on how quickly a tiny benchmark request finishes.
+        for _ in 1..concurrency {
+            let started = Instant::now();
+            match leases.acquire(binding.clone(), "conflict") {
+                Err(PackageCapabilityError::ExclusiveLeaseConflict { .. }) => {
+                    conflict_ns.push(duration_ns(started.elapsed()));
+                    typed_conflicts += 1;
+                }
+                Err(_) => errors += 1,
+                Ok(lease) => {
+                    drop(lease);
+                    errors += 1;
+                }
+            }
+        }
         let pending = match submit_driver_request(
             Arc::clone(&driver),
             Some(owner_lease),
@@ -1322,20 +1339,6 @@ async fn measure_driver_conflicts(
                 continue;
             }
         };
-        for _ in 1..concurrency {
-            let started = Instant::now();
-            match leases.acquire(binding.clone(), "conflict") {
-                Err(PackageCapabilityError::ExclusiveLeaseConflict { .. }) => {
-                    conflict_ns.push(duration_ns(started.elapsed()));
-                    typed_conflicts += 1;
-                }
-                Err(_) => errors += 1,
-                Ok(lease) => {
-                    drop(lease);
-                    errors += 1;
-                }
-            }
-        }
         match finish_driver_request(pending).await {
             Ok(sample) => samples.push(sample),
             Err(_) => errors += 1,
@@ -1742,16 +1745,6 @@ async fn measure_synthetic_conflicts(
         let owner = leases
             .acquire(binding.clone(), "synthetic-conflict")
             .context("synthetic owner lease")?;
-        let pool_for_owner = Arc::clone(pool);
-        let pending = tokio::spawn(async move {
-            run_synthetic_request(
-                &pool_for_owner,
-                Some((session, owner)),
-                work_units,
-                Instant::now(),
-            )
-            .await
-        });
         for _ in 1..concurrency {
             let started = Instant::now();
             match leases.acquire(binding.clone(), "synthetic-conflict") {
@@ -1766,6 +1759,16 @@ async fn measure_synthetic_conflicts(
                 }
             }
         }
+        let pool_for_owner = Arc::clone(pool);
+        let pending = tokio::spawn(async move {
+            run_synthetic_request(
+                &pool_for_owner,
+                Some((session, owner)),
+                work_units,
+                Instant::now(),
+            )
+            .await
+        });
         match pending.await {
             Ok(Ok(sample)) => samples.push(sample),
             Ok(Err(_)) | Err(_) => errors += 1,
