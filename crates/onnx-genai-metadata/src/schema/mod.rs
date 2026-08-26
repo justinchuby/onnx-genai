@@ -79,6 +79,14 @@ pub struct InferenceMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema_version: Option<String>,
 
+    /// Numeric model and control-token facts.
+    ///
+    /// Token strings and chat templates remain in tokenizer assets. Request
+    /// EOS inputs may override these defaults, but must not repeat them as
+    /// authored workflow literals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens: Option<TokenFacts>,
+
     /// Capability identifiers that a runtime MUST support or refuse to load the model.
     #[serde(default)]
     #[schemars(

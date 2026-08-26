@@ -12,7 +12,7 @@ use std::collections::BTreeSet;
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PackageFacts {
-    /// Exact tokenizer, vocabulary, and special-token facts.
+    /// Exact tokenizer and vocabulary facts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tokenizer: Option<TokenizerFacts>,
 
@@ -44,10 +44,6 @@ pub struct TokenizerFacts {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(length(min = 1))]
     pub artifacts: Vec<TokenizerArtifact>,
-
-    /// Special tokens by semantic role, e.g. `bos`, `eos`, `pad`.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub special_tokens: BTreeMap<String, SpecialTokenFact>,
 }
 
 /// One package-relative tokenizer artifact.
@@ -59,15 +55,37 @@ pub struct TokenizerArtifact {
     pub location: String,
 }
 
-/// One special token, pinned by id and exact surface bytes.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+/// Numeric model and control-token facts.
+///
+/// These ids are model/package facts. Token spellings, added-token maps, and
+/// chat templates remain in tokenizer assets and are not repeated here.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct SpecialTokenFact {
-    /// Vocabulary id of the token.
-    pub id: u32,
-    /// Exact UTF-8 surface form of the token.
-    #[schemars(length(min = 1))]
-    pub content: String,
+pub struct TokenFacts {
+    /// Padding token used by package-authored tensor contracts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pad_token_id: Option<u32>,
+    /// Beginning-of-sequence token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bos_token_id: Option<u32>,
+    /// Every token id that terminates package-default autoregressive generation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub eos_token_id: Vec<u32>,
+    /// Separator token used by sequence-pair models.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sep_token_id: Option<u32>,
+    /// First token fed to an encoder-decoder's autoregressive decoder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decoder_start_token_id: Option<u32>,
+    /// Prompt placeholder replaced by image features.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_token_id: Option<u32>,
+    /// Prompt placeholder replaced by video features.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_token_id: Option<u32>,
+    /// Token that opens a vision segment in a multimodal prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision_start_token_id: Option<u32>,
 }
 
 /// A constraint language the package's parser accepts.

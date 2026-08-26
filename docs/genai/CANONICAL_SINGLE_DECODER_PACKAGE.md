@@ -184,40 +184,34 @@ package whose prefill starts from an empty cache has no cheaper option.
 ## End-of-generation tokens
 
 A model may end a turn with one token and a message with another. Both stop it,
-so the declaration is a **set**:
+so top-level token facts declare an ordered set:
 
 ```yaml
-    inputs:
-      package.eos_token_ids:
-        contract: {dtype: int64, rank: 1, shape: [eos_count]}
-        role: {kind: runtime, version: '1.0', role: eos_token_ids}
-        source: {kind: literal}
-        required: false
-        externally_suppliable: true
-        default: [200002, 200012]     # e.g. <|eot|> and <|eom|>
+schema_version: v1.2
+tokens:
+  eos_token_id: [200002, 200012] # e.g. <|eot|> and <|eom|>
 ```
 
-The axis is symbolic (`eos_count`) and the element list states its extent, so
-adding a third end token is a one-line change with no other edit.
+Numeric ids are package/model facts. Token spellings, added-token mappings, and
+chat templates remain in tokenizer assets; a runtime never rediscovers ids from
+those assets.
 
 Three things follow from declaring it here:
 
-* **The package states its own stop condition.** A package that ships no
-  `generation_config.json` or `tokenizer_config.json` still stops correctly,
-  because the workflow says how.
+* **The package states its own stop values.** A package that ships no generation
+  side files still stops correctly because metadata owns the numeric facts.
 * **Every declared id terminates.** Not just the first. Keeping only one means
   generation runs past its end and emits control tokens as ordinary text — a
   silent failure that reads like the model rambling.
-* **A request cannot disarm the others.** `GenerateOptions::eos_token_id` names
-  which id a finished result *reports* and adds to the set; it does not narrow
-  it. A model's end tokens are facts about the model, and emitting one as text
-  is never what a caller meant.
+* **An explicit request value is an override, not another default.** When a
+  request supplies `eos_token_id` or `eos_token_ids`, that set replaces the
+  package default for that request. Workflow inputs with the `eos_token_ids`
+  role receive the same effective set.
 
-The engine merges the package's declaration with the tokenizer's ids (package
-first, neither able to drop the other) into `GenerateOptions::eos_token_ids`,
-and `GenerateOptions::terminates` is the only thing that reads it — so the
-single-row loop, the batched loop, the speculative verifier and a constrained
-decode cannot disagree about whether a model has finished.
+The runtime-bound `onnx-genai.token-policy` component implements termination
+semantics for this package shape. A package that ships an ONNX termination
+graph instead declares runtime-role EOS inputs for that graph; the graph
+computes done/active state but does not own the ids.
 
 ## What "single decoder" means to the runtime
 

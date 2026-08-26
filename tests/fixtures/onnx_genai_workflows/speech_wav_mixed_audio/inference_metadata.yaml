@@ -101,10 +101,3 @@ package:
     algorithm: bpe
     vocab_size: 32000
     byte_level: true
-    special_tokens:
-      bos:
-        id: 2
-        content: <bos>
-      eos:
-        id: 3
-        content: <eos>

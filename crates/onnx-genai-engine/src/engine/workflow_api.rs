@@ -218,6 +218,7 @@ impl Engine {
         )?;
         let mut request = request;
         request.request.options.max_new_tokens = max_new_tokens;
+        self.apply_eos_defaults(&mut request.request.options)?;
         if let Some(on_admitted) = on_admitted.as_mut() {
             on_admitted();
         }

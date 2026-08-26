@@ -272,6 +272,7 @@ fn preparse(content: &str) -> Result<(), crate::MetadataError> {
 
 fn gate_document(document: &serde_yaml::Value) -> Result<(), crate::MetadataError> {
     reject_retired_model_io(document)?;
+    reject_retired_inline_special_tokens(document)?;
     let declared = crate::version::declared_in(document).map_err(crate::MetadataError::Parse)?;
     crate::version::gate(declared)
         .map(|_| ())
@@ -289,6 +290,27 @@ fn gate_document(document: &serde_yaml::Value) -> Result<(), crate::MetadataErro
     // retired spelling is only ever found by recognizing its shape.
     reject_flat_token_packed(document, String::new())
         .and_then(|_| reject_retired_batching_hints(document))
+}
+
+/// Refuse numeric/string special-token duplication inside tokenizer facts.
+fn reject_retired_inline_special_tokens(
+    document: &serde_yaml::Value,
+) -> Result<(), crate::MetadataError> {
+    if document
+        .get("package")
+        .and_then(|package| package.get("tokenizer"))
+        .and_then(|tokenizer| tokenizer.get("special_tokens"))
+        .is_none()
+    {
+        return Ok(());
+    }
+    Err(crate::MetadataError::Parse(
+        "`package.tokenizer.special_tokens` is retired. Put numeric package/model ids in the \
+         top-level `tokens` section (`eos_token_id` is a list); keep token strings, added-token \
+         mappings, and chat templates only in tokenizer.json/tokenizer_config.json. A workflow \
+         termination component consumes the resolved numeric values but does not own them."
+            .to_string(),
+    ))
 }
 
 /// Refuse a document that still declares the retired `model.io` block.
