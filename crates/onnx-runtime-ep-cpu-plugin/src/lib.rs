@@ -49,6 +49,10 @@ fn build_kernel_registry_entries() -> Vec<KernelRegistryEntry> {
                     onnx_runtime_ep_cpu::kernels::input_dtype_constraints_for_op(
                         &d.op_type, &d.domain,
                     ),
+                output_dtype_constraints:
+                    onnx_runtime_ep_cpu::kernels::output_dtype_constraints_for_op(
+                        &d.op_type, &d.domain,
+                    ),
             }
         })
         .collect()

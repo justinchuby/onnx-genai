@@ -314,6 +314,21 @@ pub fn input_dtype_constraints_for_op(
     }
 }
 
+/// Per-output-slot dtype constraints for mixed-dtype ops.
+///
+/// Unlisted outputs use the op-wide union from [`supported_dtypes_for_op`].
+/// Listed slots mirror the corresponding kernel's execute-time output checks.
+pub fn output_dtype_constraints_for_op(
+    op_type: &str,
+    domain: &str,
+) -> &'static [(usize, &'static [DataType])] {
+    static DSA_INDEX_SELECT_OUTPUTS: &[(usize, &[DataType])] = &[(0, I64_ONLY)];
+    match (op_type, domain) {
+        ("DsaIndexSelect", "pkg.nxrt") => DSA_INDEX_SELECT_OUTPUTS,
+        _ => &[],
+    }
+}
+
 /// Determine the supported dtypes for a given (op_type, domain) based on the
 /// actual kernel dispatch implementation. Fail closed: unknown ops get f32 only.
 pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataType] {
@@ -2304,6 +2319,11 @@ mod tests {
         assert_eq!(constraints[1], (1, FLOAT_COMPUTE_DTYPES));
         assert_eq!(constraints[2], (2, FLOAT_COMPUTE_DTYPES));
         assert_eq!(constraints[3], (3, F32_ONLY));
+
+        assert_eq!(
+            output_dtype_constraints_for_op("DsaIndexSelect", "pkg.nxrt"),
+            &[(0, I64_ONLY)]
+        );
     }
 
     /// The plugin EP's node filter refuses a node unless *every* input and

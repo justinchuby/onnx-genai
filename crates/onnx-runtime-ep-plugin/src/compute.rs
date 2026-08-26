@@ -291,6 +291,19 @@ pub enum DeclineReason {
 const KERNEL_SIZED_OUTPUT_STRATEGIES: &[(&str, &str)] =
     &[("", "NonMaxSuppression"), ("", "Unique")];
 
+type ShapeSchemaBuilder =
+    fn(&Node, &[Vec<Option<usize>>], usize) -> Result<ShapeInference, &'static str>;
+
+const DSA_INDEX_SELECT_SCHEMAS: &[(i64, ShapeSchemaBuilder)] = &[(1, build_dsa_index_select)];
+
+fn resolve_shape_schema<T>(opset: i64, schemas: &[(i64, T)]) -> Option<&T> {
+    schemas
+        .iter()
+        .filter(|(since_version, _)| *since_version <= opset)
+        .max_by_key(|(since_version, _)| *since_version)
+        .map(|(_, schema)| schema)
+}
+
 fn kernel_sized_output_strategy(domain: &str, op_type: &str) -> bool {
     let domain = if domain == "ai.onnx" { "" } else { domain };
     KERNEL_SIZED_OUTPUT_STRATEGIES
@@ -492,8 +505,17 @@ impl ShapeInference {
                     reason: DeclineReason::NodeNotShapeable("MatMulNBits without a usable N attribute"),
                 },
             },
-            "DsaIndexSelect" if domain == "pkg.nxrt" && opset == 1 => {
-                match build_dsa_index_select(node, input_shapes, num_outputs) {
+            "DsaIndexSelect" if domain == "pkg.nxrt" => {
+                let Some(build) = resolve_shape_schema(opset, DSA_INDEX_SELECT_SCHEMAS) else {
+                    return Self::Declined {
+                        op_type: op.to_string(),
+                        domain: domain.to_string(),
+                        reason: DeclineReason::NodeNotShapeable(
+                            "DsaIndexSelect has no schema at the imported opset",
+                        ),
+                    };
+                };
+                match build(node, input_shapes, num_outputs) {
                     Ok(rule) => rule,
                     Err(reason) => Self::Declined {
                         op_type: op.to_string(),
@@ -6851,22 +6873,33 @@ fn after() {}
     }
 
     #[test]
-    fn dsa_index_select_v1_infers_fixed_width_output() {
-        let node = dsa_index_select_node("pkg.nxrt", 1, Attribute::Int(5));
-        let strategy = ShapeInference::for_node(&node, &dsa_input_shapes(), 1);
-        assert!(matches!(
-            strategy,
-            ShapeInference::DsaIndexSelect { top_k: 5 }
-        ));
+    fn shape_schema_resolution_selects_highest_compatible_since_version() {
+        let schemas = [(1, "v1"), (3, "v3"), (7, "v7")];
+        for (imported, expected) in [(1, "v1"), (2, "v1"), (3, "v3"), (6, "v3"), (99, "v7")] {
+            assert_eq!(resolve_shape_schema(imported, &schemas), Some(&expected));
+        }
+        assert_eq!(resolve_shape_schema(0, &schemas), None);
+    }
 
-        let query = typed_view(DataType::BFloat16, &[2, 3, 4, 8], &[96, 32, 8, 1]);
-        let key = typed_view(DataType::BFloat16, &[2, 16, 8], &[128, 8, 1]);
-        let weights = typed_view(DataType::BFloat16, &[2, 3, 4], &[12, 4, 1]);
-        let bias = view(&[2, 1, 3, 16], &[48, 48, 16, 1]);
-        assert_eq!(
-            infer(&strategy, &[query, key, weights, bias]).unwrap(),
-            vec![vec![2, 1, 3, 5]]
-        );
+    #[test]
+    fn dsa_index_select_resolves_v1_schema_for_later_imports() {
+        for imported_opset in [1, 2, 17] {
+            let node = dsa_index_select_node("pkg.nxrt", imported_opset, Attribute::Int(5));
+            let strategy = ShapeInference::for_node(&node, &dsa_input_shapes(), 1);
+            assert!(
+                matches!(strategy, ShapeInference::DsaIndexSelect { top_k: 5 }),
+                "imported opset {imported_opset} must resolve the sole since-version-1 schema"
+            );
+
+            let query = typed_view(DataType::BFloat16, &[2, 3, 4, 8], &[96, 32, 8, 1]);
+            let key = typed_view(DataType::BFloat16, &[2, 16, 8], &[128, 8, 1]);
+            let weights = typed_view(DataType::BFloat16, &[2, 3, 4], &[12, 4, 1]);
+            let bias = view(&[2, 1, 3, 16], &[48, 48, 16, 1]);
+            assert_eq!(
+                infer(&strategy, &[query, key, weights, bias]).unwrap(),
+                vec![vec![2, 1, 3, 5]]
+            );
+        }
     }
 
     #[test]
@@ -6894,8 +6927,8 @@ fn after() {}
                 valid.clone(),
             ),
             (
-                "wrong version",
-                dsa_index_select_node("pkg.nxrt", 2, Attribute::Int(4)),
+                "no compatible schema",
+                dsa_index_select_node("pkg.nxrt", 0, Attribute::Int(4)),
                 valid.clone(),
             ),
             (
