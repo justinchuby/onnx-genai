@@ -67,9 +67,10 @@ use onnx_runtime_ep_cpu::kernels::planar_block_quant::{
     PlanarLayout, validate_planar_values,
 };
 use onnx_runtime_ir::DataType;
+use onnx_runtime_memory_governor::ProviderContextIdentity;
 
 use crate::error::driver_err;
-use crate::provider::CudaExecutionProvider;
+use crate::provider::{CudaExecutionProvider, CudaSealedAllocation};
 use crate::runtime::{CudaRuntime, cuptr};
 
 /// Logical input elements per UE8M0 micro-scale in `fp4_planar` (MXFP4 block-32).
@@ -421,8 +422,7 @@ impl ValidatedPlanarLinear {
 }
 
 pub(crate) struct ImmutablePlanarDeviceBuffer {
-    provider: Arc<CudaExecutionProvider>,
-    buffer: Option<DeviceBuffer>,
+    allocation: CudaSealedAllocation,
 }
 
 impl ImmutablePlanarDeviceBuffer {
@@ -432,12 +432,9 @@ impl ImmutablePlanarDeviceBuffer {
         label: &str,
     ) -> Result<Self> {
         let buffer = provider
-            .allocate(bytes.len(), 256)
+            .allocate_sealed(bytes.len(), 256)
             .map_err(|err| kernel_err(format!("allocate immutable {label}: {err}")))?;
-        let owned = Self {
-            provider: Arc::clone(provider),
-            buffer: Some(buffer),
-        };
+        let owned = Self { allocation: buffer };
         // SAFETY: the fresh allocation is exactly `bytes.len()` bytes and remains
         // exclusively owned by `owned`; no public API exposes mutable access.
         unsafe {
@@ -450,9 +447,7 @@ impl ImmutablePlanarDeviceBuffer {
     }
 
     pub(crate) fn buffer(&self) -> &DeviceBuffer {
-        self.buffer
-            .as_ref()
-            .expect("immutable planar buffer is taken only during drop")
+        self.allocation.buffer()
     }
 
     pub(crate) fn ptr(&self) -> CUdeviceptr {
@@ -460,12 +455,9 @@ impl ImmutablePlanarDeviceBuffer {
     }
 }
 
-impl Drop for ImmutablePlanarDeviceBuffer {
-    fn drop(&mut self) {
-        if let Some(buffer) = self.buffer.take() {
-            let _ = self.provider.deallocate(buffer);
-        }
-    }
+struct PlanarLinearBanks {
+    packed: ImmutablePlanarDeviceBuffer,
+    scale: ImmutablePlanarDeviceBuffer,
 }
 
 /// Sealed admission for one planar linear bank.
@@ -480,7 +472,10 @@ impl Drop for ImmutablePlanarDeviceBuffer {
 /// There is deliberately no content-addressed admission cache. Provider-internal
 /// stable-VA remapping may retain an admission only when allocation ownership
 /// and immutable content identity are preserved; replacing or mutating backing
-/// storage invalidates the handle and requires a fresh atomic admission.
+/// storage invalidates the handle and requires a fresh atomic admission. During
+/// CUDA graph capture the graph registry strongly owns the sealed banks, so no
+/// release, remap, or content replacement can become reachable until every
+/// graph pin is reset or destroyed.
 ///
 /// ```
 /// fn accepts(_: &onnx_runtime_ep_cuda::AdmittedPlanarLinear) {}
@@ -499,11 +494,14 @@ impl Drop for ImmutablePlanarDeviceBuffer {
 /// requires_clone::<AdmittedPlanarLinear>();
 /// ```
 pub struct AdmittedPlanarLinear {
-    runtime: Arc<CudaRuntime>,
+    // Declared before `provider`: an eager-only admission releases its banks
+    // while the provider queue is still open. Captured graphs retain `banks`
+    // directly without retaining the provider/runtime cycle.
+    banks: Arc<PlanarLinearBanks>,
+    provider: Arc<CudaExecutionProvider>,
     device: onnx_runtime_ir::DeviceId,
+    provider_context: ProviderContextIdentity,
     validation: ValidatedPlanarLinear,
-    packed: ImmutablePlanarDeviceBuffer,
-    scale: ImmutablePlanarDeviceBuffer,
 }
 
 impl AdmittedPlanarLinear {
@@ -537,11 +535,11 @@ pub fn admit_planar_linear(
     let packed = ImmutablePlanarDeviceBuffer::upload(provider, packed, "packed weights")?;
     let scale = ImmutablePlanarDeviceBuffer::upload(provider, scale, "aux scales")?;
     Ok(AdmittedPlanarLinear {
-        runtime: Arc::clone(provider.runtime()),
+        banks: Arc::new(PlanarLinearBanks { packed, scale }),
+        provider: Arc::clone(provider),
         device: provider.device_id(),
+        provider_context: provider.provider_context_identity(),
         validation,
-        packed,
-        scale,
     })
 }
 
@@ -611,16 +609,38 @@ pub fn launch_planar_linear(
                 buffer.len()
             )));
         }
+        let context = buffer
+            .bound_owner()
+            .ok_or_else(|| {
+                kernel_err(format!(
+                    "{label} has no binding-issued provider-context identity"
+                ))
+            })?
+            .identity()
+            .binding()
+            .provider_context();
+        if context != admission.provider_context {
+            return Err(kernel_err(format!(
+                "{label} provider context {context:?} does not match admitted bank context {:?}",
+                admission.provider_context
+            )));
+        }
     }
+    let runtime = admission.provider.runtime();
+    runtime.retain_active_graph_resource(
+        Arc::as_ptr(&admission.banks) as usize,
+        &admission.banks,
+        "planar linear bank",
+    )?;
     let ptrs = PlanarLinearRawPtrs {
         activation: cuptr(activation.as_ptr()),
-        packed: admission.packed.ptr(),
-        scale: admission.scale.ptr(),
+        packed: admission.banks.packed.ptr(),
+        scale: admission.banks.scale.ptr(),
         output: cuptr(output.as_mut_ptr()),
     };
     // SAFETY: the sealed admission owns the exact immutable bank allocations;
     // activation/output device and extents were checked above.
-    unsafe { launch_planar_linear_raw(&admission.runtime, dtype, dims, &ptrs) }
+    unsafe { launch_planar_linear_raw(runtime, dtype, dims, &ptrs) }
 }
 
 unsafe fn launch_planar_linear_raw(
@@ -679,20 +699,30 @@ unsafe fn launch_planar_linear_raw(
     Ok(())
 }
 
-#[cfg(any(test, feature = "gpu-tests"))]
+#[doc(hidden)]
 pub fn test_reject_planar_linear_bank_substitution(
     admission: &AdmittedPlanarLinear,
     packed: &DeviceBuffer,
     scale: &DeviceBuffer,
 ) -> Result<()> {
-    if cuptr(packed.as_ptr()) != admission.packed.ptr()
-        || cuptr(scale.as_ptr()) != admission.scale.ptr()
+    if cuptr(packed.as_ptr()) != admission.banks.packed.ptr()
+        || cuptr(scale.as_ptr()) != admission.banks.scale.ptr()
     {
         return Err(kernel_err(
             "raw packed/scale substitution does not match the sealed admitted allocations",
         ));
     }
     Ok(())
+}
+
+#[doc(hidden)]
+pub fn test_planar_linear_bank_addresses(admission: &AdmittedPlanarLinear) -> [CUdeviceptr; 2] {
+    [admission.banks.packed.ptr(), admission.banks.scale.ptr()]
+}
+
+#[doc(hidden)]
+pub fn test_planar_linear_bank_owner_count(admission: &AdmittedPlanarLinear) -> usize {
+    Arc::strong_count(&admission.banks)
 }
 
 /// Planar matmul weight formats with a proven, launched CUDA kernel on this

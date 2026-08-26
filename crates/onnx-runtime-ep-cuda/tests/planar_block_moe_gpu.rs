@@ -43,6 +43,7 @@ use onnx_runtime_ep_cuda::{
     AdmittedPlanarMoe, CudaExecutionProvider, PLANAR_FORMAT_BLOCK_FP8, PLANAR_FORMAT_FP4_PLANAR,
     PlanarMoeBank, PlanarMoeBufferLengths, PlanarMoeBuffers, PlanarMoeDims, PlanarMoeProjection,
     admit_planar_moe, launch_planar_moe, planar_moe_capable_formats,
+    test_planar_moe_bank_addresses, test_planar_moe_bank_owner_count,
     test_reject_planar_moe_bank_substitution, warm_planar_moe,
 };
 use std::sync::Arc;
@@ -1256,6 +1257,7 @@ fn sealed_moe_admission_rejects_projection_substitution() {
 fn capture_replay_parity() {
     let ep = require_cuda();
     let runtime = ep.runtime();
+    let accounting_baseline = ep.device_allocation_counts().unwrap();
     let (hidden, inter, experts, top_k) = (256usize, 128usize, 4usize, 2usize);
     let fc1 = Projection::build(PLANAR_FORMAT_BLOCK_FP8, hidden, inter, experts, 0x40, true);
     let fc2 = Projection::build(PLANAR_FORMAT_FP4_PLANAR, inter, hidden, experts, 0x41, true);
@@ -1306,10 +1308,40 @@ fn capture_replay_parity() {
     );
     launch_planar_moe(&admission, &mut buffers.launch_buffers()).unwrap();
     runtime.end_graph_capture().unwrap();
+    assert_eq!(
+        test_planar_moe_bank_owner_count(&admission),
+        2,
+        "the installed graph must hold exactly one strong MoE bank pin"
+    );
     #[cfg(feature = "gpu-tests")]
     assert_eq!(planar_moe_source_build_count(), 1);
     assert_eq!(runtime.allocation_counts(), capture_allocations);
     assert_eq!(runtime.transfer_counts(), capture_transfers);
+
+    let bank_addresses = test_planar_moe_bank_addresses(&admission);
+    let pinned_frees = ep.device_allocation_counts().unwrap().1;
+    drop(admission);
+    assert_eq!(
+        ep.device_allocation_counts().unwrap().1,
+        pinned_frees,
+        "dropping the caller handle must not free graph-embedded MoE banks"
+    );
+    let probes = [
+        ep.allocate(fc1.packed_bank.len(), 256).unwrap(),
+        ep.allocate(fc1.scale_bank.len(), 256).unwrap(),
+        ep.allocate(fc2.packed_bank.len(), 256).unwrap(),
+        ep.allocate(fc2.scale_bank.len(), 256).unwrap(),
+    ];
+    for probe in &probes {
+        assert!(
+            !bank_addresses.contains(&cuptr(probe.as_ptr())),
+            "allocator reused a graph-pinned MoE bank address"
+        );
+    }
+    for probe in probes {
+        ep.deallocate(probe).unwrap();
+    }
+    ep.wait_for_deferred_releases().unwrap();
 
     let zeros = vec![0u8; dims.rows * hidden * 4];
     for replay in 0..3 {
@@ -1346,8 +1378,22 @@ fn capture_replay_parity() {
         );
     }
 
-    runtime.reset_graph().unwrap();
+    let before_reset_frees = ep.device_allocation_counts().unwrap().1;
+    assert!(runtime.reset_graph().unwrap());
+    ep.wait_for_deferred_releases().unwrap();
+    assert_eq!(
+        ep.device_allocation_counts().unwrap().1,
+        before_reset_frees + 4,
+        "graph reset must release all four sealed MoE projection allocations exactly once"
+    );
     free_moe(&ep, buffers);
+    ep.wait_for_deferred_releases().unwrap();
+    let settled = ep.device_allocation_counts().unwrap();
+    assert_eq!(
+        settled.0 - accounting_baseline.0,
+        settled.1 - accounting_baseline.1,
+        "capture/reset teardown must return MoE allocations to the exact accounting baseline"
+    );
 }
 
 /// The advertised routed-MoE capability strings must be exactly the two planar

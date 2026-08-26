@@ -32,7 +32,7 @@
 )]
 
 use half::{bf16, f16};
-use onnx_runtime_ep_api::{DeviceBuffer, ExecutionProvider};
+use onnx_runtime_ep_api::{DeviceBuffer, DeviceGraphSlot, ExecutionProvider};
 use onnx_runtime_ep_cpu::kernels::planar_block_quant::{
     FP4_MICROSCALE_BLOCK, FP4_PACK_FACTOR, PlanarBlockFormat, PlanarLayout, planar_block_matmul,
 };
@@ -40,7 +40,9 @@ use onnx_runtime_ep_cuda::runtime::cuptr;
 use onnx_runtime_ep_cuda::{
     CudaExecutionProvider, PLANAR_FORMAT_BLOCK_FP8, PLANAR_FORMAT_FP4_PLANAR,
     PlanarActivationDtype, PlanarLinearDims, admit_planar_linear, launch_planar_linear,
-    planar_matmul_capable_formats, test_reject_planar_linear_bank_substitution, warm_planar_linear,
+    planar_matmul_capable_formats, test_planar_linear_bank_addresses,
+    test_planar_linear_bank_owner_count, test_reject_planar_linear_bank_substitution,
+    warm_planar_linear,
 };
 use std::sync::Arc;
 
@@ -766,6 +768,7 @@ fn sealed_admission_rejects_bank_substitution() {
 fn capture_replay_parity() {
     let ep = require_cuda();
     let runtime = ep.runtime();
+    let accounting_baseline = ep.device_allocation_counts().unwrap();
 
     let (m, out, in_features, bs) = (4usize, 64usize, 128usize, 128usize);
     let (packed, scale) = block_fp8_fixture(out, in_features, bs, 0x5eed);
@@ -810,8 +813,37 @@ fn capture_replay_parity() {
     );
     launch_planar_linear(&admission, PlanarActivationDtype::F32, &a_buf, &mut out_buf).unwrap();
     runtime.end_graph_capture().unwrap();
+    assert_eq!(
+        test_planar_linear_bank_owner_count(&admission),
+        2,
+        "the installed graph must hold exactly one strong bank pin"
+    );
     assert_eq!(runtime.allocation_counts(), capture_allocations);
     assert_eq!(runtime.transfer_counts(), capture_transfers);
+
+    let bank_addresses = test_planar_linear_bank_addresses(&admission);
+    let pinned_frees = ep.device_allocation_counts().unwrap().1;
+    drop(admission);
+    assert_eq!(
+        ep.device_allocation_counts().unwrap().1,
+        pinned_frees,
+        "dropping the caller handle must not free graph-embedded banks"
+    );
+
+    // Attempt allocator VA reuse with the exact bank sizes. Both admitted
+    // addresses remain live while the graph owns them, so neither fresh
+    // allocation may alias either captured address.
+    let packed_probe = ep.allocate(packed.len(), 256).unwrap();
+    let scale_probe = ep.allocate(scale.len(), 256).unwrap();
+    for probe in [&packed_probe, &scale_probe] {
+        assert!(
+            !bank_addresses.contains(&cuptr(probe.as_ptr())),
+            "allocator reused a graph-pinned bank address"
+        );
+    }
+    ep.deallocate(packed_probe).unwrap();
+    ep.deallocate(scale_probe).unwrap();
+    ep.wait_for_deferred_releases().unwrap();
 
     let zeros = vec![0u8; out_bytes];
     for replay in 0..3 {
@@ -843,9 +875,157 @@ fn capture_replay_parity() {
         );
     }
 
-    runtime.reset_graph().unwrap();
+    let before_reset_frees = ep.device_allocation_counts().unwrap().1;
+    assert!(runtime.reset_graph().unwrap());
+    ep.wait_for_deferred_releases().unwrap();
+    assert_eq!(
+        ep.device_allocation_counts().unwrap().1,
+        before_reset_frees + 2,
+        "graph reset must release the packed and scale banks exactly once: {:?}",
+        ep.deferred_release_stats()
+    );
     ep.deallocate(a_buf).unwrap();
     ep.deallocate(out_buf).unwrap();
+    ep.wait_for_deferred_releases().unwrap();
+    let settled = ep.device_allocation_counts().unwrap();
+    assert_eq!(
+        settled.0 - accounting_baseline.0,
+        settled.1 - accounting_baseline.1,
+        "capture/reset teardown must return planar allocations to the exact accounting baseline"
+    );
+}
+
+#[test]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+fn graph_bank_pins_are_per_graph_and_abort_safe() {
+    let ep = require_cuda();
+    let runtime = ep.runtime();
+    let (packed, scale) = block_fp8_fixture(32, 32, 32, 0x9911);
+    let dims = PlanarLinearDims {
+        format: PLANAR_FORMAT_BLOCK_FP8,
+        m_rows: 1,
+        in_features: 32,
+        out_features: 32,
+        bs0: 32,
+        bs1: 32,
+    };
+    let (a_bytes, _) = quantize_activation(&[1.0; 32], PlanarActivationDtype::F32);
+    let a_buf = upload(&ep, &a_bytes);
+    let mut out_buf = ep.allocate(32 * 4, 256).unwrap();
+    let admission = admit_planar_linear(&ep, &dims, 32, &packed, &scale, 32).unwrap();
+    warm_planar_linear(runtime).unwrap();
+
+    runtime.begin_graph_capture(&[]).unwrap();
+    launch_planar_linear(&admission, PlanarActivationDtype::F32, &a_buf, &mut out_buf).unwrap();
+    runtime.abort_graph_capture().unwrap();
+    assert_eq!(
+        test_planar_linear_bank_owner_count(&admission),
+        1,
+        "aborted capture must unwind its provisional bank pin"
+    );
+
+    for slot in [DeviceGraphSlot::Primary, DeviceGraphSlot::Verify] {
+        runtime.begin_graph_capture_in(slot, &[]).unwrap();
+        launch_planar_linear(&admission, PlanarActivationDtype::F32, &a_buf, &mut out_buf).unwrap();
+        runtime.end_graph_capture_in(slot).unwrap();
+    }
+    assert_eq!(
+        test_planar_linear_bank_owner_count(&admission),
+        3,
+        "two graphs sharing one bank require two independent pins"
+    );
+    let before_drop_frees = ep.device_allocation_counts().unwrap().1;
+    drop(admission);
+    assert_eq!(ep.device_allocation_counts().unwrap().1, before_drop_frees);
+
+    assert!(runtime.reset_graph_in(DeviceGraphSlot::Primary).unwrap());
+    ep.wait_for_deferred_releases().unwrap();
+    assert_eq!(
+        ep.device_allocation_counts().unwrap().1,
+        before_drop_frees,
+        "resetting one graph must not release a bank pinned by its sibling"
+    );
+    for _ in 0..3 {
+        runtime.replay_graph_in(DeviceGraphSlot::Verify).unwrap();
+    }
+    runtime.synchronize().unwrap();
+    assert!(runtime.reset_graph_in(DeviceGraphSlot::Verify).unwrap());
+    ep.wait_for_deferred_releases().unwrap();
+    assert_eq!(
+        ep.device_allocation_counts().unwrap().1,
+        before_drop_frees + 2,
+        "{:?}",
+        ep.deferred_release_stats()
+    );
+
+    ep.deallocate(a_buf).unwrap();
+    ep.deallocate(out_buf).unwrap();
+}
+
+#[test]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+fn unregistered_capture_and_foreign_context_are_rejected_before_launch() {
+    let ep = require_cuda();
+    let runtime = ep.runtime();
+    let (packed, scale) = block_fp8_fixture(32, 32, 32, 0x5511);
+    let dims = PlanarLinearDims {
+        format: PLANAR_FORMAT_BLOCK_FP8,
+        m_rows: 1,
+        in_features: 32,
+        out_features: 32,
+        bs0: 32,
+        bs1: 32,
+    };
+    let admission = admit_planar_linear(&ep, &dims, 32, &packed, &scale, 32).unwrap();
+    let (a_bytes, _) = quantize_activation(&[1.0; 32], PlanarActivationDtype::F32);
+    let a_buf = upload(&ep, &a_bytes);
+    let mut out_buf = ep.allocate(32 * 4, 256).unwrap();
+    warm_planar_linear(runtime).unwrap();
+
+    runtime.test_begin_unregistered_graph_capture().unwrap();
+    let error = launch_planar_linear(&admission, PlanarActivationDtype::F32, &a_buf, &mut out_buf)
+        .expect_err("capture without a lifecycle ownership sink must reject");
+    assert!(error.to_string().contains("no registered ownership sink"));
+    runtime.test_end_unregistered_graph_capture().unwrap();
+
+    let foreign = require_cuda();
+    let foreign_a = upload(&foreign, &a_bytes);
+    let mut foreign_out = foreign.allocate(32 * 4, 256).unwrap();
+    let error = launch_planar_linear(
+        &admission,
+        PlanarActivationDtype::F32,
+        &foreign_a,
+        &mut foreign_out,
+    )
+    .expect_err("same-device buffers from a different provider context must reject");
+    assert!(error.to_string().contains("provider context"));
+
+    if let Ok(other_device) = CudaExecutionProvider::new(1) {
+        let other_device = Arc::new(other_device);
+        let other_a = upload(&other_device, &a_bytes);
+        let mut other_out = other_device.allocate(32 * 4, 256).unwrap();
+        let error = launch_planar_linear(
+            &admission,
+            PlanarActivationDtype::F32,
+            &other_a,
+            &mut other_out,
+        )
+        .expect_err("buffers from a different CUDA device must reject");
+        assert!(error.to_string().contains("device"));
+        other_device.deallocate(other_a).unwrap();
+        other_device.deallocate(other_out).unwrap();
+    }
+
+    ep.deallocate(a_buf).unwrap();
+    ep.deallocate(out_buf).unwrap();
+    foreign.deallocate(foreign_a).unwrap();
+    foreign.deallocate(foreign_out).unwrap();
 }
 
 /// The advertised capability strings the Mobius #602 / Deckard #593 planar

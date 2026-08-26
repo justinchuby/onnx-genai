@@ -71,6 +71,7 @@ use onnx_runtime_ep_cpu::kernels::planar_block_quant::{
     FP4_MICROSCALE_BLOCK as CPU_FP4_MICROSCALE_BLOCK, PlanarBankIdentity, PlanarBlockFormat,
     PlanarLayout, validate_planar_expert_bank_values,
 };
+use onnx_runtime_memory_governor::ProviderContextIdentity;
 
 use crate::error::driver_err;
 use crate::kernels::block_quantized_matmul::decoder_prelude;
@@ -659,6 +660,12 @@ impl AdmittedPlanarMoeProjection {
     }
 }
 
+struct PlanarMoeBanks {
+    fc1: AdmittedPlanarMoeProjection,
+    fc2: AdmittedPlanarMoeProjection,
+    fc3: Option<AdmittedPlanarMoeProjection>,
+}
+
 /// Sealed admission for all planar routed-MoE projection banks.
 ///
 /// FC1, FC2, and optional FC3 each own their exact immutable packed-weight and
@@ -671,7 +678,10 @@ impl AdmittedPlanarMoeProjection {
 /// provider-internal stable-VA remap may preserve this handle only while the
 /// same immutable content and allocation ownership remain bound to its runtime
 /// and device. Destructive movement or replacement must invalidate/drop the
-/// handle and atomically re-admit the new bytes.
+/// handle and atomically re-admit the new bytes. During CUDA graph capture the
+/// graph registry strongly owns every projection bank, so release, remap, and
+/// content replacement stay unreachable until every graph pin is reset or
+/// destroyed.
 ///
 /// ```
 /// fn accepts(_: &onnx_runtime_ep_cuda::AdmittedPlanarMoe) {}
@@ -688,14 +698,15 @@ impl AdmittedPlanarMoeProjection {
 /// requires_clone::<AdmittedPlanarMoe>();
 /// ```
 pub struct AdmittedPlanarMoe {
-    runtime: Arc<CudaRuntime>,
+    // See `AdmittedPlanarLinear`: graphs retain only these sealed allocations,
+    // never the provider/runtime that owns the graph registry.
+    banks: Arc<PlanarMoeBanks>,
+    provider: Arc<CudaExecutionProvider>,
     device: onnx_runtime_ir::DeviceId,
+    provider_context: ProviderContextIdentity,
     dims: PlanarMoeDims,
     buffers: PlanarMoeBufferLengths,
     routes: usize,
-    fc1: AdmittedPlanarMoeProjection,
-    fc2: AdmittedPlanarMoeProjection,
-    fc3: Option<AdmittedPlanarMoeProjection>,
 }
 
 impl AdmittedPlanarMoe {
@@ -709,9 +720,10 @@ impl AdmittedPlanarMoe {
 
     pub fn diagnostic_bank_identities(&self) -> [Option<PlanarBankIdentity>; 3] {
         [
-            Some(self.fc1.validation.identity),
-            Some(self.fc2.validation.identity),
-            self.fc3
+            Some(self.banks.fc1.validation.identity),
+            Some(self.banks.fc2.validation.identity),
+            self.banks
+                .fc3
                 .as_ref()
                 .map(|projection| projection.validation.identity),
         ]
@@ -748,14 +760,13 @@ pub fn admit_planar_moe(
         }
     };
     Ok(AdmittedPlanarMoe {
-        runtime: Arc::clone(provider.runtime()),
+        banks: Arc::new(PlanarMoeBanks { fc1, fc2, fc3 }),
+        provider: Arc::clone(provider),
         device: provider.device_id(),
+        provider_context: provider.provider_context_identity(),
         dims: validation.dims,
         buffers: validation.buffers,
         routes: validation.routes,
-        fc1,
-        fc2,
-        fc3,
     })
 }
 
@@ -816,6 +827,7 @@ fn exact_f32_bytes(elements: usize, label: &str) -> Result<usize> {
 
 fn require_buffer(
     device: onnx_runtime_ir::DeviceId,
+    provider_context: ProviderContextIdentity,
     label: &str,
     buffer: &DeviceBuffer,
     bytes: usize,
@@ -832,18 +844,41 @@ fn require_buffer(
             buffer.len()
         )));
     }
+    let context = buffer
+        .bound_owner()
+        .ok_or_else(|| {
+            kernel_err(format!(
+                "{label} has no binding-issued provider-context identity"
+            ))
+        })?
+        .identity()
+        .binding()
+        .provider_context();
+    if context != provider_context {
+        return Err(kernel_err(format!(
+            "{label} provider context {context:?} does not match admitted bank context \
+             {provider_context:?}"
+        )));
+    }
     Ok(())
 }
 
 fn require_optional_buffer(
     device: onnx_runtime_ir::DeviceId,
+    provider_context: ProviderContextIdentity,
     label: &str,
     buffer: Option<&DeviceBuffer>,
     elements: Option<usize>,
 ) -> Result<CUdeviceptr> {
     match (buffer, elements) {
         (Some(buffer), Some(elements)) => {
-            require_buffer(device, label, buffer, exact_f32_bytes(elements, label)?)?;
+            require_buffer(
+                device,
+                provider_context,
+                label,
+                buffer,
+                exact_f32_bytes(elements, label)?,
+            )?;
             Ok(cuptr(buffer.as_ptr()))
         }
         (None, None) => Ok(0),
@@ -861,48 +896,57 @@ fn validate_planar_moe_buffers(
     buffers: &mut PlanarMoeBuffers<'_>,
 ) -> Result<PlanarMoeRawPtrs> {
     let device = admission.device;
+    let provider_context = admission.provider_context;
     let lengths = admission.buffers();
     require_buffer(
         device,
+        provider_context,
         "input",
         buffers.input,
         exact_f32_bytes(lengths.input_elems, "input")?,
     )?;
     require_buffer(
         device,
+        provider_context,
         "router_logits",
         buffers.router_logits,
         exact_f32_bytes(lengths.router_logits_elems, "router_logits")?,
     )?;
     let router_weights = require_optional_buffer(
         device,
+        provider_context,
         "router_weights",
         buffers.router_weights,
         lengths.router_weights_elems,
     )?;
     let fc1_bias = require_optional_buffer(
         device,
+        provider_context,
         "fc1_bias",
         buffers.fc1_bias,
-        admission.fc1.validation.bias_elems,
+        admission.banks.fc1.validation.bias_elems,
     )?;
     let fc2_bias = require_optional_buffer(
         device,
+        provider_context,
         "fc2_bias",
         buffers.fc2_bias,
-        admission.fc2.validation.bias_elems,
+        admission.banks.fc2.validation.bias_elems,
     )?;
     let fc3_bias = require_optional_buffer(
         device,
+        provider_context,
         "fc3_bias",
         buffers.fc3_bias,
         admission
+            .banks
             .fc3
             .as_ref()
             .and_then(|projection| projection.validation.bias_elems),
     )?;
     require_buffer(
         device,
+        provider_context,
         "route_indices",
         buffers.route_indices,
         lengths
@@ -912,36 +956,42 @@ fn validate_planar_moe_buffers(
     )?;
     require_buffer(
         device,
+        provider_context,
         "route_weights",
         buffers.route_weights,
         exact_f32_bytes(lengths.route_weights_elems, "route_weights")?,
     )?;
     require_buffer(
         device,
+        provider_context,
         "fc1_output",
         buffers.fc1_output,
         exact_f32_bytes(lengths.fc1_output_elems, "fc1_output")?,
     )?;
     let fc3_output = require_optional_buffer(
         device,
+        provider_context,
         "fc3_output",
         buffers.fc3_output.as_deref(),
         lengths.fc3_output_elems,
     )?;
     require_buffer(
         device,
+        provider_context,
         "activated",
         buffers.activated,
         exact_f32_bytes(lengths.activated_elems, "activated")?,
     )?;
     require_buffer(
         device,
+        provider_context,
         "route_output",
         buffers.route_output,
         exact_f32_bytes(lengths.route_output_elems, "route_output")?,
     )?;
     require_buffer(
         device,
+        provider_context,
         "output",
         buffers.output,
         exact_f32_bytes(lengths.output_elems, "output")?,
@@ -1100,7 +1150,12 @@ pub fn launch_planar_moe(
     buffers: &mut PlanarMoeBuffers<'_>,
 ) -> Result<()> {
     let ptrs = validate_planar_moe_buffers(admission, buffers)?;
-    let runtime = &admission.runtime;
+    let runtime = admission.provider.runtime();
+    runtime.retain_active_graph_resource(
+        Arc::as_ptr(&admission.banks) as usize,
+        &admission.banks,
+        "planar MoE projection banks",
+    )?;
     let dims = admission.dims();
     let routes = admission.routes;
 
@@ -1137,7 +1192,7 @@ pub fn launch_planar_moe(
     // 2. FC1 (and optional FC3 gate): token rows shared across a token's routes.
     launch_planar_linear(
         runtime,
-        &admission.fc1,
+        &admission.banks.fc1,
         ptrs.input,
         ptrs.route_indices,
         ptrs.fc1_bias,
@@ -1146,7 +1201,7 @@ pub fn launch_planar_moe(
         dims.top_k,
         false,
     )?;
-    if let Some(fc3) = admission.fc3.as_ref() {
+    if let Some(fc3) = admission.banks.fc3.as_ref() {
         launch_planar_linear(
             runtime,
             fc3,
@@ -1203,7 +1258,7 @@ pub fn launch_planar_moe(
     // 4. FC2 down-projection: input rows are per-route activations.
     launch_planar_linear(
         runtime,
-        &admission.fc2,
+        &admission.banks.fc2,
         ptrs.activated,
         ptrs.route_indices,
         ptrs.fc2_bias,
@@ -1241,7 +1296,7 @@ pub fn launch_planar_moe(
     Ok(())
 }
 
-#[cfg(any(test, feature = "gpu-tests"))]
+#[doc(hidden)]
 pub fn test_reject_planar_moe_bank_substitution(
     admission: &AdmittedPlanarMoe,
     projection: usize,
@@ -1249,9 +1304,10 @@ pub fn test_reject_planar_moe_bank_substitution(
     scale: &DeviceBuffer,
 ) -> Result<()> {
     let admitted = match projection {
-        0 => &admission.fc1,
-        1 => &admission.fc2,
+        0 => &admission.banks.fc1,
+        1 => &admission.banks.fc2,
         2 => admission
+            .banks
             .fc3
             .as_ref()
             .ok_or_else(|| kernel_err("fc3 substitution requested without admitted fc3"))?,
@@ -1269,6 +1325,26 @@ pub fn test_reject_planar_moe_bank_substitution(
         ));
     }
     Ok(())
+}
+
+#[doc(hidden)]
+pub fn test_planar_moe_bank_addresses(admission: &AdmittedPlanarMoe) -> Vec<CUdeviceptr> {
+    let mut addresses = vec![
+        admission.banks.fc1.packed.ptr(),
+        admission.banks.fc1.scale.ptr(),
+        admission.banks.fc2.packed.ptr(),
+        admission.banks.fc2.scale.ptr(),
+    ];
+    if let Some(fc3) = admission.banks.fc3.as_ref() {
+        addresses.push(fc3.packed.ptr());
+        addresses.push(fc3.scale.ptr());
+    }
+    addresses
+}
+
+#[doc(hidden)]
+pub fn test_planar_moe_bank_owner_count(admission: &AdmittedPlanarMoe) -> usize {
+    Arc::strong_count(&admission.banks)
 }
 
 /// Planar weight formats with a proven, launched routed top-k MoE kernel on this

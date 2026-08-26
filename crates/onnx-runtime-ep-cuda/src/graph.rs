@@ -12,6 +12,17 @@ use onnx_runtime_ep_api::{EpError, Result};
 
 use crate::error::driver_err;
 
+trait CapturedResource: Send + Sync {}
+
+impl<T> CapturedResource for T where T: Send + Sync {}
+
+/// One strongly owned resource whose address or contents were embedded in a
+/// captured graph segment.
+struct GraphResource {
+    identity: usize,
+    _owner: Arc<dyn CapturedResource>,
+}
+
 /// Whether the lifecycle is currently recording a segment, and on which thread.
 enum CaptureState {
     Idle,
@@ -26,12 +37,15 @@ struct CapturedGraph {
     graph: CUgraph,
     graph_exec: CUgraphExec,
     stream: Arc<CudaStream>,
+    /// Dropped only after `graph_exec` and `graph` are destroyed by `Drop`.
+    resources: Vec<GraphResource>,
 }
 
 impl CapturedGraph {
     fn end_capture(
         stream: &Arc<CudaStream>,
         flags: CUgraphInstantiate_flags,
+        resources: Vec<GraphResource>,
     ) -> std::result::Result<Option<Self>, cudarc::driver::DriverError> {
         stream.context().bind_to_thread()?;
         // SAFETY: this lifecycle holds the state mutex and `stream` is currently
@@ -61,6 +75,7 @@ impl CapturedGraph {
             graph,
             graph_exec,
             stream: stream.clone(),
+            resources,
         }))
     }
 
@@ -97,6 +112,12 @@ impl Drop for CapturedGraph {
             // replaces it with null before destroying it.
             context.record_err(unsafe { result::graph::destroy(graph) });
         }
+
+        // Graph launches already queued on `stream` may still be in flight.
+        // Releasing a resource enqueues its final allocation release behind the
+        // stream tail, so keeping the owners through handle destruction is the
+        // required ordering boundary.
+        self.resources.clear();
     }
 }
 
@@ -124,6 +145,10 @@ struct LifecycleState {
     /// device-synchronizing memory operation that would invalidate it. Set in
     /// `begin`, cleared on every exit from capture (`end`, `abort`, reset).
     exclusion: Option<CaptureExclusion>,
+    /// Resources provisionally retained by the active capture. On successful
+    /// instantiation these move into exactly one `CapturedGraph`; abort/failure
+    /// drops them after the half-recorded graph is destroyed.
+    capture_resources: Vec<GraphResource>,
     segments: Vec<CapturedGraph>,
 }
 
@@ -141,6 +166,7 @@ impl CudaGraphLifecycle {
             state: Mutex::new(LifecycleState {
                 capture: CaptureState::Idle,
                 exclusion: None,
+                capture_resources: Vec::new(),
                 segments: Vec::new(),
             }),
         }
@@ -166,6 +192,10 @@ impl CudaGraphLifecycle {
                 ));
             }
         }
+        debug_assert!(
+            state.capture_resources.is_empty(),
+            "idle CUDA graph lifecycle retained provisional resources"
+        );
 
         // Acquire *before* `cuStreamBeginCapture`: taking it afterwards leaves a
         // window in which the capture is live and unprotected. THREAD_LOCAL mode
@@ -208,9 +238,11 @@ impl CudaGraphLifecycle {
         // `end_capture` returns, and `?` below must not skip the release. As a
         // local, it drops at every exit from this function and never earlier.
         let _exclusion = state.exclusion.take();
+        let resources = std::mem::take(&mut state.capture_resources);
         let graph = CapturedGraph::end_capture(
             &self.stream,
             CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_USE_NODE_PRIORITY,
+            resources,
         )
         .map_err(|error| driver_err("end and instantiate CUDA graph capture", error))?
         .ok_or_else(|| {
@@ -291,6 +323,7 @@ impl CudaGraphLifecycle {
         // Released once this function returns, i.e. after `end_capture` has
         // taken the stream out of capture mode. See `end`.
         let _exclusion = state.exclusion.take();
+        let resources = std::mem::take(&mut state.capture_resources);
         // End the stream capture to drain the half-recorded graph, then drop it.
         // A mid-capture failure invalidates the capture, so end_capture may
         // report an error — but it still takes the stream out of capture mode,
@@ -298,10 +331,48 @@ impl CudaGraphLifecycle {
         if let Ok(Some(graph)) = CapturedGraph::end_capture(
             &self.stream,
             CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_USE_NODE_PRIORITY,
+            resources,
         ) {
             drop(graph);
         }
         Ok(())
+    }
+
+    /// Retain `owner` in the active capture on this lifecycle.
+    ///
+    /// Returns `false` when this slot is idle so the runtime can try its other
+    /// graph slot. A capture owned by another thread is a hard error: CUDA's
+    /// thread-local capture cannot safely accept launches or resources there.
+    pub(crate) fn retain_capture_resource<T>(&self, identity: usize, owner: &Arc<T>) -> Result<bool>
+    where
+        T: Send + Sync + 'static,
+    {
+        let mut state = self.lock()?;
+        match state.capture {
+            CaptureState::Idle => return Ok(false),
+            CaptureState::Capturing(capture_owner)
+                if capture_owner == std::thread::current().id() => {}
+            CaptureState::Capturing(_) => {
+                return Err(EpError::KernelFailed(
+                    "cuda_ep: CUDA graph capture resource registration must occur on the thread \
+                     that began the thread-local capture"
+                        .into(),
+                ));
+            }
+        }
+        if state
+            .capture_resources
+            .iter()
+            .any(|resource| resource.identity == identity)
+        {
+            return Ok(true);
+        }
+        let owner: Arc<dyn CapturedResource> = owner.clone();
+        state.capture_resources.push(GraphResource {
+            identity,
+            _owner: owner,
+        });
+        Ok(true)
     }
 
     pub(crate) fn reset(&self) -> Result<bool> {

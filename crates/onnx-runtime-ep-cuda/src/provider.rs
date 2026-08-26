@@ -39,7 +39,7 @@
 use std::collections::HashMap;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use onnx_runtime_ep_api::{
     BoundBufferOwnership, Cost, DeviceBuffer, DeviceGraphSlot, EpConfig, EpError,
@@ -51,11 +51,12 @@ use onnx_runtime_ir::{
     DataType, DeviceId, DeviceType, Graph, Node, NodeId, Shape, TensorLayout, ValueId,
 };
 use onnx_runtime_memory_governor::{
-    AllocationChargeMode, AllocationPublication, AllocationReleaseOutcome, AllocationRequest,
-    AllocationSettlementStatus, AllocationSettlementToken, AllocationSettlementWait,
-    AllocationStepError, AllocationTransactionError, BindingError, DeviceAllocator, MemoryRole,
-    OwningAllocation, ProcessMemoryManager, RegisteredMemoryAuthority, RegisteredMemoryContext,
-    RegisteredMemoryHolder, RegisteredMemoryMechanism, ScopedMemoryBinding, ScopedVirtualBacking,
+    AllocationChargeMode, AllocationIdentity, AllocationPublication, AllocationReleaseOutcome,
+    AllocationRequest, AllocationSettlementStatus, AllocationSettlementToken,
+    AllocationSettlementWait, AllocationStepError, AllocationTransactionError, BindingError,
+    DeviceAllocator, MemoryRole, OwningAllocation, ProcessMemoryManager, ProviderContextIdentity,
+    RegisteredMemoryAuthority, RegisteredMemoryContext, RegisteredMemoryHolder,
+    RegisteredMemoryMechanism, ScopedMemoryBinding, ScopedVirtualBacking,
 };
 
 use crate::deferred_release::{
@@ -208,6 +209,115 @@ impl ReleaseObserver for ManagedCudaReleaseAccounting {
         // SAFETY: this observer is stored on the exact queue action carrying the
         // prepared release paired with `settlement`.
         unsafe { self.settlement.settle(outcome) };
+    }
+}
+
+/// One immutable CUDA allocation that can outlive its public admission handle.
+///
+/// The graph registry may strongly own this value, so it deliberately carries
+/// only weak links back to the runtime and release queue. This avoids a
+/// `runtime -> graph -> allocation -> runtime` cycle while preserving the exact
+/// generation-checked allocation owner until the final graph pin is released.
+pub(crate) struct CudaSealedAllocation {
+    buffer: Option<DeviceBuffer>,
+    runtime: Weak<CudaRuntime>,
+    release_queue: Weak<CudaDeferredReleaseQueue>,
+    identity: AllocationIdentity,
+    observer: Arc<dyn ReleaseObserver>,
+}
+
+impl CudaSealedAllocation {
+    pub(crate) fn buffer(&self) -> &DeviceBuffer {
+        self.buffer
+            .as_ref()
+            .expect("sealed CUDA allocation is taken only during drop")
+    }
+
+    fn release(&mut self) -> Result<()> {
+        let Some(buffer) = self.buffer.take() else {
+            return Ok(());
+        };
+        let queue = self.release_queue.upgrade().ok_or_else(|| {
+            EpError::KernelFailed(format!(
+                "cuda_ep: sealed allocation {:?} outlived its provider release queue; retaining \
+                 ownership rather than issuing an unordered free",
+                self.identity
+            ))
+        })?;
+        if let Some(runtime) = self.runtime.upgrade() {
+            runtime.invalidate_interleaved_for(cuptr(buffer.as_ptr()), buffer.len());
+        }
+        let ownership = buffer.into_bound_ownership().map_err(|foreign| {
+            EpError::KernelFailed(format!(
+                "cuda_ep: sealed allocation at {:#x} lost binding-issued ownership; retaining it \
+                 rather than freeing by address",
+                cuptr(foreign.as_ptr())
+            ))
+        })?;
+        if ownership.owner().identity() != self.identity {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep: sealed allocation identity changed from {:?} to {:?}; refusing a stale \
+                 release",
+                self.identity,
+                ownership.owner().identity()
+            )));
+        }
+        let (prepared, settlement, observer) = match ownership {
+            BoundBufferOwnership::Binding(owner) => {
+                let prepared = owner.prepare_release().map_err(|error| {
+                    let (error, _owner) = error.into_parts();
+                    binding_failure("cannot prepare a sealed CUDA allocation release", error)
+                })?;
+                (prepared, None, Some(Arc::clone(&self.observer)))
+            }
+            BoundBufferOwnership::Managed(owner) => {
+                let prepared = owner.prepare_release().map_err(|error| {
+                    let (error, _owner) = error.into_parts();
+                    manager_failure(
+                        "cannot prepare a managed sealed CUDA allocation release",
+                        AllocationTransactionError::Binding(error),
+                    )
+                })?;
+                // SAFETY: the request and settlement remain paired in the queue
+                // observer and in the enqueue-refusal branch below.
+                let (prepared, settlement) = unsafe { prepared.into_parts() };
+                let observer: Arc<dyn ReleaseObserver> = Arc::new(ManagedCudaReleaseAccounting {
+                    provider: Arc::clone(&self.observer),
+                    settlement: settlement.clone(),
+                });
+                (prepared, Some(settlement), Some(observer))
+            }
+        };
+        match queue.enqueue_prepared(prepared, observer) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let rejection = error.rejection();
+                let outcome = error.quarantine();
+                if let Some(settlement) = settlement {
+                    // SAFETY: this outcome came from the exact refused request
+                    // paired with the settlement token.
+                    unsafe { settlement.settle(&outcome) };
+                }
+                Err(EpError::KernelFailed(format!(
+                    "cuda_ep: the deferred release queue refused sealed allocation {:?} ({}); \
+                     ownership is quarantined ({}) and {} byte(s) remain charged",
+                    self.identity,
+                    rejection.name(),
+                    outcome.state(),
+                    outcome
+                        .residual()
+                        .map_or(0, |residual| residual.retained_bytes)
+                )))
+            }
+        }
+    }
+}
+
+impl Drop for CudaSealedAllocation {
+    fn drop(&mut self) {
+        if let Err(error) = self.release() {
+            eprintln!("cuda_ep: WARNING: {error}");
+        }
     }
 }
 
@@ -1853,6 +1963,33 @@ impl CudaExecutionProvider {
         Arc::new(CudaReleaseAccounting {
             attribution: Arc::clone(&self.attribution),
             frees: Arc::clone(&self.ep_frees),
+        })
+    }
+
+    pub(crate) fn provider_context_identity(&self) -> ProviderContextIdentity {
+        self.memory_binding.context.identity()
+    }
+
+    pub(crate) fn allocate_sealed(
+        &self,
+        bytes: usize,
+        align: usize,
+    ) -> Result<CudaSealedAllocation> {
+        let buffer = <Self as ExecutionProvider>::allocate(self, bytes, align)?;
+        let identity = buffer
+            .bound_owner()
+            .ok_or_else(|| {
+                EpError::KernelFailed(
+                    "cuda_ep: a fresh sealed allocation carries no binding-issued ownership".into(),
+                )
+            })?
+            .identity();
+        Ok(CudaSealedAllocation {
+            buffer: Some(buffer),
+            runtime: Arc::downgrade(&self.runtime),
+            release_queue: Arc::downgrade(&self.release_queue),
+            identity,
+            observer: self.release_accounting(),
         })
     }
 
@@ -3856,6 +3993,12 @@ impl Drop for CudaExecutionProvider {
     /// returns. Nothing here panics, synchronizes, or joins a thread.
     fn drop(&mut self) {
         self.closed.store(true, Ordering::Release);
+        // Graph executables are the final owners of any sealed allocations whose
+        // addresses they embedded. Destroy both slots while the release queue is
+        // still open so those owners can enqueue exactly-once, stream-ordered
+        // releases before provider teardown retires the allocator.
+        let _ = self.runtime.reset_graph();
+        let _ = self.runtime.reset_graph_in(DeviceGraphSlot::Verify);
         // Residency is retired first so its pages can still enqueue, then the
         // queue is closed: nothing else can reach this provider afterwards.
         self.retire_residency();
