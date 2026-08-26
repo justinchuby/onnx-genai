@@ -339,10 +339,171 @@ else
 fi
 
 echo
+echo "== SKIPPED is a third outcome =="
+
+# A docs-only change skips the heavy lanes by design, and GitHub's ruleset
+# accepts a skipped required check -- so the pull request is merge-ready by
+# the repository's own rules while never reporting SUCCESS. Without a way
+# through, this script waits for a verdict that is not coming and its operator
+# reaches for `--admin`, which is the hazard it exists to remove. Without a
+# GATE on the way through, a job skipped by a broken `if:` merges unvalidated.
+# Hence: distinct outcome, explicit decision, and still a refusal if GitHub
+# says the skip does not satisfy the ruleset.
+skipped_fixture() {
+    fixture "$1"
+    rollup "$FIX/pr.json" OPEN deadbeef \
+        '{"name":"Fast (Linux x86_64)","status":"COMPLETED","conclusion":"SKIPPED"}' \
+        '{"name":"Rust quality","status":"COMPLETED","conclusion":"SKIPPED"}'
+    # `rollup` writes BLOCKED; a repository that accepts the skip reports
+    # UNSTABLE, and that difference is the gate two cells below.
+    sed -i 's/"mergeStateStatus":"BLOCKED"/"mergeStateStatus":"UNSTABLE"/' "$FIX/pr.json"
+}
+
+skipped_fixture skip_default
+chk "a SKIPPED required check does not merge by default" "$(run_mw)" "7"
+chk "and nothing was merged" "$(merges)" "0"
+chk "and the refusal names the outcome, not just a generic wait" \
+    "$(grep -c 'concluded SKIPPED' "$FIX/out")" "1"
+chk "and it points at the flag, not at --admin" \
+    "$(grep -c -- '--allow-skipped' "$FIX/out")" "1"
+
+skipped_fixture skip_allowed
+chk "--allow-skipped merges when the skip is the only thing missing" \
+    "$(run_mw --allow-skipped)" "0"
+chk "and still without --admin" "$(grep -c -- '--admin' "$FIX/argv.log")" "0"
+
+# The gate. `--allow-skipped` is the caller saying the skip is by design; it is
+# NOT permission to overrule the repository. BLOCKED means GitHub does not
+# accept the skip as satisfying the requirement.
+skipped_fixture skip_blocked
+sed -i 's/"mergeStateStatus":"UNSTABLE"/"mergeStateStatus":"BLOCKED"/' "$FIX/pr.json"
+chk "--allow-skipped does not merge a pull request GitHub reports BLOCKED" \
+    "$(run_mw --allow-skipped)" "6"
+chk "and nothing was merged" "$(merges)" "0"
+
+# The negative control for the flag: it must widen SKIPPED and nothing else.
+# A required context that is ABSENT or still running is not skipped, and the
+# absent case is the defect this whole suite exists for (#1966).
+fixture skip_not_absent
+rollup "$FIX/pr.json" OPEN deadbeef \
+    '{"name":"Fast (Linux x86_64)","status":"COMPLETED","conclusion":"SKIPPED"}'
+sed -i 's/"mergeStateStatus":"BLOCKED"/"mergeStateStatus":"UNSTABLE"/' "$FIX/pr.json"
+chk "--allow-skipped does not excuse a required check with no row at all" \
+    "$(run_mw --allow-skipped)" "3"
+chk "and nothing was merged" "$(merges)" "0"
+
+fixture skip_not_pending
+rollup "$FIX/pr.json" OPEN deadbeef \
+    '{"name":"Fast (Linux x86_64)","status":"COMPLETED","conclusion":"SKIPPED"}' \
+    '{"name":"Rust quality","status":"IN_PROGRESS","conclusion":null}'
+sed -i 's/"mergeStateStatus":"BLOCKED"/"mergeStateStatus":"UNSTABLE"/' "$FIX/pr.json"
+chk "--allow-skipped does not excuse a required check still running" \
+    "$(run_mw --allow-skipped)" "3"
+chk "and nothing was merged" "$(merges)" "0"
+
+fixture skip_not_failure
+rollup "$FIX/pr.json" OPEN deadbeef \
+    '{"name":"Fast (Linux x86_64)","status":"COMPLETED","conclusion":"SKIPPED"}' \
+    '{"name":"Rust quality","status":"COMPLETED","conclusion":"FAILURE"}'
+sed -i 's/"mergeStateStatus":"BLOCKED"/"mergeStateStatus":"UNSTABLE"/' "$FIX/pr.json"
+chk "--allow-skipped does not excuse a required check that failed" \
+    "$(run_mw --allow-skipped)" "2"
+chk "and nothing was merged" "$(merges)" "0"
+
+# And the flag must not change the ordinary path in either direction: an
+# all-green pull request merges with it, and reports SUCCESS rather than
+# claiming a skip it did not have.
+fixture skip_absent_is_green
+chk "--allow-skipped still merges an all-green pull request" \
+    "$(run_mw --allow-skipped)" "0"
+chk "and reports SUCCESS, not a skip" \
+    "$(grep -c 'every required check reported SUCCESS' "$FIX/out")" "1"
+
+echo
+echo "== a skip must be the only thing wrong with its name =="
+
+# The cells above give each bad conclusion its OWN required name, which the
+# pre-existing failure path already caught -- they never reach the fold. A
+# re-run puts two runs under ONE name, and the fold then has to choose which
+# one to report. While the only question was green-or-not that choice was
+# free; once SKIPPED is mergeable it decides whether a failure is visible.
+# Both orders, because the hazard is that rollup array order alone decides.
+dup_fixture() {
+    fixture "$1"
+    rollup "$FIX/pr.json" OPEN deadbeef \
+        '{"name":"Fast (Linux x86_64)","status":"COMPLETED","conclusion":"SUCCESS"}' \
+        "$2" "$3"
+    sed -i 's/"mergeStateStatus":"BLOCKED"/"mergeStateStatus":"UNSTABLE"/' "$FIX/pr.json"
+}
+
+RQ_SKIP='{"name":"Rust quality","status":"COMPLETED","conclusion":"SKIPPED"}'
+RQ_FAIL='{"name":"Rust quality","status":"COMPLETED","conclusion":"FAILURE"}'
+RQ_RUN='{"name":"Rust quality","status":"IN_PROGRESS","conclusion":null}'
+
+dup_fixture dup_skip_then_fail "$RQ_SKIP" "$RQ_FAIL"
+chk "a name that skipped AND failed is a failure, skip listed first" \
+    "$(run_mw --allow-skipped)" "2"
+chk "and nothing was merged" "$(merges)" "0"
+
+dup_fixture dup_fail_then_skip "$RQ_FAIL" "$RQ_SKIP"
+chk "and the same, skip listed second -- array order decides nothing" \
+    "$(run_mw --allow-skipped)" "2"
+
+# Without the flag this input must not report itself as a skip either: exit 7
+# tells the operator to re-run with --allow-skipped, so a masked failure here
+# would route them into merging it.
+dup_fixture dup_default_not_seven "$RQ_SKIP" "$RQ_FAIL"
+chk "and without the flag it is still a failure, not an offer to allow it" \
+    "$(run_mw)" "2"
+
+dup_fixture dup_skip_then_running "$RQ_SKIP" "$RQ_RUN"
+chk "a name that skipped and is also still running keeps waiting" \
+    "$(run_mw --allow-skipped)" "3"
+chk "and nothing was merged" "$(merges)" "0"
+
+echo
+echo "== the merge state is an allowlist, not a BLOCKED denylist =="
+
+# Refusing only BLOCKED would make every other value -- including GitHub
+# saying it has not worked out mergeability yet, and including the field
+# vanishing in an API change -- count as the repository accepting the skip.
+state_fixture() {
+    skipped_fixture "$1"
+    sed -i "s/\"mergeStateStatus\":\"UNSTABLE\"/\"mergeStateStatus\":\"$2\"/" \
+        "$FIX/pr.json"
+}
+
+state_fixture state_dirty DIRTY
+chk "--allow-skipped does not merge a pull request with conflicts" \
+    "$(run_mw --allow-skipped)" "6"
+chk "and nothing was merged" "$(merges)" "0"
+
+state_fixture state_behind BEHIND
+chk "--allow-skipped does not merge a pull request that is BEHIND" \
+    "$(run_mw --allow-skipped)" "6"
+
+state_fixture state_unknown UNKNOWN
+chk "an uncomputed merge state is not an accepting one -- it waits" \
+    "$(run_mw --allow-skipped)" "3"
+chk "and nothing was merged" "$(merges)" "0"
+
+skipped_fixture state_missing
+sed -i 's/"mergeStateStatus":"UNSTABLE",//' "$FIX/pr.json"
+chk "and the field being absent altogether waits too, not merges" \
+    "$(run_mw --allow-skipped)" "3"
+chk "and nothing was merged" "$(merges)" "0"
+chk "the fixture really did drop the field" \
+    "$(grep -c mergeStateStatus "$FIX/pr.json")" "0"
+
+state_fixture state_clean CLEAN
+chk "a CLEAN pull request with a skipped required check merges" \
+    "$(run_mw --allow-skipped)" "0"
+
+echo
 # An assertion that quietly stops running is indistinguishable from one that
 # passes. Both branches of the probe above assert, so this total is invariant
 # across environments.
-chk "every assertion in this file ran" "$((pass + fail + 1))" "41"
+chk "every assertion in this file ran" "$((pass + fail + 1))" "72"
 
 echo
 echo "passed=${pass} failed=${fail}"
