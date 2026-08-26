@@ -49,7 +49,7 @@ use onnx_runtime_ep_api::{
 };
 use onnx_runtime_ir::{
     DataType, Graph, GraphViewCache, ModelFunction, ModelFunctionKey, Node, NodeId, Shape,
-    TensorLayout, ValueId, as_static_shape,
+    TensorLayout, ValueId, WeightRef, as_static_shape,
 };
 use onnx_runtime_loader::WeightStore;
 use onnx_runtime_tracer::TraceContext;
@@ -69,6 +69,15 @@ pub struct ProviderPlacement {
     /// Provider used both as the capability oracle (planning) and to execute
     /// the partitions assigned to it.
     pub provider: Arc<dyn ExecutionProvider>,
+}
+
+/// Exhaustive source classification for a value with no producing node.
+///
+/// An absent optional operand is not a value at all: it is a `None` node-input
+/// slot and therefore cannot reach this classification.
+enum ProducerlessSource<'input, 'weight> {
+    ExternalInput(&'input Tensor),
+    Initializer(&'weight WeightRef),
 }
 
 /// A maximal convex run of same-provider nodes, executed as one unit.
@@ -1215,6 +1224,7 @@ struct PartitionExecutor {
 /// external bindings are intentionally rejected by the parent executor.
 pub(crate) struct HeterogeneousExecutor {
     graph: Arc<Graph>,
+    weights: Arc<WeightStore>,
     plan: HeterogeneousPlan,
     providers: HashMap<EpId, Arc<dyn ExecutionProvider>>,
     partitions: Vec<PartitionExecutor>,
@@ -1280,6 +1290,27 @@ impl HeterogeneousExecutor {
                     format!("capability was accepted but kernel creation failed: {error}"),
                 )
             })?;
+            if kernel.has_kernel_sized_outputs() {
+                let domain = if node.domain.is_empty() {
+                    "ai.onnx"
+                } else {
+                    node.domain.as_str()
+                };
+                return Err(SessionError::HeterogeneousExecutionUnsupported {
+                    placement_summary: format!(
+                        "node {} ({domain}::{}@{opset}) assigned to provider '{}' has \
+                         kernel-sized outputs ({:?}); the opt-in heterogeneous executor's \
+                         current static tensor-DAG slice preallocates declared output shapes and \
+                         therefore cannot execute a kernel whose runtime cardinality may differ. \
+                         Keep this graph on one provider until heterogeneous dynamic-output \
+                         ownership is implemented",
+                        node_id.0,
+                        node.op_type,
+                        provider.name(),
+                        kernel.kernel_sized_output_policy(),
+                    ),
+                });
+            }
             if kernel.may_produce_views() {
                 let domain = if node.domain.is_empty() {
                     "ai.onnx"
@@ -1319,6 +1350,7 @@ impl HeterogeneousExecutor {
         Ok(Self {
             placement_report: placement_summary(&plan, &graph, providers),
             graph,
+            weights: Arc::clone(weights),
             plan,
             providers: provider_by_ep,
             partitions: partition_executors,
@@ -1433,6 +1465,73 @@ impl HeterogeneousExecutor {
         Ok(true)
     }
 
+    fn producerless_source<'input, 'weight>(
+        &'weight self,
+        value: ValueId,
+        external_inputs: &'input HashMap<ValueId, &'input Tensor>,
+    ) -> Result<ProducerlessSource<'input, 'weight>> {
+        if let Some(weight) = self.graph.initializers.get(&value) {
+            return Ok(ProducerlessSource::Initializer(weight));
+        }
+        if self.graph.inputs.contains(&value) {
+            return external_inputs
+                .get(&value)
+                .copied()
+                .map(ProducerlessSource::ExternalInput)
+                .ok_or_else(|| {
+                    SessionError::Internal(format!(
+                        "heterogeneous graph input value {} ('{}') is unavailable",
+                        value.0,
+                        self.graph
+                            .value(value)
+                            .name
+                            .as_deref()
+                            .unwrap_or("<unnamed>")
+                    ))
+                });
+        }
+        Err(SessionError::Internal(format!(
+            "producer-less heterogeneous value {} ('{}') is neither a graph input nor an \
+             initializer; optional absent inputs must be represented by an empty node-input slot",
+            value.0,
+            self.graph
+                .value(value)
+                .name
+                .as_deref()
+                .unwrap_or("<unnamed>")
+        )))
+    }
+
+    fn initializer_output(&self, value: ValueId, weight: &WeightRef) -> Result<Tensor> {
+        let metadata = self.graph.value(value);
+        let shape = as_static_shape(&metadata.shape).expect("validated static shape");
+        if weight.dtype() != metadata.dtype || weight.dims() != shape {
+            return Err(SessionError::Internal(format!(
+                "initializer graph output value {} ('{}') metadata {:?} {:?} does not match its \
+                 canonical weight {:?} {:?}",
+                value.0,
+                metadata.name.as_deref().unwrap_or("<unnamed>"),
+                metadata.dtype,
+                shape,
+                weight.dtype(),
+                weight.dims(),
+            )));
+        }
+        let bytes = self.weights.bytes(weight).ok_or_else(|| {
+            SessionError::Internal(format!(
+                "initializer graph output value {} ('{}') could not resolve its canonical weight \
+                 bytes; keep the WeightStore and any external-data mapping alive for the session",
+                value.0,
+                metadata.name.as_deref().unwrap_or("<unnamed>")
+            ))
+        })?;
+        // Ordinary `run` returns owned host tensors even when a producing
+        // partition ran on a device (`copy_from_device_buffer` above). Use the
+        // same governed CPU output policy here; do not invent a hetero resident
+        // for immutable initializer storage.
+        Tensor::from_raw(metadata.dtype, shape, bytes)
+    }
+
     pub(crate) fn run(&mut self, inputs: &[(&str, &Tensor)]) -> Result<Vec<Tensor>> {
         let input_by_value: HashMap<ValueId, &Tensor> = self
             .graph
@@ -1488,18 +1587,19 @@ impl HeterogeneousExecutor {
 
             let mut normal_inputs = Vec::new();
             for (value, name) in &input_feeds {
-                if self.graph.value(*value).producer.is_none()
-                    && !self.graph.initializers.contains_key(value)
-                {
-                    normal_inputs.push((
-                        name.as_str(),
-                        *input_by_value.get(value).ok_or_else(|| {
-                            SessionError::Internal(format!(
-                                "graph input value {} is unavailable",
+                if self.graph.value(*value).producer.is_none() {
+                    match self.producerless_source(*value, &input_by_value)? {
+                        ProducerlessSource::ExternalInput(tensor) => {
+                            normal_inputs.push((name.as_str(), tensor));
+                        }
+                        ProducerlessSource::Initializer(_) => {
+                            return Err(SessionError::Internal(format!(
+                                "initializer value {} was extracted as a runtime partition input \
+                                 instead of being attached to the partition graph",
                                 value.0
-                            ))
-                        })?,
-                    ));
+                            )));
+                        }
+                    }
                 }
             }
 
@@ -1591,17 +1691,13 @@ impl HeterogeneousExecutor {
         let mut outputs = Vec::with_capacity(self.graph.outputs.len());
         for &value in &self.graph.outputs {
             if self.graph.value(value).producer.is_none() {
-                outputs.push(
-                    input_by_value
-                        .get(&value)
-                        .map(|tensor| (*tensor).clone())
-                        .ok_or_else(|| {
-                            SessionError::Internal(format!(
-                                "graph output source value {} is unavailable",
-                                value.0
-                            ))
-                        })?,
-                );
+                let output = match self.producerless_source(value, &input_by_value)? {
+                    ProducerlessSource::ExternalInput(tensor) => tensor.clone(),
+                    ProducerlessSource::Initializer(weight) => {
+                        self.initializer_output(value, weight)?
+                    }
+                };
+                outputs.push(output);
                 continue;
             }
             let producer = self.graph.value(value).producer.expect("checked above");

@@ -17,7 +17,7 @@ use prost::Message;
 
 use onnx_runtime_ep_api::{
     Cost, DeviceBuffer, DeviceId, DeviceType, EpConfig, EpId, ExecutionProvider, Fence, Kernel,
-    KernelMatch, Result as EpResult,
+    KernelMatch, KernelSizedOutputPolicy, Result as EpResult, TensorMut, TensorView,
 };
 use onnx_runtime_ep_cpu::CpuExecutionProvider;
 use onnx_runtime_ir::{
@@ -37,6 +37,7 @@ struct AcceleratorEp {
     inner: CpuExecutionProvider,
     allowed: Vec<&'static str>,
     claim_only: Vec<&'static str>,
+    device_sized: Vec<&'static str>,
     device: DeviceId,
 }
 
@@ -48,6 +49,7 @@ impl AcceleratorEp {
             inner,
             allowed,
             claim_only: Vec::new(),
+            device_sized: Vec::new(),
             // Mlx is host-accessible, so the CPU execution path stays valid while
             // the device id differs from CPU:0 for transfer planning.
             device: DeviceId::new(DeviceType::Mlx, 0),
@@ -57,6 +59,12 @@ impl AcceleratorEp {
     fn claim_only(allowed: Vec<&'static str>) -> Self {
         let mut ep = Self::new(Vec::new());
         ep.claim_only = allowed;
+        ep
+    }
+
+    fn device_sized(allowed: Vec<&'static str>) -> Self {
+        let mut ep = Self::new(Vec::new());
+        ep.device_sized = allowed;
         ep
     }
 }
@@ -89,7 +97,9 @@ impl ExecutionProvider for AcceleratorEp {
         input_dtypes: &[DataType],
         layouts: &[TensorLayout],
     ) -> KernelMatch {
-        if self.claim_only.contains(&op.op_type.as_str()) {
+        if self.claim_only.contains(&op.op_type.as_str())
+            || self.device_sized.contains(&op.op_type.as_str())
+        {
             return KernelMatch::Supported {
                 cost: Cost::ZERO,
                 required_input_layouts: None,
@@ -109,6 +119,9 @@ impl ExecutionProvider for AcceleratorEp {
         shapes: &[Vec<usize>],
         opset: u64,
     ) -> EpResult<Box<dyn Kernel>> {
+        if self.device_sized.contains(&op.op_type.as_str()) {
+            return Ok(Box::new(DeviceSizedKernel));
+        }
         self.inner.get_kernel(op, shapes, opset)
     }
     fn allocate(&self, size: usize, alignment: usize) -> EpResult<DeviceBuffer> {
@@ -140,6 +153,22 @@ struct AsyncAcceleratorEp {
     inner: AcceleratorEp,
     pending: Mutex<Option<(Vec<u8>, usize)>>,
     waits: Arc<AtomicUsize>,
+}
+
+struct DeviceSizedKernel;
+
+impl Kernel for DeviceSizedKernel {
+    fn execute(&self, _: &[TensorView], _: &mut [TensorMut]) -> EpResult<()> {
+        unreachable!("heterogeneous build must reject this kernel before execution")
+    }
+
+    fn has_kernel_sized_outputs(&self) -> bool {
+        true
+    }
+
+    fn kernel_sized_output_policy(&self) -> KernelSizedOutputPolicy {
+        KernelSizedOutputPolicy::DeviceWorkspace
+    }
 }
 
 impl AsyncAcceleratorEp {
@@ -285,6 +314,13 @@ fn claim_only_slot(ep: u32, allowed: Vec<&'static str>) -> ProviderPlacement {
     }
 }
 
+fn device_sized_slot(ep: u32) -> ProviderPlacement {
+    ProviderPlacement {
+        ep: EpId(ep),
+        provider: Arc::new(AcceleratorEp::device_sized(vec!["RuntimeSized"])),
+    }
+}
+
 fn weights() -> Arc<WeightStore> {
     Arc::new(WeightStore::new())
 }
@@ -301,6 +337,31 @@ fn build_chain(ops: &[&str]) -> Graph {
         current = out;
     }
     graph.add_output(current);
+    graph
+}
+
+fn unique_chain_graph() -> Graph {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let x = graph.create_named_value("x", DataType::Float32, static_shape([4]));
+    graph.add_input(x);
+    let relu = graph.create_named_value("relu", DataType::Float32, static_shape([4]));
+    graph.insert_node(Node::new(NodeId(0), "Relu", vec![Some(x)], vec![relu]));
+    let unique = graph.create_named_value("unique", DataType::Float32, static_shape([4]));
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "Unique",
+        vec![Some(relu)],
+        vec![unique],
+    ));
+    let output = graph.create_named_value("output", DataType::Float32, static_shape([4]));
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "Neg",
+        vec![Some(unique)],
+        vec![output],
+    ));
+    graph.add_output(output);
     graph
 }
 
@@ -325,6 +386,14 @@ fn assert_byte_identical(a: &[Tensor], b: &[Tensor]) {
 fn inline_f32(dims: &[usize], data: &[f32]) -> WeightRef {
     WeightRef::Inline(TensorData::from_raw(
         DataType::Float32,
+        dims.to_vec(),
+        data.iter().flat_map(|v| v.to_le_bytes()).collect(),
+    ))
+}
+
+fn inline_i64(dims: &[usize], data: &[i64]) -> WeightRef {
+    WeightRef::Inline(TensorData::from_raw(
+        DataType::Int64,
         dims.to_vec(),
         data.iter().flat_map(|v| v.to_le_bytes()).collect(),
     ))
@@ -907,6 +976,108 @@ fn empty_graph_has_no_partitions() {
 }
 
 #[test]
+fn initializer_only_outputs_use_canonical_bytes_including_zero_size() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let values = graph.create_named_value("values", DataType::Int64, static_shape([3]));
+    graph.set_initializer(values, inline_i64(&[3], &[7, -2, 99]));
+    graph.add_output(values);
+    let empty = graph.create_named_value("empty", DataType::Float32, static_shape([0]));
+    graph.set_initializer(empty, inline_f32(&[0], &[]));
+    graph.add_output(empty);
+
+    let providers = vec![cpu_slot(0)];
+    let plan = plan(&graph, &providers).unwrap();
+    assert!(plan.partitions.is_empty());
+    assert!(plan.transfers.is_empty());
+
+    let output = execute(&plan, &graph, &weights(), &providers, &[]).unwrap();
+    assert_eq!(output.len(), 2);
+    assert_eq!(output[0].dtype, DataType::Int64);
+    assert_eq!(output[0].shape, [3]);
+    assert_eq!(output[0].device(), DeviceId::cpu());
+    assert_eq!(
+        output[0].as_bytes(),
+        [7i64, -2, 99]
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(output[1].dtype, DataType::Float32);
+    assert_eq!(output[1].shape, [0]);
+    assert_eq!(output[1].device(), DeviceId::cpu());
+    assert!(output[1].as_bytes().is_empty());
+}
+
+#[test]
+fn initializer_consumed_by_partition_and_returned_as_output_is_not_a_transfer() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let x = graph.create_named_value("x", DataType::Float32, static_shape([4]));
+    graph.add_input(x);
+    let bias = graph.create_named_value("bias", DataType::Float32, static_shape([4]));
+    let bias_values = [1.0f32, -3.0, 10.0, -20.0];
+    graph.set_initializer(bias, inline_f32(&[4], &bias_values));
+    graph.add_output(bias);
+    let sum = graph.create_named_value("sum", DataType::Float32, static_shape([4]));
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "Add",
+        vec![Some(x), Some(bias)],
+        vec![sum],
+    ));
+    let output = graph.create_named_value("output", DataType::Float32, static_shape([4]));
+    graph.insert_node(Node::new(NodeId(0), "Abs", vec![Some(sum)], vec![output]));
+    graph.add_output(output);
+
+    let providers = vec![accel_slot(0, vec!["Add"]), cpu_slot(1)];
+    let plan = plan(&graph, &providers).unwrap();
+    assert_eq!(
+        plan.transfers.len(),
+        1,
+        "the initializer is attached to its partition, not planned as a transfer"
+    );
+    let mut executor = HeterogeneousExecutor::build(plan, &graph, &weights(), &providers).unwrap();
+    let input = Tensor::from_f32(&[4], &[2.0, 4.0, -5.0, 8.0]).unwrap();
+    let outputs = executor.run(&[("x", &input)]).unwrap();
+
+    let bias_bytes = bias_values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect::<Vec<_>>();
+    assert_eq!(outputs[0].as_bytes(), bias_bytes);
+    assert_eq!(outputs[0].device(), DeviceId::cpu());
+    assert_eq!(outputs[1].to_vec_f32(), vec![3.0, 1.0, 5.0, 12.0]);
+    assert_eq!(executor.last_transfer_count(), 1);
+    assert_eq!(executor.last_release_count(sum, EpId(0)), 1);
+    assert_eq!(executor.last_release_count(sum, EpId(1)), 1);
+    assert_eq!(
+        executor.last_release_count(bias, EpId(0)),
+        0,
+        "canonical initializer storage is owned by the child executor/WeightStore, not duplicated \
+         as a heterogeneous resident"
+    );
+}
+
+#[test]
+fn unknown_producerless_output_fails_with_source_classification() {
+    let mut graph = Graph::new();
+    let orphan = graph.create_named_value("orphan", DataType::Float32, static_shape([1]));
+    graph.add_output(orphan);
+    let providers = vec![cpu_slot(0)];
+    let plan = plan(&graph, &providers).unwrap();
+    let error = execute(&plan, &graph, &weights(), &providers, &[])
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("orphan"), "{error}");
+    assert!(
+        error.contains("neither a graph input nor an initializer"),
+        "{error}"
+    );
+    assert!(error.contains("optional absent"), "{error}");
+}
+
+#[test]
 fn node_unsupported_by_all_providers_fails_before_execution() {
     // No provider supports Sqrt (both slots only advertise Relu), so planning
     // must fail with an actionable error before any execution.
@@ -1129,6 +1300,123 @@ fn view_producing_kernel_is_rejected_before_partition_execution() {
         .to_string();
     assert!(error.contains("Transpose"), "{error}");
     assert!(error.contains("aliased/view output"), "{error}");
+}
+
+#[test]
+fn host_kernel_sized_unique_is_rejected_before_partition_execution() {
+    let graph = unique_chain_graph();
+    let providers = vec![accel_slot(0, vec!["Relu", "Neg"]), cpu_slot(1)];
+    let plan = plan(&graph, &providers).unwrap();
+    assert_eq!(
+        plan.node_placement
+            .values()
+            .copied()
+            .collect::<HashSet<_>>(),
+        HashSet::from([EpId(0), EpId(1)])
+    );
+    let error = HeterogeneousExecutor::build(plan, &graph, &weights(), &providers)
+        .err()
+        .expect("declared static shape must not admit runtime-sized Unique")
+        .to_string();
+    assert!(error.contains("ai.onnx::Unique@17"), "{error}");
+    assert!(error.contains("cpu_ep"), "{error}");
+    assert!(error.contains("HostOwned"), "{error}");
+    assert!(error.contains("runtime cardinality may differ"), "{error}");
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn real_cuda_device_workspace_unique_hits_the_generic_gate() {
+    let Ok(mut cuda) = onnx_runtime_ep_cuda::CudaExecutionProvider::new(0) else {
+        eprintln!("skipping heterogeneous CUDA Unique gate: CUDA runtime unavailable");
+        return;
+    };
+    ExecutionProvider::initialize(&mut cuda, &EpConfig::default()).unwrap();
+    let graph = unique_chain_graph();
+    let providers = vec![
+        accel_slot(0, vec!["Relu", "Neg"]),
+        ProviderPlacement {
+            ep: EpId(1),
+            provider: Arc::new(cuda),
+        },
+    ];
+    let plan = plan(&graph, &providers).unwrap();
+    let error = HeterogeneousExecutor::build(plan, &graph, &weights(), &providers)
+        .err()
+        .expect("real CUDA Unique must hit the kernel-sized output gate")
+        .to_string();
+    assert!(error.contains("ai.onnx::Unique@17"), "{error}");
+    assert!(error.contains("cuda_ep"), "{error}");
+    assert!(error.contains("DeviceWorkspace"), "{error}");
+}
+
+#[test]
+fn host_kernel_sized_nms_is_rejected_despite_static_declared_output() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let boxes = graph.create_named_value("boxes", DataType::Float32, static_shape([1, 3, 4]));
+    graph.add_input(boxes);
+    let scores = graph.create_named_value("scores", DataType::Float32, static_shape([1, 1, 3]));
+    graph.add_input(scores);
+    let relu_scores =
+        graph.create_named_value("relu_scores", DataType::Float32, static_shape([1, 1, 3]));
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "Relu",
+        vec![Some(scores)],
+        vec![relu_scores],
+    ));
+    let limit = graph.create_named_value("limit", DataType::Int64, static_shape([]));
+    graph.set_initializer(limit, inline_i64(&[], &[1]));
+    let selected = graph.create_named_value("selected", DataType::Int64, static_shape([3, 3]));
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "NonMaxSuppression",
+        vec![Some(boxes), Some(relu_scores), Some(limit)],
+        vec![selected],
+    ));
+    graph.add_output(selected);
+
+    let providers = vec![accel_slot(0, vec!["Relu"]), cpu_slot(1)];
+    let plan = plan(&graph, &providers).unwrap();
+    let error = HeterogeneousExecutor::build(plan, &graph, &weights(), &providers)
+        .err()
+        .expect("declared [3,3] must not preallocate a data-dependent NMS output")
+        .to_string();
+    assert!(error.contains("ai.onnx::NonMaxSuppression@17"), "{error}");
+    assert!(error.contains("cpu_ep"), "{error}");
+    assert!(error.contains("HostOwned"), "{error}");
+}
+
+#[test]
+fn device_workspace_kernel_sized_policy_hits_the_same_capability_gate() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    graph.opset_imports.insert("test.dynamic".into(), 1);
+    let x = graph.create_named_value("x", DataType::Float32, static_shape([4]));
+    graph.add_input(x);
+    let dynamic = graph.create_named_value("dynamic", DataType::Float32, static_shape([4]));
+    let mut node = Node::new(NodeId(0), "RuntimeSized", vec![Some(x)], vec![dynamic]);
+    node.domain = "test.dynamic".into();
+    graph.insert_node(node);
+    let output = graph.create_named_value("output", DataType::Float32, static_shape([4]));
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "Relu",
+        vec![Some(dynamic)],
+        vec![output],
+    ));
+    graph.add_output(output);
+
+    let providers = vec![accel_slot(0, vec!["Relu"]), device_sized_slot(1)];
+    let plan = plan(&graph, &providers).unwrap();
+    let error = HeterogeneousExecutor::build(plan, &graph, &weights(), &providers)
+        .err()
+        .expect("device-workspace runtime cardinality must fail the generic kernel gate")
+        .to_string();
+    assert!(error.contains("test.dynamic::RuntimeSized@1"), "{error}");
+    assert!(error.contains("accel_ep"), "{error}");
+    assert!(error.contains("DeviceWorkspace"), "{error}");
 }
 
 #[test]
