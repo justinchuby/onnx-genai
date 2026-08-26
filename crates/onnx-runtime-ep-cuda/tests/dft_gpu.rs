@@ -39,11 +39,22 @@ fn dft(
     attrs: &[(&str, Attribute)],
     optional: &[Tensor],
 ) -> Vec<f32> {
+    dft_at(ep, 20, input_tensor, output_shape, attrs, optional)
+}
+
+fn dft_at(
+    ep: &onnx_runtime_ep_cuda::CudaExecutionProvider,
+    opset: u64,
+    input_tensor: Tensor,
+    output_shape: &[usize],
+    attrs: &[(&str, Attribute)],
+    optional: &[Tensor],
+) -> Vec<f32> {
     let mut inputs = vec![input_tensor];
     inputs.extend_from_slice(optional);
     let outputs = [(DataType::Float32, output_shape.to_vec())];
     decode_floats(
-        &run_cuda(ep, "DFT", "", 20, &inputs, &outputs, attrs)[0],
+        &run_cuda(ep, "DFT", "", opset, &inputs, &outputs, attrs)[0],
         DataType::Float32,
     )
 }
@@ -54,13 +65,68 @@ fn cpu_dft(
     attrs: &[(&str, Attribute)],
     optional: &[Tensor],
 ) -> Vec<f32> {
+    cpu_dft_at(20, input_tensor, output_shape, attrs, optional)
+}
+
+fn cpu_dft_at(
+    opset: u64,
+    input_tensor: Tensor,
+    output_shape: &[usize],
+    attrs: &[(&str, Attribute)],
+    optional: &[Tensor],
+) -> Vec<f32> {
     let mut inputs = vec![input_tensor];
     inputs.extend_from_slice(optional);
     let outputs = [(DataType::Float32, output_shape.to_vec())];
     decode_floats(
-        &run_cpu("DFT", "", 20, &inputs, &outputs, attrs)[0],
+        &run_cpu("DFT", "", opset, &inputs, &outputs, attrs)[0],
         DataType::Float32,
     )
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn opset_defaults_and_explicit_axes_match_cpu_on_rank4_input() {
+    let _suite_lock = lock_dft_gpu();
+    let ep = require_cuda();
+    let tensor = float_input(DataType::Float32, &[1, 8, 6, 1], &[0.0; 48]);
+    let onesided = [("onesided", Attribute::Int(1))];
+
+    let opset17 = dft_at(&ep, 17, tensor.clone(), &[1, 5, 6, 2], &onesided, &[]);
+    assert_close(
+        &opset17,
+        &cpu_dft_at(17, tensor.clone(), &[1, 5, 6, 2], &onesided, &[]),
+        1e-5,
+    );
+
+    let opset20 = dft_at(&ep, 20, tensor.clone(), &[1, 8, 4, 2], &onesided, &[]);
+    assert_close(
+        &opset20,
+        &cpu_dft_at(20, tensor.clone(), &[1, 8, 4, 2], &onesided, &[]),
+        1e-5,
+    );
+
+    let axis_attr = [("onesided", Attribute::Int(1)), ("axis", Attribute::Int(2))];
+    let explicit_attr = dft_at(&ep, 17, tensor.clone(), &[1, 8, 4, 2], &axis_attr, &[]);
+    assert_close(
+        &explicit_attr,
+        &cpu_dft_at(17, tensor.clone(), &[1, 8, 4, 2], &axis_attr, &[]),
+        1e-5,
+    );
+
+    let optional = [
+        common::absent_input(DataType::Undefined),
+        input(DataType::Int64, &[], &[1_i64]),
+    ];
+    let explicit_input = dft_at(&ep, 20, tensor.clone(), &[1, 5, 6, 2], &onesided, &optional);
+    assert_close(
+        &explicit_input,
+        &cpu_dft_at(20, tensor, &[1, 5, 6, 2], &onesided, &optional),
+        1e-5,
+    );
 }
 
 #[cfg_attr(

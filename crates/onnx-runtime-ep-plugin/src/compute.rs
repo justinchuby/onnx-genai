@@ -107,8 +107,12 @@ pub enum ShapeInference {
     GatherBlockQuantized,
     /// Shape op — emits [len(dims[start:end])] as a 1-D int64 tensor.
     ShapeOp { start: i64, end: Option<i64> },
-    /// Squeeze: remove dims listed in `axes` (or all size-1 dims if empty).
+    /// Squeeze: remove dimensions listed in an explicitly provided axes list.
     Squeeze { axes: Vec<i64> },
+    /// Squeeze with absent axes: remove every unit dimension.
+    SqueezeAllUnitDims,
+    /// Opset-13+ Squeeze with present axes read from input[1].
+    SqueezeFromInput,
     /// Unsqueeze: insert unit dims at `axes`.
     Unsqueeze { axes: Vec<i64> },
     /// Reshape — output shape read from input[1] at Compute time.
@@ -122,7 +126,10 @@ pub enum ShapeInference {
         axes: Option<Vec<i64>>,
         noop_with_empty_axes: bool,
     },
-    /// Opset-18+ reduction where axes come from input[1].
+    /// Reduction whose schema carries axes in optional input[1].
+    ///
+    /// This starts at opset 13 for ReduceSum and opset 18 for the other
+    /// reduction-family operators.
     ReductionFromInput {
         keepdims: bool,
         noop_with_empty_axes: bool,
@@ -233,6 +240,7 @@ pub enum ShapeInference {
     Dft {
         onesided: bool,
         axis_attr: Option<i64>,
+        default_axis: i64,
     },
     /// `ai.onnx::Compress`: select along `axis` (or over the flattened input
     /// when absent) using a 1-D Bool `condition`.
@@ -310,6 +318,17 @@ impl ShapeInference {
         if let Some(rule) = SharedNativeShapeRule::for_node(node) {
             let fallback = match rule {
                 SharedNativeShapeRule::ConstantOfShape => Self::ConstantOfShape,
+                SharedNativeShapeRule::Dft => Self::Dft {
+                    onesided: node
+                        .attr("onesided")
+                        .and_then(onnx_runtime_ir::Attribute::as_int)
+                        .unwrap_or(0)
+                        != 0,
+                    axis_attr: node
+                        .attr("axis")
+                        .and_then(onnx_runtime_ir::Attribute::as_int),
+                    default_axis: if opset >= 20 { -2 } else { 1 },
+                },
                 SharedNativeShapeRule::Expand => Self::Expand,
                 SharedNativeShapeRule::Stft => Self::Declined {
                     op_type: "STFT".into(),
@@ -507,16 +526,16 @@ impl ShapeInference {
 
             // ── Squeeze ───────────────────────────────────────────────────
             "Squeeze" => {
-                // opset 13+: axes from input[1]; earlier: attribute.
-                let axes = if opset >= 13 {
-                    // We can't read input[1] at compile time (data-dependent),
-                    // but we know input_shapes[0] and can remove all size-1 dims
-                    // if no axes input is provided.
-                    ints_attr("axes").unwrap_or_default()
+                // The graph reader injects constant opset-13 axes as an
+                // attribute. Otherwise a present input must be read at Compute;
+                // an absent input retains the schema default (all unit dims).
+                if let Some(axes) = ints_attr("axes") {
+                    Self::Squeeze { axes }
+                } else if opset >= 13 && node.inputs.get(1).is_some_and(Option::is_some) {
+                    Self::SqueezeFromInput
                 } else {
-                    ints_attr("axes").unwrap_or_default()
-                };
-                Self::Squeeze { axes }
+                    Self::SqueezeAllUnitDims
+                }
             }
 
             // ── Unsqueeze ─────────────────────────────────────────────────
@@ -543,10 +562,10 @@ impl ShapeInference {
             "Slice" => Self::SliceData,
 
             // ── Reductions ────────────────────────────────────────────────
-            op_name if is_reduction(op_name) => {
+            op_name if reduction_axes_input_since(op_name).is_some() => {
                 let keepdims = int_attr("keepdims").unwrap_or(1) != 0;
                 let noop_with_empty_axes = int_attr("noop_with_empty_axes").unwrap_or(0) != 0;
-                if opset >= 18 {
+                if reduction_axes_are_input(op_name, opset) {
                     Self::ReductionFromInput {
                         keepdims,
                         noop_with_empty_axes,
@@ -654,6 +673,7 @@ impl ShapeInference {
             "DFT" => Self::Dft {
                 onesided: int_attr("onesided").unwrap_or(0) != 0,
                 axis_attr: int_attr("axis"),
+                default_axis: if opset >= 20 { -2 } else { 1 },
             },
 
             // ── Compress ──────────────────────────────────────────────────
@@ -672,20 +692,21 @@ impl ShapeInference {
     }
 }
 
-fn is_reduction(op: &str) -> bool {
-    matches!(
-        op,
-        "ReduceMean"
-            | "ReduceSum"
-            | "ReduceProd"
-            | "ReduceMax"
-            | "ReduceMin"
-            | "ReduceL1"
-            | "ReduceL2"
-            | "ReduceLogSum"
-            | "ReduceLogSumExp"
-            | "ReduceSumSquare"
-    )
+fn reduction_axes_input_since(op: &str) -> Option<i64> {
+    // ONNX moved ReduceSum.axes to optional input[1] in schema 13. The rest of
+    // this reduction family retained the attribute through schema 17 and moved
+    // at schema 18. This is also the reduction-family census: a newly supported
+    // operator must choose its own boundary rather than inherit a blanket one.
+    match op {
+        "ReduceSum" => Some(13),
+        "ReduceMean" | "ReduceProd" | "ReduceMax" | "ReduceMin" | "ReduceL1" | "ReduceL2"
+        | "ReduceLogSum" | "ReduceLogSumExp" | "ReduceSumSquare" => Some(18),
+        _ => None,
+    }
+}
+
+fn reduction_axes_are_input(op: &str, opset: i64) -> bool {
+    reduction_axes_input_since(op).is_some_and(|since| opset >= since)
 }
 
 fn build_conv(node: &Node, input_shapes: &[Vec<Option<usize>>]) -> Option<ShapeInference> {
@@ -868,6 +889,7 @@ pub(crate) struct IntermediateBuf {
     pub(crate) shape: crate::dim_vec::DimVec<usize>,
     pub(crate) strides: crate::dim_vec::DimVec<i64>,
     pub(crate) dtype: DataType,
+    pub(crate) device: DeviceId,
 }
 
 impl IntermediateBuf {
@@ -896,7 +918,7 @@ impl IntermediateBuf {
             self.dtype,
             &self.shape,
             &self.strides,
-            onnx_runtime_ir::DeviceId::cpu(),
+            self.device,
         )
     }
 }
@@ -1999,7 +2021,7 @@ unsafe fn mem_info_is_device(api: &ort::OrtApi, mem_info: *const ort::OrtMemoryI
 fn host_operand_indices(strategy: &ShapeInference) -> &'static [usize] {
     match strategy {
         ShapeInference::SharedNative { fallback, .. } => host_operand_indices(fallback),
-        ShapeInference::ReshapeData { .. } => &[1],
+        ShapeInference::ReshapeData { .. } | ShapeInference::SqueezeFromInput => &[1],
         ShapeInference::SliceData => &[1, 2, 3, 4],
         ShapeInference::ReductionFromInput { .. } => &[1],
         _ => &[],
@@ -2913,6 +2935,18 @@ unsafe extern "C" fn compute_execute(
                                                 ));
                                             }
                                         };
+                                        let device = match unsafe {
+                                            crate::kernel_ctx::device_from_memory_info(
+                                                api_ref,
+                                                mem_info,
+                                                format_args!(
+                                                    "node {node_idx} dynamic intermediate"
+                                                ),
+                                            )
+                                        } {
+                                            Ok(device) => device,
+                                            Err(error) => return fail_status(&error),
+                                        };
                                         new_bufs.push((
                                             *buffer_index,
                                             IntermediateBuf {
@@ -2923,6 +2957,7 @@ unsafe extern "C" fn compute_execute(
                                                 ),
                                                 strides: contiguous_strides(&output.shape),
                                                 dtype: output.dtype,
+                                                device,
                                             },
                                         ));
                                         slot_kinds.push(RoutedSlotKind::Buffer);
@@ -3058,6 +3093,7 @@ unsafe extern "C" fn compute_execute(
                                             ),
                                             strides,
                                             dtype: output.dtype,
+                                            device: DeviceId::cpu(),
                                         },
                                     ));
                                 }
@@ -3230,12 +3266,24 @@ unsafe extern "C" fn compute_execute(
                         let numel: usize = shape.iter().product();
                         let byte_len = dtype.byte_size() * numel;
                         let strides = contiguous_strides(shape);
-                        let (data, scratch_ptr) = match intermediate_scratch {
+                        let (data, scratch_ptr, device) = match intermediate_scratch {
                             Some(mem_info) => {
                                 match unsafe {
                                     alloc_scratch(api_ref, kernel_context, mem_info, byte_len)
                                 } {
-                                    Ok(ptr) => (Vec::new(), ptr.cast::<u8>()),
+                                    Ok(ptr) => {
+                                        let device = match unsafe {
+                                            crate::kernel_ctx::device_from_memory_info(
+                                                api_ref,
+                                                mem_info,
+                                                format_args!("node {node_idx} intermediate output"),
+                                            )
+                                        } {
+                                            Ok(device) => device,
+                                            Err(error) => return fail_status(&error),
+                                        };
+                                        (Vec::new(), ptr.cast::<u8>(), device)
+                                    }
                                     Err(e) => {
                                         return fail_status(&format!(
                                             "Compute: intermediate scratch alloc failed: {e}"
@@ -3243,7 +3291,11 @@ unsafe extern "C" fn compute_execute(
                                     }
                                 }
                             }
-                            None => (host_pool.take_intermediate(byte_len), std::ptr::null_mut()),
+                            None => (
+                                host_pool.take_intermediate(byte_len),
+                                std::ptr::null_mut(),
+                                DeviceId::cpu(),
+                            ),
                         };
                         new_bufs.push((
                             buf_idx,
@@ -3257,6 +3309,7 @@ unsafe extern "C" fn compute_execute(
                                 shape: (*shape).clone(),
                                 strides,
                                 dtype,
+                                device,
                             },
                         ));
                     }
@@ -4546,7 +4599,7 @@ fn buf_view_mut(buf: &mut IntermediateBuf) -> onnx_runtime_ep_api::tensor::Tenso
         buf.dtype,
         &buf.shape,
         &buf.strides,
-        onnx_runtime_ir::DeviceId::cpu(),
+        buf.device,
     )
 }
 
@@ -5079,23 +5132,31 @@ fn infer_shapes(
             if inputs.is_empty() {
                 return Err("Squeeze: no inputs".into());
             }
-            let shape = inputs[0].shape;
-            let out: Vec<usize> = if axes.is_empty() {
-                shape.iter().filter(|&&d| d != 1).copied().collect()
-            } else {
-                let rank = shape.len();
-                let norm_axes: Vec<usize> = axes
+            Ok(vec![squeeze_axes_shape(inputs[0].shape, axes)?])
+        }
+
+        ShapeInference::SqueezeAllUnitDims => {
+            if inputs.is_empty() {
+                return Err("Squeeze: no inputs".into());
+            }
+            Ok(vec![
+                inputs[0]
+                    .shape
                     .iter()
-                    .map(|&a| normalise_axis(a, rank))
-                    .collect::<Result<_, _>>()?;
-                shape
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, _)| !norm_axes.contains(i))
-                    .map(|(_, &d)| d)
-                    .collect()
-            };
-            Ok(vec![out])
+                    .filter(|&&dim| dim != 1)
+                    .copied()
+                    .collect(),
+            ])
+        }
+
+        ShapeInference::SqueezeFromInput => {
+            if inputs.len() < 2 || inputs[1].is_absent() {
+                return Err(
+                    "Squeeze: axes input is present in the graph but absent at Compute".into(),
+                );
+            }
+            let axes = unsafe { read_i64_tensor(&inputs[1]) }?;
+            Ok(vec![squeeze_axes_shape(inputs[0].shape, &axes)?])
         }
 
         ShapeInference::Unsqueeze { axes } => {
@@ -5615,6 +5676,7 @@ fn infer_shapes(
         ShapeInference::Dft {
             onesided,
             axis_attr,
+            default_axis,
         } => {
             if inputs.is_empty() {
                 return Err("DFT: expected at least 1 input".into());
@@ -5638,8 +5700,10 @@ fn infer_shapes(
             // opset 20 moves `axis` into input 2; before that it is an
             // attribute defaulting to -2.
             let axis_raw = match inputs.get(2) {
-                Some(t) if !t.shape.is_empty() => read_scalar_i64(t, "DFT axis")?,
-                _ => axis_attr.unwrap_or(-2),
+                Some(t) if !t.is_absent() && t.shape.iter().product::<usize>() > 0 => {
+                    read_scalar_i64(t, "DFT axis")?
+                }
+                _ => axis_attr.unwrap_or(*default_axis),
             };
             let axis = normalize_axis(axis_raw, rank, "DFT axis")?;
             if axis == last {
@@ -5650,7 +5714,7 @@ fn infer_shapes(
 
             // `dft_length` (input 1) overrides the signal extent when present.
             let signal_len = match inputs.get(1) {
-                Some(t) if t.shape.iter().product::<usize>() > 0 => {
+                Some(t) if !t.is_absent() && t.shape.iter().product::<usize>() > 0 => {
                     let n = read_scalar_i64(t, "DFT dft_length")?;
                     usize::try_from(n)
                         .map_err(|_| format!("DFT: dft_length must be non-negative, got {n}"))?
@@ -5791,6 +5855,29 @@ fn matmul_output_shape(a: &[usize], b: &[usize]) -> Result<Vec<usize>, String> {
     }
 }
 
+/// Output shape for Squeeze with an explicit attribute- or input-carried axes list.
+fn squeeze_axes_shape(shape: &[usize], axes: &[i64]) -> Result<Vec<usize>, String> {
+    let rank = shape.len();
+    let norm_axes: Vec<usize> = axes
+        .iter()
+        .map(|&axis| normalise_axis(axis, rank))
+        .collect::<Result<_, _>>()?;
+    for &axis in &norm_axes {
+        if shape[axis] != 1 {
+            return Err(format!(
+                "Squeeze: axis {axis} has extent {}, expected 1",
+                shape[axis]
+            ));
+        }
+    }
+    Ok(shape
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !norm_axes.contains(index))
+        .map(|(_, &dim)| dim)
+        .collect())
+}
+
 /// Output shape for a reduction op.
 fn reduce_shape(
     shape: &[usize],
@@ -5839,6 +5926,14 @@ fn reduce_shape(
 /// `view.data` must point to a valid, readable region of `view.shape.iter().product()`
 /// `i64` elements.
 unsafe fn read_i64_tensor(view: &TensorView<'_>) -> Result<Vec<i64>, String> {
+    if !view.device.is_host_accessible() {
+        return Err(format!(
+            "shape operand is on {:?}, which the plugin host cannot dereference; \
+             the device EP must decline this value-driven shape rule or provide \
+             an explicit bounded metadata transfer",
+            view.device
+        ));
+    }
     if view.dtype != DataType::Int64 {
         return Err(format!("expected Int64 tensor, got {:?}", view.dtype));
     }
@@ -6843,6 +6938,107 @@ fn after() {}
     }
 
     #[test]
+    fn dft_shared_and_plugin_defaults_agree_across_opsets() {
+        let data = vec![0.0f32; 48];
+        let x = f32_data(&[1, 8, 6, 1], &[48, 6, 1, 1], &data);
+        let make_node = |version| {
+            let mut node = Node::new(
+                onnx_runtime_ir::NodeId(0),
+                "DFT",
+                vec![Some(onnx_runtime_ir::ValueId(0))],
+                vec![onnx_runtime_ir::ValueId(1)],
+            );
+            node.version = Some(version);
+            node.attributes
+                .insert("onesided".into(), onnx_runtime_ir::Attribute::Int(1));
+            node
+        };
+
+        for (version, expected) in [(17, vec![1, 5, 6, 2]), (20, vec![1, 8, 4, 2])] {
+            let node = make_node(version);
+            let strategy =
+                ShapeInference::for_node(&node, &[vec![Some(1), Some(8), Some(6), Some(1)]], 1);
+            assert!(matches!(strategy, ShapeInference::SharedNative { .. }));
+            assert_eq!(infer(&strategy, &[x]).unwrap(), vec![expected]);
+            if version == 17 {
+                let ShapeInference::SharedNative { fallback, .. } = &strategy else {
+                    unreachable!()
+                };
+                assert_eq!(
+                    infer(fallback, &[x]).unwrap(),
+                    vec![vec![1, 5, 6, 2]],
+                    "the compatibility fallback must preserve the opset-17 axis=1 default"
+                );
+            }
+        }
+
+        let mut attr_node = make_node(17);
+        attr_node
+            .attributes
+            .insert("axis".into(), onnx_runtime_ir::Attribute::Int(2));
+        let strategy =
+            ShapeInference::for_node(&attr_node, &[vec![Some(1), Some(8), Some(6), Some(1)]], 1);
+        assert_eq!(infer(&strategy, &[x]).unwrap(), vec![vec![1, 8, 4, 2]]);
+
+        let mut input_node = make_node(20);
+        input_node.inputs = vec![
+            Some(onnx_runtime_ir::ValueId(0)),
+            None,
+            Some(onnx_runtime_ir::ValueId(2)),
+        ];
+        let axis_value = [1i64];
+        let axis = i64_scalar(&axis_value, &[], &[]);
+        let absent_length = TensorView::absent(DataType::Int64);
+        let strategy = ShapeInference::for_node(
+            &input_node,
+            &[vec![Some(1), Some(8), Some(6), Some(1)], vec![], vec![]],
+            1,
+        );
+        assert_eq!(
+            infer(&strategy, &[x, absent_length, axis]).unwrap(),
+            vec![vec![1, 5, 6, 2]]
+        );
+    }
+
+    #[test]
+    fn dft_device_axis_is_symbolic_and_never_dereferenced() {
+        let data = vec![0.0f32; 48];
+        let x = f32_data(&[1, 8, 6, 1], &[48, 6, 1, 1], &data);
+        let absent_length = TensorView::absent(DataType::Int64);
+        let device_axis = TensorView::new(
+            DevicePtr(std::ptr::dangling::<i64>().cast()),
+            DataType::Int64,
+            &[],
+            &[],
+            DeviceId::cuda(0),
+        );
+        let mut node = Node::new(
+            onnx_runtime_ir::NodeId(0),
+            "DFT",
+            vec![
+                Some(onnx_runtime_ir::ValueId(0)),
+                None,
+                Some(onnx_runtime_ir::ValueId(2)),
+            ],
+            vec![onnx_runtime_ir::ValueId(3)],
+        );
+        node.version = Some(20);
+        node.attributes
+            .insert("onesided".into(), onnx_runtime_ir::Attribute::Int(1));
+        assert_eq!(
+            infer_shared_node(&node, &[x, absent_length, device_axis]),
+            SharedShapeResult::SymbolicOrUnknown
+        );
+        let strategy = ShapeInference::for_node(
+            &node,
+            &[vec![Some(1), Some(8), Some(6), Some(1)], vec![], vec![]],
+            1,
+        );
+        let error = infer(&strategy, &[x, absent_length, device_axis]).unwrap_err();
+        assert!(error.contains("host cannot read"), "{error}");
+    }
+
+    #[test]
     fn dft_real_input_produces_a_complex_last_dim() {
         // [batch=2, signal=8, real=1] -> [2, 8, 2]. The last dim must become 2
         // even though the input is real; a rule that copied it through would
@@ -6853,7 +7049,8 @@ fn after() {}
             infer(
                 &ShapeInference::Dft {
                     onesided: false,
-                    axis_attr: Some(1)
+                    axis_attr: Some(1),
+                    default_axis: 1,
                 },
                 &[x]
             )
@@ -6872,7 +7069,8 @@ fn after() {}
             infer(
                 &ShapeInference::Dft {
                     onesided: true,
-                    axis_attr: Some(1)
+                    axis_attr: Some(1),
+                    default_axis: 1,
                 },
                 &[x]
             )
@@ -6893,7 +7091,8 @@ fn after() {}
             infer(
                 &ShapeInference::Dft {
                     onesided: false,
-                    axis_attr: Some(1)
+                    axis_attr: Some(1),
+                    default_axis: 1,
                 },
                 &[x, len]
             )
@@ -6916,7 +7115,8 @@ fn after() {}
             infer(
                 &ShapeInference::Dft {
                     onesided: true,
-                    axis_attr: Some(1)
+                    axis_attr: Some(1),
+                    default_axis: 1,
                 },
                 &[x, no_len, axis_in]
             )
@@ -6934,6 +7134,7 @@ fn after() {}
             &ShapeInference::Dft {
                 onesided: false,
                 axis_attr: Some(-1),
+                default_axis: 1,
             },
             &[x],
         )
@@ -7527,8 +7728,86 @@ fn after() {}
     fn squeeze_removes_ones() {
         let s = [1usize, 3, 1, 4];
         let st = [12i64, 4, 4, 1];
-        let res = infer(&ShapeInference::Squeeze { axes: vec![] }, &[view(&s, &st)]).unwrap();
+        let res = infer(&ShapeInference::SqueezeAllUnitDims, &[view(&s, &st)]).unwrap();
         assert_eq!(res, vec![vec![3, 4]]);
+    }
+
+    #[test]
+    fn squeeze_opset13_present_axes_are_read_from_input() {
+        use onnx_runtime_ir::{Node, NodeId, ValueId};
+
+        let mut node = Node::new(
+            NodeId(0),
+            "Squeeze",
+            vec![Some(ValueId(0)), Some(ValueId(1))],
+            vec![ValueId(2)],
+        );
+        node.version = Some(13);
+        let strategy =
+            ShapeInference::for_node(&node, &[vec![Some(1), Some(1), Some(3)], vec![Some(1)]], 1);
+        assert!(matches!(strategy, ShapeInference::SqueezeFromInput));
+
+        let shape = [1usize, 1, 3];
+        let strides = [3i64, 3, 1];
+        let axes = [0i64];
+        let axis_shape = [1usize];
+        let axis_strides = [1i64];
+        let result = infer(
+            &strategy,
+            &[
+                view(&shape, &strides),
+                i64_view(&axes, &axis_shape, &axis_strides),
+            ],
+        )
+        .unwrap();
+        assert_eq!(result, vec![vec![1, 3]]);
+
+        let empty_axes: [i64; 0] = [];
+        let empty_shape = [0usize];
+        let present_empty = infer(
+            &strategy,
+            &[
+                view(&shape, &strides),
+                i64_view(&empty_axes, &empty_shape, &axis_strides),
+            ],
+        )
+        .unwrap();
+        assert_eq!(present_empty, vec![shape.to_vec()]);
+    }
+
+    #[test]
+    fn squeeze_opset13_absent_axes_remove_every_unit_dimension() {
+        use onnx_runtime_ir::{Node, NodeId, ValueId};
+
+        let mut node = Node::new(
+            NodeId(0),
+            "Squeeze",
+            vec![Some(ValueId(0)), None],
+            vec![ValueId(2)],
+        );
+        node.version = Some(13);
+        let strategy =
+            ShapeInference::for_node(&node, &[vec![Some(1), Some(1), Some(3)], vec![]], 1);
+        assert!(matches!(strategy, ShapeInference::SqueezeAllUnitDims));
+
+        let shape = [1usize, 1, 3];
+        let strides = [3i64, 3, 1];
+        assert_eq!(
+            infer(&strategy, &[view(&shape, &strides)]).unwrap(),
+            vec![vec![3]]
+        );
+    }
+
+    #[test]
+    fn squeeze_explicit_empty_axes_is_a_noop() {
+        let shape = [1usize, 1, 3];
+        let strides = [3i64, 3, 1];
+        let result = infer(
+            &ShapeInference::Squeeze { axes: Vec::new() },
+            &[view(&shape, &strides)],
+        )
+        .unwrap();
+        assert_eq!(result, vec![shape.to_vec()]);
     }
 
     #[test]
@@ -7673,6 +7952,148 @@ fn after() {}
     // ── Reduction ────────────────────────────────────────────────────────────
 
     #[test]
+    fn reduction_axes_input_boundaries_match_each_operator_schema() {
+        assert_eq!(reduction_axes_input_since("NotAReduction"), None);
+        assert!(!reduction_axes_are_input("ReduceSum", 12));
+        assert!(reduction_axes_are_input("ReduceSum", 13));
+        assert!(reduction_axes_are_input("ReduceSum", 17));
+
+        for op in [
+            "ReduceMean",
+            "ReduceProd",
+            "ReduceMax",
+            "ReduceMin",
+            "ReduceL1",
+            "ReduceL2",
+            "ReduceLogSum",
+            "ReduceLogSumExp",
+            "ReduceSumSquare",
+        ] {
+            assert!(
+                !reduction_axes_are_input(op, 17),
+                "{op} must retain attribute axes through opset 17"
+            );
+            assert!(
+                reduction_axes_are_input(op, 18),
+                "{op} must read optional input[1] starting at opset 18"
+            );
+        }
+    }
+
+    #[test]
+    fn reduce_sum_opset_13_and_17_read_present_host_axes() {
+        let shape = [2usize, 3, 4];
+        let strides = [12i64, 4, 1];
+        let axes = [1i64];
+        let axis_shape = [1usize];
+        let axis_strides = [1i64];
+
+        for opset in [13, 17] {
+            let mut node = onnx_runtime_ir::Node::new(
+                onnx_runtime_ir::NodeId(0),
+                "ReduceSum",
+                vec![
+                    Some(onnx_runtime_ir::ValueId(0)),
+                    Some(onnx_runtime_ir::ValueId(1)),
+                ],
+                vec![onnx_runtime_ir::ValueId(2)],
+            );
+            node.version = Some(opset);
+            node.attributes
+                .insert("keepdims".into(), onnx_runtime_ir::Attribute::Int(0));
+            let strategy = ShapeInference::for_node(
+                &node,
+                &[vec![Some(2), Some(3), Some(4)], vec![Some(1)]],
+                1,
+            );
+            assert!(
+                matches!(strategy, ShapeInference::ReductionFromInput { .. }),
+                "ReduceSum opset {opset} must read axes from input[1]"
+            );
+            let result = infer(
+                &strategy,
+                &[
+                    view(&shape, &strides),
+                    i64_view(&axes, &axis_shape, &axis_strides),
+                ],
+            )
+            .unwrap();
+            assert_eq!(result, vec![vec![2, 4]]);
+        }
+    }
+
+    #[test]
+    fn reduce_sum_opset_12_keeps_attribute_axes() {
+        let mut node = onnx_runtime_ir::Node::new(
+            onnx_runtime_ir::NodeId(0),
+            "ReduceSum",
+            vec![Some(onnx_runtime_ir::ValueId(0))],
+            vec![onnx_runtime_ir::ValueId(1)],
+        );
+        node.version = Some(12);
+        node.attributes
+            .insert("axes".into(), onnx_runtime_ir::Attribute::Ints(vec![1]));
+        node.attributes
+            .insert("keepdims".into(), onnx_runtime_ir::Attribute::Int(0));
+        let strategy = ShapeInference::for_node(&node, &[vec![Some(2), Some(3), Some(4)]], 1);
+        assert!(matches!(strategy, ShapeInference::Reduction { .. }));
+
+        let shape = [2usize, 3, 4];
+        let strides = [12i64, 4, 1];
+        assert_eq!(
+            infer(&strategy, &[view(&shape, &strides)]).unwrap(),
+            vec![vec![2, 4]]
+        );
+    }
+
+    #[test]
+    fn reduce_sum_opset_13_absent_and_empty_axes_keep_schema_defaults() {
+        let mut node = onnx_runtime_ir::Node::new(
+            onnx_runtime_ir::NodeId(0),
+            "ReduceSum",
+            vec![Some(onnx_runtime_ir::ValueId(0)), None],
+            vec![onnx_runtime_ir::ValueId(2)],
+        );
+        node.version = Some(13);
+        node.attributes
+            .insert("keepdims".into(), onnx_runtime_ir::Attribute::Int(0));
+        node.attributes.insert(
+            "noop_with_empty_axes".into(),
+            onnx_runtime_ir::Attribute::Int(1),
+        );
+        let strategy =
+            ShapeInference::for_node(&node, &[vec![Some(2), Some(3), Some(4)], vec![]], 1);
+        assert!(matches!(
+            strategy,
+            ShapeInference::ReductionFromInput { .. }
+        ));
+
+        let shape = [2usize, 3, 4];
+        let strides = [12i64, 4, 1];
+        assert_eq!(
+            infer(&strategy, &[view(&shape, &strides)]).unwrap(),
+            vec![Vec::<usize>::new()],
+            "absent optional axes means reduce all regardless of noop_with_empty_axes"
+        );
+
+        let axes: [i64; 0] = [];
+        let axis_shape = [0usize];
+        let axis_strides = [1i64];
+        assert_eq!(
+            infer(
+                &strategy,
+                &[
+                    view(&shape, &strides),
+                    i64_view(&axes, &axis_shape, &axis_strides),
+                ],
+            )
+            .unwrap(),
+            vec![shape.to_vec()],
+            "present empty axes honours noop_with_empty_axes=1"
+        );
+    }
+
+    #[test]
     fn reduction_keepdims_single_axis() {
         let s = [2usize, 3, 4];
         let st = [12i64, 4, 1];
@@ -7718,6 +8139,61 @@ fn after() {}
         )
         .unwrap();
         assert_eq!(res, vec![vec![1, 1, 1]]);
+    }
+
+    #[test]
+    fn reduction_from_absent_axes_uses_reduce_all_default() {
+        let shape = [2usize, 3, 4];
+        let strides = [12i64, 4, 1];
+        let result = infer(
+            &ShapeInference::ReductionFromInput {
+                keepdims: true,
+                noop_with_empty_axes: true,
+            },
+            &[view(&shape, &strides)],
+        )
+        .unwrap();
+        assert_eq!(result, vec![vec![1, 1, 1]]);
+        let scalar = infer(
+            &ShapeInference::ReductionFromInput {
+                keepdims: false,
+                noop_with_empty_axes: true,
+            },
+            &[view(&shape, &strides)],
+        )
+        .unwrap();
+        assert_eq!(scalar, vec![Vec::<usize>::new()]);
+    }
+
+    #[test]
+    fn reduction_from_present_empty_axes_honours_noop_flag() {
+        let shape = [2usize, 3, 4];
+        let strides = [12i64, 4, 1];
+        let axes: [i64; 0] = [];
+        let axis_shape = [0usize];
+        let axis_strides = [1i64];
+        let inputs = [
+            view(&shape, &strides),
+            i64_view(&axes, &axis_shape, &axis_strides),
+        ];
+        let no_op = infer(
+            &ShapeInference::ReductionFromInput {
+                keepdims: false,
+                noop_with_empty_axes: true,
+            },
+            &inputs,
+        )
+        .unwrap();
+        assert_eq!(no_op, vec![shape.to_vec()]);
+        let reduce_all = infer(
+            &ShapeInference::ReductionFromInput {
+                keepdims: false,
+                noop_with_empty_axes: false,
+            },
+            &inputs,
+        )
+        .unwrap();
+        assert_eq!(reduce_all, vec![Vec::<usize>::new()]);
     }
 
     #[test]
@@ -7806,10 +8282,27 @@ fn after() {}
             shape: crate::dim_vec::DimVec::from_slice(&shape),
             strides: crate::dim_vec::DimVec::from_slice(&strides),
             dtype: DataType::Float32,
+            device: DeviceId::cpu(),
         };
         let v = buf.view();
         assert_eq!(v.shape, &shape[..]);
         assert_eq!(v.dtype, DataType::Float32);
+        assert_eq!(v.device, DeviceId::cpu());
+    }
+
+    #[test]
+    fn device_intermediate_view_preserves_residency() {
+        let buf = IntermediateBuf {
+            data: Vec::new(),
+            scratch_ptr: std::ptr::dangling_mut(),
+            shape: crate::dim_vec::DimVec::new(),
+            strides: crate::dim_vec::DimVec::new(),
+            dtype: DataType::Int64,
+            device: DeviceId::cuda(2),
+        };
+        let view = buf.view();
+        assert_eq!(view.device, DeviceId::cuda(2));
+        assert!(!view.device.is_host_accessible());
     }
 
     #[test]
@@ -8432,6 +8925,7 @@ fn after() {}
             shape: crate::dim_vec::DimVec::from_slice(&dims),
             strides,
             dtype: DataType::Float32,
+            device: DeviceId::cpu(),
         };
 
         let v = buf.view();
@@ -8648,6 +9142,7 @@ fn after() {}
             dtype: DataType::Float32,
             shape: crate::dim_vec::DimVec::zeroed(1),
             strides: crate::dim_vec::DimVec::zeroed(1),
+            device: DeviceId::cpu(),
         }
     }
 

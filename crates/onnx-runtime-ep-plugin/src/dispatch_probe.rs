@@ -1047,7 +1047,7 @@ mod ffi_coverage {
     /// account for it.
     const EXPECTED: &[(&str, &str, usize, usize)] = &[
         ("compute.rs", include_str!("compute.rs"), 9, 9),
-        ("kernel_ctx.rs", include_str!("kernel_ctx.rs"), 12, 12),
+        ("kernel_ctx.rs", include_str!("kernel_ctx.rs"), 15, 16),
         ("status.rs", include_str!("status.rs"), 1, 1),
         ("host_pool.rs", include_str!("host_pool.rs"), 2, 2),
     ];

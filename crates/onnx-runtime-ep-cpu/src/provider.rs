@@ -566,7 +566,11 @@ impl ExecutionProvider for CpuExecutionProvider {
                 op_type: op.op_type.clone(),
                 opset,
             })?;
-        factory.create(op, shapes)
+        let mut versioned = op.clone();
+        if versioned.version.is_none() {
+            versioned.version = i64::try_from(opset).ok();
+        }
+        factory.create(&versioned, shapes)
     }
 
     fn custom_passes(&self) -> Vec<Box<dyn onnx_runtime_optimizer::OptimizationPass>> {

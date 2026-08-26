@@ -378,6 +378,32 @@ fn ep_get_capability_inner(
             if is_gpu_ep && !node_inputs_all_routable(&view, node) {
                 return false;
             }
+            if is_gpu_ep {
+                let ir_node = view.node(node);
+                let input_shapes: Vec<Vec<Option<usize>>> = view
+                    .node_inputs(node)
+                    .iter()
+                    .map(|input| {
+                        input
+                            .map(|value| {
+                                view.value(value)
+                                    .shape
+                                    .iter()
+                                    .map(|dimension| dimension.as_static())
+                                    .collect()
+                            })
+                            .unwrap_or_default()
+                    })
+                    .collect();
+                let strategy = crate::compute::ShapeInference::for_node(
+                    ir_node,
+                    &input_shapes,
+                    ir_node.outputs.len(),
+                );
+                if shape_inference_reads_runtime_values(&strategy, ir_node) {
+                    return false;
+                }
+            }
             true
         })
     });
@@ -639,6 +665,38 @@ pub(crate) fn node_passes_dtype_filter(
         }
     }
     true
+}
+
+fn shape_inference_reads_runtime_values(
+    strategy: &crate::compute::ShapeInference,
+    node: &onnx_runtime_ir::Node,
+) -> bool {
+    use crate::compute::ShapeInference;
+
+    match strategy {
+        ShapeInference::SharedNative { node, .. } if node.op_type == "DFT" => {
+            node.inputs.get(1).is_some_and(Option::is_some)
+                || node.inputs.get(2).is_some_and(Option::is_some)
+        }
+        // Every other shared rule in the current census consumes shape-data:
+        // ConstantOfShape, Expand, STFT, and Tile.
+        ShapeInference::ReductionFromInput { .. } | ShapeInference::SqueezeFromInput => {
+            node.inputs.get(1).is_some_and(Option::is_some)
+        }
+        ShapeInference::SharedNative { .. }
+        | ShapeInference::ReshapeData { .. }
+        | ShapeInference::SliceData
+        | ShapeInference::ConstantOfShape
+        | ShapeInference::Expand
+        | ShapeInference::Tile
+        | ShapeInference::Window
+        | ShapeInference::Compress { .. } => true,
+        ShapeInference::Dft { .. } => {
+            node.inputs.get(1).is_some_and(Option::is_some)
+                || node.inputs.get(2).is_some_and(Option::is_some)
+        }
+        _ => false,
+    }
 }
 
 /// Compile: for each claimed subgraph, create kernels and wrap them as
@@ -1673,6 +1731,108 @@ mod tests {
             matches!(si, crate::compute::ShapeInference::Declined { .. }),
             "NonZero must be Declined; got {si:?}"
         );
+    }
+
+    #[test]
+    fn device_claims_decline_every_host_value_reading_shape_rule() {
+        use onnx_runtime_ir::{Node, NodeId, ValueId};
+
+        for (op, inputs) in [
+            ("ConstantOfShape", 1usize),
+            ("Expand", 2),
+            ("STFT", 4),
+            ("Tile", 2),
+            ("Compress", 2),
+            ("HannWindow", 1),
+            ("Reshape", 2),
+            ("Slice", 3),
+        ] {
+            let node = Node::new(
+                NodeId(0),
+                op,
+                (0..inputs)
+                    .map(|index| Some(ValueId(index as u32)))
+                    .collect(),
+                vec![ValueId(100)],
+            );
+            let shapes = vec![vec![Some(1)]; inputs];
+            let strategy = crate::compute::ShapeInference::for_node(&node, &shapes, 1);
+            assert!(
+                shape_inference_reads_runtime_values(&strategy, &node),
+                "{op} must not be claimed by a device plugin while its shape rule reads values"
+            );
+        }
+
+        let mut dft = Node::new(NodeId(0), "DFT", vec![Some(ValueId(0))], vec![ValueId(100)]);
+        dft.version = Some(20);
+        let strategy =
+            crate::compute::ShapeInference::for_node(&dft, &[vec![Some(1), Some(8), Some(1)]], 1);
+        assert!(!shape_inference_reads_runtime_values(&strategy, &dft));
+        dft.inputs.push(Some(ValueId(1)));
+        let strategy = crate::compute::ShapeInference::for_node(
+            &dft,
+            &[vec![Some(1), Some(8), Some(1)], vec![]],
+            1,
+        );
+        assert!(shape_inference_reads_runtime_values(&strategy, &dft));
+
+        let mut squeeze = Node::new(
+            NodeId(0),
+            "Squeeze",
+            vec![Some(ValueId(0)), Some(ValueId(1))],
+            vec![ValueId(100)],
+        );
+        squeeze.version = Some(13);
+        let strategy = crate::compute::ShapeInference::for_node(
+            &squeeze,
+            &[vec![Some(1), Some(1), Some(3)], vec![Some(1)]],
+            1,
+        );
+        assert!(matches!(
+            strategy,
+            crate::compute::ShapeInference::SqueezeFromInput
+        ));
+        assert!(shape_inference_reads_runtime_values(&strategy, &squeeze));
+        squeeze.inputs[1] = None;
+        let strategy = crate::compute::ShapeInference::for_node(
+            &squeeze,
+            &[vec![Some(1), Some(1), Some(3)], vec![]],
+            1,
+        );
+        assert!(matches!(
+            strategy,
+            crate::compute::ShapeInference::SqueezeAllUnitDims
+        ));
+        assert!(!shape_inference_reads_runtime_values(&strategy, &squeeze));
+
+        let mut reduction = Node::new(
+            NodeId(0),
+            "ReduceSum",
+            vec![Some(ValueId(0)), Some(ValueId(1))],
+            vec![ValueId(100)],
+        );
+        reduction.version = Some(13);
+        let strategy = crate::compute::ShapeInference::for_node(
+            &reduction,
+            &[vec![Some(2), Some(3), Some(4)], vec![Some(1)]],
+            1,
+        );
+        assert!(matches!(
+            strategy,
+            crate::compute::ShapeInference::ReductionFromInput { .. }
+        ));
+        assert!(shape_inference_reads_runtime_values(&strategy, &reduction));
+        reduction.inputs[1] = None;
+        let strategy = crate::compute::ShapeInference::for_node(
+            &reduction,
+            &[vec![Some(2), Some(3), Some(4)], vec![]],
+            1,
+        );
+        assert!(matches!(
+            strategy,
+            crate::compute::ShapeInference::ReductionFromInput { .. }
+        ));
+        assert!(!shape_inference_reads_runtime_values(&strategy, &reduction));
     }
 
     /// ShapeInference::for_node accepts Add (elementwise broadcast) without
