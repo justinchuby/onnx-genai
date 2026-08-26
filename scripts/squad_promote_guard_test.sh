@@ -207,6 +207,57 @@ else
   check_output "8b: names the over-match" "ordinary source path" "$out" present
 fi
 
+# --- 9. the workflow must not invoke the guard from the working tree ------
+# This arm exists because review caught a bootstrap deadlock the other 30 arms
+# could not see: the guard is a tracked file, so `git checkout preview` removes
+# it from the working tree, and `preview` only receives it via the very merge
+# the guard performs. Every arm above tests the script in isolation and passes
+# regardless. The hazard is in *how the workflow reaches it*, so that is what
+# this checks.
+WF="$HERE/../.github/workflows/squad-promote.yml"
+
+lint_workflow() { # file -> 0 clean, 1 hazard (reason on stdout)
+  local f="$1"
+  awk '
+    /^  [a-z][a-z0-9_-]*:$/ { if (job != "") check(); job = $1; sub(/:$/, "", job); calls = 0; stages = 0; relative = 0 }
+    /bash +"?\$(RUNNER_TEMP|\{RUNNER_TEMP\})"?\/squad_promote_guard\.sh/ { calls++ }
+    /bash +scripts\/squad_promote_guard\.sh/ { relative++ }
+    /install +-m +0755 +scripts\/squad_promote_guard\.sh/ { stages++ }
+    END { check() }
+    function check() {
+      if (relative > 0)
+        print "job " job ": invokes the guard at a working-tree path (" relative "x); a git checkout can delete it"
+      if (calls > 0 && stages == 0)
+        print "job " job ": invokes the staged guard but never stages it"
+    }
+  ' "$f"
+}
+
+if [ ! -f "$WF" ]; then
+  bad "arm 9: could not find $WF -- the lint has nothing to read and proves nothing"
+else
+  out=$(lint_workflow "$WF")
+  if [ -z "$out" ]; then ok; else bad "workflow lint: $out"; fi
+
+  # Positive control: the lint must fail on the shape review actually caught.
+  mutant="$WORK/wf_mutant.yml"
+  # `$RUNNER_TEMP` must stay literal here: it is the text being replaced.
+  # shellcheck disable=SC2016
+  sed 's#bash "\$RUNNER_TEMP/squad_promote_guard.sh"#bash scripts/squad_promote_guard.sh#' "$WF" > "$mutant"
+  if ! grep -qF 'bash scripts/squad_promote_guard.sh' "$mutant"; then
+    bad "arm 9 control anchor missed -- the mutation did not apply, so the lint is unproven"
+  else
+    out=$(lint_workflow "$mutant")
+    check_output "lint catches a working-tree invocation" "working-tree path" "$out" present
+  fi
+
+  # And on a job that calls the staged guard without staging it.
+  mutant="$WORK/wf_mutant2.yml"
+  grep -v 'install -m 0755 scripts/squad_promote_guard.sh' "$WF" > "$mutant"
+  out=$(lint_workflow "$mutant")
+  check_output "lint catches a missing staging step" "never stages it" "$out" present
+fi
+
 echo
 echo "passed: $pass   failed: $fail"
 [ "$fail" -eq 0 ]
