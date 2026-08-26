@@ -100,6 +100,9 @@ use std::time::{Duration, Instant};
 
 use crate::decode_affinity::{NodeShard, NumaTopology};
 use crate::kernels::matmul_nbits::output_chunk_len_for;
+use crate::persistent_pool_width::{
+    DEFAULT_SERVICE_CPUS_PER_NUMA_NODE, PoolLayoutInputs, resolve_pool_layout,
+};
 
 /// Environment switch selecting the persistent SPMD decode pool policy:
 /// **unset (the default) or `=1`** uses the persistent SPMD pool deterministically
@@ -4419,33 +4422,19 @@ fn node_shards_with(
     }
     let allowed = crate::decode_affinity::allowed_cpus();
     let cores = crate::core_topology::host();
-    if let Some(topology) = NumaTopology::detect() {
-        let topology = topology.restrict_to_allowed(allowed.as_deref());
-        if let Some(mut shards) = topology.split_workers(total) {
-            // Reserve a dispatcher core on every node so the engine thread has a
-            // free core on whichever socket the scheduler places it, and each
-            // node's completion counter can be read without contending with a
-            // pinned spinning worker.
-            reserve_split_headroom(&mut shards);
-            for shard in shards.iter_mut() {
-                shard.cpus = crate::decode_affinity::order_pin_targets(&shard.cpus, cores);
-            }
-            return shards;
-        }
+    let numa = NumaTopology::detect();
+    let mut layout = resolve_pool_layout(PoolLayoutInputs {
+        requested_workers: total,
+        allowed_cpus: allowed.as_deref(),
+        core_topology: cores,
+        numa_topology: numa.as_ref(),
+        available_parallelism: parallelism,
+        service_cpus_per_numa_node: DISPATCHER_RESERVED_CPUS,
+    });
+    for shard in &mut layout.shards {
+        shard.cpus = crate::decode_affinity::order_pin_targets(&shard.cpus, cores);
     }
-    // Single-node / non-NUMA / no-pinning fallback: one group. Pin to the
-    // process's allowed CPUs when known (best-effort), else leave unpinned.
-    let cpus = crate::decode_affinity::order_pin_targets(&allowed.unwrap_or_default(), cores);
-    let budget = effective_cpu_budget(cpus.len(), parallelism);
-    let core_count = cores
-        .map_or(0, |cores| cores.leaders_within(&cpus).len())
-        .min(budget);
-    let workers = reserve_single_group_headroom(total, budget, core_count);
-    vec![NodeShard {
-        index: 0,
-        cpus,
-        workers,
-    }]
+    layout.shards
 }
 
 /// Allowed CPUs kept free for the inline dispatcher per pinned worker group.
@@ -4464,7 +4453,7 @@ fn node_shards_with(
 /// per allowed physical core: on a non-SMT host the pool is now deliberately
 /// wide enough that this reserve is what keeps it from being *fully*
 /// subscribed.
-const DISPATCHER_RESERVED_CPUS: usize = 1;
+const DISPATCHER_RESERVED_CPUS: usize = DEFAULT_SERVICE_CPUS_PER_NUMA_NODE;
 
 /// Opt-in: bind the inline dispatcher to the CPU [`DISPATCHER_RESERVED_CPUS`]
 /// reserved for it (`1`/`on`/`true`/`yes`). Default off.
@@ -4707,13 +4696,7 @@ fn release_dispatcher_pin() {
 /// affinity mask (macOS, a seccomp-filtered container). `parallelism == 0`
 /// means the platform could not report *that*, so the mask stands alone.
 fn effective_cpu_budget(mask_len: usize, parallelism: usize) -> usize {
-    match (mask_len, parallelism) {
-        // "Allowed set unknown" is a distinct answer from any budget, and its
-        // meaning belongs to the reserve, not here.
-        (0, _) => 0,
-        (m, 0) => m,
-        (m, p) => m.min(p),
-    }
+    crate::persistent_pool_width::effective_cpu_budget(mask_len, parallelism)
 }
 
 /// CPUs this process may run on at once, as the platform reports it, or 0 when
@@ -4736,29 +4719,12 @@ fn host_parallelism() -> usize {
 /// workers (never zero); the single-CPU case is handled earlier by falling back
 /// to the flat path in [`build_from_env`].
 fn reserve_single_group_headroom(total: usize, allowed_count: usize, core_count: usize) -> usize {
-    if allowed_count == 0 {
-        return total;
-    }
-    // Within the physical-core budget the pool runs one worker per core, so the
-    // inline dispatcher has nowhere to go but some worker's SMT sibling -- and
-    // that worker becomes a straggler the whole barrier waits for on every op.
-    // Measured on qwen int4 `accuracy_level=0` decode, 16 physical cores, no
-    // cpuset: 16 workers 4.41 ms/token against 15 workers 2.81 ms/token (1.57x).
-    // Past the core budget the workers already share cores because the user asked
-    // for more threads than there are cores, so the historical logical-CPU
-    // reserve applies instead -- reserving cores there is a 1.28x regression
-    // (8-logical/4-core cpuset: 7 workers 10.58 ms against 3 workers 13.56 ms).
-    if core_count > 0 && total <= core_count {
-        return total
-            .min(core_count.saturating_sub(DISPATCHER_RESERVED_CPUS))
-            .max(1);
-    }
-    if total < allowed_count {
-        return total;
-    }
-    allowed_count
-        .saturating_sub(DISPATCHER_RESERVED_CPUS)
-        .max(1)
+    crate::persistent_pool_width::reserve_single_group_headroom(
+        total,
+        allowed_count,
+        core_count,
+        DISPATCHER_RESERVED_CPUS,
+    )
 }
 
 /// Cap each NUMA-split shard so at least [`DISPATCHER_RESERVED_CPUS`] CPU of that
@@ -4774,15 +4740,9 @@ fn reserve_single_group_headroom(total: usize, allowed_count: usize, core_count:
 /// *not* handed back -- `dispatcher_owns_a_shard` is false whenever there is
 /// more than one shard -- so guessing a per-node budget would cost compute
 /// width on hosts this change cannot measure. Tracked as #2195.
+#[cfg(test)]
 fn reserve_split_headroom(shards: &mut [NodeShard]) {
-    for shard in shards.iter_mut() {
-        let cap = shard
-            .cpus
-            .len()
-            .saturating_sub(DISPATCHER_RESERVED_CPUS)
-            .max(1);
-        shard.workers = shard.workers.min(cap);
-    }
+    crate::persistent_pool_width::reserve_split_headroom(shards, DISPATCHER_RESERVED_CPUS);
 }
 
 /// The calling thread's OS thread id, or `None` where the platform exposes no

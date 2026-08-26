@@ -3751,28 +3751,18 @@ fn configured_decode_threads() -> Option<usize> {
 pub fn configured_persistent_decode_threads() -> Option<usize> {
     let value = std::env::var(DECODE_THREADS_ENV).ok();
     let available = available_parallelism();
+    let uses_default = decode_threads_override().is_none()
+        && value
+            .as_deref()
+            .is_none_or(|v| v.is_empty() || v.parse::<usize>().is_err());
     let threads = resolve_persistent_decode_threads_with_override(
         decode_threads_override(),
         value.as_deref(),
         available,
         crate::core_topology::allowed_physical_cores(),
     );
-    // Snapdragon/X Elite style ARM64 hosts have measured their decode roofline
-    // at 6--8 workers, and the KAI-style packed SDOT path still scales from the
-    // generic `available/2` default (6 on a 12-way Oryon) to 8 workers. Keep the
-    // generic half-machine rule for other platforms, but use the measured ARM64
-    // topology ceiling when no explicit budget was provided.
-    #[cfg(all(
-        target_arch = "aarch64",
-        not(any(target_os = "macos", target_os = "ios"))
-    ))]
-    if decode_threads_override().is_none()
-        && value
-            .as_deref()
-            .is_none_or(|v| v.is_empty() || v.parse::<usize>().is_err())
-        && available >= MAX_TOPOLOGY_DECODE_THREADS
-    {
-        return Some(MAX_TOPOLOGY_DECODE_THREADS.min(available));
+    if !uses_default {
+        return threads;
     }
     // On Apple Silicon, when no explicit thread count was set, override the
     // generic `available/2` default with `P_cores - 1`. The SPMD dispatcher
@@ -3781,16 +3771,53 @@ pub fn configured_persistent_decode_threads() -> Option<usize> {
     // derived at runtime from `hw.perflevel0.physicalcpu` and generalizes
     // across all Apple Silicon tiers. Falls back silently on Intel Macs.
     #[cfg(any(target_os = "macos", target_os = "ios"))]
-    if decode_threads_override().is_none()
-        && value
-            .as_deref()
-            .is_none_or(|v| v.is_empty() || v.parse::<usize>().is_err())
-        && let Some(perf_cores) = performance_core_count()
-    {
+    if let Some(perf_cores) = performance_core_count() {
         let override_threads = perf_cores.saturating_sub(1).max(1).min(available);
         return Some(override_threads);
     }
-    threads
+
+    let allowed = crate::decode_affinity::allowed_cpus();
+    let cores = crate::core_topology::host();
+    let numa = crate::decode_affinity::NumaTopology::detect();
+    crate::persistent_pool_width::resolve_default_pool_width(
+        crate::persistent_pool_width::DefaultPoolWidthInputs {
+            allowed_cpus: allowed.as_deref(),
+            core_topology: cores,
+            numa_topology: numa.as_ref(),
+            available_parallelism: available,
+            architecture_cap: default_persistent_architecture_cap(),
+            service_cpus_per_numa_node:
+                crate::persistent_pool_width::DEFAULT_SERVICE_CPUS_PER_NUMA_NODE,
+        },
+    )
+    .map(|plan| plan.global_workers)
+    .or(threads)
+}
+
+/// Process-wide architecture ceiling for the automatic persistent-pool width.
+///
+/// It is applied after affinity/topology and `available_parallelism` establish
+/// the global capacity, but before NUMA distribution and per-node service-core
+/// headroom. Explicit user budgets bypass it.
+fn default_persistent_architecture_cap() -> Option<usize> {
+    #[cfg(all(
+        target_arch = "aarch64",
+        not(any(target_os = "macos", target_os = "ios"))
+    ))]
+    {
+        // Snapdragon/X Elite style ARM64 hosts have measured their decode
+        // roofline at 6--8 workers. This is a ceiling, not an instruction to
+        // inflate an SMT/restricted topology with fewer than eight physical
+        // leaders to exactly eight workers.
+        Some(MAX_TOPOLOGY_DECODE_THREADS)
+    }
+    #[cfg(not(all(
+        target_arch = "aarch64",
+        not(any(target_os = "macos", target_os = "ios"))
+    )))]
+    {
+        None
+    }
 }
 
 /// Set or clear a process-local CPU decode worker budget.
@@ -20630,68 +20657,6 @@ mod tests {
         AffinityFixtureOutcome::Ready(mask)
     }
 
-    #[cfg(target_os = "linux")]
-    #[derive(Debug, PartialEq, Eq)]
-    enum DefaultPoolExpectation {
-        FlatSingleCpu {
-            cores: usize,
-        },
-        Pool {
-            cores: usize,
-            nodes: usize,
-            workers: usize,
-        },
-    }
-
-    /// Expected NUMA-split compute width after reserving one service CPU per
-    /// fully subscribed node for the unpinned dispatcher/control path.
-    #[cfg(target_os = "linux")]
-    fn expected_split_worker_width(shards: &[crate::decode_affinity::NodeShard]) -> usize {
-        const RESERVED_SERVICE_CPUS_PER_NODE: usize = 1;
-        shards
-            .iter()
-            .map(|shard| {
-                let cap = shard
-                    .cpus
-                    .len()
-                    .saturating_sub(RESERVED_SERVICE_CPUS_PER_NODE)
-                    .max(1);
-                shard.workers.min(cap)
-            })
-            .sum()
-    }
-
-    #[cfg(target_os = "linux")]
-    fn default_pool_expectation(
-        mask: &[usize],
-        topology: &crate::core_topology::CoreTopology,
-        numa: Option<&crate::decode_affinity::NumaTopology>,
-    ) -> DefaultPoolExpectation {
-        let cores = topology.physical_cores_within(mask);
-        assert!(
-            cores > 0,
-            "a selected affinity fixture must cover at least one physical core: {mask:?}"
-        );
-        if mask.len() == 1 {
-            return DefaultPoolExpectation::FlatSingleCpu { cores };
-        }
-        let split = numa.and_then(|numa| numa.restrict_to_allowed(Some(mask)).split_workers(cores));
-        match split {
-            Some(shards) => DefaultPoolExpectation::Pool {
-                cores,
-                nodes: shards.len(),
-                workers: expected_split_worker_width(&shards),
-            },
-            None => DefaultPoolExpectation::Pool {
-                cores,
-                nodes: 1,
-                // The single group reserves one spawned worker, but the inline
-                // dispatcher owns that shard and restores the compute width.
-                workers: cores,
-            },
-        }
-    }
-
     fn realized_width_report(requested: usize) -> RealizedWidth {
         realized_width_report_with(requested, false, None)
     }
@@ -21040,7 +21005,6 @@ mod tests {
         topology: &crate::core_topology::CoreTopology,
         numa: Option<&crate::decode_affinity::NumaTopology>,
     ) {
-        let expectation = default_pool_expectation(mask, topology, numa);
         let report = realized_default_width_report(mask);
         assert_eq!(
             report.requested, 0,
@@ -21059,9 +21023,24 @@ mod tests {
             mask.len(),
             "{case}: the reported allowed count disagrees with the exact mask ({report:?})"
         );
-        match expectation {
-            DefaultPoolExpectation::FlatSingleCpu { cores } => {
-                assert_eq!(report.cores, cores, "{case}: {report:?}");
+        let expectation = crate::persistent_pool_width::resolve_default_pool_width(
+            crate::persistent_pool_width::DefaultPoolWidthInputs {
+                allowed_cpus: Some(mask),
+                core_topology: Some(topology),
+                numa_topology: numa,
+                available_parallelism: report.available,
+                architecture_cap: default_persistent_architecture_cap(),
+                service_cpus_per_numa_node:
+                    crate::persistent_pool_width::DEFAULT_SERVICE_CPUS_PER_NUMA_NODE,
+            },
+        )
+        .expect("the applied non-empty mask must resolve a default pool width");
+        let cores = expectation
+            .physical_cores
+            .expect("the integration fixture supplies a detected physical topology");
+        assert_eq!(report.cores, cores, "{case}: {report:?}");
+        match expectation.disposition {
+            crate::persistent_pool_width::DefaultPoolDisposition::FlatSingleCpu => {
                 assert!(
                     !report.pool_built,
                     "{case}: a single-CPU mask must take the documented flat fallback ({report:?})"
@@ -21072,18 +21051,16 @@ mod tests {
                     "{case}: a declined pool must not report nodes or workers ({report:?})"
                 );
             }
-            DefaultPoolExpectation::Pool {
-                cores,
-                nodes,
-                workers,
-            } => {
+            crate::persistent_pool_width::DefaultPoolDisposition::Pool(layout) => {
                 assert!(report.pool_built, "{case}: no pool was built ({report:?})");
-                assert_eq!(report.cores, cores, "{case}: {report:?}");
-                assert_eq!(report.nodes, nodes, "{case}: {report:?}");
+                assert_eq!(report.nodes, layout.shards.len(), "{case}: {report:?}");
                 assert_eq!(
-                    report.workers, workers,
-                    "{case}: the pool width must include the production service-core \
-                     reservation rather than assuming workers == requested CPUs ({report:?})"
+                    report.workers,
+                    layout.realized_workers(),
+                    "{case}: the observed pool must realize the shared production width plan \
+                     after its global {}-worker clamp and per-node service-core reserve \
+                     ({report:?})",
+                    expectation.global_workers
                 );
                 assert_eq!(
                     report.planned_distinct_cores,
@@ -21174,24 +21151,6 @@ mod tests {
         panic!(
             "this ignored test was forced to run on a target without process-wide CPU affinity \
              masking; no exact-mask assertion is possible here"
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn default_width_expectation_accounts_for_one_reserved_service_cpu_per_node() {
-        let shards: Vec<crate::decode_affinity::NodeShard> = (0..4)
-            .map(|node| crate::decode_affinity::NodeShard {
-                index: node,
-                cpus: (node * 24..(node + 1) * 24).collect(),
-                workers: 24,
-            })
-            .collect();
-        assert_eq!(
-            expected_split_worker_width(&shards),
-            92,
-            "four fully subscribed 24-core nodes reserve four service CPUs; the original \
-             92-vs-96 observation is the production invariant, not lost workers"
         );
     }
 
