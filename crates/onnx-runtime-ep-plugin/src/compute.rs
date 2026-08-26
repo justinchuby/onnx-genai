@@ -3328,7 +3328,15 @@ unsafe extern "C" fn compute_execute(
                         absent_scratch.iter().map(|(slot, _, _)| *slot),
                         absent_shapes,
                     );
-                    let mut all_output_views: Vec<_> = {
+                    // Same stack storage as the single-node path's output views
+                    // below, for the same reason and with the same seed. On the
+                    // routed path it is paid once per *node* rather than once per
+                    // `Run`, so a 100-node graph collected -- and freed -- a
+                    // hundred short-lived vectors of views per `Run` for storage
+                    // that never outlives the node that built it.
+                    let mut inline_views;
+                    let mut heap_views;
+                    let all_output_views: &mut [TensorMut<'_>] = {
                         // Taken lazily. Collecting these into their own `Vec` and
                         // immediately draining it built a second vector of views per
                         // node, for every node of every `Run`, to hand each view
@@ -3336,30 +3344,60 @@ unsafe extern "C" fn compute_execute(
                         // doing this; the routed path is where it is paid per node.
                         let mut ort_iter = ort_outputs.iter_mut().map(|o| o.view_mut());
                         let mut buf_iter = new_bufs.iter_mut();
-                        slot_kinds
-                            .iter()
-                            .enumerate()
-                            .map(|(slot_idx, kind)| match kind {
-                                RoutedSlotKind::Ort => ort_iter.next().unwrap(),
-                                RoutedSlotKind::Buffer => {
-                                    let (_, buf) = buf_iter.next().unwrap();
-                                    buf_view_mut(buf)
-                                }
-                                RoutedSlotKind::Absent(idx) => {
-                                    let (_, scratch_buf, dtype) = &mut absent_scratch[*idx];
-                                    let shape = &absent_shapes[slot_idx];
-                                    let strides = &absent_strides_storage[*idx];
-                                    TensorMut::new(
-                                        DevicePtrMut(scratch_buf.as_mut_ptr().cast()),
-                                        *dtype,
-                                        shape.as_slice(),
-                                        strides.as_slice(),
-                                        DeviceId::cpu(),
-                                    )
-                                    .mark_absent()
-                                }
-                            })
-                            .collect()
+                        let views =
+                            slot_kinds
+                                .iter()
+                                .enumerate()
+                                .map(|(slot_idx, kind)| match kind {
+                                    RoutedSlotKind::Ort => ort_iter.next().unwrap(),
+                                    RoutedSlotKind::Buffer => {
+                                        let (_, buf) = buf_iter.next().unwrap();
+                                        buf_view_mut(buf)
+                                    }
+                                    RoutedSlotKind::Absent(idx) => {
+                                        let (_, scratch_buf, dtype) = &mut absent_scratch[*idx];
+                                        let shape = &absent_shapes[slot_idx];
+                                        let strides = &absent_strides_storage[*idx];
+                                        TensorMut::new(
+                                            DevicePtrMut(scratch_buf.as_mut_ptr().cast()),
+                                            *dtype,
+                                            shape.as_slice(),
+                                            strides.as_slice(),
+                                            DeviceId::cpu(),
+                                        )
+                                        .mark_absent()
+                                    }
+                                });
+                        if slot_kinds.len() <= INLINE_OPERANDS {
+                            inline_views = std::array::from_fn::<_, INLINE_OPERANDS, _>(|_| {
+                                absent_output_view()
+                            });
+                            // `zip` stops at the shorter side, which is `views`
+                            // here -- the seeded tail past `slot_kinds.len()` is
+                            // left alone and never handed to the kernel.
+                            for (dst, view) in inline_views.iter_mut().zip(views) {
+                                *dst = view;
+                            }
+                            &mut inline_views[..slot_kinds.len()]
+                        } else {
+                            // Unreachable for every op this EP can currently
+                            // claim -- four is the widest any of them gets
+                            // (`SkipLayerNormalization` and `AttentionStd` are
+                            // the ones that reach it), and a node whose shapes
+                            // cannot be inferred is declined before it ever
+                            // reaches here. `Unique` is not a counter-example
+                            // despite also having four: kernel-sized outputs
+                            // take the branch above and never arrive. Kept
+                            // because that is a fact about today's table rather
+                            // than about this code, and because the alternative
+                            // to a heap arm is a panic on the first op that adds
+                            // a fifth output.
+                            crate::dispatch_probe::count(
+                                crate::dispatch_probe::Event::DispatchAlloc,
+                            );
+                            heap_views = Vec::from_iter(views);
+                            &mut heap_views[..]
+                        }
                     };
 
                     let plans = match exported.workspace_plan_cache(node_idx) {
@@ -3403,7 +3441,7 @@ unsafe extern "C" fn compute_execute(
                     let kernel_probe = crate::dispatch_probe::Phase::KernelInvoke.enter();
                     if let Err(e) = entry.kernel.execute_with_workspace(
                         &kernel_inputs,
-                        &mut all_output_views,
+                        all_output_views,
                         workspace,
                     ) {
                         return fail_status(&format!("Compute: kernel execution failed: {e}"));
