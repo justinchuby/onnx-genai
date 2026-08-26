@@ -66,7 +66,7 @@ fn heterogeneous_parameter_adapters_match_independent_rows_and_compaction() -> a
     let red = br#"{"targets":{"projection":{"a":[1.0,0.0],"b":[1.0,2.0]}}}"#;
     let blue = br#"{"targets":{"projection":{"a":[0.0,1.0],"b":[3.0,4.0]}}}"#;
     let metadata = r#"
-schema_version: v1
+schema_version: v1.1
 adapters:
   target_manifest:
     targets:
@@ -150,6 +150,8 @@ pipeline:
           kind: adapter
           abi: onnx-genai.parameter-overlay
           version: "1"
+        batch_capacity:
+          budgets: [{ dimensions: [batch], max_total: 8 }]
         row_scope: { axis: 0, stateful: false }
         ports:
           inputs:

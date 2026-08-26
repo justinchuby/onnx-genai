@@ -6,12 +6,17 @@
 //! - Priority ordering
 //! - Batch formation
 
+pub mod batch_admission;
 pub mod byte_budget;
 pub mod governor;
 pub mod host_lease;
 pub mod policy;
 pub mod pressure;
 
+pub use batch_admission::{
+    AdmittedBatch, BatchAdmissionError, BatchContribution, BatchDimensionAggregation, BatchPolicy,
+    MaterializedBudget, group_batch_contributions, validate_materialized_footprint,
+};
 pub use byte_budget::{
     AdmissionCeiling, BudgetSnapshot, ByteBudget, ByteBudgetError, ByteBudgetReservation,
     ReconfigureOutcome as ByteBudgetReconfigureOutcome,

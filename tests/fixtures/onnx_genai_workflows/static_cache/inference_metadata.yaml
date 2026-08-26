@@ -1,4 +1,4 @@
-schema_version: v1
+schema_version: v1.1
 pipeline:
   workflow:
     manifest:
@@ -189,6 +189,7 @@ pipeline:
         stage: pre_adapter
     components:
       model:
+        batch_capacity: { uniform_dimensions: [cache_capacity] }
         implementation:
           kind: onnx
           artifact: model.onnx.textproto
@@ -274,6 +275,7 @@ pipeline:
             input_ids: token_ids
             logits: logits
       state_init:
+        batch_capacity: { uniform_dimensions: [prompt_sequence] }
         implementation:
           kind: onnx
           artifact: policies/state_init.onnx.textproto
@@ -340,6 +342,7 @@ pipeline:
                 kind: request_aligned
                 axis: 0
       step_update:
+        batch_capacity: {}
         implementation:
           kind: onnx
           artifact: policies/step_update.onnx.textproto
@@ -416,6 +419,7 @@ pipeline:
                 kind: request_aligned
                 axis: 0
       next_token:
+        batch_capacity: {}
         implementation:
           kind: onnx
           artifact: policies/next_token.onnx.textproto
@@ -442,6 +446,7 @@ pipeline:
                 kind: request_aligned
                 axis: 0
       loop_continue:
+        batch_capacity: {}
         implementation:
           kind: onnx
           artifact: policies/loop_continue.onnx.textproto

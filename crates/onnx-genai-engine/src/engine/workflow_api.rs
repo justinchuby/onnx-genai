@@ -304,6 +304,21 @@ impl Engine {
         self.workflow_runtime().prepare_workflow_execution(request)
     }
 
+    /// Group request-local component inputs under the package's symbol-keyed
+    /// capacity contract.
+    ///
+    /// Input maps are keyed by component port name. This performs ownership,
+    /// uniformity, padding-aware footprint, and budget admission only; a backend
+    /// packer still owns materializing the grouped payload allocation.
+    pub fn group_workflow_component_inputs(
+        &self,
+        component: &str,
+        requests: &[(crate::config::SessionId, &PipelineTensors)],
+    ) -> anyhow::Result<Vec<onnx_genai_scheduler::AdmittedBatch>> {
+        self.workflow_runtime()
+            .group_component_batch_inputs(component, requests)
+    }
+
     pub fn workflow_performance_diagnostic(&self) -> WorkflowPerformanceDiagnostic {
         WorkflowRuntime::workflow_performance_diagnostic(&self.workflow)
     }

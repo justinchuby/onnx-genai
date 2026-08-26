@@ -1,4 +1,4 @@
-schema_version: v1
+schema_version: v1.1
 pipeline:
   workflow:
     manifest:
@@ -245,46 +245,57 @@ pipeline:
         stage: post_adapter
     components:
       talker:
+        batch_capacity: {}
         implementation:
           kind: onnx
           artifact: talker/model.onnx.textproto
       code_predictor:
+        batch_capacity: {}
         implementation:
           kind: onnx
           artifact: code_predictor/model.onnx.textproto
       embedding:
+        batch_capacity: {}
         implementation:
           kind: onnx
           artifact: embedding/model.onnx.textproto
       talker_step_embedder:
+        batch_capacity: {}
         implementation:
           kind: onnx
           artifact: talker_step_embedder/model.onnx.textproto
       talker_prefill_embedder:
+        batch_capacity: {}
         implementation:
           kind: onnx
           artifact: talker_prefill_embedder/model.onnx.textproto
       code_predictor_prefill:
+        batch_capacity: {}
         implementation:
           kind: onnx
           artifact: code_predictor_prefill/model.onnx.textproto
       code_predictor_step_embedder:
+        batch_capacity: {}
         implementation:
           kind: onnx
           artifact: code_predictor_step_embedder/model.onnx.textproto
       code_predictor_indices:
+        batch_capacity: {}
         implementation:
           kind: onnx
           artifact: code_predictor_indices/model.onnx.textproto
       talker_text_step:
+        batch_capacity: {}
         implementation:
           kind: onnx
           artifact: talker_text_step/model.onnx.textproto
       codec:
+        batch_capacity: {}
         implementation:
           kind: onnx
           artifact: codec/model.onnx.textproto
       last_token_logits:
+        batch_capacity: { uniform_dimensions: [sequence, vocabulary] }
         implementation:
           kind: onnx
           artifact: policies/last_token_logits.onnx.textproto
@@ -311,6 +322,7 @@ pipeline:
                 kind: request_aligned
                 axis: 0
       setup_talker_sampler:
+        batch_capacity: { uniform_dimensions: [vocabulary] }
         implementation:
           kind: onnx
           artifact: policies/setup_talker_sampler.onnx.textproto
@@ -344,6 +356,7 @@ pipeline:
             mode: greedy
         application_overridable: true
       setup_predictor_sampler:
+        batch_capacity: { uniform_dimensions: [vocabulary] }
         implementation:
           kind: onnx
           artifact: policies/setup_predictor_sampler.onnx.textproto
@@ -377,6 +390,7 @@ pipeline:
             mode: greedy
         application_overridable: true
       talker_sampler:
+        batch_capacity: { uniform_dimensions: [vocabulary] }
         implementation:
           kind: onnx
           artifact: policies/talker_sampler.onnx.textproto
@@ -410,6 +424,7 @@ pipeline:
             mode: greedy
         application_overridable: true
       predictor_prefill_sampler:
+        batch_capacity: { uniform_dimensions: [vocabulary] }
         implementation:
           kind: onnx
           artifact: policies/predictor_prefill_sampler.onnx.textproto
@@ -443,6 +458,7 @@ pipeline:
             mode: greedy
         application_overridable: true
       predictor_body_sampler:
+        batch_capacity: { uniform_dimensions: [vocabulary] }
         implementation:
           kind: onnx
           artifact: policies/predictor_body_sampler.onnx.textproto
@@ -476,6 +492,7 @@ pipeline:
             mode: greedy
         application_overridable: true
       continue_predicate:
+        batch_capacity: {}
         implementation:
           kind: onnx
           artifact: policies/continue_predicate.onnx.textproto
@@ -496,6 +513,7 @@ pipeline:
               shape:
               - 1
       tts_state_initializer:
+        batch_capacity: { uniform_dimensions: [sequence] }
         implementation:
           kind: onnx
           artifact: policies/tts_state_initializer.onnx.textproto
@@ -540,6 +558,7 @@ pipeline:
                 kind: request_aligned
                 axis: 0
       token_to_slot:
+        batch_capacity: {}
         implementation:
           kind: onnx
           artifact: policies/token_to_slot.onnx.textproto
@@ -564,6 +583,7 @@ pipeline:
                 kind: request_aligned
                 axis: 0
       code_frame_update:
+        batch_capacity: {}
         implementation:
           kind: onnx
           artifact: policies/code_frame_update.onnx.textproto
@@ -601,6 +621,7 @@ pipeline:
                 kind: request_aligned
                 axis: 0
       code_history_append:
+        batch_capacity: { uniform_dimensions: [frames] }
         implementation:
           kind: onnx
           artifact: policies/code_history_append.onnx.textproto
@@ -637,6 +658,7 @@ pipeline:
                 kind: request_aligned
                 axis: 0
       cache_length_update:
+        batch_capacity: {}
         implementation:
           kind: onnx
           artifact: policies/cache_length_update.onnx.textproto
@@ -668,6 +690,7 @@ pipeline:
                 kind: request_aligned
                 axis: 0
       talker_state_initializer:
+        batch_capacity: { uniform_dimensions: [prefill_sequence] }
         implementation:
           kind: onnx
           artifact: policies/talker_state_initializer.onnx.textproto
@@ -739,6 +762,7 @@ pipeline:
                 kind: request_aligned
                 axis: 0
       predictor_state_initializer:
+        batch_capacity: { uniform_dimensions: [prefill_sequence] }
         implementation:
           kind: onnx
           artifact: policies/predictor_state_initializer.onnx.textproto
@@ -902,6 +926,7 @@ pipeline:
                 kind: request_aligned
                 axis: 0
       talker_step_update:
+        batch_capacity: { uniform_dimensions: [context], budgets: [{ dimensions: [batch], max_total: 2 }] }
         implementation:
           kind: onnx
           artifact: policies/talker_step_update.onnx.textproto
@@ -923,6 +948,9 @@ pipeline:
               - 3
               - batch
               - 1
+              batch_layout:
+                kind: request_aligned
+                axis: 1
           outputs:
             next_attention_mask:
               dtype: int64
@@ -940,7 +968,11 @@ pipeline:
               - 3
               - batch
               - 1
+              batch_layout:
+                kind: request_aligned
+                axis: 1
       predictor_step_update:
+        batch_capacity: { uniform_dimensions: [context], budgets: [{ dimensions: [batch], max_total: 2 }] }
         implementation:
           kind: onnx
           artifact: policies/predictor_step_update.onnx.textproto
@@ -984,6 +1016,7 @@ pipeline:
                 kind: request_aligned
                 axis: 0
       codec_layout:
+        batch_capacity: { uniform_dimensions: [frames] }
         implementation:
           kind: onnx
           artifact: policies/codec_layout.onnx.textproto

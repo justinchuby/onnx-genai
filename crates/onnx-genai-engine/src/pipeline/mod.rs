@@ -27,6 +27,7 @@ use std::sync::Arc;
 mod adapters;
 mod arg_reduce;
 mod audio;
+mod batching;
 mod device_ops;
 pub(crate) mod generation;
 mod islands;
@@ -40,6 +41,10 @@ mod workflow;
 pub use adapters::{AdapterActivation, AdapterLifecycleDiagnostic, AdapterSelection};
 pub use arg_reduce::{ArgReduceRewrites, WideArgReduceLowering, lower_degenerate_arg_reductions};
 pub use audio::{EncodedAudio, encode_pcm16_wav, resample_planar};
+pub use batching::{
+    BatchContractError, ComposedOwnership, OwnershipLevelValues, PackedOwnership,
+    PackedRequestView, PackedTensor, PackedValueView, RebasedI64Slice, batch_contract_error,
+};
 pub(crate) use generation::validate_generation_workflow;
 pub use islands::ExecutionIslandDiagnostic;
 pub use onnx_genai_metadata::WorkflowOutputRole;
@@ -922,7 +927,7 @@ impl WorkflowRuntime {
         if let Some(existing) = self.worker.iteration_runtimes.borrow().get(&policy) {
             return Ok(Rc::clone(existing));
         }
-        let variant =
+        let mut variant =
             onnx_genai_metadata::decoder_workflow::iteration_variant(&self.plan.workflow, policy)
                 .map_err(|error| {
                 anyhow::anyhow!(
@@ -930,6 +935,18 @@ impl WorkflowRuntime {
                          {policy:?}: {error}"
                 )
             })?;
+        if policy == IterationPolicy::ContinuousBatch {
+            // This variant is created only behind the continuous scheduler,
+            // which has already admitted and assigned every live row. Record
+            // that proven batching boundary on the runtime-local component so
+            // the universal pre-dispatch check does not mistake scheduler
+            // capacity for an undeclared package capability.
+            let component = variant
+                .components
+                .get_mut(onnx_genai_metadata::decoder_workflow::BATCH_STEP_COMPONENT)
+                .context("continuous-batch variant has no batch_step component")?;
+            component.batch_capacity = Some(onnx_genai_metadata::ComponentBatchCapacity::default());
+        }
         generation::validate_generation_workflow(&variant)?;
         // A variant body invokes bindings only, so the directory it is built
         // over names no artifacts. Declaring that explicitly — rather than
