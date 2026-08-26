@@ -184,12 +184,14 @@ package whose prefill starts from an empty cache has no cheaper option.
 ## End-of-generation tokens
 
 A model may end a turn with one token and a message with another. Both stop it,
-so top-level token facts declare an ordered set:
+so tokenizer package facts declare an ordered set:
 
 ```yaml
 schema_version: v1.2
-tokens:
-  eos_token_id: [200002, 200012] # e.g. <|eot|> and <|eom|>
+package:
+  tokenizer:
+    special_tokens:
+      eos_token_id: [200002, 200012] # e.g. <|eot|> and <|eom|>
 ```
 
 Numeric ids are package/model facts. Token spellings, added-token mappings, and

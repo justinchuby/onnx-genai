@@ -1,7 +1,4 @@
 schema_version: v1.2
-tokens:
-  eos_token_id:
-  - 2
 preprocessing:
   image:
     transforms:
@@ -1623,6 +1620,9 @@ package:
     algorithm: bpe
     vocab_size: 32000
     byte_level: true
+    special_tokens:
+      eos_token_id:
+      - 2
   constraint_languages:
   - dialect: gbnf
     version: '1'

@@ -1172,8 +1172,8 @@ pub struct GenerateOptions {
     /// A caller's optional multi-id EOS override.
     ///
     /// When neither request field is set, the engine copies the package default
-    /// from top-level `tokens.eos_token_id`. Tokenizer assets never contribute
-    /// numeric ids.
+    /// from `package.tokenizer.special_tokens.eos_token_id`. Tokenizer assets
+    /// never contribute numeric ids for v1.2 packages.
     pub eos_token_ids: Vec<TokenId>,
     /// Whether an end token terminates generation.
     pub stop_on_eos: bool,

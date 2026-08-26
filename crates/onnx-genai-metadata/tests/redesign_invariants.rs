@@ -767,15 +767,15 @@ pipeline:
 fn constraint_dialect_and_tokenizer_artifact_are_representable() {
     let document = r#"
 schema_version: v1.2
-tokens:
-  pad_token_id: 0
-  bos_token_id: 1
-  eos_token_id: [2]
 package:
   tokenizer:
     algorithm: bpe
     vocab_size: 32000
     byte_level: true
+    special_tokens:
+      pad_token_id: 0
+      bos_token_id: 1
+      eos_token_id: [2]
     artifacts:
       - location: tokenizer.json
   constraint_languages:
@@ -800,12 +800,12 @@ pipeline:
     validate_metadata(&metadata).expect("package facts are valid");
     let package = metadata.package.as_ref().expect("package facts");
     let tokenizer = package.tokenizer.as_ref().expect("tokenizer facts");
-    assert_eq!(tokenizer.vocab_size, 32000);
+    assert_eq!(tokenizer.vocab_size, Some(32000));
     assert!(tokenizer.byte_level);
     assert_eq!(tokenizer.artifacts[0].location, "tokenizer.json");
     assert_eq!(
-        metadata
-            .tokens
+        tokenizer
+            .special_tokens
             .as_ref()
             .expect("numeric token facts")
             .eos_token_id,
@@ -823,21 +823,20 @@ pipeline:
 }
 
 #[test]
-fn inline_tokenizer_special_tokens_have_an_actionable_migration() {
+fn retired_top_level_tokens_have_an_actionable_migration() {
     let error = parse_metadata(
         r#"
-package:
-  tokenizer:
-    algorithm: bpe
-    vocab_size: 32
-    special_tokens:
-      eos: {id: 2, content: "</s>"}
+tokens:
+  eos_token_id: [2]
 "#,
         Some("yaml"),
     )
-    .expect_err("inline special-token duplication is retired")
+    .expect_err("top-level token authority is retired")
     .to_string();
-    assert!(error.contains("top-level `tokens`"), "{error}");
+    assert!(
+        error.contains("package.tokenizer.special_tokens"),
+        "{error}"
+    );
     assert!(error.contains("tokenizer.json"), "{error}");
 }
 
@@ -850,12 +849,17 @@ fn generation_requires_one_token_authority_and_an_executable_stop_policy() {
     validate_metadata(&metadata).expect("the canonical generation fixture is valid");
 
     let mut no_tokens = metadata.clone();
-    no_tokens.tokens = None;
+    no_tokens
+        .package
+        .as_mut()
+        .and_then(|package| package.tokenizer.as_mut())
+        .expect("tokenizer facts")
+        .special_tokens = None;
     let reported = validate_metadata(&no_tokens).expect_err("generation needs package EOS facts");
     assert!(
         reported
             .iter()
-            .any(|error| error.contains("top-level `tokens.eos_token_id`")),
+            .any(|error| error.contains("package.tokenizer.special_tokens.eos_token_id")),
         "{reported:?}"
     );
 
@@ -885,9 +889,11 @@ fn eos_authority_rejects_duplicates_and_workflow_literals() {
     );
     let mut metadata = parse(document);
     metadata
-        .tokens
+        .package
         .as_mut()
-        .expect("token facts")
+        .and_then(|package| package.tokenizer.as_mut())
+        .and_then(|tokenizer| tokenizer.special_tokens.as_mut())
+        .expect("special token facts")
         .eos_token_id
         .push(127);
     let reported = validate_metadata(&metadata).expect_err("duplicate EOS ids are ambiguous");

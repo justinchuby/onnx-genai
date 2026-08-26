@@ -260,7 +260,7 @@ impl GenAiConfig {
             "schema_version".into(),
             json!(onnx_genai_metadata::version::TOKEN_AUTHORITY_SCHEMA_VERSION.to_string()),
         );
-        let mut tokens = Map::new();
+        let mut special_tokens = Map::new();
         for (name, id) in [
             ("pad_token_id", self.model.pad_token_id),
             ("bos_token_id", self.model.bos_token_id),
@@ -271,11 +271,19 @@ impl GenAiConfig {
             ("vision_start_token_id", self.model.vision_start_token_id),
         ] {
             if let Some(id) = id {
-                tokens.insert(name.to_string(), json!(checked_token_id(name, id)?));
+                special_tokens.insert(name.to_string(), json!(checked_token_id(name, id)?));
             }
         }
-        tokens.insert("eos_token_id".to_string(), json!(eos_token_ids));
-        root.insert("tokens".into(), Value::Object(tokens));
+        special_tokens.insert("eos_token_id".to_string(), json!(eos_token_ids));
+        root.insert(
+            "package".into(),
+            json!({
+                "tokenizer": {
+                    "vocab_size": self.model.vocab_size,
+                    "special_tokens": special_tokens,
+                }
+            }),
+        );
 
         // `genai_config.json` is a *foreign* producer's format, so importing it
         // is a conversion, not a fallback: the result is stated in this project's

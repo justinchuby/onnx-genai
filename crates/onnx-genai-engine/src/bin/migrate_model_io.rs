@@ -149,18 +149,19 @@ fn migrate(
     }
 
     let artifact = decoder_artifact(package)?;
-    let eos_token_ids = document
-        .get("tokens")
-        .and_then(|tokens| tokens.get("eos_token_id"))
-        .and_then(serde_yaml::Value::as_sequence)
-        .map(|ids| ids.iter().filter_map(serde_yaml::Value::as_i64).collect())
+    let eos_token_ids = package_eos_token_ids(&document)
+        .or_else(|| {
+            document
+                .get("tokens")
+                .and_then(|tokens| tokens.get("eos_token_id"))
+                .and_then(sequence_i64)
+        })
         .or_else(|| {
             document
                 .get("generation")
                 .and_then(|generation| generation.get("defaults"))
                 .and_then(|defaults| defaults.get("eos_token_ids"))
-                .and_then(serde_yaml::Value::as_sequence)
-                .map(|ids| ids.iter().filter_map(serde_yaml::Value::as_i64).collect())
+                .and_then(sequence_i64)
         })
         .or_else(|| declared_eos_token_ids(&document))
         .unwrap_or_default();
@@ -218,12 +219,28 @@ fn migrate(
             onnx_genai_metadata::version::TOKEN_AUTHORITY_SCHEMA_VERSION.to_string(),
         ),
     );
-    let mut tokens = document
-        .get("tokens")
+    let mut package = document
+        .get("package")
         .and_then(serde_yaml::Value::as_mapping)
         .cloned()
         .unwrap_or_default();
-    tokens.insert(
+    let mut tokenizer = package
+        .get(serde_yaml::Value::String("tokenizer".to_string()))
+        .and_then(serde_yaml::Value::as_mapping)
+        .cloned()
+        .unwrap_or_default();
+    let mut special_tokens = tokenizer
+        .get(serde_yaml::Value::String("special_tokens".to_string()))
+        .and_then(serde_yaml::Value::as_mapping)
+        .cloned()
+        .or_else(|| {
+            document
+                .get("tokens")
+                .and_then(serde_yaml::Value::as_mapping)
+                .cloned()
+        })
+        .unwrap_or_default();
+    special_tokens.insert(
         serde_yaml::Value::String("eos_token_id".to_string()),
         serde_yaml::to_value(
             eos_token_ids
@@ -232,9 +249,19 @@ fn migrate(
                 .collect::<Result<Vec<_>, _>>()?,
         )?,
     );
-    document.as_mapping_mut().expect("metadata mapping").insert(
-        serde_yaml::Value::String("tokens".to_string()),
-        serde_yaml::Value::Mapping(tokens),
+    tokenizer.insert(
+        serde_yaml::Value::String("special_tokens".to_string()),
+        serde_yaml::Value::Mapping(special_tokens),
+    );
+    package.insert(
+        serde_yaml::Value::String("tokenizer".to_string()),
+        serde_yaml::Value::Mapping(tokenizer),
+    );
+    let document_mapping = document.as_mapping_mut().expect("metadata mapping");
+    document_mapping.remove(serde_yaml::Value::String("tokens".to_string()));
+    document_mapping.insert(
+        serde_yaml::Value::String("package".to_string()),
+        serde_yaml::Value::Mapping(package),
     );
     if let Some(defaults) = document
         .get_mut("generation")
@@ -261,15 +288,30 @@ fn migrate(
 /// that keeps a rebuild a rebuild rather than a quiet reset to
 /// "this model has no end token".
 fn declared_eos_token_ids(document: &serde_yaml::Value) -> Option<Vec<i64>> {
-    let elements = document
-        .get("pipeline")?
-        .get("workflow")?
-        .get("inputs")?
-        .get("package.eos_token_ids")?
-        .get("default")?
-        .as_sequence()?;
+    let inputs = document.get("pipeline")?.get("workflow")?.get("inputs")?;
+    ["package.eos_token_ids", "package.eos_ids"]
+        .into_iter()
+        .find_map(|name| inputs.get(name)?.get("default").and_then(sequence_i64))
+}
+
+/// Canonical package-default EOS ids.
+///
+/// Presence outranks every retired location even when the list is empty: an
+/// empty authoritative declaration is an error, not permission to resurrect a
+/// stale workflow literal during re-emission.
+fn package_eos_token_ids(document: &serde_yaml::Value) -> Option<Vec<i64>> {
+    document
+        .get("package")?
+        .get("tokenizer")?
+        .get("special_tokens")?
+        .get("eos_token_id")
+        .and_then(sequence_i64)
+}
+
+fn sequence_i64(value: &serde_yaml::Value) -> Option<Vec<i64>> {
     Some(
-        elements
+        value
+            .as_sequence()?
             .iter()
             .filter_map(serde_yaml::Value::as_i64)
             .collect(),
@@ -326,4 +368,47 @@ fn decoder_artifact(package: &Path) -> Fallible<String> {
         )
         .into()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{declared_eos_token_ids, package_eos_token_ids};
+
+    #[test]
+    fn canonical_eos_ids_preserve_order_and_multi_eos() {
+        let document: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+package:
+  tokenizer:
+    special_tokens:
+      eos_token_id: [151643, 151645]
+pipeline:
+  workflow:
+    inputs:
+      package.eos_ids:
+        default: [2]
+"#,
+        )
+        .expect("metadata");
+
+        assert_eq!(package_eos_token_ids(&document), Some(vec![151643, 151645]));
+    }
+
+    #[test]
+    fn legacy_workflow_eos_spellings_remain_migration_fallbacks() {
+        for name in ["package.eos_token_ids", "package.eos_ids"] {
+            let document: serde_yaml::Value = serde_yaml::from_str(&format!(
+                r#"
+pipeline:
+  workflow:
+    inputs:
+      {name}:
+        default: [2, 3]
+"#
+            ))
+            .expect("metadata");
+
+            assert_eq!(declared_eos_token_ids(&document), Some(vec![2, 3]));
+        }
+    }
 }

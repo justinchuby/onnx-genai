@@ -421,13 +421,20 @@ fn validate_schema_version(metadata: &InferenceMetadata, errors: &mut Vec<String
         ));
         return;
     }
-    if metadata.tokens.is_some() && declared < crate::version::TOKEN_AUTHORITY_SCHEMA_VERSION {
+    let has_special_tokens = metadata
+        .package
+        .as_ref()
+        .and_then(|package| package.tokenizer.as_ref())
+        .and_then(|tokenizer| tokenizer.special_tokens.as_ref())
+        .is_some();
+    if has_special_tokens && declared < crate::version::TOKEN_AUTHORITY_SCHEMA_VERSION {
         let spelled = metadata.schema_version.as_deref().unwrap_or("<absent>");
         errors.push(format!(
-            "this package declares top-level `tokens`, which schema version {} introduced, but \
+            "this package declares `package.tokenizer.special_tokens`, which schema version {} \
+             introduced, but \
              declares schema_version '{spelled}' ({declared}); declare schema_version '{}' so an \
              older reader refuses the package as a newer contract rather than reporting \
-             `tokens` as an unknown field",
+             `special_tokens` as an unknown field",
             crate::version::TOKEN_AUTHORITY_SCHEMA_VERSION,
             crate::version::TOKEN_AUTHORITY_SCHEMA_VERSION
         ));
@@ -454,12 +461,18 @@ fn validate_token_authority(
     version: crate::version::SchemaVersion,
     errors: &mut Vec<String>,
 ) {
-    if let Some(tokens) = &metadata.tokens {
+    let special_tokens = metadata
+        .package
+        .as_ref()
+        .and_then(|package| package.tokenizer.as_ref())
+        .and_then(|tokenizer| tokenizer.special_tokens.as_ref());
+    if let Some(tokens) = special_tokens {
         let mut unique = BTreeSet::new();
         for id in &tokens.eos_token_id {
             if !unique.insert(id) {
                 errors.push(format!(
-                    "tokens.eos_token_id repeats id {id}; EOS ids are an ordered set"
+                    "package.tokenizer.special_tokens.eos_token_id repeats id {id}; EOS ids are \
+                     an ordered set"
                 ));
             }
         }
@@ -477,8 +490,8 @@ fn validate_token_authority(
         if matches!(name.as_str(), "package.eos_ids" | "package.eos_token_ids") {
             errors.push(format!(
                 "workflow input '{name}' is a retired duplicate of package token facts; move its \
-                     numeric ids to top-level `tokens.eos_token_id` and let an optional request \
-                     `eos_token_ids` role override them"
+                     numeric ids to `package.tokenizer.special_tokens.eos_token_id` and let an \
+                     optional request `eos_token_ids` role override them"
             ));
         }
         if matches!(
@@ -493,7 +506,7 @@ fn validate_token_authority(
             errors.push(format!(
                 "workflow input '{name}' is a request EOS override but declares a literal \
                      default; remove the default because package defaults derive from \
-                     top-level `tokens.eos_token_id`"
+                     `package.tokenizer.special_tokens.eos_token_id`"
             ));
         }
     }
@@ -502,17 +515,14 @@ fn validate_token_authority(
         return;
     }
 
-    let has_eos = metadata
-        .tokens
-        .as_ref()
-        .is_some_and(|tokens| !tokens.eos_token_id.is_empty());
+    let has_eos = special_tokens.is_some_and(|tokens| !tokens.eos_token_id.is_empty());
     validate_generation_eos_steps(&workflow.steps, workflow, has_eos, errors);
 
     if metadata.speculative.is_some() {
         if !has_eos {
             errors.push(
                 "a speculative autoregressive package must declare non-empty \
-                     `tokens.eos_token_id`"
+                     `package.tokenizer.special_tokens.eos_token_id`"
                     .to_string(),
             );
         }
@@ -554,7 +564,7 @@ fn validate_generation_eos_steps(
                     if !has_eos {
                         errors.push(
                             "a `generation_eos` workflow loop must declare non-empty \
-                                 top-level `tokens.eos_token_id`"
+                                 `package.tokenizer.special_tokens.eos_token_id`"
                                 .to_string(),
                         );
                     }

@@ -29,12 +29,14 @@ pub struct PackageFacts {
 #[serde(deny_unknown_fields)]
 pub struct TokenizerFacts {
     /// Tokenizer algorithm identifier, e.g. `bpe`, `unigram`, `wordpiece`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(min = 1))]
-    pub algorithm: String,
+    pub algorithm: Option<String>,
 
     /// Number of entries in the vocabulary, including added tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
-    pub vocab_size: usize,
+    pub vocab_size: Option<usize>,
 
     /// Whether the tokenizer operates on raw bytes rather than Unicode scalars.
     #[serde(default)]
@@ -44,6 +46,14 @@ pub struct TokenizerFacts {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(length(min = 1))]
     pub artifacts: Vec<TokenizerArtifact>,
+
+    /// Numeric model and control-token facts for this tokenizer vocabulary.
+    ///
+    /// Token strings, added-token mappings, and chat templates remain in the
+    /// tokenizer assets. Request EOS inputs may override these defaults, but
+    /// workflow literals and termination components do not own another copy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub special_tokens: Option<TokenFacts>,
 }
 
 /// One package-relative tokenizer artifact.

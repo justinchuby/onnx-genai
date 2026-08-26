@@ -331,7 +331,14 @@ pub fn build(directory: &PipelineModelDirectory) -> anyhow::Result<MultimodalSpe
 fn image_placeholder_token_id(
     metadata: Option<&onnx_genai_metadata::InferenceMetadata>,
 ) -> Option<u32> {
-    metadata?.tokens.as_ref()?.image_token_id
+    metadata?
+        .package
+        .as_ref()?
+        .tokenizer
+        .as_ref()?
+        .special_tokens
+        .as_ref()?
+        .image_token_id
 }
 
 /// Replace each declared image placeholder with that image's token run.
@@ -353,8 +360,8 @@ fn expand_image_placeholders(
              Why: it declares no numeric image placeholder token, so there is no \
              token for the image's features to replace, and the encoded image would be \
              preprocessed and then ignored. \
-             How: declare top-level `tokens.image_token_id`; keep its text spelling only in \
-             tokenizer assets."
+             How: declare `package.tokenizer.special_tokens.image_token_id`; keep its text \
+             spelling only in tokenizer assets."
         )
     })?;
     let program = spec
@@ -541,9 +548,9 @@ fn derive_specs(
 
 #[cfg(test)]
 mod media_binding_tests {
-    use onnx_genai_metadata::{PreprocessingSpec, WorkflowSpec};
+    use onnx_genai_metadata::{InferenceMetadata, PreprocessingSpec, WorkflowSpec};
 
-    use super::derive_specs;
+    use super::{derive_specs, image_placeholder_token_id};
 
     /// A workflow declaring exactly the given `media` runtime inputs.
     fn workflow(inputs: serde_json::Value) -> WorkflowSpec {
@@ -563,6 +570,23 @@ mod media_binding_tests {
             "source": { "kind": "request" },
             "contract": contract,
         })
+    }
+
+    #[test]
+    fn image_placeholder_comes_from_package_tokenizer_facts() {
+        let metadata: InferenceMetadata = serde_json::from_value(serde_json::json!({
+            "schema_version": "v1.2",
+            "package": {
+                "tokenizer": {
+                    "special_tokens": {
+                        "image_token_id": 151655,
+                    },
+                },
+            },
+        }))
+        .expect("metadata");
+
+        assert_eq!(image_placeholder_token_id(Some(&metadata)), Some(151655));
     }
 
     #[test]
