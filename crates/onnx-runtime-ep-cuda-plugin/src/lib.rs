@@ -398,7 +398,7 @@ pub unsafe extern "C" fn CreateEpFactories(
 
             // S4 fix: use create_ep_factories_for_shared_ep which takes the
             // EP name directly, avoiding the constructor call that would panic.
-            unsafe {
+            let status = unsafe {
                 onnx_runtime_ep_plugin::factory::create_ep_factories_for_shared_ep(
                     api_base,
                     out_factories,
@@ -410,9 +410,6 @@ pub unsafe extern "C" fn CreateEpFactories(
                     support,
                     stream_handle,
                 )
-<<<<<<< HEAD
-            }
-=======
             };
             if status.is_null() && !out_factories.is_null() && max_factories != 0 {
                 let factory = unsafe { *out_factories };
@@ -435,7 +432,6 @@ pub unsafe extern "C" fn CreateEpFactories(
                 }
             }
             status
->>>>>>> 2912f42fa (fix(ep-cuda): make DsaIndexSelect plugin contract coherent)
         }
 
         #[cfg(not(feature = "cuda"))]
