@@ -2047,6 +2047,14 @@ time. That figure is now stale; the re-measurement replaces it.
 > dispatcher migrates at most once per launch, so migration is not it. The knob
 > ships **off**, and would need prefill in the matrix before it could ship on --
 > the dispatcher is the session thread and keeps its affinity after decode ends.
+> **A concurrency cliff in the knob was found and fixed on 2026-08-26 (#2177):**
+> the reserve frees one CPU and every dispatching thread pinned to it, while a
+> thread that loses the pool's single claim computes *every* shard inline -- so
+> two sessions ran at **0.551x** of unpinned and four at **0.321x**, 0/10 in both
+> cells, with both session threads observed on `cpu=30`. `dispatch_inline` now
+> gives the CPU back; the same cells read 1.027 and 1.019 and the single-session
+> gain is unchanged. See the addendum in
+> `docs/benchmarks/2026-08-24-acc0-dispatcher-placement.md`.
 > **The A/A null therefore remains open, and the +23% steal-tiles candidate
 > remains blocked behind it.** **A third mechanism has now been tested and
 > rejected: transparent-hugepage backing of the weight arena.** THP is
