@@ -1,5 +1,4 @@
 use std::path::Path;
-use std::sync::{Mutex, MutexGuard, TryLockError};
 
 use onnx_genai_engine::{
     Engine as RustEngine, EngineConfig, FinishReason, GenerateOptions, GenerateRequest,
@@ -8,6 +7,8 @@ use onnx_genai_engine::{
 use pyo3::exceptions::{PyFileNotFoundError, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyModule};
+
+use crate::thread_owned::{CallError, SpawnError, ThreadOwned};
 
 fn finish_reason_name(reason: &FinishReason) -> String {
     match reason {
@@ -125,19 +126,32 @@ fn generation_error(err: impl std::fmt::Display) -> PyErr {
 const ENGINE_IN_USE: &str = "engine is in use by another thread — nxrt genai Engine is not \
 re-entrant; serialize calls or use one Engine per thread";
 
-fn try_lock_engine<T>(inner: &Mutex<T>) -> PyResult<MutexGuard<'_, T>> {
-    inner.try_lock().map_err(|err| match err {
-        TryLockError::WouldBlock => PyRuntimeError::new_err(ENGINE_IN_USE),
-        TryLockError::Poisoned(_) => PyRuntimeError::new_err(
-            "nxrt genai Engine state is unavailable because a previous generation panicked; \
-             create a new Engine instance",
-        ),
-    })
+const ENGINE_LOST: &str = "nxrt genai Engine state is unavailable because a previous generation \
+panicked; create a new Engine instance";
+
+/// Map a failed call on the owning thread onto the two Python errors this
+/// module has always raised. The wording is unchanged from when the engine was
+/// held in a `Mutex` on the calling thread: the same two situations arise, and
+/// the advice for each is the same. The panic message is appended when there is
+/// one, because the `Mutex` version unwound into the caller and Python saw it.
+fn call_error(err: CallError) -> PyErr {
+    match err {
+        CallError::InUse => PyRuntimeError::new_err(ENGINE_IN_USE),
+        CallError::WorkerLost { panic: None } => PyRuntimeError::new_err(ENGINE_LOST),
+        CallError::WorkerLost { panic: Some(panic) } => {
+            PyRuntimeError::new_err(format!("{ENGINE_LOST}. The panic was: {panic}"))
+        }
+    }
 }
 
+/// A genai engine, owned by a thread of its own.
+///
+/// The engine is `!Send` by construction (see [`crate::thread_owned`]), so it
+/// is not stored here — only a handle to the thread that holds it. Every method
+/// hands a closure to that thread and waits for the answer.
 #[pyclass(module = "nxrt.genai", name = "Engine")]
 struct Engine {
-    inner: Mutex<RustEngine>,
+    inner: ThreadOwned<RustEngine>,
 }
 
 #[pymethods]
@@ -176,16 +190,24 @@ impl Engine {
             }
             config.page_size = value;
         }
-        let engine = RustEngine::from_dir(path_ref, config).map_err(|err| {
-            PyValueError::new_err(format!(
+        // Built on the worker, because the sessions, allocators and bindings it
+        // creates belong to whichever thread creates them.
+        let owned_path = path.clone();
+        let inner = ThreadOwned::new("nxrt-genai-engine", move || {
+            RustEngine::from_dir(Path::new(&owned_path), config).map_err(|err| err.to_string())
+        })
+        .map_err(|err| match err {
+            SpawnError::Build(err) => PyValueError::new_err(format!(
                 "failed to load genai model from {path:?}: {err}. Verify the directory \
                  contains compatible ONNX graph(s), tokenizer.json, and \
                  inference_metadata.yaml or genai_config.json."
-            ))
+            )),
+            SpawnError::Thread(err) => PyRuntimeError::new_err(format!(
+                "failed to start the thread that owns the genai engine: {err}. Each \
+                 Engine holds its ONNX Runtime handles on a dedicated thread."
+            )),
         })?;
-        Ok(Self {
-            inner: Mutex::new(engine),
-        })
+        Ok(Self { inner })
     }
 
     #[pyo3(signature = (prompt, *, max_tokens=128, temperature=1.0, top_p=1.0, top_k=0, seed=None, stop=None))]
@@ -204,11 +226,14 @@ impl Engine {
     ) -> PyResult<GenerateResult> {
         let request = request(prompt, max_tokens, temperature, top_p, top_k, seed, stop)?;
         py.detach(|| {
-            let mut engine = try_lock_engine(&self.inner)?;
-            engine
-                .generate(request)
-                .map(GenerateResult::from)
-                .map_err(generation_error)
+            self.inner
+                .with(move |engine| {
+                    engine
+                        .generate(request)
+                        .map(GenerateResult::from)
+                        .map_err(generation_error)
+                })
+                .map_err(call_error)?
         })
     }
 
@@ -234,51 +259,60 @@ impl Engine {
         }
         let request = request(prompt, max_tokens, temperature, top_p, top_k, seed, stop)?;
         py.detach(|| {
-            let mut callback_error: Option<PyErr> = None;
-            let mut callback_fn = |token: GenerateToken| {
-                let call = Python::attach(|py| {
-                    callback.call1(
-                        py,
-                        (
-                            token.text,
-                            token.token_id,
-                            token.finish_reason.as_ref().map(finish_reason_name),
-                        ),
-                    )
-                });
-                match call {
-                    Ok(_) => Ok(()),
-                    Err(err) => {
-                        callback_error = Some(err);
-                        Err(
-                            std::io::Error::other("Python streaming callback raised an exception")
-                                .into(),
-                        )
+            self.inner
+                .with(move |engine| {
+                    let mut callback_error: Option<PyErr> = None;
+                    // Runs on the engine's thread, which holds no GIL, so it
+                    // takes one per token. The calling thread has released its
+                    // own for the duration of this call.
+                    let mut callback_fn = |token: GenerateToken| {
+                        let call = Python::attach(|py| {
+                            callback.call1(
+                                py,
+                                (
+                                    token.text,
+                                    token.token_id,
+                                    token.finish_reason.as_ref().map(finish_reason_name),
+                                ),
+                            )
+                        });
+                        match call {
+                            Ok(_) => Ok(()),
+                            Err(err) => {
+                                callback_error = Some(err);
+                                Err(std::io::Error::other(
+                                    "Python streaming callback raised an exception",
+                                )
+                                .into())
+                            }
+                        }
+                    };
+                    let callback_fn: &mut onnx_genai_engine::GenerateTokenCallback<'_> =
+                        &mut callback_fn;
+                    let result = engine.generate_with_callback(request, Some(callback_fn));
+                    if let Some(err) = callback_error {
+                        return Err(err);
                     }
-                }
-            };
-            // The guard remains held while Rust generates, including callback
-            // invocations. Re-entry is safe because every method uses try_lock
-            // and therefore fails immediately instead of waiting on this mutex.
-            let mut engine = try_lock_engine(&self.inner)?;
-            let callback_fn: &mut onnx_genai_engine::GenerateTokenCallback<'_> = &mut callback_fn;
-            let result = engine.generate_with_callback(request, Some(callback_fn));
-            if let Some(err) = callback_error {
-                return Err(err);
-            }
-            result.map(GenerateResult::from).map_err(generation_error)
+                    result.map(GenerateResult::from).map_err(generation_error)
+                })
+                .map_err(call_error)?
         })
     }
 
     fn tokenize(&self, py: Python<'_>, text: &str) -> PyResult<Vec<u32>> {
+        // Owned because the job outlives this borrow on another thread.
+        let text = text.to_owned();
         py.detach(|| {
-            let engine = try_lock_engine(&self.inner)?;
-            engine.tokenize(text).map_err(|err| {
-                PyValueError::new_err(format!(
-                    "failed to tokenize input text: {err}. Verify the model directory contains \
-                     a valid tokenizer.json compatible with the loaded model."
-                ))
-            })
+            self.inner
+                .with(move |engine| {
+                    engine.tokenize(&text).map_err(|err| {
+                        PyValueError::new_err(format!(
+                            "failed to tokenize input text: {err}. Verify the model directory \
+                             contains a valid tokenizer.json compatible with the loaded model."
+                        ))
+                    })
+                })
+                .map_err(call_error)?
         })
     }
 }
@@ -302,9 +336,11 @@ pub(crate) fn register(parent: &Bound<'_, PyModule>) -> PyResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::marker::PhantomData;
+    use std::rc::Rc;
 
-    use super::{ENGINE_IN_USE, Engine, build_options, try_lock_engine};
+    use super::{ENGINE_IN_USE, ENGINE_LOST, Engine, build_options, call_error};
+    use crate::thread_owned::CallError;
 
     #[test]
     fn generation_options_match_python_arguments() {
@@ -318,23 +354,68 @@ mod tests {
         assert_eq!(options.stop_sequences.len(), 1);
     }
 
+    /// The `#[pyclass]` requirement that the engine crate's `!Send` worker state
+    /// used to satisfy only through `unsafe impl Send for Engine` (removed in
+    /// #2132). It now holds structurally; see `crate::thread_owned`.
     #[test]
     fn engine_pyclass_is_send_and_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<Engine>();
     }
 
+    /// The engine itself must stay `!Send`. This is a tripwire, not a
+    /// requirement: if it fails, `onnx_genai_engine::Engine` became `Send`
+    /// again, and the first question is whether that happened structurally or
+    /// by a reinstated `unsafe impl Send`. Only in the first case is deleting
+    /// [`crate::thread_owned`] the right response.
     #[test]
-    fn engine_lock_contention_returns_actionable_python_error() {
-        pyo3::Python::initialize();
-        let inner = Arc::new(Mutex::new(()));
-        let guard = inner.lock().unwrap();
-        let contender = Arc::clone(&inner);
-        let error = std::thread::spawn(move || try_lock_engine(&contender).unwrap_err())
-            .join()
-            .expect("contending thread panicked");
-        drop(guard);
+    fn the_underlying_engine_is_still_not_send() {
+        // Inherent methods win over trait methods, and the inherent impl only
+        // applies when `T: Send` — the stable stand-in for specialization.
+        struct Probe<T>(PhantomData<T>);
+        trait NotSend {
+            fn is_send(&self) -> bool {
+                false
+            }
+        }
+        impl<T> NotSend for Probe<T> {}
+        impl<T: Send> Probe<T> {
+            fn is_send(&self) -> bool {
+                true
+            }
+        }
 
-        assert_eq!(error.to_string(), format!("RuntimeError: {ENGINE_IN_USE}"));
+        assert!(
+            Probe::<u32>(PhantomData).is_send(),
+            "positive control: u32 is Send, so the probe is not simply always false"
+        );
+        assert!(
+            !Probe::<Rc<()>>(PhantomData).is_send(),
+            "negative control: Rc is not Send"
+        );
+        assert!(
+            !Probe::<super::RustEngine>(PhantomData).is_send(),
+            "onnx_genai_engine::Engine is Send again — see this test's doc comment"
+        );
+    }
+
+    #[test]
+    fn call_failures_keep_their_python_wording() {
+        pyo3::Python::initialize();
+        assert_eq!(
+            call_error(CallError::InUse).to_string(),
+            format!("RuntimeError: {ENGINE_IN_USE}")
+        );
+        assert_eq!(
+            call_error(CallError::WorkerLost { panic: None }).to_string(),
+            format!("RuntimeError: {ENGINE_LOST}")
+        );
+        assert_eq!(
+            call_error(CallError::WorkerLost {
+                panic: Some("kv cache overflow".to_owned())
+            })
+            .to_string(),
+            format!("RuntimeError: {ENGINE_LOST}. The panic was: kv cache overflow")
+        );
     }
 }

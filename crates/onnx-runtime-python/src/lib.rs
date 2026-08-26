@@ -44,6 +44,8 @@ mod dlpack;
 mod eager;
 #[cfg(feature = "genai")]
 mod genai;
+#[cfg(feature = "genai")]
+mod thread_owned;
 
 use std::sync::Mutex;
 
