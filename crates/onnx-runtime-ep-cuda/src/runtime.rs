@@ -674,9 +674,10 @@ impl CudaRuntime {
         let cubin_arch = cubin_arch_for(major, minor);
         // A dedicated non-blocking stream (not the legacy NULL stream, which the
         // driver refuses to capture) so device-resident kernels are eligible for
-        // CUDA-graph capture. The whole EP drives this single stream, so its
-        // ordering is self-contained and host-blocking `*_sync` copies remain
-        // correctly serialized against kernel launches.
+        // CUDA-graph capture. The whole EP drives this single stream. Synchronous
+        // H2D copies explicitly drain it before using and synchronizing the
+        // legacy default stream; CUDA does not implicitly order non-blocking
+        // streams against that stream.
         let stream = context
             .new_stream()
             .map_err(|e| driver_err("create compute stream", e))?;
@@ -1676,17 +1677,45 @@ impl CudaRuntime {
         Ok(())
     }
 
-    /// Copy `bytes` host → device (H2D). `dst` must be large enough.
+    /// Copy `src` host → device (H2D), completing before return.
+    ///
+    /// The EP compute stream is non-blocking, so CUDA's legacy-default-stream
+    /// semantics do not order `cuMemcpyHtoD` against kernels using `dst`.
+    /// Retiring prior compute before the copy prevents an overwrite racing a
+    /// previous user. Synchronizing the default stream afterwards proves the
+    /// final DMA reached `dst`; the host wait is required for pageable memory
+    /// because `cuMemcpyHtoD` may return after staging while DMA is still in
+    /// flight. A later consumer is submitted only after that completion.
+    /// Async prefetch uses [`CudaRuntime::htod_async`] on the dedicated transfer
+    /// stream with explicit copy/compute fences instead.
     ///
     /// # Safety
     /// `dst` is a live device allocation of at least `src.len()` bytes.
     pub unsafe fn htod(&self, src: &[u8], dst: CUdeviceptr) -> Result<()> {
         self.bind()?;
-        // A synchronous copy on the null stream; see `alloc_raw`.
         let _section = capture_gate::synchronizing_section();
+        if self.is_capturing()? {
+            return Err(EpError::KernelFailed(
+                "cuda_ep: synchronous H2D upload is illegal during CUDA graph capture; \
+                 warm the host data before capture or use htod_async with an explicit fence"
+                    .into(),
+            ));
+        }
+        self.stream.synchronize().map_err(|e| {
+            driver_err(
+                "cuStreamSynchronize(compute) before synchronous cuMemcpyHtoD",
+                e,
+            )
+        })?;
         // SAFETY: bound context; `dst` covers `src.len()` bytes per the contract.
         unsafe { cudarc::driver::result::memcpy_htod_sync(dst, src) }
             .map_err(|e| driver_err("cuMemcpyHtoD", e))?;
+        self.context.default_stream().synchronize().map_err(|e| {
+            driver_err(
+                "cuStreamSynchronize(default) after synchronous cuMemcpyHtoD",
+                e,
+            )
+        })?;
         self.host_to_device_copies.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }

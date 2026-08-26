@@ -229,9 +229,6 @@ impl PersistentMetadata {
                 "cuda_ep {op}: shape changed during CUDA graph capture; warm the exact shape first"
             )));
         }
-        if self.ptr != 0 {
-            self.runtime.synchronize()?;
-        }
         let scalar_metadata = [0_u64];
         let bytes = u64_bytes(if values.is_empty() {
             &scalar_metadata
