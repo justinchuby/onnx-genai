@@ -5291,23 +5291,26 @@ extern "C" __global__ void copy_out(const float* in, float* out, unsigned long l
     }
 
     // Anti-regression lock for the async, fence-ordered weight page-in (#87,
-    // #1896). Both arms enqueue the same gated transfer and the same consumer.
-    // The sole CUDA-ordering difference is the production `wait_fence`:
+    // #1896). Both arms run the same progress protocol; the only ordering
+    // difference is whether the production `wait_fence` operation is invoked.
     //
-    //   * ordered arm: wait(copy event) -> consumer, then the host releases the
-    //     transfer gate; the consumer must read PAYLOAD;
-    //   * bypass/vacuity arm: no wait; while the transfer remains gated, the
-    //     consumer signals completion through mapped host memory and therefore
-    //     must have read POISON. Only then does the host release the already
-    //     submitted transfer and prove that it lands.
+    // A transfer-stream gate precedes H2D and its event. The consumer publishes
+    // READY before its read and waits on a second host gate. A resolver submitted
+    // after the consumer distinguishes the two causal states without a clock:
     //
-    // The mapped completion flag observes the consumer without inserting a
-    // compute-stream drain or a reverse compute→copy event. The gate owner is
-    // RAII: every panic/error path releases the gate and drains both streams
-    // before freeing the mapped backing (or deliberately leaks it if CUDA cannot
-    // prove completion).
+    //   * wait present: `wait_fence` consumed the event, so the resolver reports
+    //     RESOLVED while the consumer is still event-blocked. The host releases
+    //     H2D, observes READY, and releases the consumer; it reads PAYLOAD.
+    //   * wait absent: the resolver owns and host-waits the still-pending event,
+    //     while the earlier consumer reaches READY with H2D still gated. The host
+    //     releases the consumer, observes DONE, and only then releases H2D; it
+    //     deterministically reads POISON.
+    //
+    // The no-wait arm is therefore both the mutation oracle and the apparatus
+    // control. It uses no duration, retry count, host sleep, stream priority, or
+    // reverse compute→copy fence.
     #[test]
-    fn async_pagein_fence_orders_weight_page_in_consumer() {
+    fn async_pagein_fence_orders_weight_page_in_consumer() -> Result<()> {
         use std::ffi::c_void;
 
         use cudarc::driver::{LaunchConfig, PushKernelArg, result, sys};
@@ -5318,22 +5321,37 @@ extern "C" __global__ void wait_for_release(const volatile unsigned int* release
     while (*release == 0u) { }
     __threadfence_system();
 }
-extern "C" __global__ void copy_out_and_signal(
+extern "C" __global__ void gated_copy_out(
     const float* in,
     float* out,
     unsigned long long n,
-    volatile unsigned int* completed
+    volatile unsigned int* ready,
+    const volatile unsigned int* release,
+    volatile unsigned int* done
 ) {
+    if (threadIdx.x == 0u) {
+        *ready = 1u;
+        __threadfence_system();
+    }
+    __syncthreads();
+    while (*release == 0u) { }
+    __threadfence_system();
+
     unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] = in[i];
     __syncthreads();
     if (blockIdx.x == 0u && threadIdx.x == 0u) {
         __threadfence_system();
-        *completed = 1u;
+        *done = 1u;
         __threadfence_system();
     }
 }
 "#;
+
+        const COPY_RELEASE: usize = 0;
+        const CONSUMER_READY: usize = 1;
+        const CONSUMER_RELEASE: usize = 2;
+        const CONSUMER_DONE: usize = 3;
 
         struct MappedGate {
             host: *mut u32,
@@ -5341,51 +5359,75 @@ extern "C" __global__ void copy_out_and_signal(
         }
 
         impl MappedGate {
-            fn reset(&mut self) {
-                // Every prior arm settles both streams before reusing the words.
+            fn word(&self, index: usize) -> *mut u32 {
+                // SAFETY: the allocation contains all four protocol words.
+                unsafe { self.host.add(index) }
+            }
+
+            fn reset(&self) {
+                // Every prior arm drains both streams before these words are
+                // reused, so no device access overlaps this reset.
                 unsafe {
-                    std::ptr::write_volatile(self.host, 0);
-                    std::ptr::write_volatile(self.host.add(1), 0);
-                }
-                std::sync::atomic::fence(Ordering::SeqCst);
-            }
-
-            fn release(&mut self) {
-                // SAFETY: `host` remains a live mapped allocation.
-                unsafe { std::ptr::write_volatile(self.host, 1) };
-                std::sync::atomic::fence(Ordering::SeqCst);
-            }
-
-            fn wait_for_consumer(&self, iteration: usize) {
-                let deadline = std::time::Instant::now() + Duration::from_secs(30);
-                loop {
-                    // SAFETY: the second mapped word remains live and is written
-                    // only by the single-block consumer kernel.
-                    if unsafe { std::ptr::read_volatile(self.host.add(1)) } == 1 {
-                        return;
+                    for index in 0..4 {
+                        std::ptr::write_volatile(self.word(index), 0);
                     }
-                    assert!(
-                        std::time::Instant::now() < deadline,
-                        "iteration {iteration}: bypass consumer did not signal while page-in was \
-                         host-gated; the apparatus failed to establish consumer-before-transfer"
-                    );
-                    std::thread::yield_now();
+                }
+                std::sync::atomic::fence(Ordering::SeqCst);
+            }
+
+            fn release(&self, index: usize) {
+                // SAFETY: `host` remains a live mapped allocation and the host
+                // is the only writer of the two release words.
+                unsafe { std::ptr::write_volatile(self.word(index), 1) };
+                std::sync::atomic::fence(Ordering::SeqCst);
+            }
+
+            fn release_copy(&self) {
+                self.release(COPY_RELEASE);
+            }
+
+            fn release_consumer(&self) {
+                self.release(CONSUMER_RELEASE);
+            }
+
+            fn release_all(&self) {
+                self.release_copy();
+                self.release_consumer();
+            }
+
+            fn settle(&self) -> Result<()> {
+                self.release_all();
+                let copy = self.runtime.sync_copy_stream();
+                let compute = self.runtime.drain_for_unmap();
+                match (copy, compute) {
+                    (Ok(()), Ok(())) => Ok(()),
+                    (Err(copy), Ok(())) => Err(EpError::KernelFailed(format!(
+                        "cuda page-in test cleanup could not drain the transfer stream: {copy}"
+                    ))),
+                    (Ok(()), Err(compute)) => Err(EpError::KernelFailed(format!(
+                        "cuda page-in test cleanup could not drain the compute stream: {compute}"
+                    ))),
+                    (Err(copy), Err(compute)) => Err(EpError::KernelFailed(format!(
+                        "cuda page-in test cleanup could not drain either CUDA stream; \
+                         transfer: {copy}; compute: {compute}"
+                    ))),
                 }
             }
 
-            fn settle(&mut self) -> Result<()> {
-                self.release();
-                self.runtime.sync_copy_stream()?;
-                self.runtime.drain_for_unmap()
-            }
-
-            fn finish(mut self) -> Result<()> {
-                self.settle()?;
-                let host = std::mem::replace(&mut self.host, std::ptr::null_mut());
-                // SAFETY: both streams are drained and this is the allocation's
-                // single successful free.
-                unsafe { result::free_host(host.cast::<c_void>()) }
-                    .map_err(|error| driver_err("cuMemFreeHost(page-in test gate)", error))
+            fn finish(mut self, primary: Result<()>) -> Result<()> {
+                let cleanup = self.settle().and_then(|()| {
+                    let host = std::mem::replace(&mut self.host, std::ptr::null_mut());
+                    // SAFETY: both streams are drained and this is the
+                    // allocation's single explicit free.
+                    unsafe { result::free_host(host.cast::<c_void>()) }
+                        .map_err(|error| driver_err("cuMemFreeHost(page-in test gate)", error))
+                });
+                match (primary, cleanup) {
+                    (Ok(()), cleanup) | (cleanup, Ok(())) => cleanup,
+                    (Err(primary), Err(cleanup)) => Err(EpError::KernelFailed(format!(
+                        "{primary}; additionally, page-in test cleanup failed: {cleanup}"
+                    ))),
+                }
             }
         }
 
@@ -5394,38 +5436,97 @@ extern "C" __global__ void copy_out_and_signal(
                 if self.host.is_null() {
                     return;
                 }
-                self.release();
-                let copy = self.runtime.sync_copy_stream();
-                let compute = self.runtime.drain_for_unmap();
-                if copy.is_err() || compute.is_err() {
-                    eprintln!(
-                        "cuda page-in test gate cleanup could not prove both streams complete; \
-                         leaking mapped gate to avoid freeing memory still visible to CUDA: \
-                         copy={copy:?}, compute={compute:?}"
-                    );
+                self.release_all();
+                // This backstop cannot report without risking a second panic
+                // during unwinding. Raw driver calls avoid error formatting. The
+                // mapped allocation is freed only if both device users retired;
+                // otherwise it is deliberately leaked.
+                let copy_done = unsafe {
+                    sys::cuStreamSynchronize(self.runtime.copy_stream().cu_stream())
+                        == sys::CUresult::CUDA_SUCCESS
+                };
+                let compute_done = unsafe {
+                    sys::cuStreamSynchronize(self.runtime.stream().cu_stream())
+                        == sys::CUresult::CUDA_SUCCESS
+                };
+                if copy_done && compute_done {
+                    let host = std::mem::replace(&mut self.host, std::ptr::null_mut());
+                    // SAFETY: both streams are complete; ignoring a failed free
+                    // leaks the still-live allocation instead of panicking.
+                    let _ = unsafe { sys::cuMemFreeHost(host.cast::<c_void>()) };
+                } else {
                     self.host = std::ptr::null_mut();
-                    return;
                 }
-                let host = std::mem::replace(&mut self.host, std::ptr::null_mut());
-                // SAFETY: release was published and both possible device users
-                // completed. Drop never panics; a failed free is reported.
-                if let Err(error) = unsafe { result::free_host(host.cast::<c_void>()) } {
-                    eprintln!("cuda page-in test gate cuMemFreeHost failed: {error}");
+            }
+        }
+
+        struct ReleaseBackstop<'a> {
+            gate: &'a MappedGate,
+            cancelled: Arc<AtomicBool>,
+        }
+
+        impl Drop for ReleaseBackstop<'_> {
+            fn drop(&mut self) {
+                self.cancelled.store(true, Ordering::Release);
+                self.gate.release_all();
+            }
+        }
+
+        #[derive(Debug)]
+        enum Progress {
+            FenceResolved(std::result::Result<(), String>),
+            ConsumerReady,
+            ConsumerDone,
+            ComputeFinished(std::result::Result<(), String>),
+        }
+
+        struct ArmObservation {
+            consumed: Vec<f32>,
+            destination: Vec<f32>,
+            consumer_preceded_copy: bool,
+        }
+
+        fn progress_error(arm: &str, detail: impl std::fmt::Display) -> EpError {
+            EpError::KernelFailed(format!("cuda page-in {arm} protocol failed: {detail}"))
+        }
+
+        fn recv_progress(
+            receiver: &std::sync::mpsc::Receiver<Progress>,
+            arm: &str,
+        ) -> Result<Progress> {
+            loop {
+                let progress = receiver.recv().map_err(|error| {
+                    progress_error(arm, format!("progress channel closed: {error}"))
+                })?;
+                match progress {
+                    Progress::ComputeFinished(Ok(())) => {}
+                    Progress::ComputeFinished(Err(error)) => {
+                        return Err(progress_error(
+                            arm,
+                            format!("compute stream failed: {error}"),
+                        ));
+                    }
+                    progress => return Ok(progress),
                 }
+            }
+        }
+
+        fn merge_primary_and_cleanup(primary: Result<()>, cleanup: Result<()>) -> Result<()> {
+            match (primary, cleanup) {
+                (Ok(()), cleanup) | (cleanup, Ok(())) => cleanup,
+                (Err(primary), Err(cleanup)) => Err(EpError::KernelFailed(format!(
+                    "{primary}; additionally, CUDA test device-buffer cleanup failed: {cleanup}"
+                ))),
             }
         }
 
         let Ok(ep) = CudaExecutionProvider::initialized(0) else {
             eprintln!("skipping async page-in fence test: CUDA EP unavailable");
-            return;
+            return Ok(());
         };
         let runtime = ep.runtime().clone();
-        let wait_for_release = runtime
-            .nvrtc_function(MODULE, SOURCE, "wait_for_release")
-            .unwrap();
-        let copy_out = runtime
-            .nvrtc_function(MODULE, SOURCE, "copy_out_and_signal")
-            .unwrap();
+        let wait_for_release = runtime.nvrtc_function(MODULE, SOURCE, "wait_for_release")?;
+        let copy_out = runtime.nvrtc_function(MODULE, SOURCE, "gated_copy_out")?;
 
         let n = 64usize;
         let bytes = n * std::mem::size_of::<f32>();
@@ -5440,23 +5541,21 @@ extern "C" __global__ void copy_out_and_signal(
         let poison = vec![-777.0f32; n];
         let poison_bytes =
             unsafe { std::slice::from_raw_parts(poison.as_ptr().cast::<u8>(), bytes) };
-        let pos_dst = ep.allocate(bytes, 256).unwrap();
-        let neg_dst = ep.allocate(bytes, 256).unwrap();
-        let out = ep.allocate(bytes, 256).unwrap();
+        let pos_dst = ep.allocate(bytes, 256)?;
+        let neg_dst = ep.allocate(bytes, 256)?;
+        let out = ep.allocate(bytes, 256)?;
         let pos_dst_p = cuptr(pos_dst.as_ptr());
         let neg_dst_p = cuptr(neg_dst.as_ptr());
         let out_p = cuptr(out.as_ptr());
-        let mut staging = runtime.alloc_pinned(bytes).unwrap();
+        let mut staging = runtime.alloc_pinned(bytes)?;
         staging.as_mut_slice().copy_from_slice(payload_bytes);
 
         const CU_MEMHOSTALLOC_DEVICEMAP: u32 = 0x02;
-        // SAFETY: `MappedGate` owns and releases these two DEVICEMAP words
-        // (transfer release, consumer completion).
-        let gate_bytes = 2 * std::mem::size_of::<u32>();
+        let gate_bytes = 4 * std::mem::size_of::<u32>();
         let gate_host = unsafe { result::malloc_host(gate_bytes, CU_MEMHOSTALLOC_DEVICEMAP) }
-            .expect("allocate host-mapped page-in gate")
+            .map_err(|error| driver_err("cuMemHostAlloc(page-in test gate)", error))?
             .cast::<u32>();
-        let mut gate = MappedGate {
+        let gate = MappedGate {
             host: gate_host,
             runtime: runtime.clone(),
         };
@@ -5465,11 +5564,21 @@ extern "C" __global__ void copy_out_and_signal(
         unsafe {
             sys::cuMemHostGetDevicePointer_v2(&mut gate_device, gate.host.cast::<c_void>(), 0)
                 .result()
-                .expect("map page-in gate into the CUDA address space");
+                .map_err(|error| {
+                    driver_err("cuMemHostGetDevicePointer(page-in test gate)", error)
+                })?;
         }
-        let completed_device = gate_device
-            .checked_add(std::mem::size_of::<u32>() as u64)
-            .expect("mapped completion pointer overflow");
+        let consumer_ready_device = gate_device
+            .checked_add((CONSUMER_READY * std::mem::size_of::<u32>()) as u64)
+            .ok_or_else(|| EpError::KernelFailed("mapped READY pointer overflow".into()))?;
+        let consumer_release_device = gate_device
+            .checked_add((CONSUMER_RELEASE * std::mem::size_of::<u32>()) as u64)
+            .ok_or_else(|| {
+                EpError::KernelFailed("mapped consumer-release pointer overflow".into())
+            })?;
+        let consumer_done_device = gate_device
+            .checked_add((CONSUMER_DONE * std::mem::size_of::<u32>()) as u64)
+            .ok_or_else(|| EpError::KernelFailed("mapped DONE pointer overflow".into()))?;
         let one_thread = LaunchConfig {
             grid_dim: (1, 1, 1),
             block_dim: (1, 1, 1),
@@ -5481,117 +5590,276 @@ extern "C" __global__ void copy_out_and_signal(
             shared_mem_bytes: 0,
         };
 
-        let launch_gate = || {
+        let run_arm = |arm: &str,
+                       dst: sys::CUdeviceptr,
+                       wait: &dyn Fn(&Fence) -> Result<()>|
+         -> Result<ArmObservation> {
+            unsafe { runtime.htod(poison_bytes, dst) }?;
+            gate.reset();
+
             let mut launch = runtime.copy_stream().launch_builder(&wait_for_release);
             launch.arg(&gate_device);
-            // SAFETY: the mapped gate remains live through `MappedGate`, whose
-            // cleanup releases and drains this stream before freeing it.
-            unsafe { launch.launch(one_thread) }.unwrap();
-        };
-        let launch_consumer = |src: sys::CUdeviceptr| {
+            // SAFETY: the mapped gate stays live until explicit stream drains.
+            unsafe { launch.launch(one_thread) }
+                .map_err(|error| driver_err("launch page-in transfer gate", error))?;
+
+            unsafe { runtime.htod_async(staging.as_slice(), dst) }?;
+            let fence_id = runtime.record_copy_fence()?;
+            wait(&Fence::new(fence_id))?;
+
             let mut consume = runtime.stream().launch_builder(&copy_out);
             consume
-                .arg(&src)
+                .arg(&dst)
                 .arg(&out_p)
                 .arg(&n_u64)
-                .arg(&completed_device);
-            // SAFETY: all pointers cover the one-block launch and mapped
-            // completion remains live through stream completion.
-            unsafe { consume.launch(one_block) }.unwrap();
+                .arg(&consumer_ready_device)
+                .arg(&consumer_release_device)
+                .arg(&consumer_done_device);
+            // SAFETY: all data and mapped protocol pointers cover this launch.
+            unsafe { consume.launch(one_block) }
+                .map_err(|error| driver_err("launch gated page-in consumer", error))?;
+
+            let consumer_preceded_copy = std::thread::scope(|scope| -> Result<bool> {
+                let cancelled = Arc::new(AtomicBool::new(false));
+                let _release_backstop = ReleaseBackstop {
+                    gate: &gate,
+                    cancelled: Arc::clone(&cancelled),
+                };
+                let (sender, receiver) = std::sync::mpsc::channel();
+
+                let resolve_runtime = Arc::clone(&runtime);
+                let resolve_sender = sender.clone();
+                scope.spawn(move || {
+                    let resolution = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        resolve_runtime
+                            .resolve_prefetch_fence(fence_id)
+                            .map(|_| ())
+                            .map_err(|error| error.to_string())
+                    }))
+                    .unwrap_or_else(|_| Err("fence resolver panicked".into()));
+                    let _ = resolve_sender.send(Progress::FenceResolved(resolution));
+                });
+
+                let ready_host = gate.word(CONSUMER_READY) as usize;
+                let ready_sender = sender.clone();
+                let ready_cancelled = Arc::clone(&cancelled);
+                scope.spawn(move || {
+                    let ready_host = ready_host as *const u32;
+                    // Value-driven handshake: there is no deadline or iteration
+                    // count. The release backstop guarantees progress on unwind.
+                    while unsafe { std::ptr::read_volatile(ready_host) } == 0 {
+                        if ready_cancelled.load(Ordering::Acquire) {
+                            return;
+                        }
+                        std::thread::yield_now();
+                    }
+                    let _ = ready_sender.send(Progress::ConsumerReady);
+                });
+
+                let done_host = gate.word(CONSUMER_DONE) as usize;
+                let done_sender = sender.clone();
+                let done_cancelled = Arc::clone(&cancelled);
+                scope.spawn(move || {
+                    let done_host = done_host as *const u32;
+                    while unsafe { std::ptr::read_volatile(done_host) } == 0 {
+                        if done_cancelled.load(Ordering::Acquire) {
+                            return;
+                        }
+                        std::thread::yield_now();
+                    }
+                    let _ = done_sender.send(Progress::ConsumerDone);
+                });
+
+                let compute_runtime = Arc::clone(&runtime);
+                let compute_sender = sender.clone();
+                scope.spawn(move || {
+                    let completion = compute_runtime
+                        .drain_for_unmap()
+                        .map_err(|error| error.to_string());
+                    let _ = compute_sender.send(Progress::ComputeFinished(completion));
+                });
+                drop(sender);
+
+                let first = recv_progress(&receiver, arm)?;
+                match first {
+                    Progress::FenceResolved(resolution) => {
+                        resolution.map_err(|error| progress_error(arm, error))?;
+                        // With the real wait, the consumer cannot publish READY
+                        // until E completes. Release and drain H2D first.
+                        gate.release_copy();
+                        runtime.sync_copy_stream()?;
+                        match recv_progress(&receiver, arm)? {
+                            Progress::ConsumerReady => {}
+                            other => {
+                                return Err(progress_error(
+                                    arm,
+                                    format!("expected consumer READY after H2D, got {other:?}"),
+                                ));
+                            }
+                        }
+                        gate.release_consumer();
+                        match recv_progress(&receiver, arm)? {
+                            Progress::ConsumerDone => Ok(false),
+                            other => Err(progress_error(
+                                arm,
+                                format!("expected consumer DONE after release, got {other:?}"),
+                            )),
+                        }
+                    }
+                    Progress::ConsumerReady => {
+                        // With no wait, the resolver cannot finish while H2D is
+                        // gated. Let the already-ready consumer read POISON and
+                        // observe DONE before making H2D runnable.
+                        gate.release_consumer();
+                        match recv_progress(&receiver, arm)? {
+                            Progress::ConsumerDone => {}
+                            other => {
+                                return Err(progress_error(
+                                    arm,
+                                    format!(
+                                        "expected consumer DONE before H2D release, got {other:?}"
+                                    ),
+                                ));
+                            }
+                        }
+                        gate.release_copy();
+                        runtime.sync_copy_stream()?;
+                        match recv_progress(&receiver, arm)? {
+                            Progress::FenceResolved(resolution) => {
+                                resolution.map_err(|error| progress_error(arm, error))?;
+                                Ok(true)
+                            }
+                            other => Err(progress_error(
+                                arm,
+                                format!("expected fence resolution after H2D, got {other:?}"),
+                            )),
+                        }
+                    }
+                    Progress::ConsumerDone => Err(progress_error(
+                        arm,
+                        "consumer reported DONE before the host released its pre-read gate",
+                    )),
+                    Progress::ComputeFinished(_) => Err(progress_error(
+                        arm,
+                        "internal progress filter returned a compute-completion message",
+                    )),
+                }
+            })?;
+
+            let mut consumed = vec![0.0f32; n];
+            let consumed_bytes = unsafe {
+                std::slice::from_raw_parts_mut(consumed.as_mut_ptr().cast::<u8>(), bytes)
+            };
+            unsafe { runtime.dtoh(consumed_bytes, out_p) }?;
+
+            let mut destination = vec![0.0f32; n];
+            let destination_bytes = unsafe {
+                std::slice::from_raw_parts_mut(destination.as_mut_ptr().cast::<u8>(), bytes)
+            };
+            unsafe { runtime.dtoh(destination_bytes, dst) }?;
+            gate.settle()?;
+
+            Ok(ArmObservation {
+                consumed,
+                destination,
+                consumer_preceded_copy,
+            })
         };
 
-        for iteration in 0..8 {
-            // ── Ordered arm. Transfer remains gated while the real EP wait and
-            // consumer are enqueued; releasing it makes the event establish
-            // H2D -> consumer.
-            unsafe { runtime.htod(poison_bytes, pos_dst_p) }.unwrap();
-            gate.reset();
-            launch_gate();
+        let primary = (|| -> Result<()> {
+            for iteration in 0..8 {
+                let ordered = run_arm("ordered", pos_dst_p, &|fence| ep.wait_fence(fence))?;
+                assert_eq!(
+                    ordered.consumed, payload,
+                    "iteration {iteration}: production wait did not order H2D before the \
+                     consumer; left={:?}, right={payload:?}",
+                    ordered.consumed
+                );
+                assert!(
+                    !ordered.consumer_preceded_copy,
+                    "iteration {iteration}: ordered consumer reached its pre-read gate before \
+                     H2D release"
+                );
+                assert_eq!(
+                    ordered.destination, payload,
+                    "iteration {iteration}: ordered-arm transfer did not land"
+                );
 
-            unsafe { runtime.htod_async(staging.as_slice(), pos_dst_p) }.unwrap();
-            let fence = Fence::new(runtime.record_copy_fence().unwrap());
-            ep.wait_fence(&fence).unwrap();
-            launch_consumer(pos_dst_p);
-            gate.release();
+                let bypass = run_arm("no-wait control", neg_dst_p, &|_| Ok(()))?;
+                assert_eq!(
+                    bypass.consumed, poison,
+                    "iteration {iteration}: no-wait consumer did not read POISON before the \
+                     host released H2D; left={:?}, right={poison:?}",
+                    bypass.consumed
+                );
+                assert!(
+                    bypass.consumer_preceded_copy,
+                    "iteration {iteration}: no-wait apparatus did not establish \
+                     consumer-before-H2D"
+                );
+                assert_eq!(
+                    bypass.destination, payload,
+                    "iteration {iteration}: no-wait transfer did not land after release"
+                );
 
-            let mut got = vec![0.0f32; n];
-            let got_bytes =
-                unsafe { std::slice::from_raw_parts_mut(got.as_mut_ptr().cast::<u8>(), bytes) };
-            unsafe { runtime.dtoh(got_bytes, out_p) }.unwrap();
-            gate.settle().unwrap();
-            assert_eq!(
-                got, payload,
-                "iteration {iteration}: ordered page-in consumer read stale bytes; \
-                 left={got:?}, right={payload:?}"
-            );
+                // Real allocate+stage+copy+fence entry point.
+                let staging = runtime.alloc_pinned(payload_bytes.len())?;
+                let (page, page_fence, staging) =
+                    crate::weight_paging::CudaWeightPage::upload_async_queued(
+                        &runtime,
+                        DataType::Float32,
+                        vec![n],
+                        payload_bytes,
+                        staging,
+                        Arc::clone(ep.release_queue()),
+                    )
+                    .map_err(|error| EpError::KernelFailed(error.to_string()))?;
+                ep.wait_fence(&Fence::new(page_fence))?;
+                drop(staging);
+                let page_p = cuptr(page.device_ptr());
+                let mut consume = runtime.stream().launch_builder(&copy_out);
+                gate.reset();
+                gate.release_consumer();
+                consume
+                    .arg(&page_p)
+                    .arg(&out_p)
+                    .arg(&n_u64)
+                    .arg(&consumer_ready_device)
+                    .arg(&consumer_release_device)
+                    .arg(&consumer_done_device);
+                unsafe { consume.launch(one_block) }
+                    .map_err(|error| driver_err("launch upload_async page consumer", error))?;
+                let mut paged = vec![0.0f32; n];
+                let paged_bytes = unsafe {
+                    std::slice::from_raw_parts_mut(paged.as_mut_ptr().cast::<u8>(), bytes)
+                };
+                unsafe { runtime.dtoh(paged_bytes, out_p) }?;
+                assert_eq!(
+                    paged, payload,
+                    "iteration {iteration}: upload_async page-in read stale bytes; \
+                     left={paged:?}, right={payload:?}"
+                );
+                drop(page);
+                gate.settle()?;
+            }
+            Ok(())
+        })();
 
-            // ── Bypass/vacuity arm. This is the same already-submitted gated
-            // transfer and consumer with only `wait_fence` omitted. The mapped
-            // completion handshake observes the consumer while the transfer is
-            // still held, without draining or otherwise ordering either stream.
-            unsafe { runtime.htod(poison_bytes, neg_dst_p) }.unwrap();
-            gate.reset();
-            launch_gate();
-
-            unsafe { runtime.htod_async(staging.as_slice(), neg_dst_p) }.unwrap();
-            let bypassed_fence = runtime.record_copy_fence().unwrap();
-            launch_consumer(neg_dst_p);
-            gate.wait_for_consumer(iteration);
-            gate.release();
-            runtime.sync_copy_stream().unwrap();
-
-            let mut stale = vec![0.0f32; n];
-            let stale_bytes =
-                unsafe { std::slice::from_raw_parts_mut(stale.as_mut_ptr().cast::<u8>(), bytes) };
-            unsafe { runtime.dtoh(stale_bytes, out_p) }.unwrap();
-            assert_eq!(
-                stale, poison,
-                "iteration {iteration}: bypass consumer did not read poison while page-in was \
-                 gated; fence={bypassed_fence}, left={stale:?}, right={poison:?}"
-            );
-
-            let mut landed = vec![0.0f32; n];
-            let landed_bytes =
-                unsafe { std::slice::from_raw_parts_mut(landed.as_mut_ptr().cast::<u8>(), bytes) };
-            unsafe { runtime.dtoh(landed_bytes, neg_dst_p) }.unwrap();
-            gate.settle().unwrap();
-            assert_eq!(
-                landed, payload,
-                "iteration {iteration}: bypass-arm transfer did not land after release; \
-                 left={landed:?}, right={payload:?}"
-            );
-
-            // ── Real allocate+stage+copy+fence entry point.
-            let staging = runtime.alloc_pinned(payload_bytes.len()).unwrap();
-            let (page, page_fence, staging) =
-                crate::weight_paging::CudaWeightPage::upload_async_queued(
-                    &runtime,
-                    DataType::Float32,
-                    vec![n],
-                    payload_bytes,
-                    staging,
-                    Arc::clone(ep.release_queue()),
-                )
-                .unwrap();
-            ep.wait_fence(&Fence::new(page_fence)).unwrap();
-            drop(staging);
-            launch_consumer(cuptr(page.device_ptr()));
-            let mut paged = vec![0.0f32; n];
-            let paged_bytes =
-                unsafe { std::slice::from_raw_parts_mut(paged.as_mut_ptr().cast::<u8>(), bytes) };
-            unsafe { runtime.dtoh(paged_bytes, out_p) }.unwrap();
-            assert_eq!(
-                paged, payload,
-                "iteration {iteration}: upload_async page-in read stale bytes; \
-                 left={paged:?}, right={payload:?}"
-            );
-            drop(page);
+        let after_gate = gate.finish(primary);
+        let mut buffer_cleanup = Ok(());
+        for (name, buffer) in [
+            ("ordered dst", pos_dst),
+            ("control dst", neg_dst),
+            ("output", out),
+        ] {
+            if let Err(error) = ep.deallocate(buffer) {
+                let next = Err(EpError::KernelFailed(format!(
+                    "cuda page-in test could not deallocate {name}: {error}"
+                )));
+                buffer_cleanup = merge_primary_and_cleanup(buffer_cleanup, next);
+            }
         }
-
-        gate.finish().unwrap();
-        ep.deallocate(pos_dst).unwrap();
-        ep.deallocate(neg_dst).unwrap();
-        ep.deallocate(out).unwrap();
+        merge_primary_and_cleanup(after_gate, buffer_cleanup)
     }
 
     /// Regression for the MTP dual-slot graph-replay crash: a kernel-variant
