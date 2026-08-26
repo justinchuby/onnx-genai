@@ -61,6 +61,23 @@ impl EpHandle {
 /// ORT's built-in fallback produced correct output).
 static COMPILED_NODE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+/// Global counter of C-ABI `GetCapability` callback invocations.
+///
+/// Session-creation tests read this through the plugin cdylib to prove that a
+/// rejection happened inside the real ORT capability path rather than during
+/// model parsing before the EP was consulted.
+static GET_CAPABILITY_CALL_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Returns the number of C-ABI `GetCapability` callback invocations.
+pub fn get_capability_call_count() -> usize {
+    GET_CAPABILITY_CALL_COUNT.load(Ordering::Relaxed)
+}
+
+/// Resets the C-ABI `GetCapability` callback counter.
+pub fn reset_get_capability_call_count() {
+    GET_CAPABILITY_CALL_COUNT.store(0, Ordering::Relaxed);
+}
+
 /// Returns the total number of nodes compiled by our EP since process start.
 /// Reset with [`reset_compiled_node_count`] before a test session.
 pub fn compiled_node_count() -> usize {
@@ -306,6 +323,7 @@ unsafe extern "C" fn ep_get_capability(
     graph: *const ort::OrtGraph,
     support: *mut ort::OrtEpGraphSupportInfo,
 ) -> *mut ort::OrtStatus {
+    GET_CAPABILITY_CALL_COUNT.fetch_add(1, Ordering::Relaxed);
     let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
         ep_get_capability_inner(ep, graph, support)
     }));

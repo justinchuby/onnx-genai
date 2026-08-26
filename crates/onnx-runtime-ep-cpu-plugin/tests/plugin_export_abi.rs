@@ -763,6 +763,8 @@ fn l1_required_symbols_resolve() {
     for symbol in [
         &b"nxrt_ep_compiled_node_count"[..],
         &b"nxrt_ep_reset_compiled_node_count"[..],
+        &b"nxrt_ep_get_capability_call_count"[..],
+        &b"nxrt_ep_reset_get_capability_call_count"[..],
         &b"nxrt_ep_workspace_placement_queries"[..],
         &b"nxrt_ep_reset_workspace_placement_queries"[..],
         &b"nxrt_ep_constant_weight_inputs"[..],
@@ -862,6 +864,8 @@ fn l1_no_symbol_leakage() {
                 && *name != "ReleaseEpFactory"
                 && *name != "nxrt_ep_compiled_node_count"
                 && *name != "nxrt_ep_reset_compiled_node_count"
+                && *name != "nxrt_ep_get_capability_call_count"
+                && *name != "nxrt_ep_reset_get_capability_call_count"
                 && *name != "nxrt_ep_workspace_placement_queries"
                 && *name != "nxrt_ep_reset_workspace_placement_queries"
                 && *name != "nxrt_ep_constant_weight_inputs"
