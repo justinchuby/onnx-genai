@@ -89,6 +89,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 import unittest
 import unittest.mock
 from pathlib import Path
@@ -2972,6 +2973,208 @@ class CoTenancy(unittest.TestCase):
             failed = m.self_test()
         self.assertFalse(failed)
         self.assertIn("FAIL", out.getvalue())
+
+
+class AssignmentIsNotExecution(unittest.TestCase):
+    """Where the harness *put* a launch and where it *ran* are two claims.
+
+    `taskset` is not a bound: it is one `sched_setaffinity` call, and the
+    process it pinned may make another. Sebastian's #1812 measured the live
+    version of this -- `ONNX_GENAI_CPU_DECODE_THREADS=N` confines the process
+    to N cpus of the pool's choosing -- which means a pinned row can be
+    labelled `cpu4` and measured somewhere else entirely, and the co-tenant arm
+    can be injecting load next to a core nothing is running on.
+
+    Probed directly on this host (decode arm, `PROBE_TOKENS=8`):
+
+      * `taskset -c 4`, width 1  -> every thread `allowed=4`, ran on 4;
+        `path=flat`, `PIN-OFF`.
+      * `taskset -c 4-7`, width 4 -> `realized=4 path=spmd-pool`, threads
+        floated within 4-7 and never outside.
+      * `taskset -c 4`, width 4  -> clamped to `realized=1` and printed
+        `WIDTH-MISMATCH` rather than escaping the mask.
+
+    So the pool respects an operator mask on this host, and these tests are the
+    regression guard on that, not a bug report.
+    """
+
+    @staticmethod
+    def _harness():
+        if str(EP_BENCHES) not in sys.path:
+            sys.path.insert(0, str(EP_BENCHES))
+        import int4_modulo_matrix
+
+        return int4_modulo_matrix
+
+    def test_a_launch_confined_elsewhere_is_an_escape(self):
+        m = self._harness()
+        pinned = [("decode_before", "4", "4")]
+        self.assertEqual(m.classify_affinity(pinned, [4])["verdict"], "conformant")
+        for mask in ("0-31", "0,2", "5"):
+            got = m.classify_affinity([("decode_before", mask, "4")], [4])
+            self.assertEqual(got["verdict"], "escaped", mask)
+            self.assertEqual(got["offenders"][0]["allowed"], mask)
+
+    def test_the_pre_exec_launcher_is_not_the_workload(self):
+        """The false positive this instrument produced on its first run.
+
+        `taskset` is sampled between fork and exec, before it applies the mask
+        to itself, so it reads the whole machine every time. Counting it
+        reported ESCAPED on a launch whose every real thread was pinned.
+        """
+        m = self._harness()
+        mixed = [("taskset", "0-31", "28"), ("decode_before", "4", "4")]
+        self.assertEqual(m.classify_affinity(mixed, [4])["verdict"], "conformant")
+
+    def test_the_launcher_alone_is_not_evidence_of_conformance(self):
+        """...and dropping it must not turn "saw nothing" into "saw a pass"."""
+        m = self._harness()
+        launcher_only = [("taskset", "0-31", "28")]
+        self.assertEqual(m.classify_affinity(launcher_only, [4])["verdict"], "unobserved")
+        self.assertEqual(m.classify_affinity([], [4])["verdict"], "unobserved")
+
+    def test_a_lagging_last_cpu_is_not_an_escape(self):
+        """The unsound criterion this check shipped with for ten minutes.
+
+        A thread's last-run cpu lags its own `sched_setaffinity` until it next
+        runs, so `allowed=4, last_cpu=7` is a routine transient at pool startup.
+        Verdicting on it would abort correct runs; it is reported instead.
+        """
+        m = self._harness()
+        got = m.classify_affinity([("decode_before", "4", "7")], [4])
+        self.assertEqual(got["verdict"], "conformant")
+        self.assertEqual(got["cpus_seen"], [7])
+
+    def test_only_an_escape_stops_the_run(self):
+        m = self._harness()
+        escaped = m.classify_affinity([("w", "0-31", "9")], [4])
+        self.assertIn("escaped their pin", m.affinity_abort_message("decode", escaped))
+        for benign in ([("w", "4", "4")], [], [("taskset", "0-31", "0")]):
+            obs = m.classify_affinity(benign, [4])
+            self.assertIsNone(m.affinity_abort_message("decode", obs), benign)
+
+    def test_the_window_is_sampled_throughout_rather_than_once(self):
+        """The defect a positive control caught in this probe's first version.
+
+        It stopped sampling at the first successful read, which sounds
+        equivalent to sampling the window and is not: a process is pinned
+        correctly at exec and escapes later, when its pool initialises. Against
+        a child that widened its own mask 300ms in, the early-stopping probe
+        returned `conformant` for a provable escape.
+        """
+        m = self._harness()
+        reads = [[("w", "4", "4")], [("w", "4", "4")], [("w", "0-31", "9")]]
+        seen = {"n": 0}
+
+        def fake_samples(_pid):
+            out = reads[min(seen["n"], len(reads) - 1)]
+            seen["n"] += 1
+            return out
+
+        class FakeProc:
+            pid = 4242
+
+            def __init__(self):
+                self.polls = 0
+
+            def poll(self):
+                self.polls += 1
+                return None if self.polls < 6 else 0
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+        with unittest.mock.patch.object(m, "_thread_samples", fake_samples), \
+                unittest.mock.patch.object(m.subprocess, "Popen",
+                                           lambda *a, **k: FakeProc()):
+            obs = m.observe_affinity("bin", {}, assigned=[4], budget_s=5.0)
+        self.assertEqual(obs["verdict"], "escaped")
+        self.assertGreater(seen["n"], 1, "probe read /proc only once")
+
+    def test_the_probe_stops_when_the_launch_exits(self):
+        """A 0.13s prefill launch must not cost the full sampling budget."""
+        m = self._harness()
+
+        class DeadProc:
+            pid = 4243
+
+            def poll(self):
+                return 0
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+        with unittest.mock.patch.object(m, "_thread_samples",
+                                        lambda _p: [("w", "4", "4")]), \
+                unittest.mock.patch.object(m.subprocess, "Popen",
+                                           lambda *a, **k: DeadProc()):
+            start = time.time()
+            obs = m.observe_affinity("bin", {}, assigned=[4], budget_s=30.0)
+        self.assertEqual(obs["verdict"], "conformant")
+        self.assertLess(time.time() - start, 5.0)
+
+
+class WidthScaledEfficiencyFloor(unittest.TestCase):
+    """A `(utime+stime)/wall` floor of 0.95 only means something at width 1.
+
+    Sebastian measured the failure reversibly at width 2 (#1812): one foreign
+    thread inside the confined set, `cpu ms/token` flat at 35.4-36.5 while wall
+    doubled from 17.64 to 35.86. Because a dispatch is a barrier, the foreign
+    thread costs the entire dispatch rather than `1/n` of it, and the healthy
+    lane idles at the barrier -- so the run keeps its cpu time and loses its
+    wall time, which is precisely the shape a fixed floor cannot see.
+
+    Scaling the floor with the assignment turns his contaminated run into a
+    discard with no new instrument: 35.37/17.64 = 2.00 clean, 36.45/35.86 =
+    1.02 contaminated, floor 1.90.
+    """
+
+    @staticmethod
+    def _harness():
+        if str(EP_BENCHES) not in sys.path:
+            sys.path.insert(0, str(EP_BENCHES))
+        import int4_modulo_matrix
+
+        return int4_modulo_matrix
+
+    def test_the_floor_tracks_the_number_of_cpus_assigned(self):
+        m = self._harness()
+        self.assertAlmostEqual(m.efficiency_floor([4]), 0.95)
+        self.assertAlmostEqual(m.efficiency_floor([0, 2]), 1.90)
+        self.assertAlmostEqual(m.efficiency_floor([4, 5, 6, 7]), 3.80)
+        # An empty assignment is a bug, not a licence to admit everything.
+        self.assertAlmostEqual(m.efficiency_floor([]), 0.95)
+
+    def test_sebastians_contaminated_width_2_run_is_discarded(self):
+        m = self._harness()
+        two = m.efficiency_floor([0, 2])
+        clean = 35.37 / 17.64
+        contaminated = 36.45 / 35.86
+        self.assertIsNone(m.admit(clean, 0.01, None, "none", eff_floor=two))
+        self.assertEqual(m.admit(contaminated, 0.01, None, "none", eff_floor=two), "eff")
+        # The same pair against the unscaled floor, which is what the harness
+        # would have believed: both admitted, and the 2x regression published.
+        flat = m.CPU_EFF_FLOOR
+        self.assertIsNone(m.admit(clean, 0.01, None, "none", eff_floor=flat))
+        self.assertIsNone(m.admit(contaminated, 0.01, None, "none", eff_floor=flat))
+
+    def test_the_default_floor_still_matches_this_harnesss_own_pin(self):
+        """This harness pins one cpu, so the change must decide nothing today.
+
+        A refactor that silently moved the live matrices to a different floor
+        would make the published rows incomparable with the merged ones.
+        """
+        m = self._harness()
+        self.assertEqual(len(m.ASSIGNED_CPUS), 1)
+        self.assertAlmostEqual(m.efficiency_floor(), m.CPU_EFF_FLOOR)
+        self.assertEqual(m.admit(0.94, 0.01, None, "none"), "eff")
+        self.assertIsNone(m.admit(0.96, 0.01, None, "none"))
 
 
 if __name__ == "__main__":

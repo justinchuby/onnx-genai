@@ -534,6 +534,56 @@ whether a row is *readable* for a regression, which it is; that is not a
 licence to report a 0.66% gain measured through a ±1.4% null. Read the whole
 `dram` column as "no resolvable effect, and no regression".
 
+### Was the measured work actually on the cpu the harness pinned? (2026-08-27)
+
+Every row above is labelled `cpu4`, and until now that label rested on the
+`taskset` in the launch line. `taskset` is not a bound. It is one
+`sched_setaffinity` call, and the process it pinned is free to make another —
+so a pinned row can be measured somewhere else entirely, and the co-tenant arm
+in particular could be injecting load on the SMT sibling of a core nothing is
+running on. Sebastian's #1812 is the live version of that hazard:
+`ONNX_GENAI_CPU_DECODE_THREADS=N` confines the process to N cpus of the
+*pool's* choosing, and this harness sets that variable on every decode launch.
+
+Assignment is not execution until it is read back, so it was: launch as the
+matrix does, then read each thread's `Cpus_allowed_list` and last-run cpu from
+`/proc` across a sampling window.
+
+| launched as | requested width | realized | threads allowed on | ran on |
+|---|---|---|---|---|
+| `taskset -c 4`, `THREADS=1` (**what every row above used**) | 1 | `realized=1 path=flat` `PIN-OFF` | `4` | `4` |
+| `taskset -c 4-7`, `THREADS=4` | 4 | `realized=4 path=spmd-pool` | `4-7` | 4, 5, 6, 7 |
+| `taskset -c 4`, `THREADS=4` | 4 | `realized=1 path=flat` `WIDTH-MISMATCH` | `4` | `4` |
+
+So the pin held: the rows are measured where they say they are. The third case
+is the one worth keeping — asked for four workers inside a one-cpu mask, the
+pool clamps to one and *says so* rather than escaping the mask, which is the
+behaviour #1802 asks for and is now guarded by a test rather than by a habit.
+
+The width=1 row also settles the exposure directly. Sebastian's amplification
+needs a barrier across a multi-cpu confined set: one foreign thread costs the
+whole dispatch, so wall doubles while cpu-time stays flat. These rows take
+`path=flat` on a single cpu, where there is no barrier and where a foreign
+thread on cpu4 shows up as `(utime+stime)/wall` below the floor and is
+discarded per launch. The mechanism cannot reach them.
+
+It reaches anything wider, though, and a fixed `0.95` floor is exactly the
+wrong instrument there: a 2-wide launch that kept both cpus scores ~2.00, and
+his contaminated one scores 36.45/35.86 = **1.02** — admitted by a flat floor,
+discarded by one that scales with the assignment (1.90). `efficiency_floor()`
+now scales; at this harness's one-cpu pin it returns 0.95 and changes no
+decision here, which is deliberate: the merged rows stay comparable.
+
+**Both new checks were wrong first, and the controls are what said so.**
+Mutation testing killed the escape criterion I shipped with — verdicting on a
+thread's last-run cpu, which legitimately lags its own `sched_setaffinity` and
+would abort correct runs; the allowed mask is the assertable fact and
+`cpus_seen` is now evidence rather than a criterion. Then a positive control (a
+child that widens its own mask 300ms after starting) returned **`conformant`**,
+because the probe stopped sampling at its first successful read and saw only
+the pre-escape state. A check that has only ever said "conformant" has not yet
+been shown to be a check.
+
 ### What this does not establish
 
 The co-tenants are synthetic: a spinner and a memcpy loop, not another
