@@ -150,3 +150,31 @@ jobs:
       # must hold the lock or carry a recorded gap.
       - name: Driver gate conformance
         run: python3 scripts/ort_ab/test_gate_conformance.py
+
+      # A pre-registered rule that takes its own parameters from `argv` is not
+      # pre-registered. `acc0_w16_worker_split.py` read its comparison pair
+      # from `--widths` while its docstring named the pair as part of the rule,
+      # so `--widths 2,8,16` re-based every verdict onto w=2 and inverted a
+      # published conclusion, with output byte-identical in shape to a correct
+      # run. Its `--self-test` fails against that defect rather than exercising
+      # the happy path.
+      #
+      # Discovered by behaviour rather than listed, for the same reason as the
+      # path filter above: the harness that most needs this step is one that
+      # does not exist yet. The match is on the argparse *registration* and
+      # accepts either quote style, so a file that merely mentions the flag in
+      # prose is not selected and then failed for not accepting it. Self-tests
+      # here are pure arithmetic on synthetic records -- no binary, no host
+      # load, no lock -- so they are safe on a shared runner.
+      - name: Harness self-tests
+        run: |
+          set -euo pipefail
+          found=0
+          for f in crates/onnx-runtime-ep-cpu/benches/*.py scripts/ort_ab/*.py; do
+            [ -f "$f" ] || continue
+            grep -qE 'add_argument\(["'"'"']--self-test' "$f" || continue
+            echo "== $f --self-test"
+            python3 "$f" --self-test
+            found=$((found + 1))
+          done
+          echo "ran $found harness self-test(s)"
