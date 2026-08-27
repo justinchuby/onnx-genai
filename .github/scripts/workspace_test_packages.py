@@ -214,9 +214,6 @@ DENYLIST: dict[str, str] = {
     # Benchmark crate includes CUDA/native performance entry points; benchmark
     # execution belongs in explicit perf/GPU jobs, not every PR test lane.
     "onnx-genai-bench": "benchmark/perf crate; not a unit-test CI target",
-    # CUDA EP tests require a CUDA device. Compile coverage is handled by the
-    # CUDA compile job; runtime GPU honesty is checked separately.
-    "onnx-runtime-ep-cuda": "runtime tests require a CUDA GPU",
     # PyO3 extension crates need wheel/extension-module packaging so the test
     # binary can find the generated module and runtime DLLs. Plain cargo test on
     # CI is not the right harness.
@@ -274,7 +271,31 @@ ORT_BACKED = frozenset(
 # MLAS is Linux-tested for coverage and separately built on Windows ARM64; keep
 # it out of the cross-platform coverage/ARM test lanes that intentionally avoid
 # native MLAS execution there.
-LINUX_ONLY = frozenset({"mlas-sys"})
+# Packages whose tests run on Linux only. They stay in `offline-linux` -- which
+# `Fast (Linux x86_64)` executes, so they are enforced by a required check --
+# and are kept out of `offline-cross-platform`.
+#
+# `onnx-runtime-ep-cuda` is here rather than in `DENYLIST` because "its tests
+# need a GPU" is true of 656 of them and false of the other 732, and denying the
+# package acted on all 1388. The crate already draws that line itself, with
+# `#[ignore]` and the `gpu-tests` feature, so a GPU-less runner reports the GPU
+# tests as ignored and executes the rest:
+#
+#     cargo test --locked -p onnx-runtime-ep-cuda
+#     82 targets: 732 passed, 0 failed, 656 ignored, exit 0
+#
+# What the old entry cost: `kernels::tests::every_cuda_covered_op_is_named_in_
+# current_coverage_matrix` compares CUDA_COVERED_OPS against the matrix parsed
+# out of docs/execution/CUDA_COVERAGE.md. #2076 added an op to the constant and
+# no row to the document, and `main` was red from that merge until #2271 --
+# through every green required check, because no lane ran the assertion. The
+# `unenforced` gate at the bottom of this file exists to catch exactly that and
+# says so ("Their tests can go red on `main` while every required check is
+# green"); the DENYLIST entry was what stopped it looking.
+#
+# macOS/Windows exclusion is unchanged and deliberate: CUDA is unsupported on
+# macOS, and no CI runner outside the CUDA lanes builds this crate.
+LINUX_ONLY = frozenset({"mlas-sys", "onnx-runtime-ep-cuda"})
 
 
 def workspace_packages() -> set[str]:

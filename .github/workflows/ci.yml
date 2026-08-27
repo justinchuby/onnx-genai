@@ -913,8 +913,10 @@ jobs:
           flags: offline
           fail_ci_if_error: false
           token: ${{ secrets.CODECOV_TOKEN }}
-      # Keep MLAS coverage on Linux; the Windows ARM64 lane below separately
-      # validates that the native build script stays MSVC-compatible.
+      # Coverage for the Linux-only crates: `mlas-sys`, whose Windows ARM64
+      # build-script compatibility the lane below validates separately, and
+      # `onnx-runtime-ep-cuda`, which is Linux-only because CUDA is unsupported
+      # on macOS. The GPU tests in the latter report as ignored here.
       - name: Test Linux-only offline crates with coverage
         if: runner.os == 'Linux'
         shell: bash
@@ -1398,19 +1400,19 @@ jobs:
 
       # The safe-point rejection rules are pure predicate logic over
       # ResizeSafePoint (no device). Same situation as the two targets above:
-      # the honesty checker deliberately does not police a non-_gpu target, and
-      # workspace_test_packages.py deny-lists this crate from every offline
-      # lane, so without this step the target would be compiled and never run
-      # (#1875).
+      # the honesty checker deliberately does not police a non-_gpu target.
+      # This step predates the crate joining `offline-linux`: it was added by
+      # #1875 because the deny-list kept the target compiled-but-never-run, and
+      # it is kept because `Fast` runs the default features while this runs
+      # `--features cuda`, which is a different build of the same assertions.
       - name: Verify granule transition safe-point rules
         if: ${{ !cancelled() }}
         run: cargo test --locked -p onnx-runtime-ep-cuda --features cuda --test content_preserving_transition
 
-      # Non-`_gpu` targets in this crate run in no other lane: the honesty
-      # script skips them and workspace_test_packages.py deny-lists the crate
-      # from the offline lanes. Without this step the relocated CPU-only tests
-      # would compile and never execute, which is the failure they were moved
-      # out of `_gpu` targets to avoid.
+      # The honesty script skips non-`_gpu` targets, so this step was the only
+      # thing running them while the deny-list held the crate out of every
+      # offline lane. `Fast (Linux x86_64)` now runs them too, under default
+      # features; this keeps the `--features cuda` build of the same tests.
       - name: Verify expert route telemetry CPU oracle
         if: ${{ !cancelled() }}
         run: cargo test --locked -p onnx-runtime-ep-cuda --features cuda --test expert_route_telemetry_probe
