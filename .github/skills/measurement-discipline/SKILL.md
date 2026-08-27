@@ -356,6 +356,22 @@ the cause of a syntax error four files away. Checking cargo's status first
 separates *the tree does not build* from *the name does not resolve*; they are
 different bugs with different fixes, and only one of them is about your filter.
 
+That `||` reads the *assignment's* status, which is the command substitution's
+only while the assignment is bare. Wrapping the recipe in a helper — the obvious
+way to reuse it — puts a builtin in front, and the builtin's status is its own:
+
+```sh
+list=$(cmd);          echo $?   # 101  guard fires
+local list=$(cmd);    echo $?   # 0    guard silent   (also `export`, `declare`)
+```
+
+Measured: with `local`, a crate that fails to build reports
+`FILTER-DRIFT: selected 0, expected 1` and exits 2 — the identical wrong verdict
+the `||` was added to eliminate, because `grep -c` still counts an empty string.
+Assign bare and declare separately (`local list; list=$(cmd) || …`). This is the
+pipeline rule one step over: **a status is only yours if nothing ran after the
+thing you meant to measure** — and `local` runs after it.
+
 Asserting `1 passed` in the run output is the same idea and is what
 `agrees_with_hostlock_sh.rs` does, but on its own it is a substring match on a
 *result*. Measured — note both arms use **substring** filters, with no `--exact`:
