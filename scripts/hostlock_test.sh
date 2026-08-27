@@ -452,16 +452,38 @@ clean_out=$($HL run --owner leon --reason "clean run" -- sh -c 'sleep 1' 2>&1)
 chk "a clean run warns about nothing" \
     "$(printf '%s\n' "$clean_out" | grep -c WARNING)" "0"
 
-# SIGKILL cannot be trapped, so the lock survives; the anchor is the runner's
-# own pid, so the next acquirer must reap it. This is the case the pid anchor
-# exists for.
+# SIGKILL cannot be trapped, so the lock survives -- and, more importantly,
+# the runner never reaps the tree it started, so `sleep 60` outlives it. The
+# anchor is the runner's own pid, so ANCHOR-ONLY liveness calls this box free
+# while the job still holds it. That is the wedge #1806 shipped with,
+# reproduced: holder gone, job alive, status "STALE ... next acquire will reap
+# it", and the next acquirer measures against a competitor it cannot see.
+#
+# The lock must stay HELD for as long as the JOB holds cores, and must become
+# reclaimable once it does not -- both halves, or the fix for one is a wedge
+# for the other.
 $HL run --owner leon --reason "hard kill" -- sleep 60 >/dev/null 2>&1 &
 runner=$!
 sleep 2
+kpgid=$(sed -n 's/^child_pgid=//p' "$LOCK/meta" 2>/dev/null | head -1)
 sig "$runner" 9
 wait_bounded "$runner" >/dev/null 2>&1
 sleep 1
-chk "SIGKILL leaves the lock behind" "$(st state)" "STALE"
+chk "the killed runner had published its job's process group" \
+    "$([ -n "$kpgid" ] && echo yes || echo no)" "yes"
+chk "SIGKILL with the job still running does not declare the box free" \
+    "$(st state)" "HELD"
+chk "and status names the surviving job instead of the dead anchor" \
+    "$($HL status 2>&1 | grep -c 'ORPHANED')" "1"
+$HL acquire --owner roy --ttl 600 >/dev/null 2>&1
+chk "and a peer cannot reap a lock whose job still holds cores" \
+    "$(st owner)" "leon"
+# The other half: this must not become a permanent wedge. Kill the job and the
+# lock goes stale exactly as before -- the anchor still bounds the claim, it
+# just no longer outranks the evidence.
+python3 -c 'import os,sys,signal; os.killpg(int(sys.argv[1]), signal.SIGKILL)' "$kpgid" 2>/dev/null
+sleep 1
+chk "SIGKILL leaves the lock behind, once the job is gone" "$(st state)" "STALE"
 $HL acquire --owner roy --ttl 600 >/dev/null 2>&1
 chk "next acquirer reaps the killed holder" "$(st owner)" "roy"
 cleanup
@@ -3060,7 +3082,7 @@ cleanup
 # the inert R1 block and the vacuous STALE arm that this PR exists to fix.
 # Every probe branch asserts something, so the total is invariant across
 # environments; if a refactor drops a check, this fails and says so.
-chk "every assertion in this file ran" "$((pass + fail + 1))" "456"
+chk "every assertion in this file ran" "$((pass + fail + 1))" "460"
 
 echo
 echo "passed=${pass} failed=${fail}"
