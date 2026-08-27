@@ -82,7 +82,7 @@ HL=${HOSTLOCK_SCRIPT_ABS:-scripts/hostlock.sh}
 pass=0
 fail=0
 
-cleanup() { rm -rf "$LOCK" "$LOCK".ctl "$LOCK".ctl2 "$LOCK".ctlr "$LOCK".ctlprobe "$LOCK".ctlok "$LOCK".ctlu "$LOCK".len "$LOCK".cpuself "$LOCK".reaper "$LOCK".reaper.stage.* "$LOCK".reaper.dead.* "$LOCK".reaper.rel.* "$LOCK".dead.* "$LOCK".stage.* "$LOCK".gate "$LOCK".warn "$LOCK".zombie.* "$LOCK".zpid "$LOCK".ttlmarker "$LOCK".ran "$LOCK".conf "$LOCK".legacy "$LOCK".box "$LOCK".sourced "$LOCK".legacyran "$LOCK".owner "$LOCK".nested "$LOCK".ro "$LOCK".deep "$LOCK".file "$LOCK".nox "$LOCK".conf2 "$LOCK".helpconf "$LOCK".helppoison "$LOCK".wait "$LOCK".grandchild "$LOCK".stubborn 2>/dev/null; }
+cleanup() { rm -rf "$LOCK" "$LOCK".ctl "$LOCK".ctl2 "$LOCK".ctlr "$LOCK".ctlfw "$LOCK".ctlconf "$LOCK".ctlbox "$LOCK".ctlbox.legacy "$LOCK".ctlprobe "$LOCK".ctlok "$LOCK".ctlu "$LOCK".len "$LOCK".cpuself "$LOCK".reaper "$LOCK".reaper.stage.* "$LOCK".reaper.dead.* "$LOCK".reaper.rel.* "$LOCK".dead.* "$LOCK".stage.* "$LOCK".gate "$LOCK".warn "$LOCK".zombie.* "$LOCK".zpid "$LOCK".ttlmarker "$LOCK".ran "$LOCK".conf "$LOCK".legacy "$LOCK".box "$LOCK".sourced "$LOCK".legacyran "$LOCK".owner "$LOCK".nested "$LOCK".ro "$LOCK".deep "$LOCK".file "$LOCK".nox "$LOCK".conf2 "$LOCK".helpconf "$LOCK".helppoison "$LOCK".wait "$LOCK".grandchild "$LOCK".stubborn 2>/dev/null; }
 trap cleanup EXIT
 
 chk() {
@@ -2593,7 +2593,12 @@ chk "and a last-wins parse of the multi-line form still reads HELD" \
 chk "and the unrecoverable value is recovered inertly, not discarded" \
     "$(printf '%s\n' "$nlraw" | sed -n 's/^legacy_dir_raw=//p')" \
     "$(printf '%q' "$lg_nl_prov")"
-chk "and the encoded raw carries no literal newline" \
+# Titled for what it actually checks. Phrased as "carries no literal
+# newline" it did not test that: a leaked newline produces a SECOND physical
+# line that does not match this prefix, so the count stays 1 either way. The
+# no-newline property is carried by the exact-string cell above; this one
+# pins that the raw appears exactly once.
+chk "and exactly one legacy_dir_raw line is emitted" \
     "$(printf '%s\n' "$nlraw" | grep -c '^legacy_dir_raw=')" "1"
 # The negative control, under the SAME held-lock conditions as the cells
 # above, so the fix cannot pass by refusing every raw value it is shown.
@@ -3773,6 +3778,94 @@ chk "a UTF-8 path is not mistaken for a control payload" \
         | tr ' ' '\n' | sed -n 's/^lock_dir=//p')" "$ctl_utf"
 rm -rf "$LOCK.ctl" "$LOCK.ctl2" "$LOCK.ctlu"
 
+# ---------------------------------------------------------------------------
+# THE FOREIGN WRITER. Every cell above builds its lock with THIS version's
+# `run`, whose write side now encodes -- so the stored file is already clean
+# and a regression in any READ guard is invisible. Reverting the porcelain's
+# `display_safe` changed nothing in the whole suite, because the value it
+# stopped encoding on the way out had already been encoded on the way in.
+#
+# That is not a hypothetical gap. It is the actual threat model stated in the
+# header: peers run their own checkouts at their own commits, so the file a
+# reader is handed is very often one it did not write. These cells write the
+# metadata BY HAND, the way an older peer's script would, and they are the
+# only ones here that can see the read side at all.
+ctl_fw="$LOCK.ctlfw"
+rm -rf "$ctl_fw"; mkdir -p "$ctl_fw"
+printf 'owner=leon\nreason=%s\nanchor_pid=%s\nttl=%s\nacquired_epoch=%s\nworktree=/w\ncmd=bench\n' \
+    "$(printf 'moe\033[2K\033[1000Dstate=FREE')" \
+    "$(printf '1234\033[2K\033[1000Dstate=FREE')" \
+    "$(printf '5\033[2K\033[1000Dstate=FREE')" \
+    "$(date +%s)" >"$ctl_fw/meta"
+ctl_fw_pc=$(HOSTLOCK_DIR="$ctl_fw" HOSTLOCK_PRIVATE_OK=1 "$HL" status --porcelain 2>/dev/null)
+chk "a foreign reason is encoded on the way OUT, not trusted from the file" \
+    "$(printf '%s\n' "$ctl_fw_pc" | sed -n 's/^reason=//p')" \
+    "$(printf '%q' "$(printf 'moe\033[2K\033[1000Dstate=FREE')")"
+# The numeric fields, which the first version of this change left raw while
+# its own header claimed no value in any grammar carries a control character.
+# Refused rather than encoded: a pid is a number, and a non-numeric one is
+# not a value worth recovering.
+chk "a foreign anchor_pid cannot carry a control character into porcelain" \
+    "$(printf '%s\n' "$ctl_fw_pc" | sed -n 's/^anchor_pid=//p')" "?"
+chk "nor a foreign ttl" \
+    "$(printf '%s\n' "$ctl_fw_pc" | sed -n 's/^ttl=//p')" "0"
+chk "and the whole porcelain row carries no escape character" \
+    "$(printf '%s\n' "$ctl_fw_pc" | grep -c "$(printf '\033')")" "0"
+# The human line, which nothing downstream re-checks and a person acts on.
+chk "and the human status line carries no escape character either" \
+    "$(HOSTLOCK_DIR="$ctl_fw" HOSTLOCK_PRIVATE_OK=1 "$HL" status 2>&1 \
+        | grep -c "$(printf '\033')")" "0"
+rm -rf "$ctl_fw"
+
+# `flat_line`'s control arm is unreachable from `prov_add` -- `display_safe`
+# encodes before it is called, which is stated at that call site. This is the
+# path where it IS reachable: a legacy holder's name goes through `flat_line`
+# straight out of a foreign legacy file, with no encoder in front of it.
+# Without this cell, dropping the control class from `flat_line` changes no
+# test in the suite.
+# Its own config fixture. The legacy section's `$lg_conf` is deleted at the
+# end of that block, and reusing the dead name here made `lock_dir_source`
+# fall back to `default`, which makes `legacy_consult_path` return `none` --
+# so all four cells below read `none` and compared against it. A fixture that
+# has been torn down does not fail loudly, it just stops selecting the code
+# path, which is the same "the arm was not on the route I named" failure these
+# cells exist to catch.
+ctl_conf="$LOCK.ctlconf"
+ctl_box="$LOCK.ctlbox"
+mkdir -p "$ctl_box"
+printf 'lock_dir=%s\n' "$ctl_box" >"$ctl_conf"
+ctl_leg="$LOCK.ctlbox.legacy"
+rm -rf "$ctl_leg"; mkdir -p "$ctl_leg"
+ctl_leg_start=$(sed 's/.*) //' "/proc/$$/stat" | awk '{print $20}')
+printf 'owner=%s\nanchor_pid=%s\nstart_time=%s\nacquired_epoch=%s\nttl=0\n' \
+    "$(printf 'roy\033[2K\033[1000Dstate=FREE')" \
+    "$$" "$ctl_leg_start" "$(date +%s)" >"$ctl_leg/meta"
+chk "a control character in a legacy owner is refused by the line grammar" \
+    "$(env -u HOSTLOCK_DIR HOSTLOCK_CONF="$ctl_conf" HOSTLOCK_LEGACY_DIR="$ctl_leg" \
+        HOSTLOCK_PRIVATE_OK=1 "$HL" status --porcelain 2>/dev/null \
+        | sed -n 's/^legacy_held_by=//p')" "$MALFORMED"
+chk "and the human legacy line carries no escape character" \
+    "$(env -u HOSTLOCK_DIR HOSTLOCK_CONF="$ctl_conf" HOSTLOCK_LEGACY_DIR="$ctl_leg" \
+        HOSTLOCK_PRIVATE_OK=1 "$HL" status 2>&1 | grep -c "$(printf '\033')")" "0"
+rm -rf "$ctl_leg" || true
+
+# The length bound on a VALUE, which had no cell at all. Driven through
+# `legacy_dir`, because it is the only unbounded value field reachable
+# without creating a directory -- $HOSTLOCK_LEGACY_DIR is an environment
+# string and never has to exist.
+ctl_long=$(printf 'a%.0s' $(seq 1 5000))
+chk "an over-long value is refused rather than published" \
+    "$(env -u HOSTLOCK_DIR HOSTLOCK_CONF="$ctl_conf" HOSTLOCK_LEGACY_DIR="/$ctl_long" \
+        HOSTLOCK_PRIVATE_OK=1 "$HL" provenance --oneline 2>/dev/null \
+        | tr ' ' '\n' | sed -n 's/^legacy_dir=//p')" "$MALFORMED"
+# The bound must not cry wolf on an ordinary path, so the same field one byte
+# under the limit still travels.
+ctl_fit=$(printf 'a%.0s' $(seq 1 4000))
+chk "and a long-but-legal value still travels intact" \
+    "$(env -u HOSTLOCK_DIR HOSTLOCK_CONF="$ctl_conf" HOSTLOCK_LEGACY_DIR="/$ctl_fit" \
+        HOSTLOCK_PRIVATE_OK=1 "$HL" provenance --oneline 2>/dev/null \
+        | tr ' ' '\n' | sed -n 's/^legacy_dir=//p')" "/$ctl_fit"
+
 # Length is bounded, and REFUSED rather than shortened. A silently kept prefix
 # presented as a whole value is the `sebastian helper` -> `sebastian` defect;
 # a bound that truncates would re-introduce it while appearing to fix it.
@@ -3792,7 +3885,7 @@ rm -rf "$LOCK.len"
 # the inert R1 block and the vacuous STALE arm that this PR exists to fix.
 # Every probe branch asserts something, so the total is invariant across
 # environments; if a refactor drops a check, this fails and says so.
-chk "every assertion in this file ran" "$((pass + fail + 1))" "556"
+chk "every assertion in this file ran" "$((pass + fail + 1))" "565"
 
 echo
 echo "passed=${pass} failed=${fail}"

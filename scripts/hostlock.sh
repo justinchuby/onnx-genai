@@ -82,7 +82,14 @@
 #      about the reader, not the parser: ESC[2K and CR are not whitespace, so
 #      they passed every delimiter check, and a row that parses as HELD can be
 #      made to DISPLAY as FREE in any terminal or renderer that honours ANSI.
-#      Rows get pasted into issue comments, so that is a real reading.
+#      Rows get pasted into issue comments, so that is a real reading. The
+#      class is pinned to C0+DEL with LC_ALL=C so it is identical on every
+#      agent's machine; the 8-bit C1 controls (0x80-0x9F) are deliberately NOT
+#      covered, because those bytes are ordinary UTF-8 continuation bytes and
+#      refusing them would call a legitimate `naïve/漢字` path malformed.
+#      This guarantee covers the HUMAN lines too -- `status`, and the reap,
+#      release and legacy warnings -- because those are where a forged FREE
+#      actually gets acted on, and nothing downstream re-checks them.
 #   4. A value that could not satisfy the above is replaced ENTIRELY by the
 #      sentinel `@malformed`. It is never truncated -- a silently kept prefix
 #      presented as a whole value is the defect this contract exists to stop.
@@ -604,7 +611,7 @@ META="${LOCK_DIR}/meta"
 warn_if_private() {
     [ "$LOCK_SCOPE" = private ] || return 0
     [ "${HOSTLOCK_PRIVATE_OK:-0}" = 1 ] && return 0
-    echo "hostlock: WARNING: HOSTLOCK_DIR is set, so this is a PRIVATE lock at ${LOCK_DIR}." >&2
+    echo "hostlock: WARNING: HOSTLOCK_DIR is set, so this is a PRIVATE lock at $(display_safe "${LOCK_DIR}")." >&2
     echo "hostlock: it coordinates with NOBODY -- peers on this host use ${SHARED_LOCK_DIR}." >&2
     echo "hostlock: set HOSTLOCK_PRIVATE_OK=1 to acknowledge and silence (the test suite does)." >&2
 }
@@ -646,7 +653,7 @@ refuse_if_legacy_held() {
     local h
     h=$(legacy_holder) || return 0
     echo "hostlock: BUSY (legacy path)" >&2
-    echo "hostlock: ${HOSTLOCK_LEGACY_PATH} is held by ${h% *} (pid ${h#* }), which is the path this host used" >&2
+    echo "hostlock: ${HOSTLOCK_LEGACY_PATH} is held by $(display_safe "${h% *}") (pid $(num_or "${h#* }" '?')), which is the path this host used" >&2
     echo "hostlock: before ${HOSTLOCK_CONF_PATH} moved the lock to ${LOCK_DIR}. That holder cannot see our lock," >&2
     echo "hostlock: so taking this one would put two benchmarks on the box. Wait for it to release." >&2
     return 2
@@ -1293,10 +1300,10 @@ reap_if_dead() {
     local reaped=1
     if [ -d "$LOCK_DIR" ] && reapable; then
         local pid owner
-        pid=$(meta_get anchor_pid 2>/dev/null || echo '?')
-        owner=$(meta_get owner 2>/dev/null || echo '?')
+        pid=$(num_or "$(meta_get anchor_pid 2>/dev/null || echo '')" '?')
+        owner=$(display_safe "$(meta_get owner 2>/dev/null || echo '?')")
         if holder_alive || unverifiable_live_anchor; then
-            echo "hostlock: WARNING taking over a lock held by ${owner} (pid ${pid}, still alive) after its $(meta_get ttl)s TTL expired" >&2
+            echo "hostlock: WARNING taking over a lock held by ${owner} (pid ${pid}, still alive) after its $(num_or "$(meta_get ttl || echo '')" '?')s TTL expired" >&2
             echo "hostlock: WARNING if ${owner} is still benchmarking, both sets of numbers are now suspect" >&2
         else
             echo "hostlock: reaping stale lock from dead pid ${pid} (owner ${owner})" >&2
@@ -1484,7 +1491,7 @@ remove_lock_if_mine() {
     local pid
     pid=$(meta_get anchor_pid 2>/dev/null || echo '')
     if [ -n "$pid" ] && [ "$pid" != "$ANCHOR_PID" ]; then
-        echo "hostlock: NOT releasing -- the lock is now held by pid ${pid} ($(meta_get owner 2>/dev/null))." >&2
+        echo "hostlock: NOT releasing -- the lock is now held by pid $(num_or "$pid" '?') ($(display_safe "$(meta_get owner 2>/dev/null)"))." >&2
         echo "hostlock: we were taken over mid-run, so both sets of numbers are suspect." >&2
         return 1
     fi
@@ -1597,6 +1604,16 @@ HL_MAX_NAME=64
 # malformed. Verified both directions -- ESC and CR classify as control, while
 # spaces, UTF-8 paths and ordinary paths do not.
 has_ctrl() {
+    # LC_ALL=C pins the class to C0 plus DEL, which is exactly what the parser
+    # contract promises. Without it the class follows the caller's locale: in
+    # a single-byte locale such as latin1, 0x80-0x9F ARE control characters,
+    # and those bytes are ordinary UTF-8 continuation bytes -- so a worktree
+    # path containing `é` or `漢` would start being called malformed for
+    # nobody's benefit. Pinning it makes the classification identical on every
+    # agent's box regardless of environment, which is the property a shared
+    # lock needs. Verified no-match for UTF-8 and match for ESC/CR/DEL under
+    # C, C.UTF-8 and en_US.utf8.
+    local LC_ALL=C
     case "$1" in
         *[[:cntrl:]]*) return 0 ;;
     esac
@@ -1624,6 +1641,15 @@ has_ctrl() {
 # documented total encoding rather than a blacklist I would have to keep in
 # sync with [:cntrl:], and it escapes the backslash it introduces, so the
 # result is unambiguous. Checked that its output carries no raw control bytes.
+#
+# One honest limit, because `%q` encodes FOR A SHELL. The result is
+# `$'moe\E[2K'`, which is inert in every reading that matters here -- a
+# terminal prints it literally, a markdown comment shows it, awk sees an
+# ordinary token -- but it is shell-ACTIVE: `eval "echo $enc"` reconstitutes
+# the raw ESC. So this neutralises the payload for reading, not for
+# re-execution, and a row pasted into a shell AND EVALUATED can still act.
+# That is an acceptable boundary: the same is true of every byte in the row,
+# and `--oneline` output is documented for awk rather than for eval.
 display_safe() {
     if has_ctrl "$1"; then
         printf '%q' "$1"
@@ -2015,7 +2041,12 @@ status_lock_dir_note() {
     # to "sebastian" -- a DIFFERENT REAL AGENT on this team. This is the
     # human-readable line rather than a machine row, which makes it worse,
     # not better: a person reads it and goes to ask the wrong peer.
-    [ "$legacy" != none ] && echo "  legacy: ${HOSTLOCK_LEGACY_PATH} is still held by ${legacy% *} (pid ${legacy##* }); acquire will refuse"
+    # `display_safe` for the same reason the truncation mattered here: this is
+    # the line a person reads before walking over to ask a peer, and an ESC in
+    # a foreign legacy owner rewrites it. Third emitter, second defect, same
+    # function -- which is why the guard belongs on the emitter and not on the
+    # list of fields somebody remembered.
+    [ "$legacy" != none ] && echo "  legacy: ${HOSTLOCK_LEGACY_PATH} is still held by $(display_safe "${legacy% *}") (pid $(num_or "${legacy##* }" '?')); acquire will refuse"
     return 0
 }
 
@@ -2063,13 +2094,13 @@ cmd_status() {
             # validation this version added. `display_safe` is what makes the
             # read side safe against a file this version never wrote.
             echo "owner=$(display_safe "$(meta_get owner || echo '?')")"
-            echo "anchor_pid=$(meta_get anchor_pid || echo '?')"
+            echo "anchor_pid=$(num_or "$(meta_get anchor_pid || echo '')" '?')"
             echo "reason=$(display_safe "$(meta_get reason || echo '')")"
             # `unknown` rather than empty for locks published before these
             # fields existed: empty would read as "held from no worktree".
             echo "worktree=$(display_safe "$(meta_get worktree || echo 'unknown')")"
             echo "cmd=$(display_safe "$(meta_get cmd || echo 'unknown')")"
-            echo "ttl=$(meta_get ttl || echo 0)"
+            echo "ttl=$(num_or "$(meta_get ttl || echo '')" 0)"
             echo "age=$(lock_age)"
         fi
         return 0
@@ -2086,9 +2117,9 @@ cmd_status() {
     # directly, and "the box is free" is the reading that gets acted on.
     owner=$(display_safe "$(meta_get owner || echo '?')")
     reason=$(display_safe "$(meta_get reason || echo '?')")
-    at=$(meta_get acquired_at || echo '?')
-    pid=$(meta_get anchor_pid || echo '?')
-    ttl=$(meta_get ttl || echo 0)
+    at=$(display_safe "$(meta_get acquired_at || echo '?')")
+    pid=$(num_or "$(meta_get anchor_pid || echo '')" '?')
+    ttl=$(num_or "$(meta_get ttl || echo '')" 0)
     age=$(lock_age)
     # Drive the human branch from lock_state, not from holder_alive directly.
     # Keying off holder_alive made this print "STALE ... is gone; next acquire
@@ -2107,7 +2138,7 @@ cmd_status() {
             if ! holder_alive && ! unverifiable_live_anchor && orph=$(orphan_group_pids); then
                 echo "HELD (ORPHANED)  holder ${owner} pid=${pid} is gone, but the job it started is still running"
                 echo "  reason: ${reason}"
-                echo "  still alive in pgid $(meta_get child_pgid || echo '?'): ${orph}"
+                echo "  still alive in pgid $(num_or "$(meta_get child_pgid || echo '')" '?'): ${orph}"
                 echo "  the host is NOT free; the lock stays held until these exit"
                 echo "  runnable=$(runnable_now)"
             else
@@ -2333,9 +2364,9 @@ cmd_release() {
     # shell cannot hand the box away mid-run.
     if [ -n "$pid" ] && [ "$pid" != "$ANCHOR_PID" ] && [ "$pid" != "$$" ] && holder_alive; then
         if [ "${HOSTLOCK_FORCE:-0}" = 1 ]; then
-            echo "hostlock: forcing release of a live lock held by pid ${pid}" >&2
+            echo "hostlock: forcing release of a live lock held by pid $(num_or "$pid" '?')" >&2
         else
-            echo "hostlock: refusing to release a lock held by live pid ${pid}" >&2
+            echo "hostlock: refusing to release a lock held by live pid $(num_or "$pid" '?')" >&2
             echo "hostlock: set HOSTLOCK_FORCE=1 if you are certain" >&2
             return 1
         fi
