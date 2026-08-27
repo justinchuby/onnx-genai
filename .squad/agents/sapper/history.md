@@ -35,3 +35,8 @@ Converted `LayerNorm17_PrePack_ScaleBiasInitializers` and `SkipLayerNorm_PrePack
 **PrePack A/B:** Converted `LayerNorm17_PrePack_ScaleBiasInitializers` and `SkipLayerNorm_PrePack_GammaBetaInitializers` to A/B loop (`is_initializer ∈ {false, true}`). Both configs assert against the same `LayerNormRef` reference. 20 BF16 / 106 LayerNorm-suite tests green. Head: `e053afd77e`.
 
 **PR body correction (Coordinator):** PR #31974 also changes pre-existing MLFloat16 behavior: (1) `REGISTER_CONTRIB_KERNELS(MLFloat16)` → `REGISTER_CONTRIB_KERNELS(MLFloat16, float)`, (2) MLFloat16 `ComputeJob` overload uses `WriteStat<U=float>` instead of `MLFloat16(mean)`. PR body rewritten to disclose both explicitly; stale "45 MLAS tests / 10 operator tests" table removed. Awaiting CI.
+
+
+## 2026-08-26 — #1896 layered contract approved and merged
+
+Implemented the accepted layered proof: at-most-once dispatcher behavior, structural reachability to `CudaStream::wait`, positive gated CUDA integration, and separate no-wait/early-copy apparatus validation with explicit limitations. Pris approved revision 6; PR #2235 squash-merged as `26dbc0f341769fcef80d4261f63898cc46bbb7c3`.

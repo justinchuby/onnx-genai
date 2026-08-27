@@ -66,3 +66,12 @@ relayout/dequant bug blows it, loose enough to pass fp32 reassociation drift. Cu
 `runtime.synchronize()` after `execute`** — an un-synced run reading stale device-pool memory once faked an
 abs-81.8 catastrophic divergence; not a kernel bug. Marlin driver must follow the same sync/zero discipline.
 Chew concurred the tolerance is engineering-justified, not a rubber stamp.
+
+## 2026-08-25 — Dynamic-output CUDA capture contract revision (#2180)
+
+Independently revised Luv's rejected origin/main capture contract under author lockout. Reproduced exact 1/2 failure, proved Unique and NonMaxSuppression are capture-unsupported because DeviceWorkspace prepare must synchronously copy an 8-byte device count before ORT can allocate dynamic outputs, and added per-owning-kernel source guards plus real RTX 4060 begin-capture refusal tests. Mutation checks caught both `CaptureSupport::Supported` and deleted-reason variants. Local contract, Unique, NMS, capture unit tests, fmt, and exact all-target CUDA Clippy `-D warnings` passed. Opened PR #2180; not merged.
+
+
+## 2026-08-26 — #1896 adversarial review sequence closed
+
+Rejected four revisions that misclassified the production defect, changed mutation semantics or schedules, permitted panicking teardown, or missed transitive capture synchronization. Approved Sapper's revision 6 layered contract and re-approved merged-latest-main HEAD; issue #1896 closed with synchronous H2D semantics and proof limitations stated honestly.
