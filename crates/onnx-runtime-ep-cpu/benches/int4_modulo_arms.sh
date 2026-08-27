@@ -14,18 +14,30 @@
 # so any row whose route reaches this line moves its checksum, and any row that
 # does not is left bit-identical as a built-in control.
 #
-# INDEPENDENT LAYOUT. One pair of binaries has one code layout, and the layout
-# component of a source-level A/B on this tree reaches ~2% -- larger than most
-# results it is used to measure, and invisible to a same-binary A/A. To get a
-# second, independent layout on demand, rebuild every arm with function
-# alignment forced. It changes nothing an instruction executes; it moves where
-# functions start (~50% -> ~91% of FUNC symbols on a 32-byte boundary here):
+# INDEPENDENT LAYOUT. One pair of binaries has one code layout, and no
+# same-binary A/A can see the difference between two of them. To get a second,
+# independent layout on demand, rebuild every arm with function alignment
+# forced. It changes nothing an instruction executes; it moves where functions
+# start (~50% -> ~91% of FUNC symbols on a 32-byte boundary here):
 #
 #   RUSTFLAGS=-Cllvm-args=-align-all-functions=5 \
 #   MOD_ARMS_OUT=target/int4-modulo-arms-align32 \
 #       crates/onnx-runtime-ep-cpu/benches/int4_modulo_arms.sh
 #
-# A sub-2% result that does not survive that is layout, not a kernel change.
+# Better than re-running the A/B under it: point the matrix at a directory whose
+# `before` is the default-layout `after` and whose `after` is the aligned one.
+# The headline ratio is then a pure A/B' layout null -- same source line, two
+# layouts -- and the harness's own bit-identity check across arms proves the
+# semantics really were held constant while only the layout moved.
+#
+# Measured that way through the SMT-sibling gate (#2216): 1.0014 [1.0000,
+# 1.0042] at prefill block 32 m=1 and 0.9993 [0.9971, 1.0005] on the block 16
+# decode. Both null. Layout sensitivity at these cells is under half a percent.
+#
+# This header used to say the layout component "reaches ~2%", read off the
+# spread across three build pairs taken before that gate existed. The direct
+# measurement says that spread was contention, not layout. Do not carry 2%
+# forward as a credibility bar; measure the null for the cell you care about.
 set -euo pipefail
 
 cd "$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"

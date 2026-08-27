@@ -3191,14 +3191,30 @@ Full report:
   do not overlap the original, so most of the 1.9% was a contended hyperthread
   sibling and not layout. The route proof re-ran on the same rebuilt arms and
   still reports `before == after == poison == 4cb1dcffe7454cff` at that cell,
-  so the *attribution* is untouched; only the size is. Treat ~2% as an upper
-  bound contaminated by contention until pairs A and C are re-taken.
+  so the *attribution* is untouched; only the size is.
+
+  **Retracted in size, 2026-08-26, by direct measurement.** The ~2% is not
+  layout at all. Built the same source at two independent layouts — default,
+  and `-Cllvm-args=-align-all-functions=5`, which moves 50% → 91% of `FUNC`
+  symbols onto a 32-byte boundary — and ran one against the other as an **A/B′
+  null** through the #2216 gate: **1.0014 [1.0000, 1.0042]** at prefill block 32
+  `m = 1` and **0.9993 [0.9971, 1.0005]** on the block-16 decode, with the arms
+  bit-identical, which is what certifies only the layout moved. Layout
+  sensitivity at these cells is under half a percent, so the spread across the
+  three original pairs was SMT contention wearing layout's clothes. Pairs A and
+  C no longer need re-taking — the question they were queued to answer has been
+  answered directly and better. Two consequences: the ~2% decode win clears its
+  real floor by roughly 5x and **stands**, and the `m = 1` −0.28% sits inside
+  the floor and is not a regression.
   Standing consequence: a small source-level A/B with no route-not-taken row
   is not confirmed. Where a route-not-taken row exists, prove it with a
   poisoned build and read it as the experiment's floor. Where it does not,
-  **require the result to reproduce across independently built pairs of
-  binaries** — cheapest on demand by rebuilding every arm under
-  `-Cllvm-args=-align-all-functions=5`, which perturbs layout and nothing else.
+  **measure an A/B′ null on the cell you are claiming** — rebuild every arm
+  under `-Cllvm-args=-align-all-functions=5`, then compare the aligned `after`
+  against the default-layout `after`. That is a pure layout null on the exact
+  cell, certified by the harness's cross-arm bit-identity check, and it
+  replaces the older rule of distrusting anything under 2%: measure your own
+  floor rather than importing someone else's.
   Reproducing across two block sizes from one pair does *not* substitute:
   a single pair of binaries has a single layout, and I initially argued
   otherwise in this document. The 1/m decay of the ratio does not distinguish
@@ -3206,6 +3222,37 @@ Full report:
   total that grows with `m` produces the identical curve. What distinguishes
   them is that the route-not-taken row is the only one that moves when the
   layout does.
+* **The clip that the modulo elimination rests on is mutation-tested, and a
+  review finding that it was not is disposed as falsified (2026-08-26).** The
+  finding (Pris) was that the substitution `(depth + q) % block_size` →
+  `offset_base + q` relies on `run` being clipped to `block_size - offset_base`,
+  and that a removal or relaxation of that clip could corrupt output while the
+  int4 tests stayed green. The premise about the invariant is exactly right and
+  matches the code comment; the claim about the tests is not. Mutating
+  `dequant_panel_avx2`'s clip four ways and running
+  `cargo test -p onnx-runtime-ep-cpu --lib int4_`:
+
+  | mutant | result |
+  | --- | --- |
+  | `run = whole - p` (clip removed) | **killed**, 4 tests |
+  | `run = (2 * block_size - offset_base).min(..)` | **killed** |
+  | `run = (block_size - offset_base + DEQUANT_GROUP).min(..)` | **killed**, 4 tests |
+  | `offset_base = depth & (block_size - 1)` (power-of-two only) | **killed** at `block = 24` |
+  | no-op edit to the same line | survived |
+
+  The no-op surviving is the calibration that makes the kills meaningful: the
+  suite discriminates rather than reddening at any touch. The guard is
+  `int4_dequant_panel_is_bit_identical_to_the_per_column_path`, which is a
+  differential test against the scalar `dequant_column` across `block_size`
+  2/4/8/24/32/40/128 × `nr` × `kc` × `pc` — so it catches clip damage as output
+  divergence without needing to name the invariant. The fourth mutant also
+  shows the non-power-of-two sizes are load-bearing: trim 24 and 40 from that
+  list as redundant and the masked form goes green. Recorded in the test's own
+  comment so a future tidy-up cannot remove them silently. Related sub-finding
+  also checked and rejected: every int4 test in `x86_sgemm.rs` is already
+  `#[cfg(target_arch = "x86_64")]`-gated and reaches `dequant_panel_avx2`
+  through the real dispatcher, so there is no un-gated test claiming AVX2
+  execution.
 * **The decode headline was overstated, by my own instrument's rules.** #1809
   said 1.015x; two sweeps here give 1.0116 and 1.0095, and in both the
   decode-loop **A/A interval excludes 1.000, with opposite signs** (+0.63% at
