@@ -14,15 +14,15 @@
 //!
 //! ## Determinism / bit-parity
 //!
-//! Every reduction sums in the same fixed ascending order as the CPU reference:
-//! each key's dot product accumulates over `head_dim` in one thread, the
-//! head-weighted sum accumulates over `heads` ascending in that same thread, and
-//! the final `weighted + bias` add matches the reference exactly. The top-k tie
-//! break reproduces the CPU oracle's `f32::total_cmp` order bit-for-bit via the
-//! `total_order_key` integer transform (`(score desc, index asc)`; lower index
-//! wins on an exact tie). `scale`, `weights_scale`, and the ReLU clamp are
-//! applied in the reference's operand order, so scores are byte-identical to the
-//! CPU oracle across f16/bf16/f32 storage.
+//! Scoring is flattened across `(row, key-position)`, so a decode row uses many
+//! CTAs while each key retains the CPU reference's fixed ascending `head_dim`
+//! then `heads` reduction order. Selection uses 32 parallel radix-count passes
+//! to find the exact kth `f32::total_cmp` key, followed by stable block-scan
+//! compaction; no thread performs `top_k` full scans. Final NaNs are
+//! canonicalized to positive quiet NaN (`0x7fc00000`) before ordering on both
+//! CPU and CUDA, removing backend-specific sign/payload differences after
+//! finite overflow. Ties still prefer the lower index, and emitted indices are
+//! strictly ascending with `-1` right padding.
 //!
 //! ## Capture support
 //!
@@ -30,7 +30,7 @@
 //! — so there is no host D2H validation to skip and no capture-error latch: the
 //! kernel never synchronizes the stream or copies to the host on any path. After
 //! a warmed eager execution has sized the kernel-owned persistent workspace
-//! (the per-row score and selection-state scratch keep stable device addresses
+//! (the per-row score and allowed-mask scratch keep stable device addresses
 //! across warmup → capture → replay) and compiled the NVRTC kernel, the launch
 //! path is legal to record into a CUDA graph and replay with only device-buffer
 //! contents changing:
@@ -74,15 +74,17 @@ const OP: &str = "DsaIndexSelect";
 
 const INPUT_NAMES: [&str; 4] = ["query", "key", "weights", "attention_bias"];
 
-/// Threads per block; one block services one `(batch, query)` output row.
-const ROW_THREADS: u32 = 128;
+const SCORE_THREADS: u32 = 256;
+const SELECT_THREADS: u32 = 256;
 const WORKSPACE_ALIGNMENT: usize = 256;
 
-const MODULE: &str = "dsa_index_select_f32_f16_bf16_v1";
+const MODULE: &str = "dsa_index_select_parallel_radix_v2";
 const SOURCE: &str = r#"
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #define NEG_INF __int_as_float(0xff800000)
+#define CANONICAL_NAN __int_as_float(0x7fc00000)
+#define SELECT_THREADS 256
 // Bias at or below this magnitude is the -inf / finfo.min causal fill.
 #define MASK_THRESHOLD (-1e30f)
 
@@ -99,118 +101,226 @@ __device__ __forceinline__ float load_float(
   return __bfloat162float(((const __nv_bfloat16*)data)[index]);
 }
 
-// Integer key that orders floats identically to Rust's `f32::total_cmp`
-// (used by the CPU oracle's `score_order`): the sign bit is flipped for
-// positives and every bit for negatives, so a plain signed-integer compare of
-// the keys reproduces total order (including -0 < +0 and NaN placement).
-__device__ __forceinline__ int total_order_key(float x) {
-  int bits = __float_as_int(x);
-  int sign = bits >> 31;                          // 0 or -1 (arithmetic shift)
-  int flip = (int)(((unsigned int)sign) >> 1);    // 0 or 0x7fffffff
-  return bits ^ flip;
+// Canonicalize at the same logical point as the CPU oracle: after the final
+// additive score and before total ordering. Finite overflow may otherwise leave
+// backend-specific NaN signs/payloads (notably infinity * 0).
+__device__ __forceinline__ float canonicalize_score(float score) {
+  return isnan(score) ? CANONICAL_NAN : score;
 }
 
-// Blocks walk rows with a grid-stride loop, so every accepted row executes even
-// when total_rows exceeds the device's maximum grid X. Threads cooperatively
-// score every key position (Phase 1); the lead thread then runs the deterministic
-// top-k selection and ascending emit (Phase 2). `state` marks each position as
-// 0 = allowed/unselected, 1 = masked, 2 = selected.
-extern "C" __global__ void dsa_index_select_row(
+// Unsigned key whose ordinary order is Rust `f32::total_cmp` order. The signed
+// total-order transform is biased by 0x80000000 so radix selection can compare
+// all 32 bits with unsigned arithmetic.
+__device__ __forceinline__ unsigned int ordered_total_key(float x) {
+  int bits = __float_as_int(x);
+  const int sign = bits >> 31;                       // 0 or -1
+  const int flip = (int)(((unsigned int)sign) >> 1); // 0 or 0x7fffffff
+  return ((unsigned int)(bits ^ flip)) ^ 0x80000000u;
+}
+
+// Phase 1 is flattened over every (row, key-position) cell. A realistic decode
+// row therefore occupies many CTAs (T / blockDim rather than one CTA), while
+// each cell retains the CPU oracle's exact ascending D then H reduction order.
+extern "C" __global__ void dsa_index_select_score(
     const void* query, const void* key, const void* weights, const float* bias,
-    float* scores, unsigned char* state, long long* out,
+    float* scores, unsigned char* allowed,
     unsigned long long batch, unsigned long long q_seq, unsigned long long heads,
     unsigned long long head_dim, unsigned long long key_seq,
-    unsigned long long top_k, float scale, float weights_scale, int dtype) {
+    float scale, float weights_scale, int dtype) {
   const unsigned long long total_rows = batch * q_seq;
-  const int tid = threadIdx.x;
-  const int nthreads = blockDim.x;
-
-  for (unsigned long long row = blockIdx.x; row < total_rows; row += gridDim.x) {
+  const unsigned long long total_cells = total_rows * key_seq;
+  const unsigned long long stride =
+      (unsigned long long)blockDim.x * (unsigned long long)gridDim.x;
+  for (unsigned long long cell =
+           (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+       cell < total_cells;) {
+    const unsigned long long row = cell / key_seq;
+    const unsigned long long t = cell - row * key_seq;
     const unsigned long long b = row / q_seq;
     const unsigned long long weights_base = row * heads;
-    const unsigned long long bias_base = row * key_seq;  // bias[b,0,s,.]
-    const unsigned long long score_base = row * key_seq;
-    const unsigned long long out_base = row * top_k;
-
-    // Initialise the output row to the -1 padding sentinel.
-    for (unsigned long long i = tid; i < top_k; i += nthreads) {
-      out[out_base + i] = -1;
-    }
-
-    // Phase 1: head-weighted, ReLU'd, scaled score for every allowed key.
-    for (unsigned long long t = tid; t < key_seq; t += nthreads) {
-      const float bias_bt = bias[bias_base + t];
-      // NaN and the -inf / finfo.min causal fill are both "not allowed"; binding
-      // the comparison keeps the negation on a bool (partial-order safe).
-      const bool allowed = bias_bt > MASK_THRESHOLD;
-      if (!allowed) {
-        state[score_base + t] = 1;         // masked / -inf causal fill
-        scores[score_base + t] = NEG_INF;
-        continue;
-      }
+    const float bias_bt = bias[cell];
+    const bool is_allowed = bias_bt > MASK_THRESHOLD;
+    if (!is_allowed) {
+      allowed[cell] = 0;
+      scores[cell] = NEG_INF;
+    } else {
       float weighted = 0.0f;
       for (unsigned long long h = 0; h < heads; ++h) {
         const unsigned long long q_base = (row * heads + h) * head_dim;
         const unsigned long long k_base = (b * key_seq + t) * head_dim;
         float dot = 0.0f;
         for (unsigned long long d = 0; d < head_dim; ++d) {
-          // __fadd_rn / __fmul_rn keep every multiply-add un-fused so the device
-          // reduction matches the CPU oracle's non-FMA rounding order bit-for-bit
-          // (NVRTC compiles with the NVCC default --fmad=true, which would
-          // otherwise contract dot += q*k into a single-rounding fma.rn.f32 and
-          // perturb the score enough to flip an integer top-k selection).
+          // Keep multiply/add un-fused so every cell matches the CPU oracle's
+          // fixed reduction and rounding order bit-for-bit.
           dot = __fadd_rn(dot, __fmul_rn(load_float(query, q_base + d, dtype),
                                          load_float(key, k_base + d, dtype)));
         }
-        const float scored = fmaxf(scale * dot, 0.0f);  // Relu(scale * dot)
-        const float wprod = load_float(weights, weights_base + h, dtype) * weights_scale;
+        const float scored = fmaxf(scale * dot, 0.0f);
+        const float wprod =
+            load_float(weights, weights_base + h, dtype) * weights_scale;
         weighted = __fadd_rn(weighted, __fmul_rn(scored, wprod));
       }
-      scores[score_base + t] = weighted + bias_bt;
-      state[score_base + t] = 0;            // allowed, unselected
+      scores[cell] = canonicalize_score(__fadd_rn(weighted, bias_bt));
+      allowed[cell] = 1;
+    }
+    if (stride >= total_cells - cell) {
+      break;
+    }
+    cell += stride;
+  }
+}
+
+__device__ __forceinline__ unsigned long long block_sum(
+    unsigned long long value, unsigned long long* scratch) {
+  const unsigned int tid = threadIdx.x;
+  scratch[tid] = value;
+  __syncthreads();
+  for (unsigned int stride = blockDim.x >> 1; stride != 0; stride >>= 1) {
+    if (tid < stride) {
+      scratch[tid] += scratch[tid + stride];
     }
     __syncthreads();
+  }
+  const unsigned long long total = scratch[0];
+  __syncthreads();
+  return total;
+}
 
-    // Phase 2: deterministic top-k on the lead thread. `keep` rounds of argmax by
-    // (total_cmp desc, index asc), then emit the winners ascending by position.
-    if (tid == 0) {
-      unsigned long long allowed_count = 0;
-      for (unsigned long long t = 0; t < key_seq; ++t) {
-        if (state[score_base + t] == 0) {
-          allowed_count += 1;
-        }
-      }
-      const unsigned long long keep = allowed_count < top_k ? allowed_count : top_k;
-      for (unsigned long long r = 0; r < keep; ++r) {
-        long long best_t = -1;
-        int best_key = 0;
-        for (unsigned long long t = 0; t < key_seq; ++t) {
-          if (state[score_base + t] != 0) {
-            continue;                       // masked or already selected
+__device__ __forceinline__ unsigned long long block_inclusive_scan(
+    unsigned long long value, unsigned long long* first,
+    unsigned long long* second) {
+  const unsigned int tid = threadIdx.x;
+  first[tid] = value;
+  __syncthreads();
+  unsigned long long* src = first;
+  unsigned long long* dst = second;
+  for (unsigned int offset = 1; offset < blockDim.x; offset <<= 1) {
+    unsigned long long sum = src[tid];
+    if (tid >= offset) {
+      sum += src[tid - offset];
+    }
+    dst[tid] = sum;
+    __syncthreads();
+    unsigned long long* swap = src;
+    src = dst;
+    dst = swap;
+  }
+  return src[tid];
+}
+
+// Phase 2 uses one block per row, but no thread performs top_k full scans.
+// Thirty-two parallel radix-count passes find the exact kth total-order key in
+// O(32*T/blockDim), then a block scan selects the lowest indices at the
+// threshold and compacts every winner in ascending index order.
+extern "C" __global__ void dsa_index_select_select(
+    const float* scores, const unsigned char* allowed, long long* out,
+    unsigned long long total_rows, unsigned long long key_seq,
+    unsigned long long top_k) {
+  __shared__ unsigned long long scan_a[SELECT_THREADS];
+  __shared__ unsigned long long scan_b[SELECT_THREADS];
+  __shared__ unsigned long long shared_total;
+
+  const unsigned int tid = threadIdx.x;
+  const unsigned long long threads = blockDim.x;
+  for (unsigned long long row = blockIdx.x; row < total_rows;) {
+    const unsigned long long score_base = row * key_seq;
+    const unsigned long long out_base = row * top_k;
+    for (unsigned long long slot = tid; slot < top_k; slot += threads) {
+      out[out_base + slot] = -1;
+    }
+
+    // Contiguous per-thread chunks preserve index order during final compaction
+    // and avoid overflow in key_seq * tid.
+    const unsigned long long base = key_seq / threads;
+    const unsigned long long extra = key_seq % threads;
+    const unsigned long long tid64 = tid;
+    const unsigned long long begin =
+        tid64 * base + (tid64 < extra ? tid64 : extra);
+    const unsigned long long end = begin + base + (tid64 < extra ? 1 : 0);
+
+    unsigned long long local_allowed = 0;
+    for (unsigned long long t = begin; t < end; ++t) {
+      local_allowed += allowed[score_base + t] != 0;
+    }
+    const unsigned long long allowed_count = block_sum(local_allowed, scan_a);
+    const unsigned long long keep =
+        allowed_count < top_k ? allowed_count : top_k;
+    if (keep != 0) {
+      unsigned int prefix = 0;
+      unsigned int prefix_mask = 0;
+      unsigned long long rank = keep; // one-based rank among descending keys
+      for (unsigned int bit = 0x80000000u; bit != 0; bit >>= 1) {
+        unsigned long long local_ones = 0;
+        for (unsigned long long t = begin; t < end; ++t) {
+          if (!allowed[score_base + t]) {
+            continue;
           }
-          const int candidate = total_order_key(scores[score_base + t]);
-          // Strict `>` keeps the lower index on an exact tie (ascending scan).
-          if (best_t < 0 || candidate > best_key) {
-            best_key = candidate;
-            best_t = (long long)t;
-          }
+          const unsigned int key = ordered_total_key(scores[score_base + t]);
+          local_ones +=
+              ((key & prefix_mask) == prefix) && ((key & bit) != 0);
         }
-        if (best_t < 0) {
-          break;                            // defensive; `keep` rules this out
+        const unsigned long long ones = block_sum(local_ones, scan_a);
+        if (ones >= rank) {
+          prefix |= bit;
+        } else {
+          rank -= ones;
         }
-        state[score_base + (unsigned long long)best_t] = 2;   // selected
+        prefix_mask |= bit;
       }
-      unsigned long long slot = 0;
-      for (unsigned long long t = 0; t < key_seq; ++t) {
-        if (state[score_base + t] == 2) {
-          out[out_base + slot] = (long long)t;
-          slot += 1;
+      const unsigned int threshold = prefix;
+
+      unsigned long long local_greater = 0;
+      unsigned long long local_equal = 0;
+      for (unsigned long long t = begin; t < end; ++t) {
+        if (!allowed[score_base + t]) {
+          continue;
+        }
+        const unsigned int key = ordered_total_key(scores[score_base + t]);
+        local_greater += key > threshold;
+        local_equal += key == threshold;
+      }
+      const unsigned long long greater_prefix =
+          block_inclusive_scan(local_greater, scan_a, scan_b);
+      if (tid == blockDim.x - 1) {
+        shared_total = greater_prefix;
+      }
+      __syncthreads();
+      const unsigned long long total_greater = shared_total;
+
+      const unsigned long long equal_prefix =
+          block_inclusive_scan(local_equal, scan_a, scan_b);
+      const unsigned long long equal_before = equal_prefix - local_equal;
+      const unsigned long long ties_needed = keep - total_greater;
+      const unsigned long long local_ties =
+          equal_before >= ties_needed
+              ? 0
+              : (local_equal < ties_needed - equal_before
+                     ? local_equal
+                     : ties_needed - equal_before);
+      const unsigned long long local_selected = local_greater + local_ties;
+      const unsigned long long selected_prefix =
+          block_inclusive_scan(local_selected, scan_a, scan_b);
+      unsigned long long out_slot = selected_prefix - local_selected;
+      unsigned long long equal_seen = 0;
+      for (unsigned long long t = begin; t < end; ++t) {
+        if (!allowed[score_base + t]) {
+          continue;
+        }
+        const unsigned int key = ordered_total_key(scores[score_base + t]);
+        const bool take_greater = key > threshold;
+        const bool take_equal = key == threshold && equal_seen < local_ties;
+        equal_seen += key == threshold;
+        if (take_greater || take_equal) {
+          out[out_base + out_slot] = (long long)t;
+          out_slot += 1;
         }
       }
     }
+    __syncthreads();
     if ((unsigned long long)gridDim.x >= total_rows - row) {
       break;
     }
+    row += gridDim.x;
   }
 }
 "#;
@@ -284,7 +394,7 @@ struct Dims {
 struct WorkspaceLayout {
     bytes: usize,
     scores_offset: usize,
-    state_offset: usize,
+    allowed_offset: usize,
 }
 
 impl WorkspaceLayout {
@@ -296,8 +406,8 @@ impl WorkspaceLayout {
         self.ptr_at(workspace, self.scores_offset)
     }
 
-    fn state(self, workspace: CUdeviceptr) -> CUdeviceptr {
-        self.ptr_at(workspace, self.state_offset)
+    fn allowed(self, workspace: CUdeviceptr) -> CUdeviceptr {
+        self.ptr_at(workspace, self.allowed_offset)
     }
 }
 
@@ -330,16 +440,16 @@ fn dsa_index_select_workspace_layout(dims: Dims) -> Result<WorkspaceLayout> {
     let scores_bytes = cells
         .checked_mul(std::mem::size_of::<f32>())
         .ok_or_else(|| error("DsaIndexSelect score workspace byte count overflow"))?;
-    let state_bytes = cells; // one u8 per cell
+    let allowed_bytes = cells; // one u8 per score cell
 
     let mut offset = 0usize;
     let scores_offset = append_workspace_segment(&mut offset, scores_bytes)?;
-    let state_offset = append_workspace_segment(&mut offset, state_bytes)?;
+    let allowed_offset = append_workspace_segment(&mut offset, allowed_bytes)?;
     let bytes = align_up(offset, WORKSPACE_ALIGNMENT)?;
     Ok(WorkspaceLayout {
         bytes,
         scores_offset,
-        state_offset,
+        allowed_offset,
     })
 }
 
@@ -351,10 +461,24 @@ pub struct DsaWorkspaceStats {
     pub last_ptr: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DsaLaunchStats {
+    pub executions: u64,
+    pub score_launches: u64,
+    pub selection_launches: u64,
+    pub last_score_grid_x: u64,
+    pub last_selection_grid_x: u64,
+}
+
 static DSA_WORKSPACE_ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
 static DSA_WORKSPACE_RELEASES: AtomicU64 = AtomicU64::new(0);
 static DSA_WORKSPACE_LIVE_BYTES: AtomicU64 = AtomicU64::new(0);
 static DSA_WORKSPACE_LAST_PTR: AtomicU64 = AtomicU64::new(0);
+static DSA_EXECUTIONS: AtomicU64 = AtomicU64::new(0);
+static DSA_SCORE_LAUNCHES: AtomicU64 = AtomicU64::new(0);
+static DSA_SELECTION_LAUNCHES: AtomicU64 = AtomicU64::new(0);
+static DSA_LAST_SCORE_GRID_X: AtomicU64 = AtomicU64::new(0);
+static DSA_LAST_SELECTION_GRID_X: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(feature = "gpu-tests")]
 static DSA_TEST_CAPTURE_REPLAYS: AtomicU64 = AtomicU64::new(0);
@@ -382,6 +506,24 @@ pub fn reset_dsa_workspace_stats() -> bool {
     DSA_WORKSPACE_RELEASES.store(0, Ordering::Relaxed);
     DSA_WORKSPACE_LAST_PTR.store(0, Ordering::Relaxed);
     true
+}
+
+pub fn dsa_launch_stats() -> DsaLaunchStats {
+    DsaLaunchStats {
+        executions: DSA_EXECUTIONS.load(Ordering::Relaxed),
+        score_launches: DSA_SCORE_LAUNCHES.load(Ordering::Relaxed),
+        selection_launches: DSA_SELECTION_LAUNCHES.load(Ordering::Relaxed),
+        last_score_grid_x: DSA_LAST_SCORE_GRID_X.load(Ordering::Relaxed),
+        last_selection_grid_x: DSA_LAST_SELECTION_GRID_X.load(Ordering::Relaxed),
+    }
+}
+
+pub fn reset_dsa_launch_stats() {
+    DSA_EXECUTIONS.store(0, Ordering::Relaxed);
+    DSA_SCORE_LAUNCHES.store(0, Ordering::Relaxed);
+    DSA_SELECTION_LAUNCHES.store(0, Ordering::Relaxed);
+    DSA_LAST_SCORE_GRID_X.store(0, Ordering::Relaxed);
+    DSA_LAST_SELECTION_GRID_X.store(0, Ordering::Relaxed);
 }
 
 #[cfg(feature = "gpu-tests")]
@@ -533,6 +675,11 @@ impl DsaIndexSelectFactory {
             workspace: Mutex::new(DsaWorkspace::new(self.runtime.clone())),
             max_grid_x,
             warmed: AtomicBool::new(false),
+            executions: AtomicU64::new(0),
+            score_launches: AtomicU64::new(0),
+            selection_launches: AtomicU64::new(0),
+            last_score_grid_x: AtomicU64::new(0),
+            last_selection_grid_x: AtomicU64::new(0),
         })
     }
 }
@@ -548,6 +695,11 @@ pub struct DsaIndexSelectKernel {
     /// Set after a successful eager execution has compiled the NVRTC kernel and
     /// sized the persistent workspace, the precondition for CUDA-graph capture.
     warmed: AtomicBool,
+    executions: AtomicU64,
+    score_launches: AtomicU64,
+    selection_launches: AtomicU64,
+    last_score_grid_x: AtomicU64,
+    last_selection_grid_x: AtomicU64,
 }
 
 impl Kernel for DsaIndexSelectKernel {
@@ -582,6 +734,17 @@ impl DsaIndexSelectKernel {
     pub fn workspace_snapshot(&self) -> (u64, usize) {
         let workspace = self.workspace.lock().unwrap_or_else(|e| e.into_inner());
         (workspace.ptr, workspace.bytes)
+    }
+
+    #[doc(hidden)]
+    pub fn launch_snapshot(&self) -> DsaLaunchStats {
+        DsaLaunchStats {
+            executions: self.executions.load(Ordering::Relaxed),
+            score_launches: self.score_launches.load(Ordering::Relaxed),
+            selection_launches: self.selection_launches.load(Ordering::Relaxed),
+            last_score_grid_x: self.last_score_grid_x.load(Ordering::Relaxed),
+            last_selection_grid_x: self.last_selection_grid_x.load(Ordering::Relaxed),
+        }
     }
 
     fn execute_impl(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
@@ -654,7 +817,7 @@ impl DsaIndexSelectKernel {
         let bias_ptr = cuptr(inputs[3].data_ptr::<u8>() as *const c_void);
         let out_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
         let scores_ptr = layout.scores(workspace_ptr);
-        let state_ptr = layout.state(workspace_ptr);
+        let allowed_ptr = layout.allowed(workspace_ptr);
 
         #[cfg(feature = "gpu-tests")]
         {
@@ -666,7 +829,7 @@ impl DsaIndexSelectKernel {
                     weights_ptr,
                     bias_ptr,
                     scores_ptr,
-                    state_ptr,
+                    allowed_ptr,
                     out_ptr,
                     dims,
                     dtype_code(dtype)?,
@@ -675,13 +838,13 @@ impl DsaIndexSelectKernel {
             }
         }
 
-        self.launch_row(
+        self.launch_pipeline(
             query_ptr,
             key_ptr,
             weights_ptr,
             bias_ptr,
             scores_ptr,
-            state_ptr,
+            allowed_ptr,
             out_ptr,
             dims,
             dtype_code(dtype)?,
@@ -708,19 +871,19 @@ impl DsaIndexSelectKernel {
         weights_ptr: CUdeviceptr,
         bias_ptr: CUdeviceptr,
         scores_ptr: CUdeviceptr,
-        state_ptr: CUdeviceptr,
+        allowed_ptr: CUdeviceptr,
         out_ptr: CUdeviceptr,
         dims: Dims,
         dtype: i32,
         replays: u64,
     ) -> Result<()> {
-        self.launch_row(
+        self.launch_pipeline(
             query_ptr,
             key_ptr,
             weights_ptr,
             bias_ptr,
             scores_ptr,
-            state_ptr,
+            allowed_ptr,
             out_ptr,
             dims,
             dtype,
@@ -730,13 +893,13 @@ impl DsaIndexSelectKernel {
         self.runtime.reset_graph()?;
         self.runtime.reset_capture_error()?;
         self.runtime.begin_graph_capture(&[self])?;
-        if let Err(error) = self.launch_row(
+        if let Err(error) = self.launch_pipeline(
             query_ptr,
             key_ptr,
             weights_ptr,
             bias_ptr,
             scores_ptr,
-            state_ptr,
+            allowed_ptr,
             out_ptr,
             dims,
             dtype,
@@ -847,14 +1010,14 @@ impl DsaIndexSelectKernel {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn launch_row(
+    fn launch_pipeline(
         &self,
         query_ptr: CUdeviceptr,
         key_ptr: CUdeviceptr,
         weights_ptr: CUdeviceptr,
         bias_ptr: CUdeviceptr,
         scores_ptr: CUdeviceptr,
-        state_ptr: CUdeviceptr,
+        allowed_ptr: CUdeviceptr,
         out_ptr: CUdeviceptr,
         dims: Dims,
         dtype: i32,
@@ -867,9 +1030,12 @@ impl DsaIndexSelectKernel {
         if total_rows == 0 {
             return Ok(());
         }
-        let func = self
+        let score_func = self
             .runtime
-            .nvrtc_function(MODULE, SOURCE, "dsa_index_select_row")?;
+            .nvrtc_function(MODULE, SOURCE, "dsa_index_select_score")?;
+        let select_func = self
+            .runtime
+            .nvrtc_function(MODULE, SOURCE, "dsa_index_select_select")?;
         let batch = u64::try_from(dims.batch)
             .map_err(|_| error("DsaIndexSelect batch does not fit u64"))?;
         let q_seq = u64::try_from(dims.q_seq)
@@ -882,44 +1048,83 @@ impl DsaIndexSelectKernel {
             .map_err(|_| error("DsaIndexSelect key sequence does not fit u64"))?;
         let top_k = u64::try_from(self.top_k)
             .map_err(|_| error("DsaIndexSelect top_k does not fit u64"))?;
+        let total_cells = total_rows
+            .checked_mul(key_seq)
+            .ok_or_else(|| error("DsaIndexSelect score cell count does not fit u64"))?;
         let scale = self.scale;
         let weights_scale = self.weights_scale;
-        let mut builder = self.runtime.stream().launch_builder(&func);
-        builder
-            .arg(&query_ptr)
-            .arg(&key_ptr)
-            .arg(&weights_ptr)
-            .arg(&bias_ptr)
+        let device_max_grid_x = self.runtime.capabilities().max_grid_dim_x();
+        let max_grid_x = self
+            .max_grid_x
+            .unwrap_or(device_max_grid_x)
+            .min(device_max_grid_x);
+
+        if total_cells != 0 {
+            let score_threads = u64::from(SCORE_THREADS);
+            let score_blocks = (total_cells / score_threads
+                + u64::from(total_cells % score_threads != 0))
+            .min(u64::from(max_grid_x))
+            .max(1) as u32;
+            let mut score = self.runtime.stream().launch_builder(&score_func);
+            score
+                .arg(&query_ptr)
+                .arg(&key_ptr)
+                .arg(&weights_ptr)
+                .arg(&bias_ptr)
+                .arg(&scores_ptr)
+                .arg(&allowed_ptr)
+                .arg(&batch)
+                .arg(&q_seq)
+                .arg(&heads)
+                .arg(&head_dim)
+                .arg(&key_seq)
+                .arg(&scale)
+                .arg(&weights_scale)
+                .arg(&dtype);
+            // SAFETY: argument order matches `dsa_index_select_score`; score and
+            // allowed scratch span `batch*q_seq*key_seq` cells.
+            unsafe {
+                score.launch(LaunchConfig {
+                    grid_dim: (score_blocks, 1, 1),
+                    block_dim: (SCORE_THREADS, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .map_err(|e| driver_err("launch dsa_index_select_score", e))?;
+            self.score_launches.fetch_add(1, Ordering::Relaxed);
+            self.last_score_grid_x
+                .store(u64::from(score_blocks), Ordering::Relaxed);
+            DSA_SCORE_LAUNCHES.fetch_add(1, Ordering::Relaxed);
+            DSA_LAST_SCORE_GRID_X.store(u64::from(score_blocks), Ordering::Relaxed);
+        }
+
+        let selection_blocks = total_rows.min(u64::from(max_grid_x)).max(1) as u32;
+        let mut select = self.runtime.stream().launch_builder(&select_func);
+        select
             .arg(&scores_ptr)
-            .arg(&state_ptr)
+            .arg(&allowed_ptr)
             .arg(&out_ptr)
-            .arg(&batch)
-            .arg(&q_seq)
-            .arg(&heads)
-            .arg(&head_dim)
+            .arg(&total_rows)
             .arg(&key_seq)
-            .arg(&top_k)
-            .arg(&scale)
-            .arg(&weights_scale)
-            .arg(&dtype);
-        // SAFETY: argument types/order match `dsa_index_select_row`; all pointers
-        // refer to live contiguous device allocations, and the scores/state
-        // scratch is sized for `batch*q_seq*key_seq` f32/u8 by
-        // `dsa_index_select_workspace_layout`.
+            .arg(&top_k);
+        // SAFETY: argument order matches `dsa_index_select_select`; output spans
+        // `total_rows*top_k`, and score/allowed scratch spans all score cells.
         unsafe {
-            let device_max_grid_x = self.runtime.capabilities().max_grid_dim_x();
-            let max_grid_x = self
-                .max_grid_x
-                .unwrap_or(device_max_grid_x)
-                .min(device_max_grid_x);
-            builder.launch(LaunchConfig {
-                grid_dim: (total_rows.min(u64::from(max_grid_x)).max(1) as u32, 1, 1),
-                block_dim: (ROW_THREADS, 1, 1),
+            select.launch(LaunchConfig {
+                grid_dim: (selection_blocks, 1, 1),
+                block_dim: (SELECT_THREADS, 1, 1),
                 shared_mem_bytes: 0,
             })
         }
-        .map_err(|e| driver_err("launch dsa_index_select_row", e))
-        .map(|_| ())
+        .map_err(|e| driver_err("launch dsa_index_select_select", e))?;
+        self.selection_launches.fetch_add(1, Ordering::Relaxed);
+        self.last_selection_grid_x
+            .store(u64::from(selection_blocks), Ordering::Relaxed);
+        self.executions.fetch_add(1, Ordering::Relaxed);
+        DSA_SELECTION_LAUNCHES.fetch_add(1, Ordering::Relaxed);
+        DSA_LAST_SELECTION_GRID_X.store(u64::from(selection_blocks), Ordering::Relaxed);
+        DSA_EXECUTIONS.fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
 }
 

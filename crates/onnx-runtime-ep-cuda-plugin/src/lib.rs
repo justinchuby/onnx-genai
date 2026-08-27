@@ -733,6 +733,42 @@ pub extern "C" fn nxrt_cuda_reset_dsa_workspace_stats() -> bool {
     onnx_runtime_ep_cuda::reset_dsa_workspace_stats()
 }
 
+#[cfg(feature = "cuda")]
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_cuda_dsa_executions() -> u64 {
+    onnx_runtime_ep_cuda::dsa_launch_stats().executions
+}
+
+#[cfg(feature = "cuda")]
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_cuda_dsa_score_launches() -> u64 {
+    onnx_runtime_ep_cuda::dsa_launch_stats().score_launches
+}
+
+#[cfg(feature = "cuda")]
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_cuda_dsa_selection_launches() -> u64 {
+    onnx_runtime_ep_cuda::dsa_launch_stats().selection_launches
+}
+
+#[cfg(feature = "cuda")]
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_cuda_dsa_last_score_grid_x() -> u64 {
+    onnx_runtime_ep_cuda::dsa_launch_stats().last_score_grid_x
+}
+
+#[cfg(feature = "cuda")]
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_cuda_dsa_last_selection_grid_x() -> u64 {
+    onnx_runtime_ep_cuda::dsa_launch_stats().last_selection_grid_x
+}
+
+#[cfg(feature = "cuda")]
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_cuda_reset_dsa_launch_stats() {
+    onnx_runtime_ep_cuda::reset_dsa_launch_stats()
+}
+
 #[cfg(feature = "gpu-tests")]
 #[unsafe(no_mangle)]
 pub extern "C" fn nxrt_cuda_set_dsa_capture_replays_for_test(replays: u64) {

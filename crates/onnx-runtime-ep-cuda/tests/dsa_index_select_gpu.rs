@@ -16,13 +16,11 @@
 //! integer indices, so parity is byte-exact (not tolerance-based): the CPU
 //! oracle and the CUDA kernel both widen f16/bf16 storage to f32 losslessly,
 //! compute the head-weighted ReLU'd scaled scores in the same operand order, and
-//! break score ties by the same `f32::total_cmp` order. The tests cover tiny and
-//! real GLM-5.2 indexer dimensions (`H=2`, `D=8`, `top_k=4`), first-token /
-//! prefill / decode geometries, block-boundary top-k widths, explicit tie and
-//! `-inf` mask handling, `-1` sentinel padding, query-dependent route changes,
-//! sequential request isolation, CUDA-graph capture + ≥3 replays with no
-//! fallback, eager equivalence, and typed rejection of the f32-only
-//! `attention_bias` contract.
+//! break score ties by the same canonicalized `f32::total_cmp` order. The tests
+//! cover tiny shapes plus real GLM decode (`H=32`, `D=128`, `top_k=2048`),
+//! overflow-produced NaNs across f32/f16/bf16, block/grid boundaries, masking,
+//! sentinel padding, query-dependent routes, CUDA-graph capture + replay,
+//! workspace lifetime, and typed rejection of the f32-only bias contract.
 //!
 //! CPU-only CI reports these tests as ignored unless `gpu-tests` is enabled.
 
@@ -35,6 +33,9 @@ use onnx_runtime_ep_cpu::CpuExecutionProvider;
 use onnx_runtime_ep_cuda::CudaExecutionProvider;
 use onnx_runtime_ep_cuda::kernels::dsa_index_select::DsaIndexSelectFactory;
 use onnx_runtime_ep_cuda::runtime::cuptr;
+use onnx_runtime_ep_cuda::{
+    dsa_launch_stats, dsa_workspace_stats, reset_dsa_launch_stats, reset_dsa_workspace_stats,
+};
 use onnx_runtime_ir::{
     Attribute, DataType, DeviceId, Graph, Node, NodeId, compute_contiguous_strides, static_shape,
 };
@@ -724,6 +725,60 @@ fn real_glm_dims_first_token_prefill_decode_match_cpu() {
     ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
 )]
 #[test]
+fn real_glm_decode_top_k_2048_uses_parallel_score_and_selection_launches() {
+    let ep = require_cuda();
+    let case = Case {
+        batch: 1,
+        q_seq: 1,
+        heads: 32,
+        head_dim: 128,
+        key_seq: 2304,
+        top_k: 2048,
+        scale: (128.0f32).powf(-0.5),
+        weights_scale: Some((32.0f32).powf(-0.5)),
+    };
+    let mut rng = lcg(0x2076_2048);
+    let inputs = [
+        Some(HostTensor::f16(
+            &[1, 1, case.heads, case.head_dim],
+            &make(case.heads * case.head_dim, &mut rng),
+        )),
+        Some(HostTensor::f16(
+            &[1, case.key_seq, case.head_dim],
+            &make(case.key_seq * case.head_dim, &mut rng),
+        )),
+        Some(HostTensor::f16(
+            &[1, 1, case.heads],
+            &make(case.heads, &mut rng),
+        )),
+        Some(causal_bias(1, 1, case.key_seq)),
+    ];
+    let (graph, node, specs) = build_node(&inputs, case);
+    let factory = DsaIndexSelectFactory {
+        runtime: ep.runtime().clone(),
+    };
+    let kernel = factory
+        .create_kernel_with_grid_limit(graph.node(node), 1024)
+        .expect("create real-GLM DsaIndexSelect");
+    let gpu = run_gpu_with_kernel(&ep, &kernel, &inputs, &specs).expect("real-GLM CUDA run");
+    let cpu = run_cpu(&graph, node, &inputs, &specs).expect("real-GLM CPU oracle");
+    assert_indices_bit_exact(&gpu[0], &cpu[0], "real GLM top_k=2048");
+    let launches = kernel.launch_snapshot();
+    assert_eq!(launches.executions, 1);
+    assert_eq!(launches.score_launches, 1);
+    assert_eq!(launches.selection_launches, 1);
+    assert_eq!(
+        launches.last_score_grid_x, 9,
+        "T=2304 must occupy nine 256-thread score CTAs, not one row CTA"
+    );
+    assert_eq!(launches.last_selection_grid_x, 1);
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
 fn long_decode_16_steps_match_cpu() {
     let ep = require_cuda();
     // A ≥16-length decode context exercises rows wider than a warp of keys.
@@ -763,6 +818,56 @@ fn f16_and_bf16_storage_match_cpu() {
         let (graph, node, specs) = build_node(&inputs, case);
         assert_parity(&ep, &graph, node, &inputs, &specs);
         eprintln!("{dtype:?} storage DsaIndexSelect: bit-identical indices to CPU oracle");
+    }
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn overflow_nan_scores_are_canonicalized_across_f32_f16_bf16() {
+    let ep = require_cuda();
+    let case = Case {
+        batch: 1,
+        q_seq: 1,
+        heads: 1,
+        head_dim: 1,
+        key_seq: 3,
+        top_k: 2,
+        scale: f32::MAX,
+        weights_scale: Some(1.0),
+    };
+    for (dtype, large) in [
+        (DataType::Float32, f32::MAX),
+        (DataType::Float16, f16::MAX.to_f32()),
+        (DataType::BFloat16, bf16::MAX.to_f32()),
+    ] {
+        let scored = (case.scale * (0.0f32 + large * large)).max(0.0);
+        let raw_score = 0.0f32 + scored * (0.0 * 1.0) + 0.0;
+        assert!(
+            raw_score.is_nan(),
+            "{dtype:?} regression input must actually produce infinity * 0"
+        );
+        let tensor = |shape: &[usize], values: &[f32]| match dtype {
+            DataType::Float32 => HostTensor::f32(shape, values),
+            DataType::Float16 => HostTensor::f16(shape, values),
+            DataType::BFloat16 => HostTensor::bf16(shape, values),
+            other => panic!("unexpected dtype {other:?}"),
+        };
+        let inputs = [
+            Some(tensor(&[1, 1, 1, 1], &[large])),
+            Some(tensor(&[1, 3, 1], &[large, 0.0, large])),
+            Some(tensor(&[1, 1, 1], &[0.0])),
+            Some(HostTensor::f32(&[1, 1, 1, 3], &[0.0; 3])),
+        ];
+        let (graph, node, specs) = build_node(&inputs, case);
+        let indices = assert_parity(&ep, &graph, node, &inputs, &specs);
+        assert_eq!(
+            indices,
+            vec![0, 2],
+            "{dtype:?}: canonical positive NaNs must tie above the finite score"
+        );
     }
 }
 
@@ -916,7 +1021,7 @@ fn forced_small_grid_stride_executes_every_row() {
         q_seq: 5,
         heads: 2,
         head_dim: 8,
-        key_seq: 7,
+        key_seq: 521,
         top_k: 4,
         scale: 0.125,
         weights_scale: Some(0.5),
@@ -931,8 +1036,15 @@ fn forced_small_grid_stride_executes_every_row() {
         .expect("create forced-small-grid DsaIndexSelect");
     let gpu = run_gpu_with_kernel(&ep, &kernel, &inputs, &specs)
         .expect("forced-small-grid DsaIndexSelect");
+    let launches = kernel.launch_snapshot();
+    assert_eq!(launches.last_score_grid_x, 2);
+    assert_eq!(launches.last_selection_grid_x, 2);
     let cpu = run_cpu(&graph, node, &inputs, &specs).expect("CPU oracle");
-    assert_indices_bit_exact(&gpu[0], &cpu[0], "two-block grid-stride execution");
+    assert_indices_bit_exact(
+        &gpu[0],
+        &cpu[0],
+        "two-block score and row-selection grid-stride execution",
+    );
     assert_eq!(
         as_i64(&gpu[0]).len(),
         case.q_seq * case.top_k,
@@ -1302,16 +1414,25 @@ fn supports_op_declines_malformed_nodes_at_capability_time() {
 // explicitly. It makes **no** full-size tok/s claim; it reports per-launch
 // microseconds and the fixed scratch VRAM for tiny and real GLM indexer
 // dimensions only. onnx-genai-kv remains the sole page authority — this op
-// allocates no pages, only a `B*S*T` f32 score buffer plus a `B*S*T` u8 state
-// buffer in the executor-owned SessionPersistent workspace.
+// allocates no pages, only a `B*S*T` f32 score buffer plus a `B*S*T` u8 allowed
+// mask in the executor-owned SessionPersistent workspace.
 // ---------------------------------------------------------------------------
 
 struct BenchResult {
     kernel_us_median: f32,
     kernel_us_min: f32,
     kernel_us_max: f32,
+    kernel_us_first: f32,
+    kernel_us_last: f32,
     enqueue_us_median: f32,
     workspace_bytes: u64,
+    graph_nodes: usize,
+    setup_ms: f64,
+    executions: u64,
+    score_launches: u64,
+    selection_launches: u64,
+    score_grid_x: u64,
+    selection_grid_x: u64,
 }
 
 fn median_min_max(samples: &mut [f32]) -> (f32, f32, f32) {
@@ -1321,21 +1442,51 @@ fn median_min_max(samples: &mut [f32]) -> (f32, f32, f32) {
 }
 
 fn gpu_clock_witness(phase: &str) {
+    let physical_gpu = std::env::var("ONNX_GENAI_DSA_PHYSICAL_GPU").unwrap_or_else(|_| "0".into());
     let out = std::process::Command::new("nvidia-smi")
         .args([
-            "--query-gpu=index,clocks.sm,power.draw,utilization.gpu",
+            "-i",
+            &physical_gpu,
+            "--query-gpu=index,uuid,name,clocks.sm,power.draw,utilization.gpu,memory.used",
             "--format=csv,noheader",
         ])
         .output();
     match out {
         Ok(out) if out.status.success() => {
             let text = String::from_utf8_lossy(&out.stdout);
-            // Only the first line is our pinned device under CUDA_VISIBLE_DEVICES.
             let first = text.lines().next().unwrap_or("").trim();
-            println!("[clock witness: {phase}] gpu0 -> {first}");
+            println!("[clock witness: {phase}] physical gpu {physical_gpu} -> {first}");
         }
         _ => println!("[clock witness: {phase}] nvidia-smi unavailable"),
     }
+}
+
+fn perf_inputs(case: Case, seed: u64, dtype: DataType) -> [Option<HostTensor>; 4] {
+    let mut rng = lcg(seed);
+    let query = make(
+        case.batch * case.q_seq * case.heads * case.head_dim,
+        &mut rng,
+    );
+    let key = make(case.batch * case.key_seq * case.head_dim, &mut rng);
+    let weights = make(case.batch * case.q_seq * case.heads, &mut rng);
+    let make_tensor = |shape: &[usize], values: &[f32]| match dtype {
+        DataType::Float32 => HostTensor::f32(shape, values),
+        DataType::Float16 => HostTensor::f16(shape, values),
+        DataType::BFloat16 => HostTensor::bf16(shape, values),
+        other => panic!("unsupported perf dtype {other:?}"),
+    };
+    [
+        Some(make_tensor(
+            &[case.batch, case.q_seq, case.heads, case.head_dim],
+            &query,
+        )),
+        Some(make_tensor(
+            &[case.batch, case.key_seq, case.head_dim],
+            &key,
+        )),
+        Some(make_tensor(&[case.batch, case.q_seq, case.heads], &weights)),
+        Some(causal_bias(case.batch, case.q_seq, case.key_seq)),
+    ]
 }
 
 /// Capture the single-node DsaIndexSelect graph, ramp the device for
@@ -1345,6 +1496,7 @@ fn bench_config(
     label: &str,
     case: Case,
     seed: u64,
+    dtype: DataType,
     ramp_secs: f32,
     batch: usize,
     repeats: usize,
@@ -1352,12 +1504,20 @@ fn bench_config(
     use cudarc::driver::result::event;
     use cudarc::driver::sys::{
         CUevent_flags, CUgraph, CUgraphExec, CUstreamCaptureMode, cuGraphDestroy,
-        cuGraphExecDestroy, cuGraphInstantiateWithFlags, cuGraphLaunch, cuStreamBeginCapture_v2,
-        cuStreamEndCapture,
+        cuGraphExecDestroy, cuGraphGetNodes, cuGraphInstantiateWithFlags, cuGraphLaunch,
+        cuStreamBeginCapture_v2, cuStreamEndCapture,
     };
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Instant;
 
-    let inputs = glm_inputs(case, seed);
+    assert!(
+        reset_dsa_workspace_stats(),
+        "DsaIndexSelect workspace accounting must be idle before the perf run"
+    );
+    reset_dsa_launch_stats();
+    let setup_start = Instant::now();
+    let inputs = perf_inputs(case, seed, dtype);
     let (graph, node, specs) = build_node(&inputs, case);
     let model = Model::new(&graph);
     let kernel = ep
@@ -1371,17 +1531,6 @@ fn bench_config(
         .map(|slot| slot.as_ref().map(|t| compute_contiguous_strides(&t.shape)))
         .collect();
     let views = input_views(&inputs, &buffers, &strides, ep);
-
-    let workspace_bytes = {
-        let metadata: Vec<_> = views
-            .iter()
-            .map(|v| TensorMetadata::new(v.dtype, v.shape, !v.is_absent()))
-            .collect();
-        kernel
-            .workspace_requirement(&metadata)
-            .expect("workspace requirement")
-            .bytes
-    };
 
     let out_strides: Vec<_> = specs
         .iter()
@@ -1455,6 +1604,13 @@ fn bench_config(
     unsafe { cuGraphInstantiateWithFlags(&mut graph_exec, graph_handle, 0) }
         .result()
         .expect("instantiate graph");
+    let mut graph_nodes = 0usize;
+    unsafe { cuGraphGetNodes(graph_handle, std::ptr::null_mut(), &mut graph_nodes) }
+        .result()
+        .expect("count captured graph nodes");
+    let setup_ms = setup_start.elapsed().as_secs_f64() * 1e3;
+    let workspace_bytes = dsa_workspace_stats().live_bytes;
+    let launch_stats = dsa_launch_stats();
 
     let launch = |exec: CUgraphExec| {
         // SAFETY: `exec` is instantiated; `stream` is the EP stream.
@@ -1464,13 +1620,25 @@ fn bench_config(
     };
 
     // Clock ramp: continuous graph replay until the wall-clock floor elapses.
+    // Sample the physical device concurrently so clocks and power are witnessed
+    // while kernels are running, not only after a synchronization boundary.
+    let stop_witness = Arc::new(AtomicBool::new(false));
+    let witness_stop = stop_witness.clone();
+    let witness = std::thread::spawn(move || {
+        while !witness_stop.load(Ordering::Relaxed) {
+            gpu_clock_witness("ramp");
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+    });
     let ramp_start = Instant::now();
     while ramp_start.elapsed().as_secs_f32() < ramp_secs {
-        for _ in 0..64 {
+        for _ in 0..16 {
             launch(graph_exec);
         }
         runtime.synchronize().expect("ramp sync");
     }
+    stop_witness.store(true, Ordering::Relaxed);
+    witness.join().expect("clock witness thread");
 
     // Device time: CUDA events bracket a batch of captured-graph launches.
     let start_ev = event::create(CUevent_flags::CU_EVENT_DEFAULT).expect("start event");
@@ -1525,12 +1693,16 @@ fn bench_config(
         ep.deallocate(buffer).expect("free workspace");
     }
 
+    let kernel_us_first = kernel_us[0];
+    let kernel_us_last = kernel_us[kernel_us.len() - 1];
     let (kmed, kmin, kmax) = median_min_max(&mut kernel_us);
     let (emed, _, _) = median_min_max(&mut enqueue_us);
     println!(
-        "{label:28} | B={} S={:>3} H={} D={} T={:>3} top_k={} | kernel {kmed:7.2} us \
+        "{label:28} | B={} S={:>3} H={} D={} T={:>4} top_k={} dtype={dtype:?} | \
+         kernel {kmed:9.2} us \
          (min {kmin:.2}, max {kmax:.2}) | host-enqueue {emed:6.3} us | scratch {} B | \
-         batch={batch} n={repeats}",
+         batch={batch} n={repeats} | graph_nodes={graph_nodes} | setup={setup_ms:.2} ms | \
+         host-dispatches={}/{}/{} grids={}/{} | first/last={kernel_us_first:.2}/{kernel_us_last:.2} us",
         case.batch,
         case.q_seq,
         case.heads,
@@ -1538,14 +1710,34 @@ fn bench_config(
         case.key_seq,
         case.top_k,
         workspace_bytes,
+        launch_stats.executions,
+        launch_stats.score_launches,
+        launch_stats.selection_launches,
+        launch_stats.last_score_grid_x,
+        launch_stats.last_selection_grid_x,
+    );
+    drop(kernel);
+    assert_eq!(
+        dsa_workspace_stats().live_bytes,
+        0,
+        "perf runner must release the kernel-owned workspace"
     );
 
     BenchResult {
         kernel_us_median: kmed,
         kernel_us_min: kmin,
         kernel_us_max: kmax,
+        kernel_us_first,
+        kernel_us_last,
         enqueue_us_median: emed,
         workspace_bytes,
+        graph_nodes,
+        setup_ms,
+        executions: launch_stats.executions,
+        score_launches: launch_stats.score_launches,
+        selection_launches: launch_stats.selection_launches,
+        score_grid_x: launch_stats.last_score_grid_x,
+        selection_grid_x: launch_stats.last_selection_grid_x,
     }
 }
 
@@ -1572,13 +1764,32 @@ fn measure_dsa_index_select_kernel_and_host_enqueue() {
 
     // 8s clock ramp on the tiny graph before any measurement (Trap 5), result
     // discarded; the device then stays warm for the measured configs.
-    let _ = bench_config(&ep, "tiny-decode (ramp)", tiny, 0x51ce_d5a0, 8.0, 512, 7);
-    let first = bench_config(&ep, "tiny-decode", tiny, 0x51ce_d5a0, 1.0, 512, 7);
+    let _ = bench_config(
+        &ep,
+        "tiny-decode (ramp)",
+        tiny,
+        0x51ce_d5a0,
+        DataType::Float32,
+        8.0,
+        512,
+        7,
+    );
+    let first = bench_config(
+        &ep,
+        "tiny-decode",
+        tiny,
+        0x51ce_d5a0,
+        DataType::Float32,
+        1.0,
+        512,
+        7,
+    );
     let _ = bench_config(
         &ep,
         "glm-prefill S=64 T=64",
         glm_prefill,
         0x6c3f_2d11,
+        DataType::Float32,
         1.0,
         256,
         7,
@@ -1588,6 +1799,7 @@ fn measure_dsa_index_select_kernel_and_host_enqueue() {
         "glm-decode S=1 T=512",
         glm_decode,
         0x6c3f_2d12,
+        DataType::Float32,
         1.0,
         512,
         7,
@@ -1598,6 +1810,7 @@ fn measure_dsa_index_select_kernel_and_host_enqueue() {
         "tiny-decode (drift re-measure)",
         tiny,
         0x51ce_d5a0,
+        DataType::Float32,
         0.0,
         512,
         7,
@@ -1613,7 +1826,91 @@ fn measure_dsa_index_select_kernel_and_host_enqueue() {
     let _ = (
         first.kernel_us_min,
         first.kernel_us_max,
+        first.kernel_us_first,
+        first.kernel_us_last,
         again.enqueue_us_median,
+        again.graph_nodes,
+        again.setup_ms,
+        again.executions,
+        again.score_launches,
+        again.selection_launches,
+        again.score_grid_x,
+        again.selection_grid_x,
     );
     gpu_clock_witness("end");
+}
+
+#[ignore = "real GLM decode perf probe; set ONNX_GENAI_DSA_PERF_T=2048 or 8192 and run explicitly"]
+#[test]
+fn measure_dsa_index_select_real_glm_decode() {
+    let key_seq = std::env::var("ONNX_GENAI_DSA_PERF_T")
+        .expect("set ONNX_GENAI_DSA_PERF_T to 2048 or 8192")
+        .parse::<usize>()
+        .expect("ONNX_GENAI_DSA_PERF_T must be an integer");
+    assert!(
+        matches!(key_seq, 2048 | 8192),
+        "real GLM perf probe only accepts T=2048 or T=8192"
+    );
+    let top_k = std::env::var("ONNX_GENAI_DSA_PERF_TOP_K")
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .expect("ONNX_GENAI_DSA_PERF_TOP_K must be an integer")
+        })
+        .unwrap_or(2048);
+    assert!(
+        matches!(top_k, 4 | 2048),
+        "perf probe accepts top_k=4 (remaining-cost control) or 2048 (real GLM)"
+    );
+    let ep = require_cuda();
+    gpu_clock_witness("before setup");
+    let case = Case {
+        batch: 1,
+        q_seq: 1,
+        heads: 32,
+        head_dim: 128,
+        key_seq,
+        top_k,
+        scale: (128.0f32).powf(-0.5),
+        weights_scale: Some((32.0f32).powf(-0.5)),
+    };
+    let result = bench_config(
+        &ep,
+        &format!("real-glm-T{key_seq}-K{top_k}"),
+        case,
+        0x2076_5eba ^ key_seq as u64 ^ top_k as u64,
+        DataType::Float16,
+        8.0,
+        4,
+        7,
+    );
+    let drift =
+        (result.kernel_us_last - result.kernel_us_first).abs() / result.kernel_us_first * 100.0;
+    assert_eq!(
+        result.graph_nodes, 2,
+        "production capture must contain separate parallel score and selection kernels"
+    );
+    assert_eq!(result.executions, 2, "warmup plus captured host execution");
+    assert_eq!(result.score_launches, 2);
+    assert_eq!(result.selection_launches, 2);
+    assert!(
+        result.score_grid_x > 1,
+        "real decode scoring must occupy multiple CTAs"
+    );
+    assert_eq!(result.selection_grid_x, 1);
+    println!(
+        "real GLM T={key_seq} top_k={top_k}: captured graph nodes={}, score grid={}, \
+         selection grid={}, ordered-sample drift={drift:.2}%, fixed setup={:.2} ms, \
+         marginal device median={:.2} us, min/max={:.2}/{:.2} us, \
+         n=7 batches of 4, scratch={} B",
+        result.graph_nodes,
+        result.score_grid_x,
+        result.selection_grid_x,
+        result.setup_ms,
+        result.kernel_us_median,
+        result.kernel_us_min,
+        result.kernel_us_max,
+        result.workspace_bytes,
+    );
+    gpu_clock_witness("after measurement");
 }

@@ -120,7 +120,8 @@ pub use kernels::csa_checkpoint::{
     CsaAttentionMode, CsaCheckpoint, CsaCheckpointJournal, CsaCursors, CsaLayerMetrics, CsaMetrics,
 };
 pub use kernels::dsa_index_select::{
-    DsaWorkspaceStats, dsa_workspace_stats, reset_dsa_workspace_stats,
+    DsaLaunchStats, DsaWorkspaceStats, dsa_launch_stats, dsa_workspace_stats,
+    reset_dsa_launch_stats, reset_dsa_workspace_stats,
 };
 #[cfg(feature = "gpu-tests")]
 pub use kernels::dsa_index_select::{
