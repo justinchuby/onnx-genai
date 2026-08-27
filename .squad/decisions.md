@@ -140,3 +140,218 @@ Detailed pre-existing 2026-08-19 narrative remains in `.squad/decisions-archive/
 **By:** Copilot; consolidated by Scribe
 **What:** The stale all-fp16 QMoE/fc1 loader blocker is resolved: native CUDA now runs all-fp16 fused QMoE, correcting the older mixed-precision blocker note. Full details are archived in `.squad/decisions-archive/2026-08.md` from `copilot-qmoe-fp16-router-probs-resolved.md`.
 **Why:** Remove the phantom blocker from future routing; QMoE fp16 investigation should proceed from current runtime behavior, not the obsolete loader-rejection premise.
+
+
+### 2026-08-26: #1896 synchronous H2D and CUDA fence-proof contract
+
+**By:** Leon, Sebastian, Challenger, Sapper, Pris; consolidated by Scribe
+**What:** Synchronous pageable `CudaRuntime::htod` completes device residency before return and orders against the EP nonblocking compute stream; asynchronous overlap remains exclusively in `htod_async` with copy-event/compute-wait fences. Capture safety includes transitive runtime synchronizers. A fixed identical schedule cannot deterministically turn deletion of only `cuStreamWaitEvent` into a reversed stale read, so PR #2235 proves the contract in layers: at-most-once dispatcher behavior, structural production reachability to `CudaStream::wait`, positive gated CUDA integration, and separate no-wait/early-copy apparatus validation with explicit limitations.
+**Why:** CUDA pageable synchronous copies may return after staging but before final DMA, and legacy-default-stream operations do not automatically order nonblocking compute streams. The layered proof preserves the real production contract without altering production schedules or event-registry behavior to manufacture a mutation oracle. Pris approved revision 6 and merged-latest-main HEAD; PR #2235 squash-merged as `26dbc0f341769fcef80d4261f63898cc46bbb7c3`, closing #1896 at 2026-08-27T02:09:46Z.
+
+---
+
+### 2026-08-27: Durable inbox consolidation
+
+**By:** Scribe
+**What:** Consolidated 52 decision drops. Current standing rules remain below;
+full source records, historical measurements, rejected revisions, and correction
+chains are preserved under
+`.squad/decisions/archive/inbox-2026-08-27/INDEX.md`.
+**Why:** The inbox is a delivery queue, not a second decision authority. Keeping
+full narrative in the dated archive makes the queue drain lossless without
+inflating the live spawn context.
+
+### Evidence criteria must match the proposition
+
+**By:** Coordinator; consolidated by Scribe
+**What:** A criterion that is structurally incapable of answering the question
+must be replaced, not applied more carefully. Squash inclusion is proved by
+content/feature evidence rather than ancestry; dependency availability by the
+resolved graph rather than manifest grep; CI coverage by the job/step and exact
+command that ran rather than a run-level conclusion. A green compile or test
+proves only code selected by its cfg/features, and `null`/queued/skipped is
+unmeasured rather than pass or fail. Report numbers with the ref and complete
+command, including target and features. Independent checks count independently
+only after their shared premises are identified and verified.
+**Why:** A mismatched criterion returns a well-formed but semantically irrelevant
+answer. Downstream rigor cannot repair an untested upstream premise, and a
+confident rejection needs the same evidence as a confident acceptance. Mark
+unsupported conclusions `unverified`, not `false`.
+
+### Mutation evidence is governed like production evidence
+
+**By:** Coordinator; consolidated by Scribe
+**What:** Safety-critical memory work requires mutation evidence. Fixtures must
+be physically capable of exhibiting the named failure, and coverage of decision
+branches does not substitute for coverage of bounded reads, release, lifetime,
+or other safety properties. Test-infrastructure fixes are themselves mutated:
+guard every exact edit and restore by the expected occurrence count, never edit
+by line number, inspect the focused diff before execution, and prove restoration
+and a clean tree afterward. Equivalent mutants may be discharged by a concrete
+equivalence proof rather than manufactured coverage.
+**Why:** Mutation harnesses fail toward false confidence: a no-op mutation can
+look like a survivor, and a failed restore can look like a clean baseline. A
+test may defend only the behavior its fixture can expose.
+
+### Unavailable environments raise the claim bar
+
+**By:** Coordinator; consolidated by Scribe
+**What:** When hardware, target OS, production data, or another required
+environment is unavailable, state exactly what was not run and which evidence
+substitutes for it. Trace written mechanism claims through the value and caller
+they rely on; do not infer reachability from the existence of a guard or
+generalize one inspected path to uninspected siblings.
+**Why:** In that environment prose carries the weight execution normally would.
+Unexercised claims therefore need a higher evidentiary bar, not a lower one.
+
+### #1186 memory-stack ownership and sequencing
+
+**By:** Copilot and Coordinator; consolidated by Scribe
+**What:** The merged memory stack in PR #1579 keeps capability discovery,
+binding identity, lifetime/release safety, and policy as distinct authorities.
+The API extraction is mechanism-only. `ProcessMemoryManager` owns process quota,
+canonical authority/view mapping, registration/selection generations, holder
+identity, context transaction gates, loss broadcast, and settlement
+coordination. Governors retain budget policy and victim choice; EP contexts
+retain stream/copy/commit/decommit/fence/deferred-release ordering. Quarantine
+does not infer refunds from allocation length; confirmed context termination is
+the device-loss discharge boundary. The built-in CUDA eager allocator is gone
+only after VMM became the sole built-in CUDA mechanism; the ordinary allocator
+capability remains for CPU, injection, and integration boundaries. Issue #1186
+remains open for the provider/context-wiring remainder named by #1579.
+**Why:** Capability discovery cannot prove release identity or settlement.
+Separating the authorities makes stale selection, ABA release, partial rollback,
+and accounting outcomes explicit rather than self-attested.
+
+### Route-residency and composable-VMM standing contract
+
+**By:** Deckard and Copilot; consolidated by Scribe
+**What:** MoE route telemetry is an observer, never a mapping or accounting
+authority. PMM/VMM alone owns map/unmap, rollback, quarantine, and accounting.
+Records are fixed-capacity, device-resident, consumed only after the existing
+coarse completion boundary, and fail closed to whole-bank residency on overflow,
+poison, stale epoch, or foreign request/device. Remapping during capture is
+forbidden by the cooperative capture gate; the driver does not reliably refuse
+it. Slice 7C and 7D merged in #2007/#2046, providing the required EP lifecycle
+boundary and property-based install/drain seam. Real producer/session binding and
+exact per-bank reservations remain open in #2082/#2163; default-off seams are
+not evidence of live residency conversion or tok/s.
+**Why:** Whole-tensor zero-copy was measured 3–8x slower for touched QMoE
+weights and cannot implement per-expert mixed backing. Stable-VA composable VMM
+is feasible, but one authority and capture-safe transitions are load-bearing.
+
+### PagedAttention keeps one KV authority
+
+**By:** Leon; consolidated by Scribe
+**What:** `onnx-genai-kv` remains the sole allocator and lifetime owner for
+PagedAttention pages, block tables, slot mappings, and sequence lengths.
+PagedAttention v1 aliases caller-owned cache buffers and updates them in place;
+index emission is a read-only view. Token-major/LATENT addressing, power-of-two
+block size >=16, partial-RoPE offset, narrower LATENT value head, required
+explicit scale, and typed rejection of unsupported quantized/sparse modes are
+property-driven rather than model-name driven. The audit/oracle and index
+emission merged in #1940/#1955; their archived `NOT merged` status is stale.
+**Why:** The op does not allocate its own KV cache, so adding a second page
+manager would duplicate authority rather than satisfy the ABI.
+
+### Plugin residency, shape, and allocator ownership
+
+**By:** Batty, Holden, Roy, and Gaff; consolidated by Scribe
+**What:** Plugin values retain allocator-derived `DeviceId`. A device plugin
+declines any output-shape rule that must host-read a present device tensor value;
+optional rules are classified by operand presence, preserving absent-vs-empty
+semantics. ABI tests must model ORT memory-info residency hooks rather than
+silently falling back to CPU, and raw device enums use checked platform-neutral
+conversion. `ExportedFactory` owns registered allocator adapters through
+teardown; release closes the adapter, returns each tracked buffer exactly once,
+and drains deferred releases while retaining the closed adapter against late or
+duplicate frees. Heterogeneous static execution rejects every kernel-sized
+output and classifies producer-less values explicitly as graph inputs or
+initializers.
+**Why:** Relabeling a device pointer as host memory creates host dereference UB.
+Factory ownership supplies one teardown authority, and declared static extents
+do not prove runtime output cardinality.
+
+### CUDA dynamic outputs, MHA geometry, and package truth
+
+**By:** Deckard, Leon, Pris, Isidore, and Gaff; consolidated by Scribe
+**What:** CUDA MHA owns per-call scratch by RAII and checks claim-time and
+execute-time products, bytes, offsets, grids, and CUDA integer arguments;
+device index arithmetic promotes the first multiplicand before multiplication.
+CUDA NMS uses bounded `DeviceWorkspace` selection and transfers only its 8-byte
+count before one device materialization. Unique and NMS remain capture
+unsupported because their prepare phase synchronously resolves data-dependent
+cardinality before ORT allocates output. CUDA Python packages stay pinned to the
+validated 13.1 runtime line. cuDNN is packaged because Conv and pooling currently
+claim before availability is probed and then require it at execution; #2198
+tracks moving that failure earlier.
+**Why:** Checked host geometry does not excuse overflowing device expressions,
+and dynamic output allocation cannot be represented as a capture-safe static
+schedule. Packaging truth must describe current claim-then-execute behavior.
+
+### CUDA integration suites and fixture CI
+
+**By:** Freysa, Holden, Gaff, Isidore, and Roy; consolidated by Scribe
+**What:** Resource-sensitive CUDA integration tests use one target-local
+process mutex acquired as the first statement of every test and held through EP
+construction, execution, telemetry, assertions, and teardown. An independent
+policy census names MHA, DFT, STFT, and NMS and fails closed on an empty or
+mismatched implementation map, missing acquisitions, wrong locks, or early
+guard use/drop. GPU-less hosted CI compiles and inventories GPU paths but does
+not claim to execute them. Fixture CI classifies `.onnx` and `.textproto` before
+generic docs paths, normalizes separators, strips only trailing ASCII
+whitespace on the extension-classification copy, preserves the exact path for
+identity/diagnostics, rejects empty terminal names, and enforces a non-vacuous
+textproto census with zero binary ONNX fixtures.
+**Why:** Process-global telemetry and VMM reservations race within each libtest
+binary. Using the implementation map as its own expected inventory, or running
+a hardware test that silently skips, produces false coverage.
+
+### Component batching permission is producer-authored
+
+**By:** Sapper; consolidated by Scribe
+**What:** Mobius emits explicit `batch_capacity` only for audited
+row-independent components; fixed internal row multiplication is
+`request_expanded`, not request batching. Undeclared multi-request runtime
+invocations remain rejected. Schema v1.1 is stamped only when the producer
+authors the permission.
+**Why:** Tensor shapes locate rows but cannot prove that co-batching preserves
+each row's result. Runtime inference of permission would defeat the fail-closed
+admission contract.
+
+### CPU decode budgets use physical cores
+
+**By:** Sebastian; consolidated by Scribe
+**What:** CPU benchmarks and deployments should size explicit decode budgets to
+physical cores rather than logical CPUs. The runtime warns but does not override
+an explicit request above that count.
+**Why:** On the measured 16-physical/32-logical host, 32 threads were never
+faster, could be substantially slower, and multiplied one-time pool and CPU
+cost. Full measurement context remains in the dated inbox archive.
+
+### Quartz publishing stays deliberately simple
+
+**By:** Copilot Coordinator; consolidated by Scribe
+**What:** For the project wiki, trust exact-pinned Quartz/plugins plus
+successful deterministic production builds. Keep custom checks to source
+wikilinks/repository targets, generated internal links/assets/base path, a real
+root landing page, and a small literal allowlist of immutable external runtime
+URLs. Do not restore custom AST/dataflow/resource-graph auditing when pinned
+external URLs provide the narrower stated guarantee.
+**Why:** The documentation site is not a security sandbox; minimal maintained
+code and an honest guarantee are preferable to a bespoke verifier.
+
+### Correction pointers for MTP and #1896
+
+**By:** Scribe
+**What:** `gaff-mtp-verify-graph-capture.md` is retained for its generic
+dual-slot graph-liveness fix (#1690), but its wrong-logit root-cause is
+superseded by the live 2026-08-21 MTP decision: recurrent correctness can be
+token-identical and current MTP is throughput-negative. Likewise,
+`roy-1896-r4-wait-proof.md` is retained as a superseded revision: deleting only
+the wait under an identical fixed schedule cannot create reverse ordering. The
+final #2235 layered proof above is authoritative; Deckard's later explicit
+handshake is separate apparatus validation, not a production-schedule
+equivalence.
+**Why:** Preserving both the rejected premise and the final rule prevents an
+old, detailed narrative from outranking a newer compact correction.
