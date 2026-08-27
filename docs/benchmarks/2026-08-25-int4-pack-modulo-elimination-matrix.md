@@ -28,19 +28,24 @@ Three corrections come out of filling it in.
    number's interval suggests: the decode-loop A/A null **excludes 1.000 in
    both sweeps taken here, with opposite signs** (+0.63% at 21 launches, −0.28%
    at 41). Its real floor is about ±0.6%.
-3. **A source-level A/B on this codebase carries a per-build code-layout
-   component, and no same-binary A/A can see it.** Found by a control that was
-   supposed to be boring. Detailed below, because it bears on every A/B in this
-   directory and not just this one — and because it is the reason a single build
-   pair is not enough to establish a small result. **Its magnitude is no longer
-   settled:** the ~2% originally claimed here rests on three build pairs all
-   measured through a gate blind to SMT-sibling contention, and the one cell
-   since re-taken through the fixed gate (#2216) shrank from 1.93% to 0.28%.
-   The *existence* of the component is unaffected — it is established by
-   readings that differ across builds on a row proven bit-identical, not by
-   their size — but anyone using this document to set a credibility bar for a
-   sub-2% result should treat 2% as an upper bound contaminated by contention,
-   and re-take pairs A and C through the SMT gate before relying on it.
+3. **The per-build code-layout component this document reported at ~2% does not
+   survive being measured directly.** Found by a control that was supposed to be
+   boring, and detailed below because it bore on every A/B in this directory.
+   **Measured head-on, 2026-08-26:** build the *same* source at two independent
+   layouts — default, and `-Cllvm-args=-align-all-functions=5`, which moves 50%
+   → 91% of `FUNC` symbols onto a 32-byte boundary — and run one against the
+   other as an **A/B′ null**. Through the SMT-sibling gate (#2216) that null is
+   **1.0014 [1.0000, 1.0042]** at prefill block 32 `m = 1` and **0.9993 [0.9971,
+   1.0005]** on the block-16 decode. Both null; all arms bit-identical, which is
+   what proves only the layout moved. Layout sensitivity at these cells is under
+   half a percent, not two. The original ~2% was the spread across three build
+   pairs taken *before* that gate existed, and the one cell since re-taken
+   shrank 1.93% → 0.28%; the honest reading is that the spread was SMT
+   contention wearing layout's clothes. **This retracts the credibility bar**
+   earlier versions of this bullet exported: do not require a result here to
+   clear 2% before believing it. What stands unchanged is the narrower claim
+   that a *same-binary* A/A cannot see between-binary layout at all — so the
+   control to run is the A/B′ null above, not a longer A/A.
 
 ## Matrix
 
@@ -283,21 +288,72 @@ because:
 * **It is invisible to an A/A.** The A/A arm is the *same file*, so it measures
   everything except the thing that differs between builds. Every A/A in this
   document brackets 1.000 while a 1.9% artifact sits in the same table.
-* **It is larger than most kernel results this repository ships.** Any
-  source-level A/B here whose claim is under ~2%, on a route with no
-  route-not-taken control, cannot distinguish its result from this.
+* **It is mostly not layout.** ~~It is larger than most kernel results this
+  repository ships.~~ Retracted 2026-08-26 by direct measurement: an A/B′ null
+  holding the source constant and moving only the layout is 1.0014 [1.0000,
+  1.0042] here and 0.9993 [0.9971, 1.0005] on the decode row — under half a
+  percent, against the 1.9% this bullet was written to explain. Two independent
+  builds of this tree disagreeing by ~2% on a bit-identical row is a real
+  observation, but the cause was SMT-sibling contention, not code placement.
+  A/B′ nulls are cheap; run one before attributing a small delta to layout.
 * **It is not stable across rebuilds**, so it cannot be calibrated out once and
   reused. It has to be re-measured per build, which is what a route-not-taken
   row does for free when one exists.
 
 The practical rule: **include a row the change provably cannot reach, prove it
 with a poisoned build, and read it as the experiment's real floor.** Where no
-such row exists — which is the usual case — a sub-2% result is unconfirmed
-until it reproduces across **independently built pairs of binaries**, and the
-cheapest way to get an independent pair on demand is to rebuild every arm under
-`-Cllvm-args=-align-all-functions=5`, which perturbs layout and nothing else.
-Reproducing across two block sizes, or two amortization slopes, from a *single*
-pair does not substitute for it: one pair of binaries has one layout.
+such row exists — which is the usual case — the control is an **A/B′ null**:
+rebuild every arm under `-Cllvm-args=-align-all-functions=5`, then point the
+matrix at a directory whose `before` is the default-layout `after` and whose
+`after` is the aligned one. The headline ratio is then a pure layout null on
+the exact cell being claimed, and the harness's cross-arm bit-identity check
+proves the semantics were held constant. That is strictly better than the older
+advice to distrust anything under 2%: it measures the floor for your cell
+instead of importing someone else's. Reproducing across two block sizes, or two
+amortization slopes, from a *single* pair still does not substitute for it: one
+pair of binaries has one layout.
+
+### The A/B′ null, measured (2026-08-26)
+
+Everything above about layout was inferred from *disagreement between pairs*:
+three build pairs read +0.3%, −1.9%, +0.3% on a row proven bit-identical, and
+the spread was attributed to code placement. That is an indirect argument, and
+it was reached with an instrument later found blind to SMT-sibling contention.
+The direct experiment holds the source constant and moves only the layout:
+
+| arm | binary | layout | semantics |
+| --- | --- | --- | --- |
+| `before` | default build of `after` | 2546/5136 `FUNC` on 32B = 50% | `offset_base + q` |
+| `after` | `-Cllvm-args=-align-all-functions=5` | 4690/5136 `FUNC` on 32B = 91% | `offset_base + q` |
+| `aa` | copy of the aligned build | same as `after` | `offset_base + q` |
+
+Both binaries compile the same line, so the harness's cross-arm bit-identity
+check is what certifies the manipulation: if the arms had differed in anything
+that reaches the output, the checksums would have parted. They did not.
+
+```
+prefill block 32, m = 1, 41 launches/arm   0.712 -> 0.711  1.0014 [1.0000, 1.0042]  null  bit-id True
+decode  block 16,      15 launches/arm   126.070 -> 126.163  0.9993 [0.9971, 1.0005]  null  bit-id True
+```
+
+**Layout sensitivity at these cells is under half a percent**, against the ~2%
+this document previously exported as a credibility bar. Two consequences, and
+they point in opposite directions, so both are stated:
+
+* The **decode result stands and is strengthened**. ~1.9–2.3% over a layout
+  floor of ≤0.4% is a real effect, not a build artifact — the objection that it
+  is the same size as the layout noise was correct to raise and does not hold.
+* The **`m = 1` −0.28% is inside the floor** and should not be read as a
+  regression. It already had a route proof saying the changed line does not
+  execute there; it now also has a floor wide enough to contain it.
+
+Caveats, since this is one perturbation and not a survey of layout space:
+forced 32-byte alignment is a large, systematic, whole-binary change, so it
+bounds this tree's sensitivity at these two cells rather than sampling ordinary
+build-to-build drift. The decode row is 15 launches with an uneven admission
+rate (`before` 14/15, `after` 15/15, `aa` 13/15, spread 0.133) and is the
+weaker of the two; prefill is 41/41/40 with spread 0.024. Three of the four
+discards were the SMT gate, one the CPU-efficiency floor.
 
 ## Route proof, per row
 
