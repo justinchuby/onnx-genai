@@ -146,12 +146,14 @@ fn cubin_arch_for(major: u32, minor: u32) -> String {
 
 const SAFE_MAX_THREADS_PER_BLOCK_FALLBACK: u32 = 256;
 const SAFE_SHARED_MEMORY_PER_BLOCK_FALLBACK: u32 = 48 * 1024;
+const SAFE_MAX_GRID_DIM_X_FALLBACK: u32 = 65_535;
 
 /// Hardware limits used to select portable CUDA launch configurations.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CudaDeviceCapabilities {
     compute_capability: (u32, u32),
     max_threads_per_block: u32,
+    max_grid_dim_x: u32,
     max_shared_memory_per_block: u32,
     max_shared_memory_per_block_optin: u32,
     multiprocessor_count: u32,
@@ -162,6 +164,7 @@ impl CudaDeviceCapabilities {
     fn from_reported_limits(
         compute_capability: (u32, u32),
         max_threads_per_block: Option<u32>,
+        max_grid_dim_x: Option<u32>,
         max_shared_memory_per_block: Option<u32>,
         max_shared_memory_per_block_optin: Option<u32>,
         multiprocessor_count: Option<u32>,
@@ -170,6 +173,9 @@ impl CudaDeviceCapabilities {
         let max_threads_per_block = max_threads_per_block
             .filter(|&value| value > 0)
             .unwrap_or(SAFE_MAX_THREADS_PER_BLOCK_FALLBACK);
+        let max_grid_dim_x = max_grid_dim_x
+            .filter(|&value| value > 0)
+            .unwrap_or(SAFE_MAX_GRID_DIM_X_FALLBACK);
         let max_shared_memory_per_block = max_shared_memory_per_block
             .filter(|&value| value > 0)
             .unwrap_or(SAFE_SHARED_MEMORY_PER_BLOCK_FALLBACK);
@@ -184,6 +190,7 @@ impl CudaDeviceCapabilities {
         Self {
             compute_capability,
             max_threads_per_block,
+            max_grid_dim_x,
             max_shared_memory_per_block,
             max_shared_memory_per_block_optin,
             multiprocessor_count,
@@ -201,6 +208,10 @@ impl CudaDeviceCapabilities {
 
     pub fn max_threads_per_block(self) -> u32 {
         self.max_threads_per_block
+    }
+
+    pub fn max_grid_dim_x(self) -> u32 {
+        self.max_grid_dim_x
     }
 
     pub fn multiprocessor_count(self) -> u32 {
@@ -248,6 +259,7 @@ impl CudaDeviceCapabilities {
     ) -> Self {
         Self::from_reported_limits(
             compute_capability,
+            None,
             None,
             None,
             None,
@@ -681,6 +693,10 @@ impl CudaRuntime {
             positive_attribute(
                 &context,
                 CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK,
+            ),
+            positive_attribute(
+                &context,
+                CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_X,
             ),
             positive_attribute(
                 &context,
@@ -2587,10 +2603,18 @@ mod tests {
 
     #[test]
     fn capability_limits_use_conservative_fallbacks() {
-        let capabilities =
-            CudaDeviceCapabilities::from_reported_limits((7, 0), None, None, None, None, None);
+        let capabilities = CudaDeviceCapabilities::from_reported_limits(
+            (7, 0),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         assert_eq!(capabilities.compute_capability(), (7, 0));
         assert_eq!(capabilities.max_threads_per_block, 256);
+        assert_eq!(capabilities.max_grid_dim_x(), SAFE_MAX_GRID_DIM_X_FALLBACK);
         assert_eq!(
             capabilities.max_shared_memory_per_block,
             SAFE_SHARED_MEMORY_PER_BLOCK_FALLBACK
@@ -2608,11 +2632,13 @@ mod tests {
         let capabilities = CudaDeviceCapabilities::from_reported_limits(
             (12, 0),
             Some(1024),
+            Some(2_147_483_647),
             Some(64 * 1024),
             Some(48 * 1024),
             Some(200),
             Some(96 * 1024 * 1024),
         );
+        assert_eq!(capabilities.max_grid_dim_x(), 2_147_483_647);
         assert_eq!(capabilities.max_shared_memory_per_block_optin(), 64 * 1024);
         assert_eq!(capabilities.multiprocessor_count(), 200);
         assert_eq!(capabilities.l2_cache_size(), 96 * 1024 * 1024);

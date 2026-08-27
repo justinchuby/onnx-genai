@@ -17624,7 +17624,9 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     fn matmulnbits_int8_prefill_gebp_matches_reference_and_ran() {
         let _probe = lock_dispatch_probe();
-        if !crate::backend::has_simd_x86() {
+        if !crate::backend::require_simd_x86(
+            "matmulnbits_int8_prefill_gebp_matches_reference_and_ran",
+        ) {
             return;
         }
         for &(k, n, block_size) in &[(96usize, 20usize, 32usize), (100, 7, 32), (128, 16, 128)] {
@@ -17825,7 +17827,9 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     fn matmulnbits_int8_gebp_row_gate_is_the_kernels_own_lower_bound() {
         let _probe = lock_dispatch_probe();
-        if !crate::backend::has_simd_x86() {
+        if !crate::backend::require_simd_x86(
+            "matmulnbits_int8_gebp_row_gate_is_the_kernels_own_lower_bound",
+        ) {
             return;
         }
         assert_eq!(
@@ -17875,7 +17879,9 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     fn matmulnbits_int8_gebp_is_bit_identical_to_the_dequant_route() {
         let _probe = lock_dispatch_probe();
-        if !crate::backend::has_simd_x86() {
+        if !crate::backend::require_simd_x86(
+            "matmulnbits_int8_gebp_is_bit_identical_to_the_dequant_route",
+        ) {
             return;
         }
         // k = 100 leaves a 4-wide trailing block; n = 7 leaves a partial NR=16

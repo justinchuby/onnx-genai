@@ -2394,6 +2394,10 @@ unsafe fn stage_host_boundary_inputs(
 ///   * `StandardAttention` (`standard_attention.rs`), single-token single-batch
 ///     decode only — every other geometry is `StepScoped` and *is* served: the
 ///     score and staged-K/V scratch is pooled or per-call inside `run`.
+///   * `DsaIndexSelect` (`dsa_index_select.rs`) declares no external workspace:
+///     its kernel-owned slot grows only outside capture and remains pointer-stable
+///     from warmup through graph replay, so the plugin and native executors use
+///     the same production path.
 ///   * `MatMulNBits` bf16 activations: the `Bf16Scratch` staging arena is
 ///     always self-owned and is listed here only because it is easy to assume
 ///     otherwise — that path declares [`WorkspaceRequirement::NONE`], so it is

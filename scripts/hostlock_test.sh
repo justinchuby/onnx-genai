@@ -1118,7 +1118,7 @@ echo "-- R2: emitted rows carry identity, state and occupancy --"
 cleanup
 $HL acquire --owner leon --ttl 600 --reason "moe matrix" >/dev/null 2>&1
 row=$($HL provenance --oneline --expect-runnable 100000)
-for field in hostlock_state declared held_by held_uid held_pid held_secs takeover gate runnable_at_acquire runnable contended sampled_at; do
+for field in hostlock_state declared held_by held_owner_source held_uid held_pid held_secs takeover gate runnable_at_acquire runnable contended sampled_at; do
     chk "the row carries $field" \
         "$(echo "$row" | tr ' ' '\n' | grep -c "^${field}=")" "1"
 done
@@ -1126,6 +1126,60 @@ chk "the row's state is the real state" \
     "$(echo "$row" | tr ' ' '\n' | sed -n 's/^hostlock_state=//p')" "HELD"
 chk "the row's owner is the real owner" \
     "$(echo "$row" | tr ' ' '\n' | sed -n 's/^held_by=//p')" "leon"
+# ...and it says HOW that name was obtained, which is what decides whether it
+# can be believed. `--owner` is a name somebody chose for THIS run; an
+# inherited $HOSTLOCK_OWNER may name whoever exported it, arbitrarily long ago,
+# because `run` exports it to the wrapped command and the export outlives the
+# run. That is not hypothetical: two archived benchmark datasets are stamped
+# `held_by=roy` while their kernel-read `worktree` and `cmd` fields name a
+# different agent's worktree and command line. Nothing in the row contradicted
+# the wrong name, since `declared=yes` holds for both and every agent here
+# shares one unix account, so `held_uid` corroborates either equally.
+chk "the row says the owner was declared on the command line" \
+    "$(echo "$row" | tr ' ' '\n' | sed -n 's/^held_owner_source=//p')" "flag"
+cleanup
+# An INHERITED name must be reported as inherited. If this reported `flag` the
+# field would be worthless -- it exists only to separate these two cases.
+env_row=$(HOSTLOCK_OWNER=roy $HL acquire --ttl 600 --reason "inherited" >/dev/null 2>&1; \
+    $HL provenance --oneline --expect-runnable 100000)
+chk "an inherited HOSTLOCK_OWNER still names its holder" \
+    "$(echo "$env_row" | tr ' ' '\n' | sed -n 's/^held_by=//p')" "roy"
+chk "but the row marks that name as inherited, not chosen" \
+    "$(echo "$env_row" | tr ' ' '\n' | sed -n 's/^held_owner_source=//p')" "env"
+cleanup
+# The $USER fallback names a shared ACCOUNT, not an agent, so it is its own
+# case and must not masquerade as either of the two above.
+user_row=$(env -u HOSTLOCK_OWNER "$HL" acquire --ttl 600 --reason "default" >/dev/null 2>&1; \
+    env -u HOSTLOCK_OWNER "$HL" provenance --oneline --expect-runnable 100000)
+chk "an undeclared owner is reported as the account default" \
+    "$(echo "$user_row" | tr ' ' '\n' | sed -n 's/^held_owner_source=//p')" "user"
+chk "and it names the unix account it fell back to" \
+    "$(echo "$user_row" | tr ' ' '\n' | sed -n 's/^held_by=//p')" "${USER:-unknown}"
+# A lock written before this key existed must read `unknown`. Answering `user`
+# would assert the most trustworthy of the three provenances about a row whose
+# name may well have been inherited -- the exact mislabelling the key exists to
+# expose, moved out of the console and into the data.
+sed -i '/^owner_source=/d' "$LOCK/meta"
+chk "a lock predating the key reports unknown, not a guess" \
+    "$($HL provenance --oneline --expect-runnable 100000 | tr ' ' '\n' \
+        | sed -n 's/^held_owner_source=//p')" "unknown"
+chk "and dropping the key did not disturb the name itself" \
+    "$($HL provenance --oneline --expect-runnable 100000 | tr ' ' '\n' \
+        | sed -n 's/^held_by=//p')" "${USER:-unknown}"
+# `status --porcelain` re-emits the attribution set for machine consumers, so
+# it must carry the qualifier too -- `owner` alone is exactly the free-text
+# half that #2260 is about, and a porcelain reader would inherit the defect.
+chk "porcelain reports unknown for a lock predating the key" \
+    "$($HL status --porcelain | sed -n 's/^owner_source=//p')" "unknown"
+cleanup
+$HL acquire --owner leon --ttl 600 --reason "porcelain" >/dev/null 2>&1
+chk "and porcelain reports a declared owner as declared" \
+    "$($HL status --porcelain | sed -n 's/^owner_source=//p')" "flag"
+chk "alongside the name it qualifies" \
+    "$($HL status --porcelain | sed -n 's/^owner=//p')" "leon"
+cleanup
+$HL acquire --owner leon --ttl 600 --reason "moe matrix" >/dev/null 2>&1
+row=$($HL provenance --oneline --expect-runnable 100000)
 # `held_by` is self-declared free text: `--owner roy` from my shell produces a
 # row that says roy. The only identity the kernel vouches for is the anchor's
 # uid, so a published row must carry that too, and it must be the REAL uid --
@@ -2283,7 +2337,7 @@ chk "and the row still parses back to the state it physically carries" \
 # Categorical, and the strongest cell here: a forged row cannot be the same
 # width as a clean one. This is immune to any question about which field the
 # injection happened to target.
-fw_clean_nf=17
+fw_clean_nf=18
 chk "and the field count is unchanged by the injection" \
     "$(echo "$fw_row" | awk '{print NF}')" "$fw_clean_nf"
 # Not destroyed -- relocated to where the newline is the delimiter. Whoever is
@@ -3680,10 +3734,10 @@ cleanup
 # Finally, pin the assertion count itself. Several of the checks in this file
 # sit behind environment probes, and an assertion that quietly stops running is
 # indistinguishable from one that passes -- which is the same failure mode as
-# the inert R1 block and the vacuous STALE arm that this PR exists to fix.
-# Every probe branch asserts something, so the total is invariant across
+# the inert R1 block and the vacuous STALE arm fixed in #1830. Every probe
+# branch asserts something, so the total is invariant across
 # environments; if a refactor drops a check, this fails and says so.
-chk "every assertion in this file ran" "$((pass + fail + 1))" "547"
+chk "every assertion in this file ran" "$((pass + fail + 1))" "558"
 
 echo
 echo "passed=${pass} failed=${fail}"

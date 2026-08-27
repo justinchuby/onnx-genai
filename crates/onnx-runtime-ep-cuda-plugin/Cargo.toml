@@ -16,6 +16,7 @@ crate-type = ["cdylib", "lib"]
 # host. Without it the crate compiles (for workspace-check CI) but the cdylib
 # is a no-op stub returning zero factories.
 cuda = ["onnx-runtime-ep-cuda"]
+gpu-tests = ["cuda", "onnx-runtime-ep-cuda/gpu-tests"]
 
 [dependencies]
 onnx-runtime-ep-plugin = { path = "../onnx-runtime-ep-plugin", version = "=0.1.0-dev.5" }
