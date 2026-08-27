@@ -89,7 +89,7 @@ cargo build --release -p onnx-genai-cli
   --max-new-tokens 64 \
   --temperature 0 \
   --stream \
-  --prompt "Write a short Rust hello-world program."
+  "Write a short Rust hello-world program."
 ```
 
 When `--max-new-tokens` is omitted, `generate` and `run` use whatever budget
@@ -258,7 +258,7 @@ ONNX fixtures in `tests/fixtures/`; see
 `--profile` reports where the time went. It works on every subcommand:
 
 ```bash
-onnx-genai --profile generate models/qwen2.5-0.5b --prompt "..." --max-new-tokens 40
+onnx-genai --profile generate models/qwen2.5-0.5b --max-new-tokens 40 "..."
 ```
 
 ```text
@@ -368,10 +368,10 @@ absent line means "not accounted here", never "nothing was used".
 
 ```bash
 # Machine-readable, for diffing runs or plotting in CI (`-` writes to stdout)
-onnx-genai --profile-json bench.json generate models/qwen2.5-0.5b --prompt "..."
+onnx-genai --profile-json bench.json generate models/qwen2.5-0.5b "..."
 
 # Chrome Trace Event timeline, viewable at https://ui.perfetto.dev
-onnx-genai --profile-trace trace.json generate models/qwen2.5-0.5b --prompt "..."
+onnx-genai --profile-trace trace.json generate models/qwen2.5-0.5b "..."
 ```
 
 ### Generate images
