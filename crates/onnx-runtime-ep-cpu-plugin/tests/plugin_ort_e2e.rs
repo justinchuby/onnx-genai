@@ -4826,6 +4826,25 @@ struct MatmulFamilyCase {
     ort_can_build: bool,
     /// Absolute tolerance for the elementwise comparison against ORT.
     tolerance: f32,
+    /// How many nodes this model has, and therefore how many must end up on
+    /// our EP before a per-node number means anything.
+    ///
+    /// The old check was `ops_on_our_ep().contains(&case.op)` — a membership
+    /// test. It passes when *one* node of the right type is ours, so a
+    /// hundred-node chain of which we claimed three would still have reported
+    /// a ratio, and any per-node figure a reader derived from that row by
+    /// dividing by its nominal depth would have been wrong by a factor of 33.
+    /// That is the same defect as a thread-name filter that matches nothing:
+    /// the filter answers, the answer is vacuous, and the vacuity is
+    /// invisible in the number.
+    ///
+    /// Fallback is disabled for these sessions, so in principle a declined
+    /// node fails session creation rather than going elsewhere quietly — but
+    /// that is an inference about ORT's behaviour, and it says nothing about
+    /// nodes the graph optimiser *removed* (a `Relu` chain is idempotent and
+    /// a folder is entitled to collapse it). Counting is a measurement and
+    /// costs one comparison per case.
+    expected_ep_nodes: usize,
 }
 
 /// One runtime input: name, element type, dims and raw little-endian bytes.
@@ -4990,6 +5009,7 @@ opset_import: [{{ version: 17 }}]
         output_elem: elem,
         ort_can_build: true,
         tolerance,
+        expected_ep_nodes: 1,
     }
 }
 
@@ -5110,6 +5130,7 @@ opset_import: [{{ version: 17 }}, {{ domain: "com.microsoft" version: 1 }}]
         // variant also rounds its activation and result to 11 significand
         // bits, which at this magnitude costs about one unit.
         tolerance: if act_elem == ELEM_F32 { 0.5 } else { 4.0 },
+        expected_ep_nodes: 1,
     }
 }
 
@@ -5209,6 +5230,7 @@ opset_import: [{{ version: 13 }}]
         // of a value landing precisely on .5 is implementation-defined, so one
         // least-significant unit is allowed.
         tolerance: 1.0,
+        expected_ep_nodes: 1,
     }
 }
 
@@ -5865,6 +5887,7 @@ opset_import: [{{ version: 17 }}]
         output_elem: ELEM_F32,
         ort_can_build: true,
         tolerance: 0.0,
+        expected_ep_nodes: 1,
     };
 
     let path = write_generated_model(case.name, &case.model);
@@ -5977,6 +6000,7 @@ opset_import: [{{ version: 17 }}, {{ domain: "com.microsoft" version: 1 }}]
         output_elem: ELEM_F32,
         ort_can_build: true,
         tolerance: 0.0,
+        expected_ep_nodes: 1,
     };
 
     let path = write_generated_model(case.name, &case.model);
@@ -6236,6 +6260,7 @@ opset_import: [{{ version: 17 }}, {{ domain: "com.microsoft" version: 1 }}]
         output_elem: ELEM_F32,
         ort_can_build: true,
         tolerance: 0.5,
+        expected_ep_nodes: 1,
     };
     (case, other_b)
 }
@@ -6472,6 +6497,7 @@ opset_import: {opset_imports}
         output_elem: elem,
         ort_can_build: true,
         tolerance,
+        expected_ep_nodes: 1,
     }
 }
 
@@ -6552,6 +6578,7 @@ opset_import: [{{ version: 17 }}]
         // A Relu chain is exact in both implementations; Identity is a copy.
         // Anything above zero here would be hiding a real disagreement.
         tolerance: 0.0,
+        expected_ep_nodes: depth,
     }
 }
 
@@ -6605,6 +6632,7 @@ opset_import: [{{ version: 17 }}]
         output_elem: ELEM_F32,
         ort_can_build: true,
         tolerance: 1e-3,
+        expected_ep_nodes: 1,
     }
 }
 
@@ -6630,7 +6658,27 @@ fn dispatch_grid_cases() -> Vec<MatmulFamilyCase> {
     const TINY: usize = 8;
     vec![
         chain_case("grid_identity_1_static", "Identity", 1, W, false),
-        chain_case("grid_identity_10_static", "Identity", 10, W, false),
+        // Ten `Identity` nodes go in; **one** arrives. ORT collapses the
+        // redundant chain during session build, so by the time our EP sees
+        // the graph it is a single node. That is the observation — `got 1
+        // ours, 0 elsewhere` the first time the count check ran — and not a
+        // claim about which ORT pass does it, which cannot be checked from
+        // this tree.
+        //
+        // Nothing published was wrong because of it: the in-code per-node
+        // probe already divides by `ops_on_our_ep().len()` rather than by the
+        // case's depth, and the #1077 figures come from the `relu_*_tiny`
+        // rows. The hazard was a human dividing this row's *total* by its
+        // nominal depth of ten. The count check makes that impossible to do
+        // silently.
+        //
+        // Kept rather than deleted: it is now a pin on that folding
+        // behaviour. It must not be read as a depth-10 point; at run time it
+        // is `grid_identity_1_static` with a longer name.
+        MatmulFamilyCase {
+            expected_ep_nodes: 1,
+            ..chain_case("grid_identity_10_static", "Identity", 10, W, false)
+        },
         chain_case("grid_relu_1_static", "Relu", 1, W, false),
         chain_case("grid_relu_10_static", "Relu", 10, W, false),
         chain_case("grid_relu_100_static", "Relu", 100, W, false),
@@ -7223,9 +7271,26 @@ fn plugin_path_ab_vs_plain_ort() {
 
         unsafe {
             let info = query_ep_assignment(api, session);
+            let ours = info.ops_on_our_ep();
+            let theirs = info.ops_not_on_our_ep();
+            // Categorical, not statistical: N nodes in must give N nodes on
+            // our EP. It costs one comparison, it is immune to host noise,
+            // and it is the only thing standing between a per-node number and
+            // a denominator that was never true. `contains` used to be the
+            // whole check, and `contains` cannot tell 100 nodes from 1.
             assert!(
-                info.ops_on_our_ep().contains(&case.op),
-                "{}: not assigned to this EP, refusing to report a ratio",
+                ours.len() == case.expected_ep_nodes && theirs.is_empty(),
+                "{}: expected all {} node(s) on this EP, got {} ours {ours:?} and \
+                 {} elsewhere {theirs:?} — refusing to report a per-node ratio \
+                 against a denominator that is not what ran",
+                case.name,
+                case.expected_ep_nodes,
+                ours.len(),
+                theirs.len()
+            );
+            assert!(
+                ours.contains(&case.op),
+                "{}: node count matches but the op does not — got {ours:?}",
                 case.name
             );
 
