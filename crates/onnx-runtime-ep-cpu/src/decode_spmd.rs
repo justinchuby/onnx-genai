@@ -68,10 +68,10 @@
 //! under greedy decode.
 //!
 //! The worker count is
-//! [`crate::kernels::matmul_nbits::configured_persistent_decode_threads`] (one
-//! worker per *allowed physical core*, falling back to half the logical CPUs
-//! only when the core topology is undiscoverable); a `THREADS=0` opt-out leaves
-//! the decode path unchanged.
+//! [`crate::kernels::matmul_nbits::configured_persistent_decode_threads`].
+//! Shared-host `compact` leaves at least half the logical CPU capacity for the
+//! dispatcher and co-tenants; explicit `spread` restores the dedicated-host
+//! physical-core width. A `THREADS=0` opt-out leaves the decode path unchanged.
 //!
 //! # Precedence when on (default or `=1`) vs the affinity control
 //!
@@ -1747,6 +1747,13 @@ pub struct SpmdDecodePools {
     /// is the field #1792 needed and did not have: a pool could report
     /// `realized=16 as_requested` with a placement nothing had ever looked at.
     worker_placements: Vec<WorkerPlacement>,
+    /// Test-only helper-boundary counts for this pool's worker affinity setup.
+    ///
+    /// The counter is installed on each spawned worker while it runs, so calls
+    /// from concurrently executing tests cannot contaminate this pool's
+    /// evidence.
+    #[cfg(test)]
+    affinity_calls: Arc<crate::decode_affinity::AffinityCallCounter>,
     /// The allowed CPU that [`DISPATCHER_RESERVED_CPUS`] freed for the inline
     /// dispatcher, or `None` when the pool has no dispatcher shard or the
     /// reservation could not be located (unpinned workers, empty CPU list).
@@ -1997,6 +2004,8 @@ impl SpmdDecodePools {
         schedule: DecodeSchedule,
         dispatcher_shard: bool,
     ) -> Self {
+        #[cfg(test)]
+        let affinity_calls = Arc::new(crate::decode_affinity::AffinityCallCounter::default());
         let node_count = shards.len();
         let mut worker_node = Vec::new();
         let mut node_thread_counts = Vec::with_capacity(node_count);
@@ -2060,6 +2069,8 @@ impl SpmdDecodePools {
                 // Likewise: threads we neither spawned nor pinned have no
                 // placement of ours to observe.
                 worker_placements: Vec::new(),
+                #[cfg(test)]
+                affinity_calls,
                 total_workers: total_threads,
                 schedule,
                 // No inline dispatcher on this path, so nothing reserved one.
@@ -2123,11 +2134,18 @@ impl SpmdDecodePools {
         for (global_index, (node_position, cpu)) in assignment.into_iter().enumerate() {
             let shared = Arc::clone(&shared);
             let placements = Arc::clone(&placements);
+            #[cfg(test)]
+            let worker_affinity_calls = Arc::clone(&affinity_calls);
             let handle = thread::Builder::new()
                 .name(format!(
                     "{SPMD_THREAD_NAME_PREFIX}-n{node_position}-{global_index}"
                 ))
                 .spawn(move || {
+                    #[cfg(test)]
+                    let _affinity_call_counter =
+                        crate::decode_affinity::install_affinity_call_counter(
+                            worker_affinity_calls,
+                        );
                     let (attempt, observed) = match cpu {
                         None => (
                             PinAttempt::NotRequested,
@@ -2354,6 +2372,8 @@ impl SpmdDecodePools {
             worker_cpus,
             chunk_permutation: chunk_permutation(),
             worker_placements,
+            #[cfg(test)]
+            affinity_calls,
             dispatcher_cpu,
             dispatcher_tid: AtomicI64::new(0),
             dispatcher_observed_cpu: AtomicI64::new(-1),
@@ -2364,6 +2384,11 @@ impl SpmdDecodePools {
     /// Total decode workers across all node groups.
     pub fn total_workers(&self) -> usize {
         self.total_workers
+    }
+
+    #[cfg(test)]
+    fn affinity_call_counts(&self) -> crate::decode_affinity::AffinityCallCounts {
+        self.affinity_calls.snapshot()
     }
 
     /// How many *spawned* worker threads this pool has, excluding the inline
@@ -3765,7 +3790,8 @@ fn worker_loop(shared: Arc<SharedState>, global_index: usize) {
 }
 
 /// The process-wide persistent SPMD layout. `None` (once initialized) means the
-/// mode opted out or the safe auto-enable gate declined. Held at module scope so
+/// mode opted out, the configured width opted out, or a single-CPU cpuset could
+/// not safely host both a worker and the dispatcher. Held at module scope so
 /// [`shutdown_pools`] can *peek* (join the workers if the pool was ever built)
 /// without forcing a build.
 static POOLS: OnceLock<Option<SpmdDecodePools>> = OnceLock::new();
@@ -3984,9 +4010,9 @@ pub fn blocktime() -> Duration {
 /// with `=0` (which never reaches the latch in [`pools`]).
 static REQUESTED_WIDTH: OnceLock<Option<usize>> = OnceLock::new();
 
-/// The lazily built persistent SPMD layout, or `None` when the mode is opted out
-/// or the safe auto-enable gate declines. Built once and reused for the whole
-/// process.
+/// The lazily built persistent SPMD layout, or `None` when the mode/width opts
+/// out or the single-CPU safety fallback applies. Built once and reused for the
+/// whole process.
 pub fn pools() -> Option<&'static SpmdDecodePools> {
     POOLS
         .get_or_init(|| {
@@ -4042,9 +4068,9 @@ pub fn shutdown_pools() {
 
 /// Resolve the persistent pool's worker count. Honors `ONNX_GENAI_CPU_DECODE_THREADS`
 /// when set (`0` opts out); when unset it uses the persistent-specific default
-/// (half the logical capacity under shared-host compact placement, or one
-/// worker per allowed physical core under explicit spread), *not* the flat
-/// pool's eight-worker ceiling -- see
+/// (a dispatcher-inclusive half-logical budget under shared-host compact
+/// placement, or one worker per allowed physical core under explicit spread),
+/// *not* the flat pool's eight-worker ceiling -- see
 /// [`crate::kernels::matmul_nbits::configured_persistent_decode_threads`].
 fn default_threads() -> Option<usize> {
     crate::kernels::matmul_nbits::configured_persistent_decode_threads()
@@ -4229,7 +4255,8 @@ pub fn build_from_env(threads: Option<usize>) -> Option<SpmdDecodePools> {
         return None;
     }
     report_pool_built(mode);
-    let shards = node_shards(total);
+    let mut shards = node_shards(total);
+    let dispatcher_only = reserve_tiny_shared_default_for_dispatcher(&mut shards, total);
     // The dispatcher computes a shard exactly when the headroom reservation took
     // a worker away to keep its CPU free. Then `total - 1` pinned threads plus
     // the dispatcher give `total` compute lanes on `total` CPUs -- the requested
@@ -4247,8 +4274,30 @@ pub fn build_from_env(threads: Option<usize>) -> Option<SpmdDecodePools> {
     // shard's weights across sockets; those layouts keep the previous behavior.
     Some(SpmdDecodePools::build(
         &shards,
-        dispatcher_owns_a_shard(&shards, total),
+        dispatcher_only || dispatcher_owns_a_shard(&shards, total),
     ))
+}
+
+/// Keep a two-CPU compact default genuinely shared-host-safe.
+///
+/// One spawned worker plus the inline dispatcher are two runnable threads and
+/// consume the entire restricted cpuset. The automatic compact policy keeps its
+/// one compute lane but assigns it to the dispatcher instead, leaving one CPU
+/// available to a co-tenant. Explicit widths and explicit `spread` retain their
+/// requested/dedicated behavior.
+fn reserve_tiny_shared_default_for_dispatcher(shards: &mut [NodeShard], requested: usize) -> bool {
+    if requested != 1
+        || !crate::kernels::matmul_nbits::persistent_decode_threads_are_automatic()
+        || crate::decode_affinity::CorePlacement::from_env()
+            != crate::decode_affinity::CorePlacement::Compact
+        || !crate::decode_affinity::allowed_cpus().is_some_and(|cpus| cpus.len() == 2)
+        || shards.len() != 1
+        || shards[0].workers != 1
+    {
+        return false;
+    }
+    shards[0].workers = 0;
+    true
 }
 
 /// Whether the inline dispatcher should own a compute shard.
@@ -4487,11 +4536,11 @@ fn node_shards_with(
 /// costs one worker's share of a bandwidth-bound loop while removing the
 /// starvation cliff.
 ///
-/// This used to be justified by the workers plateauing "around half the logical
-/// CPUs", which stopped being the sizing rule when the default became one worker
-/// per allowed physical core: on a non-SMT host the pool is now deliberately
-/// wide enough that this reserve is what keeps it from being *fully*
-/// subscribed.
+/// Under the shared-host default, the automatic width already accounts for the
+/// dispatcher and leaves at least half the logical capacity outside the active
+/// decode threads. Explicit widths and explicit `spread` may be wider; this
+/// reserve is the final anti-starvation guard when either would otherwise fully
+/// subscribe a worker group.
 const DISPATCHER_RESERVED_CPUS: usize = DEFAULT_SERVICE_CPUS_PER_NUMA_NODE;
 
 /// Opt-in: bind the inline dispatcher to the CPU [`DISPATCHER_RESERVED_CPUS`]
@@ -5394,6 +5443,21 @@ mod tests {
             workers: threads,
         }];
         SpmdDecodePools::build_with_schedule(&shards, DecodeSchedule::Fixed, true)
+    }
+
+    #[test]
+    fn dispatcher_only_pool_runs_its_single_lane_inline() {
+        let pool = dispatcher_shard_pool(0);
+        assert_eq!(pool.total_workers(), 1);
+        assert_eq!(pool.spawned_workers(), 0);
+        let mut output = vec![0.0; 4];
+        pool.dispatch_output_rows(&mut output, 32, &|start, rows| {
+            for (offset, row) in rows.iter_mut().enumerate() {
+                *row = (start + offset) as f32;
+            }
+        });
+        assert_eq!(output, vec![0.0, 1.0, 2.0, 3.0]);
+        pool.shutdown();
     }
 
     #[test]
@@ -7878,6 +7942,16 @@ mod tests {
         )
         .expect("`off` is an explicit request");
         let pools = SpmdDecodePools::build_with_schedule(&shards, DecodeSchedule::Fixed, false);
+        let off_calls = pools.affinity_call_counts();
+        eprintln!(
+            "affinity-helper-calls mode=off pin={} set={} readback={}",
+            off_calls.pin, off_calls.set, off_calls.readback
+        );
+        assert_eq!(
+            off_calls,
+            crate::decode_affinity::AffinityCallCounts::default(),
+            "explicit `off` must make zero pin, set-mask, and read-back helper calls"
+        );
         assert!(
             pools
                 .worker_placements()
@@ -7926,18 +8000,52 @@ mod tests {
         }
         pools.shutdown();
 
+        let target = allowed.first().copied().unwrap_or(0);
+        let pinned = SpmdDecodePools::build_with_schedule(
+            &[NodeShard {
+                index: 0,
+                cpus: vec![target],
+                workers: 1,
+            }],
+            DecodeSchedule::Fixed,
+            false,
+        );
+        let pinned_calls = pinned.affinity_call_counts();
+        eprintln!(
+            "affinity-helper-calls mode=pinned pin={} set={} readback={}",
+            pinned_calls.pin, pinned_calls.set, pinned_calls.readback
+        );
+        assert_eq!(
+            pinned_calls,
+            crate::decode_affinity::AffinityCallCounts {
+                pin: 1,
+                set: 0,
+                readback: 1,
+            },
+            "the positive control must cross both worker affinity helper boundaries"
+        );
+
+        let set_calls = Arc::new(crate::decode_affinity::AffinityCallCounter::default());
+        crate::decode_affinity::with_affinity_call_counter(Arc::clone(&set_calls), || {
+            let _ = crate::decode_affinity::set_current_thread_affinity(&[]);
+        });
+        let set_calls = set_calls.snapshot();
+        eprintln!(
+            "affinity-helper-calls mode=set-control pin={} set={} readback={}",
+            set_calls.pin, set_calls.set, set_calls.readback
+        );
+        assert_eq!(
+            set_calls,
+            crate::decode_affinity::AffinityCallCounts {
+                pin: 0,
+                set: 1,
+                readback: 0,
+            },
+            "the set-mask boundary counter must move even when the setter rejects the request"
+        );
+
         #[cfg(target_os = "linux")]
-        if allowed.len() > 1 && environment_can_pin(&[allowed[0]]) {
-            let target = allowed[0];
-            let pinned = SpmdDecodePools::build_with_schedule(
-                &[NodeShard {
-                    index: 0,
-                    cpus: vec![target],
-                    workers: 1,
-                }],
-                DecodeSchedule::Fixed,
-                false,
-            );
+        if allowed.len() > 1 && environment_can_pin(&[target]) {
             let tid = pinned.worker_placements()[0]
                 .tid
                 .expect("the pinned control worker must publish its TID");
@@ -7951,8 +8059,8 @@ mod tests {
                 Some(allowed),
                 "the positive control cannot distinguish a pin from explicit `off`"
             );
-            pinned.shutdown();
         }
+        pinned.shutdown();
     }
 
     /// Read one live spawned worker's actual affinity mask by OS TID.

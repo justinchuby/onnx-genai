@@ -4,8 +4,9 @@
 //!
 //! 1. The affinity/logical-CPU capacity, `available_parallelism` quota, physical
 //!    core topology, placement policy, and architecture cap produce one
-//!    **global** worker budget. Compact keeps at least half the logical capacity
-//!    free; explicit spread may use one worker per physical core.
+//!    **global** worker budget. Compact counts the inline dispatcher as an
+//!    active decode thread and keeps at least half the logical capacity free;
+//!    explicit spread may use one worker per physical core.
 //! 2. That budget is distributed across the usable NUMA nodes, then each fully
 //!    subscribed node gives up its configured service-core reserve.
 //!
@@ -92,7 +93,13 @@ pub(crate) fn resolve_default_pool_width(
             None => topology.core_count(),
         })
         .filter(|cores| *cores > 0);
-    let shared_host_width = (logical_capacity / 2).max(1);
+    // The dispatcher publishes every op and spin-waits for completion, so it
+    // consumes scheduling capacity even when it owns no compute shard. Budget
+    // spawned workers from the capacity left after that thread, keeping at
+    // least floor(logical_capacity / 2) CPUs available to co-tenants. The
+    // single-worker floor covers unknown/tiny capacity; the exact two-CPU mask
+    // is converted to a dispatcher-only lane below.
+    let shared_host_width = (logical_capacity.saturating_sub(1) / 2).max(1);
     let topology_width = match (physical_cores, inputs.placement) {
         (Some(cores), CorePlacement::Compact) => cores.min(shared_host_width),
         (Some(cores), CorePlacement::Spread) => cores,
@@ -112,7 +119,7 @@ pub(crate) fn resolve_default_pool_width(
         });
     }
 
-    let layout = resolve_pool_layout(PoolLayoutInputs {
+    let mut layout = resolve_pool_layout(PoolLayoutInputs {
         requested_workers: global_workers,
         allowed_cpus: inputs.allowed_cpus,
         core_topology: inputs.core_topology,
@@ -120,6 +127,20 @@ pub(crate) fn resolve_default_pool_width(
         available_parallelism: inputs.available_parallelism,
         service_cpus_per_numa_node: inputs.service_cpus_per_numa_node,
     });
+    // With exactly two allowed CPUs, even one spawned worker plus the inline
+    // dispatcher consumes the whole cpuset. The compact automatic policy keeps
+    // one compute lane but lets the dispatcher own it, leaving the other CPU
+    // available to a co-tenant. A one-CPU mask still uses the explicit flat
+    // fallback above.
+    if inputs.placement == CorePlacement::Compact
+        && inputs.allowed_cpus.is_some_and(|cpus| cpus.len() == 2)
+        && global_workers == 1
+        && layout.shards.len() == 1
+        && layout.shards[0].workers == 1
+    {
+        layout.shards[0].workers = 0;
+        layout.dispatcher_owns_shard = true;
+    }
     Some(DefaultPoolWidthPlan {
         physical_cores,
         global_workers,
@@ -242,11 +263,11 @@ mod tests {
             None,
             CorePlacement::Compact,
         );
-        assert_eq!(compact.global_workers, 48);
+        assert_eq!(compact.global_workers, 47);
         assert_eq!(
             compact.realized_workers(),
-            48,
-            "the shared-host policy must leave half of a one-CPU-per-core cpuset free"
+            47,
+            "47 workers plus the dispatcher must leave half of a 96-CPU cpuset free"
         );
 
         let spread = plan(
@@ -271,7 +292,7 @@ mod tests {
         let cores = no_smt(96);
         let four_nodes = numa((0..4).map(|node| (node, (node * 24..(node + 1) * 24).collect())));
         let cases = [
-            ("quota-below-topology", 4, None, 2, 2),
+            ("quota-below-topology", 4, None, 1, 1),
             ("quota-one", 1, None, 1, 1),
             ("linux-aarch64-over-eight", 96, Some(8), 8, 8),
         ];
@@ -302,10 +323,10 @@ mod tests {
             Some(8),
             CorePlacement::Compact,
         );
-        assert_eq!(plan.global_workers, 3);
+        assert_eq!(plan.global_workers, 2);
         assert_eq!(
             plan.realized_workers(),
-            3,
+            2,
             "the architecture ceiling must not inflate the shared-host half-capacity budget"
         );
     }
@@ -324,10 +345,10 @@ mod tests {
             CorePlacement::Compact,
         );
         assert_eq!(
-            plan.global_workers, 4,
-            "the architecture ceiling must not inflate a four-physical-core topology to eight"
+            plan.global_workers, 3,
+            "three workers plus the dispatcher leave half of eight logical CPUs free"
         );
-        assert_eq!(plan.realized_workers(), 4);
+        assert_eq!(plan.realized_workers(), 3);
     }
 
     #[test]
@@ -349,13 +370,13 @@ mod tests {
             CorePlacement::Compact,
         );
         assert_eq!(plan.physical_cores, Some(4));
-        assert_eq!(plan.global_workers, 2);
-        assert_eq!(plan.realized_workers(), 2);
+        assert_eq!(plan.global_workers, 1);
+        assert_eq!(plan.realized_workers(), 1);
         let DefaultPoolDisposition::Pool(layout) = plan.disposition else {
             panic!("a four-CPU sparse mask must build a pool");
         };
-        assert_eq!(layout.shards[0].cpus, vec![1, 2]);
-        assert_eq!(layout.shards[1].cpus, vec![101, 103]);
+        assert_eq!(layout.shards.len(), 1);
+        assert_eq!(layout.shards[0].cpus, allowed);
     }
 
     #[test]
@@ -371,7 +392,7 @@ mod tests {
             None,
             CorePlacement::Compact,
         );
-        assert_eq!(plan.global_workers, 5);
+        assert_eq!(plan.global_workers, 4);
         assert_eq!(plan.realized_workers(), 3);
         let DefaultPoolDisposition::Pool(layout) = plan.disposition else {
             panic!("a two-node host must build a split pool");
@@ -387,12 +408,33 @@ mod tests {
     }
 
     #[test]
-    fn unknown_topology_keeps_the_historical_half_logical_fallback() {
+    fn unknown_topology_still_accounts_for_the_dispatcher() {
         let allowed: Vec<usize> = (0..16).collect();
         let plan = plan(Some(&allowed), None, None, 16, None, CorePlacement::Compact);
         assert_eq!(plan.physical_cores, None);
-        assert_eq!(plan.global_workers, 8);
-        assert_eq!(plan.realized_workers(), 8);
+        assert_eq!(plan.global_workers, 7);
+        assert_eq!(plan.realized_workers(), 7);
+    }
+
+    #[test]
+    fn two_cpu_compact_default_is_dispatcher_only() {
+        let allowed = [0, 2];
+        let cores = no_smt(2);
+        let plan = plan(
+            Some(&allowed),
+            Some(&cores),
+            None,
+            2,
+            None,
+            CorePlacement::Compact,
+        );
+        assert_eq!(plan.global_workers, 1);
+        assert_eq!(plan.realized_workers(), 1);
+        let DefaultPoolDisposition::Pool(layout) = plan.disposition else {
+            panic!("two allowed CPUs must retain one inline compute lane");
+        };
+        assert!(layout.dispatcher_owns_shard);
+        assert_eq!(layout.shards[0].workers, 0);
     }
 
     #[test]

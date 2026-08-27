@@ -38,6 +38,101 @@
 
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
+#[cfg(test)]
+use std::{
+    cell::RefCell,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct AffinityCallCounts {
+    pub(crate) pin: usize,
+    pub(crate) set: usize,
+    pub(crate) readback: usize,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct AffinityCallCounter {
+    pin: AtomicUsize,
+    set: AtomicUsize,
+    readback: AtomicUsize,
+}
+
+#[cfg(test)]
+impl AffinityCallCounter {
+    pub(crate) fn snapshot(&self) -> AffinityCallCounts {
+        AffinityCallCounts {
+            pin: self.pin.load(Ordering::Relaxed),
+            set: self.set.load(Ordering::Relaxed),
+            readback: self.readback.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static AFFINITY_CALL_COUNTER: RefCell<Option<Arc<AffinityCallCounter>>> =
+        const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+struct AffinityCallCounterGuard(Option<Arc<AffinityCallCounter>>);
+
+#[cfg(test)]
+impl Drop for AffinityCallCounterGuard {
+    fn drop(&mut self) {
+        AFFINITY_CALL_COUNTER.with(|slot| {
+            slot.replace(self.0.take());
+        });
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn install_affinity_call_counter(counter: Arc<AffinityCallCounter>) -> impl Drop {
+    let previous = AFFINITY_CALL_COUNTER.with(|slot| slot.replace(Some(counter)));
+    AffinityCallCounterGuard(previous)
+}
+
+#[cfg(test)]
+pub(crate) fn with_affinity_call_counter<T>(
+    counter: Arc<AffinityCallCounter>,
+    f: impl FnOnce() -> T,
+) -> T {
+    let _guard = install_affinity_call_counter(counter);
+    f()
+}
+
+#[cfg(test)]
+fn record_pin_call() {
+    AFFINITY_CALL_COUNTER.with(|slot| {
+        if let Some(counter) = slot.borrow().as_ref() {
+            counter.pin.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+}
+
+#[cfg(test)]
+fn record_set_call() {
+    AFFINITY_CALL_COUNTER.with(|slot| {
+        if let Some(counter) = slot.borrow().as_ref() {
+            counter.set.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+}
+
+#[cfg(test)]
+fn record_readback_call() {
+    AFFINITY_CALL_COUNTER.with(|slot| {
+        if let Some(counter) = slot.borrow().as_ref() {
+            counter.readback.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+}
 
 /// Selects how the decode pool binds its workers to CPUs.
 ///
@@ -221,7 +316,7 @@ impl DecodeAffinity {
     /// single, consistent, actionable diagnostic (see [`Self::resolve`]).
     pub fn from_env() -> std::result::Result<Self, String> {
         let raw = std::env::var(DECODE_AFFINITY_ENV).ok();
-        Self::resolve(raw.as_deref(), NumaTopology::detect().as_ref())
+        resolve_scheduler_affinity(raw.as_deref())
     }
 
     /// Parse `raw` and validate it against `topology`, producing one consistent
@@ -254,6 +349,21 @@ impl DecodeAffinity {
                 topology,
             )),
         }
+    }
+}
+
+fn resolve_scheduler_affinity(raw: Option<&str>) -> std::result::Result<DecodeAffinity, String> {
+    #[cfg(not(miri))]
+    {
+        DecodeAffinity::resolve(raw, NumaTopology::detect().as_ref())
+    }
+    #[cfg(miri)]
+    {
+        // Miri aborts on filesystem directory iteration, so it cannot discover
+        // Linux NUMA nodes. Resolve against an unavailable topology instead:
+        // malformed values and node selectors still fail loudly, while
+        // topology-independent values need no host probe.
+        DecodeAffinity::resolve(raw, None)
     }
 }
 
@@ -516,6 +626,8 @@ fn build_cpu_mask(cpu: usize) -> Option<Vec<libc::c_ulong>> {
 /// but never aborts decode.
 #[cfg(target_os = "linux")]
 pub fn pin_current_thread_to_cpu(cpu: usize) -> std::result::Result<(), String> {
+    #[cfg(test)]
+    record_pin_call();
     // Size the mask from `cpu` itself so a large CPU index can never index past
     // a fixed 1024-bit `cpu_set_t`; on overflow we fall back to unpinned.
     let mask = build_cpu_mask(cpu)
@@ -539,6 +651,8 @@ pub fn pin_current_thread_to_cpu(cpu: usize) -> std::result::Result<(), String> 
 
 #[cfg(target_os = "windows")]
 pub fn pin_current_thread_to_cpu(cpu: usize) -> std::result::Result<(), String> {
+    #[cfg(test)]
+    record_pin_call();
     windows_imp::pin_current_thread_to_cpu(cpu)
 }
 
@@ -551,6 +665,8 @@ pub fn pin_current_thread_to_cpu(cpu: usize) -> std::result::Result<(), String> 
 /// never builds a pinning pool there.
 #[cfg(target_os = "macos")]
 pub fn pin_current_thread_to_cpu(cpu: usize) -> std::result::Result<(), String> {
+    #[cfg(test)]
+    record_pin_call();
     Err(format!(
         "thread-to-core affinity is not supported on macOS; \
          decode worker for cpu {cpu} runs unpinned (no-op)"
@@ -562,6 +678,8 @@ pub fn pin_current_thread_to_cpu(cpu: usize) -> std::result::Result<(), String> 
 /// not reached in practice because [`pinning_supported`] gates it off.
 #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
 pub fn pin_current_thread_to_cpu(cpu: usize) -> std::result::Result<(), String> {
+    #[cfg(test)]
+    record_pin_call();
     Err(format!(
         "thread-to-core affinity is not implemented on this platform; \
          decode worker for cpu {cpu} runs unpinned (no-op)"
@@ -602,6 +720,8 @@ fn build_cpu_mask_multi(cpus: &[usize]) -> Option<Vec<libc::c_ulong>> {
 /// cgroup) is reported so the caller can log it, but never aborts inference.
 #[cfg(target_os = "linux")]
 pub fn set_current_thread_affinity(cpus: &[usize]) -> std::result::Result<(), String> {
+    #[cfg(test)]
+    record_set_call();
     if cpus.is_empty() {
         return Err("cannot set CPU affinity to an empty CPU set".to_string());
     }
@@ -629,6 +749,8 @@ pub fn set_current_thread_affinity(cpus: &[usize]) -> std::result::Result<(), St
 /// so this is a documented no-op that reports the reason for the caller to log.
 #[cfg(not(target_os = "linux"))]
 pub fn set_current_thread_affinity(cpus: &[usize]) -> std::result::Result<(), String> {
+    #[cfg(test)]
+    record_set_call();
     let _ = cpus;
     Err("process-wide CPU affinity masking is only implemented on Linux (no-op)".to_string())
 }
@@ -932,6 +1054,8 @@ pub const fn affinity_observation_supported() -> bool {
 /// Windows `GetThreadGroupAffinity(GetCurrentThread(), ..)` both scope to the
 /// caller, so this must be called *on* the thread being asked about.
 pub fn observe_current_thread_cpus() -> ObservedAffinity {
+    #[cfg(test)]
+    record_readback_call();
     #[cfg(all(target_os = "linux", not(miri)))]
     {
         match linux_thread_cpus() {
@@ -1511,6 +1635,20 @@ mod windows_imp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(miri)]
+    #[test]
+    fn miri_scheduler_validation_needs_no_topology_directory_walk() {
+        assert_eq!(
+            resolve_scheduler_affinity(None).unwrap(),
+            DecodeAffinity::Off
+        );
+        for invalid in ["typo", "node:not-a-number", "node:0"] {
+            let message = resolve_scheduler_affinity(Some(invalid)).unwrap_err();
+            assert!(message.contains(DECODE_AFFINITY_ENV), "{message}");
+            assert!(message.contains("accepted modes"), "{message}");
+        }
+    }
 
     /// The support flag must not claim less than the call delivers.
     ///
