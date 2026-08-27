@@ -2162,18 +2162,6 @@ impl CudaWeightPage {
         Self::upload_async_inner(runtime, dtype, shape, bytes, staging, None)
     }
 
-    #[cfg(test)]
-    pub(crate) fn upload_async_queued(
-        runtime: &Arc<CudaRuntime>,
-        dtype: DataType,
-        shape: Vec<usize>,
-        bytes: &[u8],
-        staging: PinnedStaging,
-        queue: Arc<CudaDeferredReleaseQueue>,
-    ) -> Result<(Self, u64, PinnedStaging), WeightHandleError> {
-        Self::upload_async_inner(runtime, dtype, shape, bytes, staging, Some(queue))
-    }
-
     fn upload_async_inner(
         runtime: &Arc<CudaRuntime>,
         dtype: DataType,
