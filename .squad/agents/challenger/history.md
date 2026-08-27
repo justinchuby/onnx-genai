@@ -42,3 +42,8 @@ three files as `4a16925a88`. PR #31973 and #31974 both marked ready for review.
 
 **Board state:** #762 ready · #31985 merged · #31973 ready · #31974 ready · #32001 ready
 · #32003 ready · #31993 draft · #31988 draft (parked)
+
+
+## 2026-08-26 — #1896 impossibility proof independently verified
+
+Independently verified Sebastian's same-schedule impossibility proof and prescribed a layered contract: dispatcher semantics, structural production reachability, positive CUDA execution, and separate apparatus validation. This prevented a false deterministic mutation claim from becoming the acceptance bar.

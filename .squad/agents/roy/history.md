@@ -37,3 +37,8 @@ Fixed stale SHAs and corrected CUDA status terminology after B1-B4 fixes landed.
 
 ### 2026-08-11 — Session update (Scribe append)
 PR #762 marked ready-for-review. 15 CI checks green. Upstream PRs #31973 and #31974 marked ready-for-review. `.squad/` git history purge complete on both upstream branches.
+
+
+## 2026-08-26 — #1896 isolated-wait revision superseded
+
+Roy isolated the wait selector, but the revision still changed the host schedule and its capture census missed transitive runtime synchronization. The fixed-schedule deterministic-POISON claim was later disproved; use the accepted layered proof instead of manufacturing a reverse ordering.

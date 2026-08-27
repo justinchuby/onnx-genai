@@ -52,3 +52,11 @@ Older entries in `history-archive.md`.
 ## 2026-08-12 — PR #762 final items (ort_discovery + validate_write_dtype docs)
 
 Consolidated `find_ort_lib_dir` into `tests/common/ort_discovery.rs`; all three integration test files use `#[path]` include. `validate_write_dtype` documented as test-only contract helper. 283 passed / 0 failed; clippy clean; fmt clean. Closed both substantive items Gaff flagged. PR #762 marked ready for review.
+
+## 2026-08-25 — GPU integration-suite parallel isolation (PR #2184)
+
+Independently revised MHA/DFT/STFT after final-audit rejection. Added one poison-tolerant target-local process mutex per integration binary and acquired it first in every test, covering EP construction, execution, process-global telemetry, assertions, and teardown. Extended `verify_cuda_test_honesty.py` with a fail-closed structural census plus hermetic mutation fixtures.
+
+Baseline default-parallel reproduced at MHA 5/9, DFT 4/7, STFT 4/9. Revised targets passed 3 default-parallel repetitions (75/75 total), serial 25/25, and no-`gpu-tests` inventory 34/34 ignored including unchanged NMS. Actual one-acquisition removal was rejected by the source scan. Both exact CUDA Clippy configurations passed with `-D warnings`; Rust formatting passed all 60 workspace packages package-by-package (literal `cargo fmt --all -- --check` hit Windows OS error 206). The earlier implementation commit `69c4280fed45d04caa8e7d3cd00defe27ca07fd9` (`test(cuda): isolate resource-sensitive GPU suites`, parent `97353d5a7a12af5769aff09944027cc34b6342bc`) is absent from GitHub's final three-commit PR source list and is not the final PR head.
+
+**Merge metadata:** GitHub reports PR #2184 merged at `2026-08-26T08:21:44Z`. Its final source-branch head was `7262498d11a601e10d4fa7b1bb1fba16c331bb58`; GitHub squash-merged the PR as `5c2851c45874eab2c21795b297e00d76da1be8f2` onto base `61adbaf71a3bc5255a56437638a6256c47539c49`. These hashes identify different contexts: the source branch tip and the resulting mainline squash commit.

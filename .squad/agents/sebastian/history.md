@@ -45,3 +45,8 @@ Dispatched to benchmark Qwen3.8-27B int4 batch=1 decode on native CUDA EP versus
 ## 2026-08-20T05:50:19+00:00 — Phase-4 q38 integration validation closed
 
 Scribe recorded Sebastian's Phase-4 benchmark/revalidation: initial q38 baseline was **52.6 tok/s** and #1557 alone lifted current-main to **54.56 tok/s**, correcting the earlier host-argmax thesis. Integrated #1561+#1562 then measured q38 **54.56→61.32 tok/s (+12.4%)** and mary **58.81→60.59 tok/s (+3.0%)**. mary was byte-identical; q38 differences were intrinsic razor-thin argmax tie flips from split-K GEMV accumulation, not a regression. Standing next lever is int4 M=1 GEMV toward bandwidth-bound execution; q38 remains ~**2.45×** short of 150 tok/s and still lacks a deterministic golden oracle.
+
+
+## 2026-08-26 — #1896 impossibility proof and capture census
+
+Proved that deleting only `cuStreamWaitEvent` under one identical fixed schedule cannot deterministically reverse H2D/consumer order: deletion removes an edge but cannot create the reverse edge without making the normal graph cyclic. Also fixed capture safety to account for transitive runtime synchronizers.
