@@ -968,6 +968,43 @@ python3 scripts/ort_ab/ab.py --native-only --null-control \
 these cells a paired run depressed the native median by up to 6x and pushed the null control past the
 effect being measured.
 
+**Matching the widths does not make a paired run safe (2026-08-27).** #1839 removed the *count*
+half of that bias — `resolve_ort_intra_threads` now sizes ORT's pool to the native budget — and the
+guard it shipped with is silent once the widths agree. Prompted by a cross-agent report, the
+placement half was measured directly, reading `Cpus_allowed_list` per thread from `/proc` on a live
+paired run at `--native-threads 8`: **8 ORT threads on `0-31` against every native thread on
+`0,2,4,6,8,10,12,14`**. `bench_generic` builds the ORT session *before* `InferenceSession::load`
+reaches `bound_process_to_decode_budget`, so ORT's pool inherits the startup mask and the native
+arm inherits the confined one. Equal count, unequal set — and ORT spins between runs, so a share of
+that spin lands on exactly the CPUs being timed:
+
+| arm (`gemm_nbits_llama3_8b_qkv_t8`, width 8, 40 runs, medians of 4) | native p50 | vs reference |
+|---|---|---|
+| `--native-only` (no ORT session exists) | 2.11 ms | reference |
+| paired, equal width, ORT unconfined | 2.78 ms | **+32%** |
+| paired, equal width, ORT spin disabled | 2.26 ms | +7% |
+
+So ~78% of the residue is idle spin, and the overlap predicts its size: 8 spinners over 32 CPUs put
+~2 CPUs' worth of load on the native arm's 8, and 2/8 ≈ 25% against a measured 32%.
+
+Three findings worth more than the patch. First, **the obvious remedy is the harmful one** —
+`taskset`-ing both arms onto the same 8 CPUs, to "make it symmetric", concentrates every ORT spinner
+onto the measured cores: native 2.9–3.8 ms became **13.6–18.0 ms (5x worse)** while ORT got ~2x
+faster. Symmetry of the mask is not symmetry of the interference. Second, **the asymmetry inverts
+with width**: at `--native-threads 32` it is ORT that pins one thread per CPU while the native arm
+floats across all 32, so its direction cannot be inferred from one row. Third, the predicted
+mechanism was **absent** where it was expected — a native-only A/B between a confined set containing
+this host's permanently-busy cpu0 and a clean set of the same width and topology showed no penalty
+(prod median 1.98 ms vs clean 2.15 ms), because the prefill pool work-*steals* rather than statically
+partitioning, so one slow lane is absorbed rather than stalling a barrier. That is the negative
+result that keeps the positive one honest: the tax is the co-tenant's spin, not the mask's
+membership.
+
+Shipped as a second warning (`ort_spin_overlap_warning`) keyed on the *span* rather than the width,
+verified to fire on the biased run and stay silent under `--native-only` and on an unconfined host.
+Left as a warning, not a default: disabling ORT's spin would measure ORT in a configuration nobody
+ships, trading a bias against the native arm for one against ORT.
+
 ### 9. The int4 prefill's fused dequant pack was scalar, and its row gate was measured against it (**fixed**)
 
 Section 5 fused the dequantization into the GEBP pack, so the f32 weight is never materialized: at
@@ -3276,6 +3313,66 @@ Full report:
   `int4_modulo_arms.sh` additionally **fails hard if two arms come out
   byte-identical** — that failure still produces a full table of numbers, every
   one of them a null between a binary and itself.
+* **The whole matrix was quiet-host-only evidence, and now is not (2026-08-27).**
+  Every number above was taken pinned to an idle core behind two gates whose
+  purpose is to *discard* any launch that was not alone on it. The recorded
+  correction on #1729 says that is not sufficient for something that ships as a
+  default: "a policy that wins only under exclusive quiet-host conditions is
+  not a valid default." The eliminated modulo is on by default with no opt-out,
+  so it owed that evidence. `int4_modulo_matrix.py --co-tenant {smt,dram}` now
+  supplies it by **injecting** contention instead of gating it out — a pinned
+  spinner on the measured core's SMT sibling, or eight pinned streaming hogs on
+  other physical cores — against a rule fixed before the first contended
+  launch. Result: **PASS in both regimes**, on prefill and on decode, and the
+  two move in opposite directions in the way the mechanism predicts. Under SMT
+  the win roughly **doubles** — 1.0041 → 1.0089 at prefill `m = 1`, and
+  **1.0095 → 1.0224** on the decode loop, intervals non-overlapping in both —
+  because the eliminated work is integer-division issue and a sibling competes
+  for exactly those slots. Under DRAM starvation it **fades to a null**
+  (prefill 0.9975 / 0.9991; decode 1.0038 [0.9956, 1.0155]), because a fixed
+  ALU saving disappears into a memory stall. No
+  interval anywhere is below 1.000. The `dram` `m = 16` cell reads 1.0066 but
+  its own A/A is 1.0054, so it is reported as no resolvable effect rather than
+  a gain — that regime's floor is ~4x the quiet host's.
+  Two things generalise past this patch. First, **a co-tenant arm has to be
+  gate-*inverted*, not gate-removed**: an arm whose injected load silently
+  failed to start is a quiet-host arm wearing a busy-host heading, and it
+  passes clean and reads identically in the artifact, which is the exact number
+  the arm exists to replace. Each contended launch therefore proves its own
+  contention against a floor, and the gates still meaningful in that mode keep
+  firing — a stray competitor on the sibling still voids a `dram` launch.
+  Second, the host lock and the injected load are not alternatives: the lock is
+  what makes the co-tenant a *controlled* variable rather than the uncontrolled
+  one every other gate here exists to reject. This is #1802 item 4 ("both arms
+  in the gates") delivered for this harness, and the arm is reusable by anyone
+  else who owes busy-host evidence for a default.
+* **The pin is now verified rather than assumed (2026-08-27).** Every row in
+  that matrix is labelled `cpu4`, and that label rested entirely on the
+  `taskset` in the launch line. `taskset` is not a bound — it is one
+  `sched_setaffinity` call, and the pinned process can make another — so
+  #1812's finding that `ONNX_GENAI_CPU_DECODE_THREADS=N` confines a process to
+  N cpus of the *pool's* choosing is a live hazard for a harness that sets that
+  variable on every decode launch. Measured directly, reading each thread's
+  allowed mask back from `/proc`: at `taskset -c 4` with width 1 every thread
+  is `allowed=4` and runs on 4 (`path=flat`, `PIN-OFF`); at `-c 4-7` width 4
+  the pool stays inside the mask; at `-c 4` width 4 it **clamps to
+  `realized=1` and prints `WIDTH-MISMATCH`** instead of escaping. The pin held,
+  the rows are measured where they claim, and the clamp is the #1802-shaped
+  behaviour, now held by a test. The width=1 result also closes the exposure
+  #1812 raises for this file's rows specifically: that amplification needs a
+  barrier across a multi-cpu set, and a single-cpu `flat` launch has none,
+  while a foreign thread on the pinned cpu drops `(utime+stime)/wall` below the
+  floor and is discarded per launch. It does reach **wider** assignments, where
+  a flat `0.95` floor is the wrong instrument — a 2-wide launch that kept both
+  cpus scores ~2.00 and #1812's contaminated one scores 1.02, so the floor now
+  scales with the assignment (at one cpu it still returns 0.95 and changes no
+  decision, keeping these rows comparable). Both checks were wrong on the first
+  attempt and the controls are what said so: mutation testing killed a verdict
+  on last-run cpu (which lags `sched_setaffinity` and would abort correct
+  runs), and a positive control — a child that widens its own mask 300ms in —
+  returned `conformant` from a probe that stopped sampling at its first read.
+  **A check that has only ever said "conformant" has not been shown to be a
+  check**, which is the same argument as the vacuous-guard rule one level up.
 * **Disposition: no kernel change.** #1809's code was already correct and
   already on main. What shipped is the corrected scope, the per-row route
   fingerprint, the bootstrap and A/A self-check, and the two scripts that make

@@ -89,6 +89,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 import unittest
 import unittest.mock
 from pathlib import Path
@@ -2640,7 +2641,7 @@ class GateAdmission(unittest.TestCase):
             first_touch = seen.count(arm) == 1
             eff = 0.10 if (arm == starved and first_touch) else 0.99
             rows = {1: {"steady_ms": 1.0, "cold_ms": 2.0, "fnv": "abcd"}}
-            return rows, eff, 0.0
+            return rows, eff, 0.0, None
 
         with unittest.mock.patch.object(m, "launch", fake_launch):
             _table, adm = m.prefill_matrix(rounds, 16, "shape", [1])
@@ -2665,7 +2666,7 @@ class GateAdmission(unittest.TestCase):
         m = self._harness()
 
         def all_starved(binary, env_extra, timeout=1800):
-            return {1: {"steady_ms": 1.0, "cold_ms": 2.0, "fnv": "abcd"}}, 0.10, 0.0
+            return {1: {"steady_ms": 1.0, "cold_ms": 2.0, "fnv": "abcd"}}, 0.10, 0.0, None
 
         with unittest.mock.patch.object(m, "launch", all_starved):
             with self.assertRaises(SystemExit) as caught:
@@ -2691,7 +2692,7 @@ class GateAdmission(unittest.TestCase):
         def only_before_starved(binary, env_extra, timeout=1800):
             arm = Path(binary).name.replace("decode_", "")
             eff = 0.10 if arm == "before" else 0.99
-            return {"steady": 1.0, "cold": 2.0, "checksum": "x", "raw": "r"}, eff, 0.0
+            return {"steady": 1.0, "cold": 2.0, "checksum": "x", "raw": "r"}, eff, 0.0, None
 
         with unittest.mock.patch.object(m, "decode_launch", only_before_starved):
             with self.assertRaises(SystemExit) as caught:
@@ -2735,7 +2736,7 @@ class SmtContention(unittest.TestCase):
             seen[arm] = seen.get(arm, 0) + 1
             # Perfect CPU efficiency in every case -- the old gate keeps them all.
             sib = 0.90 if (arm == "before" and seen[arm] == 1) else 0.0
-            return {1: {"steady_ms": 1.0, "cold_ms": 2.0, "fnv": "f"}}, 1.0, sib
+            return {1: {"steady_ms": 1.0, "cold_ms": 2.0, "fnv": "f"}}, 1.0, sib, None
 
         with unittest.mock.patch.object(m, "launch", busy_sibling_first_round):
             _table, adm = m.prefill_matrix(2, 16, "shape", [1])
@@ -2818,6 +2819,362 @@ class SmtContention(unittest.TestCase):
         self.assertEqual(total, 100)
         self.assertEqual(busy, 30, "idle+iowait must not count as busy")
         self.assertIsNone(m.cpu_busy_jiffies([]))
+
+
+class CoTenancy(unittest.TestCase):
+    """The busy-host arm has to prove it was busy.
+
+    The recorded correction on #1729 says a policy that wins only under
+    exclusive quiet-host conditions is not a valid default, so a default-on
+    change owes a measurement taken under load. `int4_modulo_matrix.py
+    --co-tenant` supplies one by injecting load instead of gating it out.
+
+    That inverts the harness's whole relationship to contention, and creates a
+    failure mode the quiet-host gates cannot have: an arm whose injected load
+    never arrived. It runs clean, reports a clean pass, and is indistinguishable
+    in the artifact from a real busy-host result -- while being exactly the
+    quiet-host number the arm exists to replace. These tests drive the real
+    matrix loop rather than `admit` alone, because the defect that matters is a
+    gate that is correct and not wired in.
+    """
+
+    @staticmethod
+    def _harness():
+        if str(EP_BENCHES) not in sys.path:
+            sys.path.insert(0, str(EP_BENCHES))
+        import int4_modulo_matrix
+
+        return int4_modulo_matrix
+
+    @staticmethod
+    def _prefill(m, eff=1.0, sib=0.0, hog=None):
+        def fake(binary, env_extra, timeout=1800):
+            return {1: {"steady_ms": 1.0, "cold_ms": 2.0, "fnv": "f"}}, eff, sib, hog
+
+        return fake
+
+    def test_an_smt_arm_whose_spinner_never_started_is_not_a_busy_host_arm(self):
+        """The defect this arm exists to avoid, driven end to end.
+
+        `sib = 0.02` is an idle sibling. Under `--co-tenant smt` that is not a
+        clean rep, it is a missing treatment, and admitting it would publish a
+        quiet-host matrix under a busy-host heading.
+        """
+        m = self._harness()
+        with unittest.mock.patch.dict(m.CO_TENANT, {"mode": "smt", "cpus": [5]}), \
+                unittest.mock.patch.object(m, "launch", self._prefill(m, sib=0.02)):
+            with self.assertRaises(SystemExit) as caught:
+                m.prefill_matrix(2, 16, "shape", [1])
+        message = str(caught.exception)
+        self.assertIn("co-tenant floor", message)
+        self.assertIn("discarded every launch", message)
+
+    def test_the_smt_arm_keeps_the_rep_the_quiet_host_gate_throws_away(self):
+        """Two-sided, or it proves nothing.
+
+        The same launch -- perfect efficiency, saturated sibling -- must be
+        discarded on a quiet-host run and kept on an `smt` run. Asserting only
+        the second would pass against a gate that admits everything.
+        """
+        m = self._harness()
+        loaded = self._prefill(m, sib=0.99)
+
+        with unittest.mock.patch.dict(m.CO_TENANT, {"mode": "none", "cpus": []}), \
+                unittest.mock.patch.object(m, "launch", loaded):
+            with self.assertRaises(SystemExit) as caught:
+                m.prefill_matrix(2, 16, "shape", [1])
+        self.assertIn("SMT ceiling", str(caught.exception))
+
+        with unittest.mock.patch.dict(m.CO_TENANT, {"mode": "smt", "cpus": [5]}), \
+                unittest.mock.patch.object(m, "launch", loaded):
+            _table, adm = m.prefill_matrix(2, 16, "shape", [1])
+        self.assertEqual(adm["total"], 0, adm)
+        self.assertEqual(adm["cotenant_total"], 0, adm)
+
+    def test_a_dram_arm_still_discards_a_stray_competitor_on_the_sibling(self):
+        """Injecting one kind of load does not license every other kind.
+
+        The hogs sit on other physical cores, so the measured core's sibling is
+        still supposed to be idle. A run that lifted all contention gates
+        whenever a co-tenant was present would credit somebody else's spinner
+        to the bandwidth arm.
+        """
+        m = self._harness()
+        with unittest.mock.patch.dict(m.CO_TENANT, {"mode": "dram", "cpus": [6, 8]}), \
+                unittest.mock.patch.object(
+                    m, "launch", self._prefill(m, sib=0.99, hog=0.99)):
+            with self.assertRaises(SystemExit) as caught:
+                m.prefill_matrix(2, 16, "shape", [1])
+        message = str(caught.exception)
+        self.assertIn("SMT ceiling", message)
+        self.assertIn("'smt_total': 6", message)
+
+    def test_the_contention_admitted_launches_saw_lands_in_the_artifact(self):
+        """A floor that is enforced but not reported is unauditable.
+
+        The reader has to be able to see how loaded the box actually was, and
+        `min` in particular -- the floor is per launch, so the minimum is the
+        weakest rep that made it into the medians.
+        """
+        m = self._harness()
+        with unittest.mock.patch.dict(m.CO_TENANT, {"mode": "smt", "cpus": [5]}), \
+                unittest.mock.patch.object(m, "launch", self._prefill(m, sib=0.97)):
+            _table, adm = m.prefill_matrix(2, 16, "shape", [1])
+        con = adm["contention_admitted"]
+        self.assertAlmostEqual(con["median"], 0.97)
+        self.assertAlmostEqual(con["min"], 0.97)
+        self.assertEqual(con["n"], 6)
+        self.assertIn("mode smt", adm["cotenant_gate"])
+        # The ceiling must not read as a passing gate in a mode that inverted
+        # it: zero SMT discards under `--co-tenant smt` means "not applicable",
+        # not "the sibling was quiet".
+        self.assertIn("REPLACED BY A FLOOR", adm["smt_gate"])
+
+    def test_a_quiet_run_says_so_rather_than_reporting_an_empty_cotenant_gate(self):
+        """Zero discards is not evidence; an inactive gate has to name itself."""
+        m = self._harness()
+        zero = {"before": 0, "after": 0, "aa": 0}
+        one = {"before": 1, "after": 1, "aa": 1}
+        with unittest.mock.patch.dict(m.CO_TENANT, {"mode": "none", "cpus": []}):
+            cols = m.admission_columns(zero, one, zero, zero, None)
+        self.assertIn("INACTIVE", cols["cotenant_gate"])
+        self.assertNotIn("REPLACED", cols["smt_gate"])
+
+    def test_the_preregistered_rule_voids_rather_than_reads_around_a_broken_aa(self):
+        """A loss must not be reachable through an instrument that was biased.
+
+        VOID takes precedence over FAIL and over PASS: if any row's A/A
+        excludes 1.000 the answer is "re-take the matrix", never a verdict
+        computed from the rows that happened to look fine.
+        """
+        m = self._harness()
+        ok = {"label": "m=1", "verdict": "null", "aa_brackets_unity": True}
+        loss = {"label": "m=16", "verdict": "loss", "aa_brackets_unity": True}
+        broken = {"label": "decode", "verdict": "gain", "aa_brackets_unity": False}
+        self.assertEqual(m.cotenancy_verdict([ok])["verdict"], "PASS")
+        self.assertEqual(m.cotenancy_verdict([ok, loss])["verdict"], "FAIL")
+        self.assertEqual(m.cotenancy_verdict([ok, broken])["verdict"], "VOID")
+        self.assertEqual(m.cotenancy_verdict([loss, broken])["verdict"], "VOID")
+        self.assertEqual(m.cotenancy_verdict([ok, loss])["rows"], ["m=16"])
+
+    def test_the_harness_self_test_is_wired_to_the_exit_code(self):
+        """CI runs `--self-test` and reads the status, so it has to be one.
+
+        A self-test that prints its failures and exits 0 is a green check that
+        cannot go red -- the same vacuous-gate class it is written to catch.
+        """
+        m = self._harness()
+        self.assertTrue(m.self_test())
+        # Redirected: the negative case prints its failures by design, and a
+        # passing suite that emits `FAIL ...` lines trains readers to skim past
+        # them in the run where they are real.
+        with unittest.mock.patch.object(m, "admit", lambda *a, **k: None), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            failed = m.self_test()
+        self.assertFalse(failed)
+        self.assertIn("FAIL", out.getvalue())
+
+
+class AssignmentIsNotExecution(unittest.TestCase):
+    """Where the harness *put* a launch and where it *ran* are two claims.
+
+    `taskset` is not a bound: it is one `sched_setaffinity` call, and the
+    process it pinned may make another. Sebastian's #1812 measured the live
+    version of this -- `ONNX_GENAI_CPU_DECODE_THREADS=N` confines the process
+    to N cpus of the pool's choosing -- which means a pinned row can be
+    labelled `cpu4` and measured somewhere else entirely, and the co-tenant arm
+    can be injecting load next to a core nothing is running on.
+
+    Probed directly on this host (decode arm, `PROBE_TOKENS=8`):
+
+      * `taskset -c 4`, width 1  -> every thread `allowed=4`, ran on 4;
+        `path=flat`, `PIN-OFF`.
+      * `taskset -c 4-7`, width 4 -> `realized=4 path=spmd-pool`, threads
+        floated within 4-7 and never outside.
+      * `taskset -c 4`, width 4  -> clamped to `realized=1` and printed
+        `WIDTH-MISMATCH` rather than escaping the mask.
+
+    So the pool respects an operator mask on this host, and these tests are the
+    regression guard on that, not a bug report.
+    """
+
+    @staticmethod
+    def _harness():
+        if str(EP_BENCHES) not in sys.path:
+            sys.path.insert(0, str(EP_BENCHES))
+        import int4_modulo_matrix
+
+        return int4_modulo_matrix
+
+    def test_a_launch_confined_elsewhere_is_an_escape(self):
+        m = self._harness()
+        pinned = [("decode_before", "4", "4")]
+        self.assertEqual(m.classify_affinity(pinned, [4])["verdict"], "conformant")
+        for mask in ("0-31", "0,2", "5"):
+            got = m.classify_affinity([("decode_before", mask, "4")], [4])
+            self.assertEqual(got["verdict"], "escaped", mask)
+            self.assertEqual(got["offenders"][0]["allowed"], mask)
+
+    def test_the_pre_exec_launcher_is_not_the_workload(self):
+        """The false positive this instrument produced on its first run.
+
+        `taskset` is sampled between fork and exec, before it applies the mask
+        to itself, so it reads the whole machine every time. Counting it
+        reported ESCAPED on a launch whose every real thread was pinned.
+        """
+        m = self._harness()
+        mixed = [("taskset", "0-31", "28"), ("decode_before", "4", "4")]
+        self.assertEqual(m.classify_affinity(mixed, [4])["verdict"], "conformant")
+
+    def test_the_launcher_alone_is_not_evidence_of_conformance(self):
+        """...and dropping it must not turn "saw nothing" into "saw a pass"."""
+        m = self._harness()
+        launcher_only = [("taskset", "0-31", "28")]
+        self.assertEqual(m.classify_affinity(launcher_only, [4])["verdict"], "unobserved")
+        self.assertEqual(m.classify_affinity([], [4])["verdict"], "unobserved")
+
+    def test_a_lagging_last_cpu_is_not_an_escape(self):
+        """The unsound criterion this check shipped with for ten minutes.
+
+        A thread's last-run cpu lags its own `sched_setaffinity` until it next
+        runs, so `allowed=4, last_cpu=7` is a routine transient at pool startup.
+        Verdicting on it would abort correct runs; it is reported instead.
+        """
+        m = self._harness()
+        got = m.classify_affinity([("decode_before", "4", "7")], [4])
+        self.assertEqual(got["verdict"], "conformant")
+        self.assertEqual(got["cpus_seen"], [7])
+
+    def test_only_an_escape_stops_the_run(self):
+        m = self._harness()
+        escaped = m.classify_affinity([("w", "0-31", "9")], [4])
+        self.assertIn("escaped their pin", m.affinity_abort_message("decode", escaped))
+        for benign in ([("w", "4", "4")], [], [("taskset", "0-31", "0")]):
+            obs = m.classify_affinity(benign, [4])
+            self.assertIsNone(m.affinity_abort_message("decode", obs), benign)
+
+    def test_the_window_is_sampled_throughout_rather_than_once(self):
+        """The defect a positive control caught in this probe's first version.
+
+        It stopped sampling at the first successful read, which sounds
+        equivalent to sampling the window and is not: a process is pinned
+        correctly at exec and escapes later, when its pool initialises. Against
+        a child that widened its own mask 300ms in, the early-stopping probe
+        returned `conformant` for a provable escape.
+        """
+        m = self._harness()
+        reads = [[("w", "4", "4")], [("w", "4", "4")], [("w", "0-31", "9")]]
+        seen = {"n": 0}
+
+        def fake_samples(_pid):
+            out = reads[min(seen["n"], len(reads) - 1)]
+            seen["n"] += 1
+            return out
+
+        class FakeProc:
+            pid = 4242
+
+            def __init__(self):
+                self.polls = 0
+
+            def poll(self):
+                self.polls += 1
+                return None if self.polls < 6 else 0
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+        with unittest.mock.patch.object(m, "_thread_samples", fake_samples), \
+                unittest.mock.patch.object(m.subprocess, "Popen",
+                                           lambda *a, **k: FakeProc()):
+            obs = m.observe_affinity("bin", {}, assigned=[4], budget_s=5.0)
+        self.assertEqual(obs["verdict"], "escaped")
+        self.assertGreater(seen["n"], 1, "probe read /proc only once")
+
+    def test_the_probe_stops_when_the_launch_exits(self):
+        """A 0.13s prefill launch must not cost the full sampling budget."""
+        m = self._harness()
+
+        class DeadProc:
+            pid = 4243
+
+            def poll(self):
+                return 0
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+        with unittest.mock.patch.object(m, "_thread_samples",
+                                        lambda _p: [("w", "4", "4")]), \
+                unittest.mock.patch.object(m.subprocess, "Popen",
+                                           lambda *a, **k: DeadProc()):
+            start = time.time()
+            obs = m.observe_affinity("bin", {}, assigned=[4], budget_s=30.0)
+        self.assertEqual(obs["verdict"], "conformant")
+        self.assertLess(time.time() - start, 5.0)
+
+
+class WidthScaledEfficiencyFloor(unittest.TestCase):
+    """A `(utime+stime)/wall` floor of 0.95 only means something at width 1.
+
+    Sebastian measured the failure reversibly at width 2 (#1812): one foreign
+    thread inside the confined set, `cpu ms/token` flat at 35.4-36.5 while wall
+    doubled from 17.64 to 35.86. Because a dispatch is a barrier, the foreign
+    thread costs the entire dispatch rather than `1/n` of it, and the healthy
+    lane idles at the barrier -- so the run keeps its cpu time and loses its
+    wall time, which is precisely the shape a fixed floor cannot see.
+
+    Scaling the floor with the assignment turns his contaminated run into a
+    discard with no new instrument: 35.37/17.64 = 2.00 clean, 36.45/35.86 =
+    1.02 contaminated, floor 1.90.
+    """
+
+    @staticmethod
+    def _harness():
+        if str(EP_BENCHES) not in sys.path:
+            sys.path.insert(0, str(EP_BENCHES))
+        import int4_modulo_matrix
+
+        return int4_modulo_matrix
+
+    def test_the_floor_tracks_the_number_of_cpus_assigned(self):
+        m = self._harness()
+        self.assertAlmostEqual(m.efficiency_floor([4]), 0.95)
+        self.assertAlmostEqual(m.efficiency_floor([0, 2]), 1.90)
+        self.assertAlmostEqual(m.efficiency_floor([4, 5, 6, 7]), 3.80)
+        # An empty assignment is a bug, not a licence to admit everything.
+        self.assertAlmostEqual(m.efficiency_floor([]), 0.95)
+
+    def test_sebastians_contaminated_width_2_run_is_discarded(self):
+        m = self._harness()
+        two = m.efficiency_floor([0, 2])
+        clean = 35.37 / 17.64
+        contaminated = 36.45 / 35.86
+        self.assertIsNone(m.admit(clean, 0.01, None, "none", eff_floor=two))
+        self.assertEqual(m.admit(contaminated, 0.01, None, "none", eff_floor=two), "eff")
+        # The same pair against the unscaled floor, which is what the harness
+        # would have believed: both admitted, and the 2x regression published.
+        flat = m.CPU_EFF_FLOOR
+        self.assertIsNone(m.admit(clean, 0.01, None, "none", eff_floor=flat))
+        self.assertIsNone(m.admit(contaminated, 0.01, None, "none", eff_floor=flat))
+
+    def test_the_default_floor_still_matches_this_harnesss_own_pin(self):
+        """This harness pins one cpu, so the change must decide nothing today.
+
+        A refactor that silently moved the live matrices to a different floor
+        would make the published rows incomparable with the merged ones.
+        """
+        m = self._harness()
+        self.assertEqual(len(m.ASSIGNED_CPUS), 1)
+        self.assertAlmostEqual(m.efficiency_floor(), m.CPU_EFF_FLOOR)
+        self.assertEqual(m.admit(0.94, 0.01, None, "none"), "eff")
+        self.assertIsNone(m.admit(0.96, 0.01, None, "none"))
 
 
 if __name__ == "__main__":

@@ -1,8 +1,10 @@
 # The int4 pack's eliminated modulo: the matrix #1809 could not finish
 
-**Date:** 2026-08-25 · **Refs:** #1809 (merged `71bbec062`), #1676
+**Date:** 2026-08-25 (busy-host arm added 2026-08-27) · **Refs:** #1809 (merged
+`71bbec062`), #1676, #1802
 **Reproduce:** `crates/onnx-runtime-ep-cpu/benches/int4_modulo_arms.sh`, then
-`int4_modulo_matrix.py`. For an independent layout, rebuild the arms with
+`int4_modulo_matrix.py` (add `--co-tenant smt|dram` for the busy-host arms).
+For an independent layout, rebuild the arms with
 `RUSTFLAGS=-Cllvm-args=-align-all-functions=5 MOD_ARMS_OUT=...`
 
 ## What this corrects
@@ -412,6 +414,228 @@ narrowed it, so constant propagation never reaches the body. Different
 mechanism from #1783, where the value was a literal at every call site and only
 the inlining barrier hid it.
 
+## Does it survive a busy host? (2026-08-27)
+
+Everything above this line was measured on a quiet host: pinned to an idle
+core, under two gates whose entire job is to discard any launch that was not
+alone on it. The recorded user correction on #1729 says that is not sufficient
+evidence for something that ships as a default:
+
+> CPU scheduling and performance policy **must not assume exclusive access to
+> the machine.** Edge deployments commonly share CPUs with other programs and
+> may be busy. [...] **A policy that wins only under exclusive quiet-host
+> conditions is not a valid default.**
+
+`dequant_panel_avx2`'s eliminated modulo is on by default with no opt-out, so
+it owes that evidence, and until now it did not have it — every number in this
+document was a quiet-host number, including the ones used to justify keeping
+the change. `int4_modulo_matrix.py --co-tenant` supplies the missing arm by
+**injecting** load rather than gating it out, in the two contention modes this
+host actually has:
+
+* **`smt`** — one pinned scalar-throughput spinner on the measured core's SMT
+  sibling (cpu 5). Takes execution-unit throughput without taking timeslices;
+  this is the mode `(utime+stime)/wall` is structurally blind to, and it is the
+  one that bears directly on an ALU-work claim.
+* **`dram`** — eight pinned streaming-memcpy hogs on other physical cores
+  (2, 6, 8, …, 18), buffers far larger than either 32 MiB L3. Takes memory
+  bandwidth and shared cache, and does not touch the measured core at all.
+
+Arms stay interleaved and rotated inside each regime, so the co-tenant is
+common-mode and the ratio remains a fair A/B. What changes is the regime the
+kernel runs in, and the whole question is whether the ranking survives it.
+
+### Pre-registered, before the first contended launch
+
+```
+PASS   no row regresses -- every cell is a gain or a null under injected load.
+FAIL   any cell's 95% interval lies entirely below 1.000. The change is then a
+       quiet-host-only win and is not valid as an unconditional default.
+VOID   any row's A/A interval excludes 1.000 -- re-take the matrix rather than
+       read around it. VOID outranks FAIL and PASS, so a loss can never be
+       reached through an instrument that was already biased.
+```
+
+The rule is deliberately **not** "the win must be the same size". Magnitude is
+reported whichever way the rule goes; what the correction forbids is a default
+that is *worse* on a shared box, and that is what this tests.
+
+### Block 16 prefill — 61 launches per arm, in each of three regimes
+
+Ratio is `before / after`, so above 1.000 means the elimination is faster.
+
+| m | quiet | 95% CI | `smt` co-tenant | 95% CI | `dram` co-tenant | 95% CI |
+|---:|---:|---|---:|---|---:|---|
+| 1 | **1.0041** | [1.0019, 1.0063] | **1.0089** | [1.0077, 1.0101] | 0.9975 | [0.9882, 1.0134] |
+| 8 | **1.0034** | [1.0008, 1.0053] | **1.0072** | [1.0050, 1.0082] | 0.9991 | [0.9913, 1.0108] |
+| 16 | **1.0042** | [1.0015, 1.0059] | **1.0057** | [1.0040, 1.0065] | 1.0066 | [1.0016, 1.0145] |
+
+Per-regime A/A null, and what the co-tenant cost in absolute terms:
+
+| regime | A/A m=1 / m=8 / m=16 | `before ms` m=1 | vs quiet | admitted | co-tenant busy (median / min) |
+|---|---|---:|---:|---|---|
+| quiet | 0.9998 / 1.0008 / 1.0005 | 2.085 | — | 176/183 | n/a |
+| `smt` | 1.0015 / 1.0014 / 1.0006 | 3.413 | **1.64x slower** | 183/183 | 1.000 / 1.000 |
+| `dram` | 0.9991 / 1.0031 / 1.0054 | 3.731 | **1.79x slower** | 177/183 | 1.000 / 0.995 |
+
+Both co-tenants are real: they cost the *unmodified* kernel 64% and 79% of its
+runtime at prefill `m = 1`, and 54% and 64% on the decode loop. The `smt`
+regime discarded nothing in either workload, and the busy fraction its floor
+measured never dropped below 1.000 on any admitted launch, so no cell in this
+section is a quiet-host cell wearing a busy-host label.
+
+**Verdict: PASS in both contended regimes.** No interval anywhere lies below
+1.000, every A/A brackets unity, and every arm is bit-identical.
+
+### Block 16 decode — 15 launches per arm, 32 tokens, same three regimes
+
+The decode loop is where this change is worth the most, because every token is
+a fresh `m = 1` pack with nothing to amortize it over.
+
+| regime | before ms/tok | after ms/tok | speedup | 95% CI | A/A null | admitted | co-tenant busy (median / min) |
+|---|---:|---:|---:|---|---|---|---|
+| quiet | 123.064 | 121.905 | **1.0095** | [1.0077, 1.0135] | 0.01% [0.9980, 1.0021] | 45/45 | n/a |
+| `smt` | 189.591 | 185.441 | **1.0224** | [1.0213, 1.0237] | 0.07% [0.9994, 1.0024] | 45/45 | 1.000 / 1.000 |
+| `dram` | 201.735 | 200.970 | 1.0038 | [0.9956, 1.0155] | 0.09% [0.9929, 1.0095] | 38/45 | 1.000 / 1.000 |
+
+Decode reproduces the prefill pattern and amplifies it: under SMT contention
+the win goes from 0.95% to **2.24%**, intervals nowhere near overlapping, on an
+A/A of 0.07%. Under DRAM contention it is a null. Bit-identical in all three.
+The `dram` regime lost 7 of 45 launches to the efficiency floor and its
+discard-rate spread is 0.133, the least even admission anywhere in this study —
+another reason that column is read as "no resolvable effect" and not mined for
+a number.
+
+### The two regimes move in opposite directions, and the mechanism predicts both
+
+* **Under SMT contention the win roughly doubles** — 1.0041 → 1.0089 at
+  `m = 1` prefill, and 1.0095 → 1.0224 on the decode loop, with
+  non-overlapping intervals in both. The eliminated work is integer division:
+  pure ALU issue. A hyperthread sibling competes for exactly those issue slots,
+  so slots the kernel no longer needs are worth more when they are scarce than
+  when they are free. This is the regime an ALU-saving change should win
+  hardest in, and it does, on both workloads.
+* **Under bandwidth contention the win fades to a null** — 0.9975 and 0.9991 at
+  prefill `m = 1` and `m = 8`, 1.0038 [0.9956, 1.0155] on decode. Same
+  mechanism from the other side: with eight hogs on DRAM the pack is waiting on
+  memory, and a fixed ALU saving disappears into the stall it no longer sits on
+  the critical path of.
+
+So the honest summary is not "the win holds at the same size" — it does not.
+It is that **the regime where the change is worth less is the regime where it
+is worth nothing, not the regime where it is worth negative**, which is exactly
+the distinction the correction cares about for a default.
+
+**One cell I decline to claim**, despite the rule mechanically reading it as a
+gain: `dram` `m = 16` at 1.0066 [1.0016, 1.0145]. That regime's own A/A at the
+same row is **1.0054** — the instrument's floor there is roughly 4x the quiet
+host's, and it is the same size as the effect. The rule uses A/A only to decide
+whether a row is *readable* for a regression, which it is; that is not a
+licence to report a 0.66% gain measured through a ±1.4% null. Read the whole
+`dram` column as "no resolvable effect, and no regression".
+
+### Was the measured work actually on the cpu the harness pinned? (2026-08-27)
+
+Every row above is labelled `cpu4`, and until now that label rested on the
+`taskset` in the launch line. `taskset` is not a bound. It is one
+`sched_setaffinity` call, and the process it pinned is free to make another —
+so a pinned row can be measured somewhere else entirely, and the co-tenant arm
+in particular could be injecting load on the SMT sibling of a core nothing is
+running on. Sebastian's #1812 is the live version of that hazard:
+`ONNX_GENAI_CPU_DECODE_THREADS=N` confines the process to N cpus of the
+*pool's* choosing, and this harness sets that variable on every decode launch.
+
+Assignment is not execution until it is read back, so it was: launch as the
+matrix does, then read each thread's `Cpus_allowed_list` and last-run cpu from
+`/proc` across a sampling window.
+
+| launched as | requested width | realized | threads allowed on | ran on |
+|---|---|---|---|---|
+| `taskset -c 4`, `THREADS=1` (**what every row above used**) | 1 | `realized=1 path=flat` `PIN-OFF` | `4` | `4` |
+| `taskset -c 4-7`, `THREADS=4` | 4 | `realized=4 path=spmd-pool` | `4-7` | 4, 5, 6, 7 |
+| `taskset -c 4`, `THREADS=4` | 4 | `realized=1 path=flat` `WIDTH-MISMATCH` | `4` | `4` |
+
+So the pin held: the rows are measured where they say they are. The third case
+is the one worth keeping — asked for four workers inside a one-cpu mask, the
+pool clamps to one and *says so* rather than escaping the mask, which is the
+behaviour #1802 asks for and is now guarded by a test rather than by a habit.
+
+The width=1 row also settles the exposure directly. Sebastian's amplification
+needs a barrier across a multi-cpu confined set: one foreign thread costs the
+whole dispatch, so wall doubles while cpu-time stays flat. These rows take
+`path=flat` on a single cpu, where there is no barrier and where a foreign
+thread on cpu4 shows up as `(utime+stime)/wall` below the floor and is
+discarded per launch. The mechanism cannot reach them.
+
+It reaches anything wider, though, and a fixed `0.95` floor is exactly the
+wrong instrument there: a 2-wide launch that kept both cpus scores ~2.00, and
+his contaminated one scores 36.45/35.86 = **1.02** — admitted by a flat floor,
+discarded by one that scales with the assignment (1.90). `efficiency_floor()`
+now scales; at this harness's one-cpu pin it returns 0.95 and changes no
+decision here, which is deliberate: the merged rows stay comparable.
+
+**Both new checks were wrong first, and the controls are what said so.**
+Mutation testing killed the escape criterion I shipped with — verdicting on a
+thread's last-run cpu, which legitimately lags its own `sched_setaffinity` and
+would abort correct runs; the allowed mask is the assertable fact and
+`cpus_seen` is now evidence rather than a criterion. Then a positive control (a
+child that widens its own mask 300ms after starting) returned **`conformant`**,
+because the probe stopped sampling at its first successful read and saw only
+the pre-escape state. A check that has only ever said "conformant" has not yet
+been shown to be a check.
+
+### What this does not establish
+
+The co-tenants are synthetic: a spinner and a memcpy loop, not another
+inference process. A real neighbour would contend for L2, the TLB and the
+memory controller in proportions neither of these reproduces, and would itself
+be bursty rather than constant. What the arm rules out is the specific failure
+the correction names — a result that exists only because the box was empty —
+and it does that for the two contention modes this host can produce. It does
+not measure cgroup or cpuset co-tenancy, where the scheduler, not the hardware,
+is what is shared; the efficiency floor would reject those launches rather than
+measure them, and covering that regime needs a different instrument.
+
+### Reproducing
+
+```bash
+crates/onnx-runtime-ep-cpu/benches/int4_modulo_arms.sh
+for mode in none smt dram; do
+  crates/onnx-runtime-ep-cpu/benches/int4_modulo_matrix.py \
+      --rounds 61 --block 16 --m-list 1,8,16 --skip-decode \
+      --co-tenant "$mode" --out target/int4-modulo-arms/cot_prefill_$mode.json
+  crates/onnx-runtime-ep-cpu/benches/int4_modulo_matrix.py \
+      --skip-prefill --block 16 --decode-rounds 15 --tokens 32 \
+      --co-tenant "$mode" --out target/int4-modulo-arms/cot_decode_$mode.json
+done
+```
+
+Deviation from the matrix above: the decode arm is 15 launches at 32 tokens,
+not 41 at 64, because a contended decode launch costs ~30 s and the three
+regimes are 135 launches. The A/B ratio is internally consistent within each
+regime — all three use the same rounds and token count — and the quiet regime
+reproduces the published 1.010x, which is the check that the shortened form
+did not move the answer.
+
+The co-tenant is spawned by the harness, pinned by `taskset`, torn down when
+the run ends, and exits by itself if it is ever orphaned — a load generator
+that outlives its harness on a box with eight agents on it is a worse problem
+than the one it was measuring. The harness still holds `scripts/hostlock.sh`
+for the whole run: the lock is what keeps *other* agents' load off the box, and
+that is what makes the injected load a controlled variable rather than the
+uncontrolled one every other gate in this file exists to reject.
+
+The gate is inverted rather than removed, which is the part worth copying. An
+arm whose injected load silently failed to start is a quiet-host arm with a
+busy-host heading: it runs clean, passes, and is indistinguishable in the
+artifact from a real result — while being precisely the number the arm exists
+to replace. So each contended launch must *demonstrate* its contention, per
+launch, against a floor, and the gates that are still meaningful in that mode
+keep firing (a stray competitor on the sibling still invalidates a `dram`
+launch; descheduling still invalidates any launch). `--self-test` asserts all
+of that on synthetic records, and is mutation-tested against the five ways an
+implementation of this arm plausibly goes wrong.
+
 ## Method
 
 **61 launches, not one careful pairing.** The per-launch spread on this host is
@@ -519,7 +743,14 @@ incomplete was its account of where the change pays. Corrected scope:
   the SMT-aware gate** — not attributable to the change in either case, since
   the arms are bit-identical there; near-absent from the other two builds, and
   the reason the claim above rests on multiple build pairs rather than one
+* **valid as a default on a busy host, not only a quiet one (2026-08-27)** —
+  under injected SMT contention the win roughly doubles on both workloads
+  (prefill `m = 1` 1.0089, decode 1.0224); under injected DRAM contention it
+  fades to a null with no regression anywhere. Pre-registered rule, PASS in
+  both regimes. This is the evidence #1802 item 4 asks for, and until it
+  existed every number in this document was a quiet-host number
 
 Shipped here: the per-row `fnv` route fingerprint in `int4_prefill_route_ab`,
-the bootstrap and A/A self-check in the harness, and the two scripts that make
-all of it reproducible.
+the bootstrap and A/A self-check in the harness, the `--co-tenant` arm and its
+mutation-tested `--self-test`, and the two scripts that make all of it
+reproducible.

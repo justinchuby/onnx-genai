@@ -223,6 +223,14 @@ jobs:
       # Deliberately unset elsewhere, so a contributor inside a 1-core container
       # still gets a stated skip instead of a red suite.
       NXRT_REQUIRE_PLACEMENT_TESTS: "1"
+      # Same asymmetry, for `kernels::matmul::x86_sgemm`'s AVX2 differential
+      # tests. Eleven of them opened with a bare `if !has_simd_x86() { return; }`
+      # -- a silent pass -- so a lane that lost AVX2, or anything setting
+      # `ONNX_RUNTIME_EP_CPU_FORCE_NO_SIMD_X86=1`, turned all eleven into green
+      # no-ops at once, including the sole remaining falsifier for #1809's int4
+      # packing change. This lane is x86_64, so their silence is a defect here
+      # rather than a fact about somebody's laptop. See #1817.
+      NXRT_REQUIRE_SIMD_X86_TESTS: "1"
 
     steps:
       - uses: actions/checkout@v5
