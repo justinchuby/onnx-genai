@@ -361,14 +361,26 @@ only while the assignment is bare. Wrapping the recipe in a helper — the obvio
 way to reuse it — puts a builtin in front, and the builtin's status is its own:
 
 ```sh
-list=$(cmd);          echo $?   # 101  guard fires
-local list=$(cmd);    echo $?   # 0    guard silent   (also `export`, `declare`)
+cmd() { return 101; }                      # a crate that does not build
+f() { list=$(cmd);       echo "$?"; }; f   # 101  guard fires
+g() { local list=$(cmd); echo "$?"; }; g   # 0    guard silent
+h() { local list; list=$(cmd); echo "$?"; }; h   # 101  guard fires again
 ```
 
-Measured: with `local`, a crate that fails to build reports
-`FILTER-DRIFT: selected 0, expected 1` and exits 2 — the identical wrong verdict
-the `||` was added to eliminate, because `grep -c` still counts an empty string.
-Assign bare and declare separately (`local list; list=$(cmd) || …`). This is the
+`export`, `readonly`, `declare` and `typeset` mask it the same way, in `dash` as
+well as `bash`. The function wrapper above is not decoration: `local` outside a
+function is itself an error, so the masking is only reachable in the context that
+makes it likely.
+
+Measured through the whole recipe: with `local`, a crate that fails to build
+reports `FILTER-DRIFT: '$FILTER' selected 0, expected 1` and exits 2 — the
+identical wrong verdict the `||` was added to eliminate, because `grep -c` still
+counts the empty string. **`set -e` does not rescue it.** There is no failed
+command for `-e` to trip on; `local` succeeded. That is worth knowing here
+because bare `run:` steps are `bash -e`, so the shell option people assume is
+catching this is not.
+
+Assign bare, or declare separately (`local list; list=$(cmd) || …`). This is the
 pipeline rule one step over: **a status is only yours if nothing ran after the
 thing you meant to measure** — and `local` runs after it.
 
