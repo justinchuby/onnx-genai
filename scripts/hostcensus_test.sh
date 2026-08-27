@@ -192,29 +192,27 @@ reap "$idler"
 chk "an idle process is not reported at all, not reported as zero" \
     "$(group_present "$idle_out" "proj-idle")" "absent"
 
-# The census must not read its own cost into the group it was invoked from.
-# Scanning ~1200 /proc entries twice is real CPU.
+# A burner that shares the census's PROCESS GROUP must still be counted.
 #
-# Getting this cell to prove anything took two tries. The first version ran the
-# census from a directory under --root and asserted that directory was absent,
-# which passed against a census with the guard REMOVED (mutation M3, 38/38).
-# The reason is structural: the sampler runs inside `$(...)`, so its subshell
-# in the first sample has exited before the second, and a pid present in only
-# one sample has no delta by construction. The guard is unreachable that way,
-# so the mutation was invisible and the assertion was asserting nothing.
+# This cell exists because of the guard it forbids. Excluding by process group
+# looks like the right way to stop the instrument reading itself, and it
+# silently hides SIBLINGS: with job control off -- a wrapper script, a CI step,
+# `hostcensus.sh &` -- the census shares its caller's group, so a benchmark
+# launched next to it by the same driver vanishes from the reading. That is the
+# load a user most needs to see.
 #
-# What makes it reachable is a burner that shares the census's process group.
-# Note the ordinary spinners above do NOT: `timeout` puts its child in a new
-# process group, which is exactly why they are visible. So this one is
-# self-limiting instead of `timeout`-capped, and the precondition -- that it
-# really did land in our group -- is asserted rather than assumed. It is
-# `bash -c`, not `sh -c`, because `$SECONDS` is a bash builtin: under dash the
-# loop exits immediately, the burner is gone before the census reads it, and
-# the cell goes green for the wrong reason. That is not hypothetical -- the
-# first version of this cell did exactly that.
+# Note the ordinary spinners above cannot test this: `timeout` puts its child
+# in a NEW process group, which is exactly why they are visible either way. So
+# this one is self-limiting instead of `timeout`-capped, and the precondition
+# -- that it really did land in our group -- is asserted rather than assumed.
+# It is `bash -c`, not `sh -c`, because `$SECONDS` is a bash builtin: under
+# dash the loop exits immediately, the burner is gone before the census reads
+# it, and the cell goes green for the wrong reason. That is not hypothetical:
+# the first version of this cell did exactly that.
 mkdir -p "$WORK/proj-pg"
-( cd "$WORK/proj-pg" && exec bash -c 'e=$((SECONDS+9)); while [ $SECONDS -lt $e ]; do :; done' ) \
-    >/dev/null 2>&1 &
+# shellcheck disable=SC2016  # $SECONDS must expand in the burner, not here
+( cd "$WORK/proj-pg" && exec taskset -c 0 \
+    bash -c 'e=$((SECONDS+9)); while [ $SECONDS -lt $e ]; do :; done' ) >/dev/null 2>&1 &
 pg_burner=$!
 own_pgid=$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')
 burner_pgid=$(ps -o pgid= -p "$pg_burner" 2>/dev/null | tr -d ' ')
@@ -223,16 +221,28 @@ chk "precondition: the burner really is in this shell's process group" \
 
 sleep 0.5
 same_pg=$("$CENSUS" --interval 2 --root "$WORK" --porcelain 2>/dev/null)
-# The same burner, read by a census in a DIFFERENT process group. Without this
-# arm, "absent" above is satisfied by a burner that was never running.
-other_pg=$(setsid "$CENSUS" --interval 2 --root "$WORK" --porcelain 2>/dev/null)
 reap "$pg_burner"
-
-chk "a census outside the burner's process group does see it" \
-    "$(awk -v c="$(group_cores "$other_pg" "proj-pg")" 'BEGIN { print (c >= 0.05) ? "seen" : "missed" }')" \
+chk "a sibling in the census's own process group is counted, not hidden" \
+    "$(awk -v c="$(group_cores "$same_pg" "proj-pg")" 'BEGIN { print (c >= 0.05) ? "seen" : "hidden" }')" \
     "seen"
-chk "and a census inside it excludes it -- the instrument does not read itself" \
-    "$(group_present "$same_pg" "proj-pg")" "absent"
+
+# Load that ARRIVES during the sampling window has no first sample to
+# difference against, and an earlier version dropped it entirely: a burner
+# started 1.5s into a 3s read appeared in no bucket at all while the summary
+# printed unlocked_cores=0.000. That is the tool's own failure mode -- a
+# reassuringly low number on a busy box -- so it gets its own cell.
+mkdir -p "$WORK/proj-late"
+arrive_out="$WORK/arrive.txt"
+( "$CENSUS" --interval 4 --root "$WORK" --porcelain >"$arrive_out" 2>/dev/null ) &
+census_bg=$!
+sleep 2
+late_burner=$(spin_in "$WORK/proj-late" 12)
+wait "$census_bg" 2>/dev/null
+late_read=$(cat "$arrive_out")
+reap "$late_burner"
+chk "load that arrives mid-window is counted, not dropped" \
+    "$(awk -v c="$(group_cores "$late_read" "proj-late")" 'BEGIN { print (c >= 0.05) ? "counted" : "dropped" }')" \
+    "counted"
 
 # Work outside --root is still counted, in its own bucket. Dropping it would
 # under-report the box in the reassuring direction.
@@ -250,16 +260,32 @@ chk "load outside --root is bucketed, not dropped" \
 narrow_human=$("$CENSUS" --interval 2 --root "$WORK/proj-b" 2>/dev/null)
 chk "and the summary warns that the gate did not judge it" \
     "$(printf '%s\n' "$narrow_human" | grep -c 'cores are running that this gate does not judge')" "1"
-chk "ungated load is reported as its own number" \
-    "$(awk -v c="$(field "$narrow" ungated_cores)" 'BEGIN { print (c >= 0.05) ? "counted" : "hidden" }')" \
-    "counted"
+
+# `ungated` is the sum the human summary warns about, so the thing to assert is
+# that it really is that sum -- not that it exceeds some number.
+#
+# An absolute threshold here was satisfied by ambient `unattributable` load
+# whether or not the outside path worked at all; review demonstrated it by
+# removing outside-bucketing entirely and leaving this cell green. The obvious
+# repair -- assert it is higher with the spinner than without -- fights ambient
+# noise from the other side, and did in fact flake once on a contended box.
+# The identity is exact, needs no second measurement, and still fails any
+# mutation that drops a component: the cell above independently pins the
+# outside bucket at >= 0.05 on this same reading, so a version summing only
+# `unattributable` cannot satisfy it.
+chk "ungated is exactly the load the gate excluded: outside + unattributable" \
+    "$(awk -v u="$(field "$narrow" ungated_cores)" \
+           -v o="$(field "$narrow" outside_root_cores)" \
+           -v n="$(field "$narrow" unattributable_cores)" \
+           'BEGIN { print (u - (o + n) < 0.002 && (o + n) - u < 0.002) ? "exact" : "wrong" }')" \
+    "exact"
 reap "$outside2"
 
 echo
 echo "== porcelain contract =="
 
 for key in lock_state lock_holder lock_group interval root active_cores \
-           unlocked_cores outside_root_cores unattributable_cores \
+           unlocked_cores ungated_cores outside_root_cores unattributable_cores \
            unreadable_procs loadavg; do
     chk "porcelain emits $key" \
         "$(printf '%s\n' "$idle_out" | grep -c "^$key=")" "1"
@@ -348,7 +374,7 @@ cleanup
 # Pin the assertion count. Several cells above are load-dependent, and an
 # assertion that quietly stops running is indistinguishable from one that
 # passes -- which is the whole defect this tool exists to catch, one level up.
-chk "every assertion in this file ran" "$((pass + fail + 1))" "42"
+chk "every assertion in this file ran" "$((pass + fail + 1))" "43"
 
 echo
 echo "passed=${pass} failed=${fail}"

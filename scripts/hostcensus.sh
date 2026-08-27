@@ -63,9 +63,16 @@
 # The second is the reassuring-direction error -- it understates a job that is
 # about to ruin your measurement -- so this samples twice and differences.
 #
-# PID reuse is guarded by comparing field 22 (`starttime`) between samples: a
-# recycled PID has a different start and is dropped rather than differenced
-# against a stranger's counters.
+# A process that STARTS during the window has no first sample to difference
+# against. It is not dropped: a process that started inside the window has
+# spent its whole lifetime inside it, so its lifetime CPU is exactly its
+# in-window CPU. Dropping them is not a theoretical concern -- an earlier
+# version did, and a 4-core burner launched 1.5s into a 3s read appeared in no
+# bucket at all while the summary printed `unlocked_cores=0.000`.
+#
+# A pid RECYCLED onto a new process mid-window is detected by comparing field
+# 22 (`starttime`) between samples and counted as an arrival rather than
+# differenced against a stranger's counters.
 #
 # WHAT THIS CANNOT SEE, STATED RATHER THAN SWALLOWED
 #
@@ -126,16 +133,24 @@ fi
 
 ticks=$(getconf CLK_TCK 2>/dev/null || echo 100)
 
-# Everything in this tool's own process group is excluded from the census.
+# Everything this tool's own work does is either excluded or structurally
+# invisible, and the distinction matters because the obvious guard is wrong.
 #
-# `$$` alone is not enough and the difference is not cosmetic: the sampler runs
-# inside `$(...)`, so its work happens in subshells whose pids are neither `$$`
-# nor `$PPID`, and `sleep` is a further child. Scanning ~1200 `/proc` entries
-# twice is real CPU, and without this the census would report its own cost as
-# load in whatever directory it was invoked from -- a measuring instrument
-# reading itself, and reading it into the very group a user is trying to clear.
-self_pgid=$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')
-[ -n "$self_pgid" ] || self_pgid=-1
+# Excluding by PROCESS GROUP is the tempting version and it under-counts: with
+# job control off -- a wrapper script, a CI step, `hostcensus.sh &` -- the
+# census shares its caller's group, so it would exclude every SIBLING in that
+# group. A benchmark launched next to the census by the same driver is exactly
+# the load a user most needs to see, and pgid exclusion hides it. Verified: an
+# identical burner is reported at 4.120 cores when started with `setsid` and
+# vanishes entirely when started as a plain `&` sibling.
+#
+# So only this process is skipped, and the rest needs no guard: the sampler
+# runs inside `$(...)`, so each scan happens in a subshell that exists during
+# ONE sample and has exited before the other. A pid present in only one sample
+# has no delta by construction, and `sleep` between the samples is an external
+# child whose CPU is its own and negligible. The instrument does not read
+# itself because of how it is shaped, not because it filters itself out.
+self_pid=$$
 
 # One sample: "pid starttime cputicks" per line, plus a count of what we could
 # not read. Only `/proc/PID/stat` is touched here -- no `readlink`, no `exec`
@@ -145,6 +160,7 @@ sample() {
     _unreadable=0
     for _p in /proc/[0-9]*; do
         _pid=${_p#/proc/}
+        [ "$_pid" = "$self_pid" ] && continue
         _line=""
         # The redirection, not just `read`, has to be inside the silenced
         # group: a process that exits between the glob and the open makes the
@@ -159,10 +175,9 @@ sample() {
         _rest=${_line##*') '}
         # shellcheck disable=SC2086
         set -- $_rest
-        # $1 is overall field 3 (state), so pgrp/utime/stime/starttime
-        # (5/14/15/22) are $3/$12/$13/$20 here.
+        # $1 is overall field 3 (state), so utime/stime/starttime (14/15/22)
+        # are $12/$13/$20 here.
         [ $# -ge 20 ] || { _unreadable=$((_unreadable + 1)); continue; }
-        [ "$3" = "$self_pgid" ] && continue
         printf '%s %s %s\n' "$_pid" "${20}" "$(( ${12} + ${13} ))"
     done
     printf 'UNREADABLE %s\n' "$_unreadable"
@@ -195,20 +210,46 @@ if [ -x "$hostlock" ]; then
 fi
 
 # Difference the two samples, then attribute only the PIDs that actually moved.
+# The samples are tagged rather than inferred from order: the END block has to
+# know which set a pid was missing from, and "whichever one I saw it in" is not
+# recoverable from the concatenation.
 moved=$(
-    printf '%s\n' "$first" "$second" | awk -v ticks="$ticks" -v iv="$interval" '
-        $1 == "UNREADABLE" { unreadable[++nu] = $2; next }
-        !seen[$1]++ { start[$1] = $2; cpu[$1] = $3; next }
+    {
+        printf '%s\n' "$first" | sed 's/^/A /'
+        printf '%s\n' "$second" | sed 's/^/B /'
+    } | awk -v ticks="$ticks" -v iv="$interval" '
+        $2 == "UNREADABLE" { unreadable[$1] = $3; next }
+        $1 == "A" { startA[$2] = $3; cpuA[$2] = $4; next }
         {
-            # Same PID a second time. A different starttime means the number
-            # was recycled onto a new process; differencing those two counters
-            # would invent load out of a stranger.
-            if (start[$1] != $2) next
-            d = $3 - cpu[$1]
-            if (d > 0) printf "%s %.4f\n", $1, d / ticks / iv
+            pid = $2
+            if (pid in startA && startA[pid] == $3) {
+                # Present in both, same process: an ordinary delta.
+                d = $4 - cpuA[pid]
+                if (d > 0) printf "%s %.4f\n", pid, d / ticks / iv
+                next
+            }
+            # Either the pid appeared during the window, or it was RECYCLED
+            # onto a new process (different starttime) -- differencing those
+            # two counters would invent load out of a stranger. Both are
+            # arrivals.
+            #
+            # An earlier version dropped these, and that was the tool lying in
+            # its own reassuring direction: a peer launching a 16-thread build
+            # 1.5s into a 2s read landed in no bucket at all, and the box
+            # certified as unlocked=0.000. Measured, it was 4.1 cores.
+            #
+            # They can be measured exactly rather than merely disclosed: a
+            # process that started inside the window has spent its ENTIRE
+            # lifetime inside it, so its lifetime CPU *is* its in-window CPU.
+            # The one way this errs is a process that already existed but whose
+            # sample-1 stat could not be read -- then its whole lifetime is
+            # charged to this window. That over-reports, which is the safe
+            # direction for a tool whose job is to stop people trusting a quiet
+            # reading.
+            if ($4 > 0) printf "%s %.4f\n", pid, $4 / ticks / iv
         }
         END {
-            u = (unreadable[1] > unreadable[2] ? unreadable[1] : unreadable[2])
+            u = (unreadable["A"] > unreadable["B"] ? unreadable["A"] : unreadable["B"])
             printf "UNREADABLE %d\n", u
         }
     '
