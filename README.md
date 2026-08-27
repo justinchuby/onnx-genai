@@ -104,12 +104,13 @@ shows `ctx used / max`.
 
 On a shared machine, add `--cpu-cores N` to `generate`, `run`, or `transcribe` to
 cap native CPU decode to N workers (for example, `--cpu-cores 8`); where
-supported, those workers are pinned to at most N allowed CPUs. The equivalent
-environment variable is `ONNX_GENAI_CPU_DECODE_THREADS=N`; precedence is CLI flag >
-environment variable > automatic sizing. Omitting both preserves the full
-peak-throughput default. This is a decode-worker budget, not a hard cpuset for
-prefill or ONNX Runtime threads; combine it with an OS cpuset/taskset when the
-entire process must be confined.
+supported, the default compact placement keeps the budget on fewer physical cores
+so co-tenants have room. The equivalent environment variable is
+`ONNX_GENAI_CPU_DECODE_THREADS=N`; precedence is CLI flag > environment variable
+> automatic sizing. `ONNX_GENAI_CPU_DECODE_PLACEMENT=spread` (or `dedicated`) is
+an explicit opt-in for hosts where the process owns its CPU set. This is a
+decode-worker budget, not a hard cpuset for prefill or ONNX Runtime threads;
+combine it with an OS cpuset/taskset when the entire process must be confined.
 
 `onnx-genai run <model>` starts an interactive REPL. In a terminal it uses a
 rich line editor with cursor movement, persistent history, bracketed paste,

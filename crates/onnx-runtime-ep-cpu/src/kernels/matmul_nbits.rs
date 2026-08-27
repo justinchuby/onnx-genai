@@ -21063,9 +21063,9 @@ mod tests {
                     expectation.global_workers
                 );
                 assert_eq!(
-                    report.planned_distinct_cores,
-                    Some(true),
-                    "{case}: the selected default mask must plan at most one worker per core \
+                    report.placement_policy,
+                    crate::decode_affinity::CorePlacement::default().as_str(),
+                    "{case}: default-width child must report the shipped placement policy \
                      ({report:?})"
                 );
                 assert!(
@@ -21078,10 +21078,23 @@ mod tests {
                     "{case}: worker-observed masks must exactly match the requested placement \
                      ({report:?})"
                 );
+                let predicted = predicted_placement_code(
+                    mask,
+                    topology,
+                    crate::decode_affinity::CorePlacement::default(),
+                    report.workers,
+                );
                 assert_eq!(
-                    report.realized, "one-per-core",
-                    "{case}: selected workers must realize one worker per physical core \
-                     ({report:?})"
+                    report.realized,
+                    predicted,
+                    "{case}: selected workers must realize the default placement `{}` predicted \
+                     from their actual mask ({report:?})",
+                    crate::decode_affinity::CorePlacement::default().as_str()
+                );
+                assert_eq!(
+                    report.planned_distinct_cores,
+                    Some(predicted == "one-per-core"),
+                    "{case}: planned and predicted default placement disagree ({report:?})"
                 );
             }
         }
@@ -21509,17 +21522,17 @@ mod tests {
         (width >= 2).then_some((width, cores))
     }
 
-    /// A misspelled placement must fall back to the default, say so, and still
-    /// decode.
+    /// A misspelled placement must fail loudly instead of falling back.
     ///
-    /// End-to-end rather than a unit test of the parser, because the two ways
-    /// this knob can be inert are both outside the parser: reading the wrong
-    /// variable name, and swallowing the diagnostic. Either one produces a knob
-    /// a user can set with no error and no effect, which is #1792's shape and
-    /// the failure `verify_documented_env_vars.py` exists to catch statically.
+    /// End-to-end rather than a unit test of the parser, because the ways this
+    /// knob can be inert are outside the parser too: reading the wrong variable
+    /// name, swallowing the diagnostic, or treating a bad value as the shared
+    /// default. Any one produces a knob a user can set with no error and no
+    /// effect, which is #1792's shape and the failure
+    /// `verify_documented_env_vars.py` exists to catch statically.
     #[test]
     #[cfg_attr(miri, ignore = "spawns a child process")]
-    fn a_misspelled_placement_falls_back_loudly_and_still_builds_a_pool() {
+    fn a_misspelled_placement_fails_loudly() {
         let width = "2";
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .arg("--exact")
@@ -21540,28 +21553,26 @@ mod tests {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
 
-        // Not fatal: this knob ranks a set already chosen, so refusing to
-        // decode over a misspelled tuning value would be the worse failure.
         assert!(
-            output.status.success(),
-            "a misspelled placement aborted the child instead of falling back \
-             (status={}):\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            !output.status.success(),
+            "a misspelled placement was accepted instead of failing loudly              (status={}):
+stdout:
+{stdout}
+stderr:
+{stderr}",
             child_status_detail(&output.status)
         );
         assert!(
-            stdout.contains(&format!(
-                "policy={}",
-                crate::decode_affinity::CorePlacement::default().as_str()
-            )),
-            "the child did not fall back to the default placement:\n{stdout}"
-        );
-        // ...and never silent. A fallback nobody is told about is how a user
-        // ends up believing a knob is in force for the life of a deployment.
-        assert!(
             stderr.contains(crate::decode_affinity::DECODE_PLACEMENT_ENV)
                 && stderr.contains("one-per-core"),
-            "the fallback was silent -- stderr must name the variable and the value it \
-             rejected:\nstderr:\n{stderr}"
+            "the failure must name the variable and rejected value:
+stderr:
+{stderr}"
+        );
+        assert!(
+            !stdout.contains(SPMD_WIDTH_MARKER),
+            "the child still emitted a successful width report after rejecting the selector:
+             {stdout}"
         );
     }
 

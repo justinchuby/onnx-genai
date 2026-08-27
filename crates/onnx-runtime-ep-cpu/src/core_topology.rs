@@ -40,12 +40,12 @@
 //! the contended case. A bare spread therefore pays the locality cost *and*
 //! creates a straggler, which is a fair description of the losing arm.
 //!
-//! [`crate::decode_spmd`] now spreads one worker per physical core **and**
-//! reserves a core for the dispatcher. Quiet-host A/B against the compact
-//! layout, four launches per arm with an A/A null agreeing to 0.17%: 3.2%
-//! faster on llama and **29% less CPU per token**, and the dispatcher-yield
+//! [`crate::decode_spmd`] can now opt in to spreading one worker per physical
+//! core **and** reserving a core for the dispatcher. Quiet-host A/B against the
+//! compact layout, four launches per arm with an A/A null agreeing to 0.17%:
+//! 3.2% faster on llama and **29% less CPU per token**, and the dispatcher-yield
 //! counter falls 5.00 to 0.00 per token, which is the straggler mechanism
-//! closing.
+//! closing. That remains an explicit dedicated-host mode, not the default.
 //!
 //! Two parts of the old conclusion **do** survive and should not be re-litigated
 //! without measurement:
@@ -58,8 +58,8 @@
 //!   four DRAM-bandwidth hogs: compact 4.54 ms/token against spread 5.03--6.26.
 //!   With eight hogs covering both halves the ranking inverts (compact 15.92
 //!   against spread 6.08), because then the compact layout has 8 contended cores
-//!   and the spread has 16. The spread is the right default for a dedicated host
-//!   or a cpuset, which is the deployment target; it is not free on a shared box.
+//!   and the spread has 16. Spread is the right explicit mode for a dedicated
+//!   host or cpuset; it is not free on a shared box and is not the default.
 //!
 //! Capping how many *spinning* workers live inside a mask remains a separate and
 //! still-useful lever.
