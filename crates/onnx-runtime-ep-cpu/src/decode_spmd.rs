@@ -4492,7 +4492,7 @@ fn shared_two_core_default_strategy_with_topology(
         .filter(|&count| count > 0)
         .collect();
     if populated != [2, 2] {
-        return SharedTwoCoreDefaultStrategy::NotApplicable;
+        return SharedTwoCoreDefaultStrategy::DispatcherOnly;
     }
     let worker_cpu = shards[0].cpus[0];
     let dispatcher_cpu = shards[0].cpus[1];
@@ -10025,7 +10025,7 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_two_core_topology_falls_back_to_dispatcher_only() {
+    fn an_unproved_two_core_topology_falls_back_to_dispatcher_only() {
         let shards = [NodeShard {
             index: 0,
             cpus: vec![0, 1, 2, 3],
@@ -10036,6 +10036,40 @@ mod tests {
             SharedTwoCoreDefaultStrategy::DispatcherOnly,
             "unknown topology must not silently recreate one resident worker plus an \
              unpinned dispatcher"
+        );
+
+        let partial =
+            crate::core_topology::CoreTopology::from_sibling_groups([vec![0], vec![1], vec![2, 3]]);
+        assert_eq!(
+            shared_two_core_default_strategy_with_topology(&shards, &[0, 1, 2, 3], Some(&partial),),
+            SharedTwoCoreDefaultStrategy::DispatcherOnly,
+            "a partial Some topology, as Linux produces for unreadable sibling files, \
+             must not leave a resident worker and unpinned dispatcher active"
+        );
+
+        let mismatched =
+            crate::core_topology::CoreTopology::from_sibling_groups([vec![0, 1, 2], vec![3]]);
+        assert_eq!(
+            shared_two_core_default_strategy_with_topology(
+                &shards,
+                &[0, 1, 2, 3],
+                Some(&mismatched),
+            ),
+            SharedTwoCoreDefaultStrategy::DispatcherOnly,
+            "a non-[2,2] topology must not make the outer automatic candidate \
+             silently opt out of its shared-host fallback"
+        );
+
+        let non_siblings =
+            crate::core_topology::CoreTopology::from_sibling_groups([vec![0, 2], vec![1, 3]]);
+        assert_eq!(
+            shared_two_core_default_strategy_with_topology(
+                &shards,
+                &[0, 1, 2, 3],
+                Some(&non_siblings),
+            ),
+            SharedTwoCoreDefaultStrategy::DispatcherOnly,
+            "the candidate worker and dispatcher CPUs must be proven SMT siblings"
         );
 
         let topology =
