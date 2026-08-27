@@ -97,6 +97,7 @@ import json
 import os
 import statistics
 import sys
+import tempfile
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -419,24 +420,37 @@ def report_nodata(recs):
     both end at `n_trusted=0`. Only one of them is a statement about the host,
     and reporting the other as if it were sends the reader to fix the wrong
     thing.
+
+    Scans for blank widths directly rather than filtering on
+    `why_untrusted(r) == "nodata"`. That category is the *first* offence in
+    insertion order, and insertion order is the alternating per-launch `order`
+    -- so a launch with one blank width and one out-of-range width would be
+    categorised `nodata` on even launches and `resid` on odd ones, and the
+    blank width would go unreported for half the sweep.
     """
-    blank = [r for r in recs if why_untrusted(r) == "nodata"]
+    reasons = {}
+    blank = 0
+    for rec in recs:
+        widths = [w for w, st in rec["widths"].items() if st is None]
+        if not widths:
+            continue
+        blank += 1
+        recorded = rec.get("nodata")
+        for width in widths:
+            if recorded is None:
+                why = ("no data (reason unrecorded: dataset predates this "
+                       "field)")
+            else:
+                why = recorded.get(width, "no data (reason not recorded for "
+                                          "this width)")
+            reasons.setdefault(why, set()).add(width)
     if not blank:
         return
-    reasons = {}
-    for r in blank:
-        recorded = r.get("nodata") or {}
-        for width, st in r["widths"].items():
-            if st is None:
-                reasons.setdefault(
-                    recorded.get(width, "no data (reason unrecorded: dataset "
-                                        "predates this field)"),
-                    set()).add(width)
-    print(f"\n!! {len(blank)} of {len(recs)} launches produced NO DATA -- "
+    print(f"\n!! {blank} of {len(recs)} launches produced NO DATA -- "
           f"this is not a load rejection:")
     for reason, widths in sorted(reasons.items()):
         print(f"     w{','.join(sorted(widths, key=int))}: {reason}")
-    if len(blank) == len(recs):
+    if blank == len(recs):
         print("     Every launch was blank, so nothing below describes this "
               "host; check --binary and that the run reached the workload.")
 
@@ -761,6 +775,24 @@ def self_test():
         report(old, (8, 16))
     assert "reason unrecorded" in buf.getvalue(), buf.getvalue()
 
+    # A launch with one blank width and one out-of-range width is categorised
+    # by whichever comes first, and insertion order alternates per launch --
+    # so the blank width must still be reported when the category says
+    # `resid`. Built in the odd-launch order (w16 first) on purpose.
+    mixed_launch = synthetic_rows(1, stats)[0]
+    mixed_launch["widths"] = {"16": dict(stats[16], resid_frac=9.0),
+                              "8": None}
+    mixed_launch["nodata"] = {"8": "no worker rows (the child did not run, "
+                                   "or did not report)"}
+    assert why_untrusted(mixed_launch) == "resid", why_untrusted(mixed_launch)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        report([mixed_launch], (8, 16))
+    out = buf.getvalue()
+    assert "produced NO DATA" in out and "w8:" in out, (
+        "a blank width went unreported because the launch was categorised by "
+        "its other width:\n" + out)
+
     # There is no default owner. A hard-coded one is how every agent but its
     # namesake archived their runs under somebody else's identity.
     saved = {k: os.environ.get(k) for k in H.OWNER_ENV}
@@ -792,16 +824,35 @@ def self_test():
 
     # `--binary` is resolved against the caller's cwd, and proven to run,
     # here rather than eight silent launches later.
-    for bad, want in ((os.path.join(H.HERE, "definitely-not-here"),
-                       "does not exist"),
-                      (os.path.abspath(__file__), "not executable")):
+    #
+    # The absolutisation is the whole point of the function, so it has to be
+    # exercised with a genuinely *relative* path: every absolute input makes
+    # `abspath` a no-op and the assertion vacuous. That is the defect this
+    # file exists to prevent, and the first version of this test had it.
+    relative = os.path.relpath(sys.executable)
+    assert not os.path.isabs(relative), relative
+    assert H.resolve_binary(relative) == os.path.abspath(sys.executable), (
+        "a relative --binary was not anchored to the caller's cwd; children "
+        "run with cwd=benches, so it would resolve to nothing there")
+
+    missing = os.path.join(H.HERE, "definitely-not-here")
+    try:
+        H.resolve_binary(missing)
+    except SystemExit as exc:
+        assert "does not exist" in str(exc), str(exc)
+    else:
+        raise AssertionError(f"resolve_binary accepted {missing}")
+
+    # Not the test file itself: its mode bit is incidental, and `chmod +x` on
+    # a script carrying a shebang would turn this into a spurious failure.
+    with tempfile.NamedTemporaryFile(dir=H.HERE, suffix=".notexec") as fh:
+        os.chmod(fh.name, 0o644)
         try:
-            H.resolve_binary(bad)
+            H.resolve_binary(fh.name)
         except SystemExit as exc:
-            assert want in str(exc), f"expected {want!r} in: {exc}"
+            assert "not executable" in str(exc), str(exc)
         else:
-            raise AssertionError(f"resolve_binary accepted {bad}")
-    assert os.path.isabs(H.resolve_binary(sys.executable))
+            raise AssertionError(f"resolve_binary accepted {fh.name}")
 
     print(f"self-test OK: verdict pinned to w{RULE_NARROW} vs w{RULE_WIDE} "
           f"under every --widths permutation tried; steal-tile arm label "

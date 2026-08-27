@@ -1057,7 +1057,7 @@ def main():
         "driver_parked_on": parked,
     }
     with H.HostLock(
-        "roy",
+        H.bench_owner(),
         f"dequant_panel_avx2 modulo matrix: block{args.block} m={args.m_list}"
         f" + block16 decode ({args.rounds} rounds, co-tenant {args.co_tenant})",
     ), CoTenant(args.co_tenant, cot_cpus):
