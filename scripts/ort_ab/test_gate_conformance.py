@@ -1493,6 +1493,68 @@ class GateReuse(unittest.TestCase):
         # what it prints is the thing that would have worked.
         self.assertIn("hostlock.sh run --owner", self.GATE.read_text())
 
+    def test_the_remedy_is_a_command_the_script_still_accepts(self):
+        # The assertion above reads the gate's source for a prefix that both
+        # the accepted form and the refused one satisfy: #1926 made `--reason`
+        # mandatory, and `hostlock.sh run --owner` matches with or without it.
+        # A remedy that had drifted out of step with the script would still
+        # pass it, while handing the person we just stopped a command that
+        # exits 1. So this one drives the remedy rather than reading it.
+        import shutil
+
+        if str(ORT_AB) not in sys.path:
+            sys.path.insert(0, str(ORT_AB))
+        import hostlock_gate
+
+        text = hostlock_gate.remedy("true")
+        # Control before verdict: exactly one command. A reword that dropped it
+        # would otherwise leave nothing to run, and "ran nothing successfully"
+        # reaches the result line as a pass.
+        found = re.findall(r"(scripts/hostlock\.sh run (?:[^\n]*\\\n)*[^\n]*)", text)
+        self.assertEqual(
+            len(found),
+            1,
+            f"expected exactly one hostlock.sh command in the remedy: {text}",
+        )
+        filled = (
+            found[0]
+            .replace("<you>", "remedy-probe")
+            .replace("<what this measures>", "checking the printed remedy runs")
+        )
+        self.assertNotIn("<", filled, f"unsubstituted placeholder in the remedy: {filled}")
+
+        root = ORT_AB.parents[1]
+        lock = root / "target" / "tmp" / "remedy-advice-lock"
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        shutil.rmtree(lock, ignore_errors=True)
+        env = dict(os.environ)
+        # Stripped deliberately: the script accepts both as substitutes for the
+        # flags, so inheriting either would let a remedy that had *lost* those
+        # flags still exit 0 -- passing on the strength of this process's
+        # environment rather than of the string under test.
+        env.pop("HOSTLOCK_REASON", None)
+        env.pop("HOSTLOCK_OWNER", None)
+        env["HOSTLOCK_DIR"] = str(lock)
+        env["HOSTLOCK_PRIVATE_OK"] = "1"
+        try:
+            out = subprocess.run(
+                ["bash", "-c", filled],
+                cwd=root,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+        finally:
+            shutil.rmtree(lock, ignore_errors=True)
+        self.assertEqual(
+            out.returncode,
+            0,
+            f"the remedy we print is not a command the script accepts.\n"
+            f"  ran:    {filled}\n"
+            f"  stderr: {out.stderr}",
+        )
+
 
 class Vacuity(unittest.TestCase):
     """A check that does not run for new files cannot catch a new file.
