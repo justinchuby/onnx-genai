@@ -55,10 +55,12 @@ Modes:
 - `numa-split` -- explicitly build node-local sub-pools across all usable NUMA
   nodes.
 
-For the persistent SPMD pool, explicit `off` creates workers without invoking
-the per-worker affinity setter or read-back API. Their kernel affinity masks
-remain exactly the masks inherited from the creating process (including any
-external `taskset`/cgroup restriction).
+For the persistent SPMD pool, explicit `off` performs one production
+`allowed_cpus()` capacity-discovery read so the worker count still respects an
+external `taskset`/cgroup restriction and leaves dispatcher headroom. It does
+not invoke the per-worker affinity setter or read-back API, and does not replace
+the creating thread's mask. Worker kernel affinity masks therefore remain the
+inherited mask.
 
 Because the packed int4 decode weights are lazily first-touched inside the
 `with_decode_pool_scope` installation (on a pinned worker), they land on the
@@ -87,9 +89,11 @@ that set. The two are orthogonal and can be combined.
   physical cores. The automatic worker count is capped after reserving
   scheduling capacity for the inline dispatcher, so the active decode threads
   leave at least half the process's logical CPU capacity available to a
-  co-tenant. On an exact two-CPU mask the dispatcher owns the sole compute lane
-  and no resident worker is spawned. This also holds for a one-CPU-per-core
-  `taskset`.
+  co-tenant. On an exact 2-core/4-thread SMT mask, the sole worker and dispatcher
+  are bound to the two siblings of one physical core for the decode scope, so
+  the other physical core is wholly available to a co-tenant. On an exact
+  two-CPU mask the dispatcher owns the sole compute lane and no resident worker
+  is spawned. This also holds for a one-CPU-per-core `taskset`.
 - `spread` -- explicit dedicated-host opt-in. Worker `i` takes a distinct
   physical core for as long as cores last, only then doubling up on SMT
   siblings; its automatic width may use every allowed physical core (subject to

@@ -1755,8 +1755,8 @@ pub struct SpmdDecodePools {
     #[cfg(test)]
     affinity_calls: Arc<crate::decode_affinity::AffinityCallCounter>,
     /// The allowed CPU that [`DISPATCHER_RESERVED_CPUS`] freed for the inline
-    /// dispatcher, or `None` when the pool has no dispatcher shard or the
-    /// reservation could not be located (unpinned workers, empty CPU list).
+    /// dispatcher, or `None` when no dispatcher placement is requested or the
+    /// reserved CPU could not be located (unpinned workers, empty CPU list).
     ///
     /// Reserving the CPU and *using* it are two different things. The
     /// reservation is made in [`reserve_single_group_headroom`] /
@@ -1769,6 +1769,10 @@ pub struct SpmdDecodePools {
     /// anything. Measured answer so far: it is worth 9.5%, which is below the
     /// bar that was set for it.
     dispatcher_cpu: Option<usize>,
+    /// Whether compact placement must bind the dispatcher to
+    /// [`Self::dispatcher_cpu`] to preserve a whole physical core for a
+    /// co-tenant on an exact 2-core/4-thread Linux topology.
+    dispatcher_pin_required: bool,
     /// OS thread id of the first thread to dispatch on this pool, or `0` before
     /// any dispatch has happened.
     ///
@@ -1967,14 +1971,19 @@ fn resolve_decode_schedule(raw: Option<&str>, single_node: bool) -> DecodeSchedu
 /// Whether the pool spans one worker shard *and* the host affirmatively reports
 /// a single NUMA node over the CPUs this process may use. See
 /// [`resolve_decode_schedule`] for why one shard on its own is not enough.
+#[cfg(test)]
 fn on_confirmed_single_node(node_count: usize) -> bool {
     node_count == 1 && crate::decode_affinity::host_is_single_numa_node()
 }
 
-fn decode_schedule(node_count: usize) -> DecodeSchedule {
+fn on_confirmed_single_node_with_allowed(node_count: usize, allowed: Option<&[usize]>) -> bool {
+    node_count == 1 && crate::decode_affinity::host_is_single_numa_node_with_allowed(allowed)
+}
+
+fn decode_schedule_with_allowed(node_count: usize, allowed: Option<&[usize]>) -> DecodeSchedule {
     resolve_decode_schedule(
         std::env::var(DECODE_SCHEDULE_ENV).ok().as_deref(),
-        on_confirmed_single_node(node_count),
+        on_confirmed_single_node_with_allowed(node_count, allowed),
     )
 }
 
@@ -1995,17 +2004,38 @@ impl SpmdDecodePools {
     ///
     /// `dispatcher_shard` adds one compute shard, owned by the dispatcher rather
     /// than by a spawned thread. See [`SpmdDecodePools::dispatcher_shard`].
-    fn build(shards: &[NodeShard], dispatcher_shard: bool) -> Self {
-        Self::build_with_schedule(shards, decode_schedule(shards.len()), dispatcher_shard)
-    }
-
+    #[cfg(test)]
     fn build_with_schedule(
         shards: &[NodeShard],
         schedule: DecodeSchedule,
         dispatcher_shard: bool,
     ) -> Self {
+        Self::build_with_schedule_and_dispatcher_pin(shards, schedule, dispatcher_shard, false)
+    }
+
+    fn build_with_dispatcher_pin(
+        shards: &[NodeShard],
+        dispatcher_shard: bool,
+        dispatcher_pin_required: bool,
+        allowed: Option<&[usize]>,
+    ) -> Self {
+        Self::build_with_schedule_and_dispatcher_pin(
+            shards,
+            decode_schedule_with_allowed(shards.len(), allowed),
+            dispatcher_shard,
+            dispatcher_pin_required,
+        )
+    }
+
+    fn build_with_schedule_and_dispatcher_pin(
+        shards: &[NodeShard],
+        schedule: DecodeSchedule,
+        dispatcher_shard: bool,
+        dispatcher_pin_required: bool,
+    ) -> Self {
         #[cfg(test)]
-        let affinity_calls = Arc::new(crate::decode_affinity::AffinityCallCounter::default());
+        let affinity_calls = crate::decode_affinity::current_affinity_call_counter()
+            .unwrap_or_else(|| Arc::new(crate::decode_affinity::AffinityCallCounter::default()));
         let node_count = shards.len();
         let mut worker_node = Vec::new();
         let mut node_thread_counts = Vec::with_capacity(node_count);
@@ -2035,10 +2065,14 @@ impl SpmdDecodePools {
         // that node that no worker was pinned to -- exactly the CPU the reserve
         // exists to keep clear. The dispatcher's shard lives on the last node,
         // so that node's spare is the one it should sit on.
-        let dispatcher_cpu = dispatcher_shard.and_then(|_| {
-            let last = shards.last()?;
-            last.cpus.get(last.workers).copied()
-        });
+        let dispatcher_cpu = if dispatcher_shard.is_some() || dispatcher_pin_required {
+            shards
+                .last()
+                .and_then(|last| last.cpus.get(last.workers))
+                .copied()
+        } else {
+            None
+        };
 
         #[cfg(feature = "mlas")]
         if schedule == DecodeSchedule::Steal {
@@ -2075,6 +2109,7 @@ impl SpmdDecodePools {
                 schedule,
                 // No inline dispatcher on this path, so nothing reserved one.
                 dispatcher_cpu: None,
+                dispatcher_pin_required: false,
                 dispatcher_tid: AtomicI64::new(0),
                 dispatcher_observed_cpu: AtomicI64::new(-1),
                 dispatcher_cpu_changes: AtomicU64::new(0),
@@ -2112,7 +2147,8 @@ impl SpmdDecodePools {
         // worker therefore records, about itself, what it attempted *and what
         // the kernel actually gave it* -- one `sched_getaffinity` per worker
         // that attempted a pin on the one-time build path, nothing on the
-        // dispatch path. An explicit `off` performs neither a pin nor read-back.
+        // dispatch path. An explicit `off` performs one builder-side capacity
+        // discovery but neither a worker pin nor worker read-back.
         //
         // Read-back needs no further synchronization: a worker fills its slot
         // before incrementing `ready`, and the builder below waits on `ready`
@@ -2375,6 +2411,7 @@ impl SpmdDecodePools {
             #[cfg(test)]
             affinity_calls,
             dispatcher_cpu,
+            dispatcher_pin_required,
             dispatcher_tid: AtomicI64::new(0),
             dispatcher_observed_cpu: AtomicI64::new(-1),
             dispatcher_cpu_changes: AtomicU64::new(0),
@@ -2476,6 +2513,34 @@ impl SpmdDecodePools {
     /// rather than inferring one from the other.
     pub fn dispatcher_cpu(&self) -> Option<usize> {
         self.dispatcher_cpu
+    }
+
+    /// Hold the mandatory shared-host dispatcher pin for one decode forward.
+    ///
+    /// The opt-in dispatcher pin keeps its historical lifetime. Only the exact
+    /// 2-core/4-thread compact default uses this scope, so prefill after decode
+    /// regains the thread's inherited affinity mask without adding affinity
+    /// syscalls to every projection.
+    pub(crate) fn enter_dispatcher_scope(&self) -> DispatcherPinGuard {
+        if !self.dispatcher_pin_required {
+            return DispatcherPinGuard { release: false };
+        }
+        let cpu = self
+            .dispatcher_cpu
+            .expect("a mandatory dispatcher pin must have a reserved sibling CPU");
+        if let Some(tid) = current_thread_os_id() {
+            let recorded = self
+                .dispatcher_tid
+                .compare_exchange(0, tid, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok();
+            DISPATCHER_IS_RECORDED.with(|flag| flag.set(recorded));
+        }
+        assert!(
+            acquire_dispatcher_pin(cpu),
+            "the exact 2-core/4-thread compact default could not pin its dispatcher to cpu \
+             {cpu}; refusing to run a shared-host policy that may occupy both physical cores"
+        );
+        DispatcherPinGuard { release: true }
     }
 
     /// OS thread id of the thread that dispatched on this pool, once one has.
@@ -2859,7 +2924,9 @@ impl SpmdDecodePools {
     where
         F: Fn(usize) + Sync,
     {
-        release_dispatcher_pin();
+        if !self.dispatcher_pin_required {
+            release_dispatcher_pin();
+        }
         for global_index in 0..self.total_workers {
             job(global_index);
         }
@@ -2875,9 +2942,9 @@ impl SpmdDecodePools {
     /// dispatcher at a time. When another thread already owns them this runs
     /// the shards inline instead of waiting or racing -- see
     /// [`SharedState::dispatching`].
-    /// Record this thread as the dispatcher and, if [`DISPATCHER_PIN_ENV`] is
-    /// on, bind it to the CPU the headroom reserve freed. At most once per
-    /// thread.
+    /// Record this thread as the dispatcher and bind it to the CPU the headroom
+    /// reserve freed when [`DISPATCHER_PIN_ENV`] is on or the exact 2-core/
+    /// 4-thread shared-host default requires it. At most once per thread.
     ///
     /// The tid is recorded whether or not the pin is requested: with the knob
     /// off, "which CPU did the scheduler leave the dispatcher on" is the
@@ -2925,7 +2992,7 @@ impl SpmdDecodePools {
             }
             return;
         };
-        if !dispatcher_pin_requested() {
+        if !self.dispatcher_pin_required && !dispatcher_pin_requested() {
             if recorded {
                 self.sample_dispatcher_cpu();
             }
@@ -2938,7 +3005,12 @@ impl SpmdDecodePools {
         if cfg!(miri) {
             return;
         }
-        acquire_dispatcher_pin(cpu);
+        let pinned = acquire_dispatcher_pin(cpu);
+        assert!(
+            pinned || !self.dispatcher_pin_required,
+            "the exact 2-core/4-thread compact default could not pin its dispatcher to cpu \
+             {cpu}; refusing to run a shared-host policy that may occupy both physical cores"
+        );
         // After the pin, never before: the first sample is the baseline every
         // later one is compared against, so taking it pre-pin would score the
         // pin itself as a migration and a successfully pinned dispatcher could
@@ -4016,7 +4088,11 @@ static REQUESTED_WIDTH: OnceLock<Option<usize>> = OnceLock::new();
 pub fn pools() -> Option<&'static SpmdDecodePools> {
     POOLS
         .get_or_init(|| {
-            let threads = default_threads();
+            let allowed = crate::decode_affinity::allowed_cpus();
+            let threads =
+                crate::kernels::matmul_nbits::configured_persistent_decode_threads_with_allowed(
+                    allowed.as_deref(),
+                );
             // Latched here rather than inside `build_from_env` so the recorded
             // request can only ever describe the pool that `POOLS` actually
             // holds. `build_from_env` is `pub`; latching there would let a direct
@@ -4030,7 +4106,7 @@ pub fn pools() -> Option<&'static SpmdDecodePools> {
             // is no request for it to disagree with.
             REQUESTED_WIDTH
                 .get_or_init(|| crate::kernels::matmul_nbits::decode_thread_budget().or(threads));
-            build_from_env(threads)
+            build_from_env_with_allowed(threads, allowed)
         })
         .as_ref()
 }
@@ -4064,16 +4140,6 @@ pub fn shutdown_pools() {
     if let Some(Some(pool)) = POOLS.get() {
         pool.shutdown();
     }
-}
-
-/// Resolve the persistent pool's worker count. Honors `ONNX_GENAI_CPU_DECODE_THREADS`
-/// when set (`0` opts out); when unset it uses the persistent-specific default
-/// (a dispatcher-inclusive half-logical budget under shared-host compact
-/// placement, or one worker per allowed physical core under explicit spread),
-/// *not* the flat pool's eight-worker ceiling -- see
-/// [`crate::kernels::matmul_nbits::configured_persistent_decode_threads`].
-fn default_threads() -> Option<usize> {
-    crate::kernels::matmul_nbits::configured_persistent_decode_threads()
 }
 
 /// How the persistent pool was selected, parsed from `PERSISTENT_POOL_ENV`.
@@ -4188,6 +4254,14 @@ pub(crate) fn is_forced() -> bool {
 /// single-node host, a non-NUMA machine, or a platform without pinning yields a
 /// single unpinned worker group (still the lightweight barrier, still correct).
 pub fn build_from_env(threads: Option<usize>) -> Option<SpmdDecodePools> {
+    let allowed = crate::decode_affinity::allowed_cpus();
+    build_from_env_with_allowed(threads, allowed)
+}
+
+fn build_from_env_with_allowed(
+    threads: Option<usize>,
+    allowed: Option<Vec<usize>>,
+) -> Option<SpmdDecodePools> {
     // Build for `On` (the default or `=1`) and `Adaptive` (`=auto`). `On` always
     // dispatches to the pool; `Adaptive` needs the pool available so the
     // calibrator can time the live decode step on it. `Off` (`=0`) and `THREADS=0`
@@ -4244,9 +4318,7 @@ pub fn build_from_env(threads: Option<usize>) -> Option<SpmdDecodePools> {
     // paired launches favoured the fallback, a consistent ~1% loss. Extending
     // the fallback to quota would trade a measured regression for a starvation
     // that does not occur, so the quota fix stops at the headroom reserve.
-    if let Some(allowed) = crate::decode_affinity::allowed_cpus()
-        && allowed.len() == 1
-    {
+    if allowed.as_ref().is_some_and(|cpus| cpus.len() == 1) {
         report_spmd_fallback(
             "the process is confined to a single CPU (cpuset/taskset), which leaves no core \
              for the inline dispatcher alongside a spinning worker -- leaving decode on the \
@@ -4255,7 +4327,7 @@ pub fn build_from_env(threads: Option<usize>) -> Option<SpmdDecodePools> {
         return None;
     }
     report_pool_built(mode);
-    let mut shards = node_shards(total);
+    let mut shards = node_shards_with_allowed(total, allowed.as_deref());
     let dispatcher_only = reserve_tiny_shared_default_for_dispatcher(&mut shards, total);
     // The dispatcher computes a shard exactly when the headroom reservation took
     // a worker away to keep its CPU free. Then `total - 1` pinned threads plus
@@ -4272,9 +4344,13 @@ pub fn build_from_env(threads: Option<usize>) -> Option<SpmdDecodePools> {
     // Restricted to the single-group layout. On a NUMA split the dispatcher's
     // node is not known at build time, so handing it a shard could pull that
     // shard's weights across sockets; those layouts keep the previous behavior.
-    Some(SpmdDecodePools::build(
+    let require_dispatcher_pin =
+        shared_two_core_default_requires_dispatcher_pin(&shards, total, allowed.as_deref());
+    Some(SpmdDecodePools::build_with_dispatcher_pin(
         &shards,
         dispatcher_only || dispatcher_owns_a_shard(&shards, total),
+        require_dispatcher_pin,
+        allowed.as_deref(),
     ))
 }
 
@@ -4298,6 +4374,52 @@ fn reserve_tiny_shared_default_for_dispatcher(shards: &mut [NodeShard], requeste
     }
     shards[0].workers = 0;
     true
+}
+
+/// Whether the exact 2-core/4-thread shared-host default needs a mandatory
+/// dispatcher pin.
+///
+/// Compact ordering puts the sole spawned worker on one logical CPU and the
+/// next target on its SMT sibling. Binding the dispatcher to that sibling keeps
+/// both active decode threads on one physical core, leaving the other physical
+/// core wholly outside the decode affinity masks. Wider hosts retain the
+/// measured unpinned-dispatcher policy; explicit spread remains the
+/// dedicated-host opt-in.
+fn shared_two_core_default_requires_dispatcher_pin(
+    shards: &[NodeShard],
+    requested: usize,
+    allowed: Option<&[usize]>,
+) -> bool {
+    if !cfg!(target_os = "linux")
+        || requested != 1
+        || !crate::kernels::matmul_nbits::persistent_decode_threads_are_automatic()
+        || crate::decode_affinity::CorePlacement::from_env()
+            != crate::decode_affinity::CorePlacement::Compact
+        || shards.len() != 1
+        || shards[0].workers != 1
+        || shards[0].cpus.len() != 4
+        || allowed.is_none_or(|cpus| cpus.len() != 4)
+    {
+        return false;
+    }
+    let Some(cores) = crate::core_topology::host() else {
+        return false;
+    };
+    let allowed = allowed.expect("the length check above requires an allowed CPU set");
+    let populated: Vec<usize> = cores
+        .cores()
+        .iter()
+        .map(|siblings| siblings.iter().filter(|cpu| allowed.contains(cpu)).count())
+        .filter(|&count| count > 0)
+        .collect();
+    if populated != [2, 2] {
+        return false;
+    }
+    let worker_cpu = shards[0].cpus[0];
+    let dispatcher_cpu = shards[0].cpus[1];
+    cores
+        .siblings_of(worker_cpu)
+        .is_some_and(|siblings| siblings.contains(&dispatcher_cpu))
 }
 
 /// Whether the inline dispatcher should own a compute shard.
@@ -4343,7 +4465,7 @@ enum ExplicitAffinity {
 
 /// Map a raw [`DECODE_AFFINITY_ENV`] value to its meaning for this path.
 ///
-/// `numa-split` defers because [`node_shards`]'s multi-node branch *is* the
+/// `numa-split` defers because [`node_shards_with_allowed`]'s multi-node branch *is* the
 /// numa-split layout; deferring keeps one implementation rather than two that
 /// can drift.
 ///
@@ -4371,7 +4493,10 @@ fn explicit_affinity_request(raw: Option<&str>) -> ExplicitAffinity {
 /// byte-identical placement. Only the *CPU set* is decided here -- how workers
 /// are then laid out across it stays with the placement policy, so the two
 /// concerns do not have to know about each other.
-fn explicit_affinity_shards(total: usize) -> Option<Vec<NodeShard>> {
+fn explicit_affinity_shards_with_allowed(
+    total: usize,
+    allowed: Option<&[usize]>,
+) -> Option<Vec<NodeShard>> {
     let raw = std::env::var(crate::decode_affinity::DECODE_AFFINITY_ENV).ok();
     let request = explicit_affinity_request(raw.as_deref());
     if request == ExplicitAffinity::Malformed {
@@ -4392,13 +4517,13 @@ fn explicit_affinity_shards(total: usize) -> Option<Vec<NodeShard>> {
             }
             Err(message) => panic!("invalid CPU scheduler configuration: {message}"),
         },
-        crate::decode_affinity::allowed_cpus,
+        || allowed.map(<[usize]>::to_vec),
     )
 }
 
 /// The shard decision itself, with topology supplied by the caller.
 ///
-/// Split from [`explicit_affinity_shards`] for the reason given on
+/// Split from [`explicit_affinity_shards_with_allowed`] for the reason given on
 /// [`parse_decode_blocktime`]: the env read is the only impure part, so keeping
 /// it out means the precedence can be tested exhaustively without `set_var` and
 /// without depending on the test host's NUMA layout.
@@ -4486,13 +4611,18 @@ fn explicit_affinity_shards_for(
 /// throughput.
 ///
 /// An explicit affinity request is resolved first (see
-/// [`explicit_affinity_shards`]); it selects the CPU *set*, and the worker
+/// [`explicit_affinity_shards_with_allowed`]); it selects the CPU *set*, and the worker
 /// count is still capped by the same reservation.
-fn node_shards(total: usize) -> Vec<NodeShard> {
-    node_shards_with(total, host_parallelism(), explicit_affinity_shards)
+fn node_shards_with_allowed(total: usize, allowed: Option<&[usize]>) -> Vec<NodeShard> {
+    node_shards_with(
+        total,
+        host_parallelism(),
+        |total| explicit_affinity_shards_with_allowed(total, allowed),
+        allowed,
+    )
 }
 
-/// [`node_shards`] with the explicit-request lookup injected.
+/// [`node_shards_with_allowed`] with the explicit-request lookup injected.
 ///
 /// The seam exists so a test can prove the request is *consulted at all*. That
 /// is the whole defect in #1792: the helpers below can each be correct while
@@ -4502,18 +4632,18 @@ fn node_shards_with(
     total: usize,
     parallelism: usize,
     explicit: impl FnOnce(usize) -> Option<Vec<NodeShard>>,
+    allowed: Option<&[usize]>,
 ) -> Vec<NodeShard> {
     // An explicit request wins over the default placement. Without this the
     // persistent pool reads the env var for exactly nothing.
     if let Some(shards) = explicit(total) {
         return shards;
     }
-    let allowed = crate::decode_affinity::allowed_cpus();
     let cores = crate::core_topology::host();
     let numa = NumaTopology::detect();
     let mut layout = resolve_pool_layout(PoolLayoutInputs {
         requested_workers: total,
-        allowed_cpus: allowed.as_deref(),
+        allowed_cpus: allowed,
         core_topology: cores,
         numa_topology: numa.as_ref(),
         available_parallelism: parallelism,
@@ -4544,7 +4674,9 @@ fn node_shards_with(
 const DISPATCHER_RESERVED_CPUS: usize = DEFAULT_SERVICE_CPUS_PER_NUMA_NODE;
 
 /// Opt-in: bind the inline dispatcher to the CPU [`DISPATCHER_RESERVED_CPUS`]
-/// reserved for it (`1`/`on`/`true`/`yes`). Default off.
+/// reserved for it (`1`/`on`/`true`/`yes`). Default off except for the exact
+/// 2-core/4-thread compact default, where binding to the worker's SMT sibling
+/// is required to preserve one whole physical core for a co-tenant.
 ///
 /// The reservation already keeps one allowed CPU clear of workers, because a
 /// dispatcher sharing a core with a worker makes that worker a straggler the
@@ -4666,6 +4798,18 @@ thread_local! {
     static DISPATCHER_IS_RECORDED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+pub(crate) struct DispatcherPinGuard {
+    release: bool,
+}
+
+impl Drop for DispatcherPinGuard {
+    fn drop(&mut self) {
+        if self.release {
+            restore_dispatcher_pin(false);
+        }
+    }
+}
+
 /// Take the reserved CPU for this thread, remembering the mask it replaces.
 ///
 /// Refuses when the pre-pin mask cannot be read, because a thread that pinned
@@ -4690,38 +4834,40 @@ thread_local! {
 /// that re-entry would re-read the mask *while pinned*, save the reserved CPU
 /// itself as the "previous" mask, and turn every later release into a no-op
 /// that leaves the thread confined for life.
-fn acquire_dispatcher_pin(cpu: usize) {
+fn acquire_dispatcher_pin(cpu: usize) -> bool {
     if DISPATCHER_PIN_HELD.with(std::cell::Cell::get) {
-        return;
+        return true;
     }
     let saved = match crate::decode_affinity::observe_current_thread_cpus() {
         crate::decode_affinity::ObservedAffinity::Cpus(cpus) if !cpus.is_empty() => cpus,
         other => {
             report_dispatcher_pin(&format!(
-                "{DISPATCHER_PIN_ENV} on, but this thread's affinity mask could not be read \
+                "dispatcher affinity requested, but this thread's affinity mask could not be read \
                  ({other:?}), so the reserved cpu {cpu} could not be given back later; \
                  dispatcher left unpinned"
             ));
-            return;
+            return false;
         }
     };
     match crate::decode_affinity::pin_current_thread_to_cpu(cpu) {
         Ok(()) => {
             DISPATCHER_PREPIN_CPUS.with(|slot| *slot.borrow_mut() = Some(saved));
             DISPATCHER_PIN_HELD.with(|held| held.set(true));
-            report_dispatcher_pin(&format!(
-                "{DISPATCHER_PIN_ENV} on: dispatcher pinned to reserved cpu {cpu}"
-            ));
+            report_dispatcher_pin(&format!("dispatcher pinned to reserved cpu {cpu}"));
+            true
         }
-        Err(message) => report_dispatcher_pin(&format!(
-            "{DISPATCHER_PIN_ENV} on, but pinning the dispatcher to reserved cpu \
-             {cpu} failed: {message}; dispatcher left unpinned"
-        )),
+        Err(message) => {
+            report_dispatcher_pin(&format!(
+                "dispatcher affinity requested, but pinning it to reserved cpu \
+                 {cpu} failed: {message}; dispatcher left unpinned"
+            ));
+            false
+        }
     }
 }
 
-/// Give the reserved CPU back, restoring the mask this thread had before it was
-/// pinned. No-op unless this thread is holding the pin.
+/// Give the reserved CPU back for an inline fallback, restoring the mask this
+/// thread had before it was pinned. No-op unless this thread is holding the pin.
 ///
 /// Once given back it is not taken again: the pin is attempted at a thread's
 /// first dispatch and nowhere else, so a thread that has run inline stays
@@ -4731,6 +4877,10 @@ fn acquire_dispatcher_pin(cpu: usize) {
 /// op against a ~7us op -- and the case where a thread runs inline at all is
 /// the case where the pin is harmful.
 fn release_dispatcher_pin() {
+    restore_dispatcher_pin(true);
+}
+
+fn restore_dispatcher_pin(report_inline_release: bool) {
     if !DISPATCHER_PIN_HELD.with(std::cell::Cell::get) {
         return;
     }
@@ -4743,14 +4893,18 @@ fn release_dispatcher_pin() {
         return;
     };
     match crate::decode_affinity::set_current_thread_affinity(&saved) {
-        Ok(()) => report_dispatcher_unpin(&format!(
-            "{DISPATCHER_PIN_ENV} on, but this dispatch runs every shard inline: reserved cpu \
-             released back to {} cpus for the life of this thread",
-            saved.len()
-        )),
+        Ok(()) => {
+            if report_inline_release {
+                report_dispatcher_unpin(&format!(
+                    "dispatcher affinity was active, but this dispatch runs every shard inline: \
+                     reserved cpu released back to {} cpus for the life of this thread",
+                    saved.len()
+                ));
+            }
+        }
         Err(message) => report_dispatcher_unpin(&format!(
-            "{DISPATCHER_PIN_ENV} on, but restoring this thread's affinity before an inline \
-             dispatch failed: {message}; it stays on the reserved cpu"
+            "dispatcher affinity was active, but restoring this thread's affinity failed: \
+             {message}; it stays on the reserved cpu"
         )),
     }
     DISPATCHER_PIN_HELD.with(|held| held.set(false));
@@ -5941,7 +6095,7 @@ mod tests {
         if allowed.is_empty() {
             return;
         }
-        let shards = node_shards_with(4, 1, |_| None);
+        let shards = node_shards_with(4, 1, |_| None, Some(&allowed));
         if shards.len() != 1 {
             return;
         }
@@ -7944,13 +8098,14 @@ mod tests {
         let pools = SpmdDecodePools::build_with_schedule(&shards, DecodeSchedule::Fixed, false);
         let off_calls = pools.affinity_call_counts();
         eprintln!(
-            "affinity-helper-calls mode=off pin={} set={} readback={}",
-            off_calls.pin, off_calls.set, off_calls.readback
+            "affinity-helper-calls mode=off capacity={} pin={} set={} readback={}",
+            off_calls.capacity_read, off_calls.pin, off_calls.set, off_calls.readback
         );
         assert_eq!(
             off_calls,
             crate::decode_affinity::AffinityCallCounts::default(),
-            "explicit `off` must make zero pin, set-mask, and read-back helper calls"
+            "the injected shard unit must make zero capacity, pin, set-mask, and read-back \
+             helper calls"
         );
         assert!(
             pools
@@ -8012,12 +8167,13 @@ mod tests {
         );
         let pinned_calls = pinned.affinity_call_counts();
         eprintln!(
-            "affinity-helper-calls mode=pinned pin={} set={} readback={}",
-            pinned_calls.pin, pinned_calls.set, pinned_calls.readback
+            "affinity-helper-calls mode=pinned capacity={} pin={} set={} readback={}",
+            pinned_calls.capacity_read, pinned_calls.pin, pinned_calls.set, pinned_calls.readback
         );
         assert_eq!(
             pinned_calls,
             crate::decode_affinity::AffinityCallCounts {
+                capacity_read: 0,
                 pin: 1,
                 set: 0,
                 readback: 1,
@@ -8031,12 +8187,13 @@ mod tests {
         });
         let set_calls = set_calls.snapshot();
         eprintln!(
-            "affinity-helper-calls mode=set-control pin={} set={} readback={}",
-            set_calls.pin, set_calls.set, set_calls.readback
+            "affinity-helper-calls mode=set-control capacity={} pin={} set={} readback={}",
+            set_calls.capacity_read, set_calls.pin, set_calls.set, set_calls.readback
         );
         assert_eq!(
             set_calls,
             crate::decode_affinity::AffinityCallCounts {
+                capacity_read: 0,
                 pin: 0,
                 set: 1,
                 readback: 0,
@@ -8061,6 +8218,133 @@ mod tests {
             );
         }
         pinned.shutdown();
+    }
+
+    const AFFINITY_CONTRACT_CHILD_ENV: &str = "ONNX_GENAI_TEST_AFFINITY_CONTRACT_CHILD";
+    const AFFINITY_CONTRACT_MARKER: &str = "AFFINITY_CONTRACT_RESULT=";
+
+    #[test]
+    fn production_affinity_contract_subprocess() {
+        let Ok(_mode) = std::env::var(AFFINITY_CONTRACT_CHILD_ENV) else {
+            return;
+        };
+        let counter = Arc::new(crate::decode_affinity::AffinityCallCounter::default());
+        let (valid, pool_built) =
+            crate::decode_affinity::with_affinity_call_counter(Arc::clone(&counter), || {
+                if crate::decode_affinity::validate_scheduler_configuration().is_err() {
+                    return (false, false);
+                }
+                let pool_built = pools().is_some();
+                (true, pool_built)
+            });
+        let calls = counter.snapshot();
+        println!(
+            "{AFFINITY_CONTRACT_MARKER}valid={} pool={} capacity={} pin={} set={} readback={}",
+            u8::from(valid),
+            u8::from(pool_built),
+            calls.capacity_read,
+            calls.pin,
+            calls.set,
+            calls.readback
+        );
+        shutdown_pools();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[derive(Debug)]
+    struct AffinityContractReport {
+        valid: bool,
+        pool_built: bool,
+        calls: crate::decode_affinity::AffinityCallCounts,
+    }
+
+    #[cfg(target_os = "linux")]
+    fn production_affinity_contract(mode: &str) -> AffinityContractReport {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("decode_spmd::tests::production_affinity_contract_subprocess")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env(AFFINITY_CONTRACT_CHILD_ENV, mode)
+            .env(PERSISTENT_POOL_ENV, "1")
+            .env(crate::kernels::matmul_nbits::DECODE_THREADS_ENV, "2")
+            .env(crate::decode_affinity::DECODE_AFFINITY_ENV, mode)
+            .env(
+                crate::decode_affinity::DECODE_PLACEMENT_ENV,
+                crate::decode_affinity::CorePlacement::Compact.as_str(),
+            )
+            .env_remove(DISPATCHER_PIN_ENV)
+            .output()
+            .expect("run the production affinity-contract child");
+        assert!(
+            output.status.success(),
+            "affinity-contract child failed for {mode:?}:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let report = stdout
+            .lines()
+            .find_map(|line| {
+                line.split_once(AFFINITY_CONTRACT_MARKER)
+                    .map(|(_, report)| report)
+            })
+            .unwrap_or_else(|| panic!("affinity-contract child emitted no report:\n{stdout}"));
+        let field = |key: &str| -> usize {
+            let prefix = format!("{key}=");
+            report
+                .split_whitespace()
+                .find_map(|part| part.strip_prefix(&prefix))
+                .unwrap_or_else(|| panic!("affinity-contract report omitted {key}: {report}"))
+                .parse()
+                .unwrap_or_else(|_| panic!("affinity-contract {key} is not numeric: {report}"))
+        };
+        AffinityContractReport {
+            valid: field("valid") == 1,
+            pool_built: field("pool") == 1,
+            calls: crate::decode_affinity::AffinityCallCounts {
+                capacity_read: field("capacity"),
+                pin: field("pin"),
+                set: field("set"),
+                readback: field("readback"),
+            },
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn explicit_off_reads_capacity_once_without_affinity_mutation() {
+        let off = production_affinity_contract("off");
+        assert!(off.valid && off.pool_built, "{off:?}");
+        assert_eq!(
+            off.calls,
+            crate::decode_affinity::AffinityCallCounts {
+                capacity_read: 1,
+                pin: 0,
+                set: 0,
+                readback: 0,
+            },
+            "the real env-to-pool path may discover capacity once for width/headroom, but \
+             explicit `off` must not pin, replace a mask, or read back worker affinity"
+        );
+
+        let compact = production_affinity_contract("compact");
+        assert!(compact.valid && compact.pool_built, "{compact:?}");
+        assert!(compact.calls.capacity_read >= 1, "{compact:?}");
+        assert!(compact.calls.pin > 0, "{compact:?}");
+        assert_eq!(
+            compact.calls.pin, compact.calls.readback,
+            "the positive control must cross both worker pin and read-back boundaries \
+             ({compact:?})"
+        );
+
+        let invalid = production_affinity_contract("sideways");
+        assert!(!invalid.valid && !invalid.pool_built, "{invalid:?}");
+        assert_eq!(
+            invalid.calls,
+            crate::decode_affinity::AffinityCallCounts::default(),
+            "invalid selectors must fail validation before any affinity read or mutation"
+        );
     }
 
     /// Read one live spawned worker's actual affinity mask by OS TID.
@@ -8433,10 +8717,15 @@ mod tests {
             cpus: vec![100, 101],
             workers: 2,
         };
-        let shards = node_shards_with(16, 0, |total| {
-            assert_eq!(total, 16, "the worker count must reach the request");
-            Some(vec![sentinel.clone()])
-        });
+        let shards = node_shards_with(
+            16,
+            0,
+            |total| {
+                assert_eq!(total, 16, "the worker count must reach the request");
+                Some(vec![sentinel.clone()])
+            },
+            None,
+        );
         assert_eq!(
             shards.len(),
             1,
@@ -8453,7 +8742,8 @@ mod tests {
     /// `DecodeAffinity::parse(None)` is `Off`.
     #[test]
     fn no_explicit_request_leaves_default_placement_intact() {
-        let defaulted = node_shards_with(16, 0, |_| None);
+        let allowed = crate::decode_affinity::allowed_cpus();
+        let defaulted = node_shards_with(16, 0, |_| None, allowed.as_deref());
         // Whatever this host's topology, the default path never returns an
         // empty schedule or a pool with no workers.
         assert!(!defaulted.is_empty());
@@ -8461,7 +8751,7 @@ mod tests {
         // Deferring must reach the real placement policy, not the unpinned
         // single shard `off` produces: on any host with a known allowed set the
         // default path pins.
-        if crate::decode_affinity::allowed_cpus().is_some_and(|cpus| !cpus.is_empty()) {
+        if allowed.is_some_and(|cpus| !cpus.is_empty()) {
             assert!(
                 defaulted.iter().any(|shard| !shard.cpus.is_empty()),
                 "default placement pins when the allowed set is known"

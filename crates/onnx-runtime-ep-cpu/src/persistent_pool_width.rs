@@ -6,7 +6,9 @@
 //!    core topology, placement policy, and architecture cap produce one
 //!    **global** worker budget. Compact counts the inline dispatcher as an
 //!    active decode thread and keeps at least half the logical capacity free;
-//!    explicit spread may use one worker per physical core.
+//!    on an exact 2-core/4-thread host the builder additionally confines that
+//!    dispatcher to the sole worker's SMT sibling. Explicit spread may use one
+//!    worker per physical core.
 //! 2. That budget is distributed across the usable NUMA nodes, then each fully
 //!    subscribed node gives up its configured service-core reserve.
 //!

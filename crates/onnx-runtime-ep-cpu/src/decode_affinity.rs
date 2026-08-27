@@ -50,6 +50,7 @@ use std::{
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct AffinityCallCounts {
+    pub(crate) capacity_read: usize,
     pub(crate) pin: usize,
     pub(crate) set: usize,
     pub(crate) readback: usize,
@@ -58,6 +59,7 @@ pub(crate) struct AffinityCallCounts {
 #[cfg(test)]
 #[derive(Debug, Default)]
 pub(crate) struct AffinityCallCounter {
+    capacity_read: AtomicUsize,
     pin: AtomicUsize,
     set: AtomicUsize,
     readback: AtomicUsize,
@@ -67,6 +69,7 @@ pub(crate) struct AffinityCallCounter {
 impl AffinityCallCounter {
     pub(crate) fn snapshot(&self) -> AffinityCallCounts {
         AffinityCallCounts {
+            capacity_read: self.capacity_read.load(Ordering::Relaxed),
             pin: self.pin.load(Ordering::Relaxed),
             set: self.set.load(Ordering::Relaxed),
             readback: self.readback.load(Ordering::Relaxed),
@@ -105,6 +108,20 @@ pub(crate) fn with_affinity_call_counter<T>(
 ) -> T {
     let _guard = install_affinity_call_counter(counter);
     f()
+}
+
+#[cfg(test)]
+pub(crate) fn current_affinity_call_counter() -> Option<Arc<AffinityCallCounter>> {
+    AFFINITY_CALL_COUNTER.with(|slot| slot.borrow().clone())
+}
+
+#[cfg(test)]
+fn record_capacity_read() {
+    AFFINITY_CALL_COUNTER.with(|slot| {
+        if let Some(counter) = slot.borrow().as_ref() {
+            counter.capacity_read.fetch_add(1, Ordering::Relaxed);
+        }
+    });
 }
 
 #[cfg(test)]
@@ -902,10 +919,12 @@ pub fn select_budget_cpus(count: usize) -> Option<Vec<usize>> {
 /// returns `false`. The caller is expected to choose the conservative,
 /// node-local behaviour on `false`.
 pub fn host_is_single_numa_node() -> bool {
-    single_numa_node_with_allowed(
-        host_numa_node_cpu_lists().as_ref(),
-        allowed_cpus().as_deref(),
-    )
+    let allowed = allowed_cpus();
+    host_is_single_numa_node_with_allowed(allowed.as_deref())
+}
+
+pub(crate) fn host_is_single_numa_node_with_allowed(allowed: Option<&[usize]>) -> bool {
+    single_numa_node_with_allowed(host_numa_node_cpu_lists().as_ref(), allowed)
 }
 
 /// Every NUMA node the host reports with its CPU list, *unfiltered* -- unlike
@@ -958,6 +977,8 @@ fn single_numa_node_with_allowed(
 /// never try to pin to a CPU outside the process's cpuset. `None` means "do not
 /// restrict" — we could not learn the mask, so we do not guess one.
 pub fn allowed_cpus() -> Option<Vec<usize>> {
+    #[cfg(test)]
+    record_capacity_read();
     #[cfg(target_os = "linux")]
     {
         linux_allowed_cpus()

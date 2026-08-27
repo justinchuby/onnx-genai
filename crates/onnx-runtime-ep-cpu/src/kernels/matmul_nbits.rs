@@ -3748,14 +3748,29 @@ fn configured_decode_threads() -> Option<usize> {
 /// fork/join regresses beyond that; the persistent pool replaces that fork/join
 /// with one hot broadcast barrier.
 pub fn configured_persistent_decode_threads() -> Option<usize> {
+    let allowed = crate::decode_affinity::allowed_cpus();
+    configured_persistent_decode_threads_with_allowed(allowed.as_deref())
+}
+
+pub(crate) fn configured_persistent_decode_threads_with_allowed(
+    allowed: Option<&[usize]>,
+) -> Option<usize> {
     let value = std::env::var(DECODE_THREADS_ENV).ok();
     let available = available_parallelism();
     let uses_default = persistent_decode_threads_are_automatic_for(value.as_deref());
+    let allowed_physical_cores = crate::core_topology::host()
+        .map(|topology| {
+            allowed.map_or_else(
+                || topology.core_count(),
+                |cpus| topology.physical_cores_within(cpus),
+            )
+        })
+        .filter(|&cores| cores > 0);
     let threads = resolve_persistent_decode_threads_with_override(
         decode_threads_override(),
         value.as_deref(),
         available,
-        crate::core_topology::allowed_physical_cores(),
+        allowed_physical_cores,
     );
     if !uses_default {
         return threads;
@@ -3772,12 +3787,11 @@ pub fn configured_persistent_decode_threads() -> Option<usize> {
         return Some(override_threads);
     }
 
-    let allowed = crate::decode_affinity::allowed_cpus();
     let cores = crate::core_topology::host();
     let numa = crate::decode_affinity::NumaTopology::detect();
     crate::persistent_pool_width::resolve_default_pool_width(
         crate::persistent_pool_width::DefaultPoolWidthInputs {
-            allowed_cpus: allowed.as_deref(),
+            allowed_cpus: allowed,
             core_topology: cores,
             numa_topology: numa.as_ref(),
             available_parallelism: available,
@@ -5467,6 +5481,7 @@ pub fn with_decode_pool_scope<R: Send>(
 /// flag routes each projection's row-sharding through the persistent pool, and
 /// the decode-residency flag makes inner `with_decode_pool` calls run inline.
 fn with_spmd_decode_scope<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+    let _dispatcher_pin = crate::decode_spmd::pools().map(|pool| pool.enter_dispatcher_scope());
     let _spmd_guard = SpmdScopeGuard::enter();
     let _decode_guard = DecodeResidencyGuard::enter();
     f()
@@ -20048,6 +20063,10 @@ mod tests {
         /// Threads consuming CPU while an op is in flight: every spawned
         /// worker plus the inline dispatcher, whether or not it owns a shard.
         active_threads: usize,
+        /// Physical cores covered by the worker and dispatcher affinity masks
+        /// while a real pool dispatch is in flight.
+        #[cfg(target_os = "linux")]
+        active_physical_cores: Option<usize>,
         pool_built: bool,
         /// Physical cores covered by the child's allowed cpuset.
         cores: usize,
@@ -20411,6 +20430,7 @@ mod tests {
             workers,
             spawned_workers,
             active_threads,
+            active_physical_cores,
             nodes,
             placement,
             honest,
@@ -20419,6 +20439,8 @@ mod tests {
             observed_ok,
         ) = match crate::decode_spmd::pools() {
             Some(pool) => {
+                let _dispatcher_pin = pool.enter_dispatcher_scope();
+                pool.dispatch_index_tasks(pool.total_workers(), &|_| {});
                 // Reported separately from `placement`, because
                 // `planned_placement_is_one_worker_per_physical_core` answers
                 // `Some(false)` for a *partially* pinned pool and so cannot
@@ -20428,11 +20450,16 @@ mod tests {
                 // anti-vacuity guard has to key off exactly that.
                 let cpus = pool.worker_cpus();
                 let fully_pinned = !cpus.is_empty() && cpus.iter().all(Option::is_some);
+                #[cfg(target_os = "linux")]
+                let active_physical_cores = active_decode_physical_cores(pool);
+                #[cfg(not(target_os = "linux"))]
+                let active_physical_cores: Option<usize> = None;
                 (
                     true,
                     pool.total_workers(),
                     pool.spawned_workers(),
                     pool.spawned_workers() + 1,
+                    active_physical_cores,
                     pool.node_count(),
                     pool.planned_placement_is_one_worker_per_physical_core(),
                     placement_is_honest(pool),
@@ -20441,8 +20468,16 @@ mod tests {
                     pool_observed_affinities(pool).is_some(),
                 )
             }
-            None => (false, 0, 0, 0, 0, None, None, false, "nopool", false),
+            None => (false, 0, 0, 0, None, 0, None, None, false, "nopool", false),
         };
+        #[cfg(target_os = "linux")]
+        if affinity_mask_applied {
+            assert_eq!(
+                crate::decode_affinity::allowed_cpus().as_deref(),
+                Some(allowed_cpus.as_slice()),
+                "the decode-scope dispatcher pin leaked into subsequent work"
+            );
+        }
         let tri = |value: Option<bool>| match value {
             Some(true) => "1",
             Some(false) => "0",
@@ -20451,9 +20486,11 @@ mod tests {
         println!(
             "{SPMD_WIDTH_MARKER}requested={requested} available={} allowed={allowed} \
              nodes={nodes} workers={workers} spawned={spawned_workers} active={active_threads} \
+             occupied={} \
              pool={} cores={cores} placement={} honest={} pinned={} proc={} \
              realized={realized} policy={} masked={} cpulist={cpulist}",
             available_parallelism(),
+            active_physical_cores.map_or_else(|| "na".to_string(), |count| count.to_string()),
             u8::from(pool_built),
             tri(placement),
             tri(honest),
@@ -20463,6 +20500,25 @@ mod tests {
             u8::from(affinity_mask_applied)
         );
         quiesce_pools_for_child_exit("spmd_realized_width");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn active_decode_physical_cores(pool: &crate::decode_spmd::SpmdDecodePools) -> Option<usize> {
+        let topology = crate::core_topology::require_host_for_placement().ok()?;
+        let mut cpus = Vec::new();
+        for placement in pool.worker_placements() {
+            cpus.extend_from_slice(placement.observed.cpus()?);
+        }
+        let tid = pool.dispatcher_thread_id()?;
+        let status = std::fs::read_to_string(format!("/proc/self/task/{tid}/status")).ok()?;
+        let dispatcher = status
+            .lines()
+            .find_map(|line| line.strip_prefix("Cpus_allowed_list:"))
+            .and_then(onnx_runtime_hostmon::parse_cpu_list)?;
+        cpus.extend(dispatcher);
+        cpus.sort_unstable();
+        cpus.dedup();
+        Some(topology.physical_cores_within(&cpus))
     }
 
     #[cfg(target_os = "linux")]
@@ -20835,6 +20891,13 @@ mod tests {
             workers: field("workers"),
             spawned_workers: field("spawned"),
             active_threads: field("active"),
+            #[cfg(target_os = "linux")]
+            active_physical_cores: match text("occupied") {
+                "na" => None,
+                count => Some(count.parse().unwrap_or_else(|_| {
+                    panic!("`occupied` is not a physical-core count: {report}")
+                })),
+            },
             pool_built: field("pool") == 1,
             cores: field("cores"),
             planned_distinct_cores: tri("placement"),
@@ -20856,6 +20919,17 @@ mod tests {
             affinity_mask_applied: field("masked") == 1,
             attempts: attempts_used,
         };
+
+        assert_eq!(
+            report.active_threads,
+            if report.pool_built {
+                report.spawned_workers + 1
+            } else {
+                0
+            },
+            "the child report must count every resident worker plus its inline dispatcher \
+             on every target ({report:?})"
+        );
 
         // A retry is only ever consumed for an exit code of exactly
         // `STATUS_ACCESS_VIOLATION` (`0xC0000005`). A Linux exit status is
@@ -21184,6 +21258,59 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn four_thread_two_core_default_occupies_only_one_physical_core() {
+        let allowed = crate::decode_affinity::allowed_cpus()
+            .expect("Linux must report the CPU set used to derive the SMT fixture");
+        let topology = crate::core_topology::require_host_for_placement()
+            .expect("Linux topology detection must succeed for a physical-occupancy test");
+        let mut mask = Vec::new();
+        for siblings in topology.cores() {
+            let available: Vec<usize> = siblings
+                .iter()
+                .copied()
+                .filter(|cpu| allowed.contains(cpu))
+                .take(2)
+                .collect();
+            if available.len() == 2 {
+                mask.extend(available);
+                if mask.len() == 4 {
+                    break;
+                }
+            }
+        }
+        if mask.len() != 4 {
+            eprintln!(
+                "skipping 2c/4t occupancy regression: the allowed mask exposes fewer than two \
+                 physical cores with both SMT siblings"
+            );
+            return;
+        }
+        mask.sort_unstable();
+        assert_eq!(topology.physical_cores_within(&mask), 2);
+
+        let report = realized_default_width_report(&mask);
+        assert_eq!(
+            (
+                report.workers,
+                report.spawned_workers,
+                report.active_threads
+            ),
+            (1, 1, 2),
+            "the exact 2c/4t default must retain one worker plus the inline dispatcher \
+             ({report:?})"
+        );
+        assert_eq!(report.cores, 2, "{report:?}");
+        assert_eq!(
+            report.active_physical_cores,
+            Some(1),
+            "worker and dispatcher kernel affinity masks must cover one physical core, leaving \
+             the other core wholly available to a co-tenant ({report:?})"
+        );
+        assert_eq!(report.placement_honest, Some(true), "{report:?}");
     }
 
     /// The explicit dedicated-host selector restores the wider automatic pool
