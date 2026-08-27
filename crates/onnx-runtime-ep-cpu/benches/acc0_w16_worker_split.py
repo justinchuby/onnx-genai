@@ -196,17 +196,29 @@ def derive(workers):
     }
 
 
-def trusted(rec):
-    """A launch is trusted iff every width produced an in-range residual."""
+def why_untrusted(rec):
+    """`None` if the launch counts, else why it does not -- as a category.
+
+    The distinction the report needs is not "trusted or not" but "was this
+    measured and rejected, or never measured at all".  A binary that never
+    ran scores every launch untrusted, and `n_trusted=0 of 8` over a table of
+    dashes reads as a host too busy to measure on.  That is a wrong diagnosis
+    the instrument was actively supplying, so the category is now printed.
+    """
     if rec.get("peak", 0) > rec.get("peak_limit", 10**9):
-        return False
-    for st in rec["widths"].values():
+        return "load"
+    for width, st in rec["widths"].items():
         if st is None:
-            return False
+            return "nodata"
         lo, hi = RESID_BOUNDS
         if not lo <= st["resid_frac"] <= hi:
-            return False
-    return True
+            return "resid"
+    return None
+
+
+def trusted(rec):
+    """A launch is trusted iff every width produced an in-range residual."""
+    return why_untrusted(rec) is None
 
 
 def med(rows, width, key):
@@ -323,14 +335,33 @@ def run_width(args, w):
     return r.stdout + "\n" + r.stderr
 
 
+def nodata_reason(workers):
+    """Why `derive` refused this width, in the words of what was observed.
+
+    All three of these arrive as `None` and would otherwise be indistinguishable
+    from each other -- and, worse, from a launch the load filter rejected.
+    """
+    if not workers:
+        return "no worker rows (the child did not run, or did not report)"
+    if any(w["timed_ops"] == 0 for w in workers):
+        return "profiling was off (timed_ops=0)"
+    if workers[0]["wall_s"] <= 0:
+        return "wall_s <= 0"
+    return "unmeasurable"
+
+
 def one_launch(args, launch, widths):
     rec = {"launch": launch, "blocktime_us": args.blocktime, "widths": {},
-           "steal_tiles": args.steal_tiles, "peak_limit": args.quiet_limit}
+           "steal_tiles": args.steal_tiles, "peak_limit": args.quiet_limit,
+           "nodata": {}}
     order = widths if launch % 2 == 0 else tuple(reversed(widths))
     rec["order"] = list(order)
     with H.LoadWatch() as watch:
         for w in order:
-            rec["widths"][str(w)] = derive(parse_workers(run_width(args, w)))
+            workers = parse_workers(run_width(args, w))
+            rec["widths"][str(w)] = derive(workers)
+            if rec["widths"][str(w)] is None:
+                rec["nodata"][str(w)] = nodata_reason(workers)
     rec["peak"] = watch.peak
     return rec
 
@@ -381,6 +412,35 @@ def _one_tile_label(v):
     return "default (shipped, unset)" if v is None else str(v)
 
 
+def report_nodata(recs):
+    """Say out loud when launches produced nothing, and why.
+
+    A sweep where the binary never ran and a sweep rejected by the load filter
+    both end at `n_trusted=0`. Only one of them is a statement about the host,
+    and reporting the other as if it were sends the reader to fix the wrong
+    thing.
+    """
+    blank = [r for r in recs if why_untrusted(r) == "nodata"]
+    if not blank:
+        return
+    reasons = {}
+    for r in blank:
+        recorded = r.get("nodata") or {}
+        for width, st in r["widths"].items():
+            if st is None:
+                reasons.setdefault(
+                    recorded.get(width, "no data (reason unrecorded: dataset "
+                                        "predates this field)"),
+                    set()).add(width)
+    print(f"\n!! {len(blank)} of {len(recs)} launches produced NO DATA -- "
+          f"this is not a load rejection:")
+    for reason, widths in sorted(reasons.items()):
+        print(f"     w{','.join(sorted(widths, key=int))}: {reason}")
+    if len(blank) == len(recs):
+        print("     Every launch was blank, so nothing below describes this "
+              "host; check --binary and that the run reached the workload.")
+
+
 def report(recs, widths):
     rows = [r for r in recs if trusted(r)]
     pair = rule_pair(widths)
@@ -398,7 +458,7 @@ def report(recs, widths):
     print(f"# blocktime_us={recs[0]['blocktime_us'] if recs else '?'} "
           f"(profiled run: diagnostic only, tps deliberately not reported)")
     print(f"# steal_tiles={steal_tiles_label(recs)}")
-    hdr = (f"{'L':>3} {'pk':>4} {'T':>2} " +
+    hdr = (f"{'L':>3} {'pk':>4} {'T':>6} " +
            " ".join(f"{'w'+str(w)+'.'+k:>12}"
                     for w in widths
                     for k in ("wake", "work", "resid", "strag")))
@@ -418,10 +478,11 @@ def report(recs, widths):
                     f"{st['straggler_excess']:>12.2f}",
                 ]
         print(f"{r['launch']:>3} {r.get('peak', 0):>4} "
-              f"{'y' if trusted(r) else 'N':>2} " + " ".join(cells))
+              f"{why_untrusted(r) or 'ok':>6} " + " ".join(cells))
 
     verdicts, m = verdict(rows, widths)
     print(f"\nn_trusted={len(rows)} of {len(recs)}")
+    report_nodata(recs)
     for v in verdicts:
         print(f"VERDICT: {v}")
     if not m:
@@ -663,10 +724,91 @@ def self_test():
         if 2 in widths:
             assert "descriptive only" in out and "w2" in out, out
 
+    # A blank sweep must not be reported as a busy host. This is the exact
+    # shape that produced a clean-looking `n_trusted=0 of 8` while the binary
+    # had never executed.
+    blank = synthetic_rows(3, stats)
+    for r in blank:
+        r["widths"] = {"8": None, "16": None}
+        r["nodata"] = {"8": "no worker rows (the child did not run, or did "
+                            "not report)",
+                       "16": "no worker rows (the child did not run, or did "
+                             "not report)"}
+    assert why_untrusted(blank[0]) == "nodata", why_untrusted(blank[0])
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        report(blank, (8, 16))
+    out = buf.getvalue()
+    assert "produced NO DATA" in out and "not a load rejection" in out, out
+    assert "Every launch was blank" in out, out
+
+    # ...and a launch the load filter really did reject must still say `load`,
+    # or the new category would have swallowed the old one.
+    loaded = synthetic_rows(1, stats)
+    loaded[0]["peak"] = loaded[0]["peak_limit"] + 1
+    assert why_untrusted(loaded[0]) == "load", why_untrusted(loaded[0])
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        report(loaded, (8, 16))
+    assert "produced NO DATA" not in buf.getvalue(), buf.getvalue()
+
+    # An archived dataset predating `nodata` must say the reason is unrecorded
+    # rather than assert the most likely one.
+    old = synthetic_rows(1, stats)
+    old[0]["widths"] = {"8": None, "16": None}
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        report(old, (8, 16))
+    assert "reason unrecorded" in buf.getvalue(), buf.getvalue()
+
+    # There is no default owner. A hard-coded one is how every agent but its
+    # namesake archived their runs under somebody else's identity.
+    saved = {k: os.environ.get(k) for k in H.OWNER_ENV}
+    try:
+        for k in H.OWNER_ENV:
+            os.environ.pop(k, None)
+        try:
+            H.bench_owner()
+        except SystemExit as exc:
+            assert "no host-lock owner" in str(exc), str(exc)
+        else:
+            raise AssertionError(
+                "bench_owner() returned a name with no owner in the "
+                "environment; a defaulted owner is a wrong one, not a weak one")
+        os.environ["HOSTLOCK_OWNER"] = "inherited"
+        assert H.bench_owner() == "inherited"
+        os.environ["ONNX_GENAI_BENCH_OWNER"] = "explicit"
+        assert H.bench_owner() == "explicit", (
+            "the bench-specific owner must win over an inherited one")
+        os.environ["ONNX_GENAI_BENCH_OWNER"] = "   "
+        assert H.bench_owner() == "inherited", (
+            "a blank owner must not be accepted as a name")
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    # `--binary` is resolved against the caller's cwd, and proven to run,
+    # here rather than eight silent launches later.
+    for bad, want in ((os.path.join(H.HERE, "definitely-not-here"),
+                       "does not exist"),
+                      (os.path.abspath(__file__), "not executable")):
+        try:
+            H.resolve_binary(bad)
+        except SystemExit as exc:
+            assert want in str(exc), f"expected {want!r} in: {exc}"
+        else:
+            raise AssertionError(f"resolve_binary accepted {bad}")
+    assert os.path.isabs(H.resolve_binary(sys.executable))
+
     print(f"self-test OK: verdict pinned to w{RULE_NARROW} vs w{RULE_WIDE} "
           f"under every --widths permutation tried; steal-tile arm label "
           f"distinguishes explicit, shipped-default, unrecorded and mixed, "
-          f"and unhonoured tile counts are refused")
+          f"unhonoured tile counts are refused, a blank sweep is not reported "
+          f"as a busy host, and neither the lock owner nor the binary path is "
+          f"guessed")
 
 
 def main():
@@ -702,11 +844,12 @@ def main():
 
     if not args.binary:
         ap.error("--binary is required unless --replay or --self-test is used")
+    args.binary = H.resolve_binary(args.binary)
 
     recs = []
     # The sweep holds the box for its whole duration; the report afterwards is
     # arithmetic and runs unlocked.
-    with H.HostLock(owner=os.environ.get("ONNX_GENAI_BENCH_OWNER", "roy"),
+    with H.HostLock(owner=H.bench_owner(),
                     reason=f"acc0 w16 worker split, {args.launches} launches "
                            f"widths={args.widths}") as lock:
         for launch in range(args.launches):
