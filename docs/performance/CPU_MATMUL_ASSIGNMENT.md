@@ -3309,6 +3309,33 @@ Full report:
   one every other gate here exists to reject. This is #1802 item 4 ("both arms
   in the gates") delivered for this harness, and the arm is reusable by anyone
   else who owes busy-host evidence for a default.
+* **The pin is now verified rather than assumed (2026-08-27).** Every row in
+  that matrix is labelled `cpu4`, and that label rested entirely on the
+  `taskset` in the launch line. `taskset` is not a bound — it is one
+  `sched_setaffinity` call, and the pinned process can make another — so
+  #1812's finding that `ONNX_GENAI_CPU_DECODE_THREADS=N` confines a process to
+  N cpus of the *pool's* choosing is a live hazard for a harness that sets that
+  variable on every decode launch. Measured directly, reading each thread's
+  allowed mask back from `/proc`: at `taskset -c 4` with width 1 every thread
+  is `allowed=4` and runs on 4 (`path=flat`, `PIN-OFF`); at `-c 4-7` width 4
+  the pool stays inside the mask; at `-c 4` width 4 it **clamps to
+  `realized=1` and prints `WIDTH-MISMATCH`** instead of escaping. The pin held,
+  the rows are measured where they claim, and the clamp is the #1802-shaped
+  behaviour, now held by a test. The width=1 result also closes the exposure
+  #1812 raises for this file's rows specifically: that amplification needs a
+  barrier across a multi-cpu set, and a single-cpu `flat` launch has none,
+  while a foreign thread on the pinned cpu drops `(utime+stime)/wall` below the
+  floor and is discarded per launch. It does reach **wider** assignments, where
+  a flat `0.95` floor is the wrong instrument — a 2-wide launch that kept both
+  cpus scores ~2.00 and #1812's contaminated one scores 1.02, so the floor now
+  scales with the assignment (at one cpu it still returns 0.95 and changes no
+  decision, keeping these rows comparable). Both checks were wrong on the first
+  attempt and the controls are what said so: mutation testing killed a verdict
+  on last-run cpu (which lags `sched_setaffinity` and would abort correct
+  runs), and a positive control — a child that widens its own mask 300ms in —
+  returned `conformant` from a probe that stopped sampling at its first read.
+  **A check that has only ever said "conformant" has not been shown to be a
+  check**, which is the same argument as the vacuous-guard rule one level up.
 * **Disposition: no kernel change.** #1809's code was already correct and
   already on main. What shipped is the corrected scope, the per-row route
   fingerprint, the bootstrap and A/A self-check, and the two scripts that make
