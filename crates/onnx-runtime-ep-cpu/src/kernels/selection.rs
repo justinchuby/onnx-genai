@@ -291,40 +291,51 @@ impl Kernel for ArgKernel {
                 "{name}: output must be Int64"
             )));
         }
-        let x = to_dense_f32_widen(name, &inputs[0])?;
-        let axis = axis(name, self.axis, inputs[0].shape.len())?;
-        let width = inputs[0].shape[axis];
-        if width == 0 {
-            return Err(EpError::KernelFailed(format!(
-                "{name}: reduced axis must be non-empty"
-            )));
-        }
-        let inner = numel(&inputs[0].shape[axis + 1..]);
-        let mut out = Vec::with_capacity(numel(outputs[0].shape));
-        for outer in 0..numel(&inputs[0].shape[..axis]) {
-            for i in 0..inner {
-                let mut best = 0;
-                for d in 1..width {
-                    let candidate = x[(outer * width + d) * inner + i];
-                    let value = x[(outer * width + best) * inner + i];
-                    let better = match self.op {
-                        ArgOp::Max => candidate > value,
-                        ArgOp::Min => candidate < value,
-                    };
-                    if better || (self.select_last_index && candidate == value) {
-                        best = d;
-                    }
-                }
-                out.push(best as i64);
-            }
-        }
-        let bytes: Vec<u8> = out.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let _ = self.keepdims;
-        write_dense_bytes(&mut outputs[0], &bytes)
+        dispatch_arith!(inputs[0].dtype, name, T => {
+            arg_reduce::<T>(self, name, &inputs[0], &mut outputs[0])
+        })
     }
     fn supports_strided_input(&self, _: usize) -> bool {
         true
     }
+}
+
+fn arg_reduce<T: NumericElem + PartialOrd + PartialEq>(
+    kernel: &ArgKernel,
+    name: &str,
+    input: &TensorView,
+    output: &mut TensorMut,
+) -> Result<()> {
+    let x = to_dense::<T>(input)?;
+    let axis = axis(name, kernel.axis, input.shape.len())?;
+    let width = input.shape[axis];
+    if width == 0 {
+        return Err(EpError::KernelFailed(format!(
+            "{name}: reduced axis must be non-empty"
+        )));
+    }
+    let inner = numel(&input.shape[axis + 1..]);
+    let mut out = Vec::with_capacity(numel(output.shape));
+    for outer in 0..numel(&input.shape[..axis]) {
+        for i in 0..inner {
+            let mut best = 0;
+            for d in 1..width {
+                let candidate = x[(outer * width + d) * inner + i];
+                let value = x[(outer * width + best) * inner + i];
+                let better = match kernel.op {
+                    ArgOp::Max => candidate > value,
+                    ArgOp::Min => candidate < value,
+                };
+                if better || (kernel.select_last_index && candidate == value) {
+                    best = d;
+                }
+            }
+            out.push(best as i64);
+        }
+    }
+    let bytes: Vec<u8> = out.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let _ = kernel.keepdims;
+    write_dense_bytes(output, &bytes)
 }
 
 pub struct TopKKernel {
@@ -989,6 +1000,22 @@ mod tests {
         .unwrap();
         assert_eq!(y.to_i64(), vec![2, 0]);
     }
+
+    #[test]
+    fn argmax_accepts_int64_token_sampler_logits() {
+        let x = Owned::i64(&[2, 3], &[1, 4, 4, 3, 2, 1]);
+        let mut y = Owned::zeros(DataType::Int64, &[2]);
+        ArgKernel {
+            op: ArgOp::Max,
+            axis: -1,
+            keepdims: false,
+            select_last_index: true,
+        }
+        .execute(&[x.view()], &mut [y.view_mut()])
+        .unwrap();
+        assert_eq!(y.to_i64(), vec![2, 0]);
+    }
+
     #[test]
     fn argmin_keepdims_selects_last_tie() {
         let x = Owned::f32(&[2, 3], &[3., 1., 1., 2., 0., 0.]);

@@ -25,6 +25,7 @@ use crate::strided::{next_index, numel};
 enum Num {
     F(f64),
     I(i64),
+    U(u64),
 }
 
 impl Num {
@@ -32,6 +33,7 @@ impl Num {
         match self {
             Num::F(f) => f,
             Num::I(i) => i as f64,
+            Num::U(u) => u as f64,
         }
     }
 
@@ -42,6 +44,7 @@ impl Num {
         match self {
             Num::F(f) => f as i64,
             Num::I(i) => i,
+            Num::U(u) => u as i64,
         }
     }
 
@@ -49,6 +52,7 @@ impl Num {
         match self {
             Num::F(f) => f != 0.0,
             Num::I(i) => i != 0,
+            Num::U(u) => u != 0,
         }
     }
 }
@@ -68,6 +72,7 @@ macro_rules! num_to_int {
                 match self {
                     Num::F(f) => f as $ty,
                     Num::I(i) => i as $ty,
+                    Num::U(u) => u as $ty,
                 }
             }
         }
@@ -80,6 +85,7 @@ num_to_int!(to_i8, i8);
 num_to_int!(to_u8, u8);
 num_to_int!(to_u16, u16);
 num_to_int!(to_u32, u32);
+num_to_int!(to_u64, u64);
 
 /// Cast kernel carrying the target dtype (`None` until the `to` attribute is
 /// resolved; execution errors if it was absent).
@@ -201,6 +207,7 @@ mod lane {
     pub struct U8;
     pub struct U16;
     pub struct U32;
+    pub struct U64;
     pub struct Bool;
 }
 
@@ -305,6 +312,14 @@ impl_lane!(
     |b| Num::I(u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as i64),
     |n, o| o.copy_from_slice(&n.to_u32().to_le_bytes())
 );
+impl_lane!(
+    lane::U64,
+    8,
+    |b| Num::U(u64::from_le_bytes([
+        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]
+    ])),
+    |n, o| o.copy_from_slice(&n.to_u64().to_le_bytes())
+);
 impl_lane!(lane::Bool, 1, |b| Num::I((b[0] != 0) as i64), |n, o| o[0] =
     n.is_nonzero() as u8);
 
@@ -357,6 +372,10 @@ macro_rules! with_lane {
                 type $L = lane::U32;
                 Some($body)
             }
+            DataType::Uint64 => {
+                type $L = lane::U64;
+                Some($body)
+            }
             DataType::Bool => {
                 type $L = lane::Bool;
                 Some($body)
@@ -384,7 +403,7 @@ fn encode_run<D: EncodeLane>(stage: &[Num], dst: &mut [u8], n: usize) {
 /// Contiguous, non-aliasing `Cast`. Returns `Ok(false)` when the layout or
 /// dtype pair is not eligible so the caller runs the generic strided path.
 ///
-/// Staging through a fixed-size `Num` batch keeps this at 12 + 12 = 24
+/// Staging through a fixed-size `Num` batch keeps this at 13 + 13 = 26
 /// monomorphised loops instead of the 144 a fully fused `S x D` loop would
 /// need, while still paying the `DataType` match once per batch rather than
 /// once per element. The staging buffer is 16 KiB and L1-resident.
@@ -404,7 +423,7 @@ fn cast_contiguous(input: &TensorView, output: &mut TensorMut, to: DataType) -> 
     };
 
     // Resolve lane eligibility once, before any work. `elem_size` succeeds for
-    // several dtypes this path has no lane for (`Uint64`, `Complex64/128`, the
+    // several dtypes this path has no lane for (`Complex64/128`, the
     // `Float8*` family), so without this the loop below would decode a whole
     // batch only to discover the target is unsupported. Hoisting it also makes
     // the invariant explicit: past this point both `with_lane!` sites are
@@ -596,6 +615,7 @@ fn decode(dtype: DataType, buf: &[u8; 8]) -> Result<Num> {
         DataType::Uint8 => Num::I(buf[0] as i64),
         DataType::Uint16 => Num::I(u16::from_le_bytes([buf[0], buf[1]]) as i64),
         DataType::Uint32 => Num::I(u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as i64),
+        DataType::Uint64 => Num::U(u64::from_le_bytes(*buf)),
         DataType::Bool => Num::I((buf[0] != 0) as i64),
         other => {
             return Err(EpError::KernelFailed(format!(
@@ -623,6 +643,7 @@ fn write_num(out: &mut Vec<u8>, n: Num, dtype: DataType) -> Result<()> {
         DataType::Uint8 => out.push(n.to_u8()),
         DataType::Uint16 => out.extend_from_slice(&n.to_u16().to_le_bytes()),
         DataType::Uint32 => out.extend_from_slice(&n.to_u32().to_le_bytes()),
+        DataType::Uint64 => out.extend_from_slice(&n.to_u64().to_le_bytes()),
         DataType::Bool => out.push(n.is_nonzero() as u8),
         other => {
             return Err(EpError::KernelFailed(format!(
@@ -637,6 +658,15 @@ fn write_num(out: &mut Vec<u8>, n: Num, dtype: DataType) -> Result<()> {
 mod tests {
     use super::*;
     use crate::kernels::testutil::Owned;
+
+    fn bytes_to_u64(bytes: &[u8]) -> Vec<u64> {
+        bytes
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|chunk| u64::from_le_bytes(*chunk))
+            .collect()
+    }
 
     fn cast(to: DataType, input: &Owned, out: &mut Owned) {
         CastKernel { to: Some(to) }
@@ -669,6 +699,21 @@ mod tests {
         let mut back = Owned::zeros(DataType::Int64, &[2]);
         cast(DataType::Int64, &i32out, &mut back);
         assert_eq!(back.to_i64(), vec![123456, -7]);
+    }
+
+    #[test]
+    fn i64_to_u64_and_back_supports_token_sampler_seed_casts() {
+        // The workflow token samplers cast the per-row seed Int64 -> Uint64
+        // before feeding the counter-RNG. Native must match ONNX/ORT here or
+        // decoder/VLM native parity fails before sampling even begins.
+        let a = Owned::i64(&[3], &[0, 7, -1]);
+        let mut u64out = Owned::zeros(DataType::Uint64, &[3]);
+        cast(DataType::Uint64, &a, &mut u64out);
+        assert_eq!(bytes_to_u64(&u64out.bytes), vec![0, 7, u64::MAX]);
+
+        let mut back = Owned::zeros(DataType::Int64, &[3]);
+        cast(DataType::Int64, &u64out, &mut back);
+        assert_eq!(back.to_i64(), vec![0, 7, -1]);
     }
 
     #[test]
@@ -832,7 +877,7 @@ mod contiguous_fast_path_tests {
         output.bytes
     }
 
-    const TARGETS: [DataType; 12] = [
+    const TARGETS: [DataType; 13] = [
         DataType::Float32,
         DataType::Float64,
         DataType::Float16,
@@ -844,6 +889,7 @@ mod contiguous_fast_path_tests {
         DataType::Uint8,
         DataType::Uint16,
         DataType::Uint32,
+        DataType::Uint64,
         DataType::Bool,
     ];
 

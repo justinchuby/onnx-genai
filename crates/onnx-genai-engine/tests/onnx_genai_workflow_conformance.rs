@@ -12,6 +12,9 @@ use onnx_genai_engine::{
 use onnx_genai_ort::{DataType, Value};
 use std::path::PathBuf;
 
+#[path = "common/hermetic_workflows.rs"]
+mod hermetic_workflows;
+
 fn root(name: &str) -> anyhow::Result<PathBuf> {
     let root = std::env::var_os("MOBIUS_WORKFLOW_CONFORMANCE_DIR")
         .map(PathBuf::from)
@@ -58,50 +61,7 @@ fn adapter_request(
     values: &[f32],
     selection: AdapterSelection,
 ) -> anyhow::Result<PipelineGenerateRequest> {
-    // Rows are identified by batch position. The package carries no slot ids or
-    // epochs, so the caller's row order is the only association there is.
-    let rows = selection.rows.len();
-    let batch = i64::try_from(rows)?;
-    let mut segments = vec![-1i64; rows * 2];
-    let mut adapter_counts = vec![0i64; rows];
-    let mut adapter_scales = vec![0.0f32; rows * 2];
-    for (row, activations) in selection.rows.iter().enumerate() {
-        adapter_counts[row] = i64::try_from(activations.len())?;
-        for (slot, activation) in activations.iter().enumerate() {
-            segments[row * 2 + slot] = match activation.adapter.as_str() {
-                "blue" => 0,
-                "green" => 1,
-                "red" => 3,
-                other => anyhow::bail!("unknown test adapter {other}"),
-            };
-            adapter_scales[row * 2 + slot] = activation.scale;
-        }
-    }
-    Ok(PipelineGenerateRequest::new(GenerateRequest {
-        prompt: GeneratePrompt::TokenIds(vec![]),
-        options: Default::default(),
-    })
-    .with_input(
-        "request.adapter_segments",
-        Value::from_slice_i64(&segments, &[batch, 2])?,
-    )
-    .with_input(
-        "request.adapter_counts",
-        Value::from_slice_i64(&adapter_counts, &[batch])?,
-    )
-    .with_input(
-        "request.adapter_scales",
-        Value::from_slice_f32(&adapter_scales, &[batch, 2])?,
-    )
-    .with_input(
-        "request.active",
-        Value::from_raw_bytes(
-            active.iter().map(|value| u8::from(*value)).collect(),
-            &[batch],
-            DataType::Bool,
-        )?,
-    )
-    .with_input("activations", Value::from_slice_f32(values, &[batch, 2])?))
+    hermetic_workflows::adapter_request(active, values, selection)
 }
 
 #[test]
@@ -415,21 +375,7 @@ fn mobius_decoder_rows_match_independent_runs_and_dynamic_batch_replay() -> anyh
 #[test]
 fn mobius_vlm_workflow_executes_complete_image_path() -> anyhow::Result<()> {
     let mut engine = Engine::from_dir(&root("vlm")?, EngineConfig::default())?;
-    let png = vec![
-        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 2,
-        0, 0, 0, 144, 119, 83, 222, 0, 0, 0, 12, 73, 68, 65, 84, 120, 156, 99, 248, 207, 192, 0, 0,
-        3, 1, 1, 0, 201, 254, 146, 239, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
-    ];
-    let png_len = i64::try_from(png.len())?;
-    let request = PipelineGenerateRequest::new(GenerateRequest {
-        prompt: GeneratePrompt::TokenIds(vec![4, 5]),
-        options: options(2),
-    })
-    .with_input(
-        "request.image",
-        Value::from_raw_bytes(png, &[png_len], DataType::Uint8)?,
-    );
-    let output = engine.run_pipeline_outputs(request)?;
+    let output = engine.run_pipeline_outputs(hermetic_workflows::vlm_request(&[4, 5], 2)?)?;
     assert_eq!(
         engine
             .structured_output_for_role(&output, WorkflowOutputRole::Tokens)
@@ -628,34 +574,7 @@ fn mobius_euler_diffusion_workflow_executes_batched() -> anyhow::Result<()> {
 #[test]
 fn mobius_guided_diffusion_workflow_executes_complete_path() -> anyhow::Result<()> {
     let mut engine = Engine::from_dir(&root("diffusion_guided")?, EngineConfig::default())?;
-    let request = |seeds: &[i64], prompts: &[i64]| -> anyhow::Result<PipelineGenerateRequest> {
-        let rows = i64::try_from(seeds.len())?;
-        Ok(PipelineGenerateRequest::new(GenerateRequest {
-            prompt: GeneratePrompt::TokenIds(vec![]),
-            options: options(3),
-        })
-        .with_input(
-            "request.input_ids",
-            Value::from_slice_i64(prompts, &[rows, 2])?,
-        )
-        .with_input(
-            "request.negative_input_ids",
-            Value::from_slice_i64(&vec![0; prompts.len()], &[rows, 2])?,
-        )
-        .with_input("request.seed", Value::from_slice_i64(seeds, &[rows])?)
-        .with_input(
-            "package.rng_offset",
-            Value::from_slice_i64(&vec![0; seeds.len()], &[rows])?,
-        )
-        .with_input(
-            "request.guidance_scale",
-            Value::from_slice_f32(&vec![7.5; seeds.len()], &[rows])?,
-        )
-        .with_input(
-            "package.false",
-            Value::from_raw_bytes(vec![0; seeds.len()], &[rows], DataType::Bool)?,
-        ))
-    };
+    let request = hermetic_workflows::guided_diffusion_request;
 
     let output = engine.run_pipeline_outputs(request(&[7, 11], &[1, 2, 3, 4])?)?;
     assert_eq!(output["latent"].shape(), [2, 4, 4, 4]);
@@ -705,16 +624,11 @@ fn mobius_guided_diffusion_workflow_executes_complete_path() -> anyhow::Result<(
 #[test]
 fn mobius_masked_diffusion_workflow_executes() -> anyhow::Result<()> {
     let mut engine = Engine::from_dir(&root("masked")?, EngineConfig::default())?;
-    let request = PipelineGenerateRequest::new(GenerateRequest {
-        prompt: GeneratePrompt::TokenIds(vec![0, 0]),
-        options: options(3),
-    })
-    .with_input(
-        "masked_positions",
-        Value::from_raw_bytes(vec![1, 0], &[1, 2], DataType::Bool)?,
-    )
-    .with_input("rng_offset", Value::from_slice_i64(&[0], &[1])?);
-    let output = engine.run_pipeline_outputs(request)?;
+    let output = engine.run_pipeline_outputs(hermetic_workflows::masked_request(
+        &[0, 0],
+        &[true, false],
+        &[0],
+    )?)?;
     assert_eq!(output["tokens"].shape(), [1, 2]);
     Ok(())
 }
@@ -722,44 +636,13 @@ fn mobius_masked_diffusion_workflow_executes() -> anyhow::Result<()> {
 #[test]
 fn mobius_codec_workflow_executes() -> anyhow::Result<()> {
     let mut engine = Engine::from_dir(&root("codec")?, EngineConfig::default())?;
-    let request =
-        PipelineGenerateRequest::new(GenerateRequest::new(GeneratePrompt::TokenIds(vec![])))
-            .with_input(
-                "request.waveform",
-                Value::from_slice_f32(&[0.25, -0.5], &[1, 1, 2])?,
-            );
-    let output = engine.run_pipeline_outputs(request)?;
+    let output = engine.run_pipeline_outputs(hermetic_workflows::codec_request(&[0.25, -0.5])?)?;
     assert_eq!(output["waveform"].to_vec_f32()?, [0.25, -0.5]);
     Ok(())
 }
 
 fn tts_request(prompt_tokens: &[i64], batch: i64) -> anyhow::Result<PipelineGenerateRequest> {
-    let rows = usize::try_from(batch)?;
-    assert_eq!(prompt_tokens.len(), rows * 2);
-    Ok(PipelineGenerateRequest::new(GenerateRequest {
-        prompt: GeneratePrompt::TokenIds(vec![0]),
-        options: options(1),
-    })
-    .with_input(
-        "request.prompt_tokens",
-        Value::from_slice_i64(prompt_tokens, &[batch, 2])?,
-    )
-    .with_input(
-        "package.false",
-        Value::from_raw_bytes(vec![0; rows], &[batch], DataType::Bool)?,
-    )
-    .with_input(
-        "package.zero_batch",
-        Value::from_slice_i64(&vec![0; rows], &[batch])?,
-    )
-    .with_input(
-        "package.one_batch",
-        Value::from_slice_i64(&vec![1; rows], &[batch])?,
-    )
-    .with_input(
-        "package.true",
-        Value::from_raw_bytes(vec![1; rows], &[batch], DataType::Bool)?,
-    ))
+    hermetic_workflows::tts_request(prompt_tokens, batch)
 }
 
 #[test]
@@ -873,30 +756,7 @@ fn mobius_hierarchical_audio_executes_nested_generation() -> anyhow::Result<()> 
 }
 
 fn video_request(latent_frames: i64, batch: i64) -> anyhow::Result<PipelineGenerateRequest> {
-    let rows = usize::try_from(batch)?;
-    // [batch, latent_frames, channels, height, width]. Generating from the flat
-    // index keeps row 0 and the leading frames identical across shapes, so the
-    // comparisons below isolate the runtime's handling of the temporal axis.
-    let elements = batch * latent_frames * 4 * 2 * 2;
-    let noise: Vec<f32> = (0..elements)
-        .map(|index| (index % 11) as f32 / 11.0 - 0.5)
-        .collect();
-    Ok(PipelineGenerateRequest::new(GenerateRequest {
-        prompt: GeneratePrompt::TokenIds(vec![]),
-        options: options(3),
-    })
-    .with_input(
-        "request.noise",
-        Value::from_slice_f32(&noise, &[batch, latent_frames, 4, 2, 2])?,
-    )
-    .with_input(
-        "request.encoder_hidden_states",
-        Value::from_slice_f32(&vec![0.25; rows * 2 * 32], &[batch, 2, 32])?,
-    )
-    .with_input(
-        "package.false",
-        Value::from_raw_bytes(vec![0; rows], &[batch], DataType::Bool)?,
-    ))
+    hermetic_workflows::video_request(latent_frames, batch)
 }
 
 #[test]
