@@ -24,6 +24,8 @@
 //!   * `score(h, t)    = relu(scale · dot(h, t))`
 //!   * `weighted(t)    = Σ_h score(h, t) · (weights[b,s,h] · weights_scale)`
 //!   * `masked(t)      = weighted(t) + attention_bias[b,0,s,t]`
+//!   * if `masked(t)` is NaN, canonicalize it to positive quiet NaN
+//!     (`0x7fc00000`) before ranking,
 //!   * a position `t` is *allowed* iff `attention_bias[b,0,s,t] > -1e30`
 //!     (i.e. not the `-inf` / `finfo.min` causal fill),
 //!   * select the top `min(#allowed, top_k)` allowed positions by
@@ -52,6 +54,20 @@ const INPUT_NAMES: [&str; 4] = ["query", "key", "weights", "attention_bias"];
 /// Bias values at or below this magnitude are treated as `-inf` causal fill
 /// (`-inf` and `f32::MIN`/`torch.finfo.min` ≈ `-3.4e38` both qualify).
 const MASK_THRESHOLD: f32 = -1e30;
+const CANONICAL_NAN_BITS: u32 = 0x7fc0_0000;
+
+/// Ranking contract shared with CUDA: after the final additive score is
+/// computed, every NaN is replaced by one positive quiet-NaN bit pattern before
+/// `total_cmp`. This removes backend-specific NaN sign/payload differences from
+/// finite-overflow expressions such as `infinity * 0`.
+#[inline]
+fn canonicalize_score(score: f32) -> f32 {
+    if score.is_nan() {
+        f32::from_bits(CANONICAL_NAN_BITS)
+    } else {
+        score
+    }
+}
 
 pub struct DsaIndexSelectFactory;
 
@@ -246,7 +262,7 @@ impl Kernel for DsaIndexSelectKernel {
                         let scored = (self.scale * dot).max(0.0); // Relu
                         weighted += scored * (weights[weights_base + h] * self.weights_scale);
                     }
-                    candidates.push((weighted + bias_bt, t));
+                    candidates.push((canonicalize_score(weighted + bias_bt), t));
                 }
 
                 let keep = candidates.len().min(self.top_k);
@@ -276,8 +292,8 @@ impl Kernel for DsaIndexSelectKernel {
 }
 
 /// Total order over `(score, index)` candidates: highest score wins, ties broken
-/// by lower position index (matching ONNX Runtime `TopK`). `total_cmp` keeps NaN
-/// handling deterministic and identical to the CUDA kernel.
+/// by lower position index (matching ONNX Runtime `TopK`). Scores have already
+/// passed through [`canonicalize_score`], so `total_cmp` is backend-independent.
 fn score_order(a: (f32, usize), b: (f32, usize)) -> Ordering {
     match b.0.total_cmp(&a.0) {
         Ordering::Equal => a.1.cmp(&b.1),
@@ -596,7 +612,7 @@ mod tests {
                         let relu = (case.scale * dot).max(0.0);
                         weighted += relu * (weights[(b * case.q_seq + s) * case.heads + h] * ws);
                     }
-                    scored.push((weighted + bias_bt, t));
+                    scored.push((canonicalize_score(weighted + bias_bt), t));
                 }
                 scored.sort_by(|a, b| match b.0.total_cmp(&a.0) {
                     Ordering::Equal => a.1.cmp(&b.1),
@@ -924,6 +940,46 @@ mod tests {
         let bf16_out = run_dtype(case, DataType::BFloat16, &query, &key, &weights, &bias).unwrap();
         assert_eq!(f16_out, f32_out);
         assert_eq!(bf16_out, f32_out);
+    }
+
+    #[test]
+    fn overflow_nan_scores_are_canonicalized_before_total_ordering() {
+        let case = Case {
+            batch: 1,
+            q_seq: 1,
+            heads: 1,
+            head_dim: 1,
+            key_seq: 3,
+            top_k: 2,
+            scale: f32::MAX,
+            weights_scale: Some(1.0),
+        };
+        for (dtype, large) in [
+            (DataType::Float32, f32::MAX),
+            (DataType::Float16, half::f16::MAX.to_f32()),
+            (DataType::BFloat16, half::bf16::MAX.to_f32()),
+        ] {
+            let scored = (case.scale * (0.0f32 + large * large)).max(0.0);
+            let raw_score = 0.0f32 + scored * (0.0 * 1.0) + 0.0;
+            assert!(
+                raw_score.is_nan(),
+                "{dtype:?} regression input must actually produce infinity * 0"
+            );
+            let got = run_dtype(
+                case,
+                dtype,
+                &[large],
+                &[large, 0.0, large],
+                &[0.0],
+                &[0.0; 3],
+            )
+            .unwrap();
+            assert_eq!(
+                got,
+                vec![0, 2],
+                "{dtype:?}: canonical positive NaNs rank equally above the finite score"
+            );
+        }
     }
 
     // --- Typed rejection tests -----------------------------------------------
