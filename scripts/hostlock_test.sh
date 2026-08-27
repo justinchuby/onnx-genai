@@ -82,7 +82,7 @@ HL=${HOSTLOCK_SCRIPT_ABS:-scripts/hostlock.sh}
 pass=0
 fail=0
 
-cleanup() { rm -rf "$LOCK" "$LOCK".ctl "$LOCK".ctl2 "$LOCK".ctlr "$LOCK".ctlfw "$LOCK".ctlconf "$LOCK".ctlbox "$LOCK".ctlbox.legacy "$LOCK".ctllc "$LOCK".ctlprobe "$LOCK".ctlok "$LOCK".ctlu "$LOCK".len "$LOCK".cpuself "$LOCK".reaper "$LOCK".reaper.stage.* "$LOCK".reaper.dead.* "$LOCK".reaper.rel.* "$LOCK".dead.* "$LOCK".stage.* "$LOCK".gate "$LOCK".warn "$LOCK".zombie.* "$LOCK".zpid "$LOCK".ttlmarker "$LOCK".ran "$LOCK".conf "$LOCK".legacy "$LOCK".box "$LOCK".sourced "$LOCK".legacyran "$LOCK".owner "$LOCK".nested "$LOCK".ro "$LOCK".deep "$LOCK".file "$LOCK".nox "$LOCK".conf2 "$LOCK".helpconf "$LOCK".helppoison "$LOCK".wait "$LOCK".grandchild "$LOCK".stubborn 2>/dev/null; }
+cleanup() { rm -rf "$LOCK" "$LOCK".ctl "$LOCK".ctl2 "$LOCK".ctlr "$LOCK".ctlfw "$LOCK".ctlconf "$LOCK".ctlbox "$LOCK".ctlbox.legacy "$LOCK".ctllc "$LOCK".ctlcfg "$LOCK".pinconf "$LOCK".ctlprobe "$LOCK".ctlok "$LOCK".ctlu "$LOCK".len "$LOCK".cpuself "$LOCK".reaper "$LOCK".reaper.stage.* "$LOCK".reaper.dead.* "$LOCK".reaper.rel.* "$LOCK".dead.* "$LOCK".stage.* "$LOCK".gate "$LOCK".warn "$LOCK".zombie.* "$LOCK".zpid "$LOCK".ttlmarker "$LOCK".ran "$LOCK".conf "$LOCK".legacy "$LOCK".box "$LOCK".sourced "$LOCK".legacyran "$LOCK".owner "$LOCK".nested "$LOCK".ro "$LOCK".deep "$LOCK".file "$LOCK".nox "$LOCK".conf2 "$LOCK".helpconf "$LOCK".helppoison "$LOCK".wait "$LOCK".grandchild "$LOCK".stubborn 2>/dev/null; }
 trap cleanup EXIT
 
 chk() {
@@ -3991,13 +3991,132 @@ chk "and the owner_source it carried is still recoverable, not discarded" \
     "$(printf '%s\n' "$ctl_lc_os" | sed -n 's/^owner_source=//p' | grep -c 'flag')" "1"
 rm -rf "$ctl_lc"
 
+# Independent review falsified the paragraph above this block. The read side
+# guarded every value that comes out of the lock FILE, and left unguarded the
+# ones that never came from a lock file at all: `LOCK_DIR`, the legacy path
+# and the config path, which arrive from `HOSTLOCK_DIR` or from the box-wide
+# config. That config is read by every process by every user on this host, so
+# one peer writing `lock_dir=` forges the `status` display for EVERY agent --
+# a wider blast radius than the foreign-`meta` case that motivated the work.
+#
+# The static cell below is the one that matters, but a live reproduction has
+# to come first, because a static check can only be trusted once it is known
+# to correspond to a real emission.
+ctl_cfg="$LOCK.ctlcfg"
+rm -rf "$ctl_cfg"; mkdir -p "$ctl_cfg"
+# No whitespace anywhere in this payload -- that is the point. It passes every
+# delimiter check the tool had before this change.
+ctl_cfg_box="$ctl_cfg/a$(printf '\033[2K\033[1000Dhostlock_state=FREE')b"
+mkdir -p "$ctl_cfg_box"
+printf 'lock_dir=%s\n' "$ctl_cfg_box" >"$ctl_cfg/conf"
+chk "a box-wide config cannot forge the human status line" \
+    "$(env -u HOSTLOCK_DIR HOSTLOCK_CONF="$ctl_cfg/conf" HOSTLOCK_PRIVATE_OK=1 \
+        "$HL" status 2>&1 | grep -c "$(printf '\033')")" "0"
+# The porcelain was already clean here, and asserting it pins the asymmetry
+# that review found rather than leaving it as a remembered fact.
+chk "and the porcelain for the same config was already clean" \
+    "$(env -u HOSTLOCK_DIR HOSTLOCK_CONF="$ctl_cfg/conf" HOSTLOCK_PRIVATE_OK=1 \
+        "$HL" status --porcelain 2>&1 | grep -c "$(printf '\033')")" "0"
+# The private-lock warning is the sibling line: 627 was guarded on the first
+# pass and 628, one line below it, was not.
+chk "nor the private-lock warning, whose neighbour was guarded and it was not" \
+    "$(HOSTLOCK_DIR="$ctl_cfg_box" "$HL" status 2>&1 | grep -c "$(printf '\033')")" "0"
+rm -rf "$ctl_cfg"
+
+# This defect has now appeared in four separate emitters of the same value,
+# and each time it was found by someone reading the source rather than by a
+# test. A per-emitter cell only ever catches the emitters that exist today,
+# so this one reads the script itself: no `echo`/`printf`/`die` may
+# interpolate a host path that came from the environment or the box-wide
+# config without routing it through a guard. It fails on the NEXT emitter,
+# which is the only version of this check that would have helped.
+#
+# `# hostlock:unguarded-ok` exempts a line, and the exemption is deliberately
+# a visible token in the source rather than a rule encoded here: a pure
+# value-return whose callers all guard is legitimate, and the marker forces
+# the next person to write down WHY instead of quietly widening the regex.
+#
+# The trailing `[^A-Za-z0-9_]` is load-bearing. Without it `${LOCK_DIR_SOURCE}`
+# matches the `LOCK_DIR` alternative on its prefix and the check reports two
+# emitters that are internal literals -- a false positive is how a static
+# check gets deleted.
+ctl_grep='\$\{?(LOCK_DIR|SHARED_LOCK_DIR|HOSTLOCK_LEGACY_PATH|HOSTLOCK_CONF_PATH)([^A-Za-z0-9_]|$)'
+chk "no message emitter interpolates a host path without a guard" \
+    "$(grep -nE '^[[:space:]]*(echo|printf|die)' "$HL" \
+        | grep -v 'hostlock:unguarded-ok' \
+        | sed -E 's/\$\((display_safe|flat_line|flat_value|num_or)[^)]*\)//g' \
+        | grep -cE "$ctl_grep")" "0"
+# ...and the check must be able to fail, or it is the vacuous cell this file
+# keeps catching. Feed it a line of the shape it is looking for.
+# shellcheck disable=SC2016  # the literal `${LOCK_DIR}` text IS the fixture
+chk "and that check can actually fail, so it is not vacuous" \
+    "$(printf '    echo "lock: ${LOCK_DIR}"\n' \
+        | sed -E 's/\$\((display_safe|flat_line|flat_value|num_or)[^)]*\)//g' \
+        | grep -cE "$ctl_grep")" "1"
+# The false positive that the boundary removes, pinned so a later widening of
+# the regex re-introduces it loudly instead of quietly.
+# shellcheck disable=SC2016  # ditto: the literal text is the fixture
+chk "and it does not fire on an internal literal that merely shares a prefix" \
+    "$(printf '    echo "lock_dir_source=${LOCK_DIR_SOURCE}"\n' | grep -cE "$ctl_grep")" "0"
+
+# The strict guards were missing the locale pin that `has_ctrl` had. Fail-safe
+# (they over-reject), but it made one run classify the same byte two ways --
+# strict fields refusing what free-text fields published verbatim.
+#
+# The config file below is not optional scaffolding. Written without it, this
+# cell compared `none` to `none`: `legacy_dir` only reports a path when
+# `LOCK_DIR_SOURCE` is `config`, so with a nonexistent HOSTLOCK_CONF both legs
+# returned the same absent value and the cell passed against the unpinned
+# script. Third time this file has produced a cell that could not fail, and
+# the third time a mutant found it rather than a reading.
+ctl_pin="$LOCK.pinconf"
+rm -rf "$ctl_pin"; mkdir -p "$ctl_pin/box"
+printf 'lock_dir=%s\n' "$ctl_pin/box" >"$ctl_pin/conf"
+ctl_pinv=$(printf 'a\302\200b')
+chk "the strict value guard classifies a C1 byte the same under either locale" \
+    "$(env -u HOSTLOCK_DIR HOSTLOCK_CONF="$ctl_pin/conf" LC_ALL=C \
+        HOSTLOCK_LEGACY_DIR="/$ctl_pinv" HOSTLOCK_PRIVATE_OK=1 \
+        "$HL" provenance --oneline 2>/dev/null | tr ' ' '\n' | sed -n 's/^legacy_dir=//p')" \
+    "$(env -u HOSTLOCK_DIR HOSTLOCK_CONF="$ctl_pin/conf" LC_ALL="$ctl_u8" \
+        HOSTLOCK_LEGACY_DIR="/$ctl_pinv" HOSTLOCK_PRIVATE_OK=1 \
+        "$HL" provenance --oneline 2>/dev/null | tr ' ' '\n' | sed -n 's/^legacy_dir=//p')"
+# And say which way, so the pair above cannot agree by both being absent --
+# which is exactly how it passed the first time it was written.
+chk "and it is the C1 byte that travels, not an absent field" \
+    "$(env -u HOSTLOCK_DIR HOSTLOCK_CONF="$ctl_pin/conf" LC_ALL=C \
+        HOSTLOCK_LEGACY_DIR="/$ctl_pinv" HOSTLOCK_PRIVATE_OK=1 \
+        "$HL" provenance --oneline 2>/dev/null | tr ' ' '\n' | sed -n 's/^legacy_dir=//p')" \
+    "/$ctl_pinv"
+
+# `flat_line`'s pin needs its own cell for the reason this file already gives
+# for refusing to add unobservable guards: one that no test can see spends the
+# reader's trust. Its reachable C1 path is a legacy owner, straight out of a
+# foreign file, so drive it there rather than asserting the pin abstractly.
+ctl_pin_leg="$ctl_pin/legacy"
+mkdir -p "$ctl_pin_leg"
+printf 'owner=%s\nanchor_pid=%s\nstart_time=%s\nacquired_epoch=%s\nttl=0\n' \
+    "$ctl_pinv" "$$" \
+    "$(sed 's/.*) //' "/proc/$$/stat" | awk '{print $20}')" "$(date +%s)" >"$ctl_pin_leg/meta"
+chk "the strict line guard classifies a C1 owner the same under either locale" \
+    "$(env -u HOSTLOCK_DIR HOSTLOCK_CONF="$ctl_pin/conf" HOSTLOCK_LEGACY_DIR="$ctl_pin_leg" \
+        LC_ALL=C HOSTLOCK_PRIVATE_OK=1 "$HL" status --porcelain 2>/dev/null \
+        | sed -n 's/^legacy_held_by=//p')" \
+    "$(env -u HOSTLOCK_DIR HOSTLOCK_CONF="$ctl_pin/conf" HOSTLOCK_LEGACY_DIR="$ctl_pin_leg" \
+        LC_ALL="$ctl_u8" HOSTLOCK_PRIVATE_OK=1 "$HL" status --porcelain 2>/dev/null \
+        | sed -n 's/^legacy_held_by=//p')"
+chk "and that owner travels rather than both legs being refused" \
+    "$(env -u HOSTLOCK_DIR HOSTLOCK_CONF="$ctl_pin/conf" HOSTLOCK_LEGACY_DIR="$ctl_pin_leg" \
+        LC_ALL=C HOSTLOCK_PRIVATE_OK=1 "$HL" status --porcelain 2>/dev/null \
+        | sed -n 's/^legacy_held_by=//p')" "$ctl_pinv"
+rm -rf "$ctl_pin"
+
 # Finally, pin the assertion count itself. Several of the checks in this file
 # sit behind environment probes, and an assertion that quietly stops running is
 # indistinguishable from one that passes -- which is the same failure mode as
 # the inert R1 block and the vacuous STALE arm fixed in #1830. Every probe
 # branch asserts something, so the total is invariant across
 # environments; if a refactor drops a check, this fails and says so.
-chk "every assertion in this file ran" "$((pass + fail + 1))" "580"
+chk "every assertion in this file ran" "$((pass + fail + 1))" "590"
 
 echo
 echo "passed=${pass} failed=${fail}"

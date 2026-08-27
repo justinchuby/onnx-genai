@@ -89,11 +89,27 @@
 #      refusing them would call a legitimate `naïve/漢字` path malformed.
 #      This guarantee covers the HUMAN lines too -- `status`, and the reap,
 #      release and legacy warnings -- because those are where a forged FREE
-#      actually gets acted on, and nothing downstream re-checks them.
+#      actually gets acted on, and nothing downstream re-checks them. It also
+#      covers the values that never came from a lock file at all: `lock_dir`,
+#      the legacy path and the config path arrive from `HOSTLOCK_DIR` or from
+#      the BOX-WIDE config that every process by every user on this host
+#      reads, so one peer writing `lock_dir=` forges those lines for EVERY
+#      agent. Review found them unguarded after this paragraph already
+#      claimed them; the paragraph was right about where the guard belongs
+#      and wrong about where it was.
+#      Residual, disclosed rather than fixed: a terminal that honours 8-bit
+#      C1 can still act on a raw 0x9B. That is the price of not calling
+#      `naïve/漢字` malformed, and the two cannot both be had in a byte
+#      grammar.
 #   4. A value that could not satisfy the above is replaced ENTIRELY by the
 #      sentinel `@malformed`. It is never truncated -- a silently kept prefix
 #      presented as a whole value is the defect this contract exists to stop.
 #      `@` cannot occur in an accepted name, so the sentinel is unforgeable.
+#      Length is bounded on the same terms and with the same remedy: a value
+#      over HL_MAX_VALUE is refused, and a name over HL_MAX_NAME is a hard
+#      error at parse time. This is the one guard that changes a row which
+#      contains no control character at all, and it is called out here so
+#      that "control-free rows are unchanged" is not read wider than it is.
 #   5. `_raw` lines, and the free-text fields `reason`, `worktree`, `cmd`,
 #      `held_worktree`, `held_cmd`, are the exception to (4): they are allowed
 #      to contain spaces, so they are ENCODED rather than refused. If and only
@@ -428,6 +444,105 @@ die() {
     exit 1
 }
 
+# `has_ctrl` and `display_safe` live here, above everything that emits, and
+# not down beside the flat-row guards where the rest of this machinery sits.
+# The config validation below is the FIRST thing that runs and the first
+# thing that emits, so a definition placed with its siblings was still ~1000
+# lines too late: `display_safe: command not found`, and the message lost
+# both the path and the value it exists to report. Bash resolves a function
+# at call time, so nothing warned until the path was taken.
+# Does this value contain a control character?
+#
+# THE GAP THIS CLOSES, because it is not the one the other guards close.
+# Every guard above was written against a PARSER: the flat row's delimiter is
+# a space, the porcelain's is a newline, so each rejects its own delimiter and
+# a value that survives cannot forge a field. That reasoning is correct and it
+# is complete -- for a parser.
+#
+# It is not complete for a READER. These rows exist to be pasted into issue
+# comments and read in terminals; the header says so. A terminal has its own
+# delimiters, and they are not whitespace: ESC[2K erases the line, ESC[1000D
+# returns the cursor to column 0, and a bare CR does the same. None of those
+# is a space or a newline, so every guard here passed them.
+#
+# Demonstrated on the released script, with the payload reaching `lock_dir`
+# through $HOSTLOCK_DIR and containing NO whitespace at all:
+#
+#   physical bytes : hostlock_state=HELD ... lock_dir=/w/a^[[2K^[[1000Dhostlock_state=FREE
+#   awk last-wins  : hostlock_state=HELD          <- the parser guard held
+#   what a terminal displays:
+#                    hostlock_state=FREE lock_scope=private ...
+#
+# The row is simultaneously correct to a machine and inverted to a human, and
+# the human is the one who then takes the box. `reason` is the worse vector of
+# the two because `run` REQUIRES it, so it is the field every caller supplies:
+# `--reason $'moe\e[2K\e[1000Dstate=FREE'` makes `status --porcelain` print
+# `state=HELD` and display `state=FREE` on the next line.
+#
+# [:cntrl:] and not a printable-ASCII whitelist: a worktree path may contain
+# UTF-8 perfectly legitimately, and `/home/naïve/漢字` must not be called
+# malformed. Verified both directions -- ESC and CR classify as control, while
+# spaces, UTF-8 paths and ordinary paths do not.
+has_ctrl() {
+    # LC_ALL=C pins the class to C0 plus DEL, which is exactly what the parser
+    # contract promises. Without it the class follows the caller's locale: in
+    # a single-byte locale such as latin1, 0x80-0x9F ARE control characters,
+    # and those bytes are ordinary UTF-8 continuation bytes -- so a worktree
+    # path containing `é` or `漢` would start being called malformed for
+    # nobody's benefit. Pinning it makes the classification identical on every
+    # agent's box regardless of environment, which is the property a shared
+    # lock needs. Verified no-match for UTF-8 and match for ESC/CR/DEL under
+    # C, C.UTF-8 and en_US.utf8.
+    local LC_ALL=C
+    case "$1" in
+        *[[:cntrl:]]*) return 0 ;;
+    esac
+    return 1
+}
+
+# Render a value that is allowed to contain spaces so it cannot act on a
+# terminal.
+#
+# For the fields that must stay free text -- `reason`, `worktree`, `cmd`, and
+# the `_raw` recovery lines -- rejection would be cry-wolf: a reason is prose
+# and a command line is full of spaces, and a guard that refuses ordinary
+# input is a guard somebody deletes. So these are ENCODED rather than refused.
+#
+# Encoding is conditional on the value actually containing a control
+# character, and that is deliberate. An unconditional `%q` would rewrite every
+# ordinary reason -- `--reason 'moe matrix sweep'` would start publishing as
+# `moe\ matrix\ sweep` -- which changes the output every existing consumer
+# already reads in order to defend against input none of them have ever seen.
+# Conditional encoding leaves the normal row byte-identical and makes the
+# abnormal one loudly, visibly quoted: `$'moe\E[2K'` is self-evidently not a
+# reason somebody typed.
+#
+# `printf %q` and not a hand-rolled tr/sed pass: it is bash builtin, it is a
+# documented total encoding rather than a blacklist I would have to keep in
+# sync with [:cntrl:], and it escapes the backslash it introduces, so the
+# result is unambiguous. Checked that its output carries no raw control bytes.
+#
+# One honest limit, because `%q` encodes FOR A SHELL. The result is
+# `$'moe\E[2K'`, which is inert in every reading that matters here -- a
+# terminal prints it literally, a markdown comment shows it, awk sees an
+# ordinary token -- but it is shell-ACTIVE: `eval "echo $enc"` reconstitutes
+# the raw ESC. So this neutralises the payload for reading, not for
+# re-execution, and a row pasted into a shell AND EVALUATED can still act.
+# That is an acceptable boundary: the same is true of every byte in the row,
+# and `--oneline` output is documented for awk rather than for eval.
+display_safe() {
+    if has_ctrl "$1"; then
+        printf '%q' "$1"
+    else
+        printf '%s' "$1"
+    fi
+    # Always 0. Several callers interpolate this inside another command
+    # substitution where a non-zero status would be either invisible or, if
+    # `set -e` is ever added to this script, fatal. Nothing branches on it --
+    # unlike `flat_value`, whose status `prov_add` genuinely consumes.
+    return 0
+}
+
 # The options are already documented, exhaustively, in this file's header --
 # but only to someone who opens a 2000-line shell script. Four agents spent a
 # night arguing to build this tool while it sat in scripts/ with a test suite,
@@ -595,7 +710,7 @@ else
     # prevent. Only the env path (tests) skips this, because it never consults
     # the config in the first place.
     if [ -f "$HOSTLOCK_CONF_PATH" ] && grep -q '^[[:space:]]*lock_dir[[:space:]]*=' "$HOSTLOCK_CONF_PATH" 2>/dev/null; then
-        die "${HOSTLOCK_CONF_PATH}: lock_dir must be a non-empty absolute path (got '$(conf_lock_dir || true)')"
+        die "$(display_safe "${HOSTLOCK_CONF_PATH}"): lock_dir must be a non-empty absolute path (got '$(display_safe "$(conf_lock_dir || true)")')"
     fi
     LOCK_DIR="$HOSTLOCK_BUILTIN_DIR"
     LOCK_DIR_SOURCE=default
@@ -625,7 +740,7 @@ warn_if_private() {
     [ "$LOCK_SCOPE" = private ] || return 0
     [ "${HOSTLOCK_PRIVATE_OK:-0}" = 1 ] && return 0
     echo "hostlock: WARNING: HOSTLOCK_DIR is set, so this is a PRIVATE lock at $(display_safe "${LOCK_DIR}")." >&2
-    echo "hostlock: it coordinates with NOBODY -- peers on this host use ${SHARED_LOCK_DIR}." >&2
+    echo "hostlock: it coordinates with NOBODY -- peers on this host use $(display_safe "${SHARED_LOCK_DIR}")." >&2
     echo "hostlock: set HOSTLOCK_PRIVATE_OK=1 to acknowledge and silence (the test suite does)." >&2
 }
 
@@ -666,8 +781,8 @@ refuse_if_legacy_held() {
     local h
     h=$(legacy_holder) || return 0
     echo "hostlock: BUSY (legacy path)" >&2
-    echo "hostlock: ${HOSTLOCK_LEGACY_PATH} is held by $(display_safe "${h% *}") (pid $(num_or "${h#* }" '?')), which is the path this host used" >&2
-    echo "hostlock: before ${HOSTLOCK_CONF_PATH} moved the lock to ${LOCK_DIR}. That holder cannot see our lock," >&2
+    echo "hostlock: $(display_safe "${HOSTLOCK_LEGACY_PATH}") is held by $(display_safe "${h% *}") (pid $(num_or "${h#* }" '?')), which is the path this host used" >&2
+    echo "hostlock: before $(display_safe "${HOSTLOCK_CONF_PATH}") moved the lock to $(display_safe "${LOCK_DIR}"). That holder cannot see our lock," >&2
     echo "hostlock: so taking this one would put two benchmarks on the box. Wait for it to release." >&2
     return 2
 }
@@ -1423,7 +1538,7 @@ publish_lock() {
 lock_dir_problem() {
     local p
     if [ -e "$LOCK_DIR" ] && [ ! -d "$LOCK_DIR" ]; then
-        printf '%s\n' "${LOCK_DIR} exists and is not a directory"
+        printf '%s\n' "$(display_safe "${LOCK_DIR}") exists and is not a directory"
         return 0
     fi
     case "$LOCK_DIR" in
@@ -1453,8 +1568,8 @@ lock_dir_problem() {
 explain_unusable() {
     local problem=$1
     echo "hostlock: UNUSABLE: ${problem}" >&2
-    echo "hostlock: no lock can be created at ${LOCK_DIR} (${LOCK_DIR_SOURCE}, ${LOCK_SCOPE}), so this host cannot participate." >&2
-    echo "hostlock: set lock_dir in ${HOSTLOCK_CONF_PATH} to a path you can write; do NOT run saturating benchmarks unlocked." >&2
+    echo "hostlock: no lock can be created at $(display_safe "${LOCK_DIR}") (${LOCK_DIR_SOURCE}, ${LOCK_SCOPE}), so this host cannot participate." >&2
+    echo "hostlock: set lock_dir in $(display_safe "${HOSTLOCK_CONF_PATH}") to a path you can write; do NOT run saturating benchmarks unlocked." >&2
 }
 
 lock_state() {
@@ -1585,98 +1700,6 @@ HL_MAX_VALUE=4096
 # cannot be used to push the fields after it off the readable part of a row.
 HL_MAX_NAME=64
 
-# Does this value contain a control character?
-#
-# THE GAP THIS CLOSES, because it is not the one the other guards close.
-# Every guard above was written against a PARSER: the flat row's delimiter is
-# a space, the porcelain's is a newline, so each rejects its own delimiter and
-# a value that survives cannot forge a field. That reasoning is correct and it
-# is complete -- for a parser.
-#
-# It is not complete for a READER. These rows exist to be pasted into issue
-# comments and read in terminals; the header says so. A terminal has its own
-# delimiters, and they are not whitespace: ESC[2K erases the line, ESC[1000D
-# returns the cursor to column 0, and a bare CR does the same. None of those
-# is a space or a newline, so every guard here passed them.
-#
-# Demonstrated on the released script, with the payload reaching `lock_dir`
-# through $HOSTLOCK_DIR and containing NO whitespace at all:
-#
-#   physical bytes : hostlock_state=HELD ... lock_dir=/w/a^[[2K^[[1000Dhostlock_state=FREE
-#   awk last-wins  : hostlock_state=HELD          <- the parser guard held
-#   what a terminal displays:
-#                    hostlock_state=FREE lock_scope=private ...
-#
-# The row is simultaneously correct to a machine and inverted to a human, and
-# the human is the one who then takes the box. `reason` is the worse vector of
-# the two because `run` REQUIRES it, so it is the field every caller supplies:
-# `--reason $'moe\e[2K\e[1000Dstate=FREE'` makes `status --porcelain` print
-# `state=HELD` and display `state=FREE` on the next line.
-#
-# [:cntrl:] and not a printable-ASCII whitelist: a worktree path may contain
-# UTF-8 perfectly legitimately, and `/home/naïve/漢字` must not be called
-# malformed. Verified both directions -- ESC and CR classify as control, while
-# spaces, UTF-8 paths and ordinary paths do not.
-has_ctrl() {
-    # LC_ALL=C pins the class to C0 plus DEL, which is exactly what the parser
-    # contract promises. Without it the class follows the caller's locale: in
-    # a single-byte locale such as latin1, 0x80-0x9F ARE control characters,
-    # and those bytes are ordinary UTF-8 continuation bytes -- so a worktree
-    # path containing `é` or `漢` would start being called malformed for
-    # nobody's benefit. Pinning it makes the classification identical on every
-    # agent's box regardless of environment, which is the property a shared
-    # lock needs. Verified no-match for UTF-8 and match for ESC/CR/DEL under
-    # C, C.UTF-8 and en_US.utf8.
-    local LC_ALL=C
-    case "$1" in
-        *[[:cntrl:]]*) return 0 ;;
-    esac
-    return 1
-}
-
-# Render a value that is allowed to contain spaces so it cannot act on a
-# terminal.
-#
-# For the fields that must stay free text -- `reason`, `worktree`, `cmd`, and
-# the `_raw` recovery lines -- rejection would be cry-wolf: a reason is prose
-# and a command line is full of spaces, and a guard that refuses ordinary
-# input is a guard somebody deletes. So these are ENCODED rather than refused.
-#
-# Encoding is conditional on the value actually containing a control
-# character, and that is deliberate. An unconditional `%q` would rewrite every
-# ordinary reason -- `--reason 'moe matrix sweep'` would start publishing as
-# `moe\ matrix\ sweep` -- which changes the output every existing consumer
-# already reads in order to defend against input none of them have ever seen.
-# Conditional encoding leaves the normal row byte-identical and makes the
-# abnormal one loudly, visibly quoted: `$'moe\E[2K'` is self-evidently not a
-# reason somebody typed.
-#
-# `printf %q` and not a hand-rolled tr/sed pass: it is bash builtin, it is a
-# documented total encoding rather than a blacklist I would have to keep in
-# sync with [:cntrl:], and it escapes the backslash it introduces, so the
-# result is unambiguous. Checked that its output carries no raw control bytes.
-#
-# One honest limit, because `%q` encodes FOR A SHELL. The result is
-# `$'moe\E[2K'`, which is inert in every reading that matters here -- a
-# terminal prints it literally, a markdown comment shows it, awk sees an
-# ordinary token -- but it is shell-ACTIVE: `eval "echo $enc"` reconstitutes
-# the raw ESC. So this neutralises the payload for reading, not for
-# re-execution, and a row pasted into a shell AND EVALUATED can still act.
-# That is an acceptable boundary: the same is true of every byte in the row,
-# and `--oneline` output is documented for awk rather than for eval.
-display_safe() {
-    if has_ctrl "$1"; then
-        printf '%q' "$1"
-    else
-        printf '%s' "$1"
-    fi
-    # Always 0. Several callers interpolate this inside another command
-    # substitution where a non-zero status would be either invisible or, if
-    # `set -e` is ever added to this script, fatal. Nothing branches on it --
-    # unlike `flat_value`, whose status `prov_add` genuinely consumes.
-    return 0
-}
-
 # Guard for a value about to be placed in the space-separated `key=value` row.
 #
 # Write-time validation covers the owners THIS script writes. It cannot cover
@@ -1729,6 +1752,16 @@ flat_value() {
     # `has_ctrl`. Listed alongside the delimiter because both answer the same
     # question -- can this value pretend to be a different field -- and the
     # two channels only look different until somebody pastes the row.
+    #
+    # Pinned for the same reason `has_ctrl` is, and it was missed here on the
+    # first pass: unpinned, `[[:cntrl:]]` follows the CALLER's locale, so a
+    # worktree path holding a C1 byte reads `@malformed` on a UTF-8 box and
+    # travels verbatim under `LC_ALL=C`. The failure is fail-safe -- C0 and
+    # DEL are control characters in every locale, so nothing escapes either
+    # way -- but it made a strict field disagree with a free-text one inside
+    # a single run, and "identical on every agent's machine" was written in
+    # the contract before it was true of the two functions that enforce it.
+    local LC_ALL=C
     case "$1" in
         '' | *[[:space:]]* | *[[:cntrl:]]* | "$FLAT_MALFORMED")
             printf '%s' "$FLAT_MALFORMED"
@@ -1793,6 +1826,10 @@ flat_line() {
     # THIS grammar's delimiter, so it must remain rejected on its own terms
     # rather than as an incidental member of a wider class somebody could
     # later narrow. The redundancy is the point.
+    #
+    # `LC_ALL=C` for the same reason as `flat_value`: the class must not be
+    # decided by the caller's locale.
+    local LC_ALL=C
     case "$1" in
         *$'\n'* | *[[:cntrl:]]*)
             printf '%s' "$FLAT_MALFORMED"
@@ -2057,7 +2094,7 @@ cmd_provenance() {
 # that never moved, and a row that does not say which cannot be re-checked.
 legacy_consult_path() {
     if [ "$LOCK_DIR_SOURCE" = config ] && [ "$LOCK_DIR" != "$HOSTLOCK_LEGACY_PATH" ]; then
-        printf '%s\n' "$HOSTLOCK_LEGACY_PATH"
+        printf '%s\n' "$HOSTLOCK_LEGACY_PATH" # hostlock:unguarded-ok value-return; both callers guard
     else
         printf 'none\n'
     fi
@@ -2068,7 +2105,13 @@ legacy_consult_path() {
 # meaning depends entirely on the directory it was measured in.
 status_lock_dir_note() {
     local legacy=$1
-    [ "$LOCK_DIR_SOURCE" = default ] || echo "  lock: ${LOCK_DIR} (${LOCK_DIR_SOURCE}, ${LOCK_SCOPE})"
+    # `LOCK_DIR` and `HOSTLOCK_LEGACY_PATH` are guarded for a reason the
+    # foreign-`meta` fields are not: they do not come from the lock file at
+    # all. They come from `HOSTLOCK_DIR` or from the BOX-WIDE config, which
+    # every process by every user on this host reads -- so a single peer
+    # writing `lock_dir=` forges this line for EVERY agent, not just for
+    # whoever wrote it. The read-side guard is what makes that inert.
+    [ "$LOCK_DIR_SOURCE" = default ] || echo "  lock: $(display_safe "${LOCK_DIR}") (${LOCK_DIR_SOURCE}, ${LOCK_SCOPE})"
     # `${legacy% *}`, not `${legacy%% *}`: `legacy_holder` returns
     # "<owner> <pid>", so stripping the LAST field leaves an owner that
     # contains spaces intact. The greedy form renamed "sebastian helper"
@@ -2080,7 +2123,7 @@ status_lock_dir_note() {
     # a foreign legacy owner rewrites it. Third emitter, second defect, same
     # function -- which is why the guard belongs on the emitter and not on the
     # list of fields somebody remembered.
-    [ "$legacy" != none ] && echo "  legacy: ${HOSTLOCK_LEGACY_PATH} is still held by $(display_safe "${legacy% *}") (pid $(num_or "${legacy##* }" '?')); acquire will refuse"
+    [ "$legacy" != none ] && echo "  legacy: $(display_safe "${HOSTLOCK_LEGACY_PATH}") is still held by $(display_safe "${legacy% *}") (pid $(num_or "${legacy##* }" '?')); acquire will refuse"
     return 0
 }
 
@@ -2244,7 +2287,7 @@ cmd_acquire() {
     # says a co-tenant held the box. There was no co-tenant. See #1977.
     if nested_under_own_run; then
         echo "hostlock: outcome=nested by ${OWNER}" >&2
-        echo "hostlock: this process is already inside a \`run\` holding ${LOCK_DIR} (anchor pid ${HOSTLOCK_HELD_ANCHOR})." >&2
+        echo "hostlock: this process is already inside a \`run\` holding $(display_safe "${LOCK_DIR}") (anchor pid ${HOSTLOCK_HELD_ANCHOR})." >&2
         echo "hostlock: that holder cannot release until this command returns, so waiting for it can only time out." >&2
         echo "hostlock: run the inner command directly -- the host is already held for it -- or give the inner lock its own path via HOSTLOCK_DIR." >&2
         cmd_status >&2
