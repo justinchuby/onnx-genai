@@ -82,7 +82,7 @@ HL=${HOSTLOCK_SCRIPT_ABS:-scripts/hostlock.sh}
 pass=0
 fail=0
 
-cleanup() { rm -rf "$LOCK" "$LOCK".cpuself "$LOCK".reaper "$LOCK".reaper.stage.* "$LOCK".reaper.dead.* "$LOCK".reaper.rel.* "$LOCK".dead.* "$LOCK".stage.* "$LOCK".gate "$LOCK".warn "$LOCK".zombie.* "$LOCK".zpid "$LOCK".ttlmarker "$LOCK".ran "$LOCK".conf "$LOCK".legacy "$LOCK".box "$LOCK".sourced "$LOCK".legacyran "$LOCK".owner "$LOCK".nested "$LOCK".ro "$LOCK".deep "$LOCK".file "$LOCK".nox "$LOCK".conf2 "$LOCK".helpconf "$LOCK".helppoison "$LOCK".wait "$LOCK".grandchild "$LOCK".stubborn 2>/dev/null; }
+cleanup() { rm -rf "$LOCK" "$LOCK".ctl "$LOCK".ctl2 "$LOCK".ctlr "$LOCK".ctlprobe "$LOCK".ctlok "$LOCK".ctlu "$LOCK".len "$LOCK".cpuself "$LOCK".reaper "$LOCK".reaper.stage.* "$LOCK".reaper.dead.* "$LOCK".reaper.rel.* "$LOCK".dead.* "$LOCK".stage.* "$LOCK".gate "$LOCK".warn "$LOCK".zombie.* "$LOCK".zpid "$LOCK".ttlmarker "$LOCK".ran "$LOCK".conf "$LOCK".legacy "$LOCK".box "$LOCK".sourced "$LOCK".legacyran "$LOCK".owner "$LOCK".nested "$LOCK".ro "$LOCK".deep "$LOCK".file "$LOCK".nox "$LOCK".conf2 "$LOCK".helpconf "$LOCK".helppoison "$LOCK".wait "$LOCK".grandchild "$LOCK".stubborn 2>/dev/null; }
 trap cleanup EXIT
 
 chk() {
@@ -2579,8 +2579,22 @@ chk "a newline in a legacy path cannot add a state line via the raw form" \
 # FREE against a lock that was physically held.
 chk "and a last-wins parse of the multi-line form still reads HELD" \
     "$(printf '%s\n' "$nlraw" | awk -F= '/^hostlock_state=/{v=$2} END{print v}')" "HELD"
-chk "and the unrecoverable value says so rather than printing itself" \
-    "$(printf '%s\n' "$nlraw" | sed -n 's/^legacy_dir_raw=//p')" "$MALFORMED"
+# The raw line used to answer this case by throwing the value away entirely
+# (`legacy_dir_raw=@malformed`), and this cell asserted that. It now ENCODES
+# instead, which is a deliberate strengthening in both directions at once:
+# the forge is still dead -- the cell above proves no second `hostlock_state=`
+# line appears -- and the operator gets the value back, which is the entire
+# reason the raw affordance exists. Discarding it satisfied the guard by
+# defeating the feature.
+#
+# Asserted as an exact string rather than "does not contain a newline",
+# because the weaker form is satisfied by the old discard-everything
+# behaviour too and so cannot tell the two apart.
+chk "and the unrecoverable value is recovered inertly, not discarded" \
+    "$(printf '%s\n' "$nlraw" | sed -n 's/^legacy_dir_raw=//p')" \
+    "$(printf '%q' "$lg_nl_prov")"
+chk "and the encoded raw carries no literal newline" \
+    "$(printf '%s\n' "$nlraw" | grep -c '^legacy_dir_raw=')" "1"
 # The negative control, under the SAME held-lock conditions as the cells
 # above, so the fix cannot pass by refusing every raw value it is shown.
 # This is the case the affordance exists for and it must still work.
@@ -3649,13 +3663,136 @@ wait "$wait_holder" 2>/dev/null
 rm -rf "$LOCK.wait"
 cleanup
 
+# ---------------------------------------------------------------------------
+# A field that cannot forge the PARSER can still forge the READER.
+#
+# Every guard above this block was written against a delimiter -- a space in
+# the flat row, a newline in the line-oriented ones. That reasoning is sound
+# and complete for a parser, and it is why these cells did not exist: a
+# control character is not whitespace, so it satisfied every check.
+#
+# A terminal has different delimiters. ESC[2K erases the line, ESC[1000D
+# returns the cursor to column 0, CR does the same. On the released script the
+# payload below -- containing NO whitespace at all, so nothing rejected it --
+# produced a row that awk parses as HELD and a terminal displays as FREE. The
+# header tells people to paste these rows into issue comments, so "what it
+# displays as" is a real reading and not a hypothetical one.
+ctl_esc=$(printf 'a\033[2K\033[1000Dhostlock_state=FREE')
+ctl_dir="$LOCK.ctl/$ctl_esc"
+mkdir -p "$ctl_dir"
+ctl_row=$(HOSTLOCK_DIR="$ctl_dir" HOSTLOCK_PRIVATE_OK=1 "$HL" provenance --oneline 2>/dev/null)
+# The field itself must be refused. Asserted on the field, not on "the row
+# contains no ESC": the row could be clean because the probe never reached
+# the emitter, and that spelling passes for the wrong reason.
+chk "an ANSI payload in a value field is refused, not published" \
+    "$(printf '%s' "$ctl_row" | tr ' ' '\n' | sed -n 's/^lock_dir=//p')" "$MALFORMED"
+chk "and the published row carries no escape character anywhere" \
+    "$(printf '%s' "$ctl_row" | grep -c "$(printf '\033')")" "0"
+# NOT "a last-wins parse still reads HELD". That assertion passes against the
+# UNFIXED script -- verified, it does -- because the payload rides inside the
+# `lock_dir=` token and never becomes a second space-separated field. The
+# parser was never the thing at risk here, so a cell phrased in the parser's
+# terms cannot discriminate the fix and would only advertise a guarantee that
+# was already true. The categorical "no ESC survives into the row" above is
+# the assertion that matches the actual defect, and it fails without the fix.
+#
+# Non-ANSI control bytes are refused on the same rule, so the guard is a class
+# and not a blacklist of the two sequences that happened to be demonstrated.
+# CR and VT are marked because they were ALREADY refused before this change --
+# they are [:space:], so the flat row's delimiter rule caught them. They are
+# kept as the boundary of the old rule, and they are honestly labelled: they
+# pass with or without this fix, and SOH/BEL/DEL are the ones that prove it.
+for ctl_pair in 'CR:\r' 'SOH:\001' 'BEL:\007' 'DEL:\177' 'VT:\013'; do
+    ctl_name=${ctl_pair%%:*}
+    ctl_d="$LOCK.ctl2/a$(printf '%b' "${ctl_pair#*:}")b"
+    mkdir -p "$ctl_d" 2>/dev/null
+    chk "a bare ${ctl_name} in a value field is refused too" \
+        "$(HOSTLOCK_DIR="$ctl_d" HOSTLOCK_PRIVATE_OK=1 "$HL" provenance --oneline 2>/dev/null \
+            | tr ' ' '\n' | sed -n 's/^lock_dir=//p')" "$MALFORMED"
+done
+
+# `reason` is the worse vector of the two, because `run` REQUIRES it -- it is
+# the one free-text field every caller supplies, and it reaches the porcelain
+# raw. It cannot be REFUSED without crying wolf on every ordinary prose
+# reason, so it is encoded instead.
+ctl_lock="$LOCK.ctlr"
+rm -rf "$ctl_lock"
+# The metadata is read INSIDE the held window, by the wrapped command. Read
+# after the run instead -- which is how this was written first -- and the lock
+# is already released, the file is gone, `grep` matches nothing, and the cell
+# reports a clean metadata file for a lock that no longer exists. It passed
+# against the unfixed script for exactly that reason. A cell that cannot tell
+# "no escape in the file" from "no file" is not testing the write side.
+#
+# A probe script rather than a nested `sh -c` string: the inner command needs
+# $HOSTLOCK_DIR expanded by the INNER shell while $HL is expanded by the
+# outer one, and spelling that inline needs alternating quote states that are
+# unreadable and that shellcheck flags. A quoted heredoc has one quoting rule.
+ctl_probe="$LOCK.ctlprobe"
+cat >"$ctl_probe" <<'CTLPROBE'
+"$HL_UT" status --porcelain
+printf 'metaseen=%s metaesc=%s\n' \
+    "$([ -f "$HOSTLOCK_DIR/meta" ] && echo yes || echo no)" \
+    "$(grep -c "$(printf '\033')" "$HOSTLOCK_DIR/meta" 2>/dev/null || true)"
+CTLPROBE
+ctl_pc=$(HOSTLOCK_DIR="$ctl_lock" HOSTLOCK_PRIVATE_OK=1 HL_UT="$HL" \
+    "$HL" run --owner leon-ctl \
+    --reason "$(printf 'moe\033[2K\033[1000Dstate=FREE')" \
+    -- sh "$ctl_probe" 2>/dev/null)
+chk "a control character in --reason is encoded in the porcelain" \
+    "$(printf '%s\n' "$ctl_pc" | sed -n 's/^reason=//p')" \
+    "$(printf '%q' "$(printf 'moe\033[2K\033[1000Dstate=FREE')")"
+chk "and the porcelain carries no escape character" \
+    "$(printf '%s\n' "$ctl_pc" | grep -c "$(printf '\033')")" "0"
+# Written by THIS version, so the write-side half is what is being read here:
+# a lock published today is clean before any reader looks at it. `metaseen` is
+# asserted in the same string so a vanished file fails loudly instead of
+# reading as a clean one.
+chk "and the stored metadata never contained the raw escape" \
+    "$(printf '%s\n' "$ctl_pc" | sed -n 's/^metaseen=//p')" "yes metaesc=0"
+rm -rf "$ctl_lock" "$ctl_probe"
+
+# THE CRY-WOLF CONTROLS. A guard that refuses ordinary input is a guard
+# somebody deletes, and the whole reason `reason` is encoded rather than
+# refused is that prose is legitimate. If these ever start failing, the fix
+# above has become the more expensive bug.
+ctl_ok="$LOCK.ctlok"
+rm -rf "$ctl_ok"
+ctl_plain=$(HOSTLOCK_DIR="$ctl_ok" HOSTLOCK_PRIVATE_OK=1 "$HL" run --owner leon-ctl \
+    --reason 'moe matrix sweep phi35' \
+    -- sh -c 'HOSTLOCK_DIR='"$ctl_ok"' HOSTLOCK_PRIVATE_OK=1 '"$HL"' status --porcelain' 2>/dev/null)
+chk "an ordinary spaced reason is published verbatim, not quoted" \
+    "$(printf '%s\n' "$ctl_plain" | sed -n 's/^reason=//p')" "moe matrix sweep phi35"
+rm -rf "$ctl_ok"
+# Non-ASCII is not a control character. A worktree path may legitimately be
+# UTF-8, and calling it malformed would be the false-positive direction.
+ctl_utf="$LOCK.ctlu/naïve/漢字"
+mkdir -p "$ctl_utf"
+chk "a UTF-8 path is not mistaken for a control payload" \
+    "$(HOSTLOCK_DIR="$ctl_utf" HOSTLOCK_PRIVATE_OK=1 "$HL" provenance --oneline 2>/dev/null \
+        | tr ' ' '\n' | sed -n 's/^lock_dir=//p')" "$ctl_utf"
+rm -rf "$LOCK.ctl" "$LOCK.ctl2" "$LOCK.ctlu"
+
+# Length is bounded, and REFUSED rather than shortened. A silently kept prefix
+# presented as a whole value is the `sebastian helper` -> `sebastian` defect;
+# a bound that truncates would re-introduce it while appearing to fix it.
+chk "an over-long owner is refused" \
+    "$(HOSTLOCK_PRIVATE_OK=1 HOSTLOCK_DIR="$LOCK.len" "$HL" run \
+        --owner "$(printf 'a%.0s' $(seq 1 65))" --reason r -- true 2>&1 \
+        | grep -c 'at most 64 characters')" "1"
+chk "and a 64-character owner is still accepted, so the bound does not cry wolf" \
+    "$(HOSTLOCK_PRIVATE_OK=1 HOSTLOCK_DIR="$LOCK.len" "$HL" run \
+        --owner "$(printf 'a%.0s' $(seq 1 64))" --reason r -- true >/dev/null 2>&1 \
+        && echo ok || echo refused)" "ok"
+rm -rf "$LOCK.len"
+
 # Finally, pin the assertion count itself. Several of the checks in this file
 # sit behind environment probes, and an assertion that quietly stops running is
 # indistinguishable from one that passes -- which is the same failure mode as
 # the inert R1 block and the vacuous STALE arm that this PR exists to fix.
 # Every probe branch asserts something, so the total is invariant across
 # environments; if a refactor drops a check, this fails and says so.
-chk "every assertion in this file ran" "$((pass + fail + 1))" "541"
+chk "every assertion in this file ran" "$((pass + fail + 1))" "556"
 
 echo
 echo "passed=${pass} failed=${fail}"

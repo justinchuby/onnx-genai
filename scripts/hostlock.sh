@@ -51,6 +51,58 @@
 #   lock_dir_source, so a recorded row says which lock its `declared=yes` is
 #   a claim about.
 #
+# Machine-readable output: the parser contract.
+#
+#   Three grammars, and the guarantee is the same in all three: NO FIELD CAN
+#   EVER CONTAIN ITS GRAMMAR'S DELIMITER, so no escaping is required to read
+#   one back, and a naive parser is a correct parser.
+#
+#     provenance --oneline   one line, fields separated by a single SPACE
+#     provenance             one `key=value` per LINE
+#     status --porcelain     one `key=value` per LINE
+#
+#   Safety comes from refusal at emit time, not from encoding. That is the
+#   deliberate trade: an escaping grammar would be more expressive and would
+#   oblige every consumer -- awk one-liners, issue comments, other agents'
+#   scripts -- to implement an unescaper before they could read a row safely,
+#   and the ones that did not would be silently wrong. Refusal keeps the flat
+#   form flat, which is what makes this recipe safe to recommend at all:
+#
+#     hostlock.sh provenance --oneline | awk '{for(i=1;i<=NF;i++){
+#         split($i,kv,"="); m[kv[1]]=kv[2]} print m["hostlock_state"]}'
+#
+#   Guarantees, in the order a parser depends on them:
+#
+#   1. Field ORDER is fixed and every field is present on every row. A missing
+#      field is a bug, not an absent value; absence is spelled `none` or
+#      `unknown`.
+#   2. Keys match [a-z][a-z0-9_]*. Values in `--oneline` contain no
+#      whitespace. Values in the line-oriented grammars contain no newline.
+#   3. NO value in any grammar contains a control character (C0, DEL). This is
+#      about the reader, not the parser: ESC[2K and CR are not whitespace, so
+#      they passed every delimiter check, and a row that parses as HELD can be
+#      made to DISPLAY as FREE in any terminal or renderer that honours ANSI.
+#      Rows get pasted into issue comments, so that is a real reading.
+#   4. A value that could not satisfy the above is replaced ENTIRELY by the
+#      sentinel `@malformed`. It is never truncated -- a silently kept prefix
+#      presented as a whole value is the defect this contract exists to stop.
+#      `@` cannot occur in an accepted name, so the sentinel is unforgeable.
+#   5. `_raw` lines, and the free-text fields `reason`, `worktree`, `cmd`,
+#      `held_worktree`, `held_cmd`, are the exception to (4): they are allowed
+#      to contain spaces, so they are ENCODED rather than refused. If and only
+#      if the value contained a control character it is emitted in bash `$'…'`
+#      form, which is unambiguous and self-announcing. An ordinary value is
+#      emitted verbatim, so normal rows are byte-identical to before.
+#   6. `_raw` is a DIAGNOSTIC, never a parsed field. It appears only beside a
+#      field the guard rejected, and it is the rejected text -- do not read a
+#      value out of it and act on it.
+#
+#   Fields whose text originates with the OPERATOR (`owner`, `reason`) are
+#   validated at write time as well, so a lock published by this version is
+#   already clean. Read-side guards are not thereby redundant: peers run their
+#   own checkouts at their own commits, and a lock file this version reads is
+#   very often one it did not write.
+#
 # Usage:
 #   hostlock.sh status [--porcelain]    # who holds it, is that holder alive
 #   hostlock.sh acquire [opts]          # take it, or fail / wait
@@ -781,7 +833,21 @@ meta_get() {
 # reason stays readable instead of silently welding two words together, and
 # NULs and CRs are dropped outright.
 meta_value() {
-    printf '%s' "$1" | tr -d '\000\r' | tr '\n' ' '
+    local v
+    v=$(printf '%s' "$1" | tr -d '\000\r' | tr '\n' ' ')
+    # NUL, CR and newline were handled here because they break the metadata
+    # FILE -- one `key=value` per line, read back with sed plus `head -1`. That
+    # is a storage argument, and it is why the rest of the control set was
+    # never considered: ESC does not break the file at all. It breaks whoever
+    # later prints the value.
+    #
+    # Encoding at write time is not a substitute for the read-side guards and
+    # is not meant to be. A peer running an older checkout writes this file
+    # too, so the reader can never assume it was written by this version --
+    # which is exactly why `display_safe` is also applied on every read. This
+    # is the half that stops THIS version from producing such a file at all,
+    # so a lock published today is clean no matter who reads it.
+    display_safe "$v"
 }
 
 # The repo checkout the holder is working in.
@@ -1478,6 +1544,99 @@ name_is_safe() {
 # one that says the row itself is not trustworthy.
 FLAT_MALFORMED='@malformed'
 
+# Longest value any guarded field may publish.
+#
+# A bound, not a truncation. Truncating is the defect this whole family of
+# guards exists to stop -- `held_by=sebastian helper` becoming `sebastian` is
+# only harmful BECAUSE something silently kept a prefix and presented it as
+# the whole. A guard that fixes truncation by truncating has moved the bug.
+#
+# 4096 is chosen so it cannot cry wolf: `lock_dir` and `legacy_dir` are the
+# only unbounded value fields and both are filesystem paths, which Linux caps
+# at PATH_MAX = 4096 including the NUL. A path longer than this cannot name a
+# directory that exists, so no value that reaches here legitimately can trip
+# it, and anything that does trip it did not come from a real lock dir.
+HL_MAX_VALUE=4096
+
+# Longest name any strict field may publish. Names are agent and host
+# identifiers -- `leon`, `roy-1`, `gaff.2` -- so 64 is roughly an order of
+# magnitude of headroom over the longest real one. It exists so a name field
+# cannot be used to push the fields after it off the readable part of a row.
+HL_MAX_NAME=64
+
+# Does this value contain a control character?
+#
+# THE GAP THIS CLOSES, because it is not the one the other guards close.
+# Every guard above was written against a PARSER: the flat row's delimiter is
+# a space, the porcelain's is a newline, so each rejects its own delimiter and
+# a value that survives cannot forge a field. That reasoning is correct and it
+# is complete -- for a parser.
+#
+# It is not complete for a READER. These rows exist to be pasted into issue
+# comments and read in terminals; the header says so. A terminal has its own
+# delimiters, and they are not whitespace: ESC[2K erases the line, ESC[1000D
+# returns the cursor to column 0, and a bare CR does the same. None of those
+# is a space or a newline, so every guard here passed them.
+#
+# Demonstrated on the released script, with the payload reaching `lock_dir`
+# through $HOSTLOCK_DIR and containing NO whitespace at all:
+#
+#   physical bytes : hostlock_state=HELD ... lock_dir=/w/a^[[2K^[[1000Dhostlock_state=FREE
+#   awk last-wins  : hostlock_state=HELD          <- the parser guard held
+#   what a terminal displays:
+#                    hostlock_state=FREE lock_scope=private ...
+#
+# The row is simultaneously correct to a machine and inverted to a human, and
+# the human is the one who then takes the box. `reason` is the worse vector of
+# the two because `run` REQUIRES it, so it is the field every caller supplies:
+# `--reason $'moe\e[2K\e[1000Dstate=FREE'` makes `status --porcelain` print
+# `state=HELD` and display `state=FREE` on the next line.
+#
+# [:cntrl:] and not a printable-ASCII whitelist: a worktree path may contain
+# UTF-8 perfectly legitimately, and `/home/naïve/漢字` must not be called
+# malformed. Verified both directions -- ESC and CR classify as control, while
+# spaces, UTF-8 paths and ordinary paths do not.
+has_ctrl() {
+    case "$1" in
+        *[[:cntrl:]]*) return 0 ;;
+    esac
+    return 1
+}
+
+# Render a value that is allowed to contain spaces so it cannot act on a
+# terminal.
+#
+# For the fields that must stay free text -- `reason`, `worktree`, `cmd`, and
+# the `_raw` recovery lines -- rejection would be cry-wolf: a reason is prose
+# and a command line is full of spaces, and a guard that refuses ordinary
+# input is a guard somebody deletes. So these are ENCODED rather than refused.
+#
+# Encoding is conditional on the value actually containing a control
+# character, and that is deliberate. An unconditional `%q` would rewrite every
+# ordinary reason -- `--reason 'moe matrix sweep'` would start publishing as
+# `moe\ matrix\ sweep` -- which changes the output every existing consumer
+# already reads in order to defend against input none of them have ever seen.
+# Conditional encoding leaves the normal row byte-identical and makes the
+# abnormal one loudly, visibly quoted: `$'moe\E[2K'` is self-evidently not a
+# reason somebody typed.
+#
+# `printf %q` and not a hand-rolled tr/sed pass: it is bash builtin, it is a
+# documented total encoding rather than a blacklist I would have to keep in
+# sync with [:cntrl:], and it escapes the backslash it introduces, so the
+# result is unambiguous. Checked that its output carries no raw control bytes.
+display_safe() {
+    if has_ctrl "$1"; then
+        printf '%q' "$1"
+    else
+        printf '%s' "$1"
+    fi
+    # Always 0. Several callers interpolate this inside another command
+    # substitution where a non-zero status would be either invisible or, if
+    # `set -e` is ever added to this script, fatal. Nothing branches on it --
+    # unlike `flat_value`, whose status `prov_add` genuinely consumes.
+    return 0
+}
+
 # Guard for a value about to be placed in the space-separated `key=value` row.
 #
 # Write-time validation covers the owners THIS script writes. It cannot cover
@@ -1526,12 +1685,20 @@ flat_field() {
 # -- see the README, which recommends splitting on the FIRST `=` for exactly
 # this reason.
 flat_value() {
+    # A control character forges the DISPLAY rather than the parse; see
+    # `has_ctrl`. Listed alongside the delimiter because both answer the same
+    # question -- can this value pretend to be a different field -- and the
+    # two channels only look different until somebody pastes the row.
     case "$1" in
-        '' | *[[:space:]]* | "$FLAT_MALFORMED")
+        '' | *[[:space:]]* | *[[:cntrl:]]* | "$FLAT_MALFORMED")
             printf '%s' "$FLAT_MALFORMED"
             return 1
             ;;
     esac
+    if [ "${#1}" -gt "$HL_MAX_VALUE" ]; then
+        printf '%s' "$FLAT_MALFORMED"
+        return 1
+    fi
     printf '%s' "$1"
     return 0
 }
@@ -1582,12 +1749,20 @@ flat_line() {
     # two cases render the same either way. It was written, tested, and the
     # test passed with the guard reverted. An unobservable guard with a
     # vacuous cell is worse than no guard: it spends the reader's trust.
+    # `*$'\n'*` stays named even though [:cntrl:] already covers it. It is
+    # THIS grammar's delimiter, so it must remain rejected on its own terms
+    # rather than as an incidental member of a wider class somebody could
+    # later narrow. The redundancy is the point.
     case "$1" in
-        *$'\n'*)
+        *$'\n'* | *[[:cntrl:]]*)
             printf '%s' "$FLAT_MALFORMED"
             return 1
             ;;
     esac
+    if [ "${#1}" -gt "$HL_MAX_VALUE" ]; then
+        printf '%s' "$FLAT_MALFORMED"
+        return 1
+    fi
     printf '%s' "$1"
     return 0
 }
@@ -1622,7 +1797,16 @@ prov_add() {
     esac
     rc=$?
     PROV_FIELDS+=("${key}=${out}")
-    [ "$rc" -eq 0 ] || PROV_RAWS+=("${key}_raw=${val}")
+    # THROUGH `display_safe`, and this is the same lesson as the newline one
+    # directly below, in the other channel. The recovery line exists to show
+    # what the guard threw away -- so it is, by construction, the one place
+    # that handles rejected bytes, and printing them verbatim hands the reader
+    # exactly the payload the field was rejected for carrying. Demonstrated:
+    # a CR in $HOSTLOCK_DIR produced `lock_dir=@malformed` (guard held) and
+    # then `lock_dir_raw=/w/a^Mhostlock_state=FREE`, which a terminal renders
+    # as `hostlock_state=FREE`. The affordance undid the guard it recovers
+    # from, for the second time and in the second channel.
+    [ "$rc" -eq 0 ] || PROV_RAWS+=("${key}_raw=$(display_safe "$val")")
 }
 
 cmd_provenance() {
@@ -1743,12 +1927,14 @@ cmd_provenance() {
         echo "${PROV_FIELDS[*]}"
     else
         printf '%s\n' "${PROV_FIELDS[@]}"
-        printf 'reason=%s\n' "${reason:-}"
+        printf 'reason=%s\n' "$(display_safe "${reason:-}")"
         # Same rule as `reason`, for the same reason: a path can contain
         # spaces and a command almost always does, so neither is safe among
-        # space-separated fields. One per line, newline-delimited.
-        printf 'held_worktree=%s\n' "${holder_wt:-unknown}"
-        printf 'held_cmd=%s\n' "${holder_cl:-unknown}"
+        # space-separated fields. One per line, newline-delimited -- and
+        # `display_safe` because a newline is not the only thing that can
+        # forge a line once a human is reading it.
+        printf 'held_worktree=%s\n' "$(display_safe "${holder_wt:-unknown}")"
+        printf 'held_cmd=%s\n' "$(display_safe "${holder_cl:-unknown}")"
         # The sentinel says a stored value cannot travel in the flat grammar.
         # It does not say what the value was, and whoever is debugging a
         # malformed row is exactly the person who needs to know -- a lock
@@ -1784,6 +1970,16 @@ cmd_provenance() {
                 # Status, not output. A stored value that is literally the
                 # sentinel prints as the sentinel and would compare equal to
                 # a rejection, which is how the write side got this wrong.
+                #
+                # Honest note on what still reaches here: `prov_add` now runs
+                # every raw through `display_safe`, so a control character --
+                # including this grammar's own newline -- has already been
+                # encoded by the time this call sees it, and THE CONTROL-CHAR
+                # ARM OF THIS GUARD IS UNREACHABLE FROM THIS CALL SITE. It is
+                # kept as depth, not as live cover, and no cell should claim
+                # to exercise it here. What does still reach it is the LENGTH
+                # bound, which `display_safe` does not apply -- an over-long
+                # raw is discarded rather than published.
                 prov_val=$(flat_line "$prov_val") && prov_rc=0 || prov_rc=$?
                 if [ "$prov_rc" -eq 0 ]; then
                     printf '%s=%s\n' "$prov_key" "$prov_val"
@@ -1861,13 +2057,18 @@ cmd_status() {
         # `cmd_provenance`; it was in both emitters and only one was reported.
         echo "legacy_held_by=$(flat_line "${legacy% *}")"
         if [ -d "$LOCK_DIR" ]; then
-            echo "owner=$(meta_get owner || echo '?')"
+            # Every one of these is read back out of a lock file written by
+            # another agent's checkout, which is the whole threat model: a
+            # peer running an older copy is not bound by the write-side
+            # validation this version added. `display_safe` is what makes the
+            # read side safe against a file this version never wrote.
+            echo "owner=$(display_safe "$(meta_get owner || echo '?')")"
             echo "anchor_pid=$(meta_get anchor_pid || echo '?')"
-            echo "reason=$(meta_get reason || echo '')"
+            echo "reason=$(display_safe "$(meta_get reason || echo '')")"
             # `unknown` rather than empty for locks published before these
             # fields existed: empty would read as "held from no worktree".
-            echo "worktree=$(meta_get worktree || echo 'unknown')"
-            echo "cmd=$(meta_get cmd || echo 'unknown')"
+            echo "worktree=$(display_safe "$(meta_get worktree || echo 'unknown')")"
+            echo "cmd=$(display_safe "$(meta_get cmd || echo 'unknown')")"
             echo "ttl=$(meta_get ttl || echo 0)"
             echo "age=$(lock_age)"
         fi
@@ -1879,8 +2080,12 @@ cmd_status() {
         return 0
     fi
     local owner reason at pid age ttl
-    owner=$(meta_get owner || echo '?')
-    reason=$(meta_get reason || echo '?')
+    # Same foreign-writer argument as the porcelain branch above. This one is
+    # the HUMAN line, which makes it the more important of the two rather than
+    # the less: nothing downstream will re-check it, a person acts on it
+    # directly, and "the box is free" is the reading that gets acted on.
+    owner=$(display_safe "$(meta_get owner || echo '?')")
+    reason=$(display_safe "$(meta_get reason || echo '?')")
     at=$(meta_get acquired_at || echo '?')
     pid=$(meta_get anchor_pid || echo '?')
     ttl=$(meta_get ttl || echo 0)
@@ -2000,9 +2205,9 @@ cmd_acquire() {
             # not stop the load). Report it as its own outcome so a caller
             # can decide, rather than folding it into a silent success.
             if [ "$TAKEOVER" != none ]; then
-                echo "hostlock: outcome=acquired_after_reap (${TAKEOVER}) by ${OWNER} (anchor pid ${ANCHOR_PID})${REASON:+ — ${REASON}}"
+                echo "hostlock: outcome=acquired_after_reap (${TAKEOVER}) by ${OWNER} (anchor pid ${ANCHOR_PID})${REASON:+ — $(display_safe "${REASON}")}"
             else
-                echo "hostlock: outcome=acquired by ${OWNER} (anchor pid ${ANCHOR_PID})${REASON:+ — ${REASON}}"
+                echo "hostlock: outcome=acquired by ${OWNER} (anchor pid ${ANCHOR_PID})${REASON:+ — $(display_safe "${REASON}")}"
             fi
             return 0
         fi
@@ -2587,6 +2792,13 @@ require_name() {
     esac
     name_is_safe "$2" ||
         die "$1 takes a name of letters, digits, '_', '.' or '-' only, got: '$2' -- it is published in the provenance row as space-separated key=value pairs, where anything else can overwrite the fields that disclose whether the box is claimed"
+    # Refused rather than shortened, and the reason is the bug this family of
+    # guards exists for: a silently kept prefix presented as the whole value
+    # is how `sebastian helper` became `sebastian`. Length is bounded here so
+    # a name cannot push the fields after it out of the readable part of a
+    # row; a name that trips 64 characters is a mistake worth being told about.
+    [ "${#2}" -le "$HL_MAX_NAME" ] ||
+        die "$1 takes a name of at most ${HL_MAX_NAME} characters, got ${#2}"
 }
 
 while [ "$#" -gt 0 ]; do
