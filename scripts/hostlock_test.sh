@@ -1856,7 +1856,7 @@ cleanup
 # exactly what makes these two assertions fail -- and in a lane that exports it
 # globally they instead pass green with the refusal path never exercised.
 rm -f "$LOCK.ran"
-out=$(env -u HOSTLOCK_REASON $HL run --owner leon -- touch "$LOCK.ran" 2>&1); rc=$?
+out=$(env -u HOSTLOCK_REASON "$HL" run --owner leon -- touch "$LOCK.ran" 2>&1); rc=$?
 chk "a run with no reason is a usage error" "$rc" "1"
 chk "and that run's command never ran" "$([ -e "$LOCK.ran" ] && echo ran || echo no)" "no"
 chk "and no lock was left behind" "$(st state)" "FREE"
@@ -1867,7 +1867,7 @@ chk "and no lock was left behind" "$(st state)" "FREE"
 # and not the automation that follows the documented advice to set it once.
 rm -f "$LOCK.ran"
 out=$(HOSTLOCK_REASON="ambient value that must not satisfy the guard" \
-    env -u HOSTLOCK_REASON $HL run --owner leon -- touch "$LOCK.ran" 2>&1); rc=$?
+    env -u HOSTLOCK_REASON "$HL" run --owner leon -- touch "$LOCK.ran" 2>&1); rc=$?
 chk "an ambient \$HOSTLOCK_REASON does not satisfy a run that passes none" "$rc" "1"
 chk "and that scrubbed run's command never ran either" \
     "$([ -e "$LOCK.ran" ] && echo ran || echo no)" "no"
