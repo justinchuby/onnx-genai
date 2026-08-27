@@ -157,13 +157,118 @@ impl CpuBackend {
 #[inline]
 pub fn has_simd_x86() -> bool {
     #[cfg(test)]
-    if matches!(
-        std::env::var("ONNX_RUNTIME_EP_CPU_FORCE_NO_SIMD_X86").as_deref(),
-        Ok("1")
-    ) {
+    if forced_no_simd_x86() {
         return false;
     }
+    detected_simd_x86()
+}
+
+/// The raw CPUID answer, with the test override deliberately *not* applied.
+///
+/// Split out because a test that skips itself has to distinguish "this host has
+/// no AVX2" from "something switched AVX2 off underneath me": the first is a
+/// legitimate skip, the second is the whole of #1817's instance 2. Asking
+/// [`has_simd_x86`] cannot tell them apart, because it answers `false` to both.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[inline]
+pub(crate) fn detected_simd_x86() -> bool {
     std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
+}
+
+/// The test-only override that forces [`has_simd_x86`] to report `false` so the
+/// `Generic` fallback can be exercised on a host that does have AVX2.
+#[cfg(all(test, any(target_arch = "x86", target_arch = "x86_64")))]
+pub(crate) const FORCE_NO_SIMD_X86_ENV: &str = "ONNX_RUNTIME_EP_CPU_FORCE_NO_SIMD_X86";
+
+#[cfg(all(test, any(target_arch = "x86", target_arch = "x86_64")))]
+pub(crate) fn forced_no_simd_x86() -> bool {
+    std::env::var(FORCE_NO_SIMD_X86_ENV).as_deref() == Ok("1")
+}
+
+/// The variable a CI lane sets to declare that this crate's AVX2 differential
+/// falsifiers must actually execute there.
+///
+/// Modelled on `NXRT_REQUIRE_PLACEMENT_TESTS` in [`crate::core_topology`], for
+/// the same reason and with the same asymmetry: no developer's laptop is
+/// obliged to have AVX2, but the x86 lanes we point this crate at are, and
+/// until something says so their absence is indistinguishable from a pass.
+#[cfg(all(test, any(target_arch = "x86", target_arch = "x86_64")))]
+pub(crate) const REQUIRE_SIMD_X86_ENV: &str = "NXRT_REQUIRE_SIMD_X86_TESTS";
+
+#[cfg(all(test, any(target_arch = "x86", target_arch = "x86_64")))]
+pub(crate) fn simd_x86_tests_required() -> bool {
+    std::env::var(REQUIRE_SIMD_X86_ENV).as_deref() == Ok("1")
+}
+
+/// The policy behind [`require_simd_x86`], split from the environment reads so
+/// the mutation tests can drive every branch without mutating process-global
+/// state that parallel tests share -- the same reason
+/// [`crate::core_topology::topology_or_fail_closed`] takes its input as an
+/// argument.
+///
+/// `detected` is the raw CPUID answer and `forced_off` the override, because
+/// the two failure modes warrant opposite treatment: a host without AVX2 is
+/// entitled to skip, whereas an override that silently converts eleven
+/// differential tests into green no-ops is the defect being guarded against.
+#[cfg(all(test, any(target_arch = "x86", target_arch = "x86_64")))]
+pub(crate) fn simd_x86_or_fail_closed(
+    detected: bool,
+    forced_off: bool,
+    required: bool,
+    what: &str,
+) -> Result<(), String> {
+    if detected && !forced_off {
+        return Ok(());
+    }
+    assert!(
+        !required,
+        "{}",
+        if forced_off {
+            format!(
+                "{REQUIRE_SIMD_X86_ENV}=1 and {FORCE_NO_SIMD_X86_ENV}=1 are both set, so `{what}` \
+                 would return without comparing the AVX2 kernel against anything and still \
+                 report success. These two settings are a contradiction: one lane declares the \
+                 AVX2 differential tests mandatory, the other switches the AVX2 path off. Set \
+                 the override on a lane that does not require these tests."
+            )
+        } else {
+            format!(
+                "{REQUIRE_SIMD_X86_ENV}=1 but this host reports no AVX2+FMA, so `{what}` cannot \
+                 exercise the SIMD kernel it exists to falsify and would pass without testing \
+                 anything. Point this lane at an AVX2 runner or stop requiring the SIMD tests \
+                 on it."
+            )
+        }
+    );
+    Err(if forced_off {
+        format!("{FORCE_NO_SIMD_X86_ENV}=1 switched the AVX2 path off")
+    } else {
+        "this host reports no AVX2+FMA".to_string()
+    })
+}
+
+/// AVX2 capability for the differential kernel tests: fails closed on a lane
+/// that declared them mandatory, and skips with a stated reason elsewhere.
+///
+/// Returns `true` when the caller may proceed. The eleven sites in
+/// `kernels::x86_sgemm` previously opened with a bare `if !has_simd_x86() {
+/// return; }`, which is a silent pass -- and one environment variable turns all
+/// eleven into green no-ops at once, including the sole remaining falsifier for
+/// #1809's int4 packing change.
+#[cfg(all(test, any(target_arch = "x86", target_arch = "x86_64")))]
+pub(crate) fn require_simd_x86(what: &str) -> bool {
+    match simd_x86_or_fail_closed(
+        detected_simd_x86(),
+        forced_no_simd_x86(),
+        simd_x86_tests_required(),
+        what,
+    ) {
+        Ok(()) => true,
+        Err(reason) => {
+            eprintln!("skipping {what}: {reason}");
+            false
+        }
+    }
 }
 
 #[cfg(test)]
@@ -232,5 +337,70 @@ mod tests {
     #[test]
     fn forced_simd_falls_back_to_generic_without_required_cpu_features() {
         assert_eq!(CpuBackend::simd_x86_or_generic(false), CpuBackend::Generic);
+    }
+
+    /// The positive arm, in the sense #1173 established: a guard that only ever
+    /// declines proves nothing, because "it declined" and "it is broken" are the
+    /// same observation. This is the direction that must *permit* work.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    fn an_avx2_host_may_run_the_differential_tests() {
+        assert!(simd_x86_or_fail_closed(true, false, true, "w").is_ok());
+        assert!(simd_x86_or_fail_closed(true, false, false, "w").is_ok());
+    }
+
+    /// The negative arm. Before this, the eleven sites in `kernels::x86_sgemm`
+    /// opened with a bare `return`, so a lane that lost AVX2 reported eleven
+    /// passes having compared nothing.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    #[should_panic(expected = "this host reports no AVX2+FMA")]
+    fn a_lane_requiring_the_simd_tests_fails_closed_when_the_host_lacks_avx2() {
+        let _ = simd_x86_or_fail_closed(false, false, true, "int4_dequant_panel");
+    }
+
+    /// The override is the sharper half of #1817's instance 2: it is reachable
+    /// on a host that *does* have AVX2, so it converts the whole differential
+    /// suite into no-ops without any hardware change to notice.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    #[should_panic(expected = "are both set")]
+    fn a_lane_requiring_the_simd_tests_fails_closed_when_the_override_switched_it_off() {
+        let _ = simd_x86_or_fail_closed(true, true, true, "int4_dequant_panel");
+    }
+
+    /// A host genuinely without AVX2 is entitled to skip -- but the skip has to
+    /// be *stated*, and it has to say which of the two causes it was, since the
+    /// remedies are opposite: buy a different runner, or stop setting a variable.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    fn an_unrequired_lane_skips_with_a_reason_that_names_the_cause() {
+        let host = simd_x86_or_fail_closed(false, false, false, "w").unwrap_err();
+        let over = simd_x86_or_fail_closed(true, true, false, "w").unwrap_err();
+        assert!(host.contains("no AVX2+FMA"), "{host}");
+        assert!(over.contains(FORCE_NO_SIMD_X86_ENV), "{over}");
+        assert_ne!(
+            host, over,
+            "the two skip causes must be distinguishable; conflating them is what let the \
+             override hide behind 'this host has no AVX2'"
+        );
+    }
+
+    /// Totality: `Ok` must be reachable only with AVX2 present and the override
+    /// clear. Written as an exhaustive sweep of the three-bit input space so a
+    /// future edit cannot open a fourth way through without failing here.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    fn only_a_genuinely_available_avx2_permits_the_differential_tests() {
+        for detected in [false, true] {
+            for forced in [false, true] {
+                let permitted = simd_x86_or_fail_closed(detected, forced, false, "w").is_ok();
+                assert_eq!(
+                    permitted,
+                    detected && !forced,
+                    "detected={detected} forced={forced}"
+                );
+            }
+        }
     }
 }
