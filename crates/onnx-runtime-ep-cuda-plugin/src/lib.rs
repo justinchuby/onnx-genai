@@ -37,12 +37,166 @@
 
 #[cfg(feature = "cuda")]
 mod cuda_impl {
+    use std::ffi::c_void;
+    use std::ptr;
+
     use onnx_runtime_ep_cuda::CudaExecutionProvider;
     use onnx_runtime_ep_plugin::device::DeviceSupport;
     use onnx_runtime_ep_plugin::ep::KernelRegistryEntry;
+    use onnx_runtime_ep_plugin::onnx_genai_ort_sys as ort;
 
     /// NVIDIA vendor ID (PCI).
     const NVIDIA_VENDOR_ID: u32 = 0x10DE;
+
+    unsafe extern "C" fn dsa_create_schema_kernel(
+        _op: *const ort::OrtCustomOp,
+        _api: *const ort::OrtApi,
+        _info: *const ort::OrtKernelInfo,
+        kernel: *mut *mut c_void,
+    ) -> *mut ort::OrtStatus {
+        if !kernel.is_null() {
+            unsafe { *kernel = std::ptr::dangling_mut::<c_void>() };
+        }
+        std::ptr::null_mut()
+    }
+
+    unsafe extern "C" fn dsa_schema_fallback_must_not_execute(
+        _kernel: *mut c_void,
+        _context: *mut ort::OrtKernelContext,
+    ) -> *mut ort::OrtStatus {
+        onnx_runtime_ep_plugin::status::fail_status(
+            "pkg.nxrt::DsaIndexSelect schema fallback executed; cuda_ep must compile this node",
+        )
+    }
+
+    unsafe extern "C" fn dsa_schema_kernel_destroy(_kernel: *mut c_void) {}
+
+    unsafe extern "C" fn dsa_name(_op: *const ort::OrtCustomOp) -> *const std::ffi::c_char {
+        c"DsaIndexSelect".as_ptr()
+    }
+
+    unsafe extern "C" fn dsa_provider(_op: *const ort::OrtCustomOp) -> *const std::ffi::c_char {
+        c"nxrt_schema_only".as_ptr()
+    }
+
+    unsafe extern "C" fn dsa_input_count(_op: *const ort::OrtCustomOp) -> usize {
+        4
+    }
+
+    unsafe extern "C" fn dsa_input_type(
+        _op: *const ort::OrtCustomOp,
+        index: usize,
+    ) -> ort::ONNXTensorElementDataType {
+        match index {
+            3 => ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+            _ => ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED,
+        }
+    }
+
+    unsafe extern "C" fn dsa_output_count(_op: *const ort::OrtCustomOp) -> usize {
+        1
+    }
+
+    unsafe extern "C" fn dsa_output_type(
+        _op: *const ort::OrtCustomOp,
+        _index: usize,
+    ) -> ort::ONNXTensorElementDataType {
+        ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64
+    }
+
+    unsafe extern "C" fn dsa_start_version(_op: *const ort::OrtCustomOp) -> i32 {
+        1
+    }
+
+    unsafe extern "C" fn dsa_end_version(_op: *const ort::OrtCustomOp) -> i32 {
+        i32::MAX
+    }
+
+    unsafe extern "C" fn dsa_required_input(
+        _op: *const ort::OrtCustomOp,
+        _index: usize,
+    ) -> ort::OrtCustomOpInputOutputCharacteristic {
+        ort::INPUT_OUTPUT_REQUIRED
+    }
+
+    unsafe extern "C" fn dsa_input_memory(
+        _op: *const ort::OrtCustomOp,
+        _index: usize,
+    ) -> ort::OrtMemType {
+        ort::OrtMemTypeDefault
+    }
+
+    unsafe extern "C" fn dsa_zero_arity(_op: *const ort::OrtCustomOp) -> i32 {
+        0
+    }
+
+    unsafe extern "C" fn dsa_homogeneous(_op: *const ort::OrtCustomOp) -> i32 {
+        1
+    }
+
+    static DSA_CUSTOM_OP: ort::OrtCustomOp = ort::OrtCustomOp {
+        version: ort::ORT_API_VERSION,
+        CreateKernel: None,
+        GetName: Some(dsa_name),
+        GetExecutionProviderType: Some(dsa_provider),
+        GetInputType: Some(dsa_input_type),
+        GetInputTypeCount: Some(dsa_input_count),
+        GetOutputType: Some(dsa_output_type),
+        GetOutputTypeCount: Some(dsa_output_count),
+        KernelCompute: None,
+        KernelDestroy: Some(dsa_schema_kernel_destroy),
+        GetInputCharacteristic: Some(dsa_required_input),
+        GetOutputCharacteristic: Some(dsa_required_input),
+        GetInputMemoryType: Some(dsa_input_memory),
+        GetVariadicInputMinArity: Some(dsa_zero_arity),
+        GetVariadicInputHomogeneity: Some(dsa_homogeneous),
+        GetVariadicOutputMinArity: Some(dsa_zero_arity),
+        GetVariadicOutputHomogeneity: Some(dsa_homogeneous),
+        CreateKernelV2: Some(dsa_create_schema_kernel),
+        KernelComputeV2: Some(dsa_schema_fallback_must_not_execute),
+        InferOutputShapeFn: None,
+        GetStartVersion: Some(dsa_start_version),
+        GetEndVersion: Some(dsa_end_version),
+        GetMayInplace: None,
+        ReleaseMayInplace: None,
+        GetAliasMap: None,
+        ReleaseAliasMap: None,
+    };
+
+    pub(crate) unsafe fn attach_dsa_custom_domain(
+        factory: *mut ort::OrtEpFactory,
+        api: *const ort::OrtApi,
+    ) -> *mut ort::OrtStatus {
+        if api.is_null() {
+            return onnx_runtime_ep_plugin::status::fail_status(
+                "CUDA plugin custom-op registration has no ORT host API",
+            );
+        }
+        let Some(create_domain) = (unsafe { (*api).CreateCustomOpDomain }) else {
+            return onnx_runtime_ep_plugin::status::fail_status(
+                "ORT host lacks CreateCustomOpDomain",
+            );
+        };
+        let Some(add) = (unsafe { (*api).CustomOpDomain_Add }) else {
+            return onnx_runtime_ep_plugin::status::fail_status(
+                "ORT host lacks CustomOpDomain_Add",
+            );
+        };
+        let mut domain = ptr::null_mut();
+        let status = unsafe { create_domain(c"pkg.nxrt".as_ptr(), &mut domain) };
+        if !status.is_null() {
+            return status;
+        }
+        let status = unsafe { add(domain, &DSA_CUSTOM_OP) };
+        if !status.is_null() {
+            if let Some(release) = unsafe { (*api).ReleaseCustomOpDomain } {
+                unsafe { release(domain) };
+            }
+            return status;
+        }
+        unsafe { onnx_runtime_ep_plugin::factory::attach_custom_op_domain(factory, domain) };
+        ptr::null_mut()
+    }
 
     /// Build kernel registry entries from the CUDA EP's **real** registry.
     ///
@@ -68,23 +222,37 @@ mod cuda_impl {
     pub(crate) fn build_kernel_registry_entries(
         runtime: std::sync::Arc<onnx_runtime_ep_cuda::CudaRuntime>,
     ) -> Vec<KernelRegistryEntry> {
-        onnx_runtime_ep_cuda::build_cuda_registry_descriptors(runtime)
-            .into_iter()
-            .map(|d| KernelRegistryEntry {
+        let descriptors = onnx_runtime_ep_cuda::build_cuda_registry_descriptors(runtime);
+        descriptors
+            .iter()
+            .enumerate()
+            .map(|(index, d)| KernelRegistryEntry {
                 op_type: leak_str(&d.op_type),
                 domain: leak_str(&d.domain),
-                since_version: d.since_version as i32,
-                // i32::MAX: our CUDA kernels are version-agnostic — they dispatch
-                // on dtype/shape via the IR `Node` abstraction, not on opset-specific
-                // attributes. The schema version only affects how ORT parses the model
-                // into the IR; by the time we see a Node, versioned differences are
-                // already resolved. This matches the CPU EP's fix for the same issue.
-                end_version: i32::MAX,
+                since_version: i32::try_from(d.since_version)
+                    .expect("registered CUDA opset must fit ORT's i32 version ABI"),
+                end_version: schema_end_version(&descriptors, index),
                 supported_dtypes: d.supported_dtypes,
                 input_dtype_constraints: &[],
                 output_dtype_constraints: &[],
             })
             .collect()
+    }
+
+    fn schema_end_version(
+        descriptors: &[onnx_runtime_ep_cuda::CudaOpDescriptor],
+        index: usize,
+    ) -> i32 {
+        let descriptor = &descriptors[index];
+        descriptors
+            .get(index + 1)
+            .filter(|next| next.op_type == descriptor.op_type && next.domain == descriptor.domain)
+            .map(|next| {
+                i32::try_from(next.since_version)
+                    .expect("registered CUDA opset must fit ORT's i32 version ABI")
+                    - 1
+            })
+            .unwrap_or(i32::MAX)
     }
 
     /// Leak a string to get a `&'static str` (entries must live for the EP
@@ -117,6 +285,37 @@ mod cuda_impl {
         let stream_handle = ep.runtime().stream_ptr() as *mut std::os::raw::c_void;
         let entries = build_kernel_registry_entries(ep.runtime().clone());
         Ok((Box::new(ep), stream_handle, entries))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn descriptor(
+            op_type: &str,
+            domain: &str,
+            since_version: u64,
+        ) -> onnx_runtime_ep_cuda::CudaOpDescriptor {
+            onnx_runtime_ep_cuda::CudaOpDescriptor {
+                op_type: op_type.into(),
+                domain: domain.into(),
+                since_version,
+                supported_dtypes: &[],
+            }
+        }
+
+        #[test]
+        fn advertised_schema_ranges_end_before_the_next_registered_version() {
+            let descriptors = vec![
+                descriptor("DsaIndexSelect", "pkg.nxrt", 1),
+                descriptor("DsaIndexSelect", "pkg.nxrt", 3),
+                descriptor("Other", "pkg.nxrt", 1),
+            ];
+
+            assert_eq!(schema_end_version(&descriptors, 0), 2);
+            assert_eq!(schema_end_version(&descriptors, 1), i32::MAX);
+            assert_eq!(schema_end_version(&descriptors, 2), i32::MAX);
+        }
     }
 }
 
@@ -199,7 +398,7 @@ pub unsafe extern "C" fn CreateEpFactories(
 
             // S4 fix: use create_ep_factories_for_shared_ep which takes the
             // EP name directly, avoiding the constructor call that would panic.
-            unsafe {
+            let status = unsafe {
                 onnx_runtime_ep_plugin::factory::create_ep_factories_for_shared_ep(
                     api_base,
                     out_factories,
@@ -211,7 +410,28 @@ pub unsafe extern "C" fn CreateEpFactories(
                     support,
                     stream_handle,
                 )
+            };
+            if status.is_null() && !out_factories.is_null() && max_factories != 0 {
+                let factory = unsafe { *out_factories };
+                let api = unsafe {
+                    (*api_base)
+                        .GetApi
+                        .map(|get_api| {
+                            get_api(onnx_runtime_ep_plugin::onnx_genai_ort_sys::ORT_API_VERSION)
+                        })
+                        .unwrap_or(std::ptr::null())
+                };
+                let domain_status = unsafe { cuda_impl::attach_dsa_custom_domain(factory, api) };
+                if !domain_status.is_null() {
+                    let _ = unsafe { onnx_runtime_ep_plugin::factory::release_ep_factory(factory) };
+                    unsafe {
+                        *out_factories = std::ptr::null_mut();
+                        *out_num_raw = 0;
+                    }
+                    return domain_status;
+                }
             }
+            status
         }
 
         #[cfg(not(feature = "cuda"))]
@@ -481,6 +701,96 @@ pub extern "C" fn nxrt_ep_workspace_placement_queries() -> usize {
 #[unsafe(no_mangle)]
 pub extern "C" fn nxrt_ep_reset_workspace_placement_queries() {
     onnx_runtime_ep_plugin::compute::reset_workspace_placement_queries()
+}
+
+#[cfg(feature = "cuda")]
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_cuda_dsa_workspace_allocations() -> u64 {
+    onnx_runtime_ep_cuda::dsa_workspace_stats().allocations
+}
+
+#[cfg(feature = "cuda")]
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_cuda_dsa_workspace_releases() -> u64 {
+    onnx_runtime_ep_cuda::dsa_workspace_stats().releases
+}
+
+#[cfg(feature = "cuda")]
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_cuda_dsa_workspace_live_bytes() -> u64 {
+    onnx_runtime_ep_cuda::dsa_workspace_stats().live_bytes
+}
+
+#[cfg(feature = "cuda")]
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_cuda_dsa_workspace_last_ptr() -> u64 {
+    onnx_runtime_ep_cuda::dsa_workspace_stats().last_ptr
+}
+
+#[cfg(feature = "cuda")]
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_cuda_reset_dsa_workspace_stats() -> bool {
+    onnx_runtime_ep_cuda::reset_dsa_workspace_stats()
+}
+
+#[cfg(feature = "cuda")]
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_cuda_dsa_executions() -> u64 {
+    onnx_runtime_ep_cuda::dsa_launch_stats().executions
+}
+
+#[cfg(feature = "cuda")]
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_cuda_dsa_score_launches() -> u64 {
+    onnx_runtime_ep_cuda::dsa_launch_stats().score_launches
+}
+
+#[cfg(feature = "cuda")]
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_cuda_dsa_selection_launches() -> u64 {
+    onnx_runtime_ep_cuda::dsa_launch_stats().selection_launches
+}
+
+#[cfg(feature = "cuda")]
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_cuda_dsa_last_score_grid_x() -> u64 {
+    onnx_runtime_ep_cuda::dsa_launch_stats().last_score_grid_x
+}
+
+#[cfg(feature = "cuda")]
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_cuda_dsa_last_selection_grid_x() -> u64 {
+    onnx_runtime_ep_cuda::dsa_launch_stats().last_selection_grid_x
+}
+
+#[cfg(feature = "cuda")]
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_cuda_reset_dsa_launch_stats() {
+    onnx_runtime_ep_cuda::reset_dsa_launch_stats()
+}
+
+#[cfg(feature = "gpu-tests")]
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_cuda_set_dsa_capture_replays_for_test(replays: u64) {
+    onnx_runtime_ep_cuda::set_dsa_plugin_capture_replays_for_test(replays)
+}
+
+#[cfg(feature = "gpu-tests")]
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_cuda_dsa_capture_count_for_test() -> u64 {
+    onnx_runtime_ep_cuda::dsa_plugin_capture_stats_for_test().0
+}
+
+#[cfg(feature = "gpu-tests")]
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_cuda_dsa_captured_replays_for_test() -> u64 {
+    onnx_runtime_ep_cuda::dsa_plugin_capture_stats_for_test().1
+}
+
+#[cfg(feature = "gpu-tests")]
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_cuda_dsa_capture_error_for_test() -> u64 {
+    onnx_runtime_ep_cuda::dsa_plugin_capture_stats_for_test().2
 }
 
 #[cfg(test)]

@@ -313,13 +313,19 @@ def run_width(args, w):
         "ONNX_GENAI_CPU_DECODE_WORKER_PROFILE": "1",
         "ONNX_GENAI_CPU_DECODE_BLOCKTIME_US": args.blocktime,
     }
+    # Unset means the SHIPPED default, which is what almost every row should
+    # run at. Setting it to the default's current value instead would look
+    # identical today and silently pin the arm to a stale number the day the
+    # default moves.
+    if args.steal_tiles is not None:
+        env["ONNX_GENAI_CPU_DECODE_STEAL_TILES_PER_WORKER"] = args.steal_tiles
     r = H.sh(f"taskset -c {H.PIN} {args.binary}", env)
     return r.stdout + "\n" + r.stderr
 
 
 def one_launch(args, launch, widths):
     rec = {"launch": launch, "blocktime_us": args.blocktime, "widths": {},
-           "peak_limit": args.quiet_limit}
+           "steal_tiles": args.steal_tiles, "peak_limit": args.quiet_limit}
     order = widths if launch % 2 == 0 else tuple(reversed(widths))
     rec["order"] = list(order)
     with H.LoadWatch() as watch:
@@ -327,6 +333,52 @@ def one_launch(args, launch, widths):
             rec["widths"][str(w)] = derive(parse_workers(run_width(args, w)))
     rec["peak"] = watch.peak
     return rec
+
+
+def honoured_tile_count(raw):
+    """Reject a tile count the runtime would silently ignore.
+
+    `steal_tiles_per_worker_override` parses `usize` and then filters `> 0`,
+    so 0 and every negative fall back to the shipped default.  argparse would
+    take them happily, the child would run the default, and the dataset would
+    be stamped with an arm it never ran -- the exact misattribution this knob
+    is here to make impossible.
+    """
+    value = int(raw)
+    if value < 1:
+        raise argparse.ArgumentTypeError(
+            f"--steal-tiles {value} is not honoured by the runtime, which "
+            f"filters `> 0` and falls back to the shipped default; the arm "
+            f"would be labelled {value} but would run the default")
+    return value
+
+
+def steal_tiles_label(recs):
+    """How the steal-tile knob was set, for the report header and a replay.
+
+    Three distinct answers, and collapsing any two of them loses the fact that
+    matters.  `unrecorded` is a dataset archived before this key existed: it
+    ran at whatever its binary's default was, which is NOT necessarily today's
+    default, so calling it `default (shipped)` would assert a value nobody
+    measured.  Same doctrine as the absent-key handling in `hostlock.sh`.
+    """
+    if not recs:
+        return "?"
+    seen = {r["steal_tiles"] if "steal_tiles" in r else "unrecorded"
+            for r in recs}
+    if len(seen) > 1:
+        # Refuse to pick one. Reporting `recs[0]` over a concatenated or
+        # hand-edited archive is the re-based-baseline defect one field along:
+        # a single confident label above rows that did not all run under it.
+        return ("MIXED across launches -- not one arm: "
+                + ", ".join(sorted(_one_tile_label(v) for v in seen)))
+    return _one_tile_label(next(iter(seen)))
+
+
+def _one_tile_label(v):
+    if v == "unrecorded":
+        return "unrecorded (dataset predates the knob)"
+    return "default (shipped, unset)" if v is None else str(v)
 
 
 def report(recs, widths):
@@ -345,6 +397,7 @@ def report(recs, widths):
               + ", ".join(f"w{w}" for w in extras))
     print(f"# blocktime_us={recs[0]['blocktime_us'] if recs else '?'} "
           f"(profiled run: diagnostic only, tps deliberately not reported)")
+    print(f"# steal_tiles={steal_tiles_label(recs)}")
     hdr = (f"{'L':>3} {'pk':>4} {'T':>2} " +
            " ".join(f"{'w'+str(w)+'.'+k:>12}"
                     for w in widths
@@ -535,6 +588,60 @@ def self_test():
     # And the sign-consistency guard still reads the pinned pair.
     assert sign_fraction(rows, RULE_WIDE, RULE_NARROW, "resid_frac") == 1.0
 
+    # The steal-tile knob is the arm label for the #2071 tiles=1-vs-shipped
+    # comparison, so a report that misstates it misattributes the whole arm --
+    # the same class of defect as the re-based baseline this self-test exists
+    # for, one field along. Three cases, all distinct on purpose.
+    explicit = synthetic_rows(MIN_TRUSTED + 2, stats)
+    for r in explicit:
+        r["steal_tiles"] = 1
+    assert steal_tiles_label(explicit) == "1", steal_tiles_label(explicit)
+
+    shipped = synthetic_rows(MIN_TRUSTED + 2, stats)
+    for r in shipped:
+        r["steal_tiles"] = None
+    assert steal_tiles_label(shipped).startswith("default"), (
+        steal_tiles_label(shipped))
+
+    # An archived dataset predating the knob ran at ITS binary's default, not
+    # necessarily today's, so it must not be labelled `default`.
+    archived = synthetic_rows(MIN_TRUSTED + 2, stats)
+    for r in archived:
+        r.pop("steal_tiles", None)
+    assert steal_tiles_label(archived).startswith("unrecorded"), (
+        "a dataset predating the knob was labelled as if its arm were known: "
+        + steal_tiles_label(archived))
+
+    # The guard on the knob itself. Without an assertion here it is a branch
+    # nobody exercises, and the arm it protects is the one being published.
+    for bad in ("0", "-1", "-5"):
+        try:
+            honoured_tile_count(bad)
+        except argparse.ArgumentTypeError:
+            pass
+        else:
+            raise AssertionError(
+                f"--steal-tiles {bad} was accepted; the runtime filters `> 0` "
+                f"so the arm would be labelled {bad} and run the default")
+    assert honoured_tile_count("4") == 4, "an honoured tile count was rejected"
+
+    # A dataset that is not one arm must say so rather than name the first.
+    mixed = synthetic_rows(MIN_TRUSTED + 2, stats)
+    for i, r in enumerate(mixed):
+        r["steal_tiles"] = 1 if i else None
+    assert steal_tiles_label(mixed).startswith("MIXED"), (
+        "a dataset spanning two arms was labelled as one: "
+        + steal_tiles_label(mixed))
+
+    # And the label has to reach the report, not merely be computable.
+    for rows_, want in ((explicit, "# steal_tiles=1\n"),
+                        (archived, "# steal_tiles=unrecorded")):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            report(rows_, (8, 16))
+        assert want in buf.getvalue(), (
+            f"expected {want!r} in the report header:\n" + buf.getvalue())
+
     # The defect lived in `report()` as well as in `verdict()`, and `report()`
     # is the only caller of `barrier_decomposition` -- the Amdahl calibration
     # whose sign flipped. Scoring the verdict on the pinned pair while the
@@ -557,7 +664,9 @@ def self_test():
             assert "descriptive only" in out and "w2" in out, out
 
     print(f"self-test OK: verdict pinned to w{RULE_NARROW} vs w{RULE_WIDE} "
-          f"under every --widths permutation tried")
+          f"under every --widths permutation tried; steal-tile arm label "
+          f"distinguishes explicit, shipped-default, unrecorded and mixed, "
+          f"and unhonoured tile counts are refused")
 
 
 def main():
@@ -568,6 +677,7 @@ def main():
     ap.add_argument("--reps", type=int, default=2)
     ap.add_argument("--widths", default="8,16")
     ap.add_argument("--blocktime", type=int, default=0)
+    ap.add_argument("--steal-tiles", type=honoured_tile_count, default=None)
     ap.add_argument("--quiet-limit", type=int, default=40)
     ap.add_argument("--out", default=None)
     ap.add_argument("--replay", default=None)
