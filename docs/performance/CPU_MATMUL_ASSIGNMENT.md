@@ -3276,6 +3276,39 @@ Full report:
   `int4_modulo_arms.sh` additionally **fails hard if two arms come out
   byte-identical** — that failure still produces a full table of numbers, every
   one of them a null between a binary and itself.
+* **The whole matrix was quiet-host-only evidence, and now is not (2026-08-27).**
+  Every number above was taken pinned to an idle core behind two gates whose
+  purpose is to *discard* any launch that was not alone on it. The recorded
+  correction on #1729 says that is not sufficient for something that ships as a
+  default: "a policy that wins only under exclusive quiet-host conditions is
+  not a valid default." The eliminated modulo is on by default with no opt-out,
+  so it owed that evidence. `int4_modulo_matrix.py --co-tenant {smt,dram}` now
+  supplies it by **injecting** contention instead of gating it out — a pinned
+  spinner on the measured core's SMT sibling, or eight pinned streaming hogs on
+  other physical cores — against a rule fixed before the first contended
+  launch. Result: **PASS in both regimes**, on prefill and on decode, and the
+  two move in opposite directions in the way the mechanism predicts. Under SMT
+  the win roughly **doubles** — 1.0041 → 1.0089 at prefill `m = 1`, and
+  **1.0095 → 1.0224** on the decode loop, intervals non-overlapping in both —
+  because the eliminated work is integer-division issue and a sibling competes
+  for exactly those slots. Under DRAM starvation it **fades to a null**
+  (prefill 0.9975 / 0.9991; decode 1.0038 [0.9956, 1.0155]), because a fixed
+  ALU saving disappears into a memory stall. No
+  interval anywhere is below 1.000. The `dram` `m = 16` cell reads 1.0066 but
+  its own A/A is 1.0054, so it is reported as no resolvable effect rather than
+  a gain — that regime's floor is ~4x the quiet host's.
+  Two things generalise past this patch. First, **a co-tenant arm has to be
+  gate-*inverted*, not gate-removed**: an arm whose injected load silently
+  failed to start is a quiet-host arm wearing a busy-host heading, and it
+  passes clean and reads identically in the artifact, which is the exact number
+  the arm exists to replace. Each contended launch therefore proves its own
+  contention against a floor, and the gates still meaningful in that mode keep
+  firing — a stray competitor on the sibling still voids a `dram` launch.
+  Second, the host lock and the injected load are not alternatives: the lock is
+  what makes the co-tenant a *controlled* variable rather than the uncontrolled
+  one every other gate here exists to reject. This is #1802 item 4 ("both arms
+  in the gates") delivered for this harness, and the arm is reusable by anyone
+  else who owes busy-host evidence for a default.
 * **Disposition: no kernel change.** #1809's code was already correct and
   already on main. What shipped is the corrected scope, the per-row route
   fingerprint, the bootstrap and A/A self-check, and the two scripts that make
