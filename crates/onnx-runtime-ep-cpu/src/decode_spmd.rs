@@ -166,29 +166,38 @@ pub const CHUNK_PERMUTATION_ENV: &str = "ONNX_GENAI_CPU_DECODE_CHUNK_PERMUTATION
 /// standard for exactly this OMP-style fine-grained fork/join HPC workload.
 ///
 /// The window's *first-order* claim is measured and holds: it eliminates
-/// parking during a generation. At width 16 the median worker parks **0.533**
-/// times across a whole launch at the shipped 500 us, and **345.9** times with
-/// the window removed (`--blocktime 0`), per
+/// parking during a generation. At width 16 the average worker parks a median
+/// of **0.533** times per launch at the shipped 500 us, and **345.9** times
+/// with the window removed (`--blocktime 0`), per
 /// `benches/acc0_w16_worker_split.py`, 7 trusted launches per arm.
 ///
 /// Its *second-order* claim did not survive measurement and has been removed.
 /// This comment used to say parking on every barrier would "tank throughput".
 /// Parking on essentially every barrier -- those 345.9 parks -- costs **2.2% of
 /// the window** in wake latency at width 16, with a profiler exposing it
-/// (`wake_frac` 0.022 at blocktime 0, 0.014 at 500 us). The pre-registered
-/// decomposition's `WAKE-BOUND` verdict does **not** fire at either blocktime
-/// on either baseline. The throughput consequence is separately *unresolved*,
-/// not small-and-known: an unprofiled paired A/B reads a null at t=2 (0.996,
-/// CI [0.960, 1.013]) and straddles 1.0 at t=8 and t=16 with no A/A null in the
-/// same batch, so no direction can be claimed there.
+/// (`wake_frac` 0.022 at blocktime 0, 0.014 at 500 us), and the pre-registered
+/// `WAKE-BOUND` verdict does **not** fire at either blocktime.
 ///
-/// So the window is retained on the evidence that exists -- it costs ~5% of
-/// pool width in permanently-occupied cores (#2071) and buys a wake term that
-/// is small but real -- and **not** on a throughput cliff that has never been
-/// demonstrated. Changing [`DEFAULT_BLOCKTIME`] needs the gap-distribution and
-/// concurrent-session arms of #2071, plus that missing A/A null; a reader
-/// reaching for this comment as a reason not to re-measure should not find one.
-/// Corrected data and method: #2245, and
+/// Nor is the throughput half a cliff. `docs/performance/CPU_MATMUL_ASSIGNMENT.md`
+/// already records removing the ramp as throughput-neutral at t=16 -- ratio
+/// 0.9960 against a **5.24% A/A null**, which is the control that makes it a
+/// result -- and my own unprofiled paired A/B agrees at t=2 (0.996, range
+/// [0.960, 1.013] over 7 paired reps). At t=8 and t=16 my ratios straddle 1.0
+/// and I ran no A/A null in that batch, so they resolve nothing either way.
+///
+/// What is genuinely unmeasured is the case the window exists for. Every
+/// result above is a **zero-gap** decode loop, exactly where parking looks
+/// falsely free because the next op is always already there. The window's
+/// justification is inter-token gaps, and no measurement here has any.
+///
+/// So the window is retained on the evidence that exists -- it costs ~5-8% of
+/// pool width in permanently-occupied cores (~1.3 cores at width 16, #2071)
+/// and buys a wake term that is small but real -- and **not** on a throughput
+/// cliff, which the zero-gap evidence positively contradicts. Changing
+/// [`DEFAULT_BLOCKTIME`] needs the gap-distribution and concurrent-session arms
+/// of #2071 and #1395's gap-aware harness; a reader reaching for this comment
+/// as a reason not to re-measure should not find one. Corrected data and
+/// method: #2245, and
 /// `docs/benchmarks/2026-08-26-acc0-w16-baseline-correction.md` once it lands.
 ///
 /// The behavioural half is asserted mechanically, without timing, by
@@ -197,8 +206,8 @@ pub const CHUNK_PERMUTATION_ENV: &str = "ONNX_GENAI_CPU_DECODE_CHUNK_PERMUTATION
 /// The complementary direction -- back-to-back dispatches never park -- is
 /// deliberately *not* a test, because a descheduled worker's window expires
 /// off-CPU and it would fail on a loaded runner. The 0.533 above is the
-/// out-of-band substitute for it, and it is a median over launches, not a
-/// bound.
+/// out-of-band substitute for it, and it is a median over launches of a mean
+/// over workers, not a bound.
 ///
 /// The window is **load-bearing, not a bad habit**: decode fires ~400 fork/join
 /// barriers per token, microseconds apart, so a worker must catch the next
