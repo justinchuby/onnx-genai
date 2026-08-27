@@ -117,6 +117,30 @@ struct Case {
     weights_scale: Option<f32>,
 }
 
+/// Input geometry for performance fixtures. Deliberately excludes `top_k`:
+/// paired controls must change only the output width/selection target, never
+/// the query, key, weights, or bias tensors.
+#[derive(Clone, Copy)]
+struct PerfInputShape {
+    batch: usize,
+    q_seq: usize,
+    heads: usize,
+    head_dim: usize,
+    key_seq: usize,
+}
+
+impl From<Case> for PerfInputShape {
+    fn from(case: Case) -> Self {
+        Self {
+            batch: case.batch,
+            q_seq: case.q_seq,
+            heads: case.heads,
+            head_dim: case.head_dim,
+            key_seq: case.key_seq,
+        }
+    }
+}
+
 /// Build a single `DsaIndexSelect` node model from the positional input list
 /// `[query, key, weights, attention_bias]`. All four inputs are required.
 fn build_node(inputs: &[Option<HostTensor>], case: Case) -> (Graph, NodeId, Vec<OutputSpec>) {
@@ -1461,14 +1485,14 @@ fn gpu_clock_witness(phase: &str) {
     }
 }
 
-fn perf_inputs(case: Case, seed: u64, dtype: DataType) -> [Option<HostTensor>; 4] {
+fn perf_inputs(shape: PerfInputShape, seed: u64, dtype: DataType) -> [Option<HostTensor>; 4] {
     let mut rng = lcg(seed);
     let query = make(
-        case.batch * case.q_seq * case.heads * case.head_dim,
+        shape.batch * shape.q_seq * shape.heads * shape.head_dim,
         &mut rng,
     );
-    let key = make(case.batch * case.key_seq * case.head_dim, &mut rng);
-    let weights = make(case.batch * case.q_seq * case.heads, &mut rng);
+    let key = make(shape.batch * shape.key_seq * shape.head_dim, &mut rng);
+    let weights = make(shape.batch * shape.q_seq * shape.heads, &mut rng);
     let make_tensor = |shape: &[usize], values: &[f32]| match dtype {
         DataType::Float32 => HostTensor::f32(shape, values),
         DataType::Float16 => HostTensor::f16(shape, values),
@@ -1477,16 +1501,124 @@ fn perf_inputs(case: Case, seed: u64, dtype: DataType) -> [Option<HostTensor>; 4
     };
     [
         Some(make_tensor(
-            &[case.batch, case.q_seq, case.heads, case.head_dim],
+            &[shape.batch, shape.q_seq, shape.heads, shape.head_dim],
             &query,
         )),
         Some(make_tensor(
-            &[case.batch, case.key_seq, case.head_dim],
+            &[shape.batch, shape.key_seq, shape.head_dim],
             &key,
         )),
-        Some(make_tensor(&[case.batch, case.q_seq, case.heads], &weights)),
-        Some(causal_bias(case.batch, case.q_seq, case.key_seq)),
+        Some(make_tensor(
+            &[shape.batch, shape.q_seq, shape.heads],
+            &weights,
+        )),
+        Some(causal_bias(shape.batch, shape.q_seq, shape.key_seq)),
     ]
+}
+
+/// Stable FNV-1a digest over the exact typed input tensors uploaded to CUDA.
+///
+/// This is measurement evidence, not a substitute for the byte-for-byte
+/// regression assertion below. It lets separate counter-ordered A100 processes
+/// prove they timed identical query/key/weights/bias payloads.
+fn perf_input_digest(inputs: &[Option<HostTensor>; 4]) -> u64 {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut digest = OFFSET;
+    let mut add = |bytes: &[u8]| {
+        for &byte in bytes {
+            digest ^= u64::from(byte);
+            digest = digest.wrapping_mul(PRIME);
+        }
+    };
+    for (slot, tensor) in inputs.iter().enumerate() {
+        add(&(slot as u64).to_le_bytes());
+        match tensor {
+            None => add(&[0]),
+            Some(tensor) => {
+                add(&[1]);
+                let dtype = match tensor.dtype {
+                    DataType::Float32 => 1u8,
+                    DataType::Float16 => 2,
+                    DataType::BFloat16 => 3,
+                    other => panic!("unsupported perf digest dtype {other:?}"),
+                };
+                add(&[dtype]);
+                add(&(tensor.shape.len() as u64).to_le_bytes());
+                for &dim in &tensor.shape {
+                    add(&(dim as u64).to_le_bytes());
+                }
+                add(&(tensor.bytes.len() as u64).to_le_bytes());
+                add(&tensor.bytes);
+            }
+        }
+    }
+    digest
+}
+
+fn assert_perf_inputs_identical(left: &[Option<HostTensor>; 4], right: &[Option<HostTensor>; 4]) {
+    for (slot, (left, right)) in left.iter().zip(right).enumerate() {
+        match (left, right) {
+            (Some(left), Some(right)) => {
+                assert_eq!(left.dtype, right.dtype, "input {slot} dtype diverged");
+                assert_eq!(left.shape, right.shape, "input {slot} shape diverged");
+                assert_eq!(left.bytes, right.bytes, "input {slot} bytes diverged");
+            }
+            (None, None) => {}
+            _ => panic!("input {slot} presence diverged"),
+        }
+    }
+    assert_eq!(
+        perf_input_digest(left),
+        perf_input_digest(right),
+        "identical input bytes must have identical digests"
+    );
+}
+
+fn real_glm_perf_case(key_seq: usize, top_k: usize) -> Case {
+    Case {
+        batch: 1,
+        q_seq: 1,
+        heads: 32,
+        head_dim: 128,
+        key_seq,
+        top_k,
+        scale: (128.0f32).powf(-0.5),
+        weights_scale: Some((32.0f32).powf(-0.5)),
+    }
+}
+
+fn real_glm_perf_inputs(key_seq: usize) -> [Option<HostTensor>; 4] {
+    let shape = PerfInputShape::from(real_glm_perf_case(key_seq, 2048));
+    perf_inputs(shape, 0x2076_5eba ^ key_seq as u64, DataType::Float16)
+}
+
+#[test]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires the gpu-tests CUDA test inventory"
+)]
+fn real_glm_perf_controls_are_byte_identical_across_top_k() {
+    let _ep = require_cuda();
+    for key_seq in [2048usize, 8192] {
+        let real_case = real_glm_perf_case(key_seq, 2048);
+        let control_case = real_glm_perf_case(key_seq, 4);
+        let real_inputs = perf_inputs(
+            PerfInputShape::from(real_case),
+            0x2076_5eba ^ key_seq as u64,
+            DataType::Float16,
+        );
+        let control_inputs = perf_inputs(
+            PerfInputShape::from(control_case),
+            0x2076_5eba ^ key_seq as u64,
+            DataType::Float16,
+        );
+        assert_perf_inputs_identical(&real_inputs, &control_inputs);
+        eprintln!(
+            "T={key_seq} K=4/K=2048 input digest fnv1a64={:016x}",
+            perf_input_digest(&real_inputs)
+        );
+    }
 }
 
 /// Capture the single-node DsaIndexSelect graph, ramp the device for
@@ -1495,8 +1627,7 @@ fn bench_config(
     ep: &CudaExecutionProvider,
     label: &str,
     case: Case,
-    seed: u64,
-    dtype: DataType,
+    inputs: &[Option<HostTensor>; 4],
     ramp_secs: f32,
     batch: usize,
     repeats: usize,
@@ -1517,20 +1648,21 @@ fn bench_config(
     );
     reset_dsa_launch_stats();
     let setup_start = Instant::now();
-    let inputs = perf_inputs(case, seed, dtype);
-    let (graph, node, specs) = build_node(&inputs, case);
+    let input_digest = perf_input_digest(inputs);
+    let dtype = inputs[0].as_ref().expect("query input").dtype;
+    let (graph, node, specs) = build_node(inputs, case);
     let model = Model::new(&graph);
     let kernel = ep
-        .get_kernel(model.graph.node(node), &concrete_shapes(&inputs), 1)
+        .get_kernel(model.graph.node(node), &concrete_shapes(inputs), 1)
         .expect("CUDA DsaIndexSelect kernel");
     let runtime = ep.runtime();
 
-    let buffers = upload_inputs(ep, &inputs).expect("upload inputs");
+    let buffers = upload_inputs(ep, inputs).expect("upload inputs");
     let strides: Vec<_> = inputs
         .iter()
         .map(|slot| slot.as_ref().map(|t| compute_contiguous_strides(&t.shape)))
         .collect();
-    let views = input_views(&inputs, &buffers, &strides, ep);
+    let views = input_views(inputs, &buffers, &strides, ep);
 
     let out_strides: Vec<_> = specs
         .iter()
@@ -1702,7 +1834,8 @@ fn bench_config(
          kernel {kmed:9.2} us \
          (min {kmin:.2}, max {kmax:.2}) | host-enqueue {emed:6.3} us | scratch {} B | \
          batch={batch} n={repeats} | graph_nodes={graph_nodes} | setup={setup_ms:.2} ms | \
-         host-dispatches={}/{}/{} grids={}/{} | first/last={kernel_us_first:.2}/{kernel_us_last:.2} us",
+         host-dispatches={}/{}/{} grids={}/{} | input_digest={input_digest:016x} | \
+         samples={kernel_us:?} | first/last={kernel_us_first:.2}/{kernel_us_last:.2} us",
         case.batch,
         case.q_seq,
         case.heads,
@@ -1768,8 +1901,7 @@ fn measure_dsa_index_select_kernel_and_host_enqueue() {
         &ep,
         "tiny-decode (ramp)",
         tiny,
-        0x51ce_d5a0,
-        DataType::Float32,
+        &perf_inputs(PerfInputShape::from(tiny), 0x51ce_d5a0, DataType::Float32),
         8.0,
         512,
         7,
@@ -1778,8 +1910,7 @@ fn measure_dsa_index_select_kernel_and_host_enqueue() {
         &ep,
         "tiny-decode",
         tiny,
-        0x51ce_d5a0,
-        DataType::Float32,
+        &perf_inputs(PerfInputShape::from(tiny), 0x51ce_d5a0, DataType::Float32),
         1.0,
         512,
         7,
@@ -1788,8 +1919,11 @@ fn measure_dsa_index_select_kernel_and_host_enqueue() {
         &ep,
         "glm-prefill S=64 T=64",
         glm_prefill,
-        0x6c3f_2d11,
-        DataType::Float32,
+        &perf_inputs(
+            PerfInputShape::from(glm_prefill),
+            0x6c3f_2d11,
+            DataType::Float32,
+        ),
         1.0,
         256,
         7,
@@ -1798,8 +1932,11 @@ fn measure_dsa_index_select_kernel_and_host_enqueue() {
         &ep,
         "glm-decode S=1 T=512",
         glm_decode,
-        0x6c3f_2d12,
-        DataType::Float32,
+        &perf_inputs(
+            PerfInputShape::from(glm_decode),
+            0x6c3f_2d12,
+            DataType::Float32,
+        ),
         1.0,
         512,
         7,
@@ -1809,8 +1946,7 @@ fn measure_dsa_index_select_kernel_and_host_enqueue() {
         &ep,
         "tiny-decode (drift re-measure)",
         tiny,
-        0x51ce_d5a0,
-        DataType::Float32,
+        &perf_inputs(PerfInputShape::from(tiny), 0x51ce_d5a0, DataType::Float32),
         0.0,
         512,
         7,
@@ -1840,7 +1976,7 @@ fn measure_dsa_index_select_kernel_and_host_enqueue() {
     gpu_clock_witness("end");
 }
 
-#[ignore = "real GLM decode perf probe; set ONNX_GENAI_DSA_PERF_T=2048 or 8192 and run explicitly"]
+#[ignore = "real GLM paired perf probe; set T=2048/8192 and order=real-first/control-first"]
 #[test]
 fn measure_dsa_index_select_real_glm_decode() {
     let key_seq = std::env::var("ONNX_GENAI_DSA_PERF_T")
@@ -1851,66 +1987,68 @@ fn measure_dsa_index_select_real_glm_decode() {
         matches!(key_seq, 2048 | 8192),
         "real GLM perf probe only accepts T=2048 or T=8192"
     );
-    let top_k = std::env::var("ONNX_GENAI_DSA_PERF_TOP_K")
-        .map(|value| {
-            value
-                .parse::<usize>()
-                .expect("ONNX_GENAI_DSA_PERF_TOP_K must be an integer")
-        })
-        .unwrap_or(2048);
-    assert!(
-        matches!(top_k, 4 | 2048),
-        "perf probe accepts top_k=4 (remaining-cost control) or 2048 (real GLM)"
-    );
+    let control_first = match std::env::var("ONNX_GENAI_DSA_PERF_ORDER")
+        .unwrap_or_else(|_| "real-first".into())
+        .as_str()
+    {
+        "control-first" => true,
+        "real-first" => false,
+        other => panic!(
+            "ONNX_GENAI_DSA_PERF_ORDER must be 'real-first' or 'control-first', got {other:?}"
+        ),
+    };
     let ep = require_cuda();
     gpu_clock_witness("before setup");
-    let case = Case {
-        batch: 1,
-        q_seq: 1,
-        heads: 32,
-        head_dim: 128,
-        key_seq,
-        top_k,
-        scale: (128.0f32).powf(-0.5),
-        weights_scale: Some((32.0f32).powf(-0.5)),
+    let inputs = real_glm_perf_inputs(key_seq);
+    let digest = perf_input_digest(&inputs);
+    let order = if control_first {
+        [4usize, 2048]
+    } else {
+        [2048usize, 4]
     };
-    let result = bench_config(
-        &ep,
-        &format!("real-glm-T{key_seq}-K{top_k}"),
-        case,
-        0x2076_5eba ^ key_seq as u64 ^ top_k as u64,
-        DataType::Float16,
-        8.0,
-        4,
-        7,
-    );
-    let drift =
-        (result.kernel_us_last - result.kernel_us_first).abs() / result.kernel_us_first * 100.0;
-    assert_eq!(
-        result.graph_nodes, 2,
-        "production capture must contain separate parallel score and selection kernels"
-    );
-    assert_eq!(result.executions, 2, "warmup plus captured host execution");
-    assert_eq!(result.score_launches, 2);
-    assert_eq!(result.selection_launches, 2);
-    assert!(
-        result.score_grid_x > 1,
-        "real decode scoring must occupy multiple CTAs"
-    );
-    assert_eq!(result.selection_grid_x, 1);
     println!(
-        "real GLM T={key_seq} top_k={top_k}: captured graph nodes={}, score grid={}, \
-         selection grid={}, ordered-sample drift={drift:.2}%, fixed setup={:.2} ms, \
-         marginal device median={:.2} us, min/max={:.2}/{:.2} us, \
-         n=7 batches of 4, scratch={} B",
-        result.graph_nodes,
-        result.score_grid_x,
-        result.selection_grid_x,
-        result.setup_ms,
-        result.kernel_us_median,
-        result.kernel_us_min,
-        result.kernel_us_max,
-        result.workspace_bytes,
+        "paired real GLM control: T={key_seq}, order={order:?}, shared input digest fnv1a64={digest:016x}"
     );
+    for (index, top_k) in order.into_iter().enumerate() {
+        let case = real_glm_perf_case(key_seq, top_k);
+        let result = bench_config(
+            &ep,
+            &format!("real-glm-T{key_seq}-K{top_k}"),
+            case,
+            &inputs,
+            if index == 0 { 8.0 } else { 0.0 },
+            4,
+            7,
+        );
+        let drift =
+            (result.kernel_us_last - result.kernel_us_first).abs() / result.kernel_us_first * 100.0;
+        assert_eq!(
+            result.graph_nodes, 2,
+            "production capture must contain separate parallel score and selection kernels"
+        );
+        assert_eq!(result.executions, 2, "warmup plus captured host execution");
+        assert_eq!(result.score_launches, 2);
+        assert_eq!(result.selection_launches, 2);
+        assert!(
+            result.score_grid_x > 1,
+            "real decode scoring must occupy multiple CTAs"
+        );
+        assert_eq!(result.selection_grid_x, 1);
+        println!(
+            "real GLM T={key_seq} top_k={top_k}: input digest={digest:016x}, \
+             captured graph nodes={}, score grid={}, selection grid={}, \
+             ordered-sample drift={drift:.2}%, fixed setup={:.2} ms, \
+             marginal device median={:.2} us, min/max={:.2}/{:.2} us, \
+             n=7 batches of 4, scratch={} B",
+            result.graph_nodes,
+            result.score_grid_x,
+            result.selection_grid_x,
+            result.setup_ms,
+            result.kernel_us_median,
+            result.kernel_us_min,
+            result.kernel_us_max,
+            result.workspace_bytes,
+        );
+    }
     gpu_clock_witness("after measurement");
 }

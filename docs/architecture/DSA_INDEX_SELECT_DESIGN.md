@@ -29,17 +29,21 @@ function producing indices that `IndexShare` (which owns the KV I/O) consumes.
 The Mobius decomposition ends the indexer with `k = Min(key_length, index_topk)`
 — a **data-dependent** TopK width read from a device tensor every decode step. A
 CUDA graph cannot capture a kernel whose output width is a run-time value, so the
-decomposed indexer is capture-hostile. `DsaIndexSelect` fuses scoring + mask +
-top-k + ascending sort into one kernel with a **stable output width** (always
-`top_k`), right-padding short rows with the `-1` sentinel `IndexShare` already
-understands. Stable width ⇒ CUDA-graph capture/replay safe.
+decomposed indexer is capture-hostile. `DsaIndexSelect` implements scoring +
+mask + top-k + ascending sort as one operator with a **stable output width**
+(always `top_k`), right-padding short rows with the `-1` sentinel `IndexShare`
+already understands. The CUDA implementation records a fixed two-kernel
+pipeline into the graph. Stable width and stable kernel-owned scratch make
+capture/replay safe.
 
 ## Boundary and schema
 
 `DsaIndexSelect` computes only the index selection. Projections (`wq_b`, `wk`,
 `weights_proj`), norms and RoPE stay as separate generic native ops upstream; the
-scoring MatMul is fused *inside* this op so the `(B, S, H, T)` scores and
-`(B, S, T)` weighted tensors are never materialized.
+scoring MatMul is fused *inside* this op so the `(B, S, H, T)` per-head scores
+are never materialized. CUDA stores only the final masked scalar score and an
+allowed byte per `(B,S,T)` cell in private persistent scratch between its two
+kernels; neither tensor crosses the operator boundary.
 
 ### Inputs
 
@@ -82,15 +86,25 @@ dot(h, t)   = Σ_d query[b,s,h,d] · key[b,t,d]
 score(h, t) = relu(scale · dot(h, t))
 weighted(t) = Σ_h score(h, t) · (weights[b,s,h] · weights_scale)
 masked(t)   = weighted(t) + attention_bias[b,0,s,t]
+ordered(t)  = canonicalize_nan(masked(t))
 ```
 
 A position `t` is **allowed** iff `attention_bias[b,0,s,t] > -1e30` (both `-inf`
 and `finfo.min ≈ -3.4e38` causal fills, and `NaN`, count as *not allowed*).
 Select the top `min(#allowed, top_k)` allowed positions by
-`(masked(t) descending, t ascending)`, sort them **ascending by `t`**, and
+`(ordered(t) descending, t ascending)`, sort them **ascending by `t`**, and
 right-pad with `-1` to width `top_k`. A row with zero allowed positions yields an
 all-`-1` row (the caller's causal construction guarantees at least the self
 position; `IndexShare` rejects all-`-1` rows if that guarantee is violated).
+
+`canonicalize_nan` runs after the final additive score and before ranking. Every
+NaN becomes the positive quiet-NaN bit pattern `0x7fc00000`. This is the
+canonical v1 contract, not an implementation detail: finite overflow such as
+`infinity * 0` may otherwise produce backend-dependent signs/payloads. CPU and
+CUDA then apply the same Rust `f32::total_cmp` order, descending by score and
+ascending by index. The overflow regression produces NaNs non-vacuously and
+selects `[0, 2]` for f32/f16/bf16 native execution and f32/f16 through the real
+CUDA plugin.
 
 ### Equivalence to the decomposed path
 
@@ -104,9 +118,9 @@ scores always outrank `-inf`, so the top-`k` finite sets coincide.
 
 ### Tie-breaking
 
-Among equal scores, the **lower position index** wins. This mirrors ONNX Runtime
-`TopK` (`total_cmp` order, ties by index) and is a hard part of the op contract:
-the CPU oracle and the CUDA kernel must agree bit-for-bit on ties.
+Among equal canonical total-order keys, the **lower position index** wins. This
+mirrors ONNX Runtime `TopK` (`total_cmp` order, ties by index) and is a hard part
+of the op contract: CPU and CUDA must agree bit-for-bit on ties and NaNs.
 
 ## Claim-time contract
 
@@ -158,56 +172,75 @@ run-time index-validation step here — that lives in the consuming `IndexShare`
   single `DsaIndexSelect` node is a Mobius export change gated behind runtime
   approval and is **not** part of this runtime slice.
 
-## CUDA slice — landed (native NVRTC kernel)
+## CUDA implementation — parallel score + radix selection
 
-The CUDA NVRTC kernel `dsa_index_select_row` reproduces the frozen semantics
-above **bit-for-bit** against the CPU oracle (integer `selected_indices`, so
-parity is byte-exact, not tolerance-based). Design as landed:
+The native/plugin CUDA path uses two NVRTC kernels, both captured as graph nodes.
+Integer output parity with the CPU oracle is byte-exact.
 
-- **One launch, grid-stride rows.** Each block walks `(b, s)` rows by
-  `gridDim.x`, whose launch bound is capped by the device's reported maximum
-  grid X. Every accepted row therefore executes even when `B·S` exceeds that
-  bound. Phase 1 computes the head-weighted
-  ReLU'd scaled score for every allowed key in parallel (threads widen f16/bf16
-  storage to f32 with `__half2float` / `__bfloat162float`, matching the CPU
-  oracle's `half::to_f32`, so scores are identical). Phase 2 runs the
-  deterministic keep-round argmax on the lead thread using an integer
-  `total_order_key` transform that reproduces Rust `f32::total_cmp` exactly
-  (score desc, index asc), then emits the kept indices ascending and right-pads
-  with the `-1` sentinel.
-- **Un-fused reduction for exact rounding parity.** The score reduction uses
-  `__fmul_rn` / `__fadd_rn` for the `dot += q·k` and `weighted += scored·wprod`
-  accumulations so every multiply-add stays separately rounded. NVRTC compiles
-  with the NVCC default `--fmad=true`, which would otherwise contract those
-  `a + b·c` patterns into single-rounding `fma.rn.f32` and diverge from the
-  CPU oracle's non-FMA order by a few ULPs — enough to flip an integer top-k
-  selection at a cutoff tie. This matches the sibling `CompressedSparseAttention`
-  kernel's convention. Single-operand sites (`scale·dot`, `weights·weights_scale`,
-  `weighted + bias`) have no fusible partner and already match CPU rounding.
-- **Fixed scratch, no page allocation.** The only device memory the op adds is a
-  `B·S·T` f32 `scores` buffer plus a `B·S·T` u8 `state` buffer in the
-  kernel-owned persistent slot (256-aligned, overwritten fresh each call). The
-  slot grows only outside capture, is shared by the native and ORT-plugin paths,
-  and is released with the compiled kernel/session. The kernel declares no
-  external workspace, so the plugin never downgrades persistent storage to
-  ORT's recycled step scratch. `onnx-genai-kv` remains the sole
-  page/slot/lifetime authority — the op allocates and owns no pages.
-- **Capture-safe.** The kernel produces indices (no index *input* to validate),
-  so there is **no D2H and no host sync on the capturing path**.
-  `warmed` flips true only after a non-capturing eager pass has NVRTC-compiled
-  the kernel and sized the workspace; `capture_support()` reports `Supported`
-  only once warmed, so a captured region performs no host alloc / sync / compile.
-- **Single v1 schema.** `pkg.nxrt::DsaIndexSelect` has one registered schema
-  with `since_version = 1`. Normal ONNX resolution therefore maps domain imports
-  1, 2, and later to that v1 schema until a newer schema is actually registered;
-  opset 0 has no match. Native dispatch selects the highest registered
-  `since_version <= import`, while ORT gives plugin shape inference the resolved
-  schema version from `Node_GetSinceVersion`. The CUDA plugin contributes the
-  `pkg.nxrt` schema needed for a real ORT session. Shape/dtype validation delegates to the shared CPU
-  `unsupported_reason`, first projecting the query/key/weights float dtypes to f32
-  (CUDA supports f16/bf16 storage) while leaving `attention_bias` untouched, so
-  the oracle's strict f32-only bias reject still fires. Quantized cache modes,
-  head_sink, and q/k norm are out of this subset and typed-reject.
+### Kernel 1: parallel `(row, T)` scoring
+
+`dsa_index_select_score` flattens all `B·S·T` score cells. It launches 256-thread
+blocks with `ceil(B·S·T/256)` CTAs, capped by the device maximum grid X, and
+grid-strides over any remaining cells. A realistic single decode row therefore
+uses 8 score CTAs at T=2048 and 32 at T=8192 instead of leaving one CTA to do the
+whole row.
+
+One thread owns one `(b,s,t)` cell and loops over `H` then `D`. f16/bf16 storage
+is widened with `__half2float` / `__bfloat162float`. `__fmul_rn` and
+`__fadd_rn` preserve the CPU oracle's separate-rounding, ascending-D then
+ascending-H accumulation order rather than allowing FMA contraction. The thread
+writes the canonicalized final f32 score plus one u8 allowed flag. Disallowed
+cells receive `-inf` and allowed=0.
+
+### Kernel 2: 32-pass radix threshold and stable compaction
+
+`dsa_index_select_select` launches one 256-thread block per row, capped and
+grid-strided over `B·S`. It first fills the fixed-width output with `-1`. Each
+thread owns a contiguous index interval, which is essential for deterministic
+lower-index tie selection and ascending output compaction.
+
+For each row the block:
+
+1. counts allowed cells and sets `keep = min(allowed_count, top_k)`;
+2. performs exactly **32** most-significant-bit-first radix count passes over
+   the unsigned transform of Rust's signed `f32::total_cmp` key;
+3. obtains the exact kth descending threshold key;
+4. counts keys greater than and equal to the threshold;
+5. assigns the required threshold ties to the lowest source indices; and
+6. uses block scans over the contiguous thread chunks to compact every winner
+   in stable ascending index order.
+
+No thread performs a `top_k`-length sequence of full-T scans. Aggregate work is
+`O(B·S·T·H·D)` for scoring plus `O(32·B·S·T)` for selection; parallel depth per
+row is approximately `O(H·D + 32·T/256 + T/256)`. Output initialization adds
+`O(B·S·top_k/256)`. The launch structure is always two kernels after warmup.
+
+### Workspace, capture, and lifetime
+
+The kernel owns persistent device scratch: one f32 score and one u8 allowed flag
+per cell, with each segment and the total allocation aligned to 256 bytes. For
+the measured decode shapes this is 10,240 B at T=2048 and 40,960 B at T=8192.
+The slot grows only outside capture; growth drains prior users before replacing
+the allocation. It is shared by native and ORT-plugin execution, stays
+pointer-stable through warmup/capture/replay, and is released with the compiled
+kernel/session (teardown evidence: 0 B live). The kernel declares no external
+workspace, allocates no KV pages, and does not compete with `onnx-genai-kv` for
+page/slot/lifetime authority.
+
+There is no D2H, stream synchronization, allocation, free, or NVRTC compilation
+on the captured path. `capture_support()` remains unsupported until one eager
+execution has compiled both kernels and sized the fixed-shape persistent slot.
+Capture then contains exactly two graph nodes and replay changes only device
+buffer contents.
+
+### Schema and capability
+
+`pkg.nxrt::DsaIndexSelect` has one schema with `since_version = 1`; imports 1,
+2, and later resolve to that sole v1 registration until a newer schema exists,
+while import 0 rejects. Native and plugin capability validation delegates to the
+shared CPU contract. CUDA projects only query/key/weights f16/bf16 metadata to
+f32 for that structural validation and leaves `attention_bias` untouched, so
+the strict f32 bias contract remains enforced.
 
 ### Consumer-boundary decision (why no extra glue op)
 
@@ -221,24 +254,41 @@ slice asked about already exists and is unchanged. This keeps the one-authority
 invariant intact (indices are data flowing between two ops; neither allocates KV
 pages).
 
-### A100 measurement (tiny + real GLM indexer dims)
+### A100 measurement — real GLM indexer dimensions
 
-Idle A100-80GB, pinned device, 8 s clock ramp (device 210 MHz → 1410 MHz across
-the run), CUDA events over batched captured-graph launches for device time and a
-drained small-batch wall-clock for pure host-enqueue, medians of n = 7 with
-first-vs-last drift re-measure. **No full-size tok/s claim — tiny correctness is
-the gate; this is a per-launch kernel-cost witness only.**
+Validated 2026-08-27 on physical GPU 7, A100-SXM4-80GB, UUID
+`GPU-ef3c1a70-d297-933c-0c37-dbaad2136a57`, with an idle witness before every
+process (0 MiB, 0%, 210 MHz and empty `nvidia-smi pmon`). Each counter-ordered
+process ran an 8 s continuous captured-replay ramp, held 1410 MHz at 100%
+utilization (~95.4–95.8 W for T=2048; ~103.4–103.9 W for T=8192), and timed
+seven batches of four graph replays with CUDA events. Host-enqueue was measured
+separately over drained small batches and is not the performance claim.
 
-| Geometry (B,S,H,D,T,top_k) | device (µs) | host-enqueue (µs) | scratch (B) |
-| --- | --- | --- | --- |
-| tiny-decode (1,1,2,8,16,4)   | 7.6  | 2.2 | 512   |
-| glm-prefill (1,64,2,8,64,4)  | 18.4 | 2.2 | 20480 |
-| glm-decode  (1,1,2,8,512,4)  | 119  | 2.2 | 2560  |
+The fixture input type excludes `top_k`; K=4 and K=2048 share the exact same
+query/key/weights/bias bytes. A host-side regression, run after the CUDA suite's
+fail-loud device gate, asserts all four tensors byte-for-byte. The release probe
+prints stable FNV-1a identity digests:
 
-Host-enqueue for a captured-graph launch is a flat ~2.2 µs independent of kernel
-size (device time and submit cost are cleanly separated). First-vs-last drift on
-the tiny geometry was **0.5 %**, and the min/max spread within each config was
-under 0.5 %, so the device held still. Scratch VRAM is exactly `B·S·T·5` bytes,
-confirming no page allocation. The wide-`T` decode row (T=512) is dominated by
-the single-threaded Phase-2 selection (`O(keep·T)`); parallelizing it is future
-perf work and is out of scope for this correctness slice (no full-size claim).
+- T=2048: `9b0c18ee6979f3a7`
+- T=8192: `92e37c6e547702b8`
+
+| T | K | K=2048→4 process median (min–max), µs | K=4→2048 process median (min–max), µs | pooled n=14 median (min–max), µs |
+| ---: | ---: | ---: | ---: | ---: |
+| 2048 | 2048 | 853.76 (852.74–856.83) | 860.42 (858.88–862.21) | 857.86 (852.74–862.21) |
+| 2048 | 4 | 857.09 (856.83–857.86) | 851.46 (850.43–853.50) | 855.17 (850.43–857.86) |
+| 8192 | 2048 | 1089.79 (1088.51–1091.07) | 1096.70 (1096.45–1098.50) | 1093.76 (1088.51–1098.50) |
+| 8192 | 4 | 1095.68 (1093.12–1099.01) | 1088.77 (1087.74–1091.58) | 1092.35 (1087.74–1099.01) |
+
+The pooled K=2048 overhead versus byte-identical K=4 is **0.31% at T=2048**
+and **0.13% at T=8192**, smaller than the 0.87–1.10% pooled min/max spreads.
+This falsifies a hidden `top_k·T` scan; cost is parallel scoring plus the fixed
+32-pass radix pipeline. Ordered first/last drift within individual configs was
+0.00–0.40%.
+
+For historical comparison, the exact serial head `e69e21ea9` measured
+147,456.25 µs (147,446.28–147,476.23) at T=2048 and 593,648.62 µs
+(593,475.12–593,678.56) at T=8192 under the same captured CUDA-event protocol
+(PR #2076 evidence comment `5434343333`). Against the pooled parallel medians,
+the current implementation is **171.89x** and **542.76x** faster respectively.
+The T=8192 operator-only ceiling is about **914 calls/s**. These are per-operator
+device-time results, not wall-clock or full-model tok/s claims.
