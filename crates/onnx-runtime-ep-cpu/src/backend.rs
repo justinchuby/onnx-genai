@@ -403,4 +403,41 @@ mod tests {
             }
         }
     }
+
+    /// The anti-vacuity guard for the env plumbing itself, mirroring
+    /// `core_topology`'s `placement_capabilities_are_present_when_the_lane_requires_them`.
+    ///
+    /// The five tests above drive [`simd_x86_or_fail_closed`] with hard-coded
+    /// booleans, which proves the *policy* but not that anything reads the
+    /// variable CI sets. Make [`simd_x86_tests_required`] return `false`
+    /// unconditionally and the whole guard reverts to fail-open -- and no test
+    /// above notices, because they pass `required` explicitly, while the green
+    /// lane never reaches the fail-closed branch on a host that has AVX2. That
+    /// is this PR's own defect class re-entering through its own plumbing, so
+    /// it gets a named test rather than transitive coverage through eleven
+    /// differential tests in another module.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    fn simd_capabilities_are_present_when_the_lane_requires_them() {
+        if !simd_x86_tests_required() {
+            eprintln!(
+                "{REQUIRE_SIMD_X86_ENV} is unset, so AVX2 is not required here; the differential \
+                 tests in kernels::matmul::x86_sgemm may be skipping"
+            );
+            return;
+        }
+        assert!(
+            detected_simd_x86(),
+            "{REQUIRE_SIMD_X86_ENV}=1 but CPUID reports no AVX2+FMA on this runner, so every \
+             AVX2 differential test in this crate would skip. Point this lane at an AVX2 runner \
+             or stop requiring the SIMD tests on it."
+        );
+        assert!(
+            !forced_no_simd_x86(),
+            "{REQUIRE_SIMD_X86_ENV}=1 but {FORCE_NO_SIMD_X86_ENV}=1 is set in this lane's \
+             environment, which switches the AVX2 path off and would skip every differential \
+             test that requires it. These two settings are a contradiction."
+        );
+        assert!(require_simd_x86("this self-check"));
+    }
 }
