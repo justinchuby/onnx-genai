@@ -29,6 +29,15 @@ enum Num {
 }
 
 impl Num {
+    fn to_f32(self) -> f32 {
+        match self {
+            // Converting through f64 can double-round large unsigned values.
+            // Keep this direct to match ONNX Runtime's Cast implementation.
+            Num::U(u) => u as f32,
+            _ => self.to_f64() as f32,
+        }
+    }
+
     fn to_f64(self) -> f64 {
         match self {
             Num::F(f) => f,
@@ -254,7 +263,7 @@ impl_lane!(
     lane::F32,
     4,
     |b| Num::F(f32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64),
-    |n, o| o.copy_from_slice(&(n.to_f64() as f32).to_le_bytes())
+    |n, o| o.copy_from_slice(&n.to_f32().to_le_bytes())
 );
 impl_lane!(
     lane::F64,
@@ -628,7 +637,7 @@ fn decode(dtype: DataType, buf: &[u8; 8]) -> Result<Num> {
 /// Append the little-endian bytes of `n` converted to `dtype`.
 fn write_num(out: &mut Vec<u8>, n: Num, dtype: DataType) -> Result<()> {
     match dtype {
-        DataType::Float32 => out.extend_from_slice(&(n.to_f64() as f32).to_le_bytes()),
+        DataType::Float32 => out.extend_from_slice(&n.to_f32().to_le_bytes()),
         DataType::Float64 => out.extend_from_slice(&n.to_f64().to_le_bytes()),
         DataType::Float16 => {
             out.extend_from_slice(&half::f16::from_f32(n.to_f64() as f32).to_le_bytes())
@@ -688,6 +697,45 @@ mod tests {
         let mut out = Owned::zeros(DataType::Float32, &[3]);
         cast(DataType::Float32, &a, &mut out);
         assert_eq!(out.to_f32(), vec![0.0, 7.0, -13.0]);
+    }
+
+    #[test]
+    fn uint64_to_f32_avoids_double_rounding_for_contiguous_and_strided_inputs() {
+        // ONNX Runtime opset-19 returns 0x5f000001 for this exact boundary
+        // value. An f64 intermediate instead rounds to 0x5f000000.
+        let value = 9_223_372_586_610_589_697_u64;
+        let ort_bits = 0x5f00_0001;
+        assert_eq!((value as f32).to_bits(), ort_bits);
+        assert_ne!(((value as f64) as f32).to_bits(), ort_bits);
+
+        let contiguous = Owned {
+            bytes: value.to_le_bytes().to_vec(),
+            shape: vec![1],
+            strides: vec![1],
+            dtype: DataType::Uint64,
+        };
+        let mut contiguous_out = Owned::zeros(DataType::Float32, &[1]);
+        cast(DataType::Float32, &contiguous, &mut contiguous_out);
+        assert_eq!(contiguous_out.to_f32()[0].to_bits(), ort_bits);
+
+        let mut strided = Owned {
+            bytes: vec![0; 3 * size_of::<u64>()],
+            shape: vec![2],
+            strides: vec![2],
+            dtype: DataType::Uint64,
+        };
+        strided.bytes[..8].copy_from_slice(&value.to_le_bytes());
+        strided.bytes[16..24].copy_from_slice(&value.to_le_bytes());
+        let mut strided_out = Owned::zeros(DataType::Float32, &[2]);
+        cast(DataType::Float32, &strided, &mut strided_out);
+        assert_eq!(
+            strided_out
+                .to_f32()
+                .into_iter()
+                .map(f32::to_bits)
+                .collect::<Vec<_>>(),
+            vec![ort_bits; 2]
+        );
     }
 
     #[test]

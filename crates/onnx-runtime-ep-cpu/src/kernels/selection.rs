@@ -7,7 +7,7 @@ use onnx_runtime_ep_api::{
 use onnx_runtime_ir::{DataType, Node};
 
 use super::add::require_same_dtype;
-use super::{check_arity, to_dense_f32, to_dense_i64, write_dense_bytes};
+use super::{check_arity, contiguous_f32_slice, to_dense_f32, to_dense_i64, write_dense_bytes};
 use crate::dispatch_arith;
 use crate::dtype::{
     NumericElem, to_dense, to_dense_bool, to_dense_f32_widen, write_dense, write_dense_f32_narrow,
@@ -291,6 +291,9 @@ impl Kernel for ArgKernel {
                 "{name}: output must be Int64"
             )));
         }
+        if arg_reduce_contiguous_f32(self, name, &inputs[0], &mut outputs[0])? {
+            return Ok(());
+        }
         dispatch_arith!(inputs[0].dtype, name, T => {
             arg_reduce::<T>(self, name, &inputs[0], &mut outputs[0])
         })
@@ -307,6 +310,34 @@ fn arg_reduce<T: NumericElem + PartialOrd + PartialEq>(
     output: &mut TensorMut,
 ) -> Result<()> {
     let x = to_dense::<T>(input)?;
+    arg_reduce_values(kernel, name, input, output, &x)
+}
+
+/// Reduce a contiguous Float32 tensor without materializing the logits.
+fn arg_reduce_contiguous_f32(
+    kernel: &ArgKernel,
+    name: &str,
+    input: &TensorView,
+    output: &mut TensorMut,
+) -> Result<bool> {
+    if input.dtype != DataType::Float32
+        || !input.device.is_host_accessible()
+        || !input.is_contiguous()
+    {
+        return Ok(false);
+    }
+    let x = contiguous_f32_slice(input)?;
+    arg_reduce_values(kernel, name, input, output, x)?;
+    Ok(true)
+}
+
+fn arg_reduce_values<T: Copy + PartialOrd + PartialEq>(
+    kernel: &ArgKernel,
+    name: &str,
+    input: &TensorView,
+    output: &mut TensorMut,
+    x: &[T],
+) -> Result<()> {
     let axis = axis(name, kernel.axis, input.shape.len())?;
     let width = input.shape[axis];
     if width == 0 {
@@ -1002,6 +1033,24 @@ mod tests {
     }
 
     #[test]
+    fn argmax_contiguous_f32_borrows_logits() {
+        let x = Owned::f32(&[2, 3], &[1., 4., 2., 5., 0., 3.]);
+        let mut y = Owned::zeros(DataType::Int64, &[2]);
+        let kernel = ArgKernel {
+            op: ArgOp::Max,
+            axis: -1,
+            keepdims: false,
+            select_last_index: false,
+        };
+
+        assert!(
+            arg_reduce_contiguous_f32(&kernel, "ArgMax", &x.view(), &mut y.view_mut()).unwrap(),
+            "contiguous Float32 logits must use the borrowed-slice path"
+        );
+        assert_eq!(y.to_i64(), vec![1, 0]);
+    }
+
+    #[test]
     fn argmax_accepts_int64_token_sampler_logits() {
         let x = Owned::i64(&[2, 3], &[1, 4, 4, 3, 2, 1]);
         let mut y = Owned::zeros(DataType::Int64, &[2]);
@@ -1014,6 +1063,24 @@ mod tests {
         .execute(&[x.view()], &mut [y.view_mut()])
         .unwrap();
         assert_eq!(y.to_i64(), vec![2, 0]);
+    }
+
+    #[test]
+    fn argmin_strided_int64_preserves_logical_layout() {
+        // Strides [1, 2] transpose the physical [1, 5, 4, 0, 2, 3] storage
+        // into logical rows [1, 4, 2] and [5, 0, 3].
+        let mut x = Owned::i64(&[2, 3], &[1, 5, 4, 0, 2, 3]);
+        x.strides = vec![1, 2];
+        let mut y = Owned::zeros(DataType::Int64, &[2]);
+        ArgKernel {
+            op: ArgOp::Min,
+            axis: -1,
+            keepdims: false,
+            select_last_index: false,
+        }
+        .execute(&[x.view()], &mut [y.view_mut()])
+        .unwrap();
+        assert_eq!(y.to_i64(), vec![0, 1]);
     }
 
     #[test]
