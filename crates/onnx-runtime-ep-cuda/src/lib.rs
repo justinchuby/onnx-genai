@@ -133,6 +133,18 @@ pub use kernels::kv_cache_capacity_append::KV_CAPACITY_APPEND_CAPTURE_ERROR_POSI
 pub use kernels::non_max_suppression::{
     NmsExecutionStats, nms_execution_stats, reset_nms_execution_stats,
 };
+pub use kernels::planar_block_decode::{
+    AdmittedPlanarLinear, PLANAR_FORMAT_BLOCK_FP8, PLANAR_FORMAT_FP4_PLANAR, PlanarActivationDtype,
+    PlanarLinearDims, PlanarTensorLengths, admit_planar_linear, launch_planar_linear,
+    planar_matmul_capable_formats, warm_planar_linear,
+};
+#[cfg(any(test, feature = "gpu-tests"))]
+pub use kernels::planar_block_moe::planar_moe_source_build_count;
+pub use kernels::planar_block_moe::{
+    AdmittedPlanarMoe, PlanarMoeBank, PlanarMoeBufferLengths, PlanarMoeBuffers, PlanarMoeDims,
+    PlanarMoeProjection, admit_planar_moe, launch_planar_moe, planar_moe_capable_formats,
+    warm_planar_moe,
+};
 pub use kernels::reduce::REDUCE_CAPTURE_ERROR_AXES;
 pub use kernels::stft::{StftExecutionStats, stft_last_execution_stats};
 pub use kernels::unique::{

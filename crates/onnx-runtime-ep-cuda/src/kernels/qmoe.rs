@@ -15,6 +15,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use cudarc::driver::sys::CUdeviceptr;
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
+use onnx_runtime_ep_cpu::kernels::moe::{
+    Activation, DEFAULT_SWIGLU_LIMIT, validate_moe_activation_attributes,
+};
 use onnx_runtime_ir::{DataType, Node};
 
 use crate::error::driver_err;
@@ -1040,46 +1043,6 @@ fn linear_module_source(layout: QuantLayout) -> (&'static str, &'static str) {
     (module, source)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Activation {
-    Relu,
-    Gelu,
-    Silu,
-    Swiglu,
-    Identity,
-}
-
-impl Activation {
-    fn parse(node: &Node) -> Result<Self> {
-        let name = match node.attr("activation_type") {
-            Some(value) => value
-                .as_str()
-                .ok_or_else(|| error("attribute activation_type must be a string"))?,
-            None => "relu",
-        };
-        match name {
-            "relu" => Ok(Self::Relu),
-            "gelu" => Ok(Self::Gelu),
-            "silu" => Ok(Self::Silu),
-            "swiglu" => Ok(Self::Swiglu),
-            "identity" => Ok(Self::Identity),
-            other => Err(error(format!(
-                "unsupported activation_type '{other}' (supported: relu, gelu, silu, swiglu, identity)"
-            ))),
-        }
-    }
-
-    fn kernel_id(self) -> i32 {
-        match self {
-            Self::Relu => 0,
-            Self::Gelu => 1,
-            Self::Silu => 2,
-            Self::Swiglu => 3,
-            Self::Identity => 4,
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug)]
 struct MoeAttributes {
     k: usize,
@@ -1098,7 +1061,12 @@ impl MoeAttributes {
         if k <= 0 {
             return Err(error(format!("k must be > 0, got {k}")));
         }
-        let activation = Activation::parse(node)?;
+        let activation_name = match node.attr("activation_type") {
+            Some(value) => value
+                .as_str()
+                .ok_or_else(|| error("attribute activation_type must be a string"))?,
+            None => "relu",
+        };
         let prefill_min_tokens = int_attr(node, "prefill_min_tokens", 2)?;
         if prefill_min_tokens < 2 {
             return Err(error(format!(
@@ -1112,43 +1080,27 @@ impl MoeAttributes {
             ));
         }
         let swiglu_fusion = int_attr(node, "swiglu_fusion", 0)?;
-        if !(0..=2).contains(&swiglu_fusion) {
-            return Err(error(format!(
-                "swiglu_fusion must be 0, 1, or 2, got {swiglu_fusion}"
-            )));
-        }
-        if activation != Activation::Swiglu && swiglu_fusion != 0 {
-            return Err(error(
-                "swiglu_fusion is only valid when activation_type='swiglu'",
-            ));
-        }
         let activation_alpha = float_attr(node, "activation_alpha", 1.0)?;
         let activation_beta = float_attr(node, "activation_beta", 0.0)?;
-        let swiglu_limit = float_attr(node, "swiglu_limit", f32::INFINITY)?;
-        for (name, value) in [
-            ("activation_alpha", activation_alpha),
-            ("activation_beta", activation_beta),
-            ("swiglu_limit", swiglu_limit),
-        ] {
-            if value.is_nan() {
-                return Err(error(format!("attribute {name} must not be NaN")));
-            }
-        }
-        if swiglu_limit <= 0.0 {
-            return Err(error(format!(
-                "swiglu_limit must be positive, got {swiglu_limit}"
-            )));
-        }
+        let swiglu_limit = float_attr(node, "swiglu_limit", DEFAULT_SWIGLU_LIMIT)?;
+        let activation_attributes = validate_moe_activation_attributes(
+            activation_name,
+            swiglu_fusion,
+            activation_alpha,
+            activation_beta,
+            swiglu_limit,
+        )
+        .map_err(error)?;
         Ok(Self {
             k: usize::try_from(k).map_err(|_| error("k exceeds usize limits"))?,
             prefill_min_tokens: usize::try_from(prefill_min_tokens)
                 .map_err(|_| error("prefill_min_tokens exceeds usize limits"))?,
-            activation,
+            activation: activation_attributes.activation,
             normalize_routing_weights,
-            swiglu_fusion: swiglu_fusion as usize,
-            activation_alpha,
-            activation_beta,
-            swiglu_limit,
+            swiglu_fusion: activation_attributes.swiglu_fusion,
+            activation_alpha: activation_attributes.activation_alpha,
+            activation_beta: activation_attributes.activation_beta,
+            swiglu_limit: activation_attributes.swiglu_limit,
         })
     }
 
@@ -1341,6 +1293,9 @@ pub(crate) fn unsupported_reason(node: &Node) -> Option<Cow<'static, str>> {
                 "QMoE: quant_type must be the string 'int' for CUDA integer-affine expert weights",
             ));
         }
+    }
+    if let Err(reason) = MoeAttributes::from_node(node) {
+        return Some(Cow::Owned(reason.to_string()));
     }
     None
 }
@@ -3251,6 +3206,40 @@ mod tests {
             )]))
             .unwrap();
             assert!(attrs.activation.kernel_id() >= 0);
+        }
+    }
+
+    #[test]
+    fn invalid_activation_attributes_decline_before_factory_creation() {
+        for (name, value) in [
+            ("activation_alpha", f32::NAN),
+            ("activation_alpha", f32::INFINITY),
+            ("activation_alpha", f32::NEG_INFINITY),
+            ("activation_beta", f32::NAN),
+            ("activation_beta", f32::INFINITY),
+            ("activation_beta", f32::NEG_INFINITY),
+            ("swiglu_limit", f32::NAN),
+            ("swiglu_limit", f32::INFINITY),
+            ("swiglu_limit", f32::NEG_INFINITY),
+            ("swiglu_limit", 0.0),
+            ("swiglu_limit", -1.0),
+        ] {
+            let invalid = node(&[
+                ("expert_weight_bits", Attribute::Int(4)),
+                ("block_size", Attribute::Int(16)),
+                ("activation_type", Attribute::String(b"swiglu".to_vec())),
+                ("swiglu_fusion", Attribute::Int(1)),
+                (name, Attribute::Float(value)),
+            ]);
+            let reason = unsupported_reason(&invalid)
+                .unwrap_or_else(|| panic!("{name}={value} must be declined at claim time"));
+            assert!(reason.contains(name), "unexpected claim reason: {reason}");
+            let error = MoeAttributes::from_node(&invalid)
+                .expect_err("the same attribute must fail factory/create parsing");
+            assert!(
+                error.to_string().contains(name),
+                "unexpected create error: {error}"
+            );
         }
     }
 
