@@ -182,32 +182,59 @@ cargo run -q -p onnx-genai-metadata --bin validate_metadata -- MODEL_DIR
 ```
 
 The second command is package validation, not execution. The live audit in this
-report did not run generation. The CLI applies the package's chat template to a
-plain prompt by default. Use that default for ordinary user text. The recorded
-request below is already fully formatted ChatML, so `--raw` is required to send
-it verbatim and avoid applying the chat template a second time. In a separate
-earlier check, Pris independently executed CPU ORT for the Qwen `1eabeec...`
-package using onnx-genai `0.1.0-dev.5`. The recorded positional CLI syntax was:
+report did not run generation. The verified hosted instructions are fixed at
+the Qwen model card's
+[README correction revision](https://huggingface.co/justinchuby/qwen2.5-0.5b-instruct-onnx-genai/commit/e5cc13d7232bfe2b49a9df4ef13ce60714170106).
+The CLI takes a downloaded local package directory after `generate` and the
+prompt as its final positional argument. `--prompt` (and `-p`) is obsolete.
+For this Qwen package's ChatML template, omit `--raw` for unformatted prompts;
+use `--raw` only when the caller has already formatted this package's complete
+request as ChatML. Raw formatted text bypasses this package's template and its
+system/user role separation, so it should not be used where that separation
+matters. Revision pinning makes the downloaded contents reproducible, not
+trusted or safe by itself; review and trust model packages before running them.
+
+With onnx-genai source
+[`3dabd2c0`](https://github.com/justinchuby/onnx-genai/commit/3dabd2c0c2066183407c6bd98372e18e59c9571a)
+(workspace version `0.1.0-dev.5`), a fresh download of Qwen revision
+`1eabeec267303a75170ae1b43acf59cb01b47a63` and this public command shape
+produced a coherent, non-empty response on CPU ORT without a
+`missing from input feed` error:
 
 ```bash
-cargo build --release -p onnx-genai-cli
-./target/release/onnx-genai generate MODEL_DIR \
-  --max-new-tokens 40 \
+hf download justinchuby/qwen2.5-0.5b-instruct-onnx-genai \
+  --revision 1eabeec267303a75170ae1b43acf59cb01b47a63 \
+  --local-dir ./qwen2.5-0.5b-instruct-onnx-genai
+
+ONNX_GENAI_EP=cpu ONNX_GENAI_KV_MAX_LEN=128 \
+onnx-genai generate ./qwen2.5-0.5b-instruct-onnx-genai \
+  --backend ort \
+  --max-new-tokens 16 \
+  --temperature 0 \
   --stop '<|im_end|>' \
-  --raw \
-  '<|im_start|>system
-You are a helpful assistant.<|im_end|>
-<|im_start|>user
-What is 2+2? Answer briefly.<|im_end|>
-<|im_start|>assistant
-'
+  'Hello! In one sentence, what is Rust?'
 ```
 
-`--model` and `--prompt` are stale syntax. Static evidence agrees with Pris:
+Native was not available and was not tested; this is CPU-ORT evidence only.
+The current-package CLI smoke above is known-tested only on onnx-genai source
+`3dabd2c0` (workspace version `0.1.0-dev.5`). The model card's historical
+`nxrt==0.1.0.dev3` output predates the current workflow-metadata revision and
+does not demonstrate an nxrt compatibility floor for this snapshot.
+
+The user's exact missing input name remains unreproduced and must not be
+invented. Current onnx-genai source builds its CLI bindings against ORT
+1.29/API29 and rejects an incompatible loaded runtime/API; ORT 1.28/API28 versus
+1.29/API29 is therefore a CLI binary/build/API compatibility boundary, not a
+workflow-metadata requirement. That boundary is distinct from a defect in the
+hosted metadata or current request binding; the fresh current-path smoke above
+did not reproduce such a binding failure.
+
+Static evidence independently shows that
 `model.onnx` is 189,243 bytes, references 318 tensors in the present
 865,533,952-byte `model.onnx.data`, all ten policy graphs parse, tokenizer EOS
-`151645` agrees with metadata, and every inspected port matches. This is not a
-runtime defect.
+`151645` agrees with metadata, and every inspected port matches. Those facts are
+not a model smoke, and the separate smoke does not change the static
+classification or any per-item count.
 
 The only hosted packages with self-contained, directly reusable scripts found
 by this audit have these exact prerequisites/commands:
