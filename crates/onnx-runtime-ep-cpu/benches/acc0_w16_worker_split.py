@@ -335,6 +335,24 @@ def one_launch(args, launch, widths):
     return rec
 
 
+def honoured_tile_count(raw):
+    """Reject a tile count the runtime would silently ignore.
+
+    `steal_tiles_per_worker_override` parses `usize` and then filters `> 0`,
+    so 0 and every negative fall back to the shipped default.  argparse would
+    take them happily, the child would run the default, and the dataset would
+    be stamped with an arm it never ran -- the exact misattribution this knob
+    is here to make impossible.
+    """
+    value = int(raw)
+    if value < 1:
+        raise argparse.ArgumentTypeError(
+            f"--steal-tiles {value} is not honoured by the runtime, which "
+            f"filters `> 0` and falls back to the shipped default; the arm "
+            f"would be labelled {value} but would run the default")
+    return value
+
+
 def steal_tiles_label(recs):
     """How the steal-tile knob was set, for the report header and a replay.
 
@@ -346,9 +364,20 @@ def steal_tiles_label(recs):
     """
     if not recs:
         return "?"
-    if "steal_tiles" not in recs[0]:
+    seen = {r["steal_tiles"] if "steal_tiles" in r else "unrecorded"
+            for r in recs}
+    if len(seen) > 1:
+        # Refuse to pick one. Reporting `recs[0]` over a concatenated or
+        # hand-edited archive is the re-based-baseline defect one field along:
+        # a single confident label above rows that did not all run under it.
+        return ("MIXED across launches -- not one arm: "
+                + ", ".join(sorted(_one_tile_label(v) for v in seen)))
+    return _one_tile_label(next(iter(seen)))
+
+
+def _one_tile_label(v):
+    if v == "unrecorded":
         return "unrecorded (dataset predates the knob)"
-    v = recs[0]["steal_tiles"]
     return "default (shipped, unset)" if v is None else str(v)
 
 
@@ -559,27 +588,6 @@ def self_test():
     # And the sign-consistency guard still reads the pinned pair.
     assert sign_fraction(rows, RULE_WIDE, RULE_NARROW, "resid_frac") == 1.0
 
-    # The defect lived in `report()` as well as in `verdict()`, and `report()`
-    # is the only caller of `barrier_decomposition` -- the Amdahl calibration
-    # whose sign flipped. Scoring the verdict on the pinned pair while the
-    # decomposition re-based onto w=2 would print a correct VERDICT line above
-    # a wrong serial excess, so drive the whole report and check the pair
-    # reached the calibration too.
-    for widths in ((8, 16), (2, 8, 16)):
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            report(rows, widths)
-        out = buf.getvalue()
-        assert "# verdict pair: w8 vs w16" in out, out
-        assert "\n{:>18} {:>10} {:>10}\n".format("", "w8", "w16") in out, (
-            "the barrier decomposition was not scored on the pinned pair:\n"
-            + out)
-        # ratio = wide/narrow: 2 on the pinned pair, 8 if re-based onto w=2.
-        assert "dividing its parallel time by 2 " in out, (
-            "the Amdahl calibration used the wrong baseline:\n" + out)
-        if 2 in widths:
-            assert "descriptive only" in out and "w2" in out, out
-
     # The steal-tile knob is the arm label for the #2071 tiles=1-vs-shipped
     # comparison, so a report that misstates it misattributes the whole arm --
     # the same class of defect as the re-based baseline this self-test exists
@@ -604,8 +612,29 @@ def self_test():
         "a dataset predating the knob was labelled as if its arm were known: "
         + steal_tiles_label(archived))
 
+    # The guard on the knob itself. Without an assertion here it is a branch
+    # nobody exercises, and the arm it protects is the one being published.
+    for bad in ("0", "-1", "-5"):
+        try:
+            honoured_tile_count(bad)
+        except argparse.ArgumentTypeError:
+            pass
+        else:
+            raise AssertionError(
+                f"--steal-tiles {bad} was accepted; the runtime filters `> 0` "
+                f"so the arm would be labelled {bad} and run the default")
+    assert honoured_tile_count("4") == 4, "an honoured tile count was rejected"
+
+    # A dataset that is not one arm must say so rather than name the first.
+    mixed = synthetic_rows(MIN_TRUSTED + 2, stats)
+    for i, r in enumerate(mixed):
+        r["steal_tiles"] = 1 if i else None
+    assert steal_tiles_label(mixed).startswith("MIXED"), (
+        "a dataset spanning two arms was labelled as one: "
+        + steal_tiles_label(mixed))
+
     # And the label has to reach the report, not merely be computable.
-    for rows_, want in ((explicit, "# steal_tiles=1"),
+    for rows_, want in ((explicit, "# steal_tiles=1\n"),
                         (archived, "# steal_tiles=unrecorded")):
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
@@ -613,9 +642,31 @@ def self_test():
         assert want in buf.getvalue(), (
             f"expected {want!r} in the report header:\n" + buf.getvalue())
 
+    # The defect lived in `report()` as well as in `verdict()`, and `report()`
+    # is the only caller of `barrier_decomposition` -- the Amdahl calibration
+    # whose sign flipped. Scoring the verdict on the pinned pair while the
+    # decomposition re-based onto w=2 would print a correct VERDICT line above
+    # a wrong serial excess, so drive the whole report and check the pair
+    # reached the calibration too.
+    for widths in ((8, 16), (2, 8, 16)):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            report(rows, widths)
+        out = buf.getvalue()
+        assert "# verdict pair: w8 vs w16" in out, out
+        assert "\n{:>18} {:>10} {:>10}\n".format("", "w8", "w16") in out, (
+            "the barrier decomposition was not scored on the pinned pair:\n"
+            + out)
+        # ratio = wide/narrow: 2 on the pinned pair, 8 if re-based onto w=2.
+        assert "dividing its parallel time by 2 " in out, (
+            "the Amdahl calibration used the wrong baseline:\n" + out)
+        if 2 in widths:
+            assert "descriptive only" in out and "w2" in out, out
+
     print(f"self-test OK: verdict pinned to w{RULE_NARROW} vs w{RULE_WIDE} "
           f"under every --widths permutation tried; steal-tile arm label "
-          f"distinguishes explicit, shipped-default and unrecorded")
+          f"distinguishes explicit, shipped-default, unrecorded and mixed, "
+          f"and unhonoured tile counts are refused")
 
 
 def main():
@@ -626,7 +677,7 @@ def main():
     ap.add_argument("--reps", type=int, default=2)
     ap.add_argument("--widths", default="8,16")
     ap.add_argument("--blocktime", type=int, default=0)
-    ap.add_argument("--steal-tiles", type=int, default=None)
+    ap.add_argument("--steal-tiles", type=honoured_tile_count, default=None)
     ap.add_argument("--quiet-limit", type=int, default=40)
     ap.add_argument("--out", default=None)
     ap.add_argument("--replay", default=None)
