@@ -76,6 +76,12 @@
 #                     default is never exported: every agent on a shared box
 #                     runs as the same unix user, so that would make every
 #                     lock read as ours. See #1929.
+#                     PREFER --owner. `provenance` reports how the name was
+#                     obtained as `held_owner_source=flag|env|user|unknown`,
+#                     and only `flag` is a name somebody chose for THIS run.
+#                     An inherited $HOSTLOCK_OWNER outlives the `run` that
+#                     exported it and will quietly stamp a later, unrelated
+#                     benchmark with the exporter's name. See #2260.
 #   --wait            block until free instead of failing immediately
 #   --timeout S       give up after S seconds (default 3600). Only `wait`,
 #                     `run`, and `acquire --wait` ever enter a wait loop, so
@@ -300,6 +306,13 @@
 # can attribute a row to somebody who was already dead. A row that cannot say
 # what the host was doing is not a measurement, it is an anecdote with a number
 # in it.
+#
+# `held_by` also cannot be trusted on its own to name the right AGENT, which is
+# a separate failure from naming a dead one. Read it together with
+# `held_owner_source`: `flag` means somebody typed it for this run, `env` means
+# it was inherited and may name whoever exported it, `user` means it names a
+# shared unix account rather than an agent. `held_worktree` and `held_cmd` come
+# from the kernel and settle it when they disagree with `held_by`.
 #
 # (end of usage summary)
 #
@@ -1280,6 +1293,7 @@ publish_lock() {
         echo "anchor_uid=${uid}"
         echo "script_pid=$$"
         echo "owner=$(meta_value "${OWNER}")"
+        echo "owner_source=${OWNER_SOURCE}"
         echo "reason=$(meta_value "${REASON}")"
         echo "worktree=$(meta_value "$(holder_worktree)")"
         echo "cmd=$(meta_value "$(holder_cmd)")"
@@ -1627,6 +1641,7 @@ prov_add() {
 
 cmd_provenance() {
     local state owner pid age reason takeover gate r r_acq contended uid legacy
+    local owner_source
     local holder_wt=unknown holder_cl=unknown
     state=$(lock_state)
     r=$(runnable_now)
@@ -1637,7 +1652,7 @@ cmd_provenance() {
     # "sebastian helper" to a different real agent.
     legacy=${legacy% *}
     owner=none ; pid=none ; age=unknown ; reason='' ; takeover=unknown ; gate=unknown
-    r_acq=unknown ; uid=unknown
+    r_acq=unknown ; uid=unknown ; owner_source=unknown
     if [ -d "$LOCK_DIR" ]; then
         owner=$(meta_get owner) || owner=unknown
         pid=$(meta_get anchor_pid) || pid=unknown
@@ -1654,6 +1669,11 @@ cmd_provenance() {
         # and into the data, where it outlives the person who could correct it.
         takeover=$(meta_get takeover) || takeover=unknown
         gate=$(meta_get gate) || gate=unknown
+        # Same doctrine: a lock published before this key existed must read
+        # `unknown`, not `user`. Answering `user` would assert the safest of
+        # the three provenances about a row that may well have inherited its
+        # name, which is the exact mislabelling this key was added to expose.
+        owner_source=$(meta_get owner_source) || owner_source=unknown
         # `acquired_epoch` absent makes lock_age default it to 0, i.e. the
         # current epoch -- a 56-year age that looks like a datum if anyone
         # aggregates the column.
@@ -1700,6 +1720,18 @@ cmd_provenance() {
     prov_add trusted hostlock_state "${state}"
     prov_add trusted declared "${declared}"
     prov_add name held_by "${owner:-none}"
+    # How `held_by` was arrived at: `flag` (--owner, somebody typed it), `env`
+    # (inherited $HOSTLOCK_OWNER -- may name whoever exported it rather than
+    # whoever ran this), `user` (the $USER fallback, which on a shared account
+    # names the account and not the agent), or `unknown` (a lock published
+    # before this key existed). Only `flag` is a claim its holder made on
+    # purpose. `held_worktree` and `held_cmd` are read from the kernel and
+    # outrank all four when they disagree. See #2260.
+    #
+    # `name`, not `trusted`: the four literals are written here, but the value
+    # in the row comes back out of the metadata file through `meta_get`, so a
+    # foreign writer is in the path exactly as it is for `held_by`.
+    prov_add name held_owner_source "${owner_source:-unknown}"
     prov_add name held_uid "${uid:-unknown}"
     prov_add name held_pid "${pid:-none}"
     # `trusted`, and this one is worth justifying because it looks like the
@@ -1709,7 +1741,9 @@ cmd_provenance() {
     # there is nothing for the guard to reject. Verified rather than assumed
     # -- `acquired_epoch` was set to `1 hostlock_state=FREE`, to `abc`, to
     # empty and to `99 x`, and the field read back a plain integer and the row
-    # stayed 17 fields wide in every case. Classifying it `name` would have
+    # stayed 18 fields wide in every case -- 17 before `held_owner_source`
+    # was added; the width is pinned by `fw_clean_nf` in the conformance
+    # suite, not by this sentence. Classifying it `name` would have
     # been a guard on a value that cannot be malformed, which reads as
     # coverage and is not. The cell below is what fails if `lock_age` ever
     # starts echoing what it read.
@@ -1862,6 +1896,10 @@ cmd_status() {
         echo "legacy_held_by=$(flat_line "${legacy% *}")"
         if [ -d "$LOCK_DIR" ]; then
             echo "owner=$(meta_get owner || echo '?')"
+            # `owner` without this is the free-text half of the pair on its
+            # own, which is how a porcelain consumer inherits the very defect
+            # #2260 describes. Absent reads `unknown`, matching provenance.
+            echo "owner_source=$(meta_get owner_source || echo 'unknown')"
             echo "anchor_pid=$(meta_get anchor_pid || echo '?')"
             echo "reason=$(meta_get reason || echo '')"
             # `unknown` rather than empty for locks published before these
@@ -2491,9 +2529,25 @@ cmd_run() {
 # read as `mine:` to every other agent. That is the flattering error, and the
 # naive one-line export puts it on the DEFAULT path -- which is why the
 # default is recorded here as undeclared and never exported.
+#
+# OWNER_SOURCE says HOW the name was arrived at, which is a different question
+# from whether it was declared and the one that actually decides whether a name
+# can be trusted. `--owner` is somebody typing their name. `$HOSTLOCK_OWNER` is
+# an INHERITED environment variable, and `run` deliberately exports it (see
+# OWNER_DECLARED above) so a nested harness coordinates under one name. The
+# cost of that export is that any LATER, unrelated process in the same
+# environment silently adopts the exporter's name -- a real occurrence, not a
+# hypothetical: two archived benchmark datasets are stamped `held_by=roy` while
+# their `worktree` and `cmd` fields, both read from the kernel, name a
+# different agent entirely. Nothing in the row flagged the contradiction,
+# because `declared=yes` is true of both cases and `held_uid` agrees with
+# either -- every agent on this box shares one account, so the uid corroborates
+# a wrong name exactly as readily as a right one.
 OWNER_DECLARED=0
+OWNER_SOURCE="user"
 if [ -n "${HOSTLOCK_OWNER:-}" ]; then
     OWNER_DECLARED=1
+    OWNER_SOURCE="env"
 fi
 OWNER="${HOSTLOCK_OWNER:-${USER:-unknown}}"
 REASON="${HOSTLOCK_REASON:-}"
@@ -2604,6 +2658,7 @@ while [ "$#" -gt 0 ]; do
             OWNER=${2:-}
             require_name "$1" "$OWNER"
             OWNER_DECLARED=1
+            OWNER_SOURCE="flag"
             shift 2
             ;;
         --wait)
