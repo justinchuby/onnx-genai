@@ -313,13 +313,19 @@ def run_width(args, w):
         "ONNX_GENAI_CPU_DECODE_WORKER_PROFILE": "1",
         "ONNX_GENAI_CPU_DECODE_BLOCKTIME_US": args.blocktime,
     }
+    # Unset means the SHIPPED default, which is what almost every row should
+    # run at. Setting it to the default's current value instead would look
+    # identical today and silently pin the arm to a stale number the day the
+    # default moves.
+    if args.steal_tiles is not None:
+        env["ONNX_GENAI_CPU_DECODE_STEAL_TILES_PER_WORKER"] = args.steal_tiles
     r = H.sh(f"taskset -c {H.PIN} {args.binary}", env)
     return r.stdout + "\n" + r.stderr
 
 
 def one_launch(args, launch, widths):
     rec = {"launch": launch, "blocktime_us": args.blocktime, "widths": {},
-           "peak_limit": args.quiet_limit}
+           "steal_tiles": args.steal_tiles, "peak_limit": args.quiet_limit}
     order = widths if launch % 2 == 0 else tuple(reversed(widths))
     rec["order"] = list(order)
     with H.LoadWatch() as watch:
@@ -327,6 +333,23 @@ def one_launch(args, launch, widths):
             rec["widths"][str(w)] = derive(parse_workers(run_width(args, w)))
     rec["peak"] = watch.peak
     return rec
+
+
+def steal_tiles_label(recs):
+    """How the steal-tile knob was set, for the report header and a replay.
+
+    Three distinct answers, and collapsing any two of them loses the fact that
+    matters.  `unrecorded` is a dataset archived before this key existed: it
+    ran at whatever its binary's default was, which is NOT necessarily today's
+    default, so calling it `default (shipped)` would assert a value nobody
+    measured.  Same doctrine as the absent-key handling in `hostlock.sh`.
+    """
+    if not recs:
+        return "?"
+    if "steal_tiles" not in recs[0]:
+        return "unrecorded (dataset predates the knob)"
+    v = recs[0]["steal_tiles"]
+    return "default (shipped, unset)" if v is None else str(v)
 
 
 def report(recs, widths):
@@ -345,6 +368,7 @@ def report(recs, widths):
               + ", ".join(f"w{w}" for w in extras))
     print(f"# blocktime_us={recs[0]['blocktime_us'] if recs else '?'} "
           f"(profiled run: diagnostic only, tps deliberately not reported)")
+    print(f"# steal_tiles={steal_tiles_label(recs)}")
     hdr = (f"{'L':>3} {'pk':>4} {'T':>2} " +
            " ".join(f"{'w'+str(w)+'.'+k:>12}"
                     for w in widths
@@ -556,8 +580,42 @@ def self_test():
         if 2 in widths:
             assert "descriptive only" in out and "w2" in out, out
 
+    # The steal-tile knob is the arm label for the #2071 tiles=1-vs-shipped
+    # comparison, so a report that misstates it misattributes the whole arm --
+    # the same class of defect as the re-based baseline this self-test exists
+    # for, one field along. Three cases, all distinct on purpose.
+    explicit = synthetic_rows(MIN_TRUSTED + 2, stats)
+    for r in explicit:
+        r["steal_tiles"] = 1
+    assert steal_tiles_label(explicit) == "1", steal_tiles_label(explicit)
+
+    shipped = synthetic_rows(MIN_TRUSTED + 2, stats)
+    for r in shipped:
+        r["steal_tiles"] = None
+    assert steal_tiles_label(shipped).startswith("default"), (
+        steal_tiles_label(shipped))
+
+    # An archived dataset predating the knob ran at ITS binary's default, not
+    # necessarily today's, so it must not be labelled `default`.
+    archived = synthetic_rows(MIN_TRUSTED + 2, stats)
+    for r in archived:
+        r.pop("steal_tiles", None)
+    assert steal_tiles_label(archived).startswith("unrecorded"), (
+        "a dataset predating the knob was labelled as if its arm were known: "
+        + steal_tiles_label(archived))
+
+    # And the label has to reach the report, not merely be computable.
+    for rows_, want in ((explicit, "# steal_tiles=1"),
+                        (archived, "# steal_tiles=unrecorded")):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            report(rows_, (8, 16))
+        assert want in buf.getvalue(), (
+            f"expected {want!r} in the report header:\n" + buf.getvalue())
+
     print(f"self-test OK: verdict pinned to w{RULE_NARROW} vs w{RULE_WIDE} "
-          f"under every --widths permutation tried")
+          f"under every --widths permutation tried; steal-tile arm label "
+          f"distinguishes explicit, shipped-default and unrecorded")
 
 
 def main():
@@ -568,6 +626,7 @@ def main():
     ap.add_argument("--reps", type=int, default=2)
     ap.add_argument("--widths", default="8,16")
     ap.add_argument("--blocktime", type=int, default=0)
+    ap.add_argument("--steal-tiles", type=int, default=None)
     ap.add_argument("--quiet-limit", type=int, default=40)
     ap.add_argument("--out", default=None)
     ap.add_argument("--replay", default=None)
