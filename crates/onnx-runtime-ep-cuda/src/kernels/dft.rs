@@ -339,14 +339,10 @@ impl DftKernel {
         let metadata = metadata(&spec)?;
         let base = cuptr(workspace.ptr().0 as *const c_void);
         // The metadata prefix belongs to step-scoped workspace and may be
-        // reused by the next dispatch. Drain the non-blocking compute stream
-        // before the synchronous default-stream upload so it cannot overwrite
-        // metadata still consumed by a prior DFT. This host barrier is one
-        // reason capture remains explicitly unsupported.
-        self.runtime
-            .stream()
-            .synchronize()
-            .map_err(|error| driver_err("synchronizing before DFT metadata upload", error))?;
+        // reused by the next dispatch. The synchronous H2D helper drains compute
+        // before the default-stream copy, then waits for that copy, so a prior
+        // DFT retires before this overwrite. That host barrier is one reason
+        // capture remains explicitly unsupported.
         // SAFETY: workspace covers `layout.total_bytes`; the metadata prefix is
         // within that allocation and contains exactly `metadata.len()` bytes.
         unsafe {

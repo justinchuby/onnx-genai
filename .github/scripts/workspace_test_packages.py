@@ -2613,10 +2613,21 @@ _OK_IF = "needs.changes.outputs.docs_only != 'true'"
 _REQ = sorted(REQUIRED_JOB_NAMES)
 
 
-def _job_body(condition: str | None = None, step_condition: str | None = None) -> str:
+def _job_body(
+    condition: str | None = None,
+    step_condition: str | None = None,
+    *,
+    condition_on_next_line: bool = False,
+) -> str:
     body = "    name: x\n    runs-on: ubuntu-latest\n"
     if condition is not None:
-        body += f"    if: {condition}\n"
+        # YAML lets a scalar sit on the line after its key. GitHub folds the two
+        # forms into the same string and applies both; a line-anchored regex does
+        # not see the second one unless it spans the newline.
+        if condition_on_next_line:
+            body += f"    if:\n      {condition}\n"
+        else:
+            body += f"    if: {condition}\n"
     body += "    steps:\n      - name: t\n"
     if step_condition is not None:
         body += f"        if: {step_condition}\n"
@@ -2648,6 +2659,20 @@ _JOB_CONDITION_ARMS: tuple[tuple[str, dict, int, list[str]], ...] = (
      {n: _job_body(None, step_condition="false") for n in _REQ}, 0, []),
     ("job-if: both present -- the job's is the one read",
      {n: _job_body(_OK_IF, step_condition="false") for n in _REQ}, 0, []),
+    # A job-level `if:` whose value sits on the *next* line. YAML folds it into
+    # the same scalar and GitHub applies it, so the job is exactly as skippable
+    # as the inline form -- but `_JOB_IF` only sees it because `\s` matches the
+    # newline. That is a property of the class itself and holds with or without
+    # `re.MULTILINE`; the flag is separately load-bearing here, for the `^`/`$`
+    # anchors. The catch is therefore incidental, and `\s` crossing a line
+    # boundary is normally a bug, so tightening it to `[ \t]*` is the obvious
+    # future tidy-up. It would make `job_condition` return None, which this gate
+    # reads as "no guard at all: accepted" -- an unread value degrading to the
+    # most permissive verdict, in the function whose whole purpose is to refuse
+    # that. This arm is the one that fails.
+    ("job-if: a next-line scalar condition is still read as the job's",
+     {_REQ[0]: _job_body("false", condition_on_next_line=True),
+      _REQ[1]: _job_body(_OK_IF)}, 1, [_REQ[0]]),
     ("job-if: an absent required job is refused, not passed over",
      {_REQ[0]: _job_body(_OK_IF)}, 1, [_REQ[1]]),
 )

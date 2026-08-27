@@ -4826,6 +4826,25 @@ struct MatmulFamilyCase {
     ort_can_build: bool,
     /// Absolute tolerance for the elementwise comparison against ORT.
     tolerance: f32,
+    /// How many nodes this model has, and therefore how many must end up on
+    /// our EP before a per-node number means anything.
+    ///
+    /// The old check was `ops_on_our_ep().contains(&case.op)` — a membership
+    /// test. It passes when *one* node of the right type is ours, so a
+    /// hundred-node chain of which we claimed three would still have reported
+    /// a ratio, and any per-node figure a reader derived from that row by
+    /// dividing by its nominal depth would have been wrong by a factor of 33.
+    /// That is the same defect as a thread-name filter that matches nothing:
+    /// the filter answers, the answer is vacuous, and the vacuity is
+    /// invisible in the number.
+    ///
+    /// Fallback is disabled for these sessions, so in principle a declined
+    /// node fails session creation rather than going elsewhere quietly — but
+    /// that is an inference about ORT's behaviour, and it says nothing about
+    /// nodes the graph optimiser *removed* (a `Relu` chain is idempotent and
+    /// a folder is entitled to collapse it). Counting is a measurement and
+    /// costs one comparison per case.
+    expected_ep_nodes: usize,
 }
 
 /// One runtime input: name, element type, dims and raw little-endian bytes.
@@ -4990,6 +5009,7 @@ opset_import: [{{ version: 17 }}]
         output_elem: elem,
         ort_can_build: true,
         tolerance,
+        expected_ep_nodes: 1,
     }
 }
 
@@ -5110,6 +5130,7 @@ opset_import: [{{ version: 17 }}, {{ domain: "com.microsoft" version: 1 }}]
         // variant also rounds its activation and result to 11 significand
         // bits, which at this magnitude costs about one unit.
         tolerance: if act_elem == ELEM_F32 { 0.5 } else { 4.0 },
+        expected_ep_nodes: 1,
     }
 }
 
@@ -5209,6 +5230,7 @@ opset_import: [{{ version: 13 }}]
         // of a value landing precisely on .5 is implementation-defined, so one
         // least-significant unit is allowed.
         tolerance: 1.0,
+        expected_ep_nodes: 1,
     }
 }
 
@@ -5865,6 +5887,7 @@ opset_import: [{{ version: 17 }}]
         output_elem: ELEM_F32,
         ort_can_build: true,
         tolerance: 0.0,
+        expected_ep_nodes: 1,
     };
 
     let path = write_generated_model(case.name, &case.model);
@@ -5977,6 +6000,7 @@ opset_import: [{{ version: 17 }}, {{ domain: "com.microsoft" version: 1 }}]
         output_elem: ELEM_F32,
         ort_can_build: true,
         tolerance: 0.0,
+        expected_ep_nodes: 1,
     };
 
     let path = write_generated_model(case.name, &case.model);
@@ -6236,6 +6260,7 @@ opset_import: [{{ version: 17 }}, {{ domain: "com.microsoft" version: 1 }}]
         output_elem: ELEM_F32,
         ort_can_build: true,
         tolerance: 0.5,
+        expected_ep_nodes: 1,
     };
     (case, other_b)
 }
@@ -6472,6 +6497,7 @@ opset_import: {opset_imports}
         output_elem: elem,
         ort_can_build: true,
         tolerance,
+        expected_ep_nodes: 1,
     }
 }
 
@@ -6552,6 +6578,7 @@ opset_import: [{{ version: 17 }}]
         // A Relu chain is exact in both implementations; Identity is a copy.
         // Anything above zero here would be hiding a real disagreement.
         tolerance: 0.0,
+        expected_ep_nodes: depth,
     }
 }
 
@@ -6605,6 +6632,7 @@ opset_import: [{{ version: 17 }}]
         output_elem: ELEM_F32,
         ort_can_build: true,
         tolerance: 1e-3,
+        expected_ep_nodes: 1,
     }
 }
 
@@ -6630,7 +6658,27 @@ fn dispatch_grid_cases() -> Vec<MatmulFamilyCase> {
     const TINY: usize = 8;
     vec![
         chain_case("grid_identity_1_static", "Identity", 1, W, false),
-        chain_case("grid_identity_10_static", "Identity", 10, W, false),
+        // Ten `Identity` nodes go in; **one** arrives. ORT collapses the
+        // redundant chain during session build, so by the time our EP sees
+        // the graph it is a single node. That is the observation — `got 1
+        // ours, 0 elsewhere` the first time the count check ran — and not a
+        // claim about which ORT pass does it, which cannot be checked from
+        // this tree.
+        //
+        // Nothing published was wrong because of it: the in-code per-node
+        // probe already divides by `ops_on_our_ep().len()` rather than by the
+        // case's depth, and the #1077 figures come from the `relu_*_tiny`
+        // rows. The hazard was a human dividing this row's *total* by its
+        // nominal depth of ten. The count check makes that impossible to do
+        // silently.
+        //
+        // Kept rather than deleted: it is now a pin on that folding
+        // behaviour. It must not be read as a depth-10 point; at run time it
+        // is `grid_identity_1_static` with a longer name.
+        MatmulFamilyCase {
+            expected_ep_nodes: 1,
+            ..chain_case("grid_identity_10_static", "Identity", 10, W, false)
+        },
         chain_case("grid_relu_1_static", "Relu", 1, W, false),
         chain_case("grid_relu_10_static", "Relu", 10, W, false),
         chain_case("grid_relu_100_static", "Relu", 100, W, false),
@@ -7223,9 +7271,26 @@ fn plugin_path_ab_vs_plain_ort() {
 
         unsafe {
             let info = query_ep_assignment(api, session);
+            let ours = info.ops_on_our_ep();
+            let theirs = info.ops_not_on_our_ep();
+            // Categorical, not statistical: N nodes in must give N nodes on
+            // our EP. It costs one comparison, it is immune to host noise,
+            // and it is the only thing standing between a per-node number and
+            // a denominator that was never true. `contains` used to be the
+            // whole check, and `contains` cannot tell 100 nodes from 1.
             assert!(
-                info.ops_on_our_ep().contains(&case.op),
-                "{}: not assigned to this EP, refusing to report a ratio",
+                ours.len() == case.expected_ep_nodes && theirs.is_empty(),
+                "{}: expected all {} node(s) on this EP, got {} ours {ours:?} and \
+                 {} elsewhere {theirs:?} — refusing to report a per-node ratio \
+                 against a denominator that is not what ran",
+                case.name,
+                case.expected_ep_nodes,
+                ours.len(),
+                theirs.len()
+            );
+            assert!(
+                ours.contains(&case.op),
+                "{}: node count matches but the op does not — got {ours:?}",
                 case.name
             );
 
@@ -7280,7 +7345,7 @@ fn plugin_path_ab_vs_plain_ort() {
             // Allocation attribution runs before the timed loop so its
             // counter updates never land inside a measured iteration.
             if run_ours
-                && let Some((buf, names)) = probe_dispatch(
+                && let Some((buf, names, event_names)) = probe_dispatch(
                     api,
                     session,
                     &input_name_ptrs,
@@ -7299,6 +7364,7 @@ fn plugin_path_ab_vs_plain_ort() {
                     64,
                     &buf,
                     &names,
+                    &event_names,
                 );
             }
 
@@ -8306,13 +8372,42 @@ fn probe_phase_names(lib: &libloading::Library) -> Vec<String> {
     }
 }
 
-const PROBE_EVENTS: &[&str] = &[
-    "OrtFfiCall",
-    "DispatchAlloc",
-    "NodeExecuted",
-    "ShapeInferred",
-    "OutputMaterialized",
-];
+const PROBE_EVENTS_FALLBACK_LEN: usize = 5;
+
+/// Event names, read from the library rather than copied.
+///
+/// The hard-coded `PROBE_EVENTS` list this replaces had drifted from `Event`
+/// and mislabelled three of the five counters: `StatusCreated` printed as
+/// "NodeExecuted", `ComputeExecute` -- the per-`Run` divisor -- as
+/// "ShapeInferred", and `NodeExecuted` as "OutputMaterialized". Two of those
+/// names named no event at all.
+///
+/// It survived because the guard beside it checked arity, not identity: a pure
+/// reordering keeps the count at five, so `written == need` still held, and the
+/// message on that assertion claimed to detect the very drift it could not see.
+/// `probe_phase_names` already existed for exactly this reason one list over.
+fn probe_event_names(lib: &libloading::Library) -> Vec<String> {
+    // SAFETY: the export is `extern "C"` with this signature and returns either
+    // null or a 'static NUL-terminated string owned by the library.
+    unsafe {
+        let name_of: libloading::Symbol<
+            '_,
+            unsafe extern "C" fn(usize) -> *const std::os::raw::c_char,
+        > = match lib.get(b"nxrt_dispatch_probe_event_name") {
+            Ok(f) => f,
+            Err(_) => return Vec::new(),
+        };
+        let mut out = Vec::new();
+        for i in 0.. {
+            let p = name_of(i);
+            if p.is_null() {
+                break;
+            }
+            out.push(std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned());
+        }
+        out
+    }
+}
 
 /// Open the EP cdylib a second time to reach its probe exports.
 ///
@@ -8346,7 +8441,7 @@ unsafe fn probe_dispatch(
     values: &[*const ort::OrtValue],
     output_names: &[*const std::os::raw::c_char],
     runs: usize,
-) -> Option<(Vec<u64>, Vec<String>)> {
+) -> Option<(Vec<u64>, Vec<String>, Vec<String>)> {
     if std::env::var("NXRT_MM_BENCH_PROBE").unwrap_or_default() != "1" {
         return None;
     }
@@ -8360,22 +8455,43 @@ unsafe fn probe_dispatch(
             lib.get(b"nxrt_dispatch_probe_snapshot").ok()?;
         reset();
         bench_runs(api, session, input_names, values, output_names, runs);
-        let buckets = probe_phase_names(lib).len();
+        let phase_names = probe_phase_names(lib);
+        let buckets = phase_names.len();
         assert!(buckets > 0, "cdylib exports no phase names");
-        let need = (buckets - 1) * 2 + buckets * 2 + PROBE_EVENTS.len();
+        // Both lists come from the image, so the layout below is derived from
+        // the same source of truth the numbers are. The previous form used a
+        // hard-coded length here, which made this assertion a check on arity
+        // alone -- and a reordering of the event enum keeps the arity identical
+        // while moving every label, which is exactly what had happened.
+        let event_names = probe_event_names(lib);
+        assert_eq!(
+            event_names.len(),
+            PROBE_EVENTS_FALLBACK_LEN,
+            "cdylib exports {} event names; if the event enum genuinely grew, update \
+             PROBE_EVENTS_FALLBACK_LEN, but check first that the *order* still matches",
+            event_names.len()
+        );
+        let need = (buckets - 1) * 2 + buckets * 2 + event_names.len();
         let mut buf = vec![0u64; need];
         let written = snapshot(buf.as_mut_ptr(), need);
         assert_eq!(
             written, need,
             "probe wrote {written} u64s, this harness expected {need} \
-             — PROBE_EVENTS is out of sync with dispatch_probe"
+             — the exported phase/event lists disagree with dispatch_probe's layout"
         );
-        Some((buf, probe_phase_names(lib)))
+        Some((buf, phase_names, event_names))
     }
 }
 
 /// Print allocations and bytes per phase, normalised per `Run` and per node.
-fn report_probe(case: &str, nodes: usize, runs: usize, buf: &[u64], names: &[String]) {
+fn report_probe(
+    case: &str,
+    nodes: usize,
+    runs: usize,
+    buf: &[u64],
+    names: &[String],
+    event_names: &[String],
+) {
     let nb = names.len();
     let np = nb - 1;
     let (calls, ns) = (&buf[..np], &buf[np..2 * np]);
@@ -8415,7 +8531,7 @@ fn report_probe(case: &str, nodes: usize, runs: usize, buf: &[u64], names: &[Str
         total as f64 / per_node,
         total_bytes as f64 / per_run
     );
-    for (i, name) in PROBE_EVENTS.iter().enumerate() {
+    for (i, name) in event_names.iter().enumerate() {
         println!("# event {name},{:.3}/run", events[i] as f64 / per_run);
     }
 }

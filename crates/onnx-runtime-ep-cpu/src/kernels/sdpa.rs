@@ -2882,7 +2882,7 @@ mod tests {
         // On x86 the SIMD path is runtime-detected; a pre-AVX2 host legitimately
         // stays on the scalar reference.
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        if !crate::backend::has_simd_x86() {
+        if !crate::backend::require_simd_x86("sdpa_dispatcher_reaches_simd_path") {
             return;
         }
 

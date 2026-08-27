@@ -55,6 +55,9 @@ pub struct ExportedFactory {
     /// Optional native stream handle for device EPs. Returned from
     /// `DeviceSyncStream::GetHandle`. For CUDA, this would be `cudaStream_t`.
     pub stream_handle: *mut std::os::raw::c_void,
+    /// Custom operator domains contributed by this factory. ORT borrows these
+    /// pointers until the factory is released.
+    pub custom_op_domains: Vec<*mut ort::OrtCustomOpDomain>,
 }
 
 // SAFETY: The raw stream_handle pointer is only accessed from ORT callbacks
@@ -186,7 +189,42 @@ fn build_factory(
         device_allocators: Mutex::new(HashMap::new()),
         shared_ep: None,
         stream_handle: ptr::null_mut(),
+        custom_op_domains: Vec::new(),
     })
+}
+
+impl Drop for ExportedFactory {
+    fn drop(&mut self) {
+        let api = host_api();
+        if api.is_null() {
+            return;
+        }
+        let Some(release) = (unsafe { (*api).ReleaseCustomOpDomain }) else {
+            return;
+        };
+        for domain in self.custom_op_domains.drain(..).rev() {
+            if !domain.is_null() {
+                unsafe { release(domain) };
+            }
+        }
+    }
+}
+
+/// Attach an ORT custom-op domain to a factory returned by this crate.
+///
+/// # Safety
+/// `factory` must be a live pointer returned by one of this module's factory
+/// constructors, and `domain` must be a live ORT custom-op domain whose custom
+/// op descriptors outlive the factory.
+pub unsafe fn attach_custom_op_domain(
+    factory: *mut ort::OrtEpFactory,
+    domain: *mut ort::OrtCustomOpDomain,
+) {
+    if factory.is_null() || domain.is_null() {
+        return;
+    }
+    let exported = unsafe { &mut *factory.cast::<ExportedFactory>() };
+    exported.custom_op_domains.push(domain);
 }
 
 /// Write a single factory into ORT's output array.
@@ -1178,23 +1216,36 @@ unsafe extern "C" fn factory_create_resource_importer(
     ok_status()
 }
 
-/// No custom op domains.
 unsafe extern "C" fn factory_get_num_custom_op_domains(
-    _factory: *mut ort::OrtEpFactory,
+    factory: *mut ort::OrtEpFactory,
     num_domains: *mut usize,
 ) -> *mut ort::OrtStatus {
-    if !num_domains.is_null() {
-        unsafe { *num_domains = 0 };
+    if factory.is_null() || num_domains.is_null() {
+        return fail_status("GetNumCustomOpDomains: null argument");
     }
+    let exported = unsafe { &*factory.cast::<ExportedFactory>() };
+    unsafe { *num_domains = exported.custom_op_domains.len() };
     ok_status()
 }
 
-/// No custom op domains — nothing to fill.
 unsafe extern "C" fn factory_get_custom_op_domains(
-    _factory: *mut ort::OrtEpFactory,
-    _domains: *mut *mut ort::OrtCustomOpDomain,
-    _num_domains: usize,
+    factory: *mut ort::OrtEpFactory,
+    domains: *mut *mut ort::OrtCustomOpDomain,
+    num_domains: usize,
 ) -> *mut ort::OrtStatus {
+    if factory.is_null() {
+        return fail_status("GetCustomOpDomains: factory is null");
+    }
+    let exported = unsafe { &*factory.cast::<ExportedFactory>() };
+    if num_domains != exported.custom_op_domains.len() {
+        return fail_status("GetCustomOpDomains: domain count mismatch");
+    }
+    if num_domains != 0 && domains.is_null() {
+        return fail_status("GetCustomOpDomains: output array is null");
+    }
+    for (index, &domain) in exported.custom_op_domains.iter().enumerate() {
+        unsafe { *domains.add(index) = domain };
+    }
     ok_status()
 }
 

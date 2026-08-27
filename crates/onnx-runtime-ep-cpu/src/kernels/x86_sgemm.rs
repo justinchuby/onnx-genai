@@ -1625,7 +1625,7 @@ unsafe fn pack_b_half_bf16_avx2(
 #[cfg(all(test, any(target_arch = "x86", target_arch = "x86_64")))]
 mod tests {
     use super::*;
-    use crate::backend::has_simd_x86;
+    use crate::backend::require_simd_x86;
 
     /// Naive reference GEMM (row-major, f32 accumulate) for cross-checking.
     fn reference(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
@@ -1648,8 +1648,8 @@ mod tests {
     }
 
     fn check(m: usize, k: usize, n: usize) {
-        if !has_simd_x86() {
-            return; // No AVX2/FMA: the SIMD path is never selected here.
+        if !require_simd_x86("check") {
+            return;
         }
         let a = fill(m * k, 1);
         let b = fill(k * n, 7);
@@ -1703,7 +1703,7 @@ mod tests {
     /// #1091: the native M=1 GEMV must match the naive reference within f32
     /// tolerance across tile-exact, tail, and multi-cache-line N shapes.
     fn check_m1(k: usize, n: usize) {
-        if !has_simd_x86() {
+        if !require_simd_x86("check_m1") {
             return;
         }
         let a = fill(k, 3);
@@ -1740,7 +1740,7 @@ mod tests {
     /// `m == 1`; comparing it against itself would prove nothing.
     #[test]
     fn m1_route_matches_packed_within_tolerance() {
-        if !has_simd_x86() {
+        if !require_simd_x86("m1_route_matches_packed_within_tolerance") {
             return;
         }
         let (k, n) = (300usize, 517usize);
@@ -1791,8 +1791,8 @@ mod tests {
     /// stricter than a tolerance check and is the property `MatMulNBits` prefill
     /// relies on to reuse its cached `Nk` dequant.
     fn check_nt_bit_identical(m: usize, k: usize, n: usize) {
-        if !has_simd_x86() {
-            return; // No AVX2/FMA: the SIMD path is never selected here.
+        if !require_simd_x86("check_nt_bit_identical") {
+            return;
         }
         let a = fill(m * k, 2);
         let b_kn = fill(k * n, 13);
@@ -1835,7 +1835,7 @@ mod tests {
     /// shapes must be bit-identical every time.
     #[test]
     fn nt_matches_nn_packed_randomized() {
-        if !has_simd_x86() {
+        if !require_simd_x86("nt_matches_nn_packed_randomized") {
             return;
         }
         // A small LCG so the shapes are reproducible without an rng dep.
@@ -1972,7 +1972,7 @@ mod tests {
     /// equality with the GEMV rather than a tolerance against the packed path.
     #[test]
     fn the_default_entry_point_routes_m1_to_the_gemv() {
-        if !has_simd_x86() {
+        if !require_simd_x86("the_default_entry_point_routes_m1_to_the_gemv") {
             return;
         }
         let (k, n) = (300usize, 517usize);
@@ -2060,7 +2060,7 @@ mod tests {
 
     #[cfg(target_arch = "x86_64")]
     fn check_int4_gebp(m: usize, k: usize, n: usize, block_size: usize, asymmetric: bool) {
-        if !has_simd_x86() {
+        if !require_simd_x86("check_int4_gebp") {
             return;
         }
         let (packed, scales, zero_points, dense) = int4_weight(k, n, block_size, asymmetric);
@@ -2119,7 +2119,7 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn int4_dequant_panel_is_bit_identical_to_the_per_column_path() {
-        if !has_simd_x86() {
+        if !require_simd_x86("int4_dequant_panel_is_bit_identical_to_the_per_column_path") {
             return;
         }
         // `nr`: two whole groups, one whole group, a group plus every scalar
@@ -2223,7 +2223,7 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn int4_gebp_degenerate_shapes_are_bias_only_or_empty() {
-        if !has_simd_x86() {
+        if !require_simd_x86("int4_gebp_degenerate_shapes_are_bias_only_or_empty") {
             return;
         }
         let weight = Int4Weight {
@@ -2269,8 +2269,8 @@ mod tests {
     /// and drives the same microkernel, so any difference is a packing bug, not
     /// float reassociation.
     fn check_half(format: HalfFormat, m: usize, k: usize, n: usize) {
-        if !has_simd_x86() {
-            return; // No AVX2/FMA: this path is never selected.
+        if !require_simd_x86("check_half") {
+            return;
         }
         let (a_bits, a_wide) = half_operand(format, m * k, 1);
         let (b_bits, b_wide) = half_operand(format, k * n, 2);
@@ -2311,7 +2311,7 @@ mod tests {
 
     #[test]
     fn half_gebp_degenerate_shapes_write_nothing() {
-        if !has_simd_x86() {
+        if !require_simd_x86("half_gebp_degenerate_shapes_write_nothing") {
             return;
         }
         for format in [HalfFormat::F16, HalfFormat::Bf16] {
