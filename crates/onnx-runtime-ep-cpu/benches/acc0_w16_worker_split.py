@@ -91,6 +91,8 @@ informative and must not be rescued by relaxing a threshold.
 """
 
 import argparse
+import contextlib
+import io
 import json
 import os
 import statistics
@@ -475,7 +477,7 @@ def synthetic_rows(n, per_width):
     rows = []
     for i in range(n):
         rows.append({
-            "launch": i, "peak": 1, "peak_limit": 40,
+            "launch": i, "peak": 1, "peak_limit": 40, "blocktime_us": 0,
             "widths": {str(w): dict(st) for w, st in per_width.items()},
         })
     return rows
@@ -532,6 +534,27 @@ def self_test():
 
     # And the sign-consistency guard still reads the pinned pair.
     assert sign_fraction(rows, RULE_WIDE, RULE_NARROW, "resid_frac") == 1.0
+
+    # The defect lived in `report()` as well as in `verdict()`, and `report()`
+    # is the only caller of `barrier_decomposition` -- the Amdahl calibration
+    # whose sign flipped. Scoring the verdict on the pinned pair while the
+    # decomposition re-based onto w=2 would print a correct VERDICT line above
+    # a wrong serial excess, so drive the whole report and check the pair
+    # reached the calibration too.
+    for widths in ((8, 16), (2, 8, 16)):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            report(rows, widths)
+        out = buf.getvalue()
+        assert "# verdict pair: w8 vs w16" in out, out
+        assert "\n{:>18} {:>10} {:>10}\n".format("", "w8", "w16") in out, (
+            "the barrier decomposition was not scored on the pinned pair:\n"
+            + out)
+        # ratio = wide/narrow: 2 on the pinned pair, 8 if re-based onto w=2.
+        assert "dividing its parallel time by 2 " in out, (
+            "the Amdahl calibration used the wrong baseline:\n" + out)
+        if 2 in widths:
+            assert "descriptive only" in out and "w2" in out, out
 
     print(f"self-test OK: verdict pinned to w{RULE_NARROW} vs w{RULE_WIDE} "
           f"under every --widths permutation tried")

@@ -161,16 +161,18 @@ jobs:
       #
       # Discovered by behaviour rather than listed, for the same reason as the
       # path filter above: the harness that most needs this step is one that
-      # does not exist yet. Self-tests here are pure arithmetic on synthetic
-      # records -- no binary, no host load, no lock -- so they are safe on a
-      # shared runner.
+      # does not exist yet. The match is on the argparse *registration* and
+      # accepts either quote style, so a file that merely mentions the flag in
+      # prose is not selected and then failed for not accepting it. Self-tests
+      # here are pure arithmetic on synthetic records -- no binary, no host
+      # load, no lock -- so they are safe on a shared runner.
       - name: Harness self-tests
         run: |
           set -euo pipefail
           found=0
           for f in crates/onnx-runtime-ep-cpu/benches/*.py scripts/ort_ab/*.py; do
             [ -f "$f" ] || continue
-            grep -q -- '"--self-test"' "$f" || continue
+            grep -qE 'add_argument\(["'"'"']--self-test' "$f" || continue
             echo "== $f --self-test"
             python3 "$f" --self-test
             found=$((found + 1))
