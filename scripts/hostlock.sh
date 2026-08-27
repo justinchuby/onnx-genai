@@ -56,7 +56,8 @@
 #   hostlock.sh acquire [opts]          # take it, or fail / wait
 #   hostlock.sh release                 # give it back (only if you hold it)
 #   hostlock.sh wait [--timeout S]      # block until free, do not take it
-#   hostlock.sh run [opts] -- CMD...    # acquire, run CMD, always release
+#   hostlock.sh run --reason TEXT [opts] -- CMD...
+#                                       # acquire, run CMD, always release
 #   hostlock.sh provenance [opts]       # lock state as fields, to record WITH
 #                                       # each measured row (see below)
 #
