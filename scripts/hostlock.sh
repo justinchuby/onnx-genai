@@ -118,6 +118,10 @@
 #                     `run` cannot leak a lock in the first place: it anchors
 #                     to its own pid and start time, which die on every exit
 #                     path, and a zombie anchor is caught by `pid_is_live`.
+#                     Nor can it declare the box free while its own job runs:
+#                     a SIGKILLed run cannot reap its tree, so liveness also
+#                     consults the wrapped command's process group and the
+#                     lock stays held until that group is empty.
 #                     To bound the JOB rather than the CLAIM, bound the
 #                     process tree -- setsid + process group + a hard
 #                     `timeout` + a verified reap (`pgrep -g`). A lock TTL
@@ -294,7 +298,13 @@
 #
 # The lock is a directory (mkdir is atomic on POSIX). Inside it is an anchor
 # pid AND that pid's start time from /proc/<pid>/stat. A crashed holder is
-# reaped automatically by the next acquirer. The start time is what makes
+# reaped automatically by the next acquirer -- unless the job it started
+# outlived it, in which case the lock stays held until that job is gone. The
+# anchor is the CLAIM; the wrapped command's process group is the JOB, and
+# only the job holds cores. `run` publishes `child_pgid` for exactly this, and
+# a SIGKILLed run leaves both a dead anchor and a live tree, because the one
+# signal it cannot trap is also the one that stops it reaping. See
+# orphan_group_pids. The start time is what makes
 # that safe: pids are recycled, so "is there a process with pid 12345" is not
 # the same question as "is the process that took this lock still alive".
 # Reaping is guarded by a second lock, so two acquirers racing on the same
@@ -904,6 +914,51 @@ holder_alive() {
     anchor_alive "$pid" "$start"
 }
 
+# Processes still alive in the WRAPPED COMMAND's process group, for use when
+# the anchor itself is gone. Prints them; returns 1 when there are none.
+#
+# The wedge this closes, reproduced on this host before it was fixed: `run` is
+# SIGKILLed, so its EXIT trap never fires and it never reaps the tree it
+# started. The anchor pid dies, `holder_alive` says no, `reapable` says yes,
+# and `status` prints "STALE ... next acquire will reap it" -- while the
+# wrapped command's children still hold every core they had. The next
+# acquirer takes a box that is not free and measures against a live
+# competitor it cannot see, which is the one outcome this lock exists to
+# prevent.
+#
+# This is the same failure the `--ttl` text at the top of this file already
+# names as the reason `run` refuses a finite TTL -- "it would relabel the host
+# as free while the runaway kept burning cores" -- arriving through a door
+# nobody checked. The anchor is the CLAIM. The process group is the JOB. The
+# job is what holds the cores, so the job is what liveness has to mean.
+#
+# It matters because the holder is usually NOT the process doing the damage:
+# a `cargo test` that forks qemu children, a driver that spawns arm binaries.
+# Anchor-only liveness asks whether the bookkeeper is alive, not the workers.
+#
+# `child_pgid` is recorded only when the child leads its own group (see the
+# guard in `run`), so this can never name this script's own group, and it is
+# only ever consulted once the anchor is dead -- so it cannot keep a lock
+# alive on the strength of the holder.
+#
+# ZOMBIES DO NOT COUNT: `live_pids` already excludes them, and it must, or a
+# not-yet-reaped child would read as a core-holder on every clean teardown.
+#
+# A pgid can be recycled, and a recycled one would hold the lock against a
+# stranger's processes. That is the conservative direction -- BUSY when it is
+# free, never FREE when it is busy -- which is the direction this file takes
+# everywhere else. `status` names the surviving pids so an operator can see in
+# one line whether they are the job or a coincidence.
+orphan_group_pids() {
+    local pgid live
+    pgid=$(meta_get child_pgid) || return 1
+    [ -n "$pgid" ] || return 1
+    case "$pgid" in '' | *[!0-9]*) return 1 ;; esac
+    live=$(live_pids "-$pgid")
+    [ -n "$live" ] || return 1
+    printf '%s' "$live"
+}
+
 # Are we running INSIDE a `run` that holds this very lock?
 #
 # `run` always sets DO_WAIT, so a nested acquire against the same lock path
@@ -996,7 +1051,13 @@ reapable() {
         [ "$((now - mtime))" -gt "$UNPARSEABLE_GRACE" ]
         return $?
     fi
-    ! holder_alive && return 0
+    ! holder_alive && {
+        # A dead anchor is not a free host if the job it started is still
+        # running. Checked only here, on the path that would otherwise hand
+        # the box to the next acquirer.
+        orphan_group_pids >/dev/null && return 1
+        return 0
+    }
     holder_expired
 }
 
@@ -1540,9 +1601,23 @@ cmd_status() {
     # the box is abandoned is how the box gets taken.
     case "$(lock_state)" in
         HELD)
-            echo "HELD by ${owner} pid=${pid} for ${age}s since ${at}"
-            echo "  reason: ${reason}"
-            echo "  runnable=$(runnable_now)"
+            # Distinguish a live holder from a crashed one whose job survived
+            # it. Both are HELD -- the box is busy either way, which is why
+            # lock_state does not gain a state here and `wait` keeps waiting --
+            # but "pid=N" against a pid that no longer exists reads as a bug
+            # unless the surviving job is named. See orphan_group_pids.
+            local orph
+            if ! holder_alive && ! unverifiable_live_anchor && orph=$(orphan_group_pids); then
+                echo "HELD (ORPHANED)  holder ${owner} pid=${pid} is gone, but the job it started is still running"
+                echo "  reason: ${reason}"
+                echo "  still alive in pgid $(meta_get child_pgid || echo '?'): ${orph}"
+                echo "  the host is NOT free; the lock stays held until these exit"
+                echo "  runnable=$(runnable_now)"
+            else
+                echo "HELD by ${owner} pid=${pid} for ${age}s since ${at}"
+                echo "  reason: ${reason}"
+                echo "  runnable=$(runnable_now)"
+            fi
             ;;
         EXPIRED)
             echo "EXPIRED (held ${age}s > ttl ${ttl}s; next acquire will take it over) by ${owner} pid=${pid} for ${age}s since ${at}"
@@ -2063,6 +2138,21 @@ cmd_run() {
     # `-$RUN_CHILD_PGID` cannot possibly name this script's own group.
     RUN_CHILD_PGID=$(proc_pgid "$child" 2>/dev/null || echo "")
     [ "$RUN_CHILD_PGID" = "$child" ] || RUN_CHILD_PGID=""
+
+    # Publish the group, so that a run which is KILLED -- and therefore never
+    # runs a trap, never reaps its tree, and leaves the lock anchored to a
+    # dead pid -- still declares the box busy for as long as its children
+    # hold cores. See orphan_group_pids.
+    #
+    # An append, not a publish_lock field: the lock is taken before the child
+    # exists, so the group is not knowable at publish time. Safe because
+    # `meta_get` is first-match-wins and nothing else ever writes this key, so
+    # this cannot shadow or forge an earlier field; and a reader that catches
+    # the append mid-write simply fails to match, falling back to anchor-only
+    # liveness, which is the behaviour that existed before this line.
+    if [ -n "$RUN_CHILD_PGID" ] && [ -d "$LOCK_DIR" ]; then
+        printf 'child_pgid=%s\n' "$RUN_CHILD_PGID" >>"$META" 2>/dev/null || true
+    fi
 
     # Baseline the child-CPU counter as late as possible: it accumulates only
     # when a child is REAPED, so every fork above (the start-time read, the
