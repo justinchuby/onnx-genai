@@ -183,6 +183,14 @@ jobs:
       # prose is not selected and then failed for not accepting it. Self-tests
       # here are pure arithmetic on synthetic records -- no binary, no host
       # load, no lock -- so they are safe on a shared runner.
+      # `found` was already counted here but never checked, so the step could
+      # announce `ran 0 harness self-test(s)` and still exit 0. Both `continue`
+      # gates fail open: the glob matches nothing if the benches move, and the
+      # `grep` gate is a literal-text match on `add_argument('--self-test'`, so
+      # rewriting that call -- a constant, different quoting, argparse kwargs --
+      # silently drops a harness. Measured on this tree the gate admits 2 of 46
+      # candidate files, so the margin to zero is two renames, and the failure
+      # is a green. Cf. #2055 and scripts/test_step.sh.
       - name: Harness self-tests
         run: |
           set -euo pipefail
@@ -194,4 +202,11 @@ jobs:
             python3 "$f" --self-test
             found=$((found + 1))
           done
+          if [ "$found" -eq 0 ]; then
+            echo "::error::ran 0 harness self-tests: no file under \
+          'crates/onnx-runtime-ep-cpu/benches' or 'scripts/ort_ab' both existed \
+          and matched the --self-test grep, so this step exercised nothing and \
+          its success would prove nothing."
+            exit 1
+          fi
           echo "ran $found harness self-test(s)"
