@@ -753,13 +753,13 @@ There was also no mechanism through which any of it could ship, and supplying on
 was a precondition rather than a detail. The metadata structs were already closed
 — `InferenceMetadata` is `#[serde(deny_unknown_fields)]`
 (`crates/onnx-genai-metadata/src/schema/mod.rs:38-40`) and `schema/ir.rs` carries
-45 more, including `TensorContract`, `BatchLayout`, `ComponentPorts`, and
+49 more, including `TensorContract`, `BatchLayout`, `ComponentPorts`, and
 `WorkflowComponent` — so an older runtime meeting a new field rejected the whole
 document rather than ignoring it. At the time, no pre-deserialization gate
 validated `schema_version`, so a future document failed field by field instead
 of reporting that the runtime needed an upgrade. #2009 replaced that missing
 mechanism with the normalized version contract now documented at
-`schema/mod.rs:62-78` and enforced by
+`schema/mod.rs:51-78` and enforced by
 `crates/onnx-genai-metadata/src/version.rs:42,78`.
 
 ### 10.5 Generic component batching
@@ -1010,12 +1010,13 @@ the gate shipped with it** (`crates/onnx-genai-metadata/src/version.rs:78`,
 `SUPPORTED_SCHEMA_VERSION` `v1.1` at `version.rs:42`).
 `InferenceMetadata` and every struct this design extends are
 `#[serde(deny_unknown_fields)]` (`crates/onnx-genai-metadata/src/schema/mod.rs:38-40`
-and 45 occurrences in `schema/ir.rs`), so an older runtime **rejects the whole
-document** when it meets `batch_capacity`, `padding`, or `levels` — it does not
-ignore them. The current `schema_version` contract states the accepted grammar
-and normalization (`schema/mod.rs:62-78`), and the shipped gate reads the version
-from a generic parse and rejects an unsupported version with one actionable
-message **before** struct deserialization (`version.rs:42,78`):
+and 49 occurrences in `schema/ir.rs`, `grep -c deny_unknown_fields`), so an older
+runtime **rejects the whole document** when it meets `batch_capacity`, `padding`,
+or `levels` — it does not ignore them. The current `schema_version` contract
+states the accepted grammar and normalization (`schema/mod.rs:51-60`), and the
+shipped gate reads the version from a generic parse and rejects an unsupported
+version with one actionable message **before** struct deserialization
+(`version.rs:42,78`):
 
 - **Normalization.** `[v]major[.minor]`, minor defaulting to 0. The legacy
   spellings absent, `v1`, `1`, and `1.0` normalize to **v1.0**, so no existing
