@@ -73,7 +73,9 @@ fn function_blocks(source: &str) -> Vec<FunctionBlock<'_>> {
         let signature = &source[start..open];
         let name_start = start + 3;
         let name_end = source[name_start..]
-            .find(|character: char| character == '(' || character.is_whitespace())
+            .find(|character: char| {
+                character == '(' || character == '<' || character.is_whitespace()
+            })
             .map(|relative| name_start + relative)
             .unwrap_or(open);
 
@@ -202,6 +204,21 @@ fn runtime_host_sync_methods() -> BTreeSet<String> {
     }
 
     synchronizing
+}
+
+fn single_named_function<'a>(source: &'a str, name: &str, source_name: &str) -> FunctionBlock<'a> {
+    let mut matches = function_blocks(source)
+        .into_iter()
+        .filter(|function| function.name == name);
+    let function = matches
+        .next()
+        .unwrap_or_else(|| panic!("{source_name} has no function named {name}"));
+    assert!(
+        matches.next().is_none(),
+        "{source_name} has more than one function named {name}; the production call-graph \
+         contract needs an unambiguous owner"
+    );
+    function
 }
 
 fn impl_type_name(signature: &str, kernel_impl: bool) -> Option<&str> {
@@ -417,6 +434,96 @@ fn unconditional_syncs_are_limited_to_capture_unsupported_paths() {
          capture-supported paths must guard it with CudaRuntime::is_capturing, while \
          capture-unsupported paths must be reviewed and listed explicitly"
     );
+}
+
+/// Production reachability contract for asynchronous H2D page-in fencing.
+///
+/// This is intentionally separate from the CUDA outcome tests. It proves that
+/// both production upload entry points record a copy-stream fence, the EP wait
+/// dispatch reaches the runtime fence registry, and the uniquely removed event
+/// is passed to `CudaStream::wait`. It does not claim that deleting the wait
+/// forces a particular result under an otherwise identical CUDA schedule.
+#[test]
+fn production_async_pagein_reaches_cuda_stream_wait() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let read_production = |file: &str| {
+        let mut source = fs::read_to_string(root.join(file))
+            .unwrap_or_else(|error| panic!("read CUDA production source {file}: {error}"));
+        if let Some(tests) = source.find("#[cfg(test)]\nmod tests") {
+            source.truncate(tests);
+        }
+        source
+    };
+
+    let provider = read_production("provider.rs");
+    let weight_paging = read_production("weight_paging.rs");
+    let runtime = read_production("runtime.rs");
+
+    let provider_copy = single_named_function(&provider, "copy_async", "provider.rs");
+    let provider_copy = code_only(provider_copy.body);
+    assert!(
+        calls_method(&provider_copy, "htod_async")
+            && calls_method(&provider_copy, "record_copy_fence"),
+        "CudaExecutionProvider::copy_async must enqueue H2D and record its copy-stream fence"
+    );
+
+    let page_upload =
+        single_named_function(&weight_paging, "upload_async_inner", "weight_paging.rs");
+    let page_upload = code_only(page_upload.body);
+    assert!(
+        calls_method(&page_upload, "htod_async") && calls_method(&page_upload, "record_copy_fence"),
+        "CudaWeightPage::upload_async_inner must enqueue H2D and record its copy-stream fence"
+    );
+
+    let provider_wait = single_named_function(&provider, "wait_fence", "provider.rs");
+    assert!(
+        calls_method(&code_only(provider_wait.body), "compute_wait_fence"),
+        "CudaExecutionProvider::wait_fence must dispatch to CudaRuntime::compute_wait_fence"
+    );
+
+    let record = single_named_function(&runtime, "record_copy_fence", "runtime.rs");
+    let record = code_only(record.body);
+    assert!(
+        calls_method(&record, "record_fence_on") && record.contains("&self.copy_stream"),
+        "record_copy_fence must register an event recorded on the copy stream"
+    );
+
+    let compute_wait = single_named_function(&runtime, "compute_wait_fence", "runtime.rs");
+    assert!(
+        calls_method(&code_only(compute_wait.body), "wait_fence_on"),
+        "compute_wait_fence must reach the production fence-registry dispatcher"
+    );
+
+    let wait_fence_on = single_named_function(&runtime, "wait_fence_on", "runtime.rs");
+    let wait_fence_code = code_only(wait_fence_on.body);
+    assert!(
+        wait_fence_on.signature.contains("waiter: &CudaStream")
+            && calls_function(&wait_fence_code, "dispatch_registered_fence_wait"),
+        "wait_fence_on must bind a CudaStream waiter to the shared registry-dispatch core"
+    );
+    assert_eq!(
+        wait_fence_code.matches(".wait(").count(),
+        1,
+        "the production registry dispatch must invoke exactly one CudaStream::wait(event)"
+    );
+    assert!(
+        wait_fence_code.contains(".wait(event)"),
+        "the event removed by the registry core must be the event passed to CudaStream::wait"
+    );
+
+    let dispatch = single_named_function(&runtime, "dispatch_registered_fence_wait", "runtime.rs");
+    let dispatch = code_only(dispatch.body);
+    assert!(
+        calls_method(&dispatch, "remove") && calls_function(&dispatch, "wait"),
+        "the shared core must remove event ownership before invoking its backend wait"
+    );
+
+    for forbidden in ["StreamWaitOperation", "PRODUCTION_STREAM_WAIT"] {
+        assert!(
+            !runtime.contains(forbidden),
+            "production wait dispatch must not expose the bypass selector {forbidden}"
+        );
+    }
 }
 
 /// Follow every CUDA kernel entry point through its local helper calls and then

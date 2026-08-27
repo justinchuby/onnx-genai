@@ -569,15 +569,34 @@ pub struct CudaRuntime {
     teardown_section: Option<capture_gate::SynchronizingSection>,
 }
 
-/// Exact operation performed after a fence event is removed from the registry.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum StreamWaitOperation {
-    Enqueue,
-    #[cfg(test)]
-    Omit,
+/// Remove one registered event and transfer its ownership to exactly one
+/// backend wait. Fence zero and absent/already-consumed ids are no-ops.
+///
+/// Keeping registry removal and backend dispatch in this small CUDA-agnostic
+/// core makes the at-most-once ownership rule directly testable without a
+/// second implementation of the production bookkeeping.
+fn dispatch_registered_fence_wait<Event>(
+    registry: &Mutex<HashMap<u64, Event>>,
+    fence_id: u64,
+    wait: impl FnOnce(&Event) -> Result<()>,
+) -> Result<bool> {
+    if fence_id == 0 {
+        return Ok(false);
+    }
+    let event = registry
+        .lock()
+        .expect("cuda fence registry poisoned")
+        .remove(&fence_id);
+    let Some(event) = event else {
+        return Ok(false);
+    };
+    wait(&event).map_err(|error| {
+        EpError::KernelFailed(format!(
+            "cuda_ep: fence {fence_id} was consumed, but its backend wait failed: {error}"
+        ))
+    })?;
+    Ok(true)
 }
-
-pub(crate) const PRODUCTION_STREAM_WAIT: StreamWaitOperation = StreamWaitOperation::Enqueue;
 
 impl std::fmt::Debug for CudaRuntime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1985,8 +2004,7 @@ impl CudaRuntime {
     /// therefore ordered after the prefetch and observes the full transfer. Id
     /// `0` (an already-signalled fence) and an unknown id are no-ops.
     pub fn compute_wait_fence(&self, fence_id: u64) -> Result<()> {
-        self.wait_fence_on_with(&self.stream, fence_id, PRODUCTION_STREAM_WAIT)
-            .map(|_| ())
+        self.wait_fence_on(&self.stream, fence_id).map(|_| ())
     }
 
     /// Make the transfer stream wait on the compute completion event named by
@@ -1994,8 +2012,7 @@ impl CudaRuntime {
     /// staging region so the incoming prefetch never overwrites bytes a prior
     /// wave's kernel is still reading (write-after-read hazard).
     pub fn copy_wait_fence(&self, fence_id: u64) -> Result<()> {
-        self.wait_fence_on_with(&self.copy_stream, fence_id, PRODUCTION_STREAM_WAIT)
-            .map(|_| ())
+        self.wait_fence_on(&self.copy_stream, fence_id).map(|_| ())
     }
 
     /// Resolve a transfer-stream fence for a genuinely ahead-of-need prefetch
@@ -2067,57 +2084,21 @@ impl CudaRuntime {
         Ok(CopyCompleted::new())
     }
 
-    fn apply_stream_wait(
-        operation: StreamWaitOperation,
-        waiter: &CudaStream,
-        event: &CudaEvent,
-    ) -> Result<()> {
-        match operation {
-            StreamWaitOperation::Enqueue => waiter
+    fn wait_fence_on(&self, waiter: &CudaStream, fence_id: u64) -> Result<bool> {
+        dispatch_registered_fence_wait(&self.fences, fence_id, |event| {
+            self.bind()?;
+            waiter
                 .wait(event)
-                .map_err(|error| driver_err("cuStreamWaitEvent", error)),
-            #[cfg(test)]
-            StreamWaitOperation::Omit => Ok(()),
-        }
-    }
-
-    fn wait_fence_on_with(
-        &self,
-        waiter: &CudaStream,
-        fence_id: u64,
-        operation: StreamWaitOperation,
-    ) -> Result<bool> {
-        if fence_id == 0 {
-            return Ok(false);
-        }
-        let event = self
-            .fences
-            .lock()
-            .expect("cuda fence registry poisoned")
-            .remove(&fence_id);
-        let Some(event) = event else {
-            return Ok(false);
-        };
-        self.bind()?;
-        // Keep the exact CUDA operation isolated after registry removal so the
-        // test mutant changes no lookup, ownership, or event-drop behavior.
-        Self::apply_stream_wait(operation, waiter, &event)?;
-        Ok(true)
+                .map_err(|error| driver_err("cuStreamWaitEvent", error))
+        })
     }
 
     #[cfg(test)]
-    pub(crate) fn compute_wait_fence_with_operation(
-        &self,
-        fence_id: u64,
-        operation: StreamWaitOperation,
-    ) -> Result<()> {
-        if self.wait_fence_on_with(&self.stream, fence_id, operation)? {
-            Ok(())
-        } else {
-            Err(EpError::KernelFailed(format!(
-                "cuda page-in test expected fresh fence {fence_id} to own a registered event"
-            )))
-        }
+    pub(crate) fn fence_is_registered(&self, fence_id: u64) -> bool {
+        self.fences
+            .lock()
+            .expect("cuda fence registry poisoned")
+            .contains_key(&fence_id)
     }
 
     /// Block the host until every transfer queued on the copy stream completes.
@@ -2292,6 +2273,60 @@ pub fn raw_ptr(dptr: CUdeviceptr) -> *mut c_void {
 mod tests {
     use super::*;
     use cudarc::driver::PushKernelArg;
+
+    #[test]
+    fn fence_dispatch_consumes_fresh_event_once_and_propagates_wait_errors() {
+        let registry = Mutex::new(HashMap::from([(7, "fresh event")]));
+        let mut backend_waits = 0;
+        assert!(
+            dispatch_registered_fence_wait(&registry, 7, |event| {
+                backend_waits += 1;
+                assert_eq!(*event, "fresh event");
+                Ok(())
+            })
+            .expect("fresh fence dispatch")
+        );
+        assert_eq!(backend_waits, 1, "fresh fence must invoke one backend wait");
+        assert!(
+            registry.lock().unwrap().is_empty(),
+            "fresh event ownership must leave the registry before dispatch"
+        );
+
+        for fence_id in [7, 99, 0] {
+            assert!(
+                !dispatch_registered_fence_wait(&registry, fence_id, |_| {
+                    backend_waits += 1;
+                    Ok(())
+                })
+                .expect("resolved, unknown, and zero fences are no-ops")
+            );
+        }
+        assert_eq!(
+            backend_waits, 1,
+            "resolved, unknown, and zero fences must not redispatch"
+        );
+
+        registry.lock().unwrap().insert(11, "failing event");
+        let error = dispatch_registered_fence_wait(&registry, 11, |_| {
+            backend_waits += 1;
+            Err(EpError::KernelFailed(
+                "synthetic cuStreamWaitEvent failure".into(),
+            ))
+        })
+        .expect_err("backend wait failure must propagate");
+        let detail = error.to_string();
+        assert!(
+            detail.contains("fence 11")
+                && detail.contains("consumed")
+                && detail.contains("synthetic cuStreamWaitEvent failure"),
+            "wait failure must retain fence ownership and backend context: {detail}"
+        );
+        assert_eq!(backend_waits, 2);
+        assert!(
+            registry.lock().unwrap().is_empty(),
+            "a failed wait still consumes the uniquely owned event exactly once"
+        );
+    }
 
     #[test]
     fn submitted_htod_failure_reports_completion_after_fallback_sync() {
