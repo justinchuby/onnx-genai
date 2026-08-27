@@ -346,6 +346,11 @@ thread_local! {
     /// production build has no branch here at all.
     static STUB_PIN_SYSCALL: Cell<bool> = const { Cell::new(false) };
 
+    /// Test fault injection: make a requested worker pin fail before the
+    /// syscall. Unlike [`STUB_PIN_SYSCALL`], this exercises the fail-safe
+    /// policy rather than the placement-honesty detector.
+    static FAIL_PIN_SYSCALL: Cell<bool> = const { Cell::new(false) };
+
     /// Test injection of the *other* case: every worker announces, but late.
     /// Without this the healthy-pool test is vacuous, because real workers
     /// announce within the spin budget and the deadline is never consulted at
@@ -2164,6 +2169,8 @@ impl SpmdDecodePools {
         #[cfg(test)]
         let stub_pin_syscall = STUB_PIN_SYSCALL.with(Cell::get);
         #[cfg(test)]
+        let fail_pin_syscall = FAIL_PIN_SYSCALL.with(Cell::get);
+        #[cfg(test)]
         let delay_worker_before_ready = DELAY_WORKER_BEFORE_READY_MS.with(Cell::get);
         #[cfg(test)]
         let wedge_worker_at_shutdown = WEDGE_WORKER_AT_SHUTDOWN.with(Cell::get);
@@ -2189,7 +2196,9 @@ impl SpmdDecodePools {
                         ),
                         Some(cpu) => {
                             #[cfg(test)]
-                            let pinned = if stub_pin_syscall {
+                            let pinned = if fail_pin_syscall {
+                                Err("injected worker pin failure".to_string())
+                            } else if stub_pin_syscall {
                                 // The mutation: the syscall removed, success
                                 // reported. See `STUB_PIN_SYSCALL`.
                                 Ok(())
@@ -2369,6 +2378,43 @@ impl SpmdDecodePools {
                 })
             })
             .collect();
+
+        if dispatcher_pin_required
+            && worker_placements.iter().any(|placement| {
+                let Some(target) = placement.attempted_cpu else {
+                    return true;
+                };
+                placement.attempt != PinAttempt::Applied
+                    || placement.observed
+                        != crate::decode_affinity::ObservedAffinity::Cpus(vec![target])
+            })
+        {
+            report_spmd_fallback(
+                "the shared-host worker pin could not be proved; falling back to a \
+                 dispatcher-only pool instead of leaving an unpinned resident worker",
+            );
+            shared.shutdown.store(true, Ordering::SeqCst);
+            for sense in &shared.node_sense {
+                sense.0.wake.fetch_add(1, Ordering::Release);
+                atomic_wait::wake_all(&sense.0.wake);
+            }
+            for handle in handles.drain(..) {
+                handle
+                    .join()
+                    .expect("join worker while falling back from an unproved mandatory pin");
+            }
+            let mut fallback_shards = shards.to_vec();
+            for shard in &mut fallback_shards {
+                shard.workers = 0;
+            }
+            return Self::build_with_schedule_and_dispatcher_pin(
+                &fallback_shards,
+                schedule,
+                true,
+                false,
+            );
+        }
+
         for (slot, placement) in worker_cpus.iter_mut().zip(worker_placements.iter()) {
             if placement.attempt != PinAttempt::Applied {
                 *slot = None;
@@ -2535,12 +2581,15 @@ impl SpmdDecodePools {
                 .is_ok();
             DISPATCHER_IS_RECORDED.with(|flag| flag.set(recorded));
         }
+        let already_held = DISPATCHER_PIN_HELD.with(std::cell::Cell::get);
         assert!(
             acquire_dispatcher_pin(cpu),
             "the exact 2-core/4-thread compact default could not pin its dispatcher to cpu \
              {cpu}; refusing to run a shared-host policy that may occupy both physical cores"
         );
-        DispatcherPinGuard { release: true }
+        DispatcherPinGuard {
+            release: !already_held,
+        }
     }
 
     /// OS thread id of the thread that dispatched on this pool, once one has.
@@ -4328,7 +4377,7 @@ fn build_from_env_with_allowed(
     }
     report_pool_built(mode);
     let mut shards = node_shards_with_allowed(total, allowed.as_deref());
-    let dispatcher_only = reserve_tiny_shared_default_for_dispatcher(&mut shards, total);
+    let mut dispatcher_only = reserve_tiny_shared_default_for_dispatcher(&mut shards, total);
     // The dispatcher computes a shard exactly when the headroom reservation took
     // a worker away to keep its CPU free. Then `total - 1` pinned threads plus
     // the dispatcher give `total` compute lanes on `total` CPUs -- the requested
@@ -4345,7 +4394,19 @@ fn build_from_env_with_allowed(
     // node is not known at build time, so handing it a shard could pull that
     // shard's weights across sockets; those layouts keep the previous behavior.
     let require_dispatcher_pin =
-        shared_two_core_default_requires_dispatcher_pin(&shards, total, allowed.as_deref());
+        match shared_two_core_default_strategy(&shards, total, allowed.as_deref()) {
+            SharedTwoCoreDefaultStrategy::NotApplicable => false,
+            SharedTwoCoreDefaultStrategy::PinDispatcher => true,
+            SharedTwoCoreDefaultStrategy::DispatcherOnly => {
+                shards[0].workers = 0;
+                dispatcher_only = true;
+                report_spmd_fallback(
+                    "the exact shared-host topology could not be proved; using the \
+                     dispatcher-only pool instead of risking activity on both physical cores",
+                );
+                false
+            }
+        };
     Some(SpmdDecodePools::build_with_dispatcher_pin(
         &shards,
         dispatcher_only || dispatcher_owns_a_shard(&shards, total),
@@ -4385,11 +4446,18 @@ fn reserve_tiny_shared_default_for_dispatcher(shards: &mut [NodeShard], requeste
 /// core wholly outside the decode affinity masks. Wider hosts retain the
 /// measured unpinned-dispatcher policy; explicit spread remains the
 /// dedicated-host opt-in.
-fn shared_two_core_default_requires_dispatcher_pin(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SharedTwoCoreDefaultStrategy {
+    NotApplicable,
+    PinDispatcher,
+    DispatcherOnly,
+}
+
+fn shared_two_core_default_strategy(
     shards: &[NodeShard],
     requested: usize,
     allowed: Option<&[usize]>,
-) -> bool {
+) -> SharedTwoCoreDefaultStrategy {
     if !cfg!(target_os = "linux")
         || requested != 1
         || !crate::kernels::matmul_nbits::persistent_decode_threads_are_automatic()
@@ -4400,12 +4468,23 @@ fn shared_two_core_default_requires_dispatcher_pin(
         || shards[0].cpus.len() != 4
         || allowed.is_none_or(|cpus| cpus.len() != 4)
     {
-        return false;
+        return SharedTwoCoreDefaultStrategy::NotApplicable;
     }
-    let Some(cores) = crate::core_topology::host() else {
-        return false;
+    shared_two_core_default_strategy_with_topology(
+        shards,
+        allowed.expect("the length check above requires an allowed CPU set"),
+        crate::core_topology::host(),
+    )
+}
+
+fn shared_two_core_default_strategy_with_topology(
+    shards: &[NodeShard],
+    allowed: &[usize],
+    topology: Option<&crate::core_topology::CoreTopology>,
+) -> SharedTwoCoreDefaultStrategy {
+    let Some(cores) = topology else {
+        return SharedTwoCoreDefaultStrategy::DispatcherOnly;
     };
-    let allowed = allowed.expect("the length check above requires an allowed CPU set");
     let populated: Vec<usize> = cores
         .cores()
         .iter()
@@ -4413,13 +4492,18 @@ fn shared_two_core_default_requires_dispatcher_pin(
         .filter(|&count| count > 0)
         .collect();
     if populated != [2, 2] {
-        return false;
+        return SharedTwoCoreDefaultStrategy::NotApplicable;
     }
     let worker_cpu = shards[0].cpus[0];
     let dispatcher_cpu = shards[0].cpus[1];
-    cores
+    if cores
         .siblings_of(worker_cpu)
         .is_some_and(|siblings| siblings.contains(&dispatcher_cpu))
+    {
+        SharedTwoCoreDefaultStrategy::PinDispatcher
+    } else {
+        SharedTwoCoreDefaultStrategy::DispatcherOnly
+    }
 }
 
 /// Whether the inline dispatcher should own a compute shard.
@@ -9938,6 +10022,115 @@ mod tests {
             "a second acquire must not overwrite the saved mask with the reserved cpu; the \
              release then restores nothing and the thread is confined for life"
         );
+    }
+
+    #[test]
+    fn a_missing_two_core_topology_falls_back_to_dispatcher_only() {
+        let shards = [NodeShard {
+            index: 0,
+            cpus: vec![0, 1, 2, 3],
+            workers: 1,
+        }];
+        assert_eq!(
+            shared_two_core_default_strategy_with_topology(&shards, &[0, 1, 2, 3], None,),
+            SharedTwoCoreDefaultStrategy::DispatcherOnly,
+            "unknown topology must not silently recreate one resident worker plus an \
+             unpinned dispatcher"
+        );
+
+        let topology =
+            crate::core_topology::CoreTopology::from_sibling_groups([vec![0, 1], vec![2, 3]]);
+        assert_eq!(
+            shared_two_core_default_strategy_with_topology(&shards, &[0, 1, 2, 3], Some(&topology),),
+            SharedTwoCoreDefaultStrategy::PinDispatcher,
+            "an exact proved 2c/4t layout should retain its worker and pin the dispatcher \
+             to the worker's sibling"
+        );
+    }
+
+    #[test]
+    fn a_failed_mandatory_worker_pin_falls_back_to_dispatcher_only() {
+        FAIL_PIN_SYSCALL.with(|slot| slot.set(true));
+        let pool = SpmdDecodePools::build_with_schedule_and_dispatcher_pin(
+            &[NodeShard {
+                index: 0,
+                cpus: vec![0, 1, 2, 3],
+                workers: 1,
+            }],
+            DecodeSchedule::Fixed,
+            true,
+            true,
+        );
+        FAIL_PIN_SYSCALL.with(|slot| slot.set(false));
+
+        assert_eq!(
+            pool.total_workers(),
+            1,
+            "the dispatcher must retain one compute lane after the resident worker is \
+             withdrawn"
+        );
+        assert!(
+            pool.worker_placements().is_empty(),
+            "a failed mandatory pin must not leave an unpinned resident worker alive"
+        );
+        assert!(
+            !pool.dispatcher_pin_required,
+            "dispatcher-only fallback needs no affinity mutation to preserve headroom"
+        );
+        pool.shutdown();
+    }
+
+    #[test]
+    fn a_nested_dispatcher_scope_releases_only_the_outer_pin() {
+        if !crate::decode_affinity::AFFINITY_MASKING_SUPPORTED {
+            return;
+        }
+        let crate::decode_affinity::ObservedAffinity::Cpus(before) =
+            crate::decode_affinity::observe_current_thread_cpus()
+        else {
+            return;
+        };
+        if before.len() < 2 {
+            return;
+        }
+        let target = before[0];
+        let pool = SpmdDecodePools::build_with_schedule_and_dispatcher_pin(
+            &[NodeShard {
+                index: 0,
+                cpus: vec![target],
+                workers: 0,
+            }],
+            DecodeSchedule::Fixed,
+            true,
+            true,
+        );
+
+        let outer = pool.enter_dispatcher_scope();
+        assert_eq!(
+            crate::decode_affinity::observe_current_thread_cpus(),
+            crate::decode_affinity::ObservedAffinity::Cpus(vec![target])
+        );
+        {
+            let inner = pool.enter_dispatcher_scope();
+            drop(inner);
+            assert_eq!(
+                crate::decode_affinity::observe_current_thread_cpus(),
+                crate::decode_affinity::ObservedAffinity::Cpus(vec![target]),
+                "dropping a nested scope must not restore the outer scope's saved mask"
+            );
+            assert!(
+                DISPATCHER_PIN_HELD.with(std::cell::Cell::get),
+                "the outer scope must still own the dispatcher pin"
+            );
+        }
+        drop(outer);
+        assert_eq!(
+            crate::decode_affinity::observe_current_thread_cpus(),
+            crate::decode_affinity::ObservedAffinity::Cpus(before),
+            "only the outer owning guard may restore the inherited affinity mask"
+        );
+        assert!(!DISPATCHER_PIN_HELD.with(std::cell::Cell::get));
+        pool.shutdown();
     }
 
     /// Releasing a pin nobody took is a no-op, not a widening.

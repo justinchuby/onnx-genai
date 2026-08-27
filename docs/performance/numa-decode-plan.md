@@ -91,9 +91,11 @@ that set. The two are orthogonal and can be combined.
   leave at least half the process's logical CPU capacity available to a
   co-tenant. On an exact 2-core/4-thread SMT mask, the sole worker and dispatcher
   are bound to the two siblings of one physical core for the decode scope, so
-  the other physical core is wholly available to a co-tenant. On an exact
-  two-CPU mask the dispatcher owns the sole compute lane and no resident worker
-  is spawned. This also holds for a one-CPU-per-core `taskset`.
+  the other physical core is wholly available to a co-tenant. If that topology
+  or the required worker pin cannot be proved, the pool fails safe to one
+  dispatcher-owned lane instead of retaining an unpinned resident worker. On an
+  exact two-CPU mask the dispatcher likewise owns the sole compute lane and no
+  resident worker is spawned. This also holds for a one-CPU-per-core `taskset`.
 - `spread` -- explicit dedicated-host opt-in. Worker `i` takes a distinct
   physical core for as long as cores last, only then doubling up on SMT
   siblings; its automatic width may use every allowed physical core (subject to
