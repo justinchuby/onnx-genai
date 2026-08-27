@@ -106,13 +106,34 @@ jobs:
             ONNX_GENAI_ORT_LIB="$ORT_LIB" \
             cargo test -p onnx-genai-engine \
               --test onnx_genai_workflow_conformance -- --nocapture
+      # This step selects BY NAME, and a name filter is the one selector
+      # libtest does not police: a filter matching nothing prints
+      # `ok. 0 passed` and exits 0. See scripts/test_step.sh and #2055.
+      #
+      # The two vacuity paths here are distinct and need different guards:
+      #
+      #   the fixture is absent      -> `optional_producer_package` returns
+      #                                 Ok(None) and the test early-returns
+      #                                 green. Closed by REQUIRED=1 below,
+      #                                 which turns that into a hard error.
+      #   the filter selects nothing -> the test never runs at all, so nothing
+      #                                 inside it can complain. REQUIRED=1
+      #                                 cannot see this; only counting
+      #                                 executed tests can.
+      #
+      # The filter is a substring of `mobius_shared_state_pixel_flow_
+      # executes_text_and_generation_paths`, so it survives suffix renames but
+      # not a rename that touches the stem.
       - name: Execute shared-state pixel-flow paths
         run: |
           ORT_LIB="$(python -c \
             'import onnxruntime, pathlib; print(next((pathlib.Path(onnxruntime.__file__).parent / "capi").glob("libonnxruntime.so*")))')"
+          # shellcheck source=scripts/test_step.sh
+          . ./scripts/test_step.sh
           MOBIUS_WORKFLOW_CONFORMANCE_DIR="$GITHUB_WORKSPACE/validation/generated" \
             MOBIUS_WORKFLOW_CONFORMANCE_REQUIRED=1 \
             ONNX_GENAI_ORT_LIB="$ORT_LIB" \
+            run_test_step "shared-state pixel-flow paths" \
             cargo test -p onnx-genai-engine \
               --test onnx_genai_workflow_conformance \
               shared_state_pixel_flow -- --nocapture
