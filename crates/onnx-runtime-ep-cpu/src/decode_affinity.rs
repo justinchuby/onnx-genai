@@ -286,6 +286,13 @@ pub struct NumaTopology {
 }
 
 impl NumaTopology {
+    #[cfg(test)]
+    pub(crate) fn from_node_cpus(nodes: impl IntoIterator<Item = (usize, Vec<usize>)>) -> Self {
+        Self {
+            nodes: nodes.into_iter().collect(),
+        }
+    }
+
     /// Detect the NUMA topology of the running host, returning `None` when the
     /// platform exposes no multi-node information (a single node, or a target
     /// without discoverable NUMA topology such as macOS or an unsupported OS).
