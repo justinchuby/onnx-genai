@@ -3535,12 +3535,12 @@ mod tests {
     }
 
     /// Default clipped-SwiGLU attributes (`alpha=1`, `beta=0`,
-    /// `limit=+inf`) must match the independent formula oracle. This pins
+    /// `limit=f32::MAX`) must match the independent formula oracle. This pins
     /// the baseline shape of the activation before non-default attributes
     /// are exercised.
     #[test]
     fn qmoe_swiglu_default_clip_attrs_match_reference_formula() {
-        let (got, want) = run_clipped_swiglu(1.0, 0.0, f32::INFINITY);
+        let (got, want) = run_clipped_swiglu(1.0, 0.0, crate::kernels::moe::DEFAULT_SWIGLU_LIMIT);
         assert_close(&got, &want);
     }
 
@@ -3562,7 +3562,8 @@ mod tests {
     /// catch that by asserting the non-default output differs.
     #[test]
     fn qmoe_swiglu_non_default_clip_attrs_change_output_vs_defaults() {
-        let (default_output, _) = run_clipped_swiglu(1.0, 0.0, f32::INFINITY);
+        let (default_output, _) =
+            run_clipped_swiglu(1.0, 0.0, crate::kernels::moe::DEFAULT_SWIGLU_LIMIT);
         let (non_default_output, _) = run_clipped_swiglu(1.702, 1.0, 3.5);
         assert_ne!(
             default_output, non_default_output,
@@ -3586,8 +3587,16 @@ mod tests {
         ];
         for (name, value) in [
             ("activation_alpha", f32::NAN),
+            ("activation_alpha", f32::INFINITY),
+            ("activation_alpha", f32::NEG_INFINITY),
             ("activation_beta", f32::NAN),
+            ("activation_beta", f32::INFINITY),
+            ("activation_beta", f32::NEG_INFINITY),
             ("swiglu_limit", f32::NAN),
+            ("swiglu_limit", f32::INFINITY),
+            ("swiglu_limit", f32::NEG_INFINITY),
+            ("swiglu_limit", 0.0),
+            ("swiglu_limit", -1.0),
         ] {
             let mut attrs = vec![
                 ("expert_weight_bits", Attribute::Int(8)),
@@ -3600,10 +3609,10 @@ mod tests {
             let (graph, node) = model_node("QMoE", &inputs, &[1, 16], &attrs);
             let error = kernel(&graph, node)
                 .err()
-                .unwrap_or_else(|| panic!("{name}=NaN must be rejected"));
+                .unwrap_or_else(|| panic!("{name}={value} must be rejected"));
             assert!(
                 error.to_string().contains(name),
-                "error for {name}=NaN should name the offending attribute, got: {error}"
+                "error for {name}={value} should name the offending attribute, got: {error}"
             );
         }
     }

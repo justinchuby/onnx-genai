@@ -165,7 +165,7 @@ reuse `BlockQuantizedMatMul`'s `BlockFormat::parse`
 | `swiglu_fusion` | int | 0 | `0..=2`; nonzero only with swiglu ([moe.rs:87-97](../../crates/onnx-runtime-ep-cpu/src/kernels/moe.rs#L87-L97)) |
 | `activation_alpha` | float | 1.0 | ([moe.rs:103](../../crates/onnx-runtime-ep-cpu/src/kernels/moe.rs#L103)) |
 | `activation_beta` | float | 0.0 | ([moe.rs:104](../../crates/onnx-runtime-ep-cpu/src/kernels/moe.rs#L104)) |
-| `swiglu_limit` | float | +inf | ([moe.rs:105](../../crates/onnx-runtime-ep-cpu/src/kernels/moe.rs#L105)) |
+| `swiglu_limit` | float | `f32::MAX` | ([moe.rs](../../crates/onnx-runtime-ep-cpu/src/kernels/moe.rs)) |
 
 The claim validator rejects any node carrying the obsolete single `format`
 attribute (it is no longer in the attribute whitelist) — there is no silent

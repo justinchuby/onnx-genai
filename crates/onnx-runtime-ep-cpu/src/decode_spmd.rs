@@ -100,6 +100,9 @@ use std::time::{Duration, Instant};
 
 use crate::decode_affinity::{NodeShard, NumaTopology};
 use crate::kernels::matmul_nbits::output_chunk_len_for;
+use crate::persistent_pool_width::{
+    DEFAULT_SERVICE_CPUS_PER_NUMA_NODE, PoolLayoutInputs, resolve_pool_layout,
+};
 
 /// Environment switch selecting the persistent SPMD decode pool policy:
 /// **unset (the default) or `=1`** uses the persistent SPMD pool deterministically
@@ -165,14 +168,58 @@ pub const CHUNK_PERMUTATION_ENV: &str = "ONNX_GENAI_CPU_DECODE_CHUNK_PERMUTATION
 /// on a futex once genuinely idle for longer than the window. This is the gold
 /// standard for exactly this OMP-style fine-grained fork/join HPC workload.
 ///
+/// The window's *first-order* claim is measured and holds: it eliminates
+/// parking during a generation. At width 16 the average worker parks a median
+/// of **0.533** times per launch at the shipped 500 us, and **345.9** times
+/// with the window removed (`--blocktime 0`), per
+/// `benches/acc0_w16_worker_split.py`, 7 trusted launches per arm.
+///
+/// Its *second-order* claim did not survive measurement and has been removed.
+/// This comment used to say parking on every barrier would "tank throughput".
+/// Parking on essentially every barrier -- those 345.9 parks -- costs **2.2% of
+/// the window** in wake latency at width 16, with a profiler exposing it
+/// (`wake_frac` 0.022 at blocktime 0, 0.014 at 500 us), and the pre-registered
+/// `WAKE-BOUND` verdict does **not** fire at either blocktime.
+///
+/// Nor is the throughput half a cliff. `docs/performance/CPU_MATMUL_ASSIGNMENT.md`
+/// already records removing the ramp as throughput-neutral at t=16 -- ratio
+/// 0.9960 against a **5.24% A/A null**, which is the control that makes it a
+/// result -- and my own unprofiled paired A/B agrees at t=2 (0.996, range
+/// [0.960, 1.013] over 7 paired reps). At t=8 and t=16 my ratios straddle 1.0
+/// and I ran no A/A null in that batch, so they resolve nothing either way.
+///
+/// What is genuinely unmeasured is the case the window exists for. Every
+/// result above is a **zero-gap** decode loop, exactly where parking looks
+/// falsely free because the next op is always already there. The window's
+/// justification is inter-token gaps, and no measurement here has any.
+///
+/// So the window is retained on the evidence that exists -- it costs ~5-8% of
+/// pool width in permanently-occupied cores (~1.3 cores at width 16, #2071)
+/// and buys a wake term that is small but real -- and **not** on a throughput
+/// cliff, which the zero-gap evidence positively contradicts. Changing
+/// [`DEFAULT_BLOCKTIME`] needs the gap-distribution and concurrent-session arms
+/// of #2071 and #1395's gap-aware harness; a reader reaching for this comment
+/// as a reason not to re-measure should not find one. Corrected data and
+/// method: #2245, and
+/// `docs/benchmarks/2026-08-26-acc0-w16-baseline-correction.md` once it lands.
+///
+/// The behavioural half is asserted mechanically, without timing, by
+/// `an_idle_gap_far_longer_than_the_blocktime_parks_the_workers` and the
+/// `spin_hits + parks == dispatches * workers` identity on [`SpmdCounters`].
+/// The complementary direction -- back-to-back dispatches never park -- is
+/// deliberately *not* a test, because a descheduled worker's window expires
+/// off-CPU and it would fail on a loaded runner. The 0.533 above is the
+/// out-of-band substitute for it, and it is a median over launches of a mean
+/// over workers, not a bound.
+///
 /// The window is **load-bearing, not a bad habit**: decode fires ~400 fork/join
 /// barriers per token, microseconds apart, so a worker must catch the next
-/// barrier while spinning. Parking inside the active path would pay a futex wake
-/// (~1-5 us) on every barrier and tank throughput. The window is sized to span
-/// the inter-op / inter-token gaps of tight decode (so workers effectively never
-/// park mid-generation) yet expire quickly once a generation ends, so idle CPU
-/// returns to ~0 between requests -- the spin is bounded to genuinely-active
-/// decode, not "unconditional". Tunable via [`decode_blocktime`].
+/// barrier while spinning. The window is sized to span the inter-op /
+/// inter-token gaps of tight decode (so workers effectively never park
+/// mid-generation -- the 0.533 above) yet expire quickly once a generation
+/// ends, so idle CPU returns to ~0 between requests -- the spin is bounded to
+/// genuinely-active decode, not "unconditional". Tunable via
+/// [`decode_blocktime`].
 ///
 /// Default 500 us: comfortably longer than the ~microsecond inter-op gap and the
 /// serial dispatcher glue between barriers, and shorter than any human-scale idle
@@ -4419,33 +4466,19 @@ fn node_shards_with(
     }
     let allowed = crate::decode_affinity::allowed_cpus();
     let cores = crate::core_topology::host();
-    if let Some(topology) = NumaTopology::detect() {
-        let topology = topology.restrict_to_allowed(allowed.as_deref());
-        if let Some(mut shards) = topology.split_workers(total) {
-            // Reserve a dispatcher core on every node so the engine thread has a
-            // free core on whichever socket the scheduler places it, and each
-            // node's completion counter can be read without contending with a
-            // pinned spinning worker.
-            reserve_split_headroom(&mut shards);
-            for shard in shards.iter_mut() {
-                shard.cpus = crate::decode_affinity::order_pin_targets(&shard.cpus, cores);
-            }
-            return shards;
-        }
+    let numa = NumaTopology::detect();
+    let mut layout = resolve_pool_layout(PoolLayoutInputs {
+        requested_workers: total,
+        allowed_cpus: allowed.as_deref(),
+        core_topology: cores,
+        numa_topology: numa.as_ref(),
+        available_parallelism: parallelism,
+        service_cpus_per_numa_node: DISPATCHER_RESERVED_CPUS,
+    });
+    for shard in &mut layout.shards {
+        shard.cpus = crate::decode_affinity::order_pin_targets(&shard.cpus, cores);
     }
-    // Single-node / non-NUMA / no-pinning fallback: one group. Pin to the
-    // process's allowed CPUs when known (best-effort), else leave unpinned.
-    let cpus = crate::decode_affinity::order_pin_targets(&allowed.unwrap_or_default(), cores);
-    let budget = effective_cpu_budget(cpus.len(), parallelism);
-    let core_count = cores
-        .map_or(0, |cores| cores.leaders_within(&cpus).len())
-        .min(budget);
-    let workers = reserve_single_group_headroom(total, budget, core_count);
-    vec![NodeShard {
-        index: 0,
-        cpus,
-        workers,
-    }]
+    layout.shards
 }
 
 /// Allowed CPUs kept free for the inline dispatcher per pinned worker group.
@@ -4464,7 +4497,7 @@ fn node_shards_with(
 /// per allowed physical core: on a non-SMT host the pool is now deliberately
 /// wide enough that this reserve is what keeps it from being *fully*
 /// subscribed.
-const DISPATCHER_RESERVED_CPUS: usize = 1;
+const DISPATCHER_RESERVED_CPUS: usize = DEFAULT_SERVICE_CPUS_PER_NUMA_NODE;
 
 /// Opt-in: bind the inline dispatcher to the CPU [`DISPATCHER_RESERVED_CPUS`]
 /// reserved for it (`1`/`on`/`true`/`yes`). Default off.
@@ -4707,13 +4740,7 @@ fn release_dispatcher_pin() {
 /// affinity mask (macOS, a seccomp-filtered container). `parallelism == 0`
 /// means the platform could not report *that*, so the mask stands alone.
 fn effective_cpu_budget(mask_len: usize, parallelism: usize) -> usize {
-    match (mask_len, parallelism) {
-        // "Allowed set unknown" is a distinct answer from any budget, and its
-        // meaning belongs to the reserve, not here.
-        (0, _) => 0,
-        (m, 0) => m,
-        (m, p) => m.min(p),
-    }
+    crate::persistent_pool_width::effective_cpu_budget(mask_len, parallelism)
 }
 
 /// CPUs this process may run on at once, as the platform reports it, or 0 when
@@ -4736,29 +4763,12 @@ fn host_parallelism() -> usize {
 /// workers (never zero); the single-CPU case is handled earlier by falling back
 /// to the flat path in [`build_from_env`].
 fn reserve_single_group_headroom(total: usize, allowed_count: usize, core_count: usize) -> usize {
-    if allowed_count == 0 {
-        return total;
-    }
-    // Within the physical-core budget the pool runs one worker per core, so the
-    // inline dispatcher has nowhere to go but some worker's SMT sibling -- and
-    // that worker becomes a straggler the whole barrier waits for on every op.
-    // Measured on qwen int4 `accuracy_level=0` decode, 16 physical cores, no
-    // cpuset: 16 workers 4.41 ms/token against 15 workers 2.81 ms/token (1.57x).
-    // Past the core budget the workers already share cores because the user asked
-    // for more threads than there are cores, so the historical logical-CPU
-    // reserve applies instead -- reserving cores there is a 1.28x regression
-    // (8-logical/4-core cpuset: 7 workers 10.58 ms against 3 workers 13.56 ms).
-    if core_count > 0 && total <= core_count {
-        return total
-            .min(core_count.saturating_sub(DISPATCHER_RESERVED_CPUS))
-            .max(1);
-    }
-    if total < allowed_count {
-        return total;
-    }
-    allowed_count
-        .saturating_sub(DISPATCHER_RESERVED_CPUS)
-        .max(1)
+    crate::persistent_pool_width::reserve_single_group_headroom(
+        total,
+        allowed_count,
+        core_count,
+        DISPATCHER_RESERVED_CPUS,
+    )
 }
 
 /// Cap each NUMA-split shard so at least [`DISPATCHER_RESERVED_CPUS`] CPU of that
@@ -4774,15 +4784,9 @@ fn reserve_single_group_headroom(total: usize, allowed_count: usize, core_count:
 /// *not* handed back -- `dispatcher_owns_a_shard` is false whenever there is
 /// more than one shard -- so guessing a per-node budget would cost compute
 /// width on hosts this change cannot measure. Tracked as #2195.
+#[cfg(test)]
 fn reserve_split_headroom(shards: &mut [NodeShard]) {
-    for shard in shards.iter_mut() {
-        let cap = shard
-            .cpus
-            .len()
-            .saturating_sub(DISPATCHER_RESERVED_CPUS)
-            .max(1);
-        shard.workers = shard.workers.min(cap);
-    }
+    crate::persistent_pool_width::reserve_split_headroom(shards, DISPATCHER_RESERVED_CPUS);
 }
 
 /// The calling thread's OS thread id, or `None` where the platform exposes no

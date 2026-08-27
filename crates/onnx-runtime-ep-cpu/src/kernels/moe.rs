@@ -19,12 +19,109 @@ use super::matmul::gemm_bt;
 use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Activation {
+pub enum Activation {
     Relu,
     Gelu,
     Silu,
     Swiglu,
     Identity,
+}
+
+impl Activation {
+    pub fn from_kernel_id(id: i32) -> Option<Self> {
+        match id {
+            0 => Some(Self::Relu),
+            1 => Some(Self::Gelu),
+            2 => Some(Self::Silu),
+            3 => Some(Self::Swiglu),
+            4 => Some(Self::Identity),
+            _ => None,
+        }
+    }
+
+    pub fn kernel_id(self) -> i32 {
+        match self {
+            Self::Relu => 0,
+            Self::Gelu => 1,
+            Self::Silu => 2,
+            Self::Swiglu => 3,
+            Self::Identity => 4,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Relu => "relu",
+            Self::Gelu => "gelu",
+            Self::Silu => "silu",
+            Self::Swiglu => "swiglu",
+            Self::Identity => "identity",
+        }
+    }
+}
+
+/// Finite default that is numerically equivalent to an unclipped SwiGLU for
+/// every finite `f32` input while preserving the fail-closed attribute contract.
+pub const DEFAULT_SWIGLU_LIMIT: f32 = f32::MAX;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MoeActivationAttributes {
+    pub activation: Activation,
+    pub swiglu_fusion: usize,
+    pub activation_alpha: f32,
+    pub activation_beta: f32,
+    pub swiglu_limit: f32,
+}
+
+/// Single validation authority shared by CPU MoE/QMoE and CUDA
+/// QMoE/BlockQuantizedMoE/planar-MoE.
+pub fn validate_moe_activation_attributes(
+    activation_name: &str,
+    swiglu_fusion: i64,
+    activation_alpha: f32,
+    activation_beta: f32,
+    swiglu_limit: f32,
+) -> std::result::Result<MoeActivationAttributes, String> {
+    let activation = match activation_name {
+        "relu" => Activation::Relu,
+        "gelu" => Activation::Gelu,
+        "silu" => Activation::Silu,
+        "swiglu" => Activation::Swiglu,
+        "identity" => Activation::Identity,
+        other => {
+            return Err(format!(
+                "unsupported activation_type '{other}' (supported: relu, gelu, silu, swiglu, identity)"
+            ));
+        }
+    };
+    if !(0..=2).contains(&swiglu_fusion) {
+        return Err(format!(
+            "swiglu_fusion must be 0, 1, or 2, got {swiglu_fusion}"
+        ));
+    }
+    if activation != Activation::Swiglu && swiglu_fusion != 0 {
+        return Err("swiglu_fusion is only valid when activation_type='swiglu'".into());
+    }
+    for (name, value) in [
+        ("activation_alpha", activation_alpha),
+        ("activation_beta", activation_beta),
+    ] {
+        if !value.is_finite() {
+            return Err(format!("attribute {name} must be finite, got {value}"));
+        }
+    }
+    if !swiglu_limit.is_finite() || swiglu_limit <= 0.0 {
+        return Err(format!(
+            "attribute swiglu_limit must be positive and finite, got {swiglu_limit}"
+        ));
+    }
+    Ok(MoeActivationAttributes {
+        activation,
+        swiglu_fusion: swiglu_fusion as usize,
+        activation_alpha,
+        activation_beta,
+        swiglu_limit,
+    })
 }
 
 /// Factory for the ORT contrib `MoE` operator.
@@ -102,18 +199,6 @@ impl MoeAttributes {
                 .ok_or_else(|| error("attribute activation_type must be a string"))?,
             None => "relu",
         };
-        let activation = match activation_name {
-            "relu" => Activation::Relu,
-            "gelu" => Activation::Gelu,
-            "silu" => Activation::Silu,
-            "swiglu" => Activation::Swiglu,
-            "identity" => Activation::Identity,
-            other => {
-                return Err(error(format!(
-                    "unsupported activation_type '{other}' (supported: relu, gelu, silu, swiglu, identity)"
-                )));
-            }
-        };
         let normalize = bool_attr(node, "normalize_routing_weights", false)?;
         if parse_sparse_mixer && bool_attr(node, "use_sparse_mixer", false)? {
             return Err(error(
@@ -121,46 +206,25 @@ impl MoeAttributes {
             ));
         }
         let swiglu_fusion = int_attr(node, "swiglu_fusion", 0)?;
-        if !(0..=2).contains(&swiglu_fusion) {
-            return Err(error(format!(
-                "swiglu_fusion must be 0, 1, or 2, got {swiglu_fusion}"
-            )));
-        }
-        if activation != Activation::Swiglu && swiglu_fusion != 0 {
-            return Err(error(
-                "swiglu_fusion is only valid when activation_type='swiglu'",
-            ));
-        }
         let activation_alpha = float_attr(node, "activation_alpha", 1.0)?;
         let activation_beta = float_attr(node, "activation_beta", 0.0)?;
-        let swiglu_limit = float_attr(node, "swiglu_limit", f32::INFINITY)?;
-        // These three feed directly into the clipped-SwiGLU formula
-        // (`min/max/clamp` then a sigmoid and a multiply). A NaN silently
-        // poisons every routed token's output instead of failing at the one
-        // point - node creation - where the offending attribute name is
-        // still available to report.
-        for (name, value) in [
-            ("activation_alpha", activation_alpha),
-            ("activation_beta", activation_beta),
-            ("swiglu_limit", swiglu_limit),
-        ] {
-            if value.is_nan() {
-                return Err(error(format!("attribute {name} must not be NaN")));
-            }
-        }
-        if swiglu_limit <= 0.0 {
-            return Err(error(format!(
-                "swiglu_limit must be positive, got {swiglu_limit}"
-            )));
-        }
-        Ok(Self {
-            k: k as usize,
-            activation,
-            normalize_routing_weights: normalize,
-            swiglu_fusion: swiglu_fusion as usize,
+        let swiglu_limit = float_attr(node, "swiglu_limit", DEFAULT_SWIGLU_LIMIT)?;
+        let activation_attributes = validate_moe_activation_attributes(
+            activation_name,
+            swiglu_fusion,
             activation_alpha,
             activation_beta,
             swiglu_limit,
+        )
+        .map_err(error)?;
+        Ok(Self {
+            k: k as usize,
+            activation: activation_attributes.activation,
+            normalize_routing_weights: normalize,
+            swiglu_fusion: activation_attributes.swiglu_fusion,
+            activation_alpha: activation_attributes.activation_alpha,
+            activation_beta: activation_attributes.activation_beta,
+            swiglu_limit: activation_attributes.swiglu_limit,
         })
     }
 
@@ -180,6 +244,7 @@ impl Kernel for MoEKernel {
                 outputs.len()
             )));
         }
+
         for (index, name) in [
             (0, "input"),
             (1, "router_probs"),
@@ -1304,6 +1369,54 @@ fn error(message: impl Into<String>) -> EpError {
 }
 
 #[cfg(test)]
+mod activation_validation_tests {
+    use super::*;
+
+    #[test]
+    fn shared_activation_validator_covers_every_activation_fusion_pair() {
+        for activation in ["relu", "gelu", "silu", "swiglu", "identity"] {
+            validate_moe_activation_attributes(activation, 0, 1.0, 0.0, f32::MAX)
+                .unwrap_or_else(|error| panic!("{activation}/fusion=0 rejected: {error}"));
+            for fusion in [1, 2] {
+                let result =
+                    validate_moe_activation_attributes(activation, fusion, 1.0, 0.0, f32::MAX);
+                assert_eq!(
+                    result.is_ok(),
+                    activation == "swiglu",
+                    "activation={activation} fusion={fusion}: {result:?}"
+                );
+            }
+        }
+        assert!(validate_moe_activation_attributes("unknown", 0, 1.0, 0.0, f32::MAX).is_err());
+        for fusion in [-1, 3] {
+            assert!(validate_moe_activation_attributes("swiglu", fusion, 1.0, 0.0, 1.0).is_err());
+        }
+    }
+
+    #[test]
+    fn shared_activation_validator_rejects_every_non_finite_or_non_positive_value() {
+        for (name, alpha, beta, limit) in [
+            ("activation_alpha NaN", f32::NAN, 0.0, 1.0),
+            ("activation_alpha +Inf", f32::INFINITY, 0.0, 1.0),
+            ("activation_alpha -Inf", f32::NEG_INFINITY, 0.0, 1.0),
+            ("activation_beta NaN", 1.0, f32::NAN, 1.0),
+            ("activation_beta +Inf", 1.0, f32::INFINITY, 1.0),
+            ("activation_beta -Inf", 1.0, f32::NEG_INFINITY, 1.0),
+            ("swiglu_limit NaN", 1.0, 0.0, f32::NAN),
+            ("swiglu_limit +Inf", 1.0, 0.0, f32::INFINITY),
+            ("swiglu_limit -Inf", 1.0, 0.0, f32::NEG_INFINITY),
+            ("swiglu_limit zero", 1.0, 0.0, 0.0),
+            ("swiglu_limit negative", 1.0, 0.0, -1.0),
+        ] {
+            assert!(
+                validate_moe_activation_attributes("swiglu", 1, alpha, beta, limit).is_err(),
+                "{name} must fail closed"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::CpuExecutionProvider;
@@ -1455,7 +1568,7 @@ mod tests {
             swiglu_fusion: 0,
             activation_alpha: 1.0,
             activation_beta: 0.0,
-            swiglu_limit: f32::INFINITY,
+            swiglu_limit: DEFAULT_SWIGLU_LIMIT,
         };
         let input: Vec<f32> = (0..rows * HIDDEN)
             .map(|index| ((index * 17 % 101) as f32 - 50.0) * 0.01)

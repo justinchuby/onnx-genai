@@ -40,6 +40,7 @@ pub mod kernels;
 #[cfg(all(feature = "mlas", feature = "ops-cnn"))]
 pub mod nchwc_layout;
 pub mod optimizer;
+pub(crate) mod persistent_pool_width;
 pub mod provider;
 pub mod strided;
 pub mod task_runtime;

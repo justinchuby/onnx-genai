@@ -119,6 +119,14 @@ pub use kernels::attention::AttentionKernel;
 pub use kernels::csa_checkpoint::{
     CsaAttentionMode, CsaCheckpoint, CsaCheckpointJournal, CsaCursors, CsaLayerMetrics, CsaMetrics,
 };
+pub use kernels::dsa_index_select::{
+    DsaLaunchStats, DsaWorkspaceStats, dsa_launch_stats, dsa_workspace_stats,
+    reset_dsa_launch_stats, reset_dsa_workspace_stats,
+};
+#[cfg(feature = "gpu-tests")]
+pub use kernels::dsa_index_select::{
+    dsa_plugin_capture_stats_for_test, set_dsa_plugin_capture_replays_for_test,
+};
 pub use kernels::gather::GATHER_CAPTURE_ERROR_INDEX;
 pub use kernels::gather_block_quantized::GATHER_BLOCK_QUANTIZED_CAPTURE_ERROR_INDEX;
 pub use kernels::group_query_attention::{
@@ -132,6 +140,18 @@ pub use kernels::indexing::SCATTER_CAPTURE_ERROR_INDEX;
 pub use kernels::kv_cache_capacity_append::KV_CAPACITY_APPEND_CAPTURE_ERROR_POSITION;
 pub use kernels::non_max_suppression::{
     NmsExecutionStats, nms_execution_stats, reset_nms_execution_stats,
+};
+pub use kernels::planar_block_decode::{
+    AdmittedPlanarLinear, PLANAR_FORMAT_BLOCK_FP8, PLANAR_FORMAT_FP4_PLANAR, PlanarActivationDtype,
+    PlanarLinearDims, PlanarTensorLengths, admit_planar_linear, launch_planar_linear,
+    planar_matmul_capable_formats, warm_planar_linear,
+};
+#[cfg(any(test, feature = "gpu-tests"))]
+pub use kernels::planar_block_moe::planar_moe_source_build_count;
+pub use kernels::planar_block_moe::{
+    AdmittedPlanarMoe, PlanarMoeBank, PlanarMoeBufferLengths, PlanarMoeBuffers, PlanarMoeDims,
+    PlanarMoeProjection, admit_planar_moe, launch_planar_moe, planar_moe_capable_formats,
+    warm_planar_moe,
 };
 pub use kernels::reduce::REDUCE_CAPTURE_ERROR_AXES;
 pub use kernels::stft::{StftExecutionStats, stft_last_execution_stats};

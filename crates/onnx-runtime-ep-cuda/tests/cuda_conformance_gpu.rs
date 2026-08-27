@@ -2495,6 +2495,11 @@ fn conformance_profile() -> Vec<ProfileEntry> {
         "shared index buffer",
     ));
     p.push(dedicated(
+        "DsaIndexSelect",
+        "dsa_index_select_gpu.rs",
+        "query-dependent sparse index selection (DSA indexer)",
+    ));
+    p.push(dedicated(
         "RotaryEmbedding",
         "rope_capture_gpu.rs",
         "RoPE, graph-capture safe",

@@ -88,6 +88,15 @@ PR*.md
 # by whoever creates it, and only .github/root-file-allowlist.txt is able to
 # catch a name nobody predicted. Root-level only, per /*.log above.
 /.*-scratch/
+# Review bodies and merge-gate logs, written a directory down rather than at the
+# root. `.review/` is not a `-scratch` name, so the wildcard above does not reach
+# it, and `.review/pr.log` is not caught by `/*.log` below either: that pattern is
+# anchored to the root, so a .log one directory down matches nothing. Verified
+# with `git check-ignore -v .review/pr.log` (no match) against root `pr.log`
+# (matches /*.log). Found untracked in two worktrees before it was committed --
+# the allowlist check would have caught it, but only after everyone had inherited
+# the red.
+/.review/
 # Scratch buffers used when moving a block of code between files.
 .block.txt
 # Test/build output teed to a file while investigating. Root-level only, so a

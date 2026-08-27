@@ -21,6 +21,21 @@ use onnx_runtime_ep_api::{OpKey, OpRegistry};
 
 use crate::runtime::CudaRuntime;
 
+/// Capability required to extract a sealed allocation's device address for a
+/// kernel launch.
+///
+/// The type is visible to the provider module so it can constrain the sealed
+/// allocation API, but only descendants of `kernels` can mint a value. Safe
+/// external callers therefore cannot turn an admitted bank back into a mutable
+/// `DeviceBuffer` or raw address.
+pub(crate) struct SealedLaunchAccess(());
+
+impl SealedLaunchAccess {
+    fn new() -> Self {
+        Self(())
+    }
+}
+
 pub mod activations;
 pub mod argreduce;
 pub mod attention;
@@ -46,6 +61,7 @@ pub(crate) mod device_argmax;
 pub(crate) mod device_token_writer;
 pub mod dft;
 pub mod dropout;
+pub mod dsa_index_select;
 pub mod elementwise;
 pub mod expert_route_telemetry;
 mod flash_attention;
@@ -83,6 +99,8 @@ pub mod onehot;
 pub mod packed_varlen_attention;
 pub mod pad;
 pub mod paged_attention;
+pub mod planar_block_decode;
+pub mod planar_block_moe;
 pub mod pointwise;
 pub mod pooling;
 pub mod prelu;
@@ -189,6 +207,7 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "SparseKvGather",
     "CompressedSparseAttention",
     "IndexShare",
+    "DsaIndexSelect",
     "KvCacheCapacityAppend",
     "PackedVarlenAttention",
     "VarlenAttention",
@@ -534,6 +553,7 @@ pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [Da
         | ("VarlenAttention", _)
         | ("CompressedSparseAttention", _)
         | ("SparseKvGather", _)
+        | ("DsaIndexSelect", _)
         | ("LinearAttention", _) => CUDA_ATTENTION_DTYPES,
 
         // Byte-mover / structural ops: dtype-agnostic (copy/select, no
@@ -1148,6 +1168,12 @@ pub fn build_cuda_registry_with_metrics(
     reg.register(
         OpKey::new("IndexShare", "pkg.nxrt", 1),
         Box::new(index_share::IndexShareFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("DsaIndexSelect", "pkg.nxrt", 1),
+        Box::new(dsa_index_select::DsaIndexSelectFactory {
             runtime: runtime.clone(),
         }),
     );
