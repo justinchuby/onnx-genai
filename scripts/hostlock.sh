@@ -1741,7 +1741,9 @@ cmd_provenance() {
     # there is nothing for the guard to reject. Verified rather than assumed
     # -- `acquired_epoch` was set to `1 hostlock_state=FREE`, to `abc`, to
     # empty and to `99 x`, and the field read back a plain integer and the row
-    # stayed 17 fields wide in every case. Classifying it `name` would have
+    # stayed 18 fields wide in every case -- 17 before `held_owner_source`
+    # was added; the width is pinned by `fw_clean_nf` in the conformance
+    # suite, not by this sentence. Classifying it `name` would have
     # been a guard on a value that cannot be malformed, which reads as
     # coverage and is not. The cell below is what fails if `lock_age` ever
     # starts echoing what it read.

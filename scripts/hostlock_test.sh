@@ -1121,8 +1121,8 @@ chk "but the row marks that name as inherited, not chosen" \
 cleanup
 # The $USER fallback names a shared ACCOUNT, not an agent, so it is its own
 # case and must not masquerade as either of the two above.
-user_row=$(env -u HOSTLOCK_OWNER $HL acquire --ttl 600 --reason "default" >/dev/null 2>&1; \
-    env -u HOSTLOCK_OWNER $HL provenance --oneline --expect-runnable 100000)
+user_row=$(env -u HOSTLOCK_OWNER "$HL" acquire --ttl 600 --reason "default" >/dev/null 2>&1; \
+    env -u HOSTLOCK_OWNER "$HL" provenance --oneline --expect-runnable 100000)
 chk "an undeclared owner is reported as the account default" \
     "$(echo "$user_row" | tr ' ' '\n' | sed -n 's/^held_owner_source=//p')" "user"
 chk "and it names the unix account it fell back to" \
@@ -2309,7 +2309,7 @@ chk "and the row still parses back to the state it physically carries" \
 # Categorical, and the strongest cell here: a forged row cannot be the same
 # width as a clean one. This is immune to any question about which field the
 # injection happened to target.
-fw_clean_nf=17
+fw_clean_nf=18
 chk "and the field count is unchanged by the injection" \
     "$(echo "$fw_row" | awk '{print NF}')" "$fw_clean_nf"
 # Not destroyed -- relocated to where the newline is the delimiter. Whoever is
