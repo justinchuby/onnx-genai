@@ -2,7 +2,7 @@
 //!
 //! Subcommands:
 //! - `serve`    — start the OpenAI-compatible HTTP server
-//! - `generate` — one-shot text generation, or text-to-image with `--output-image`
+//! - `generate` — one-shot text generation; image and speech generation use the server APIs
 //! - `run`      — interactive generation REPL
 //! - `show`     — inspect a model's resolved files and metadata
 //! - `list`     — list model directories under a models directory

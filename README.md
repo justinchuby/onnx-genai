@@ -89,7 +89,7 @@ cargo build --release -p onnx-genai-cli
   --max-new-tokens 64 \
   --temperature 0 \
   --stream \
-  --prompt "Write a short Rust hello-world program."
+  "Write a short Rust hello-world program."
 ```
 
 When `--max-new-tokens` is omitted, `generate` and `run` use whatever budget
@@ -186,14 +186,27 @@ inference metadata (`preprocessing.image` + `pipeline.vision` for images, an
 modalities on any package that declares one:
 
 ```bash
-./target/release/onnx-genai generate models/tiny-vlm \
+./target/release/onnx-genai generate ./models/tiny-vlm \
   --image ./cat.png \
-  --prompt "What is in this image?"
+  "What is in this image?"
 
-./target/release/onnx-genai generate models/whisper-tiny \
+./target/release/onnx-genai generate ./models/whisper-tiny \
   --audio ./speech.wav \
-  --prompt ""
+  ""
 ```
+
+The argument after `generate` is a local model package directory, not a
+Hugging Face repository ID, and the prompt is the final positional argument.
+For the audited
+`justinchuby/qwen2.5-0.5b-instruct-onnx-genai` package, pass ordinary user text
+without `--raw` so the CLI applies that package's ChatML template. Use `--raw`
+only when the caller has already formatted that package's complete request as
+ChatML. That path bypasses the package template and its system/user role
+separation, so do not use it where that separation matters.
+
+Pinning a downloaded package revision makes its contents reproducible; it does
+not make an untrusted package safe. Review and trust model packages before
+running them.
 
 Audio is transcription: the model's own decoder prompt replaces the typed text,
 because the clip carries the content. A model that declares neither contract
@@ -203,17 +216,17 @@ You do not have to know a model's image placeholder token. Pass the images and
 write the prompt normally — one placeholder per image is prepended for you:
 
 ```bash
-onnx-genai generate models/my-vlm \
+onnx-genai generate ./models/my-vlm \
   --image left.png --image right.png \
-  --prompt "What changed between these two photos?"
+  "What changed between these two photos?"
 ```
 
 To control where each image sits in the sentence, write the placeholders
 yourself and they are honored verbatim:
 
 ```bash
-onnx-genai generate models/my-vlm --image cat.png --image dog.png \
-  --prompt "The first <image> is a cat and the second <image> is a dog. Compare them."
+onnx-genai generate ./models/my-vlm --image cat.png --image dog.png \
+  "The first <image> is a cat and the second <image> is a dog. Compare them."
 ```
 
 A *partial* set is rejected rather than topped up: once you start positioning
@@ -258,7 +271,7 @@ ONNX fixtures in `tests/fixtures/`; see
 `--profile` reports where the time went. It works on every subcommand:
 
 ```bash
-onnx-genai --profile generate models/qwen2.5-0.5b --prompt "..." --max-new-tokens 40
+onnx-genai --profile generate models/qwen2.5-0.5b --max-new-tokens 40 "..."
 ```
 
 ```text
@@ -291,9 +304,10 @@ Percentiles sit next to the mean because a run that averages 24 ms/token but
 stalls for 400 ms mid-sentence feels broken, and only the tail shows it. The
 per-stage table answers "ORT kernels or our orchestration?".
 
-Each mode adds its own counters: denoise steps and ms/step for `--output-image`,
-audio produced and real-time factor for `--output-audio`, and segments, audio
-transcribed, real-time factor and slowest segment for `transcribe`.
+`onnx-genai generate` currently has no image or synthesized-audio output mode.
+Receive generated images through `serve` and the image APIs documented below,
+and synthesized audio from `POST /v1/audio/speech`. `transcribe` profiling adds
+segments, audio transcribed, real-time factor, and slowest segment.
 
 #### KV page activity
 
@@ -368,30 +382,37 @@ absent line means "not accounted here", never "nothing was used".
 
 ```bash
 # Machine-readable, for diffing runs or plotting in CI (`-` writes to stdout)
-onnx-genai --profile-json bench.json generate models/qwen2.5-0.5b --prompt "..."
+onnx-genai --profile-json bench.json generate models/qwen2.5-0.5b "..."
 
 # Chrome Trace Event timeline, viewable at https://ui.perfetto.dev
-onnx-genai --profile-trace trace.json generate models/qwen2.5-0.5b --prompt "..."
+onnx-genai --profile-trace trace.json generate models/qwen2.5-0.5b "..."
 ```
 
 ### Generate images
 
-`generate --output-image` renders a prompt through a diffusion package (see
-[docs/genai/DIFFUSION.md](docs/genai/DIFFUSION.md)):
+The current `onnx-genai generate` command produces text, including from
+metadata-declared image or audio request inputs, but does not produce diffusion
+images or accept controls such as `--negative-prompt` or `--output-image`. For
+a local diffusion package, run the server against the local directory and use
+its supported AUTOMATIC1111-compatible `POST /sdapi/v1/txt2img` endpoint (see
+[Image generation](#image-generation)):
 
 ```bash
-./target/release/onnx-genai generate models/stable-diffusion-1.5 \
-  --prompt "an astronaut riding a horse" \
-  --negative-prompt "blurry, low quality" \
-  --steps 25 --guidance-scale 7.5 --seed 0 \
-  --width 512 --height 512 \
-  --output-image out.png
+# Terminal 1: serve the local package.
+./target/release/onnx-genai serve ./models/stable-diffusion-1.5 \
+  --addr 127.0.0.1:8080
+
+# Terminal 2: generate and decode the returned base64 PNG.
+curl -sS http://127.0.0.1:8080/sdapi/v1/txt2img \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"an astronaut riding a horse","negative_prompt":"blurry, low quality","steps":25,"cfg_scale":7.5,"seed":0,"width":512,"height":512}' \
+  | python3 -c 'import base64,json,sys; open("out.png","wb").write(base64.b64decode(json.load(sys.stdin)["images"][0]))'
 ```
 
-Steps, guidance scale, and the sampler default to the values the package
-declares. For packages whose pipeline stops at the latent instead of declaring
-a final VAE phase, add `--vae-decoder <latent-to-image.onnx>` (and
-`--vae-scaling-factor`).
+Omit `steps`, `cfg_scale`, or `sampler_name` to use the values the package
+declares. The package metadata must declare a workflow output with role `image`
+and its pixel `value_range`, and the workflow must emit that output as one RGB
+image for server-side PNG encoding.
 
 ### Import a ComfyUI workflow
 
