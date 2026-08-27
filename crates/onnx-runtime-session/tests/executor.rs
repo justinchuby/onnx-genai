@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 use onnx_runtime_ep_api::{
@@ -23,7 +23,9 @@ use onnx_runtime_ir::{
     TensorLayout, ValueId, WeightRef, static_shape,
 };
 use onnx_runtime_loader::{Model, encode_model};
-use onnx_runtime_session::{InferenceSession, OpsetVersion, SessionError, Tensor, WarmupShape};
+use onnx_runtime_session::{
+    DeviceGraphCaptureResult, InferenceSession, OpsetVersion, SessionError, Tensor, WarmupShape,
+};
 use onnx_runtime_shape_inference::{InferenceRegistry, MAX_SHAPE_DATA_ELEMS, MergePolicy};
 
 // This synthetic name must remain unregistered so unsupported-op error tests cannot go stale.
@@ -116,6 +118,7 @@ enum TestArtifactFinalization {
     PendingOnce,
     StructuralDecline,
     FailOnce,
+    ReadyPendingFailedReady,
 }
 
 struct HostDownloadCountingEp {
@@ -131,6 +134,11 @@ struct HostDownloadCountingEp {
     assert_finalized_before_execute: bool,
     capture_checks: Arc<AtomicUsize>,
     artifact_finalization: TestArtifactFinalization,
+    fake_device_graph: bool,
+    graph_capturing: Arc<AtomicBool>,
+    graph_installed: Arc<AtomicBool>,
+    graph_segment_replays: Arc<AtomicUsize>,
+    graph_fast_replays: Arc<AtomicUsize>,
 }
 
 impl HostDownloadCountingEp {
@@ -150,6 +158,11 @@ impl HostDownloadCountingEp {
             assert_finalized_before_execute: false,
             capture_checks: Arc::new(AtomicUsize::new(0)),
             artifact_finalization: TestArtifactFinalization::Complete,
+            fake_device_graph: false,
+            graph_capturing: Arc::new(AtomicBool::new(false)),
+            graph_installed: Arc::new(AtomicBool::new(false)),
+            graph_segment_replays: Arc::new(AtomicUsize::new(0)),
+            graph_fast_replays: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -180,6 +193,15 @@ impl HostDownloadCountingEp {
         Self {
             assert_finalized_before_execute: true,
             artifact_finalization: TestArtifactFinalization::FailOnce,
+            ..Self::new(host_downloads)
+        }
+    }
+
+    fn new_fast_replay_lifecycle(host_downloads: Arc<AtomicUsize>) -> Self {
+        Self {
+            assert_finalized_before_execute: true,
+            artifact_finalization: TestArtifactFinalization::ReadyPendingFailedReady,
+            fake_device_graph: true,
             ..Self::new(host_downloads)
         }
     }
@@ -215,6 +237,14 @@ impl HostDownloadCountingEp {
     fn capture_checks(&self) -> Arc<AtomicUsize> {
         Arc::clone(&self.capture_checks)
     }
+
+    fn graph_segment_replays(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.graph_segment_replays)
+    }
+
+    fn graph_fast_replays(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.graph_fast_replays)
+    }
 }
 
 struct FinalizationCheckingKernel {
@@ -223,6 +253,7 @@ struct FinalizationCheckingKernel {
     terminal_outcomes: Arc<Mutex<HashMap<ExecutorInstanceId, usize>>>,
     executions: Arc<Mutex<HashMap<ExecutorInstanceId, usize>>>,
     capture_checks: Arc<AtomicUsize>,
+    force_capture_supported: bool,
 }
 
 impl Kernel for FinalizationCheckingKernel {
@@ -265,7 +296,11 @@ impl Kernel for FinalizationCheckingKernel {
             "capture audit reached a kernel before provider artifacts finalized"
         );
         self.capture_checks.fetch_add(1, Ordering::Relaxed);
-        self.inner.capture_support()
+        if self.force_capture_supported {
+            CaptureSupport::Supported
+        } else {
+            self.inner.capture_support()
+        }
     }
 }
 
@@ -286,7 +321,12 @@ impl ExecutionProvider for HostDownloadCountingEp {
             .unwrap()
             .entry(executor)
             .or_default() += 1;
-        if scoped_count(&self.route_terminal_outcomes, executor) > 0 {
+        if scoped_count(&self.route_terminal_outcomes, executor) > 0
+            && !matches!(
+                self.artifact_finalization,
+                TestArtifactFinalization::ReadyPendingFailedReady
+            )
+        {
             return Ok(ExecutorArtifactFinalization::Complete);
         }
         assert!(
@@ -320,10 +360,25 @@ impl ExecutionProvider for HostDownloadCountingEp {
                     readiness.get()
                 )))
             }
+            TestArtifactFinalization::ReadyPendingFailedReady if attempt == 2 => Ok(
+                ExecutorArtifactFinalization::Pending(ExecutorArtifactPending::ProviderReadiness {
+                    reason: format!(
+                        "test provider awaits a later compiled specialization after epoch {}",
+                        readiness.get()
+                    ),
+                }),
+            ),
+            TestArtifactFinalization::ReadyPendingFailedReady if attempt == 3 => {
+                Err(EpError::KernelFailed(format!(
+                    "injected artifact finalization failure at epoch {}",
+                    readiness.get()
+                )))
+            }
             TestArtifactFinalization::Complete
             | TestArtifactFinalization::PendingOnce
             | TestArtifactFinalization::FailOnce
-            | TestArtifactFinalization::StructuralDecline => {
+            | TestArtifactFinalization::StructuralDecline
+            | TestArtifactFinalization::ReadyPendingFailedReady => {
                 *self
                     .route_terminal_outcomes
                     .lock()
@@ -410,6 +465,7 @@ impl ExecutionProvider for HostDownloadCountingEp {
                 terminal_outcomes: Arc::clone(&self.route_terminal_outcomes),
                 executions: Arc::clone(&self.kernel_executions),
                 capture_checks: Arc::clone(&self.capture_checks),
+                force_capture_supported: self.fake_device_graph,
             }))
         } else {
             Ok(kernel)
@@ -448,6 +504,60 @@ impl ExecutionProvider for HostDownloadCountingEp {
 
     fn sync(&self) -> EpResult<()> {
         self.cpu.sync()
+    }
+
+    fn begin_device_graph_capture(&self, kernels: &[&dyn Kernel]) -> EpResult<()> {
+        if !self.fake_device_graph {
+            return Err(EpError::KernelFailed(
+                "test provider device graph capture is disabled".to_string(),
+            ));
+        }
+        assert!(
+            !kernels.is_empty(),
+            "capture must contain a compiled kernel"
+        );
+        assert!(
+            !self.graph_capturing.swap(true, Ordering::SeqCst),
+            "capture cannot begin twice"
+        );
+        Ok(())
+    }
+
+    fn end_device_graph_capture(&self) -> EpResult<()> {
+        assert!(
+            self.graph_capturing.swap(false, Ordering::SeqCst),
+            "capture must be active before it ends"
+        );
+        self.graph_installed.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn abort_device_graph_capture(&self) -> EpResult<()> {
+        self.graph_capturing.store(false, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn replay_device_graph(&self) -> EpResult<()> {
+        assert!(
+            self.graph_installed.load(Ordering::SeqCst),
+            "fast replay requires an installed graph"
+        );
+        self.graph_fast_replays.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn replay_device_graph_segment(&self, index: usize) -> EpResult<()> {
+        assert_eq!(index, 0, "single-graph capture installs one segment");
+        assert!(
+            self.graph_installed.load(Ordering::SeqCst),
+            "segment replay requires an installed graph"
+        );
+        self.graph_segment_replays.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn reset_device_graph(&self) -> EpResult<bool> {
+        Ok(self.graph_installed.swap(false, Ordering::SeqCst))
     }
 }
 
@@ -2268,6 +2378,119 @@ fn failed_finalization_is_cached_until_readiness_advances() {
     assert_eq!(scoped_count(&finalizations, executor), 2);
     assert_eq!(scoped_count(&terminal_outcomes, executor), 1);
     assert_eq!(scoped_count(&executions, executor), 1);
+}
+
+#[test]
+fn single_graph_fast_replay_obeys_pending_failed_and_ready_specializations() {
+    let downloads = Arc::new(AtomicUsize::new(0));
+    let ep = HostDownloadCountingEp::new_fast_replay_lifecycle(downloads);
+    let finalizations = ep.route_finalizations();
+    let terminal_outcomes = ep.route_terminal_outcomes();
+    let executions = ep.kernel_executions();
+    let drains = ep.route_drains();
+    let segment_replays = ep.graph_segment_replays();
+    let fast_replays = ep.graph_fast_replays();
+    let ep = Arc::new(ep);
+    let mut session = InferenceSession::builder()
+        .model_bytes(&symbolic_gelu_model())
+        .execution_provider(ep)
+        .build()
+        .expect("build fast-replay lifecycle session");
+    let executor = session.executor_instance_id();
+
+    let input = session
+        .allocate_device_binding("x", None::<String>, DataType::Float32, vec![2], vec![2])
+        .expect("allocate persistent capture input");
+    let output = session
+        .allocate_device_output_binding("y", DataType::Float32, vec![2], vec![2])
+        .expect("allocate persistent capture output");
+    let mut bindings = vec![input, output];
+    bindings[0]
+        .write_bytes(0, &f32_bytes(&[-1.0, 1.0]))
+        .expect("seed persistent capture input");
+    assert!(matches!(
+        session
+            .try_capture_with_device_bindings(&[], &mut bindings)
+            .expect("first specialization reaches a terminal outcome and captures"),
+        DeviceGraphCaptureResult::Captured(_)
+    ));
+    assert_eq!(session.captured_graph_segment_count(), 1);
+    assert_eq!(scoped_count(&finalizations, executor), 1);
+    assert_eq!(scoped_count(&terminal_outcomes, executor), 1);
+    assert_eq!(scoped_count(&executions, executor), 1);
+    assert_eq!(segment_replays.load(Ordering::SeqCst), 1);
+    assert_eq!(fast_replays.load(Ordering::SeqCst), 0);
+
+    let x4 = Tensor::from_f32(&[4], &[-1.0, 0.0, 1.0, 2.0]).unwrap();
+    let error = session
+        .run(&[("x", &x4)])
+        .expect_err("second specialization remains pending");
+    assert_artifacts_pending(error, executor, 2);
+    assert_eq!(scoped_count(&executions, executor), 1);
+    let error = session
+        .replay_device_graph(&mut bindings)
+        .expect_err("fast replay must not bypass pending readiness");
+    assert_artifacts_pending(error, executor, 2);
+    assert_eq!(
+        scoped_count(&finalizations, executor),
+        2,
+        "fast replay must not busy-retry a pending epoch"
+    );
+    assert_eq!(fast_replays.load(Ordering::SeqCst), 0);
+
+    let x8 = Tensor::from_f32(&[8], &[-1.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+    let error = session
+        .run(&[("x", &x8)])
+        .expect_err("third specialization fails finalization");
+    assert!(matches!(
+        error,
+        SessionError::ExecutionProviderArtifactFinalizationFailed {
+            executor: actual_executor,
+            readiness_epoch: 3,
+            ..
+        } if actual_executor == executor.get()
+    ));
+    let error = session
+        .replay_device_graph(&mut bindings)
+        .expect_err("fast replay must not bypass failed readiness");
+    assert!(matches!(
+        error,
+        SessionError::ExecutionProviderArtifactFinalizationFailed {
+            executor: actual_executor,
+            readiness_epoch: 3,
+            ..
+        } if actual_executor == executor.get()
+    ));
+    assert_eq!(
+        scoped_count(&finalizations, executor),
+        3,
+        "fast replay must not re-enter a failed epoch"
+    );
+    assert_eq!(scoped_count(&executions, executor), 1);
+    assert_eq!(fast_replays.load(Ordering::SeqCst), 0);
+
+    let x16 = Tensor::from_f32(
+        &[16],
+        &[
+            -1.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0,
+        ],
+    )
+    .unwrap();
+    session
+        .run(&[("x", &x16)])
+        .expect("fourth specialization reaches a terminal outcome");
+    assert_eq!(scoped_count(&finalizations, executor), 4);
+    assert_eq!(scoped_count(&terminal_outcomes, executor), 2);
+    assert_eq!(scoped_count(&executions, executor), 2);
+    assert!(
+        session
+            .replay_device_graph(&mut bindings)
+            .expect("ready authority permits the installed fast replay")
+    );
+    assert_eq!(fast_replays.load(Ordering::SeqCst), 1);
+
+    drop(session);
+    assert_eq!(scoped_count(&drains, executor), 1);
 }
 
 #[test]

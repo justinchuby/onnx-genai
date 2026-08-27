@@ -1014,6 +1014,12 @@ impl Executor {
                 "mixed-provider device-graph replay",
             ));
         }
+        // Fast replay bypasses the scoped runner, so it must consult the same
+        // executor-local authority that gates eager execution and capture.
+        // Pending, failed, or not-yet-finalized specializations are never
+        // permission to relaunch an older installed graph.
+        self.provider_artifact_readiness
+            .require_complete(self.ep.name(), self.instance_id)?;
         let external = self.prepare_external_bindings(bindings)?;
         let signature = Self::binding_signature(bindings);
         if self.cap().device_graph_signature.as_ref() != Some(&signature) {

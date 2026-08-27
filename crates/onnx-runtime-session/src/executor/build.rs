@@ -1002,8 +1002,7 @@ impl Executor {
             scan_inline_single_trip_enabled: scan_inline_single_trip_env_enabled(),
             scan_inline_single_trip_count: 0,
             kernel_bindings: vec![None; plan_len],
-            provider_artifact_state: ProviderArtifactState::Unfinalized,
-            provider_artifact_readiness_epoch: ExecutorArtifactReadinessEpoch::INITIAL,
+            provider_artifact_readiness: ProviderArtifactReadiness::default(),
             persistent_workspace: None,
             step_workspace: None,
             pin_step_workspace: false,
@@ -2206,73 +2205,30 @@ impl Executor {
         resolved: &HashMap<ValueId, Vec<usize>>,
     ) -> Result<()> {
         self.compile_ready_kernels(resolved)?;
-        let epoch = self.provider_artifact_readiness_epoch;
-        match &self.provider_artifact_state {
-            ProviderArtifactState::Complete { finalized_epoch } if *finalized_epoch == epoch => {
-                return Ok(());
-            }
-            ProviderArtifactState::Pending {
-                attempted_epoch,
-                pending,
-            } if *attempted_epoch == epoch => {
-                return Err(SessionError::ExecutionProviderArtifactsPending {
-                    provider: self.ep.name().to_string(),
-                    executor: self.instance_id.get(),
-                    readiness_epoch: epoch.get(),
-                    reason: pending.reason(),
-                });
-            }
-            ProviderArtifactState::Failed {
-                attempted_epoch,
-                reason,
-            } if *attempted_epoch == epoch => {
-                return Err(SessionError::ExecutionProviderArtifactFinalizationFailed {
-                    provider: self.ep.name().to_string(),
-                    executor: self.instance_id.get(),
-                    readiness_epoch: epoch.get(),
-                    reason: reason.clone(),
-                });
-            }
-            _ => {}
+        if !self.provider_artifact_readiness.needs_finalization() {
+            return self
+                .provider_artifact_readiness
+                .require_complete(self.ep.name(), self.instance_id);
         }
 
+        let epoch = self.provider_artifact_readiness.epoch();
         match self
             .ep
             .finalize_executor_artifacts(self.instance_id, &self.graph, epoch)
         {
             Ok(ExecutorArtifactFinalization::Complete) => {
-                self.provider_artifact_state = ProviderArtifactState::Complete {
-                    finalized_epoch: epoch,
-                };
-                Ok(())
+                self.provider_artifact_readiness.mark_complete();
             }
             Ok(ExecutorArtifactFinalization::Pending(pending)) => {
-                let reason = pending.reason();
-                self.provider_artifact_state = ProviderArtifactState::Pending {
-                    attempted_epoch: epoch,
-                    pending,
-                };
-                Err(SessionError::ExecutionProviderArtifactsPending {
-                    provider: self.ep.name().to_string(),
-                    executor: self.instance_id.get(),
-                    readiness_epoch: epoch.get(),
-                    reason,
-                })
+                self.provider_artifact_readiness.mark_pending(pending);
             }
             Err(error) => {
-                let reason = error.to_string();
-                self.provider_artifact_state = ProviderArtifactState::Failed {
-                    attempted_epoch: epoch,
-                    reason: reason.clone(),
-                };
-                Err(SessionError::ExecutionProviderArtifactFinalizationFailed {
-                    provider: self.ep.name().to_string(),
-                    executor: self.instance_id.get(),
-                    readiness_epoch: epoch.get(),
-                    reason,
-                })
+                self.provider_artifact_readiness
+                    .mark_failed(error.to_string());
             }
         }
+        self.provider_artifact_readiness
+            .require_complete(self.ep.name(), self.instance_id)
     }
 
     /// Compile every leaf kernel whose inputs are currently resolved.
@@ -2359,6 +2315,10 @@ impl Executor {
                 self.instance_id,
                 self.ep.as_ref(),
             )?;
+            self.provider_artifact_readiness
+                .advance_to(ExecutorArtifactReadinessEpoch::new(
+                    self.cache.stats().misses,
+                ));
             // Pre-populate the kernel binding so the first decode step already
             // hits the zero-alloc fast path for static-shape graphs.
             self.kernel_bindings[i] = Some(key);
@@ -2374,11 +2334,6 @@ impl Executor {
                     .with("cache_entries_before", cache_entries_before as u64)
                     .with("cache_entries_after", self.cache.stats().entries as u64),
             );
-        }
-        let compiled_generation = self.cache.stats().misses;
-        if compiled_generation > self.provider_artifact_readiness_epoch.get() {
-            self.provider_artifact_readiness_epoch =
-                ExecutorArtifactReadinessEpoch::new(compiled_generation);
         }
         Ok(())
     }
