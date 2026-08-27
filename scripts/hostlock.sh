@@ -76,7 +76,7 @@
 #                     default is never exported: every agent on a shared box
 #                     runs as the same unix user, so that would make every
 #                     lock read as ours. See #1929.
-#                     PREFER --owner. `status` reports how the name was
+#                     PREFER --owner. `provenance` reports how the name was
 #                     obtained as `held_owner_source=flag|env|user|unknown`,
 #                     and only `flag` is a name somebody chose for THIS run.
 #                     An inherited $HOSTLOCK_OWNER outlives the `run` that
@@ -1894,6 +1894,10 @@ cmd_status() {
         echo "legacy_held_by=$(flat_line "${legacy% *}")"
         if [ -d "$LOCK_DIR" ]; then
             echo "owner=$(meta_get owner || echo '?')"
+            # `owner` without this is the free-text half of the pair on its
+            # own, which is how a porcelain consumer inherits the very defect
+            # #2260 describes. Absent reads `unknown`, matching provenance.
+            echo "owner_source=$(meta_get owner_source || echo 'unknown')"
             echo "anchor_pid=$(meta_get anchor_pid || echo '?')"
             echo "reason=$(meta_get reason || echo '')"
             # `unknown` rather than empty for locks published before these

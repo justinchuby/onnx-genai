@@ -1138,6 +1138,17 @@ chk "a lock predating the key reports unknown, not a guess" \
 chk "and dropping the key did not disturb the name itself" \
     "$($HL provenance --oneline --expect-runnable 100000 | tr ' ' '\n' \
         | sed -n 's/^held_by=//p')" "${USER:-unknown}"
+# `status --porcelain` re-emits the attribution set for machine consumers, so
+# it must carry the qualifier too -- `owner` alone is exactly the free-text
+# half that #2260 is about, and a porcelain reader would inherit the defect.
+chk "porcelain reports unknown for a lock predating the key" \
+    "$($HL status --porcelain | sed -n 's/^owner_source=//p')" "unknown"
+cleanup
+$HL acquire --owner leon --ttl 600 --reason "porcelain" >/dev/null 2>&1
+chk "and porcelain reports a declared owner as declared" \
+    "$($HL status --porcelain | sed -n 's/^owner_source=//p')" "flag"
+chk "alongside the name it qualifies" \
+    "$($HL status --porcelain | sed -n 's/^owner=//p')" "leon"
 cleanup
 $HL acquire --owner leon --ttl 600 --reason "moe matrix" >/dev/null 2>&1
 row=$($HL provenance --oneline --expect-runnable 100000)
@@ -3695,10 +3706,10 @@ cleanup
 # Finally, pin the assertion count itself. Several of the checks in this file
 # sit behind environment probes, and an assertion that quietly stops running is
 # indistinguishable from one that passes -- which is the same failure mode as
-# the inert R1 block and the vacuous STALE arm that this PR exists to fix.
-# Every probe branch asserts something, so the total is invariant across
+# the inert R1 block and the vacuous STALE arm fixed in #1830. Every probe
+# branch asserts something, so the total is invariant across
 # environments; if a refactor drops a check, this fails and says so.
-chk "every assertion in this file ran" "$((pass + fail + 1))" "549"
+chk "every assertion in this file ran" "$((pass + fail + 1))" "552"
 
 echo
 echo "passed=${pass} failed=${fail}"
