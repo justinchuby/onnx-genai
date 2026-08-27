@@ -3,7 +3,9 @@
 //! Width is resolved in two ordered stages:
 //!
 //! 1. The affinity/logical-CPU capacity, `available_parallelism` quota, physical
-//!    core topology, and architecture cap produce one **global** worker budget.
+//!    core topology, placement policy, and architecture cap produce one
+//!    **global** worker budget. Compact keeps at least half the logical capacity
+//!    free; explicit spread may use one worker per physical core.
 //! 2. That budget is distributed across the usable NUMA nodes, then each fully
 //!    subscribed node gives up its configured service-core reserve.
 //!
@@ -13,7 +15,7 @@
 //! quota-limited or architecture-capped pool never saturates.
 
 use crate::core_topology::CoreTopology;
-use crate::decode_affinity::{NodeShard, NumaTopology};
+use crate::decode_affinity::{CorePlacement, NodeShard, NumaTopology};
 
 pub(crate) const DEFAULT_SERVICE_CPUS_PER_NUMA_NODE: usize = 1;
 
@@ -25,6 +27,7 @@ pub(crate) struct DefaultPoolWidthInputs<'a> {
     pub(crate) available_parallelism: usize,
     pub(crate) architecture_cap: Option<usize>,
     pub(crate) service_cpus_per_numa_node: usize,
+    pub(crate) placement: CorePlacement,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -89,7 +92,12 @@ pub(crate) fn resolve_default_pool_width(
             None => topology.core_count(),
         })
         .filter(|cores| *cores > 0);
-    let topology_width = physical_cores.unwrap_or_else(|| (logical_capacity / 2).max(1));
+    let shared_host_width = (logical_capacity / 2).max(1);
+    let topology_width = match (physical_cores, inputs.placement) {
+        (Some(cores), CorePlacement::Compact) => cores.min(shared_host_width),
+        (Some(cores), CorePlacement::Spread) => cores,
+        (None, _) => shared_host_width,
+    };
     let global_workers = inputs
         .architecture_cap
         .filter(|cap| *cap > 0)
@@ -207,6 +215,7 @@ mod tests {
         numa: Option<&'a NumaTopology>,
         available: usize,
         architecture_cap: Option<usize>,
+        placement: CorePlacement,
     ) -> DefaultPoolWidthPlan {
         resolve_default_pool_width(DefaultPoolWidthInputs {
             allowed_cpus: allowed,
@@ -215,21 +224,44 @@ mod tests {
             available_parallelism: available,
             architecture_cap,
             service_cpus_per_numa_node: DEFAULT_SERVICE_CPUS_PER_NUMA_NODE,
+            placement,
         })
         .expect("the table only contains non-zero hosts")
     }
 
     #[test]
-    fn unconstrained_four_node_x86_realizes_92_workers_from_96() {
+    fn placement_controls_whether_a_no_smt_cpuset_keeps_shared_host_headroom() {
         let allowed: Vec<usize> = (0..96).collect();
         let cores = no_smt(96);
         let four_nodes = numa((0..4).map(|node| (node, (node * 24..(node + 1) * 24).collect())));
-        let plan = plan(Some(&allowed), Some(&cores), Some(&four_nodes), 96, None);
-        assert_eq!(plan.global_workers, 96);
+        let compact = plan(
+            Some(&allowed),
+            Some(&cores),
+            Some(&four_nodes),
+            96,
+            None,
+            CorePlacement::Compact,
+        );
+        assert_eq!(compact.global_workers, 48);
         assert_eq!(
-            plan.realized_workers(),
+            compact.realized_workers(),
+            48,
+            "the shared-host policy must leave half of a one-CPU-per-core cpuset free"
+        );
+
+        let spread = plan(
+            Some(&allowed),
+            Some(&cores),
+            Some(&four_nodes),
+            96,
+            None,
+            CorePlacement::Spread,
+        );
+        assert_eq!(spread.global_workers, 96);
+        assert_eq!(
+            spread.realized_workers(),
             92,
-            "four fully subscribed 24-core nodes reserve four service CPUs"
+            "explicit spread preserves the dedicated-host width, less one service CPU per node"
         );
     }
 
@@ -239,7 +271,7 @@ mod tests {
         let cores = no_smt(96);
         let four_nodes = numa((0..4).map(|node| (node, (node * 24..(node + 1) * 24).collect())));
         let cases = [
-            ("quota-below-topology", 4, None, 4, 4),
+            ("quota-below-topology", 4, None, 2, 2),
             ("quota-one", 1, None, 1, 1),
             ("linux-aarch64-over-eight", 96, Some(8), 8, 8),
         ];
@@ -250,6 +282,7 @@ mod tests {
                 Some(&four_nodes),
                 available,
                 cap,
+                CorePlacement::Compact,
             );
             assert_eq!(plan.global_workers, global, "{name}: global clamp");
             assert_eq!(plan.realized_workers(), realized, "{name}: NUMA reserve");
@@ -261,12 +294,19 @@ mod tests {
         let allowed: Vec<usize> = (0..6).collect();
         let cores = no_smt(6);
         let two_nodes = numa([(0, (0..3).collect()), (1, (3..6).collect())]);
-        let plan = plan(Some(&allowed), Some(&cores), Some(&two_nodes), 6, Some(8));
-        assert_eq!(plan.global_workers, 6);
+        let plan = plan(
+            Some(&allowed),
+            Some(&cores),
+            Some(&two_nodes),
+            6,
+            Some(8),
+            CorePlacement::Compact,
+        );
+        assert_eq!(plan.global_workers, 3);
         assert_eq!(
             plan.realized_workers(),
-            4,
-            "the <=8 global width is preserved, then two fully subscribed nodes reserve one each"
+            3,
+            "the architecture ceiling must not inflate the shared-host half-capacity budget"
         );
     }
 
@@ -275,7 +315,14 @@ mod tests {
         let allowed: Vec<usize> = (0..8).collect();
         let cores =
             CoreTopology::from_sibling_groups((0..4).map(|core| vec![core * 2, core * 2 + 1]));
-        let plan = plan(Some(&allowed), Some(&cores), None, 8, Some(8));
+        let plan = plan(
+            Some(&allowed),
+            Some(&cores),
+            None,
+            8,
+            Some(8),
+            CorePlacement::Compact,
+        );
         assert_eq!(
             plan.global_workers, 4,
             "the architecture ceiling must not inflate a four-physical-core topology to eight"
@@ -293,9 +340,16 @@ mod tests {
         ]);
         let nodes = numa([(0, vec![0, 1, 2, 3]), (1, vec![100, 101, 102, 103])]);
         let allowed = [1, 2, 101, 103];
-        let plan = plan(Some(&allowed), Some(&cores), Some(&nodes), 4, None);
+        let plan = plan(
+            Some(&allowed),
+            Some(&cores),
+            Some(&nodes),
+            4,
+            None,
+            CorePlacement::Compact,
+        );
         assert_eq!(plan.physical_cores, Some(4));
-        assert_eq!(plan.global_workers, 4);
+        assert_eq!(plan.global_workers, 2);
         assert_eq!(plan.realized_workers(), 2);
         let DefaultPoolDisposition::Pool(layout) = plan.disposition else {
             panic!("a four-CPU sparse mask must build a pool");
@@ -309,9 +363,16 @@ mod tests {
         let allowed: Vec<usize> = (0..10).collect();
         let cores = no_smt(10);
         let nodes = numa([(0, vec![0, 1]), (1, (2..10).collect())]);
-        let plan = plan(Some(&allowed), Some(&cores), Some(&nodes), 10, None);
-        assert_eq!(plan.global_workers, 10);
-        assert_eq!(plan.realized_workers(), 6);
+        let plan = plan(
+            Some(&allowed),
+            Some(&cores),
+            Some(&nodes),
+            10,
+            None,
+            CorePlacement::Compact,
+        );
+        assert_eq!(plan.global_workers, 5);
+        assert_eq!(plan.realized_workers(), 3);
         let DefaultPoolDisposition::Pool(layout) = plan.disposition else {
             panic!("a two-node host must build a split pool");
         };
@@ -321,14 +382,14 @@ mod tests {
                 .iter()
                 .map(|shard| shard.workers)
                 .collect::<Vec<_>>(),
-            vec![1, 5]
+            vec![1, 2]
         );
     }
 
     #[test]
     fn unknown_topology_keeps_the_historical_half_logical_fallback() {
         let allowed: Vec<usize> = (0..16).collect();
-        let plan = plan(Some(&allowed), None, None, 16, None);
+        let plan = plan(Some(&allowed), None, None, 16, None, CorePlacement::Compact);
         assert_eq!(plan.physical_cores, None);
         assert_eq!(plan.global_workers, 8);
         assert_eq!(plan.realized_workers(), 8);
@@ -338,7 +399,14 @@ mod tests {
     fn single_cpu_affinity_is_an_explicit_flat_fallback() {
         let allowed = [7];
         let cores = CoreTopology::from_sibling_groups([vec![7]]);
-        let plan = plan(Some(&allowed), Some(&cores), None, 1, None);
+        let plan = plan(
+            Some(&allowed),
+            Some(&cores),
+            None,
+            1,
+            None,
+            CorePlacement::Compact,
+        );
         assert_eq!(plan.global_workers, 1);
         assert_eq!(plan.realized_workers(), 0);
         assert_eq!(plan.disposition, DefaultPoolDisposition::FlatSingleCpu);

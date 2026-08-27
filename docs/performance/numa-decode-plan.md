@@ -52,6 +52,13 @@ Modes:
   whose CPU count covers `ONNX_GENAI_CPU_DECODE_THREADS`, so the per-op
   fork-join barrier and the first-touched packed int4 weights stay node-local.
 - `node:<index>` -- pin to a named NUMA node; an unknown index is a clear error.
+- `numa-split` -- explicitly build node-local sub-pools across all usable NUMA
+  nodes.
+
+For the persistent SPMD pool, explicit `off` creates workers without invoking
+the per-worker affinity setter or read-back API. Their kernel affinity masks
+remain exactly the masks inherited from the creating process (including any
+external `taskset`/cgroup restriction).
 
 Because the packed int4 decode weights are lazily first-touched inside the
 `with_decode_pool_scope` installation (on a pinned worker), they land on the
@@ -75,12 +82,15 @@ bit-identical with and without pinning (it only changes placement, not math).
 `ONNX_GENAI_CPU_DECODE_PLACEMENT` selects how the workers are arranged inside
 that set. The two are orthogonal and can be combined.
 
-- unset / `spread` -- **default**. Worker `i` takes a distinct physical core for
-  as long as cores last, only then doubling up on SMT siblings. Fastest on a
-  host the process has to itself.
-- `compact` -- SMT siblings are filled before the next core is used, so an
-  N-worker pool occupies about `N / siblings` physical cores and leaves the rest
-  of the machine to a co-tenant.
+- unset / `compact` -- **shared-host default**. SMT siblings are filled before
+  the next core is used, so an N-worker pool occupies about `N / siblings`
+  physical cores. The automatic pool width is also capped at half the process's
+  logical CPU capacity, so a one-CPU-per-core `taskset` still leaves physical
+  cores free for a co-tenant.
+- `spread` -- explicit dedicated-host opt-in. Worker `i` takes a distinct
+  physical core for as long as cores last, only then doubling up on SMT
+  siblings; its automatic width may use every allowed physical core (subject to
+  the existing dispatcher/service-core reserve).
 
 Neither is universally better, which is why it is a selector and not a constant.
 Measured with four DRAM-bandwidth hogs on a 16-core/32-thread host, `compact`
@@ -88,10 +98,9 @@ ran 4.54 ms/token against `spread`'s 5.03--6.26; with eight hogs covering both
 halves the ranking inverts (`compact` 15.92 against `spread` 6.08). The full
 table is in `crates/onnx-runtime-ep-cpu/src/core_topology.rs`'s module docs.
 
-An unrecognized value is reported on stderr once and then treated as `spread`,
-rather than refusing to decode: unlike `ONNX_GENAI_CPU_DECODE_AFFINITY`, which
-decides which CPUs the process may touch, this knob only ranks a set already
-chosen, so a misspelling must not be fatal. It is never silent.
+An unrecognized value is a configuration error. CPU EP initialization fails
+with a diagnostic that names the variable, rejected value, and accepted modes;
+it never silently selects either policy.
 
 Because the ordering is only a ranking of a permitted set, both values are
 permutations of the same CPU list: no placement policy can widen or shrink the
@@ -159,15 +168,17 @@ itself is portable `std` atomics + `thread::park`; only the optional CPU pinning
 is platform-specific and best-effort.
 
 Default worker count (Rule 2, topology-derived): when
-`ONNX_GENAI_CPU_DECODE_THREADS` is unset the persistent pool uses **half the
-logical CPUs** (at least one), *not* the flat pool's eight-worker ceiling. The
-flat pool caps at eight because its per-op fork/join regresses beyond that; the
-persistent pool replaces that fork/join with one hot broadcast barrier, so it
-keeps scaling with cores until the memory-bandwidth knee. Half leaves a full set
-of hardware threads free for the dispatcher (which runs the forward inline and
-spins on the completion counters), prefill's global pool, and co-tenants -- a
-*fully*-subscribed spinning pool starves the dispatcher and collapses (measured
-below). An explicit `ONNX_GENAI_CPU_DECODE_THREADS` is always honored.
+`ONNX_GENAI_CPU_DECODE_THREADS` is unset, shared-host `compact` uses at most
+**half the logical CPU capacity** (at least one), *not* the flat pool's
+eight-worker ceiling. Explicit `spread` may instead use one worker per allowed
+physical core. The flat pool caps at eight because its per-op fork/join regresses
+beyond that; the persistent pool replaces that fork/join with one hot broadcast
+barrier, so it keeps scaling with cores until the memory-bandwidth knee. The
+compact cap leaves scheduler capacity free for the dispatcher (which runs the
+forward inline and spins on the completion counters), prefill's global pool, and
+co-tenants -- a *fully*-subscribed spinning pool starves the dispatcher and
+collapses (measured below). An explicit `ONNX_GENAI_CPU_DECODE_THREADS` is always
+honored.
 
 Decode strategy precedence is explicit (Rule 5): **explicit `numa-split` env >
 persistent SPMD (default, unless an explicit non-`numa-split` affinity defers it)
