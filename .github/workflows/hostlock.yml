@@ -85,6 +85,10 @@ on:
     paths:
       - "scripts/hostlock.sh"
       - "scripts/hostlock_test.sh"
+      # `hostcensus.sh` answers the half of "is the host free" that the lock
+      # cannot: load running outside it. Same job, same path-filter argument.
+      - "scripts/hostcensus.sh"
+      - "scripts/hostcensus_test.sh"
       # The whole directory, not the drivers we happen to know about: the
       # conformance check below exists to catch a *new* harness, and a path
       # filter listing today's files would skip the job for exactly the file
@@ -101,6 +105,10 @@ on:
     paths:
       - "scripts/hostlock.sh"
       - "scripts/hostlock_test.sh"
+      # `hostcensus.sh` answers the half of "is the host free" that the lock
+      # cannot: load running outside it. Same job, same path-filter argument.
+      - "scripts/hostcensus.sh"
+      - "scripts/hostcensus_test.sh"
       # The whole directory, not the drivers we happen to know about: the
       # conformance check below exists to catch a *new* harness, and a path
       # filter listing today's files would skip the job for exactly the file
@@ -124,7 +132,7 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: shellcheck
-        run: shellcheck scripts/hostlock.sh scripts/hostlock_test.sh
+        run: shellcheck scripts/hostlock.sh scripts/hostlock_test.sh scripts/hostcensus.sh scripts/hostcensus_test.sh
 
       # The suite pins its own total (`every assertion in this file ran`), so a
       # refactor that silently drops assertions fails here rather than passing
@@ -132,6 +140,15 @@ jobs:
       # trusted to mean what its name says.
       - name: Conformance suite
         run: bash scripts/hostlock_test.sh
+
+      # The census is the lock's blind spot made visible: `hostlock.sh status`
+      # reports the holder, and can say nothing at all about a saturating job
+      # running outside it. Its suite pins its own total the same way, and its
+      # load cells are the ones that matter -- a census stuck at
+      # `active_cores=0.000` passes every argument-parsing assertion and
+      # certifies every contended host as free.
+      - name: Census conformance
+        run: bash scripts/hostcensus_test.sh
 
       # The admission gate in the A/B driver is lock conformance one layer up:
       # it is what makes the outer harness hold the lock across every arm

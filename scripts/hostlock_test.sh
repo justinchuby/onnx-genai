@@ -82,7 +82,7 @@ HL=${HOSTLOCK_SCRIPT_ABS:-scripts/hostlock.sh}
 pass=0
 fail=0
 
-cleanup() { rm -rf "$LOCK" "$LOCK".ctl "$LOCK".ctl2 "$LOCK".ctlr "$LOCK".ctlfw "$LOCK".ctlconf "$LOCK".ctlbox "$LOCK".ctlbox.legacy "$LOCK".ctlprobe "$LOCK".ctlok "$LOCK".ctlu "$LOCK".len "$LOCK".cpuself "$LOCK".reaper "$LOCK".reaper.stage.* "$LOCK".reaper.dead.* "$LOCK".reaper.rel.* "$LOCK".dead.* "$LOCK".stage.* "$LOCK".gate "$LOCK".warn "$LOCK".zombie.* "$LOCK".zpid "$LOCK".ttlmarker "$LOCK".ran "$LOCK".conf "$LOCK".legacy "$LOCK".box "$LOCK".sourced "$LOCK".legacyran "$LOCK".owner "$LOCK".nested "$LOCK".ro "$LOCK".deep "$LOCK".file "$LOCK".nox "$LOCK".conf2 "$LOCK".helpconf "$LOCK".helppoison "$LOCK".wait "$LOCK".grandchild "$LOCK".stubborn 2>/dev/null; }
+cleanup() { rm -rf "$LOCK" "$LOCK".ctl "$LOCK".ctl2 "$LOCK".ctlr "$LOCK".ctlfw "$LOCK".ctlconf "$LOCK".ctlbox "$LOCK".ctlbox.legacy "$LOCK".ctllc "$LOCK".ctlprobe "$LOCK".ctlok "$LOCK".ctlu "$LOCK".len "$LOCK".cpuself "$LOCK".reaper "$LOCK".reaper.stage.* "$LOCK".reaper.dead.* "$LOCK".reaper.rel.* "$LOCK".dead.* "$LOCK".stage.* "$LOCK".gate "$LOCK".warn "$LOCK".zombie.* "$LOCK".zpid "$LOCK".ttlmarker "$LOCK".ran "$LOCK".conf "$LOCK".legacy "$LOCK".box "$LOCK".sourced "$LOCK".legacyran "$LOCK".owner "$LOCK".nested "$LOCK".ro "$LOCK".deep "$LOCK".file "$LOCK".nox "$LOCK".conf2 "$LOCK".helpconf "$LOCK".helppoison "$LOCK".wait "$LOCK".grandchild "$LOCK".stubborn 2>/dev/null; }
 trap cleanup EXIT
 
 chk() {
@@ -1090,7 +1090,7 @@ echo "-- R2: emitted rows carry identity, state and occupancy --"
 cleanup
 $HL acquire --owner leon --ttl 600 --reason "moe matrix" >/dev/null 2>&1
 row=$($HL provenance --oneline --expect-runnable 100000)
-for field in hostlock_state declared held_by held_uid held_pid held_secs takeover gate runnable_at_acquire runnable contended sampled_at; do
+for field in hostlock_state declared held_by held_owner_source held_uid held_pid held_secs takeover gate runnable_at_acquire runnable contended sampled_at; do
     chk "the row carries $field" \
         "$(echo "$row" | tr ' ' '\n' | grep -c "^${field}=")" "1"
 done
@@ -1098,6 +1098,60 @@ chk "the row's state is the real state" \
     "$(echo "$row" | tr ' ' '\n' | sed -n 's/^hostlock_state=//p')" "HELD"
 chk "the row's owner is the real owner" \
     "$(echo "$row" | tr ' ' '\n' | sed -n 's/^held_by=//p')" "leon"
+# ...and it says HOW that name was obtained, which is what decides whether it
+# can be believed. `--owner` is a name somebody chose for THIS run; an
+# inherited $HOSTLOCK_OWNER may name whoever exported it, arbitrarily long ago,
+# because `run` exports it to the wrapped command and the export outlives the
+# run. That is not hypothetical: two archived benchmark datasets are stamped
+# `held_by=roy` while their kernel-read `worktree` and `cmd` fields name a
+# different agent's worktree and command line. Nothing in the row contradicted
+# the wrong name, since `declared=yes` holds for both and every agent here
+# shares one unix account, so `held_uid` corroborates either equally.
+chk "the row says the owner was declared on the command line" \
+    "$(echo "$row" | tr ' ' '\n' | sed -n 's/^held_owner_source=//p')" "flag"
+cleanup
+# An INHERITED name must be reported as inherited. If this reported `flag` the
+# field would be worthless -- it exists only to separate these two cases.
+env_row=$(HOSTLOCK_OWNER=roy $HL acquire --ttl 600 --reason "inherited" >/dev/null 2>&1; \
+    $HL provenance --oneline --expect-runnable 100000)
+chk "an inherited HOSTLOCK_OWNER still names its holder" \
+    "$(echo "$env_row" | tr ' ' '\n' | sed -n 's/^held_by=//p')" "roy"
+chk "but the row marks that name as inherited, not chosen" \
+    "$(echo "$env_row" | tr ' ' '\n' | sed -n 's/^held_owner_source=//p')" "env"
+cleanup
+# The $USER fallback names a shared ACCOUNT, not an agent, so it is its own
+# case and must not masquerade as either of the two above.
+user_row=$(env -u HOSTLOCK_OWNER "$HL" acquire --ttl 600 --reason "default" >/dev/null 2>&1; \
+    env -u HOSTLOCK_OWNER "$HL" provenance --oneline --expect-runnable 100000)
+chk "an undeclared owner is reported as the account default" \
+    "$(echo "$user_row" | tr ' ' '\n' | sed -n 's/^held_owner_source=//p')" "user"
+chk "and it names the unix account it fell back to" \
+    "$(echo "$user_row" | tr ' ' '\n' | sed -n 's/^held_by=//p')" "${USER:-unknown}"
+# A lock written before this key existed must read `unknown`. Answering `user`
+# would assert the most trustworthy of the three provenances about a row whose
+# name may well have been inherited -- the exact mislabelling the key exists to
+# expose, moved out of the console and into the data.
+sed -i '/^owner_source=/d' "$LOCK/meta"
+chk "a lock predating the key reports unknown, not a guess" \
+    "$($HL provenance --oneline --expect-runnable 100000 | tr ' ' '\n' \
+        | sed -n 's/^held_owner_source=//p')" "unknown"
+chk "and dropping the key did not disturb the name itself" \
+    "$($HL provenance --oneline --expect-runnable 100000 | tr ' ' '\n' \
+        | sed -n 's/^held_by=//p')" "${USER:-unknown}"
+# `status --porcelain` re-emits the attribution set for machine consumers, so
+# it must carry the qualifier too -- `owner` alone is exactly the free-text
+# half that #2260 is about, and a porcelain reader would inherit the defect.
+chk "porcelain reports unknown for a lock predating the key" \
+    "$($HL status --porcelain | sed -n 's/^owner_source=//p')" "unknown"
+cleanup
+$HL acquire --owner leon --ttl 600 --reason "porcelain" >/dev/null 2>&1
+chk "and porcelain reports a declared owner as declared" \
+    "$($HL status --porcelain | sed -n 's/^owner_source=//p')" "flag"
+chk "alongside the name it qualifies" \
+    "$($HL status --porcelain | sed -n 's/^owner=//p')" "leon"
+cleanup
+$HL acquire --owner leon --ttl 600 --reason "moe matrix" >/dev/null 2>&1
+row=$($HL provenance --oneline --expect-runnable 100000)
 # `held_by` is self-declared free text: `--owner roy` from my shell produces a
 # row that says roy. The only identity the kernel vouches for is the anchor's
 # uid, so a published row must carry that too, and it must be the REAL uid --
@@ -2255,7 +2309,7 @@ chk "and the row still parses back to the state it physically carries" \
 # Categorical, and the strongest cell here: a forged row cannot be the same
 # width as a clean one. This is immune to any question about which field the
 # injection happened to target.
-fw_clean_nf=17
+fw_clean_nf=18
 chk "and the field count is unchanged by the injection" \
     "$(echo "$fw_row" | awk '{print NF}')" "$fw_clean_nf"
 # Not destroyed -- relocated to where the newline is the delimiter. Whoever is
@@ -3879,13 +3933,71 @@ chk "and a 64-character owner is still accepted, so the bound does not cry wolf"
         && echo ok || echo refused)" "ok"
 rm -rf "$LOCK.len"
 
+# `has_ctrl` pins `LC_ALL=C`, and nothing observed the pin. The battery caught
+# every other guard in this block and this one survived, which is the whole
+# argument for keeping a mutation harness: the mutant that lives is the cell
+# you did not write.
+#
+# Why the pin exists. `[[:cntrl:]]` follows the CALLER's locale, and in a
+# single-byte locale the bytes 0x80-0x9F ARE control characters -- while in
+# UTF-8 those same bytes are ordinary CONTINUATION bytes. Unpinned, a worktree
+# path like `naive/kanji` is clean on one agent's box and `@malformed` on
+# another's, and the verdict depends on an environment variable nobody set on
+# purpose. The C1 range is therefore excluded deliberately (the header contract
+# says so), and the pin is what makes that exclusion hold everywhere.
+#
+# Driven through a foreign-written `meta`, because that is where an unvalidated
+# byte can still arrive: this version refuses C1 on the way IN, so the only way
+# to observe the read-side classification is a file this version did not write.
+ctl_lc="$LOCK.ctllc"
+rm -rf "$ctl_lc"; mkdir -p "$ctl_lc"
+# `\302\200` is U+0080 in UTF-8: two bytes, neither of them a control
+# character under LC_ALL=C, both of them part of one control CHARACTER under a
+# UTF-8 locale. That disagreement is precisely what the pin removes.
+ctl_c1=$(printf 'peer\302\200name')
+printf 'owner=%s\nanchor_pid=1\nstart_time=1\nacquired_epoch=%s\nttl=60\nreason=r\n' \
+    "$ctl_c1" "$(date +%s)" >"$ctl_lc/meta"
+ctl_lc_c=$(LC_ALL=C HOSTLOCK_DIR="$ctl_lc" HOSTLOCK_PRIVATE_OK=1 \
+    "$HL" status --porcelain 2>/dev/null | sed -n 's/^owner=//p')
+# glibc 2.35+ always provides C.utf8 and `ubuntu-latest` is well past that, so
+# this is not an environment probe that can silently skip; if the locale is
+# missing the comparison still runs and the cell reports it rather than
+# vanishing -- an assertion that stops running is the failure mode this file's
+# closing count exists to catch.
+ctl_u8=$(locale -a 2>/dev/null | grep -ix -m1 'c\.utf-\?8' || echo C.utf8)
+ctl_lc_u=$(LC_ALL="$ctl_u8" HOSTLOCK_DIR="$ctl_lc" HOSTLOCK_PRIVATE_OK=1 \
+    "$HL" status --porcelain 2>/dev/null | sed -n 's/^owner=//p')
+chk "a foreign owner is classified the same under C and under a UTF-8 locale" \
+    "$ctl_lc_c" "$ctl_lc_u"
+# And states which way it was decided, so the cell above cannot pass by both
+# legs being equally mangled.
+chk "and the C1 range is excluded rather than encoded, as the contract says" \
+    "$ctl_lc_c" "$ctl_c1"
+
+# `owner_source` (#2261) arrived after this block was written and is read back
+# through the same `meta_get`, so it inherits the same threat model as
+# `held_by`: the four literals are written here, but the value in the row comes
+# out of a file a peer may have written with an older checkout. A provenance
+# key that can rewrite the line it substantiates is the worst place to leave
+# the gap.
+printf 'owner=peer\nowner_source=%s\nanchor_pid=1\nstart_time=1\nacquired_epoch=%s\nttl=60\nreason=r\n' \
+    "$(printf 'flag\033[2K\033[1000Dhostlock_state=FREE')" "$(date +%s)" >"$ctl_lc/meta"
+ctl_lc_os=$(HOSTLOCK_DIR="$ctl_lc" HOSTLOCK_PRIVATE_OK=1 "$HL" status --porcelain 2>/dev/null)
+chk "a foreign owner_source cannot carry an escape into the porcelain" \
+    "$(printf '%s\n' "$ctl_lc_os" | grep -c "$(printf '\033')")" "0"
+# The value must still be RECOVERABLE -- encoded inertly, not dropped, so an
+# operator can see what the peer actually wrote.
+chk "and the owner_source it carried is still recoverable, not discarded" \
+    "$(printf '%s\n' "$ctl_lc_os" | sed -n 's/^owner_source=//p' | grep -c 'flag')" "1"
+rm -rf "$ctl_lc"
+
 # Finally, pin the assertion count itself. Several of the checks in this file
 # sit behind environment probes, and an assertion that quietly stops running is
 # indistinguishable from one that passes -- which is the same failure mode as
-# the inert R1 block and the vacuous STALE arm that this PR exists to fix.
-# Every probe branch asserts something, so the total is invariant across
+# the inert R1 block and the vacuous STALE arm fixed in #1830. Every probe
+# branch asserts something, so the total is invariant across
 # environments; if a refactor drops a check, this fails and says so.
-chk "every assertion in this file ran" "$((pass + fail + 1))" "565"
+chk "every assertion in this file ran" "$((pass + fail + 1))" "580"
 
 echo
 echo "passed=${pass} failed=${fail}"

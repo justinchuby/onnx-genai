@@ -168,14 +168,58 @@ pub const CHUNK_PERMUTATION_ENV: &str = "ONNX_GENAI_CPU_DECODE_CHUNK_PERMUTATION
 /// on a futex once genuinely idle for longer than the window. This is the gold
 /// standard for exactly this OMP-style fine-grained fork/join HPC workload.
 ///
+/// The window's *first-order* claim is measured and holds: it eliminates
+/// parking during a generation. At width 16 the average worker parks a median
+/// of **0.533** times per launch at the shipped 500 us, and **345.9** times
+/// with the window removed (`--blocktime 0`), per
+/// `benches/acc0_w16_worker_split.py`, 7 trusted launches per arm.
+///
+/// Its *second-order* claim did not survive measurement and has been removed.
+/// This comment used to say parking on every barrier would "tank throughput".
+/// Parking on essentially every barrier -- those 345.9 parks -- costs **2.2% of
+/// the window** in wake latency at width 16, with a profiler exposing it
+/// (`wake_frac` 0.022 at blocktime 0, 0.014 at 500 us), and the pre-registered
+/// `WAKE-BOUND` verdict does **not** fire at either blocktime.
+///
+/// Nor is the throughput half a cliff. `docs/performance/CPU_MATMUL_ASSIGNMENT.md`
+/// already records removing the ramp as throughput-neutral at t=16 -- ratio
+/// 0.9960 against a **5.24% A/A null**, which is the control that makes it a
+/// result -- and my own unprofiled paired A/B agrees at t=2 (0.996, range
+/// [0.960, 1.013] over 7 paired reps). At t=8 and t=16 my ratios straddle 1.0
+/// and I ran no A/A null in that batch, so they resolve nothing either way.
+///
+/// What is genuinely unmeasured is the case the window exists for. Every
+/// result above is a **zero-gap** decode loop, exactly where parking looks
+/// falsely free because the next op is always already there. The window's
+/// justification is inter-token gaps, and no measurement here has any.
+///
+/// So the window is retained on the evidence that exists -- it costs ~5-8% of
+/// pool width in permanently-occupied cores (~1.3 cores at width 16, #2071)
+/// and buys a wake term that is small but real -- and **not** on a throughput
+/// cliff, which the zero-gap evidence positively contradicts. Changing
+/// [`DEFAULT_BLOCKTIME`] needs the gap-distribution and concurrent-session arms
+/// of #2071 and #1395's gap-aware harness; a reader reaching for this comment
+/// as a reason not to re-measure should not find one. Corrected data and
+/// method: #2245, and
+/// `docs/benchmarks/2026-08-26-acc0-w16-baseline-correction.md` once it lands.
+///
+/// The behavioural half is asserted mechanically, without timing, by
+/// `an_idle_gap_far_longer_than_the_blocktime_parks_the_workers` and the
+/// `spin_hits + parks == dispatches * workers` identity on [`SpmdCounters`].
+/// The complementary direction -- back-to-back dispatches never park -- is
+/// deliberately *not* a test, because a descheduled worker's window expires
+/// off-CPU and it would fail on a loaded runner. The 0.533 above is the
+/// out-of-band substitute for it, and it is a median over launches of a mean
+/// over workers, not a bound.
+///
 /// The window is **load-bearing, not a bad habit**: decode fires ~400 fork/join
 /// barriers per token, microseconds apart, so a worker must catch the next
-/// barrier while spinning. Parking inside the active path would pay a futex wake
-/// (~1-5 us) on every barrier and tank throughput. The window is sized to span
-/// the inter-op / inter-token gaps of tight decode (so workers effectively never
-/// park mid-generation) yet expire quickly once a generation ends, so idle CPU
-/// returns to ~0 between requests -- the spin is bounded to genuinely-active
-/// decode, not "unconditional". Tunable via [`decode_blocktime`].
+/// barrier while spinning. The window is sized to span the inter-op /
+/// inter-token gaps of tight decode (so workers effectively never park
+/// mid-generation -- the 0.533 above) yet expire quickly once a generation
+/// ends, so idle CPU returns to ~0 between requests -- the spin is bounded to
+/// genuinely-active decode, not "unconditional". Tunable via
+/// [`decode_blocktime`].
 ///
 /// Default 500 us: comfortably longer than the ~microsecond inter-op gap and the
 /// serial dispatcher glue between barriers, and shorter than any human-scale idle

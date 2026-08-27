@@ -61,6 +61,7 @@ pub(crate) mod device_argmax;
 pub(crate) mod device_token_writer;
 pub mod dft;
 pub mod dropout;
+pub mod dsa_index_select;
 pub mod elementwise;
 pub mod expert_route_telemetry;
 mod flash_attention;
@@ -206,6 +207,7 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "SparseKvGather",
     "CompressedSparseAttention",
     "IndexShare",
+    "DsaIndexSelect",
     "KvCacheCapacityAppend",
     "PackedVarlenAttention",
     "VarlenAttention",
@@ -551,6 +553,7 @@ pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [Da
         | ("VarlenAttention", _)
         | ("CompressedSparseAttention", _)
         | ("SparseKvGather", _)
+        | ("DsaIndexSelect", _)
         | ("LinearAttention", _) => CUDA_ATTENTION_DTYPES,
 
         // Byte-mover / structural ops: dtype-agnostic (copy/select, no
@@ -1165,6 +1168,12 @@ pub fn build_cuda_registry_with_metrics(
     reg.register(
         OpKey::new("IndexShare", "pkg.nxrt", 1),
         Box::new(index_share::IndexShareFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("DsaIndexSelect", "pkg.nxrt", 1),
+        Box::new(dsa_index_select::DsaIndexSelectFactory {
             runtime: runtime.clone(),
         }),
     );
