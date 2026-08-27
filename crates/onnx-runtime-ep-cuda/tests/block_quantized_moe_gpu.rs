@@ -12,15 +12,13 @@
     clippy::err_expect,
     clippy::clone_on_copy
 )]
-//! GPU parity regressions for the frozen `pkg.nxrt::BlockQuantizedMoE` v1 op.
+//! GPU parity regressions for the mixed-projection `pkg.nxrt::BlockQuantizedMoE` op.
 //!
-//! Every case builds small synthetic block-quantized MoE tensors (mxfp4-packed
-//! expert weights), runs the CPU reference kernel as the parity oracle, and
-//! asserts the CUDA `BlockQuantizedMoE` kernel reproduces it within tolerance.
-//! The suite covers multiple experts, top-k routing (`k=1` and `k>1`), a single
-//! expert, optional biases, router-weight aggregation, and the relu/gelu/silu/
-//! identity/swiglu activation paths (fused and unfused). CPU-only CI reports
-//! these as ignored unless `gpu-tests` is enabled.
+//! Synthetic cases cover every supported mixed GLM projection pair and use the
+//! CPU kernel as the independent oracle. Opt-in tests also read official
+//! checkpoint blocks in place, exercise capture/replay, and measure exact-shape
+//! selected-expert execution. CPU-only CI reports GPU cases as ignored unless
+//! `gpu-tests` is enabled.
 
 use onnx_runtime_ep_api::{
     DeviceBuffer, DevicePtr, DevicePtrMut, ExecutionProvider, KernelMatch, TensorMetadata,
@@ -33,11 +31,10 @@ use onnx_runtime_ir::{
     Attribute, DataType, DeviceId, Graph, Node, NodeId, compute_contiguous_strides, static_shape,
 };
 use onnx_runtime_loader::Model;
+use std::io::{Read, Seek, SeekFrom};
 
 const DOMAIN: &str = "pkg.nxrt";
 const FORMAT: &str = "mxfp4";
-const QK: usize = 32;
-const BLOCK_BYTES: usize = 17;
 
 #[derive(Clone)]
 struct HostTensor {
@@ -90,26 +87,82 @@ fn uniform(state: &mut u64, low: f32, high: f32) -> f32 {
     low + (random_u32(state) as f32 / u32::MAX as f32) * (high - low)
 }
 
-/// mxfp4-packs one `[experts, out_features, ceil(in_features/32), 17]` projection.
-///
-/// Each 17-byte block stores an E8M0 scale exponent in byte 0 followed by 16
-/// bytes of packed fp4 codes. The exponent is kept in a tame range so the
-/// two-layer expert math stays well within f32 dynamic range.
-fn pack_projection(
+fn format_info(format: &str) -> (usize, usize) {
+    match format {
+        "mxfp4" => (32, 17),
+        "iq1_s" => (256, 50),
+        "iq2_xxs" => (256, 66),
+        "iq3_xxs" => (256, 98),
+        "iq4_xs" => (256, 136),
+        "q2_k" => (256, 84),
+        "q3_k" => (256, 110),
+        "q5_k" => (256, 176),
+        "q6_k" => (256, 210),
+        "q8_0" => (32, 34),
+        other => panic!("unknown test format {other}"),
+    }
+}
+
+fn pack_projection_format(
     state: &mut u64,
+    format: &str,
     experts: usize,
     out_features: usize,
     in_features: usize,
 ) -> HostTensor {
-    let blocks = in_features.div_ceil(QK);
-    let mut packed = vec![0u8; experts * out_features * blocks * BLOCK_BYTES];
-    for block in packed.chunks_exact_mut(BLOCK_BYTES) {
-        block[0] = 122 + (random_u32(state) % 4) as u8;
-        for byte in &mut block[1..] {
-            *byte = random_u32(state) as u8;
+    let (qk, block_bytes) = format_info(format);
+    assert!(in_features.is_multiple_of(qk));
+    let blocks = in_features / qk;
+    let mut packed = vec![0u8; experts * out_features * blocks * block_bytes];
+    for block in packed.chunks_exact_mut(block_bytes) {
+        match format {
+            "mxfp4" => {
+                block[0] = 122 + (random_u32(state) % 4) as u8;
+                for byte in &mut block[1..] {
+                    *byte = random_u32(state) as u8;
+                }
+            }
+            "q2_k" => {
+                for byte in &mut block[..80] {
+                    *byte = random_u32(state) as u8;
+                }
+                block[80..82].copy_from_slice(&half::f16::from_f32(0.002).to_le_bytes());
+                block[82..84].copy_from_slice(&half::f16::from_f32(0.001).to_le_bytes());
+            }
+            "q3_k" => {
+                for byte in &mut block[..108] {
+                    *byte = random_u32(state) as u8;
+                }
+                block[108..110].copy_from_slice(&half::f16::from_f32(0.002).to_le_bytes());
+            }
+            "q5_k" => {
+                block[..2].copy_from_slice(&half::f16::from_f32(0.0005).to_le_bytes());
+                block[2..4].copy_from_slice(&half::f16::from_f32(0.00025).to_le_bytes());
+                for byte in &mut block[4..] {
+                    *byte = random_u32(state) as u8;
+                }
+            }
+            "q6_k" => {
+                for byte in &mut block[..208] {
+                    *byte = random_u32(state) as u8;
+                }
+                block[208..210].copy_from_slice(&half::f16::from_f32(0.0005).to_le_bytes());
+            }
+            "q8_0" => {
+                block[..2].copy_from_slice(&half::f16::from_f32(0.002).to_le_bytes());
+                for byte in &mut block[2..] {
+                    *byte = random_u32(state) as u8;
+                }
+            }
+            _ => {
+                block[..2].copy_from_slice(&half::f16::from_f32(0.002).to_le_bytes());
+                for byte in &mut block[2..] {
+                    *byte = random_u32(state) as u8;
+                }
+            }
         }
     }
-    HostTensor::u8(&[experts, out_features, blocks, BLOCK_BYTES], packed)
+    HostTensor::u8(&[experts, out_features, blocks, block_bytes], packed)
 }
 
 struct Config {
@@ -141,7 +194,13 @@ impl Config {
 
 /// Builds the positional input list (`Vec<Option<HostTensor>>`, length 6..=9)
 /// for a MoE case. Omitted optional inputs are `None`.
-fn build_inputs(config: &Config, seed: u64) -> Vec<Option<HostTensor>> {
+fn build_inputs_formats(
+    config: &Config,
+    seed: u64,
+    fc1_format: &str,
+    fc2_format: &str,
+    fc3_format: Option<&str>,
+) -> Vec<Option<HostTensor>> {
     let mut state = seed;
     let Config {
         rows,
@@ -159,8 +218,8 @@ fn build_inputs(config: &Config, seed: u64) -> Vec<Option<HostTensor>> {
         .map(|_| uniform(&mut state, -2.5, 2.5))
         .collect();
 
-    let fc1 = pack_projection(&mut state, experts, fc1_size, hidden);
-    let fc2 = pack_projection(&mut state, experts, hidden, inter);
+    let fc1 = pack_projection_format(&mut state, fc1_format, experts, fc1_size, hidden);
+    let fc2 = pack_projection_format(&mut state, fc2_format, experts, hidden, inter);
 
     let mut inputs: Vec<Option<HostTensor>> = vec![
         Some(HostTensor::f32(&[rows, hidden], &input)),
@@ -183,7 +242,13 @@ fn build_inputs(config: &Config, seed: u64) -> Vec<Option<HostTensor>> {
     }
 
     if config.needs_fc3() {
-        let fc3 = pack_projection(&mut state, experts, inter, hidden);
+        let fc3 = pack_projection_format(
+            &mut state,
+            fc3_format.expect("separate gate requires a test format"),
+            experts,
+            inter,
+            hidden,
+        );
         inputs.push(Some(fc3));
         if config.with_bias {
             let fc3_bias: Vec<f32> = (0..experts * inter)
@@ -208,6 +273,16 @@ fn build_inputs(config: &Config, seed: u64) -> Vec<Option<HostTensor>> {
     inputs
 }
 
+fn build_inputs(config: &Config, seed: u64) -> Vec<Option<HostTensor>> {
+    build_inputs_formats(
+        config,
+        seed,
+        FORMAT,
+        FORMAT,
+        config.needs_fc3().then_some(FORMAT),
+    )
+}
+
 fn absent_dtype(index: usize) -> DataType {
     match index {
         2 | 4 | 6 => DataType::Uint8,
@@ -215,7 +290,13 @@ fn absent_dtype(index: usize) -> DataType {
     }
 }
 
-fn model_node(config: &Config, inputs: &[Option<HostTensor>]) -> (Graph, NodeId) {
+fn model_node_formats(
+    config: &Config,
+    inputs: &[Option<HostTensor>],
+    fc1_format: &str,
+    fc2_format: &str,
+    fc3_format: Option<&str>,
+) -> (Graph, NodeId) {
     let mut graph = Graph::new();
     graph.opset_imports.insert(DOMAIN.into(), 1);
     let values = inputs
@@ -256,16 +337,21 @@ fn model_node(config: &Config, inputs: &[Option<HostTensor>]) -> (Graph, NodeId)
     );
     node.attributes.insert(
         "fc1_format".into(),
-        Attribute::String(FORMAT.as_bytes().to_vec()),
+        Attribute::String(fc1_format.as_bytes().to_vec()),
     );
     node.attributes.insert(
         "fc2_format".into(),
-        Attribute::String(FORMAT.as_bytes().to_vec()),
+        Attribute::String(fc2_format.as_bytes().to_vec()),
     );
     if config.needs_fc3() {
         node.attributes.insert(
             "fc3_format".into(),
-            Attribute::String(FORMAT.as_bytes().to_vec()),
+            Attribute::String(
+                fc3_format
+                    .expect("separate gate requires a test format")
+                    .as_bytes()
+                    .to_vec(),
+            ),
         );
     }
     node.attributes
@@ -281,6 +367,16 @@ fn model_node(config: &Config, inputs: &[Option<HostTensor>]) -> (Graph, NodeId)
     let node = graph.insert_node(node);
     graph.add_output(output);
     (graph, node)
+}
+
+fn model_node(config: &Config, inputs: &[Option<HostTensor>]) -> (Graph, NodeId) {
+    model_node_formats(
+        config,
+        inputs,
+        FORMAT,
+        FORMAT,
+        config.needs_fc3().then_some(FORMAT),
+    )
 }
 
 fn build_views<'a>(
@@ -309,9 +405,13 @@ fn build_views<'a>(
         .collect()
 }
 
-fn run_cpu(config: &Config, inputs: &[Option<HostTensor>]) -> Vec<f32> {
-    let (graph, node) = model_node(config, inputs);
-    let model = Model::new(&graph);
+fn run_cpu_node(
+    config: &Config,
+    inputs: &[Option<HostTensor>],
+    graph: &Graph,
+    node: NodeId,
+) -> Vec<f32> {
+    let model = Model::new(graph);
     let kernel = CpuExecutionProvider::new()
         .get_kernel(model.graph.node(node), &[], 1)
         .unwrap();
@@ -341,13 +441,19 @@ fn run_cpu(config: &Config, inputs: &[Option<HostTensor>]) -> Vec<f32> {
         .collect()
 }
 
-fn run_gpu(
+fn run_cpu(config: &Config, inputs: &[Option<HostTensor>]) -> Vec<f32> {
+    let (graph, node) = model_node(config, inputs);
+    run_cpu_node(config, inputs, &graph, node)
+}
+
+fn run_gpu_node(
     ep: &CudaExecutionProvider,
     config: &Config,
     inputs: &[Option<HostTensor>],
+    graph: &Graph,
+    node: NodeId,
 ) -> onnx_runtime_ep_api::Result<Vec<f32>> {
-    let (graph, node) = model_node(config, inputs);
-    let model = Model::new(&graph);
+    let model = Model::new(graph);
     let concrete_shapes: Vec<Vec<usize>> = inputs
         .iter()
         .filter_map(|input| input.as_ref().map(|input| input.shape.clone()))
@@ -416,6 +522,15 @@ fn run_gpu(
         .collect())
 }
 
+fn run_gpu(
+    ep: &CudaExecutionProvider,
+    config: &Config,
+    inputs: &[Option<HostTensor>],
+) -> onnx_runtime_ep_api::Result<Vec<f32>> {
+    let (graph, node) = model_node(config, inputs);
+    run_gpu_node(ep, config, inputs, &graph, node)
+}
+
 fn assert_close(actual: &[f32], expected: &[f32], label: &str) {
     assert_eq!(actual.len(), expected.len(), "{label}: length mismatch");
     for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
@@ -463,6 +578,602 @@ fn block_quantized_moe_matches_cpu_across_activations() {
             &config,
             0x1111_2222_3333_4444 ^ label_seed(activation),
             activation,
+        );
+    }
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn block_quantized_moe_glm52_mixed_projection_formats_match_cpu() {
+    let ep = require_cuda();
+    let config = Config {
+        rows: 2,
+        hidden: 256,
+        inter: 256,
+        experts: 2,
+        k: 1,
+        activation: "identity",
+        swiglu_fusion: 0,
+        with_bias: false,
+        with_router_weights: false,
+        normalize: false,
+    };
+    for (index, (fc1_format, fc2_format)) in [
+        ("iq1_s", "iq3_xxs"),
+        ("iq2_xxs", "iq3_xxs"),
+        ("iq2_xxs", "iq4_xs"),
+        ("q2_k", "q3_k"),
+        ("q5_k", "q6_k"),
+        ("q6_k", "q8_0"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let inputs = build_inputs_formats(
+            &config,
+            0x5200_0000 ^ index as u64,
+            fc1_format,
+            fc2_format,
+            None,
+        );
+        let (graph, node) = model_node_formats(&config, &inputs, fc1_format, fc2_format, None);
+        let expected = run_cpu_node(&config, &inputs, &graph, node);
+        let actual = run_gpu_node(&ep, &config, &inputs, &graph, node).unwrap();
+        assert_close(&actual, &expected, &format!("{fc1_format}/{fc2_format}"));
+    }
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn block_quantized_moe_sealed_bank_admission_is_device_bound_and_whole_bank() {
+    let provider = std::sync::Arc::new(require_cuda());
+    let mut state = 0x5ea1_ed00;
+    let fc1 = pack_projection_format(&mut state, "mxfp4", 2, 32, 32);
+    let fc2 = pack_projection_format(&mut state, "q8_0", 2, 32, 32);
+    let admitted = onnx_runtime_ep_cuda::admit_block_quantized_moe_banks(
+        &provider,
+        onnx_runtime_ep_cuda::BlockQuantizedMoeBank {
+            format: "mxfp4",
+            packed: &fc1.bytes,
+            experts: 2,
+            out_features: 32,
+            in_features: 32,
+        },
+        onnx_runtime_ep_cuda::BlockQuantizedMoeBank {
+            format: "q8_0",
+            packed: &fc2.bytes,
+            experts: 2,
+            out_features: 32,
+            in_features: 32,
+        },
+        None,
+    )
+    .unwrap();
+    assert_eq!(admitted.device(), provider.device_id());
+    assert_eq!(admitted.projection_count(), 2);
+    assert_eq!(
+        admitted.residency(),
+        onnx_runtime_ep_cuda::BlockQuantizedMoeResidency::WholeProjectionBank
+    );
+    assert!(
+        admitted
+            .diagnostic_identities()
+            .into_iter()
+            .flatten()
+            .count()
+            == 2
+    );
+    let traffic = admitted.no_residency_traffic(&[1]).unwrap();
+    assert_eq!(traffic.fixed_load_bytes, 2 * 32 * (17 + 34));
+    assert_eq!(traffic.selected_read_bytes, 32 * (17 + 34));
+    assert_eq!(traffic.page_ins, 0);
+    assert_eq!(traffic.byte_hit_rate, None);
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn block_quantized_moe_mixed_decode_capture_replays_without_fallback() {
+    let ep = require_cuda();
+    let runtime = ep.runtime();
+    let config = Config {
+        rows: 1,
+        hidden: 256,
+        inter: 256,
+        experts: 2,
+        k: 1,
+        activation: "identity",
+        swiglu_fusion: 0,
+        with_bias: false,
+        with_router_weights: false,
+        normalize: false,
+    };
+    let inputs = build_inputs_formats(&config, 0xca97_0001, "iq1_s", "iq3_xxs", None);
+    let (graph, node) = model_node_formats(&config, &inputs, "iq1_s", "iq3_xxs", None);
+    let model = Model::new(&graph);
+    let concrete_shapes: Vec<Vec<usize>> = inputs
+        .iter()
+        .filter_map(|input| input.as_ref().map(|input| input.shape.clone()))
+        .collect();
+    let kernel = ep
+        .get_kernel(model.graph.node(node), &concrete_shapes, 1)
+        .unwrap();
+    let mut buffers = Vec::<Option<DeviceBuffer>>::new();
+    for input in &inputs {
+        if let Some(input) = input {
+            let buffer = ep.allocate(input.bytes.len(), 256).unwrap();
+            // SAFETY: allocation size equals the source tensor byte length.
+            unsafe { runtime.htod(&input.bytes, cuptr(buffer.as_ptr())).unwrap() };
+            buffers.push(Some(buffer));
+        } else {
+            buffers.push(None);
+        }
+    }
+    let strides: Vec<_> = inputs
+        .iter()
+        .map(|input| {
+            input
+                .as_ref()
+                .map(|input| compute_contiguous_strides(&input.shape))
+        })
+        .collect();
+    let views = build_views(&inputs, &strides, Some(&buffers), ep.device_id());
+    let output_shape = [config.rows, config.hidden];
+    let output_strides = compute_contiguous_strides(&output_shape);
+    let mut output_buffer = ep.allocate(config.hidden * 4, 256).unwrap();
+    let output_ptr_mut = output_buffer.as_mut_ptr();
+    let output_ptr = cuptr(output_buffer.as_ptr());
+    let output_view = || {
+        TensorMut::new(
+            DevicePtrMut(output_ptr_mut),
+            DataType::Float32,
+            &output_shape,
+            &output_strides,
+            ep.device_id(),
+        )
+    };
+    let metadata = views
+        .iter()
+        .map(|view| TensorMetadata::new(view.dtype, view.shape, !view.is_absent()))
+        .collect::<Vec<_>>();
+    let requirement = kernel.workspace_requirement(&metadata).unwrap();
+    let workspace_bytes = usize::try_from(requirement.bytes).unwrap();
+    let mut workspace = ep.allocate(workspace_bytes, requirement.alignment).unwrap();
+    let workspace_ptr = workspace.as_mut_ptr();
+    let workspace_view = || WorkspaceView::new(DevicePtrMut(workspace_ptr), workspace_bytes);
+
+    kernel
+        .execute_with_workspace(&views, &mut [output_view()], Some(workspace_view()))
+        .unwrap();
+    runtime.synchronize().unwrap();
+    let mut eager = vec![0u8; config.hidden * 4];
+    // SAFETY: destination exactly covers the output allocation.
+    unsafe { runtime.dtoh(&mut eager, output_ptr).unwrap() };
+
+    let allocations = runtime.allocation_counts();
+    let transfers = runtime.transfer_counts();
+    runtime.begin_graph_capture(&[kernel.as_ref()]).unwrap();
+    kernel
+        .execute_with_workspace(&views, &mut [output_view()], Some(workspace_view()))
+        .unwrap();
+    runtime.end_graph_capture().unwrap();
+    assert_eq!(runtime.graph_segment_count().unwrap(), 1, "captures");
+    assert_eq!(runtime.allocation_counts(), allocations);
+    assert_eq!(runtime.transfer_counts(), transfers);
+
+    let mut replayed = vec![0u8; eager.len()];
+    for _ in 0..3 {
+        runtime.replay_graph().unwrap();
+        runtime.synchronize().unwrap();
+        // SAFETY: destination exactly covers the output allocation.
+        unsafe { runtime.dtoh(&mut replayed, output_ptr).unwrap() };
+        assert_eq!(replayed, eager);
+    }
+    assert!(runtime.reset_graph().unwrap());
+    drop(views);
+    for buffer in buffers.into_iter().flatten() {
+        ep.deallocate(buffer).unwrap();
+    }
+    ep.deallocate(output_buffer).unwrap();
+    ep.deallocate(workspace).unwrap();
+    eprintln!("captures=1 fallbacks=0 replays=3");
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn block_quantized_moe_reads_only_selected_expert_projection_bytes() {
+    let ep = require_cuda();
+    let config = Config {
+        rows: 1,
+        hidden: 256,
+        inter: 256,
+        experts: 2,
+        k: 1,
+        activation: "identity",
+        swiglu_fusion: 0,
+        with_bias: false,
+        with_router_weights: false,
+        normalize: false,
+    };
+    let mut baseline = build_inputs_formats(&config, 0x5e1e_c7ed, "iq1_s", "iq3_xxs", None);
+    baseline[1] = Some(HostTensor::f32(&[1, 2], &[10.0, -10.0]));
+    let mut poisoned = baseline.clone();
+    let fc1_stride = 256 * 50;
+    poisoned[2].as_mut().unwrap().bytes[fc1_stride..].fill(0xff);
+    let fc2_stride = 256 * 98;
+    poisoned[4].as_mut().unwrap().bytes[fc2_stride..].fill(0xff);
+
+    let (baseline_graph, baseline_node) =
+        model_node_formats(&config, &baseline, "iq1_s", "iq3_xxs", None);
+    let (poisoned_graph, poisoned_node) =
+        model_node_formats(&config, &poisoned, "iq1_s", "iq3_xxs", None);
+    let expected = run_gpu_node(&ep, &config, &baseline, &baseline_graph, baseline_node).unwrap();
+    let actual = run_gpu_node(&ep, &config, &poisoned, &poisoned_graph, poisoned_node).unwrap();
+    assert_eq!(actual, expected);
+    eprintln!(
+        "fixed_load_bytes={} selected_read_bytes={} page_ins=0 byte_hit_rate=none",
+        2 * (fc1_stride + fc2_stride),
+        fc1_stride + fc2_stride
+    );
+}
+
+fn read_real_projection_blocks(
+    root: &std::path::Path,
+    shard: &str,
+    tensor_offset: u64,
+    format: &str,
+    source_in_features: usize,
+    out_features: usize,
+) -> HostTensor {
+    let (qk, block_bytes) = format_info(format);
+    assert!(source_in_features.is_multiple_of(qk));
+    let source_row_bytes = (source_in_features / qk) * block_bytes;
+    let mut file = std::fs::File::open(root.join(shard)).unwrap();
+    let mut packed = vec![0u8; out_features * block_bytes];
+    for output in 0..out_features {
+        file.seek(SeekFrom::Start(
+            tensor_offset + (output * source_row_bytes) as u64,
+        ))
+        .unwrap();
+        file.read_exact(&mut packed[output * block_bytes..][..block_bytes])
+            .unwrap();
+    }
+    HostTensor::u8(&[1, out_features, 1, block_bytes], packed)
+}
+
+fn read_real_projection_expert(
+    root: &std::path::Path,
+    shard: &str,
+    tensor_offset: u64,
+    format: &str,
+    in_features: usize,
+    out_features: usize,
+) -> HostTensor {
+    let (qk, block_bytes) = format_info(format);
+    assert!(in_features.is_multiple_of(qk));
+    let blocks = in_features / qk;
+    let mut file = std::fs::File::open(root.join(shard)).unwrap();
+    file.seek(SeekFrom::Start(tensor_offset)).unwrap();
+    let mut packed = vec![0u8; out_features * blocks * block_bytes];
+    file.read_exact(&mut packed).unwrap();
+    HostTensor::u8(&[1, out_features, blocks, block_bytes], packed)
+}
+
+fn measure_captured_moe(
+    ep: &CudaExecutionProvider,
+    config: &Config,
+    inputs: &[Option<HostTensor>],
+    graph: &Graph,
+    node: NodeId,
+    ramp_seconds: f64,
+    batch_replays: usize,
+) -> Vec<f64> {
+    let model = Model::new(graph);
+    let concrete_shapes: Vec<Vec<usize>> = inputs
+        .iter()
+        .filter_map(|input| input.as_ref().map(|input| input.shape.clone()))
+        .collect();
+    let kernel = ep
+        .get_kernel(model.graph.node(node), &concrete_shapes, 1)
+        .unwrap();
+    let runtime = ep.runtime();
+    let mut buffers = Vec::<Option<DeviceBuffer>>::new();
+    for input in inputs {
+        if let Some(input) = input {
+            let buffer = ep.allocate(input.bytes.len(), 256).unwrap();
+            // SAFETY: allocation size equals the source tensor byte length.
+            unsafe { runtime.htod(&input.bytes, cuptr(buffer.as_ptr())).unwrap() };
+            buffers.push(Some(buffer));
+        } else {
+            buffers.push(None);
+        }
+    }
+    let strides: Vec<_> = inputs
+        .iter()
+        .map(|input| {
+            input
+                .as_ref()
+                .map(|input| compute_contiguous_strides(&input.shape))
+        })
+        .collect();
+    let views = build_views(inputs, &strides, Some(&buffers), ep.device_id());
+    let output_shape = [config.rows, config.hidden];
+    let output_strides = compute_contiguous_strides(&output_shape);
+    let mut output_buffer = ep.allocate(config.rows * config.hidden * 4, 256).unwrap();
+    let output_ptr_mut = output_buffer.as_mut_ptr();
+    let output_view = || {
+        TensorMut::new(
+            DevicePtrMut(output_ptr_mut),
+            DataType::Float32,
+            &output_shape,
+            &output_strides,
+            ep.device_id(),
+        )
+    };
+    let metadata = views
+        .iter()
+        .map(|view| TensorMetadata::new(view.dtype, view.shape, !view.is_absent()))
+        .collect::<Vec<_>>();
+    let requirement = kernel.workspace_requirement(&metadata).unwrap();
+    let workspace_bytes = usize::try_from(requirement.bytes).unwrap();
+    let mut workspace = ep.allocate(workspace_bytes, requirement.alignment).unwrap();
+    let workspace_ptr = workspace.as_mut_ptr();
+    let workspace_view = || WorkspaceView::new(DevicePtrMut(workspace_ptr), workspace_bytes);
+
+    kernel
+        .execute_with_workspace(&views, &mut [output_view()], Some(workspace_view()))
+        .unwrap();
+    runtime.synchronize().unwrap();
+    runtime.begin_graph_capture(&[kernel.as_ref()]).unwrap();
+    kernel
+        .execute_with_workspace(&views, &mut [output_view()], Some(workspace_view()))
+        .unwrap();
+    runtime.end_graph_capture().unwrap();
+    assert_eq!(runtime.graph_segment_count().unwrap(), 1);
+
+    let allocation_counts = runtime.allocation_counts();
+    let transfer_counts = runtime.transfer_counts();
+    let ramp_start = std::time::Instant::now();
+    while ramp_start.elapsed().as_secs_f64() < ramp_seconds {
+        for _ in 0..batch_replays {
+            runtime.replay_graph().unwrap();
+        }
+        runtime.synchronize().unwrap();
+    }
+
+    let mut samples_us = Vec::with_capacity(3);
+    for _ in 0..3 {
+        runtime.synchronize().unwrap();
+        let start = std::time::Instant::now();
+        for _ in 0..batch_replays {
+            runtime.replay_graph().unwrap();
+        }
+        runtime.synchronize().unwrap();
+        samples_us.push(start.elapsed().as_secs_f64() * 1.0e6 / batch_replays as f64);
+    }
+    assert_eq!(runtime.allocation_counts(), allocation_counts);
+    assert_eq!(runtime.transfer_counts(), transfer_counts);
+    assert!(runtime.reset_graph().unwrap());
+
+    drop(views);
+    for buffer in buffers.into_iter().flatten() {
+        ep.deallocate(buffer).unwrap();
+    }
+    ep.deallocate(output_buffer).unwrap();
+    ep.deallocate(workspace).unwrap();
+    samples_us
+}
+
+#[test]
+#[ignore = "opt-in real-checkpoint test; set ONNX_GENAI_GLM52_UD_IQ1S_CHECKPOINT"]
+fn glm52_ud_iq1s_real_mixed_projection_blocks_execute_block_quantized_moe() {
+    let root = std::env::var("ONNX_GENAI_GLM52_UD_IQ1S_CHECKPOINT")
+        .expect("set ONNX_GENAI_GLM52_UD_IQ1S_CHECKPOINT to the official checkpoint directory");
+    let root = std::path::Path::new(&root);
+    let ep = require_cuda();
+    let config = Config {
+        rows: 1,
+        hidden: 256,
+        inter: 256,
+        experts: 1,
+        k: 1,
+        activation: "identity",
+        swiglu_fusion: 0,
+        with_bias: false,
+        with_router_weights: false,
+        normalize: false,
+    };
+    for (label, shard, fc1_format, fc1_offset, fc2_format, fc2_offset) in [
+        (
+            "layer56-iq1s-iq3xxs",
+            "GLM-5.2-UD-IQ1_S-00005-of-00006.gguf",
+            "iq1_s",
+            2_668_820_832u64,
+            "iq3_xxs",
+            1_425_373_536u64,
+        ),
+        (
+            "layer74-iq2xxs-iq3xxs",
+            "GLM-5.2-UD-IQ1_S-00006-of-00006.gguf",
+            "iq2_xxs",
+            3_071_455_584,
+            "iq3_xxs",
+            1_828_008_288,
+        ),
+        (
+            "layer8-iq2xxs-iq4xs",
+            "GLM-5.2-UD-IQ1_S-00002-of-00006.gguf",
+            "iq2_xxs",
+            17_617_400_576,
+            "iq4_xs",
+            15_892_755_200,
+        ),
+        (
+            "layer78-q2k-q3k",
+            "GLM-5.2-UD-IQ1_S-00006-of-00006.gguf",
+            "q2_k",
+            16_942_690_656,
+            "q3_k",
+            15_548_248_416,
+        ),
+    ] {
+        let input: Vec<f32> = (0..256)
+            .map(|index| ((index * 13 % 31) as f32 - 15.0) / 32.0)
+            .collect();
+        let inputs = vec![
+            Some(HostTensor::f32(&[1, 256], &input)),
+            Some(HostTensor::f32(&[1, 1], &[1.0])),
+            Some(read_real_projection_blocks(
+                root, shard, fc1_offset, fc1_format, 6144, 256,
+            )),
+            None,
+            Some(read_real_projection_blocks(
+                root, shard, fc2_offset, fc2_format, 2048, 256,
+            )),
+            None,
+        ];
+        let (graph, node) = model_node_formats(&config, &inputs, fc1_format, fc2_format, None);
+        let expected = run_cpu_node(&config, &inputs, &graph, node);
+        let actual = run_gpu_node(&ep, &config, &inputs, &graph, node).unwrap();
+        assert_close(&actual, &expected, label);
+    }
+}
+
+#[test]
+#[ignore = "dedicated idle A100 perf probe; set ONNX_GENAI_GLM52_UD_IQ1S_CHECKPOINT"]
+fn glm52_ud_iq1s_real_selected_expert_captured_perf() {
+    let root = std::env::var("ONNX_GENAI_GLM52_UD_IQ1S_CHECKPOINT")
+        .expect("set ONNX_GENAI_GLM52_UD_IQ1S_CHECKPOINT to the official checkpoint directory");
+    let root = std::path::Path::new(&root);
+    let ramp_seconds = std::env::var("ONNX_GENAI_CUDA_PERF_RAMP_SECONDS")
+        .map(|value| value.parse::<f64>().expect("valid perf ramp seconds"))
+        .unwrap_or(8.0);
+    assert!(ramp_seconds.is_finite() && ramp_seconds > 0.0);
+    let ep = require_cuda();
+    let cases = [
+        (
+            "layer56-iq1s-iq3xxs",
+            "decode",
+            1usize,
+            "GLM-5.2-UD-IQ1_S-00005-of-00006.gguf",
+            "iq1_s",
+            2_668_820_832u64,
+            "iq3_xxs",
+            1_425_373_536u64,
+        ),
+        (
+            "layer56-iq1s-iq3xxs",
+            "prefill",
+            8,
+            "GLM-5.2-UD-IQ1_S-00005-of-00006.gguf",
+            "iq1_s",
+            2_668_820_832,
+            "iq3_xxs",
+            1_425_373_536,
+        ),
+        (
+            "layer74-iq2xxs-iq3xxs",
+            "decode",
+            1,
+            "GLM-5.2-UD-IQ1_S-00006-of-00006.gguf",
+            "iq2_xxs",
+            3_071_455_584,
+            "iq3_xxs",
+            1_828_008_288,
+        ),
+        (
+            "layer8-iq2xxs-iq4xs",
+            "decode",
+            1,
+            "GLM-5.2-UD-IQ1_S-00002-of-00006.gguf",
+            "iq2_xxs",
+            17_617_400_576,
+            "iq4_xs",
+            15_892_755_200,
+        ),
+        (
+            "layer78-q2k-q3k",
+            "decode",
+            1,
+            "GLM-5.2-UD-IQ1_S-00006-of-00006.gguf",
+            "q2_k",
+            16_942_690_656,
+            "q3_k",
+            15_548_248_416,
+        ),
+        (
+            "layer56-iq1s-iq3xxs-repeat",
+            "decode",
+            1,
+            "GLM-5.2-UD-IQ1_S-00005-of-00006.gguf",
+            "iq1_s",
+            2_668_820_832,
+            "iq3_xxs",
+            1_425_373_536,
+        ),
+    ];
+    for (label, stage, rows, shard, fc1_format, fc1_offset, fc2_format, fc2_offset) in cases {
+        let config = Config {
+            rows,
+            hidden: 6144,
+            inter: 2048,
+            experts: 1,
+            k: 1,
+            activation: "identity",
+            swiglu_fusion: 0,
+            with_bias: false,
+            with_router_weights: false,
+            normalize: false,
+        };
+        let input: Vec<f32> = (0..config.rows * config.hidden)
+            .map(|index| ((index * 13 % 31) as f32 - 15.0) / 32.0)
+            .collect();
+        let router_logits = vec![1.0; config.rows];
+        let inputs = vec![
+            Some(HostTensor::f32(&[config.rows, config.hidden], &input)),
+            Some(HostTensor::f32(&[config.rows, 1], &router_logits)),
+            Some(read_real_projection_expert(
+                root,
+                shard,
+                fc1_offset,
+                fc1_format,
+                config.hidden,
+                config.inter,
+            )),
+            None,
+            Some(read_real_projection_expert(
+                root,
+                shard,
+                fc2_offset,
+                fc2_format,
+                config.inter,
+                config.hidden,
+            )),
+            None,
+        ];
+        let fixed_load_bytes =
+            inputs[2].as_ref().unwrap().bytes.len() + inputs[4].as_ref().unwrap().bytes.len();
+        let (graph, node) = model_node_formats(&config, &inputs, fc1_format, fc2_format, None);
+        let mut samples =
+            measure_captured_moe(&ep, &config, &inputs, &graph, node, ramp_seconds, 128);
+        samples.sort_by(f64::total_cmp);
+        eprintln!(
+            "{label}: native_cuda=true stage={stage} rows={} H=6144 I=2048 selected_experts=1 \
+             fixed_load_bytes={fixed_load_bytes} selected_read_bytes={fixed_load_bytes} \
+             page_ins=0 byte_hit_rate=none captures=1 fallbacks=0 n=3 \
+             median_us={:.3} range_us={:.3}..{:.3}",
+            config.rows, samples[1], samples[0], samples[2]
         );
     }
 }
@@ -676,9 +1387,8 @@ fn label_seed(label: &str) -> u64 {
 // ---------------------------------------------------------------------------
 // Fused, inert route-telemetry coverage (issue #1810 Slice 7A).
 //
-// BlockQuantizedMoE is not capture-capable (its trailing host synchronization
-// predates this slice), so the capture/replay matrix lives in the QMoE suite;
-// here we cover the producer fused into `bqmoe_route`: default disabled,
+// BlockQuantizedMoE capture/replay is covered above; this module covers the
+// producer fused into `bqmoe_route`: default disabled,
 // byte-identical outputs off vs on, a device bitmap that matches a CPU oracle
 // for decode and M>1, fresh epochs across consecutive eager calls, typed
 // fail-closed rejection on a device mismatch, inert behavior on a capacity

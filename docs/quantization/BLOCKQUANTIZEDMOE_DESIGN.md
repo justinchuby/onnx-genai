@@ -1,12 +1,13 @@
 # `pkg.nxrt::BlockQuantizedMoE` — Operator Design Note (mixed-projection ABI)
 
-**Status:** Mixed-projection ABI — CPU reference oracle implemented. This
+**Status:** Mixed-projection ABI — CPU oracle and native CUDA decode/prefill
+execution implemented for the verified GLM-5.2 UD-IQ1_S formats. This
 supersedes the frozen single-`format` v1 ABI: each projection (`fc1`/`fc2`/`fc3`)
 now carries its **own** native block format, because real GLM-5.2 GGUF routed
 experts pack gate/up and down at different qtypes and block widths. There is no
 backward-compatibility layer — the old single-`format` attribute is removed.
 **Author:** Ripley (architect); mixed-projection revision by Sebastian (systems/perf)
-**Date:** 2026-07-18; revised 2026-08-24
+**Date:** 2026-07-18; revised 2026-08-27
 **Scope:** ABI, dispatch semantics, decode reuse, determinism, shape inference,
 CPU+CUDA staging plan. This op is P1 #6, the largest practical GLM blocker
 ([GLM_READINESS_GAPS.md:259-268](../models/GLM_READINESS_GAPS.md#L259-L268)).
@@ -21,6 +22,39 @@ guessing `GatherBlockQuantized` shapes; that failure mode is respected here
 
 ## 0. Context and positioning
 
+### 0.1 Verified UD-IQ1_S checkpoint inventory
+
+Inventory was read from the six official GGUF shards in place on 2026-08-27;
+no model bytes were copied into the repository. The checkpoint has 1809 tensors:
+`F32=709, IQ1_S=106, IQ2_XXS=44, IQ3_XXS=71, IQ4_XS=4, Q2_K=2,
+Q3_K=1, Q4_K=2, Q5_K=312, Q6_K=82, Q8_0=476`.
+
+Routed MoE layers are 3–78 with `E=256`, `H=6144`, and `I=2048`.
+Gate/up tensors have GGUF dimensions `(6144, 2048, 256)` and down tensors
+`(2048, 6144, 256)`. Their exact layer combinations are:
+
+| gate/up | down | layer count |
+|---|---|---:|
+| IQ1_S | IQ3_XXS | 53 |
+| IQ2_XXS | IQ3_XXS | 18 |
+| IQ2_XXS | IQ4_XS | 4 |
+| Q2_K | Q3_K | 1 (layer 78) |
+
+Dense layers 0–2 use Q5_K gate/up and Q6_K down. Shared experts use Q5_K
+gate/up and Q6_K down except layer 8, which uses Q6_K gate/up and Q8_0 down.
+The authoritative serialized block geometries used by both oracles are
+IQ1_S `(256,50)`, IQ2_XXS `(256,66)`, IQ3_XXS `(256,98)`,
+IQ4_XS `(256,136)`, Q2_K `(256,84)`, Q3_K `(256,110)`,
+Q5_K `(256,176)`, Q6_K `(256,210)`, and Q8_0 `(32,34)`.
+
+The opt-in real-block tests preserve representative evidence with absolute
+GGUF file offsets: layer 56 IQ1_S/IQ3_XXS in shard 5 at
+`2668820832`/`1425373536`; layer 74 IQ2_XXS/IQ3_XXS in shard 6 at
+`3071455584`/`1828008288`; layer 8 IQ2_XXS/IQ4_XS in shard 2 at
+`17617400576`/`15892755200`; and layer 78 Q2_K/Q3_K in shard 6 at
+`16942690656`/`15548248416`. These are `GGUFReader` tensor `data_offset`
+values and are already absolute file offsets.
+
 GLM's routed MoE tensors are dominated by codebook/IQ block formats
 (IQ1_M / IQ2_XXS / IQ3_XXS), which the affine-integer `QMoE` kernel **cannot
 represent**, while the portable float export evaluates **every** expert
@@ -29,11 +63,12 @@ fills exactly that gap: QMoE's expert structure, but with the native block
 formats already decoded by `BlockQuantizedMatMul`, plus **selected-expert
 dispatch** (evaluate only routed experts).
 
-It sits on the op matrix as the only `pkg.nxrt` MoE row, still MISSING on every
-backend, and is the sole boundary the lazy initializer/offload seam already
-recognizes ([GLM_READINESS_GAPS.md:166](../models/GLM_READINESS_GAPS.md#L166),
-[weight.rs:94-104](../../crates/onnx-runtime-ep-api/src/weight.rs#L94-L104)). In
-the ordered smoothness plan it is first:
+It is implemented on the CPU reference backend and native CUDA backend and is
+the sole boundary the lazy initializer/offload seam already recognizes
+([GLM_READINESS_GAPS.md:166](../models/GLM_READINESS_GAPS.md#L166),
+[weight.rs:94-104](../../crates/onnx-runtime-ep-api/src/weight.rs#L94-L104)).
+Expert-indexed device residency remains the missing part of the ordered
+smoothness plan:
 `BlockQuantizedMoE → selected-token IndexShare DSA → liveness planner → MTP`
 ([GLM_READINESS_GAPS.md:344-347](../models/GLM_READINESS_GAPS.md#L344-L347)).
 
@@ -132,13 +167,12 @@ Notes:
   | Q2_K | Q3_K | 1 |
 
   Gate always equals up; down always differs from gate/up. The single-`format`
-  v1 ABI could not represent any of these layers. The lone `Q2_K`/`Q3_K` layer
-  and the shared experts (`Q5_K`/`Q6_K`/`Q8_0`) are **not** in `BlockFormat` and
-  are **typed-rejected** at the claim boundary — never dequantized or
-  dense-fallback executed.
+  v1 ABI could not represent any of these layers. The lone `Q2_K`/`Q3_K` routed
+  layer and shared/dense `Q5_K`/`Q6_K`/`Q8_0` projections are supported by the
+  same property-driven decoder.
 - Each projection's packed shape is `[E, N, blocksN, block_bytesN]` where
-  `blocksN = KN.div_ceil(qk(fmt))` and `block_bytesN = block_bytes(fmt)` for that
-  projection's own `fmt`, reusing `BlockFormat::qk` / `block_bytes`
+  `blocksN = KN / qk(fmt)` and `block_bytesN = block_bytes(fmt)` for that
+  projection's own `fmt`. Partial block tails are rejected.
   ([block_quantized_matmul.rs:84-112](../../crates/onnx-runtime-ep-cpu/src/kernels/block_quantized_matmul.rs#L84-L112)),
   where `KN` is the input-feature width of that projection
   (H for fc1/fc3, inter for fc2). All byte offsets, per-row and per-expert
@@ -155,7 +189,7 @@ reuse `BlockQuantizedMatMul`'s `BlockFormat::parse`
 
 | Attribute | Type | Default | Source precedent |
 |---|---|---|---|
-| `fc1_format` | string enum | *required* | `BlockFormat::parse` — `mxfp4, iq4_nl, iq4_xs, iq3_s, iq3_xxs, iq2_s, iq2_xs, iq2_xxs, iq1_s, iq1_m` ([block_quantized_matmul.rs:66-82](../../crates/onnx-runtime-ep-cpu/src/kernels/block_quantized_matmul.rs#L66-L82)) |
+| `fc1_format` | string enum | *required* | `BlockFormat::parse` — IQ formats plus `q2_k, q3_k, q5_k, q6_k, q8_0` ([block_quantized_matmul.rs](../../crates/onnx-runtime-ep-cpu/src/kernels/block_quantized_matmul.rs)) |
 | `fc2_format` | string enum | *required* | same enum as `fc1_format` |
 | `fc3_format` | string enum | required **iff** `fc3_experts_weights` wired; forbidden otherwise | same enum as `fc1_format` |
 | `block_layout_version` | int | 1 | must equal 1 ([block_quantized_matmul.rs:157-162](../../crates/onnx-runtime-ep-cpu/src/kernels/block_quantized_matmul.rs#L157-L162)) |
@@ -257,8 +291,9 @@ The ascending-expert reduction rule for this op is specified separately in §4.
 
 ## 3. Block-format decode reuse
 
-Every format maps to an **existing** `BlockQuantizedMatMul` decoder; v1 adds
-**no new decoder**. The kernel calls `BlockFormat::parse` then
+Every format maps to the shared `BlockQuantizedMatMul` decoder surface. This
+slice extends that surface with the required GGML K-quants and Q8_0. The kernel
+calls `BlockFormat::parse` then
 `BlockFormat::decoder()` / `scalar_decoder()`
 ([block_quantized_matmul.rs:114-141](../../crates/onnx-runtime-ep-cpu/src/kernels/block_quantized_matmul.rs#L114-L141)):
 
@@ -274,11 +309,18 @@ Every format maps to an **existing** `BlockQuantizedMatMul` decoder; v1 adds
 | `iq2_xxs` | `decode_iq2_xxs_block` | `IQ2XXS_GRID` ([lib.rs:960](../../crates/onnx-runtime-quantization/src/lib.rs#L960)) |
 | `iq1_s` | `decode_iq1_s_block` | `IQ1S_GRID` ([lib.rs:7](../../crates/onnx-runtime-quantization/src/lib.rs#L7)) |
 | `iq1_m` | `decode_iq1_m_block` | `IQ1S_GRID` + `IQ1_M_DELTA` ([block_quantized_matmul.rs:38-39](../../crates/onnx-runtime-ep-cpu/src/kernels/block_quantized_matmul.rs#L38-L39)) |
+| `q2_k` | `decode_q2_k_block` | embedded 4-bit scales/mins |
+| `q3_k` | `decode_q3_k_block` | embedded 6-bit signed scales |
+| `q5_k` | `decode_q5_k_block` | embedded 6-bit scales/mins |
+| `q6_k` | `decode_q6_k_block` | embedded signed 8-bit scales |
+| `q8_0` | `decode_q8_0_block` | per-block f16 scale |
 
 **Genuinely new vs. reused:**
 
-- **Reused (100%):** all per-block decode math, grids, `qk`/`block_bytes`
+- **Reused:** existing IQ/MXFP4 decode math, grids, `qk`/`block_bytes`
   tables, AVX2 dispatch, E2M1/E8M0 scale decode.
+- **Added from authoritative GGML layouts:** Q2_K/Q3_K/Q5_K/Q6_K/Q8_0 scalar
+  CPU oracles and matching property-driven CUDA cases.
 - **New (thin):** (a) an *expert-major, per-expert* iteration wrapper that
   slices `[E, N, blocks, block_bytes]` into one `[N, blocks, block_bytes]`
   weight per selected expert and feeds `dequantize_weight_kn`
@@ -381,13 +423,13 @@ Staged exactly like QMoE Phase 1/2
 - Add `BlockQuantizedMoE` to the CUDA registry next to `qmoe`/`qmoe_gemm`/
   `qmoe_grouping` (existing CUDA QMoE surface). Reuse the CUDA
   `block_quantized_matmul` decoder.
-- All-f32. The current device kernel decodes a **single uniform** format across
-  all projections. Under the mixed-projection ABI it therefore claims only nodes
-  whose `fc1_format`/`fc2_format`/`fc3_format` are all equal; **mixed-projection
-  nodes (the real GLM-5.2 case) are typed-rejected at the CUDA claim gate** and
-  fall back to the CPU oracle. A per-projection CUDA decoder is an explicit
-  follow-up — no success claim is made for mixed-projection CUDA execution.
-- Gate merges on bitwise parity vs. the Phase 1 CPU oracle (§4).
+- All-f32. Each projection launch carries its own format id, elements/block,
+  bytes/block, row stride, and expert stride. Mixed IQ/K-quant/Q8 combinations
+  are claimed and executed directly from packed bytes.
+- The warmed launch path has no trailing host synchronization, allocation,
+  transfer, or format scan, so fixed-shape execution is CUDA-graph capturable.
+- Gate merges on parity vs. the Phase 1 CPU oracle (§4), including opt-in
+  official-checkpoint block tests.
 
 **Phase 3b (out of v1 scope) — live device paging.**
 - First extend `LazyDeviceWeightBinder` and `LazyWeight` for an
@@ -395,6 +437,43 @@ Staged exactly like QMoE Phase 1/2
   whole `LazyWeight` ([weight.rs:121-161,205-227](../../crates/onnx-runtime-ep-api/src/weight.rs#L121-L161)).
 - Then implement a real CUDA binder that pages selected expert slices to device
   on demand.
+
+The current CUDA kernel reads only the routed experts selected by the route
+kernel, but the production paging API still binds/commits a whole projection
+bank. Therefore selected-expert residency/page-in and byte-hit-rate claims
+remain incomplete; this implementation makes no per-expert residency claim.
+`admit_block_quantized_moe_banks` is the sealed ownership boundary: it validates
+full-block geometry and reserved/non-finite scale codes before immutable upload,
+binds the result to one provider context/device, and exposes no device pointer.
+Its `no_residency_traffic` control reports one-time full-bank load bytes and
+unique selected-expert projection bytes, with `page_ins=0` and
+`byte_hit_rate=None` until the expert-indexed paging dependency lands.
+
+### 6.1 A100 validation snapshot
+
+On 2026-08-27, the release-mode opt-in probe ran on idle physical A100 GPU 7
+(`GPU-ef3c1a70-d297-933c-0c37-dbaad2136a57`) with
+`CUDA_VISIBLE_DEVICES=7` and `ONNX_GENAI_CUDA_DEVICE=0`. Each shape used an
+8-second continuous ramp, CUDA-graph batches of 128 replays, and three timed
+batches. The first decode shape was remeasured last. Logical bytes are unique
+selected projection bytes, not measured DRAM transactions.
+
+| checkpoint projection pair | stage | rows | fixed load / selected read bytes | median µs | full range µs |
+|---|---|---:|---:|---:|---:|
+| IQ1_S / IQ3_XXS | decode | 1 | 7,274,496 | 413.041 | 412.644–413.177 |
+| IQ1_S / IQ3_XXS | prefill | 8 | 7,274,496 | 3,319.706 | 3,319.499–3,320.734 |
+| IQ2_XXS / IQ3_XXS | decode | 1 | 8,060,928 | 271.792 | 271.753–271.834 |
+| IQ2_XXS / IQ4_XS | decode | 1 | 9,928,704 | 261.997 | 261.997–262.005 |
+| Q2_K / Q3_K | decode | 1 | 9,535,488 | 318.347 | 318.337–318.355 |
+| IQ1_S / IQ3_XXS (repeat) | decode | 1 | 7,274,496 | 412.951 | 412.781–413.071 |
+
+Every row reported `captures=1`, `fallbacks=0`, `page_ins=0`, and
+`byte_hit_rate=None`. The probe presents one exact-geometry expert
+(`H=6144`, `I=2048`) so fixed load and selected-read bytes are equal; it does
+not claim expert-indexed paging. Base
+`aa417ad372e6c0c1d2df154ceb236ab1c3bea73e` refuses these mixed-format nodes
+and lacks the required K-quant/Q8 decode cases, so no comparable base latency
+exists and no speedup claim is made.
 
 ---
 
@@ -451,8 +530,10 @@ Each item lists a recommended default. Sign-off requested before kernel work.
    shim. `mxfp4`/IQ names still mean the current `BlockQuantizedMatMul` layout,
    not an unpublished K3/Moonshot format. **Per-expert** (as opposed to
    per-projection) formats remain out of scope — every expert in a layer shares
-   that layer's per-projection formats. Native layouts outside `BlockFormat`
-   (`Q2_K`/`Q3_K`/`Q5_K`/`Q8_0`) are **typed-rejected**, never dequantized.
+   that layer's per-projection formats. `Q2_K`/`Q3_K`/`Q5_K`/`Q6_K`/`Q8_0`
+   now use the same property-driven per-projection dispatch. Q4_K remains
+   unsupported because the two checkpoint Q4_K tensors are outside this FFN
+   production slice.
 
 6. **`inter`/`expert_dim` inferred vs. declared attributes.**
    *Recommend:* **inferred from weight shapes** (QMoE precedent,

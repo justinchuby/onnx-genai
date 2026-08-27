@@ -3,27 +3,21 @@
 //!
 //! This is the CUDA counterpart to the CPU parity oracle
 //! ([`onnx_runtime_ep_cpu::kernels::block_quantized_moe`]). Expert weights stay
-//! resident on one GPU packed in the native GGUF block formats (mxfp4, iq4_nl,
-//! iq4_xs, iq2_xxs, iq3_xxs, iq2_xs, iq2_s, iq3_s, iq1_s, iq1_m). Per-weight
+//! resident on one GPU packed in the native GGUF block formats. Per-weight
 //! dequantization reuses the exact `decode_weight` device routine that backs
 //! [`super::block_quantized_matmul`], so the numeric semantics match the oracle
 //! block-for-block; only the reduction/accumulation order differs (both
 //! accumulate in f32).
 //!
 //! The mixed-projection ABI lets `fc1_format`, `fc2_format` and `fc3_format`
-//! differ per projection (real GLM-5.2 GGUF experts pack gate/up and down at
-//! different qtypes). The current device kernel decodes a single **uniform**
-//! format across all projections, so mixed-projection nodes are typed-rejected
-//! at the claim gate and fall back to the CPU oracle. A per-projection CUDA
-//! decoder is an explicit follow-up — this file makes **no** success claim for
-//! mixed-projection execution.
+//! differ per projection. Each launch derives its decoder geometry from the
+//! selected projection; no global qtype is assumed.
 //!
 //! The pipeline mirrors the CPU reference: host-free top-k routing, per-route
 //! expert GEMV for FC1 (and the optional FC3 gate), a fused
 //! activation/SwiGLU pass, the FC2 down-projection, and a weighted combine of
-//! each token's selected experts. All heavy work runs on the EP's non-default
-//! stream; the trailing host synchronization guards the eager (non-captured)
-//! path.
+//! each token's selected experts. All heavy work runs asynchronously on the
+//! EP's selected-device stream and is safe to record after warm-up.
 
 use std::borrow::Cow;
 use std::ffi::c_void;
@@ -32,27 +26,28 @@ use std::sync::{Arc, Mutex, OnceLock};
 use cudarc::driver::sys::CUdeviceptr;
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 use onnx_runtime_ep_api::{
-    EpError, Kernel, KernelFactory, Result, TensorMetadata, TensorMut, TensorView,
-    WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
+    EpError, ExecutionProvider, Kernel, KernelFactory, Result, TensorMetadata, TensorMut,
+    TensorView, WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
 };
 use onnx_runtime_ep_cpu::kernels::moe::{
     Activation, DEFAULT_SWIGLU_LIMIT, validate_moe_activation_attributes,
 };
 use onnx_runtime_ir::{DataType, Node, Shape};
-use onnx_runtime_memory_governor::MemoryRole;
+use onnx_runtime_memory_governor::{MemoryRole, ProviderContextIdentity};
 
 use crate::error::driver_err;
 use crate::kernels::block_quantized_matmul::{BlockFormat, decoder_prelude};
 use crate::kernels::expert_route_telemetry::{
     ArmedTelemetry, MARK_DEVICE_SRC, RouteTelemetryConfig, TelemetrySnapshot, TelemetryUnsupported,
 };
+use crate::provider::{CudaExecutionProvider, CudaSealedAllocation};
 use crate::runtime::{CudaRuntime, cuptr};
 
 const OP: &str = "BlockQuantizedMoE";
 const DOMAIN: &str = onnx_runtime_ir::RUNTIME_DOMAIN;
 const LAYOUT_VERSION: i64 = 1;
 
-const MODULE: &str = "block_quantized_moe_v1";
+const MODULE: &str = "block_quantized_moe_v2";
 const ROUTE_ENTRY: &str = "bqmoe_route";
 const LINEAR_ENTRY: &str = "bqmoe_linear_f32";
 const ACTIVATE_ENTRY: &str = "bqmoe_activate";
@@ -225,6 +220,7 @@ extern "C" __global__ void bqmoe_linear_f32(
     const int in_features,
     const int blocks,
     const int block_bytes,
+    const int qk,
     const int format)
 {
     const unsigned long long tasks = routes * (unsigned long long)out_features;
@@ -247,7 +243,7 @@ extern "C" __global__ void bqmoe_linear_f32(
              depth += (int)blockDim.x) {
             value += input[input_base + depth]
                 * decode_weight(
-                    expert_packed, format, blocks, block_bytes,
+                    expert_packed, format, qk, blocks, block_bytes,
                     output_feature, depth);
         }
         value = block_sum(value);
@@ -475,13 +471,7 @@ fn parse_layout_version(node: &Node) -> Result<()> {
     Ok(())
 }
 
-/// Per-projection native formats for the CUDA claim gate.
-///
-/// The mixed-projection ABI allows `fc1_format`, `fc2_format` and `fc3_format`
-/// to differ. The current device kernel decodes a single **uniform** format, so
-/// [`ProjectionFormats::uniform`] typed-rejects any mixed combination — those
-/// nodes fall back to the CPU oracle. This is an explicit CUDA follow-up with
-/// no success claim for mixed-projection execution.
+/// Per-projection native formats for CUDA validation and dispatch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ProjectionFormats {
     fc1: BlockFormat,
@@ -489,23 +479,314 @@ struct ProjectionFormats {
     fc3: Option<BlockFormat>,
 }
 
-impl ProjectionFormats {
-    /// The single format the uniform-projection device kernel decodes, or an
-    /// error describing the mixed-projection combination CUDA cannot yet run.
-    fn uniform(self) -> std::result::Result<BlockFormat, String> {
-        let mut mixed = self.fc1 != self.fc2;
-        if let Some(fc3) = self.fc3 {
-            mixed |= fc3 != self.fc1;
-        }
-        if mixed {
-            return Err(format!(
-                "CUDA does not yet support mixed per-projection block formats \
-                 (fc1={:?}, fc2={:?}, fc3={:?}); the CPU oracle owns this node",
-                self.fc1, self.fc2, self.fc3
-            ));
-        }
-        Ok(self.fc1)
+/// Immutable host description of one expert-major interleaved GGUF projection.
+#[derive(Clone, Copy, Debug)]
+pub struct BlockQuantizedMoeBank<'a> {
+    pub format: &'a str,
+    pub packed: &'a [u8],
+    pub experts: usize,
+    pub out_features: usize,
+    pub in_features: usize,
+}
+
+/// Diagnostic content identity for one admitted projection bank.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlockQuantizedMoeBankIdentity(u64);
+
+impl BlockQuantizedMoeBankIdentity {
+    pub fn digest(self) -> u64 {
+        self.0
     }
+}
+
+/// Residency granularity honestly exposed by the current sealed admission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockQuantizedMoeResidency {
+    WholeProjectionBank,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BlockQuantizedMoeTraffic {
+    /// One-time immutable host-to-device upload at admission.
+    pub fixed_load_bytes: usize,
+    /// Unique selected expert/projection bank bytes addressable by this launch.
+    pub selected_read_bytes: usize,
+    /// No selected-expert pager is wired in this slice.
+    pub page_ins: usize,
+    /// No residency cache participates, so hit rate is intentionally absent.
+    pub byte_hit_rate: Option<f64>,
+}
+
+struct AdmittedProjectionBank {
+    allocation: CudaSealedAllocation,
+    identity: BlockQuantizedMoeBankIdentity,
+    experts: usize,
+    bytes_per_expert: usize,
+    total_bytes: usize,
+}
+
+/// Sealed owner for immutable FC1/FC2/(optional) FC3 projection banks.
+///
+/// This admission validates exact full-block geometry and reserved/non-finite
+/// scale codes before upload. It deliberately exposes no device pointer or
+/// mutable allocation. Current residency remains whole-projection-bank; a
+/// selected-expert pager must mint a different admission type.
+pub struct AdmittedBlockQuantizedMoeBanks {
+    fc1: AdmittedProjectionBank,
+    fc2: AdmittedProjectionBank,
+    fc3: Option<AdmittedProjectionBank>,
+    device: onnx_runtime_ir::DeviceId,
+    provider_context: ProviderContextIdentity,
+}
+
+impl AdmittedBlockQuantizedMoeBanks {
+    pub fn diagnostic_identities(&self) -> [Option<BlockQuantizedMoeBankIdentity>; 3] {
+        [
+            Some(self.fc1.identity),
+            Some(self.fc2.identity),
+            self.fc3.as_ref().map(|bank| bank.identity),
+        ]
+    }
+
+    pub fn device(&self) -> onnx_runtime_ir::DeviceId {
+        self.device
+    }
+
+    pub fn provider_context(&self) -> ProviderContextIdentity {
+        self.provider_context
+    }
+
+    pub fn residency(&self) -> BlockQuantizedMoeResidency {
+        BlockQuantizedMoeResidency::WholeProjectionBank
+    }
+
+    pub fn projection_count(&self) -> usize {
+        let _ = (&self.fc1.allocation, &self.fc2.allocation);
+        2 + usize::from(self.fc3.is_some())
+    }
+
+    pub fn no_residency_traffic(
+        &self,
+        selected_experts: &[usize],
+    ) -> Result<BlockQuantizedMoeTraffic> {
+        let experts = self.fc1.experts;
+        if selected_experts.iter().any(|&expert| expert >= experts) {
+            return Err(error(format!(
+                "selected expert is outside admitted range 0..{experts}"
+            )));
+        }
+        let mut selected = vec![false; experts];
+        for &expert in selected_experts {
+            selected[expert] = true;
+        }
+        let selected_count = selected.into_iter().filter(|selected| *selected).count();
+        let projections = [&self.fc1, &self.fc2];
+        let fixed_load_bytes = projections
+            .iter()
+            .map(|bank| bank.total_bytes)
+            .chain(self.fc3.iter().map(|bank| bank.total_bytes))
+            .try_fold(0usize, |total, bytes| total.checked_add(bytes))
+            .ok_or_else(|| error("fixed load byte count overflow"))?;
+        let selected_read_bytes = projections
+            .iter()
+            .map(|bank| bank.bytes_per_expert)
+            .chain(self.fc3.iter().map(|bank| bank.bytes_per_expert))
+            .try_fold(0usize, |total, bytes| total.checked_add(bytes))
+            .and_then(|bytes| bytes.checked_mul(selected_count))
+            .ok_or_else(|| error("selected read byte count overflow"))?;
+        Ok(BlockQuantizedMoeTraffic {
+            fixed_load_bytes,
+            selected_read_bytes,
+            page_ins: 0,
+            byte_hit_rate: None,
+        })
+    }
+}
+
+fn bank_identity(
+    format: BlockFormat,
+    experts: usize,
+    out_features: usize,
+    in_features: usize,
+    packed: &[u8],
+) -> BlockQuantizedMoeBankIdentity {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for value in [
+        format.kernel_id() as u64,
+        experts as u64,
+        out_features as u64,
+        in_features as u64,
+    ] {
+        for byte in value.to_le_bytes() {
+            hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    for &byte in packed {
+        hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    BlockQuantizedMoeBankIdentity(hash)
+}
+
+fn validate_finite_f16(label: &str, block_index: usize, field: &str, bytes: &[u8]) -> Result<()> {
+    let value = half::f16::from_le_bytes([bytes[0], bytes[1]]).to_f32();
+    if !value.is_finite() {
+        return Err(error(format!(
+            "{label} block {block_index} has non-finite {field} scale"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_block_values(label: &str, format: BlockFormat, packed: &[u8]) -> Result<()> {
+    let block_bytes = format.block_bytes();
+    for (block_index, block) in packed.chunks_exact(block_bytes).enumerate() {
+        match format {
+            BlockFormat::Mxfp4 => {
+                if block[0] == 0xff {
+                    return Err(error(format!(
+                        "{label} block {block_index} uses reserved MXFP4 E8M0 code 0xff"
+                    )));
+                }
+            }
+            BlockFormat::Iq1M => {
+                let scales = &block[48..56];
+                let words = [
+                    u16::from_le_bytes([scales[0], scales[1]]),
+                    u16::from_le_bytes([scales[2], scales[3]]),
+                    u16::from_le_bytes([scales[4], scales[5]]),
+                    u16::from_le_bytes([scales[6], scales[7]]),
+                ];
+                let scale_bits = (words[0] >> 12)
+                    | ((words[1] >> 8) & 0x00f0)
+                    | ((words[2] >> 4) & 0x0f00)
+                    | (words[3] & 0xf000);
+                validate_finite_f16(label, block_index, "IQ1_M", &scale_bits.to_le_bytes())?;
+            }
+            BlockFormat::Q2K => {
+                validate_finite_f16(label, block_index, "Q2_K d", &block[80..82])?;
+                validate_finite_f16(label, block_index, "Q2_K dmin", &block[82..84])?;
+            }
+            BlockFormat::Q3K => {
+                validate_finite_f16(label, block_index, "Q3_K d", &block[108..110])?;
+            }
+            BlockFormat::Q5K => {
+                validate_finite_f16(label, block_index, "Q5_K d", &block[..2])?;
+                validate_finite_f16(label, block_index, "Q5_K dmin", &block[2..4])?;
+            }
+            BlockFormat::Q6K => {
+                validate_finite_f16(label, block_index, "Q6_K d", &block[208..210])?;
+            }
+            _ => validate_finite_f16(label, block_index, "block", &block[..2])?,
+        }
+    }
+    Ok(())
+}
+
+fn validate_host_bank(
+    label: &str,
+    bank: BlockQuantizedMoeBank<'_>,
+) -> Result<(BlockFormat, BlockQuantizedMoeBankIdentity)> {
+    let format = BlockFormat::parse(bank.format)?;
+    if bank.experts == 0 || bank.out_features == 0 || bank.in_features == 0 {
+        return Err(error(format!(
+            "{label} requires positive experts/out/in, got {}/{}/{}",
+            bank.experts, bank.out_features, bank.in_features
+        )));
+    }
+    if !bank.in_features.is_multiple_of(format.qk()) {
+        return Err(error(format!(
+            "{label} input width {} has a partial {:?} block tail; full blocks of {} are required",
+            bank.in_features,
+            format,
+            format.qk()
+        )));
+    }
+    let expected = bank
+        .experts
+        .checked_mul(bank.out_features)
+        .and_then(|value| value.checked_mul(bank.in_features / format.qk()))
+        .and_then(|value| value.checked_mul(format.block_bytes()))
+        .ok_or_else(|| error(format!("{label} packed byte count overflow")))?;
+    if bank.packed.len() != expected {
+        return Err(error(format!(
+            "{label} has {} bytes, expected {expected}",
+            bank.packed.len()
+        )));
+    }
+    validate_block_values(label, format, bank.packed)?;
+    Ok((
+        format,
+        bank_identity(
+            format,
+            bank.experts,
+            bank.out_features,
+            bank.in_features,
+            bank.packed,
+        ),
+    ))
+}
+
+/// Validate all projection banks before uploading any bytes, then return one
+/// non-cloneable sealed owner tied to the selected CUDA provider context.
+pub fn admit_block_quantized_moe_banks(
+    provider: &Arc<CudaExecutionProvider>,
+    fc1: BlockQuantizedMoeBank<'_>,
+    fc2: BlockQuantizedMoeBank<'_>,
+    fc3: Option<BlockQuantizedMoeBank<'_>>,
+) -> Result<AdmittedBlockQuantizedMoeBanks> {
+    if provider.runtime().is_capturing()? {
+        return Err(error(
+            "cannot admit block-quantized MoE banks during CUDA graph capture",
+        ));
+    }
+    if fc1.experts != fc2.experts
+        || fc1.in_features != fc2.out_features
+        || fc1.out_features != fc2.in_features
+    {
+        return Err(error(
+            "fc1/fc2 bank dimensions do not form one expert pipeline",
+        ));
+    }
+    if let Some(fc3) = fc3
+        && (fc3.experts != fc1.experts
+            || fc3.in_features != fc1.in_features
+            || fc3.out_features != fc1.out_features)
+    {
+        return Err(error("fc3 bank dimensions do not match fc1"));
+    }
+    let (_, fc1_identity) = validate_host_bank("fc1", fc1)?;
+    let (_, fc2_identity) = validate_host_bank("fc2", fc2)?;
+    let fc3_identity = fc3
+        .map(|bank| validate_host_bank("fc3", bank))
+        .transpose()?
+        .map(|(_, identity)| identity);
+    let upload = |label: &str, bank: BlockQuantizedMoeBank<'_>, identity| {
+        let bytes_per_expert = bank.packed.len() / bank.experts;
+        provider
+            .upload_sealed(bank.packed, 256)
+            .map(|allocation| AdmittedProjectionBank {
+                allocation,
+                identity,
+                experts: bank.experts,
+                bytes_per_expert,
+                total_bytes: bank.packed.len(),
+            })
+            .map_err(|err| error(format!("upload immutable {label} bank: {err}")))
+    };
+    let fc1 = upload("fc1", fc1, fc1_identity)?;
+    let fc2 = upload("fc2", fc2, fc2_identity)?;
+    let fc3 = match (fc3, fc3_identity) {
+        (Some(bank), Some(identity)) => Some(upload("fc3", bank, identity)?),
+        (None, None) => None,
+        _ => return Err(error("internal fc3 admission mismatch")),
+    };
+    Ok(AdmittedBlockQuantizedMoeBanks {
+        fc1,
+        fc2,
+        fc3,
+        device: provider.device_id(),
+        provider_context: provider.provider_context_identity(),
+    })
 }
 
 fn parse_format_attr(node: &Node, name: &str) -> Result<BlockFormat> {
@@ -561,10 +842,10 @@ fn claim_projection_formats(
     node: &Node,
 ) -> std::result::Result<ProjectionFormats, Cow<'static, str>> {
     let fc1 = claim_format_attr(node, "fc1_format")?.ok_or(Cow::Borrowed(
-        "BlockQuantizedMoE: missing required string attribute 'fc1_format' — export one of mxfp4, iq4_nl, iq4_xs, iq2_xxs, iq3_xxs, iq2_xs, iq2_s, iq3_s, iq1_s, or iq1_m",
+        "BlockQuantizedMoE: missing required string attribute 'fc1_format'",
     ))?;
     let fc2 = claim_format_attr(node, "fc2_format")?.ok_or(Cow::Borrowed(
-        "BlockQuantizedMoE: missing required string attribute 'fc2_format' — export one of mxfp4, iq4_nl, iq4_xs, iq2_xxs, iq3_xxs, iq2_xs, iq2_s, iq3_s, iq1_s, or iq1_m",
+        "BlockQuantizedMoE: missing required string attribute 'fc2_format'",
     ))?;
     let fc3 = claim_format_attr(node, "fc3_format")?;
     let fc3_wired = node.inputs.get(6).is_some_and(Option::is_some);
@@ -610,7 +891,7 @@ fn claim_format_attr(
     match BlockFormat::parse(text) {
         Ok(format) => Ok(Some(format)),
         Err(_) => Err(Cow::Owned(format!(
-            "BlockQuantizedMoE: CUDA does not support format '{text}' for '{name}' — re-export weights as mxfp4, iq4_nl, iq4_xs, iq2_xxs, iq3_xxs, iq2_xs, iq2_s, iq3_s, iq1_s, or iq1_m"
+            "BlockQuantizedMoE: CUDA does not support format '{text}' for '{name}'"
         ))),
     }
 }
@@ -639,23 +920,19 @@ impl BlockQuantizedMoEFactory {
     ) -> Result<BlockQuantizedMoEKernel> {
         parse_layout_version(node)?;
         let attributes = MoeAttributes::from_node(node)?;
-        // The device kernel decodes a single uniform format; mixed-projection
-        // nodes are typed-rejected at the claim gate before reaching here.
-        let format = parse_projection_formats(node)?.uniform().map_err(error)?;
+        let formats = parse_projection_formats(node)?;
         Ok(BlockQuantizedMoEKernel {
             runtime: self.runtime.clone(),
             attributes,
-            format,
+            formats,
             telemetry: Mutex::new(None),
         })
     }
 }
 
 /// Placement declaration for the CUDA claim gate. The CUDA kernel implements the
-/// BlockQuantizedMoE ABI over the ten CUDA-supported GGUF block formats with f32
-/// activations, but only for **uniform** per-projection formats. It declines any
-/// node the kernel cannot execute (unsupported format, mixed per-projection
-/// formats, wrong layout version, or non-f32 activation/router dtypes) so those
+/// BlockQuantizedMoE ABI over the CUDA-supported GGUF block formats with f32
+/// activations. It declines any node the kernel cannot execute so those
 /// nodes fall back to the CPU oracle rather than mis-executing.
 pub(crate) fn unsupported_reason(
     node: &Node,
@@ -666,16 +943,10 @@ pub(crate) fn unsupported_reason(
         Ok(formats) => formats,
         Err(reason) => return Some(reason),
     };
-    // The device kernel decodes one uniform format; real GLM-5.2 GGUF experts
-    // carry different qtypes per projection. Typed-reject the mixed case (no
-    // success claim) so the CPU oracle owns it — a per-projection CUDA decoder
-    // is an explicit follow-up.
-    if let Err(reason) = formats.uniform() {
-        return Some(Cow::Owned(format!("BlockQuantizedMoE: {reason}")));
-    }
-    if let Err(reason) = MoeAttributes::from_node(node) {
-        return Some(Cow::Owned(reason.to_string()));
-    }
+    let attributes = match MoeAttributes::from_node(node) {
+        Ok(attributes) => attributes,
+        Err(reason) => return Some(Cow::Owned(reason.to_string())),
+    };
     if let Some(attribute) = node.attr("block_layout_version") {
         match attribute.as_int() {
             Some(version) if version == LAYOUT_VERSION => {}
@@ -713,14 +984,63 @@ pub(crate) fn unsupported_reason(
             )));
         }
     }
-    let _ = shapes;
+    let static_axis = |input: usize, axis: usize| {
+        shapes
+            .get(input)
+            .and_then(|shape| shape.get(axis))
+            .and_then(|dim| dim.as_static())
+    };
+    let hidden = shapes
+        .first()
+        .and_then(|shape| shape.last())
+        .and_then(|dim| dim.as_static());
+    let fc1_out = static_axis(2, 1);
+    let inter = fc1_out.and_then(|width| {
+        if attributes.swiglu_fusion == 0 {
+            Some(width)
+        } else {
+            width.is_multiple_of(2).then_some(width / 2)
+        }
+    });
+    for (index, label, format, in_features) in [
+        (2, "fc1", Some(formats.fc1), hidden),
+        (4, "fc2", Some(formats.fc2), inter),
+        (6, "fc3", formats.fc3, hidden),
+    ] {
+        let Some(format) = format else {
+            continue;
+        };
+        if let Some(width) = in_features {
+            if !width.is_multiple_of(format.qk()) {
+                return Some(Cow::Owned(format!(
+                    "BlockQuantizedMoE: {label} input width {width} has a partial {format:?} block tail"
+                )));
+            }
+            if let Some(blocks) = static_axis(index, 2)
+                && blocks != width / format.qk()
+            {
+                return Some(Cow::Owned(format!(
+                    "BlockQuantizedMoE: {label} block count {blocks} does not match {}",
+                    width / format.qk()
+                )));
+            }
+        }
+        if let Some(bytes) = static_axis(index, 3)
+            && bytes != format.block_bytes()
+        {
+            return Some(Cow::Owned(format!(
+                "BlockQuantizedMoE: {label} block byte width {bytes} does not match {}",
+                format.block_bytes()
+            )));
+        }
+    }
     None
 }
 
 pub struct BlockQuantizedMoEKernel {
     runtime: Arc<CudaRuntime>,
     attributes: MoeAttributes,
-    format: BlockFormat,
+    formats: ProjectionFormats,
     /// Inert, default-disabled route telemetry (issue #1810 Slice 7A). `None`
     /// unless explicitly armed via
     /// [`BlockQuantizedMoEKernel::arm_route_telemetry`]; while `None` the route
@@ -986,6 +1306,7 @@ struct PackedExperts<'a> {
     out_features: usize,
     in_features: usize,
     blocks: usize,
+    format: BlockFormat,
 }
 
 impl<'a> PackedExperts<'a> {
@@ -1004,7 +1325,15 @@ impl<'a> PackedExperts<'a> {
             packed.dtype,
             DataType::Uint8,
         )?;
-        let blocks = checked_div_ceil(in_features, format.qk(), &format!("{name} block count"))?;
+        if !in_features.is_multiple_of(format.qk()) {
+            return Err(error(format!(
+                "{name} input dimension {in_features} has an unsupported partial block tail for \
+                 {:?} (elements_per_block={}); full GGUF blocks are required",
+                format,
+                format.qk()
+            )));
+        }
+        let blocks = in_features / format.qk();
         require_shape(
             &format!("{name}_experts_weights"),
             packed.shape,
@@ -1044,6 +1373,7 @@ impl<'a> PackedExperts<'a> {
             out_features,
             in_features,
             blocks,
+            format,
         })
     }
 }
@@ -1181,7 +1511,7 @@ impl Kernel for BlockQuantizedMoEKernel {
             experts,
             fc1_out,
             hidden,
-            self.format,
+            self.formats.fc1,
         )?;
         let fc2 = PackedExperts::validate(
             "fc2",
@@ -1190,7 +1520,7 @@ impl Kernel for BlockQuantizedMoEKernel {
             experts,
             hidden,
             inter,
-            self.format,
+            self.formats.fc2,
         )?;
 
         let has_fc3 = optional_input(inputs, 6).is_some();
@@ -1204,7 +1534,9 @@ impl Kernel for BlockQuantizedMoEKernel {
                 experts,
                 inter,
                 hidden,
-                self.format,
+                self.formats
+                    .fc3
+                    .ok_or_else(|| error("fc3 weights require fc3_format"))?,
             )?)
         } else {
             for (index, name) in [(6, "fc3_experts_weights"), (7, "fc3_experts_bias")] {
@@ -1284,8 +1616,8 @@ impl Kernel for BlockQuantizedMoEKernel {
         // resetting per call. When disarmed — or armed for a different capacity —
         // the pointers are null and the route kernel is byte-identical; a
         // capacity mismatch leaves telemetry inert for this call and never fails
-        // inference. (BlockQuantizedMoE is not capture-capable — its trailing
-        // host sync predates this slice — so this adds no new synchronization.)
+        // inference. The mutex is released before any launch, so graph capture
+        // records only device work.
         let (telemetry_bitmap, telemetry_header) = {
             let telemetry = self
                 .telemetry
@@ -1336,7 +1668,7 @@ impl Kernel for BlockQuantizedMoEKernel {
             rows,
             hidden,
         )?;
-        self.runtime.synchronize()
+        Ok(())
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
@@ -1344,9 +1676,7 @@ impl Kernel for BlockQuantizedMoEKernel {
     }
 
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
-        onnx_runtime_ep_api::CaptureSupport::unsupported(
-            "block-quantized MoE performs a trailing host stream synchronization",
-        )
+        onnx_runtime_ep_api::CaptureSupport::Supported
     }
 }
 
@@ -1451,8 +1781,9 @@ impl BlockQuantizedMoEKernel {
         let out_features = as_i32("output feature count", weights.out_features)?;
         let in_features = as_i32("input feature count", weights.in_features)?;
         let blocks = as_i32("block count", weights.blocks)?;
-        let block_bytes = as_i32("block byte count", self.format.block_bytes())?;
-        let format = self.format.kernel_id();
+        let block_bytes = as_i32("block byte count", weights.format.block_bytes())?;
+        let qk = as_i32("block element count", weights.format.qk())?;
+        let format = weights.format.kernel_id();
         let mut builder = self.runtime.stream().launch_builder(&function);
         builder
             .arg(&input_ptr)
@@ -1467,6 +1798,7 @@ impl BlockQuantizedMoEKernel {
             .arg(&in_features)
             .arg(&blocks)
             .arg(&block_bytes)
+            .arg(&qk)
             .arg(&format);
         // SAFETY: packed weights cover experts*out_features*blocks*block_bytes,
         // scratch buffers cover routes*out_features, and the scalar ABI matches
@@ -1646,16 +1978,6 @@ fn checked_tensor_layout(name: &str, shape: &[usize], dtype: DataType) -> Result
     Ok(elements)
 }
 
-fn checked_div_ceil(value: usize, divisor: usize, context: &str) -> Result<usize> {
-    if divisor == 0 {
-        return Err(error(format!("{context} divisor must be non-zero")));
-    }
-    value
-        .checked_add(divisor - 1)
-        .map(|adjusted| adjusted / divisor)
-        .ok_or_else(|| error(format!("{context} exceeds usize limits")))
-}
-
 fn as_u64(name: &str, value: usize) -> Result<u64> {
     u64::try_from(value).map_err(|_| error(format!("{name}={value} exceeds CUDA u64 limits")))
 }
@@ -1721,6 +2043,58 @@ mod workspace_tests {
 }
 
 #[cfg(test)]
+mod sealed_bank_tests {
+    use super::*;
+
+    fn bank<'a>(
+        format: &'a str,
+        packed: &'a [u8],
+        in_features: usize,
+    ) -> BlockQuantizedMoeBank<'a> {
+        BlockQuantizedMoeBank {
+            format,
+            packed,
+            experts: 1,
+            out_features: 1,
+            in_features,
+        }
+    }
+
+    #[test]
+    fn host_admission_rejects_reserved_tail_length_and_overflow() {
+        let mut reserved = vec![0u8; 17];
+        reserved[0] = 0xff;
+        let error = validate_host_bank("fc1", bank("mxfp4", &reserved, 32)).unwrap_err();
+        assert!(error.to_string().contains("reserved MXFP4"));
+
+        let finite = vec![0u8; 17];
+        let error = validate_host_bank("fc1", bank("mxfp4", &finite, 33)).unwrap_err();
+        assert!(error.to_string().contains("partial"));
+
+        let error = validate_host_bank("fc1", bank("mxfp4", &[], 32)).unwrap_err();
+        assert!(error.to_string().contains("expected 17"));
+
+        let overflow = BlockQuantizedMoeBank {
+            format: "q2_k",
+            packed: &[],
+            experts: usize::MAX,
+            out_features: usize::MAX,
+            in_features: 256,
+        };
+        let error = validate_host_bank("fc1", overflow).unwrap_err();
+        assert!(error.to_string().contains("overflow"));
+    }
+
+    #[test]
+    fn host_admission_rejects_non_finite_embedded_scale() {
+        let mut q8 = vec![0u8; 34];
+        q8[..2].copy_from_slice(&half::f16::NAN.to_le_bytes());
+        let error = validate_host_bank("fc2", bank("q8_0", &q8, 32)).unwrap_err();
+        assert!(error.to_string().contains("non-finite"));
+    }
+}
+
+#[cfg(test)]
 mod claim_gate_tests {
     use super::*;
     use onnx_runtime_ir::{Attribute, NodeId, ValueId};
@@ -1756,27 +2130,22 @@ mod claim_gate_tests {
     }
 
     #[test]
-    fn mixed_fc1_fc2_formats_are_typed_rejected_without_a_success_claim() {
+    fn mixed_fc1_fc2_formats_are_claimable() {
         // The real GLM-5.2 UD-IQ1_S combo: gate/up IQ1_S, down IQ3_XXS.
         let node = claim_node("iq1_s", "iq3_xxs", None);
-        let reason = unsupported_reason(&node, &[], &[])
-            .expect("mixed per-projection formats must be declined by the CUDA claim gate");
         assert!(
-            reason.contains("mixed per-projection block formats"),
-            "unexpected rejection reason: {reason}"
+            unsupported_reason(&node, &[], &[]).is_none(),
+            "mixed per-projection formats must be claimed"
         );
+        let final_layer = claim_node("q2_k", "q3_k", None);
+        assert!(unsupported_reason(&final_layer, &[], &[]).is_none());
     }
 
     #[test]
-    fn mixed_fc3_gate_format_is_typed_rejected() {
+    fn mixed_fc3_gate_format_is_claimable() {
         // Unfused gate carried at a different qtype than fc1/fc2.
         let node = claim_node("iq1_s", "iq1_s", Some("iq2_xxs"));
-        let reason = unsupported_reason(&node, &[], &[])
-            .expect("a mismatched fc3_format must be declined by the CUDA claim gate");
-        assert!(
-            reason.contains("mixed per-projection block formats"),
-            "unexpected rejection reason: {reason}"
-        );
+        assert!(unsupported_reason(&node, &[], &[]).is_none());
     }
 
     #[test]
@@ -1832,13 +2201,13 @@ mod claim_gate_tests {
 
     #[test]
     fn unsupported_native_format_is_typed_rejected_at_the_claim_gate() {
-        // A native GGUF qtype outside BlockFormat (e.g. Q2_K) is declined, not
+        // A native GGUF qtype outside BlockFormat (Q4_K) is declined, not
         // dequantized or dense-fallback executed.
-        let node = claim_node("q2_k", "q2_k", None);
+        let node = claim_node("q4_k", "q4_k", None);
         let reason = unsupported_reason(&node, &[], &[])
             .expect("an unsupported native format must be declined by the CUDA claim gate");
         assert!(
-            reason.contains("q2_k"),
+            reason.contains("q4_k"),
             "unexpected rejection reason: {reason}"
         );
     }

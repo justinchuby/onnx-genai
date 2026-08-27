@@ -39,10 +39,9 @@
 //! returns, [`launch_planar_moe`] fetches cached functions and issues launches
 //! on the EP stream with **no allocation, no host→device copy, no compile, and
 //! no trailing host synchronization**, so a warmed fixed-shape routed MoE records
-//! cleanly into a captured segment. (This is the key difference from the eager
-//! `BlockQuantizedMoE` op kernel, whose trailing host sync makes it
-//! capture-unsupported.) Ordering with a later device→host read is guaranteed by
-//! the single in-order EP stream.
+//! cleanly into a captured segment. The interleaved `BlockQuantizedMoE` path now
+//! follows the same asynchronous contract. Ordering with a later device→host
+//! read is guaranteed by the single in-order EP stream.
 //!
 //! ## Claim boundary (honest)
 //!

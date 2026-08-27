@@ -12,8 +12,7 @@
 //! claim gate — derives its byte offsets, strides and decode parameters from one
 //! property-typed [`ProjectionLayout`] contract (qtype, elements/block,
 //! bytes/block, logical K/N, per-row and per-expert bank strides, expert count).
-//! Unsupported native layouts (`Q2_K`/`Q3_K`/`Q5_K`/…) are typed-rejected at the
-//! boundary; they are never dequantized or dense-fallback executed.
+//! The GLM-5.2 IQ/K-quant/Q8 layouts are decoded by the CPU parity oracle.
 //!
 //! This CPU kernel is memory-format-only: it keeps expert weights in the native
 //! block-quantized wire layout at the operator boundary, then dequantizes each
@@ -74,7 +73,8 @@ pub(crate) struct ProjectionFormats {
 /// validator and the CPU oracle (and mirrored by the CUDA claim gate).
 ///
 /// A packed projection tensor has shape `[experts, out_features, blocks_per_row,
-/// block_bytes]` where `blocks_per_row = ceil(in_features / qk)`. Scales/aux are
+/// block_bytes]` where `blocks_per_row = in_features / qk`. Partial native
+/// blocks are rejected.
 /// embedded per block (the IQ/MXFP4 formats are self-describing), so there is no
 /// external scale or codebook tensor. Every byte offset the kernel touches is
 /// derived from this contract, never recomputed ad hoc.
@@ -537,6 +537,16 @@ fn validate_runtime_shapes(
 }
 
 fn validate_packed_shape(index: usize, shape: &[usize], layout: ProjectionLayout) -> Result<()> {
+    if !layout.in_features.is_multiple_of(layout.qk()) {
+        return Err(error(format!(
+            "input {index} ('{}') has input width {} with a partial {:?} block tail; \
+             full blocks of {} elements are required",
+            INPUT_NAMES[index],
+            layout.in_features,
+            layout.format,
+            layout.qk()
+        )));
+    }
     let expected = layout.packed_shape();
     if shape != expected {
         return Err(error(format!(
@@ -918,13 +928,24 @@ fn check_static_packed_shape(
     in_features: Option<usize>,
     format: BlockFormat,
 ) -> std::result::Result<(), String> {
+    if let Some(width) = in_features
+        && !width.is_multiple_of(format.qk())
+    {
+        return Err(format!(
+            "input {index} ('{}') input width {width} has a partial {:?} block tail; \
+             full blocks of {} elements are required",
+            INPUT_NAMES[index],
+            format,
+            format.qk()
+        ));
+    }
     check_static_axis(shapes, index, 0, experts, "expert count")?;
     check_static_axis(shapes, index, 1, out_features, "output width")?;
     check_static_axis(
         shapes,
         index,
         2,
-        in_features.map(|width| width.div_ceil(format.qk())),
+        in_features.map(|width| width / format.qk()),
         "block count",
     )?;
     check_static_axis(
@@ -2405,14 +2426,13 @@ mod tests {
     }
 
     #[test]
-    fn projection_layout_contract_is_byte_exact_and_ragged_safe() {
+    fn projection_layout_contract_is_byte_exact_and_rejects_tails() {
         // Byte offsets, per-row and per-expert strides all derive from one
-        // contract; a ragged in_features (not a multiple of qk) still rounds up
-        // to whole blocks, and expert banks tile the tensor with no gap/overlap.
+        // contract, and expert banks tile the tensor with no gap/overlap.
         for (format, out, in_features) in [
             (BlockFormat::Iq1S, 3usize, 256usize),
-            (BlockFormat::Iq3Xxs, 5, 257), // ragged: ceil(257/256) = 2 blocks
-            (BlockFormat::Mxfp4, 4, 33),   // ragged: ceil(33/32) = 2 blocks
+            (BlockFormat::Iq3Xxs, 5, 512),
+            (BlockFormat::Mxfp4, 4, 64),
             (BlockFormat::Iq4Nl, 2, 96),
         ] {
             let experts = 4usize;
@@ -2450,6 +2470,12 @@ mod tests {
                 "expert banks must cover the whole packed projection"
             );
         }
+
+        for (format, width) in [(BlockFormat::Iq3Xxs, 257), (BlockFormat::Mxfp4, 33)] {
+            let layout = ProjectionLayout::new(format, 2, width, 1);
+            let error = validate_packed_shape(2, &layout.packed_shape(), layout).unwrap_err();
+            assert!(error.to_string().contains("partial"));
+        }
     }
 
     #[test]
@@ -2463,10 +2489,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_native_formats_typed_reject_without_fallback() {
-        // GLM's shared-expert and one-off routed layers use Q2_K/Q3_K/Q5_K/Q8_0,
-        // which this runtime does not decode. The claim boundary must
-        // typed-reject them, never silently dequantize or fall back to dense.
+    fn glm52_native_formats_are_accepted_per_projection() {
         let shapes = vec![
             Some((DataType::Float32, vec![1, H])),
             Some((DataType::Float32, vec![1, E])),
@@ -2477,26 +2500,18 @@ mod tests {
             None,
             None,
         ];
-        for native in ["q2_k", "q3_k", "q5_k", "q8_0"] {
+        for native in ["q2_k", "q3_k", "q5_k", "q6_k", "q8_0"] {
             let mut fc1_spec = attrs("identity", 1, false, 0);
             fc1_spec[0] = ("fc1_format", Attribute::String(native.as_bytes().to_vec()));
             let (graph, node) = model_node(&shapes, &fc1_spec);
-            let err = validate_metadata(graph.node(node), None)
-                .expect_err("native fc1 format must be typed-rejected");
-            assert!(
-                err.to_string().contains("unsupported format"),
-                "fc1 {native}: {err}"
-            );
+            validate_metadata(graph.node(node), None)
+                .unwrap_or_else(|error| panic!("fc1 {native}: {error}"));
 
             let mut fc2_spec = attrs("identity", 1, false, 0);
             fc2_spec[1] = ("fc2_format", Attribute::String(native.as_bytes().to_vec()));
             let (graph, node) = model_node(&shapes, &fc2_spec);
-            let err = validate_metadata(graph.node(node), None)
-                .expect_err("native fc2 format must be typed-rejected");
-            assert!(
-                err.to_string().contains("unsupported format"),
-                "fc2 {native}: {err}"
-            );
+            validate_metadata(graph.node(node), None)
+                .unwrap_or_else(|error| panic!("fc2 {native}: {error}"));
         }
     }
 
