@@ -5900,7 +5900,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn no_half_decode_is_diverted_off_the_gemv_on_weight() {
-        if !crate::backend::has_simd_x86() {
+        if !crate::backend::require_simd_x86("no_half_decode_is_diverted_off_the_gemv_on_weight") {
             return;
         }
         // Straddles the retired threshold (0.79M / 1.05M) and then follows the
@@ -6088,7 +6088,8 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn f16_decode_at_the_retired_weight_gate_keeps_the_gemv() {
-        if !crate::backend::has_simd_x86() {
+        if !crate::backend::require_simd_x86("f16_decode_at_the_retired_weight_gate_keeps_the_gemv")
+        {
             return;
         }
         let (k, n) = (1024usize, 1024usize);
@@ -6144,7 +6145,9 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn a_recycled_weight_address_must_not_serve_the_previous_weights_transpose() {
-        if !crate::backend::has_simd_x86() {
+        if !crate::backend::require_simd_x86(
+            "a_recycled_weight_address_must_not_serve_the_previous_weights_transpose",
+        ) {
             return;
         }
         let (k, n) = (1024usize, 1024usize);

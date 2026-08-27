@@ -833,12 +833,20 @@ impl Engine {
         // put in front of it, which for a package continuing its conversation by
         // prepending is every earlier turn. Admitting on the request alone
         // under-reserves for exactly the turns that need the most.
-        let carried = if self.workflow_sessions.contains_key(&session_id) {
-            self.workflow
-                .session_prepended_prompt_len(&session_id.to_string())
-        } else {
-            0
-        };
+        //
+        // Read unconditionally, from the map that holds the value. #2251: this
+        // was gated on `workflow_sessions` -- engine-side, keyed by `SessionId`
+        // -- while the value comes from `workflow.worker.session_state`, which
+        // is pipeline-side and keyed by `(String, cell)`. Since
+        // `session_prepended_prompt_len` is total and answers 0 for a session it
+        // does not know, the gate was redundant whenever the two maps agreed and
+        // discarded a real prefix whenever they did not. Its only reachable
+        // effect was to under-reserve, which is the failure this comment warns
+        // about. The sole caller is the workflow path, so nothing on a
+        // non-workflow hot path pays for the removal.
+        let carried = self
+            .workflow
+            .session_prepended_prompt_len(&session_id.to_string());
         let prompt_tokens = self.interpreted_prompt_token_count(prompt)? + carried;
         let scheduled = self.admit_generate_request_with_scheduler(
             session_id,
@@ -3233,6 +3241,91 @@ mod tests {
                     },
                     if refuse { "refused" } else { "admitted" }
                 ));
+            }
+        }
+
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+        Ok(())
+    }
+
+    /// #2251: the carried prefix is charged from the map that holds it, not
+    /// gated on a second map that merely agrees today.
+    ///
+    /// `admit_interpreted_generate_request` used to gate the carry on
+    /// `workflow_sessions` (engine-side, keyed by `SessionId`) while reading
+    /// its value from `workflow.worker.session_state` (pipeline-side, keyed by
+    /// `(String, cell)`). `session_prepended_prompt_len` is already total --
+    /// it returns 0 for a session it does not know -- so when the two maps
+    /// agree the gate is redundant, and when they diverge it can only discard
+    /// a real prefix and under-reserve. No input exists for which it helps.
+    ///
+    /// A redundant gate cannot be tested through the agreeing case, which is
+    /// why deleting it left the rest of the suite green. This builds the
+    /// divergence the gate purported to handle: a conversation still live in
+    /// the pipeline while the engine map has forgotten it, which is what any
+    /// future close/reset/eviction path that skips `forget_session` leaves
+    /// behind. The failure mode is silent -- an admission that should have
+    /// been a refusal -- so no existing assertion reaches it.
+    ///
+    /// Each arm gets its own engine. Sharing one would let the admitted arm's
+    /// reservation, which `admit_*` takes and only `complete()` returns, pay
+    /// for the other arm's refusal and let this pass with the carry ignored.
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn a_carried_conversation_is_charged_even_when_the_engine_map_forgot_the_session()
+    -> anyhow::Result<()> {
+        let mut wrong = Vec::new();
+        for (label, seed, refuse) in [
+            ("a forgotten session that has heard nothing", &[][..], false),
+            ("a forgotten session holding 3 tokens", &[7, 8, 9][..], true),
+        ] {
+            // 10 B/token, so this budget holds 3 tokens. A turn stating 1
+            // prompt token and 1 new token needs 2 and fits; the same turn
+            // carrying 3 earlier tokens needs 5 and cannot.
+            let mut engine = interpreted_conversation_engine_with_byte_budget(30)?;
+            let session_id = engine.create_session()?;
+            if !seed.is_empty() {
+                engine
+                    .workflow
+                    .seed_session_conversation(&session_id.to_string(), seed)?;
+            }
+
+            // The divergence itself. `create_session` is what put the id in the
+            // engine-side map, so this genuinely removes it rather than being a
+            // no-op -- asserted below, because a silently-failed removal would
+            // send both arms down the agreeing path and pass while proving
+            // nothing.
+            assert!(
+                engine.workflow_sessions.remove(&session_id).is_some(),
+                "{label}: the engine-side map must have held the session for removing it to mean \
+                 anything"
+            );
+            assert_eq!(
+                engine
+                    .workflow
+                    .session_prepended_prompt_len(&session_id.to_string()),
+                seed.len(),
+                "{label}: the conversation must still be readable from the map the carry is read \
+                 from, or this arm is not testing the carry"
+            );
+
+            let prompt = GeneratePrompt::TokenIds(vec![1]);
+            let error = engine
+                .admit_interpreted_generate_request(session_id, &prompt, 1)
+                .map(|_| String::from("<admitted>"))
+                .unwrap_or_else(|error| error.to_string());
+            // Matching the budget refusal specifically keeps "was refused"
+            // from being satisfied by an unrelated failure.
+            let refused = error.contains("scheduler admission failed: KV byte budget");
+            match (refuse, refused) {
+                (true, false) => wrong.push(format!(
+                    "{label}: the carried conversation was not charged, so a turn over budget was \
+                     admitted; got: {error}"
+                )),
+                (false, true) => wrong.push(format!(
+                    "{label}: a turn the budget has room for was refused: {error}"
+                )),
+                _ => {}
             }
         }
 
