@@ -2042,6 +2042,17 @@ cmd_acquire() {
             else
                 echo "hostlock: outcome=acquired by ${OWNER} (anchor pid ${ANCHOR_PID})${REASON:+ — ${REASON}}"
             fi
+            # The reaper is warned twice when it takes a live holder's box, but
+            # until here the holder that LOSES the run was never told anything:
+            # a finite TTL was armed in silence and the default is 3600. That
+            # asymmetry puts the only warning on the party that suffers no
+            # damage. Announce the clock to the party that gets contaminated,
+            # at the moment it starts, while there is still time to re-run with
+            # --ttl 0. `run` pins TTL=0, so this never fires there.
+            if [ "$TTL" -gt 0 ]; then
+                echo "hostlock: WARNING this lock EXPIRES in ${TTL}s, after which another acquire takes the host even though this holder is still running" >&2
+                echo "hostlock: WARNING if that happens this measurement is silently contaminated and nothing on this side reports it; pass --ttl 0 for a job that may exceed ${TTL}s" >&2
+            fi
             return 0
         fi
         # Existing lock: reap it if its anchor died OR it outlived its TTL,
