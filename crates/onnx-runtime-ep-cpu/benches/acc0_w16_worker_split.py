@@ -385,32 +385,52 @@ def honoured_tile_count(raw):
     return value
 
 
-def steal_tiles_label(recs):
-    """How the steal-tile knob was set, for the report header and a replay.
+def arm_label(recs, key, describe):
+    """Label the arm a whole dataset ran under, or refuse to name one.
 
-    Three distinct answers, and collapsing any two of them loses the fact that
-    matters.  `unrecorded` is a dataset archived before this key existed: it
-    ran at whatever its binary's default was, which is NOT necessarily today's
-    default, so calling it `default (shipped)` would assert a value nobody
-    measured.  Same doctrine as the absent-key handling in `hostlock.sh`.
+    Reporting `recs[0][key]` is the re-based-baseline defect one field along:
+    a single confident label above rows that did not all run under it, over a
+    concatenated or hand-edited archive.  `unrecorded` is kept distinct from
+    every real value because a dataset archived before `key` existed ran at
+    whatever its binary's default was, which is NOT necessarily today's, so
+    naming today's default would assert a value nobody measured.  Same
+    doctrine as the absent-key handling in `hostlock.sh`.
     """
     if not recs:
         return "?"
-    seen = {r["steal_tiles"] if "steal_tiles" in r else "unrecorded"
-            for r in recs}
+    seen = {r[key] if key in r else "unrecorded" for r in recs}
     if len(seen) > 1:
-        # Refuse to pick one. Reporting `recs[0]` over a concatenated or
-        # hand-edited archive is the re-based-baseline defect one field along:
-        # a single confident label above rows that did not all run under it.
         return ("MIXED across launches -- not one arm: "
-                + ", ".join(sorted(_one_tile_label(v) for v in seen)))
-    return _one_tile_label(next(iter(seen)))
+                + ", ".join(sorted(describe(v) for v in seen)))
+    return describe(next(iter(seen)))
+
+
+def steal_tiles_label(recs):
+    """How the steal-tile knob was set, for the report header and a replay."""
+    return arm_label(recs, "steal_tiles", _one_tile_label)
 
 
 def _one_tile_label(v):
     if v == "unrecorded":
         return "unrecorded (dataset predates the knob)"
     return "default (shipped, unset)" if v is None else str(v)
+
+
+def blocktime_label(recs):
+    """How long workers spun before parking, for the report header.
+
+    Had the same `recs[0]` weakness the steal-tile label was built to avoid.
+    It is the more dangerous of the two: the barrier decomposition's whole
+    subject is parking, so a header naming one blocktime over launches that
+    ran at two of them would mislabel the exact variable under study.
+    """
+    return arm_label(recs, "blocktime_us", _one_blocktime_label)
+
+
+def _one_blocktime_label(v):
+    if v == "unrecorded":
+        return "unrecorded (dataset predates the field)"
+    return str(v)
 
 
 def report_nodata(recs):
@@ -469,7 +489,7 @@ def report(recs, widths):
     if extras:
         print("# descriptive only, NOT used by the rule or the decomposition: "
               + ", ".join(f"w{w}" for w in extras))
-    print(f"# blocktime_us={recs[0]['blocktime_us'] if recs else '?'} "
+    print(f"# blocktime_us={blocktime_label(recs)} "
           f"(profiled run: diagnostic only, tps deliberately not reported)")
     print(f"# steal_tiles={steal_tiles_label(recs)}")
     hdr = (f"{'L':>3} {'pk':>4} {'T':>6} " +
@@ -792,6 +812,25 @@ def self_test():
     assert "produced NO DATA" in out and "w8:" in out, (
         "a blank width went unreported because the launch was categorised by "
         "its other width:\n" + out)
+
+    # The blocktime header had the same `recs[0]` weakness, over the variable
+    # the decomposition is actually about.
+    two_blocktimes = synthetic_rows(MIN_TRUSTED + 2, stats)
+    for i, r in enumerate(two_blocktimes):
+        r["blocktime_us"] = 500 if i else 0
+    assert blocktime_label(two_blocktimes).startswith("MIXED"), (
+        "a dataset spanning two blocktimes was labelled as one: "
+        + blocktime_label(two_blocktimes))
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        report(two_blocktimes, (8, 16))
+    assert "# blocktime_us=MIXED" in buf.getvalue(), buf.getvalue()
+
+    no_blocktime = synthetic_rows(MIN_TRUSTED, stats)
+    for r in no_blocktime:
+        r.pop("blocktime_us")
+    assert blocktime_label(no_blocktime) == (
+        "unrecorded (dataset predates the field)"), blocktime_label(no_blocktime)
 
     # There is no default owner. A hard-coded one is how every agent but its
     # namesake archived their runs under somebody else's identity.
