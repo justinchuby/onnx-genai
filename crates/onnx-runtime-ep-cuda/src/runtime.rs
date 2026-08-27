@@ -970,6 +970,68 @@ impl CudaRuntime {
         self.graph_slot(slot).has_executable()
     }
 
+    /// Strongly retain a sealed resource in the graph capture currently active
+    /// on this runtime's stream.
+    ///
+    /// Eager launches are unchanged and retain nothing. If the CUDA stream is
+    /// capturing but neither runtime-owned graph slot is the active ownership
+    /// sink, fail before an address-bearing kernel is launched; an externally
+    /// initiated capture must not embed an allocation the runtime cannot pin.
+    pub(crate) fn retain_active_graph_resource<T>(
+        &self,
+        identity: usize,
+        owner: &Arc<T>,
+        label: &str,
+    ) -> Result<()>
+    where
+        T: Send + Sync + 'static,
+    {
+        if !self.is_capturing()? {
+            return Ok(());
+        }
+        if self.graph.retain_capture_resource(identity, owner)?
+            || self.verify_graph.retain_capture_resource(identity, owner)?
+        {
+            return Ok(());
+        }
+        Err(EpError::KernelFailed(format!(
+            "cuda_ep: active CUDA graph capture has no registered ownership sink for sealed \
+             {label}; refusing to embed its device addresses"
+        )))
+    }
+
+    /// Start capture directly on the stream without installing a lifecycle
+    /// ownership sink. Test-only proof that sealed launches fail closed rather
+    /// than embedding addresses in an externally owned graph.
+    #[doc(hidden)]
+    pub fn test_begin_unregistered_graph_capture(&self) -> Result<()> {
+        self.stream
+            .begin_capture(
+                cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+            )
+            .map_err(|error| driver_err("begin unregistered CUDA graph capture", error))
+    }
+
+    /// End and destroy the raw test capture started above.
+    #[doc(hidden)]
+    pub fn test_end_unregistered_graph_capture(&self) -> Result<()> {
+        self.context
+            .bind_to_thread()
+            .map_err(|error| driver_err("bind unregistered CUDA graph capture context", error))?;
+        // SAFETY: the test helper owns the active capture on this stream.
+        let graph = unsafe {
+            cudarc::driver::result::stream::end_capture(self.stream.cu_stream())
+                .map_err(|error| driver_err("end unregistered CUDA graph capture", error))?
+        };
+        if !graph.is_null() {
+            // SAFETY: no executable was instantiated; this helper exclusively
+            // owns the fresh raw graph handle.
+            unsafe { cudarc::driver::result::graph::destroy(graph) }
+                .map_err(|error| driver_err("destroy unregistered CUDA graph", error))?;
+        }
+        Ok(())
+    }
+
     /// Snapshot explicit device allocation/free calls made through this runtime.
     pub fn allocation_counts(&self) -> CudaAllocationCounts {
         CudaAllocationCounts {

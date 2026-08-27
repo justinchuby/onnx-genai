@@ -57,6 +57,83 @@ import acc0_gap_matrix as H  # noqa: E402
 PIN = os.environ.get("MOD_PIN", "4")
 CPU_EFF_FLOOR = 0.95
 
+# `(utime+stime)/wall` measures time spent ON a logical cpu. SMT contention
+# steals throughput WITHOUT stealing time: a competitor on the pinned cpu's
+# hyperthread sibling shares the physical core's execution units, so the
+# benchmark keeps its timeslice, scores a perfect 1.000, and is admitted --
+# while delivering roughly half the work. Measured on this host at PIN=4 with
+# a spinner on cpu5: 0.536x throughput at eff=1.000, against 0.976x for the
+# same spinner on a *different* physical core. So the efficiency gate is sound
+# against descheduling and structurally blind to SMT, and these are two
+# different contention modes needing two different instruments.
+#
+# Ceiling set from measurement, not taste: an idle sibling reads 0.007 with
+# the driver parked and 0.040 with it unpinned, a loaded one reads 1.000.
+# 0.15 sits ~4x above the noisy end and ~7x below a real competitor.
+SMT_SIBLING_CEIL = float(os.environ.get("MOD_SMT_CEIL", "0.15"))
+
+
+def parse_cpu_list(spec):
+    """Expand a cpu-list ("4", "4,6", "0-3") into a set of ints."""
+    out = set()
+    for part in str(spec).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            lo, hi = part.split("-", 1)
+            out.update(range(int(lo), int(hi) + 1))
+        else:
+            out.add(int(part))
+    return out
+
+
+def sibling_cpus(pin):
+    """The SMT siblings of `pin` that `pin` does not already occupy.
+
+    Empty means the gate below cannot fire -- either the host has no SMT, or
+    the pin already covers every sibling of its physical cores. That is a
+    meaningful state and `main` reports it, because a gate that cannot fail
+    reads exactly like a gate that passed.
+    """
+    pinned = parse_cpu_list(pin)
+    sibs = set()
+    for cpu in pinned:
+        path = f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list"
+        try:
+            with open(path) as fh:
+                sibs |= parse_cpu_list(fh.read().strip())
+        except OSError:
+            continue
+    return sorted(sibs - pinned)
+
+
+def cpu_busy_jiffies(cpus, path="/proc/stat"):
+    """(busy, total) jiffies summed over `cpus`, or None if there are none."""
+    if not cpus:
+        return None
+    want = {f"cpu{c}" for c in cpus}
+    busy = total = 0
+    with open(path) as fh:
+        for line in fh:
+            fields = line.split()
+            if fields and fields[0] in want:
+                vals = [int(x) for x in fields[1:11]]
+                total += sum(vals)
+                busy += sum(vals) - (vals[3] + vals[4])  # minus idle + iowait
+    return busy, total
+
+
+def sibling_busy_fraction(before, after):
+    """Fraction of the window the SMT siblings spent NOT idle."""
+    if before is None or after is None:
+        return None
+    span = after[1] - before[1]
+    return ((after[0] - before[0]) / span) if span > 0 else 0.0
+
+
+SIBLING_CPUS = sibling_cpus(PIN)
+
 
 def launch(binary, env_extra, timeout=1800):
     """One launch, with its own CPU efficiency measured by rusage.
@@ -67,6 +144,7 @@ def launch(binary, env_extra, timeout=1800):
     env.update(env_extra)
     env.pop("PROBE_MS", None)
     argv = ["taskset", "-c", PIN, binary, "--bench"]
+    sib_before = cpu_busy_jiffies(SIBLING_CPUS)
     before = resource.getrusage(resource.RUSAGE_CHILDREN)
     start = time.perf_counter()
     proc = subprocess.run(
@@ -75,6 +153,7 @@ def launch(binary, env_extra, timeout=1800):
     )
     wall = time.perf_counter() - start
     after = resource.getrusage(resource.RUSAGE_CHILDREN)
+    sib = sibling_busy_fraction(sib_before, cpu_busy_jiffies(SIBLING_CPUS))
     cpu = (after.ru_utime - before.ru_utime) + (after.ru_stime - before.ru_stime)
     rows = {}
     for line in proc.stdout.decode().splitlines():
@@ -85,13 +164,14 @@ def launch(binary, env_extra, timeout=1800):
                 "cold_ms": float(f[3]), "steady_ms": float(f[4]),
                 "gflops": float(f[5]), "sum": f[6], "fnv": f[7],
             }
-    return rows, (cpu / wall if wall > 0 else 0.0)
+    return rows, (cpu / wall if wall > 0 else 0.0), sib
 
 
 def decode_launch(binary, env_extra, timeout=1800):
     env = dict(os.environ)
     env.update(env_extra)
     argv = ["taskset", "-c", PIN, binary, "--bench"]
+    sib_before = cpu_busy_jiffies(SIBLING_CPUS)
     before = resource.getrusage(resource.RUSAGE_CHILDREN)
     start = time.perf_counter()
     proc = subprocess.run(
@@ -100,6 +180,7 @@ def decode_launch(binary, env_extra, timeout=1800):
     )
     wall = time.perf_counter() - start
     after = resource.getrusage(resource.RUSAGE_CHILDREN)
+    sib = sibling_busy_fraction(sib_before, cpu_busy_jiffies(SIBLING_CPUS))
     cpu = (after.ru_utime - before.ru_utime) + (after.ru_stime - before.ru_stime)
     out = proc.stdout.decode()
     rec = {}
@@ -111,7 +192,7 @@ def decode_launch(binary, env_extra, timeout=1800):
         elif line.startswith("checksum="):
             rec["checksum"] = line.split("=", 1)[1].strip()
     rec["raw"] = out
-    return rec, (cpu / wall if wall > 0 else 0.0)
+    return rec, (cpu / wall if wall > 0 else 0.0), sib
 
 
 #: Fixed so the published intervals are reproducible rather than merely
@@ -180,7 +261,7 @@ def ratio_stats(before_vals, after_vals):
     }
 
 
-def admission_columns(discarded, attempts):
+def admission_columns(discarded, attempts, smt=None):
     """What the efficiency gate admitted, per arm and as a rate.
 
     `total` alone is what this harness used to report, and it cannot answer the
@@ -202,13 +283,27 @@ def admission_columns(discarded, attempts):
         arm: (discarded[arm] / attempts[arm] if attempts[arm] else 0.0)
         for arm in attempts
     }
-    return {
+    cols = {
         "total": sum(discarded.values()),
         "by_arm": dict(discarded),
         "attempts_by_arm": dict(attempts),
         "rate_by_arm": rates,
         "rate_spread": (max(rates.values()) - min(rates.values())) if rates else 0.0,
     }
+    if smt is not None:
+        # Which gate did the discarding. The two catch different contention:
+        # the efficiency floor catches descheduling, the sibling ceiling
+        # catches SMT theft that the floor scores as a perfect 1.000. Merging
+        # them into one count would hide which mode this host actually has.
+        cols["smt_by_arm"] = dict(smt)
+        cols["smt_total"] = sum(smt.values())
+        cols["smt_gate"] = (
+            f"active on cpus {SIBLING_CPUS} (ceil {SMT_SIBLING_CEIL})"
+            if SIBLING_CPUS
+            else f"INACTIVE: pin {PIN!r} has no unoccupied SMT sibling, "
+                 "so no launch can be discarded for SMT contention"
+        )
+    return cols
 
 
 def prefill_matrix(rounds, block, shape, m_list, extra_env=None):
@@ -230,13 +325,18 @@ def prefill_matrix(rounds, block, shape, m_list, extra_env=None):
     # artifact instead of inferred from `rounds`.
     discarded = {a: 0 for a in arms}
     attempts = {a: 0 for a in arms}
+    smt = {a: 0 for a in arms}
     for r in range(rounds):
         # Rotate, so no arm is permanently first in a round and no arm
         # permanently inherits another's cache and frequency state.
         order = arms[r % len(arms):] + arms[: r % len(arms)]
         for arm in order:
-            rows, eff = launch(bins[arm], env)
+            rows, eff, sib = launch(bins[arm], env)
             attempts[arm] += 1
+            if sib is not None and sib > SMT_SIBLING_CEIL:
+                discarded[arm] += 1
+                smt[arm] += 1
+                continue
             if eff < CPU_EFF_FLOOR:
                 discarded[arm] += 1
                 continue
@@ -258,7 +358,7 @@ def prefill_matrix(rounds, block, shape, m_list, extra_env=None):
         raise SystemExit(
             f"cpu-efficiency gate (floor {CPU_EFF_FLOOR}) discarded every launch of "
             f"{', '.join(starved)} -- no sample survives to compare. "
-            f"admission={admission_columns(discarded, attempts)}"
+            f"admission={admission_columns(discarded, attempts, smt)}"
         )
     table = []
     for m in m_list:
@@ -285,7 +385,7 @@ def prefill_matrix(rounds, block, shape, m_list, extra_env=None):
             len(fnv["before"].get(m, set()) | fnv["after"].get(m, set()) | fnv["aa"].get(m, set())) == 1
         )
         table.append(row)
-    return table, admission_columns(discarded, attempts)
+    return table, admission_columns(discarded, attempts, smt)
 
 
 def decode_matrix(rounds, block, tokens):
@@ -299,11 +399,16 @@ def decode_matrix(rounds, block, tokens):
     raw = {}
     discarded = {a: 0 for a in arms}
     attempts = {a: 0 for a in arms}
+    smt = {a: 0 for a in arms}
     for r in range(rounds):
         order = arms[r % len(arms):] + arms[: r % len(arms)]
         for arm in order:
-            rec, eff = decode_launch(bins[arm], env)
+            rec, eff, sib = decode_launch(bins[arm], env)
             attempts[arm] += 1
+            if sib is not None and sib > SMT_SIBLING_CEIL:
+                discarded[arm] += 1
+                smt[arm] += 1
+                continue
             if eff < CPU_EFF_FLOOR:
                 discarded[arm] += 1
                 continue
@@ -325,12 +430,12 @@ def decode_matrix(rounds, block, tokens):
         raise SystemExit(
             f"cpu-efficiency gate (floor {CPU_EFF_FLOOR}) discarded every decode launch "
             f"of {', '.join(starved)} -- no sample survives to compare. "
-            f"admission={admission_columns(discarded, attempts)}"
+            f"admission={admission_columns(discarded, attempts, smt)}"
         )
     if not samples["after"]:
         return (
             {"error": "no parseable decode samples", "raw": raw},
-            admission_columns(discarded, attempts),
+            admission_columns(discarded, attempts, smt),
         )
     out = {"block": block, "tokens": tokens}
     out.update(ratio_stats(samples["before"], samples["after"]))
@@ -341,7 +446,7 @@ def decode_matrix(rounds, block, tokens):
     out["checksums"] = {a: sorted(checks[a]) for a in arms}
     out["bit_identical"] = len(checks["before"] | checks["after"] | checks["aa"]) == 1
     out["samples"] = samples
-    return out, admission_columns(discarded, attempts)
+    return out, admission_columns(discarded, attempts, smt)
 
 
 def route_proof(m_list, shape):
@@ -373,7 +478,7 @@ def route_proof(m_list, shape):
         for arm in arms:
             env = {"PROBE_BITS": "4", "PROBE_BLOCK": str(block), "PROBE_SHAPE": shape,
                    "PROBE_M_LIST": ",".join(str(m) for m in m_list)}
-            got, _ = launch(os.path.join(BIN, f"prefill_{arm}"), env)
+            got, _, _ = launch(os.path.join(BIN, f"prefill_{arm}"), env)
             for m, row in got.items():
                 rows.setdefault((block, m), {})[arm] = row["fnv"]
     print(f"{'block':>6} {'m':>5} {'before==after':>14} {'poison moves':>13}")
@@ -386,8 +491,76 @@ def route_proof(m_list, shape):
         ok = ok and identical and moved == expect_move
         note = "" if moved == expect_move else "  <-- UNEXPECTED"
         print(f"{block:>6} {m:>5} {str(identical):>14} {str(moved):>13}{note}")
+    ok = ok and _gebp_off_control(m_list, shape, rows)
     print("route proof:", "PASS" if ok else "FAIL")
     return {"rows": {f"{b}/{m}": g for (b, m), g in rows.items()}, "pass": ok}
+
+
+def _gebp_off_control(m_list, shape, rows):
+    """Assert that `ONNX_GENAI_CPU_MM_INT4_GEBP=0` really does take the pack off
+    the route, instead of documenting that it does.
+
+    `--env`'s help calls this "verified", and for a long time that word rested on
+    a run nobody had repeated and nothing re-checked. A claim that only exists in
+    a docstring is indistinguishable from one that was never true: the env var is
+    the control used to argue that a sub-2% residual is layout rather than the
+    change, so if it ever stopped removing the pack, every argument leaning on it
+    would keep reading exactly the same.
+
+    The observable: at a row that *does* move with the pack on, turning the pack
+    off must collapse `poison` onto `after`, because the poisoned line is then
+    unreachable. Checksums only -- no timing, so this is contention-independent.
+
+    Also assert the pack-off output *differs* from the pack-on output at that
+    row. Without it the control passes vacuously if the flag were ignored
+    entirely: an ignored flag leaves poison != after, which fails the collapse,
+    but a flag that silently disabled *both* kernels' output would not.
+    """
+    block, m = 32, 8
+    if m not in m_list:
+        print(f"  gebp-off control: skipped, m = {m} not in --m-list")
+        return True
+    env = {"PROBE_BITS": "4", "PROBE_BLOCK": str(block), "PROBE_SHAPE": shape,
+           "PROBE_M_LIST": str(m), "ONNX_GENAI_CPU_MM_INT4_GEBP": "0"}
+    off = {}
+    for arm in ("after", "poison"):
+        got, _, _ = launch(os.path.join(BIN, f"prefill_{arm}"), env)
+        off[arm] = got[m]["fnv"]
+    collapsed = off["after"] == off["poison"]
+    on_moves = rows[(block, m)]["poison"] != rows[(block, m)]["after"]
+    changed_route = off["after"] != rows[(block, m)]["after"]
+    good = collapsed and on_moves and changed_route
+    print(f"  gebp-off control, block {block} m {m}: "
+          f"pack-on moves={on_moves} pack-off collapses={collapsed} "
+          f"pack-off differs from pack-on={changed_route}"
+          f"{'' if good else '  <-- UNEXPECTED'}")
+    return good
+
+
+def park_driver_off_measured_core():
+    """Keep this process off the cpu it is measuring, and off that cpu's sibling.
+
+    The driver is runnable for the whole launch -- it shepherds the child and
+    reads /proc -- and it was previously unpinned, so the scheduler was free to
+    place it on the measured core's SMT sibling and contend with the very
+    benchmark it is timing. Measured: an idle sibling reads 0.040 busy with the
+    driver unpinned versus 0.007 parked, a 6x self-inflicted floor.
+
+    Best effort. If no cpu is left over, stay put rather than fail a run over
+    placement, but say so -- silently not parking is how this went unnoticed.
+    """
+    try:
+        allowed = os.sched_getaffinity(0)
+    except (AttributeError, OSError):
+        return None
+    keep_off = parse_cpu_list(PIN) | set(SIBLING_CPUS)
+    free = allowed - keep_off
+    if not free:
+        print(f"  NOTE: cannot park driver off cpus {sorted(keep_off)} -- "
+              f"only {sorted(allowed)} allowed; driver may contend with its own run")
+        return None
+    os.sched_setaffinity(0, free)
+    return sorted(free)
 
 
 def main():
@@ -405,12 +578,17 @@ def main():
     ap.add_argument(
         "--env", action="append", default=[], metavar="K=V",
         help="extra env for prefill launches. `--env ONNX_GENAI_CPU_MM_INT4_GEBP=0` "
-             "is the layout control: it takes the pack off the route entirely "
-             "(verified -- the poisoned arm goes bit-identical under it), so any "
-             "difference left between `before` and `after` is code layout and not "
-             "the change. That control has to be run on the *same* rows as the "
+             "is the layout control: it takes the pack off the route entirely, "
+             "so any difference left between `before` and `after` is code layout "
+             "and not the change. That it really does remove the pack is not "
+             "taken on trust -- `--route-proof` asserts it, by checking the "
+             "poisoned arm collapses onto `after` at a row that moves with the "
+             "pack on. That control has to be run on the *same* rows as the "
              "claim; a different row can be a different kernel with different "
-             "layout sensitivity.")
+             "layout sensitivity. Note the flag's *timing* delta is "
+             "unattributable by construction -- it swaps a whole algorithm and "
+             "moves cache behaviour and layout with it -- so route claims rest "
+             "on the poisoned checksum, never on this.")
     ap.add_argument("--out", default=os.path.join(BIN, "modulo_matrix.json"))
     args = ap.parse_args()
 
@@ -430,6 +608,7 @@ def main():
                 raise SystemExit(f"missing {p}")
 
     m_list = [int(v) for v in args.m_list.split(",")]
+    parked = park_driver_off_measured_core()
     if args.route_proof:
         # No lock: checksums do not depend on who else is on the machine, and
         # holding the whole host to compute one would be antisocial.
@@ -439,7 +618,14 @@ def main():
         print(f"wrote {args.out}")
         raise SystemExit(0 if proof["pass"] else 1)
 
-    result = {"pin": PIN, "cpu_eff_floor": CPU_EFF_FLOOR, "rounds": args.rounds}
+    result = {
+        "pin": PIN,
+        "cpu_eff_floor": CPU_EFF_FLOOR,
+        "rounds": args.rounds,
+        "smt_sibling_cpus": SIBLING_CPUS,
+        "smt_sibling_ceil": SMT_SIBLING_CEIL,
+        "driver_parked_on": parked,
+    }
     with H.HostLock(
         "roy",
         f"dequant_panel_avx2 modulo matrix: block{args.block} m={args.m_list}"
@@ -469,6 +655,8 @@ def main():
 
     print(f"\npin=cpu{PIN}  cpu_eff floor={CPU_EFF_FLOOR}  "
           f"discarded={result['prefill_discarded_launches']}")
+    print(f"smt siblings={SIBLING_CPUS or 'NONE -- sibling gate inactive'}  "
+          f"ceil={SMT_SIBLING_CEIL}  driver parked on={parked}")
     for label in ("prefill", "decode"):
         adm = result.get(f"{label}_admission")
         if not adm or not adm["attempts_by_arm"]:

@@ -82,6 +82,7 @@ mod cuda_impl {
                 end_version: i32::MAX,
                 supported_dtypes: d.supported_dtypes,
                 input_dtype_constraints: &[],
+                output_dtype_constraints: &[],
             })
             .collect()
     }

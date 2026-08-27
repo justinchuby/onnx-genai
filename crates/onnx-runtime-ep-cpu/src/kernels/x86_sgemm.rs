@@ -854,6 +854,19 @@ impl Int4Weight<'_> {
                 // is a multiple of `block_size`. Hence
                 // `(depth + q) % block_size == offset_base + q` exactly.
                 //
+                // Both halves of that are mutation-tested rather than merely
+                // argued, because a substitution justified by an invariant is
+                // only as safe as the coverage of the invariant itself.
+                // Mutating the clip on the line above -- removing it
+                // (`run = whole - p`), widening it to two blocks, or relaxing
+                // it by a single group -- is caught every time, by
+                // `int4_dequant_panel_is_bit_identical_to_the_per_column_path`
+                // and by three further int4 tests. So the clip, not any
+                // property of `block_size`, is what this rests on, and it is
+                // guarded. Conversely a no-op edit to the same line survives,
+                // so those kills are the tests discriminating, not a harness
+                // that reddens at any touch.
+                //
                 // Worth removing because this is the innermost loop of the
                 // pack -- one division per group of eight depths -- and
                 // because LLVM cannot remove it itself: `block_size` is a
@@ -2119,6 +2132,14 @@ mod tests {
         // what pins the block-scoped hoist: it walks whole groups inside one
         // block, so `block_size - pc % block_size` has to stay a multiple of
         // the group even when the block does not tile `pc` evenly.
+        //
+        // 24 and 40 are load-bearing, not decoration: replacing the packer's
+        // `depth % block_size` with the power-of-two-only
+        // `depth & (block_size - 1)` is caught here at `block = 24` (0.28 vs
+        // 0.12 at the first depth), and is caught *nowhere* if this list is
+        // trimmed to powers of two. Anyone tidying it should know they are
+        // deleting the only thing standing between that masked form and a
+        // green suite.
         let k = 256usize;
         let n = 32usize;
         for &block_size in &[2usize, 4, 8, 24, 32, 40, 128] {

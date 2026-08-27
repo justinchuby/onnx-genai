@@ -984,6 +984,15 @@ mod tests {
 
     #[test]
     fn input_view_preserves_cuda_residency_from_ort_memory_info() {
+        // `api_with_both_shape_routes` wires the *counting* shape hooks, so a
+        // `read_inputs` through it bumps `SHAPE_REF_CALLS` whether or not this
+        // test cares about the count. `SHAPE_COUNTER_LOCK` is what serializes
+        // that against the tests that do assert it, and libtest runs these in
+        // parallel: without the guard this read races
+        // `input_shapes_come_from_one_call_when_ort_offers_the_reference_hook`,
+        // which then fails intermittently with `left: 2, right: 1`. Observed,
+        // not hypothesised.
+        let _counters = shape_counters_reset();
         let mut api = api_with_both_shape_routes();
         api.MemoryInfoGetDeviceType = Some(fake_gpu_memory_device_type);
         api.MemoryInfoGetName = Some(fake_cuda_memory_name);

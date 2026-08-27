@@ -61,6 +61,23 @@ impl EpHandle {
 /// ORT's built-in fallback produced correct output).
 static COMPILED_NODE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+/// Global counter of C-ABI `GetCapability` callback invocations.
+///
+/// Session-creation tests read this through the plugin cdylib to prove that a
+/// rejection happened inside the real ORT capability path rather than during
+/// model parsing before the EP was consulted.
+static GET_CAPABILITY_CALL_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Returns the number of C-ABI `GetCapability` callback invocations.
+pub fn get_capability_call_count() -> usize {
+    GET_CAPABILITY_CALL_COUNT.load(Ordering::Relaxed)
+}
+
+/// Resets the C-ABI `GetCapability` callback counter.
+pub fn reset_get_capability_call_count() {
+    GET_CAPABILITY_CALL_COUNT.store(0, Ordering::Relaxed);
+}
+
 /// Returns the total number of nodes compiled by our EP since process start.
 /// Reset with [`reset_compiled_node_count`] before a test session.
 pub fn compiled_node_count() -> usize {
@@ -123,6 +140,12 @@ pub struct KernelRegistryEntry {
     /// input position; unlisted and absent inputs keep the union rule. Empty
     /// means "the union is exact", which is true for every uniform op.
     pub input_dtype_constraints: &'static [(usize, &'static [DataType])],
+    /// Per-output-slot dtype constraints for mixed-dtype ops.
+    ///
+    /// Each listed output position overrides `supported_dtypes`, exactly like
+    /// `input_dtype_constraints`. This keeps capability admission aligned with
+    /// kernels whose outputs have a narrower contract than their input union.
+    pub output_dtype_constraints: &'static [(usize, &'static [DataType])],
 }
 
 /// A heap-allocated EP whose raw pointer is returned as `OrtEp*`.
@@ -300,6 +323,7 @@ unsafe extern "C" fn ep_get_capability(
     graph: *const ort::OrtGraph,
     support: *mut ort::OrtEpGraphSupportInfo,
 ) -> *mut ort::OrtStatus {
+    GET_CAPABILITY_CALL_COUNT.fetch_add(1, Ordering::Relaxed);
     let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
         ep_get_capability_inner(ep, graph, support)
     }));
@@ -647,7 +671,7 @@ pub(crate) fn node_passes_dtype_filter(
             return false;
         }
     }
-    for &vid in &node.outputs {
+    for (slot, &vid) in node.outputs.iter().enumerate() {
         let Some(value) = ir_graph.values.get(vid) else {
             continue;
         };
@@ -660,7 +684,12 @@ pub(crate) fn node_passes_dtype_filter(
         if value.dtype == DataType::Undefined {
             return false;
         }
-        if !entry.supported_dtypes.contains(&value.dtype) {
+        let allowed = entry
+            .output_dtype_constraints
+            .iter()
+            .find(|(index, _)| *index == slot)
+            .map_or(entry.supported_dtypes, |(_, dtypes)| *dtypes);
+        if !allowed.contains(&value.dtype) {
             return false;
         }
     }
@@ -1933,6 +1962,7 @@ mod tests {
             end_version: 21,
             supported_dtypes: CPU_EP_SUPPORTED_DTYPES,
             input_dtype_constraints: &[],
+            output_dtype_constraints: &[],
         };
         assert_eq!(entry.op_type, "Add");
         assert!(entry.supported_dtypes.contains(&DataType::Float16));
@@ -1951,6 +1981,7 @@ mod tests {
             end_version: 21,
             supported_dtypes: CPU_EP_SUPPORTED_DTYPES,
             input_dtype_constraints: &[],
+            output_dtype_constraints: &[],
         }];
         let result = build_ort_kernel_registry(&entries, "test_ep");
         assert!(
@@ -1997,6 +2028,7 @@ mod tests {
             end_version: 21,
             supported_dtypes: &[DataType::Float32, DataType::Float16],
             input_dtype_constraints: &[],
+            output_dtype_constraints: &[],
         }];
         let (g, nid) = graph_with_node(
             "Add",
@@ -2024,6 +2056,7 @@ mod tests {
             end_version: 21,
             supported_dtypes: &[DataType::Float32, DataType::Float16],
             input_dtype_constraints: &[],
+            output_dtype_constraints: &[],
         }];
         let (g, nid) = graph_with_node(
             "Add",
@@ -2068,6 +2101,7 @@ mod tests {
                 (2, FLOATS),
                 (3, &[DataType::Uint8]),
             ],
+            output_dtype_constraints: &[],
         }];
         let empty = std::collections::HashSet::new();
 
@@ -2135,6 +2169,70 @@ mod tests {
         );
     }
 
+    #[test]
+    fn dtype_filter_applies_per_output_slot_constraints() {
+        const FLOATS: &[DataType] = &[DataType::Float32, DataType::Float16, DataType::BFloat16];
+        let entries = vec![KernelRegistryEntry {
+            op_type: "DsaIndexSelect",
+            domain: "pkg.nxrt",
+            since_version: 1,
+            end_version: i32::MAX,
+            supported_dtypes: &[
+                DataType::Float32,
+                DataType::Float16,
+                DataType::BFloat16,
+                DataType::Int64,
+            ],
+            input_dtype_constraints: &[
+                (0, FLOATS),
+                (1, FLOATS),
+                (2, FLOATS),
+                (3, &[DataType::Float32]),
+            ],
+            output_dtype_constraints: &[(0, &[DataType::Int64])],
+        }];
+        let empty = std::collections::HashSet::new();
+
+        let (good, good_id) = graph_with_node(
+            "DsaIndexSelect",
+            "pkg.nxrt",
+            &[
+                DataType::Float32,
+                DataType::Float32,
+                DataType::Float32,
+                DataType::Float32,
+            ],
+            &[DataType::Int64],
+        );
+        assert!(super::node_passes_dtype_filter(
+            good.nodes.get(good_id).unwrap(),
+            &good,
+            &entries,
+            &empty
+        ));
+
+        let (bad, bad_id) = graph_with_node(
+            "DsaIndexSelect",
+            "pkg.nxrt",
+            &[
+                DataType::Float32,
+                DataType::Float32,
+                DataType::Float32,
+                DataType::Float32,
+            ],
+            &[DataType::Float32],
+        );
+        assert!(
+            !super::node_passes_dtype_filter(
+                bad.nodes.get(bad_id).unwrap(),
+                &bad,
+                &entries,
+                &empty
+            ),
+            "a Float32 selected_indices output must be declined before Compile/Compute"
+        );
+    }
+
     /// Node with Undefined dtype is NOT claimed (fail closed).
     #[test]
     fn dtype_filter_rejects_undefined_dtype() {
@@ -2145,6 +2243,7 @@ mod tests {
             end_version: 21,
             supported_dtypes: &[DataType::Float32],
             input_dtype_constraints: &[],
+            output_dtype_constraints: &[],
         }];
         let (g, nid) = graph_with_node("Add", "", &[DataType::Undefined], &[DataType::Float32]);
         let node = g.nodes.get(nid).unwrap();
@@ -2166,6 +2265,7 @@ mod tests {
             end_version: 21,
             supported_dtypes: &[DataType::Float32],
             input_dtype_constraints: &[],
+            output_dtype_constraints: &[],
         }];
         let (g, nid) = graph_with_node("UnknownOp", "", &[DataType::Float32], &[DataType::Float32]);
         let node = g.nodes.get(nid).unwrap();
@@ -2214,6 +2314,7 @@ mod tests {
             end_version: 21,
             supported_dtypes: &[DataType::Float32],
             input_dtype_constraints: &[],
+            output_dtype_constraints: &[],
         }];
 
         // Empty absent set — the forgery name should NOT grant exemption.

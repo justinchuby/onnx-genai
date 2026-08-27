@@ -84,6 +84,8 @@ from __future__ import annotations
 import ast
 import contextlib
 import functools
+import io
+import os
 import re
 import subprocess
 import sys
@@ -2638,7 +2640,7 @@ class GateAdmission(unittest.TestCase):
             first_touch = seen.count(arm) == 1
             eff = 0.10 if (arm == starved and first_touch) else 0.99
             rows = {1: {"steady_ms": 1.0, "cold_ms": 2.0, "fnv": "abcd"}}
-            return rows, eff
+            return rows, eff, 0.0
 
         with unittest.mock.patch.object(m, "launch", fake_launch):
             _table, adm = m.prefill_matrix(rounds, 16, "shape", [1])
@@ -2663,7 +2665,7 @@ class GateAdmission(unittest.TestCase):
         m = self._harness()
 
         def all_starved(binary, env_extra, timeout=1800):
-            return {1: {"steady_ms": 1.0, "cold_ms": 2.0, "fnv": "abcd"}}, 0.10
+            return {1: {"steady_ms": 1.0, "cold_ms": 2.0, "fnv": "abcd"}}, 0.10, 0.0
 
         with unittest.mock.patch.object(m, "launch", all_starved):
             with self.assertRaises(SystemExit) as caught:
@@ -2689,7 +2691,7 @@ class GateAdmission(unittest.TestCase):
         def only_before_starved(binary, env_extra, timeout=1800):
             arm = Path(binary).name.replace("decode_", "")
             eff = 0.10 if arm == "before" else 0.99
-            return {"steady": 1.0, "cold": 2.0, "checksum": "x", "raw": "r"}, eff
+            return {"steady": 1.0, "cold": 2.0, "checksum": "x", "raw": "r"}, eff, 0.0
 
         with unittest.mock.patch.object(m, "decode_launch", only_before_starved):
             with self.assertRaises(SystemExit) as caught:
@@ -2701,6 +2703,121 @@ class GateAdmission(unittest.TestCase):
         # would pass under a wrong-arm attribution.
         self.assertIn("launch of before --", message)
         self.assertNotIn("after", message.split("--")[0])
+
+
+
+class SmtContention(unittest.TestCase):
+    """The efficiency gate is blind to SMT; a second gate has to cover it.
+
+    `(utime+stime)/wall` measures time ON a logical cpu. A competitor on the
+    pinned cpu's hyperthread sibling shares the physical core's execution
+    units, so it steals throughput without stealing time. Measured on this
+    host at PIN=4 with a spinner on cpu5: 0.536x throughput at eff=1.000,
+    versus 0.976x for the same spinner on a different physical core. The rep
+    scores perfect and is admitted, and it is the rep most worth discarding.
+    """
+
+    def _harness(self):
+        sys.path.insert(0, str(EP_BENCHES))
+        try:
+            import int4_modulo_matrix
+        finally:
+            sys.path.pop(0)
+        return int4_modulo_matrix
+
+    def test_a_perfect_efficiency_rep_is_still_discarded_when_the_sibling_is_busy(self):
+        """The whole point: eff=1.000 is not evidence of an uncontended core."""
+        m = self._harness()
+        seen = {}
+
+        def busy_sibling_first_round(binary, env_extra, timeout=1800):
+            arm = Path(binary).name.replace("prefill_", "")
+            seen[arm] = seen.get(arm, 0) + 1
+            # Perfect CPU efficiency in every case -- the old gate keeps them all.
+            sib = 0.90 if (arm == "before" and seen[arm] == 1) else 0.0
+            return {1: {"steady_ms": 1.0, "cold_ms": 2.0, "fnv": "f"}}, 1.0, sib
+
+        with unittest.mock.patch.object(m, "launch", busy_sibling_first_round):
+            _table, adm = m.prefill_matrix(2, 16, "shape", [1])
+
+        self.assertEqual(adm["by_arm"]["before"], 1, "the contended rep was admitted")
+        self.assertEqual(adm["smt_by_arm"]["before"], 1)
+        self.assertEqual(adm["smt_total"], 1)
+        # and it is attributed to SMT, not merged into the efficiency count
+        self.assertEqual(adm["smt_by_arm"]["after"], 0)
+        self.assertEqual(adm["by_arm"]["after"], 0)
+
+    def test_an_inactive_sibling_gate_says_so_rather_than_reading_as_a_pass(self):
+        """A gate that cannot fire must not look like a gate that passed.
+
+        On a host with no SMT, or under a pin that already covers both
+        siblings, no launch can ever be discarded for SMT contention. Zero
+        discards then means "not measured", not "clean", and the artifact has
+        to distinguish those two.
+        """
+        m = self._harness()
+        zero = {"before": 0, "after": 0, "aa": 0}
+        one = {"before": 1, "after": 1, "aa": 1}
+        with unittest.mock.patch.object(m, "SIBLING_CPUS", []):
+            cols = m.admission_columns(zero, one, zero)
+        self.assertIn("INACTIVE", cols["smt_gate"])
+        with unittest.mock.patch.object(m, "SIBLING_CPUS", [5]):
+            cols = m.admission_columns(zero, one, zero)
+        self.assertIn("active on cpus [5]", cols["smt_gate"])
+        self.assertNotIn("INACTIVE", cols["smt_gate"])
+
+    def test_the_sibling_set_is_read_from_topology_and_excludes_the_pin(self):
+        """Against a synthetic topology, so it tests the parse on any runner.
+
+        Review caught the first version of this test asserting only
+        `sibling_cpus(pin) & parse_cpu_list(pin) == set()` -- which is a
+        tautology of `return sorted(sibs - pinned)`, true by construction on
+        every host and doubly vacuous on a CI runner without SMT, where the
+        function returns `[]` for all inputs and the assertion still passes.
+        It change-detected the subtraction and proved nothing about reading
+        topology. This drives a fake sysfs instead, so a wrong path, a dropped
+        range expansion, or a lost subtraction all fail here rather than only
+        on an SMT host.
+        """
+        m = self._harness()
+        # 4 physical cores, siblings paired as (0,1) (2,3) (4,5) (6,7)
+        topo = {f"/sys/devices/system/cpu/cpu{c}/topology/thread_siblings_list":
+                f"{c - c % 2}-{c - c % 2 + 1}\n" for c in range(8)}
+
+        def fake_open(path, *a, **k):
+            if str(path) in topo:
+                return io.StringIO(topo[str(path)])
+            raise OSError(f"unexpected path {path}")
+
+        with unittest.mock.patch("builtins.open", fake_open):
+            self.assertEqual(m.sibling_cpus("4"), [5], "must read the sibling")
+            self.assertEqual(m.sibling_cpus("5"), [4], "and in both directions")
+            self.assertEqual(m.sibling_cpus("4,5"), [],
+                             "a pin owning the whole core has no sibling left")
+            self.assertEqual(m.sibling_cpus("0-3"), [],
+                             "a range covering both pairs leaves nothing")
+            self.assertEqual(m.sibling_cpus("0,2"), [1, 3],
+                             "two pins contribute both their siblings")
+        # An unreadable topology must degrade to "no sibling" (gate reports
+        # INACTIVE), never raise -- CI containers do not always expose sysfs.
+        with unittest.mock.patch("builtins.open",
+                                 unittest.mock.Mock(side_effect=OSError)):
+            self.assertEqual(m.sibling_cpus("4"), [])
+
+    def test_the_busy_fraction_subtracts_idle_and_survives_a_zero_span(self):
+        m = self._harness()
+        self.assertAlmostEqual(m.sibling_busy_fraction((100, 1000), (200, 2000)), 0.1)
+        self.assertEqual(m.sibling_busy_fraction((5, 10), (5, 10)), 0.0)
+        self.assertIsNone(m.sibling_busy_fraction(None, (1, 2)))
+        self.assertIsNone(m.sibling_busy_fraction((1, 2), None))
+        # idle (field 4) and iowait (field 5) are not busy; everything else is
+        stat = "cpu  1 1 1 1 1 1 1 1 1 1\ncpu5 10 0 20 60 10 0 0 0 0 0\n"
+        with unittest.mock.patch("builtins.open",
+                                 unittest.mock.mock_open(read_data=stat)):
+            busy, total = m.cpu_busy_jiffies([5])
+        self.assertEqual(total, 100)
+        self.assertEqual(busy, 30, "idle+iowait must not count as busy")
+        self.assertIsNone(m.cpu_busy_jiffies([]))
 
 
 if __name__ == "__main__":
