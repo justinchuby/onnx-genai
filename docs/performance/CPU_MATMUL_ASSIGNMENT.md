@@ -993,12 +993,34 @@ onto the measured cores: native 2.9–3.8 ms became **13.6–18.0 ms (5x worse)*
 faster. Symmetry of the mask is not symmetry of the interference. Second, **the asymmetry inverts
 with width**: at `--native-threads 32` it is ORT that pins one thread per CPU while the native arm
 floats across all 32, so its direction cannot be inferred from one row. Third, the predicted
-mechanism was **absent** where it was expected — a native-only A/B between a confined set containing
-this host's permanently-busy cpu0 and a clean set of the same width and topology showed no penalty
-(prod median 1.98 ms vs clean 2.15 ms), because the prefill pool work-*steals* rather than statically
-partitioning, so one slow lane is absorbed rather than stalling a barrier. That is the negative
-result that keeps the positive one honest: the tax is the co-tenant's spin, not the mask's
-membership.
+mechanism was **not observed** where it was expected — a native-only A/B between a confined set
+containing this host's permanently-busy cpu0 and a set of the same width and topology gave prod
+1.98 ms against "clean" 2.15 ms, i.e. the arm with the busy CPU was *faster*.
+
+**That third result is withdrawn as unestablished** (2026-08-27, on Holden's challenge). Two defects,
+either of which is sufficient:
+
+* **Neither arm was clean.** The control set had cpu20 and cpu26 at ~28% busy — recorded at the time
+  as a caveat, which was too weak a word for a 8.6% effect. Worse, re-checking the host afterwards
+  found an unpinned 123%-CPU process (`copilot --resume`, affinity `0-31`) whose threads were
+  observed on cpus 4, 7, 11 and 14 — inside the *prod* set and on the siblings of two of its cores.
+  Both arms were contaminated, by different amounts, in an uncontrolled direction. A comparison
+  between two dirty arms cannot support a null.
+* **The guard used to accept the reps is blind to the contention mode this host exhibits.** Reps were
+  kept on per-run CPU efficiency, `(utime+stime)/wall`. That ratio cannot see SMT contention: a
+  thread whose sibling is busy still accrues ~100% of its own CPU time while delivering materially
+  less work, so a contended rep scores ~1.00 and is kept. On **this** box the sibling map is
+  `(0,1), (2,3), …` — *not* `(0,16)` — so the prod set `0,2,…,14` left every sibling `1,3,…,15`
+  unreserved and in the path of exactly the roaming process above. An efficiency-gated A/A null
+  would have looked tight throughout.
+
+The claim is not inverted, it is unsupported: the data cannot distinguish "cpu0 membership is free"
+from "the control was dirtier than the treatment". Settling it needs both siblings of every measured
+core in the mask with only one running, plus per-CPU `/proc/stat` foreign-busy sampled over the
+measurement window on the confined set *and* its siblings, with contaminated reps discarded rather
+than averaged. Nothing else in this section depends on it: the +32% spin result is a three-arm
+comparison in which all arms share whatever contamination is present, and the shipped warning is
+keyed on a structural condition, not on a measured margin.
 
 Shipped as a second warning (`ort_spin_overlap_warning`) keyed on the *span* rather than the width,
 verified to fire on the biased run and stay silent under `--native-only` and on an unconfined host.
@@ -3473,3 +3495,52 @@ One standing caveat is *reinforced* rather than revised: `t=1` runs
 `path=flat` and `t>=2` runs `path=spmd-pool`, so a `t=1` vs `t=2` comparison
 crosses routes as well as widths. This file already reads that row as "vs
 serial" rather than "vs a one-worker pool" (§20), and that phrasing stands.
+
+## "aarch64 green" for `x86_sgemm.rs` is vacuous, not misleading
+
+A cross-agent report (Holden, 2026-08-27) raised what looks like a serious hole in this file's
+coverage, and it is worth recording because the reasoning is sound and the conclusion is wrong.
+
+The observation is correct as far as it goes. `x86_sgemm.rs` gates its test module
+`#[cfg(all(test, any(target_arch = "x86", target_arch = "x86_64")))]` — **21 tests that do not exist
+on aarch64** — while `matmul.rs:52` declares `#[path = "x86_sgemm.rs"] pub(crate) mod x86_sgemm;`
+with no `cfg` at all. Read together those say: the module is compiled everywhere, its tests run in
+one place, so an aarch64 green tick is zero tests over live code. Crate-wide the same shape appears
+in seven modules totalling **48 tests** that never run on aarch64.
+
+Both halves dissolve under measurement.
+
+* **This file has no ungated code.** All **38** of its top-level items carry their own `target_arch`
+  gate, including `Int4Weight` and its entire `impl`. On aarch64 the module is empty, so the gated
+  test module is exactly right — zero tests over *zero* code. The ungated `mod` declaration is a
+  layout convenience, and it is what makes the file look uncovered to a reader.
+* **The other six modules are the normal, correct pattern**, not defects: every file with an
+  arch-gated test module (`dense_elementwise`, `elementwise`, `fused_matmul_bias`, `gemm`,
+  `simd_activations`) *also* has at least one ungated `#[cfg(test)]` module. The gated ones test
+  SIMD routes that only exist on x86; the portable behaviour is tested portably. Counting gated
+  tests measures how much SIMD there is, not how much is unchecked.
+
+**The instrument is the compiler, and it costs one command:**
+`cargo check --target aarch64-unknown-linux-gnu --tests -p onnx-runtime-ep-cpu`. On aarch64
+`Int4Weight` and `NR` simply do not resolve. This was not a thought experiment — the first draft of
+the fix moved the packer's differential test outside the arch gate to "close the hole", and that
+draft failed to compile for the target because *the code under test does not exist there*. The
+proposed remedy and the reported defect were the same misreading.
+
+**The mechanical guard already exists and is stricter than the one proposed.** A hand-maintained
+allowlist of arch-excluded test names was suggested, so that a newly gated-out test fails the build.
+`scripts/check_cross_compile.sh` already does better: CI runs
+`cargo clippy --target aarch64-unknown-linux-gnu --all-targets -- -D warnings` with
+`onnx-runtime-ep-cpu` in scope (`:91`), and `--all-targets` covers test code. It uses the compiler as
+the oracle instead of a regex over source, so it cannot be defeated by a comment or a formatting
+change — the failure mode that has already cost a review round elsewhere in this repo. The draft
+above would have been caught on the way in. No new guard was added; adding one would have duplicated
+a stronger existing gate with a weaker one.
+
+What *did* land is the piece that was genuinely missing: `mod portable_block_arithmetic`, ungated,
+holding the arithmetic identity `(depth + q) % block_size == offset_base + q` that licenses the
+packer's hoisted-modulo. Its `assert_ne!` at `q == run` is the load-bearing half — without it the
+test restates the substitution instead of bounding it, and would stay green if the `run` clip that
+makes the substitution legal were ever relaxed. It is explicitly *not* a route-execution claim; the
+facts that the packer applies the clip and that the AVX2 route runs are carried by the differential
+test and the poisoned-binary proof, both necessarily x86-gated because the code they exercise is.

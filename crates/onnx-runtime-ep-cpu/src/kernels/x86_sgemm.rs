@@ -1622,6 +1622,85 @@ unsafe fn pack_b_half_bf16_avx2(
     }
 }
 
+/// The one arch-independent fact this file rests on, tested outside the arch
+/// gate so it is stated where it cannot quietly stop being checked.
+///
+/// **This module does not close a coverage gap, because there is not one.**
+/// That is worth recording, because the opposite was reported and it is a
+/// reasonable thing to believe from reading: `matmul.rs:52` declares `mod
+/// x86_sgemm` with no `cfg` at all, and the test module below it is gated
+/// `all(test, any(target_arch = "x86", target_arch = "x86_64"))`, so the
+/// obvious reading is 21 tests absent on aarch64 over code that is still
+/// compiled there. Checked rather than read: **every one of this file's 38
+/// top-level items carries its own `target_arch` gate**, so on aarch64 the
+/// module is empty and the gated test module is exactly right. It is zero
+/// tests over zero code, not zero tests over live code.
+///
+/// The instrument is `cargo check --target aarch64-unknown-linux-gnu --tests`,
+/// which answers in one command what no amount of reading settles: on aarch64
+/// `Int4Weight` and `NR` do not resolve. A first draft of this module tried to
+/// run the packer's differential test unconditionally and failed to compile
+/// there for exactly that reason — the code under test does not exist. CI
+/// already runs the strict form of that check (`scripts/check_cross_compile.sh`
+/// → `cargo clippy --target aarch64-unknown-linux-gnu --all-targets -D
+/// warnings`, with this crate in scope), so that draft would have been caught
+/// on the way in.
+///
+/// What is left is genuinely portable: the arithmetic identity that licenses
+/// the packer's hoist. It depends on nothing in this file, so it belongs
+/// outside the gate even though the code it describes is x86-only.
+#[cfg(test)]
+mod portable_block_arithmetic {
+
+    /// The arithmetic identity the hoist relies on, stated directly rather than
+    /// through the packer, so a failure says which of the two facts broke.
+    ///
+    /// Arch-independent, outside any `target_feature` gate, and — deliberately
+    /// — **not** a claim that any SIMD route executed. It closes none of the
+    /// gaps that a route-execution test closes, and it must not be cited as if
+    /// it did: it proves the identity holds *given* the clip, not that the
+    /// packer applies the clip. The facts that the packer applies it, and that
+    /// the AVX2 route is the one running, are carried by
+    /// `int4_dequant_panel_is_bit_identical_to_the_per_column_path` and by the
+    /// poisoned-binary route proof, both necessarily x86-gated because the code
+    /// they exercise does not exist elsewhere.
+    ///
+    /// The `assert_ne!` is the load-bearing half. Without it this test is a
+    /// tautology — it would restate the substitution rather than bound it, and
+    /// stay green while the `run` clip that makes the substitution legal was
+    /// relaxed or removed. Asserting that the two forms *part company* one
+    /// element past the clip is what makes the clip's presence the thing under
+    /// test.
+    #[test]
+    fn the_hoisted_offset_equals_the_modulo_for_every_clipped_run() {
+        for block_size in 1usize..=132 {
+            for depth in 0usize..300 {
+                let offset_base = depth % block_size;
+                let run = block_size - offset_base;
+                for q in 0..run {
+                    assert_eq!(
+                        (depth + q) % block_size,
+                        offset_base + q,
+                        "identity broken at block={block_size} depth={depth} q={q}"
+                    );
+                }
+                // And the clip is exactly what bounds it: one element past the
+                // run, the two forms part company for every block size that
+                // can wrap. If a change ever widens `run`, this is the fact it
+                // violates.
+                if block_size > 1 {
+                    assert_ne!(
+                        (depth + run) % block_size,
+                        offset_base + run,
+                        "the run clip is not the bound it is documented to be \
+                         at block={block_size} depth={depth}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[cfg(all(test, any(target_arch = "x86", target_arch = "x86_64")))]
 mod tests {
     use super::*;
