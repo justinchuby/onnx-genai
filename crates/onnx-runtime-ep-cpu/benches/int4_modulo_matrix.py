@@ -184,6 +184,34 @@ def sibling_busy_fraction(before, after):
 
 SIBLING_CPUS = sibling_cpus(PIN)
 
+#: The cpus this harness *assigns* a launch to. Everything below distinguishes
+#: that from the cpus a launch actually *executes on*, which are not the same
+#: claim and have to be measured separately.
+ASSIGNED_CPUS = sorted(parse_cpu_list(PIN))
+
+
+def efficiency_floor(assigned=ASSIGNED_CPUS):
+    """The `(utime+stime)/wall` floor for a launch assigned `len(assigned)` cpus.
+
+    A flat `0.95` is only correct at width 1. A launch assigned n cpus that has
+    all of them scores ~n, so a fixed floor of 0.95 passes a 2-wide launch that
+    delivered one cpu's worth of progress -- which is exactly the contamination
+    Sebastian measured reversibly at width 2 (#1812): one foreign thread inside
+    the confined set, `cpu ms/token` flat at 35.4-36.5 and wall doubling from
+    17.6 to 35.9. Because a dispatch is a barrier, the foreign thread costs the
+    whole dispatch rather than `1/n` of it.
+
+    Scaling the floor turns that signature into a discard without any new
+    instrument: his clean run reads 35.37/17.64 = 2.00 and his contaminated one
+    36.45/35.86 = 1.02, against a floor of 1.90. The fixed floor admits both.
+
+    This harness pins one cpu, so today this returns 0.95 and changes no
+    decision. It is here because the failure it prevents is invisible: widening
+    `MOD_PIN` to two cpus with a flat floor produces a gate that still reads as
+    a gate and no longer bounds anything.
+    """
+    return CPU_EFF_FLOOR * max(len(assigned), 1)
+
 
 # ---------------------------------------------------------------------------
 # The injected co-tenant
@@ -297,7 +325,7 @@ class CoTenant:
         return False
 
 
-def admit(eff, sib, hog, mode="none", eff_floor=CPU_EFF_FLOOR,
+def admit(eff, sib, hog, mode="none", eff_floor=None,
           smt_ceil=SMT_SIBLING_CEIL, cot_floor=CO_TENANT_FLOOR):
     """Which gate rejects this launch, or `None` if it is admitted.
 
@@ -319,6 +347,8 @@ def admit(eff, sib, hog, mode="none", eff_floor=CPU_EFF_FLOOR,
     is silently a quiet-host arm, reports a clean pass, and reads identically
     to a real one in the artifact.
     """
+    if eff_floor is None:
+        eff_floor = efficiency_floor()
     if mode == "smt":
         if sib is None or sib < cot_floor:
             return "cotenant"
@@ -333,6 +363,151 @@ def admit(eff, sib, hog, mode="none", eff_floor=CPU_EFF_FLOOR,
     if eff < eff_floor:
         return "eff"
     return None
+
+
+def classify_affinity(samples, assigned):
+    """Did the launch execute where the harness assigned it?
+
+    `samples` are `(comm, allowed_cpu_list, last_cpu)` triples read from
+    `/proc/<pid>/task/<tid>/`, `assigned` the cpus the harness asked for.
+
+    `taskset` is not a bound: it calls `sched_setaffinity`, and so can the
+    process being pinned. A pool that sizes itself from raw topology rather
+    than from the inherited mask would relocate the launch and every pinned row
+    in the matrix would be mislabelled -- including the co-tenant arm, whose
+    whole design is that the measured work is on the pin and the injected load
+    is on the pin's SMT sibling. Assignment is not execution until it is read
+    back.
+
+    Three verdicts, because "the check could not see" must not render as "the
+    check passed":
+
+      conformant -- every observed thread was *allowed* only on assigned cpus;
+      escaped    -- at least one was allowed somewhere else;
+      unobserved -- nothing usable was sampled (the launch outran the probe).
+
+    The verdict is on the allowed mask, not on `last_cpu`. `last_cpu` is
+    reported (`cpus_seen`) because it is the direct evidence of where work
+    landed, but it cannot be an escape criterion: a thread's last-run cpu
+    legitimately lags its own `sched_setaffinity` until the thread next runs,
+    so `allowed=4, last_cpu=7` is a routine transient during pool startup and
+    failing on it would abort correct runs. Mutation testing is what surfaced
+    this -- "check the mask but not where it ran" survived, and the reason it
+    survived is that the mask check is the one carrying the claim.
+
+    Samples whose `comm` is `taskset` are dropped: that is the launcher between
+    fork and exec, before it applies the mask to itself, and it reads
+    `allowed=0-31` every time. Counting it reported ESCAPED on a launch whose
+    every real thread was correctly pinned -- a false positive this instrument
+    produced on its first run.
+    """
+    want = set(assigned)
+    usable = [s for s in samples if s[0] != "taskset"]
+    if not usable:
+        return {"verdict": "unobserved", "offenders": [], "cpus_seen": []}
+    offenders = []
+    cpus_seen = set()
+    for comm, allowed, last_cpu in usable:
+        cpus_seen.add(int(last_cpu))
+        if not parse_cpu_list(allowed) <= want:
+            offenders.append({"comm": comm, "allowed": allowed, "last_cpu": int(last_cpu)})
+    return {
+        "verdict": "escaped" if offenders else "conformant",
+        "offenders": offenders,
+        "cpus_seen": sorted(cpus_seen),
+    }
+
+
+def _thread_samples(pid):
+    """`(comm, allowed, last_cpu)` for every live thread of `pid`."""
+    out = []
+    try:
+        tids = os.listdir(f"/proc/{pid}/task")
+    except OSError:
+        return out
+    for tid in tids:
+        try:
+            comm = allowed = ""
+            with open(f"/proc/{pid}/task/{tid}/status") as fh:
+                for line in fh:
+                    if line.startswith("Name:"):
+                        comm = line.split(":", 1)[1].strip()
+                    elif line.startswith("Cpus_allowed_list:"):
+                        allowed = line.split(":", 1)[1].strip()
+            with open(f"/proc/{pid}/task/{tid}/stat") as fh:
+                # `comm` may contain spaces and parens, so fields are counted
+                # from the last `)`; field 39 (last cpu) is index 36 there.
+                last_cpu = fh.read().rsplit(")", 1)[1].split()[36]
+        except (OSError, IndexError):
+            continue
+        if allowed:
+            out.append((comm, allowed, last_cpu))
+    return out
+
+
+def observe_affinity(binary, env_extra, assigned=ASSIGNED_CPUS, budget_s=2.0,
+                     argv=None):
+    """Pre-flight: launch as the matrix does and read back where it runs.
+
+    Once per stage rather than once per launch, because a pool sets its
+    affinity at init from the mask it inherited: the answer is a property of
+    (binary, mask, width), not of the individual launch. Sampling every timed
+    launch would buy nothing and put `/proc` reads in the measurement window.
+
+    The complementary per-launch question -- *was the assigned set actually
+    ours* -- is a different mechanism and stays where it is, in the efficiency
+    floor and the sibling/co-tenant gates.
+
+    The child is terminated once the window closes; a decode launch runs for
+    ~17s and this needs the first second or two of it.
+
+    The window is sampled *throughout*, not until the first successful read.
+    The first version stopped as soon as it had seen a non-launcher thread,
+    which sounds equivalent and is not: a process is pinned correctly at exec
+    and escapes later, when the pool initialises. Checked against a positive
+    control -- a child that calls `sched_setaffinity` on the whole machine a
+    moment after starting -- the early-stopping version returned `conformant`
+    for a process that had provably escaped. A check that has only ever said
+    "conformant" has not yet been shown to be a check.
+    """
+    env = dict(os.environ)
+    env.update(env_extra)
+    argv = argv or ["taskset", "-c", PIN, binary, "--bench"]
+    proc = subprocess.Popen(argv, env=env, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL)
+    samples = set()
+    deadline = time.time() + budget_s
+    try:
+        while time.time() < deadline:
+            samples.update(_thread_samples(proc.pid))
+            if proc.poll() is not None:
+                break
+            time.sleep(0.01)
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=30)
+    return classify_affinity(samples, assigned)
+
+
+def affinity_abort_message(name, obs, pin=PIN):
+    """The stage-abort decision, separated so it can be tested.
+
+    Only `escaped` aborts. `unobserved` deliberately does not: the probe losing
+    a race against a 0.13s launch is an instrument limitation, and turning it
+    into a hard stop would train the operator to disable the check. It is
+    recorded in the artifact instead, where "the check could not see" and "the
+    check passed" are two different words.
+    """
+    if obs["verdict"] != "escaped":
+        return None
+    return (f"ABORT: {name} launches escaped their pin: {obs['offenders']}. "
+            f"Every row would be labelled cpu{pin} and measured elsewhere, "
+            f"and the co-tenant arm would be injecting load next to nothing.")
 
 
 def starved_gate(mode):
@@ -929,6 +1104,62 @@ def self_test():
     odd = default_hog_cpus(pin="5", sibs=[4], count=8, online=list(range(32)))
     check("hogs/avoid-even-sibling", [c for c in odd if c == 4], [])
 
+    # -- the efficiency floor scales with the assignment --------------------
+    # A 2-wide launch that kept both cpus scores ~2.00; the same launch with a
+    # foreign thread inside its set scores ~1.02 at unchanged CPU per token.
+    # A flat 0.95 admits both, which is the whole defect.
+    check("floor/width-1", efficiency_floor([4]), 0.95)
+    check("floor/width-2", efficiency_floor([0, 2]), 1.90)
+    check("floor/empty-assignment-is-not-zero", efficiency_floor([]), 0.95)
+    check("floor/clean-2wide-admitted",
+          admit(2.00, 0.01, None, "none", eff_floor=efficiency_floor([0, 2])), None)
+    check("floor/contaminated-2wide-discarded",
+          admit(1.02, 0.01, None, "none", eff_floor=efficiency_floor([0, 2])), "eff")
+    # The same numbers against the unscaled floor: this is what the harness
+    # would have believed, and it is why the scaling is not cosmetic.
+    check("floor/flat-floor-would-admit-contaminated",
+          admit(1.02, 0.01, None, "none", eff_floor=CPU_EFF_FLOOR), None)
+
+    # -- assignment vs execution -------------------------------------------
+    pinned = [("decode_before", "4", "4"), ("nxgn-prefill-0", "4", "4")]
+    check("affinity/pin-held", classify_affinity(pinned, [4])["verdict"], "conformant")
+    # The launcher between fork and exec reads the full machine every time.
+    # Counting it reported ESCAPED on a correctly pinned launch.
+    check("affinity/ignores-preexec-launcher",
+          classify_affinity(pinned + [("taskset", "0-31", "28")], [4])["verdict"],
+          "conformant")
+    # ... but a launcher sample alone is not evidence of conformance either.
+    check("affinity/launcher-only-is-unobserved",
+          classify_affinity([("taskset", "0-31", "28")], [4])["verdict"], "unobserved")
+    check("affinity/nothing-sampled", classify_affinity([], [4])["verdict"], "unobserved")
+    # Escape by mask (a pool that re-pinned itself off the inherited mask)
+    # and escape by execution (allowed everywhere, ran elsewhere).
+    check("affinity/mask-widened",
+          classify_affinity([("decode_before", "0-31", "4")], [4])["verdict"], "escaped")
+    check("affinity/confined-elsewhere",
+          classify_affinity([("decode_before", "0,2", "0")], [4])["verdict"], "escaped")
+    # The transient the verdict must NOT fire on: a thread that has been
+    # re-pinned but has not run since still reports the old `last_cpu`.
+    check("affinity/last-cpu-lag-is-not-an-escape",
+          classify_affinity([("decode_before", "4", "7")], [4])["verdict"], "conformant")
+    check("affinity/reports-where-it-ran",
+          classify_affinity([("decode_before", "4", "4")], [4])["cpus_seen"], [4])
+    check("affinity/names-the-offender",
+          classify_affinity([("pool-worker", "0-31", "9")], [4])["offenders"][0]["comm"],
+          "pool-worker")
+    # A wider assignment is not an escape: 4-7 assigned, running on 6.
+    check("affinity/wide-assignment-held",
+          classify_affinity([("w", "4-7", "6")], [4, 5, 6, 7])["verdict"], "conformant")
+    esc = classify_affinity([("decode_before", "0-31", "9")], [4])
+    check("affinity/escape-aborts",
+          affinity_abort_message("decode", esc) is None, False)
+    check("affinity/conformant-does-not-abort",
+          affinity_abort_message("decode", classify_affinity(pinned, [4])), None)
+    # An instrument that could not see must not stop the run -- a check that
+    # cries wolf on its own blind spot gets switched off.
+    check("affinity/unobserved-does-not-abort",
+          affinity_abort_message("prefill", classify_affinity([], [4])), None)
+
     # -- the pre-registered rule -------------------------------------------
     ok = {"label": "m=1", "verdict": "null", "aa_brackets_unity": True}
     gain = {"label": "m=8", "verdict": "gain", "aa_brackets_unity": True}
@@ -1049,6 +1280,8 @@ def main():
     result = {
         "pin": PIN,
         "cpu_eff_floor": CPU_EFF_FLOOR,
+        "cpu_eff_floor_effective": efficiency_floor(),
+        "assigned_cpus": ASSIGNED_CPUS,
         "rounds": args.rounds,
         "smt_sibling_cpus": SIBLING_CPUS,
         "smt_sibling_ceil": SMT_SIBLING_CEIL,
@@ -1062,6 +1295,27 @@ def main():
         f" + block16 decode ({args.rounds} rounds, co-tenant {args.co_tenant})",
     ), CoTenant(args.co_tenant, cot_cpus):
         result["lock"] = H.lock_provenance()
+        # Assignment is not execution. `taskset` is not a bound -- the pinned
+        # process may call `sched_setaffinity` itself -- so read back where the
+        # workload actually runs before spending an hour measuring it there.
+        result["affinity"] = {}
+        stages = []
+        if not args.skip_prefill:
+            stages.append(("prefill", os.path.join(BIN, "prefill_aa"),
+                           {"PROBE_BITS": "4", "PROBE_BLOCK": str(args.block),
+                            "PROBE_SHAPE": args.shape, "PROBE_M_LIST": str(m_list[0])}))
+        if not args.skip_decode:
+            stages.append(("decode", os.path.join(BIN, "decode_aa"),
+                           {"PROBE_BLOCK": "16", "PROBE_TOKENS": str(args.tokens),
+                            "PROBE_SESSIONS": "1",
+                            "ONNX_GENAI_CPU_DECODE_THREADS": "1"}))
+        for name, binary, penv in stages:
+            obs = observe_affinity(binary, penv)
+            result["affinity"][name] = obs
+            print(f"  affinity/{name}: {obs['verdict']} "
+                  f"assigned={ASSIGNED_CPUS} ran_on={obs['cpus_seen']}", flush=True)
+            if obs["verdict"] == "escaped":
+                raise SystemExit(affinity_abort_message(name, obs))
         if not args.skip_prefill:
             print(f"prefill matrix block={args.block} shape={args.shape}", flush=True)
         extra_env = dict(kv.split("=", 1) for kv in args.env)
