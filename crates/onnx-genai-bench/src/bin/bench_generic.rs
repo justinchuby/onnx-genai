@@ -921,9 +921,10 @@ fn host_fields(
 /// just as hard and would otherwise go unwarned -- the external case is if
 /// anything more likely to catch someone out, since nothing in the command line
 /// mentions threads. And `--native-threads 4 --ort-intra-threads 4` has already
-/// applied the fix, so warning there would be advice to do what the user just
-/// did, which is how a warning gets tuned out before it reaches the run that
-/// needed it.
+/// applied the fix for *this* mechanism, so warning there would be advice to do
+/// what the user just did, which is how a warning gets tuned out before it
+/// reaches the run that needed it. Equal width is not the same as unbiased,
+/// though -- see [`ort_spin_overlap_warning`] for the residue it leaves.
 fn ort_pool_bias_warning(
     native_only: bool,
     native_cpus: Option<usize>,
@@ -957,6 +958,94 @@ fn ort_pool_bias_warning(
     ))
 }
 
+/// Warns when the ORT pool is *equal width* but not equally *confined*, which
+/// [`ort_pool_bias_warning`] deliberately stays silent about and which measures
+/// as a real bias anyway.
+///
+/// `--ort-intra-threads N` matches the two arms' thread counts. It does not
+/// match their placement: `bench_generic` builds the ORT session before
+/// `InferenceSession::load` reaches `bound_process_to_decode_budget`, so ORT's
+/// pool inherits the startup mask (the whole machine) while every native thread
+/// inherits the confined one. Equal *count*, unequal *set* -- and ORT's intra-op
+/// threads spin between runs, so during the native arm's timed region those
+/// spinning threads are spread over the whole machine and a share of them lands
+/// on exactly the CPUs the native arm may use.
+///
+/// Measured directly, reading `Cpus_allowed_list` per thread from `/proc` on a
+/// live paired run at `--native-threads 8`: 8 threads on `0-31` (ORT's pool,
+/// unnamed so they carry the process name) against every native thread on
+/// `0,2,4,6,8,10,12,14`. At `--native-threads 32` the asymmetry *inverts* --
+/// ORT pins one thread per CPU while the native arm floats across all 32 -- so
+/// the direction is a function of width and cannot be assumed from one row.
+///
+/// Timings on `gemm_nbits_llama3_8b_qkv_t8` at `--native-threads 8`
+/// (8 native CPUs, ORT pool of 8 spanning 32), 40 runs, medians of 4 reps:
+///
+/// | arm | native p50 | vs reference |
+/// |---|---|---|
+/// | `--native-only` (no ORT session exists) | 2.11 ms | reference |
+/// | paired, equal width, ORT unconfined | 2.78 ms | **+32%** |
+/// | paired, equal width, ORT spin disabled | 2.26 ms | +7% |
+///
+/// So ~78% of the inflation is ORT's *idle spinning*, not its work, and it
+/// survives the width fix #1839 shipped. The expected overlap predicts the
+/// size: 8 spinning threads over 32 CPUs put ~2 CPUs' worth of load on the
+/// native arm's 8, and 2/8 is ~25% against a measured ~32%.
+///
+/// **The intuitive remedy is the harmful one.** Confining both arms to the same
+/// set -- the obvious way to "make it symmetric" -- concentrates every one of
+/// ORT's spinning threads onto the native arm's CPUs instead of a quarter of
+/// them. Measured on the same model with `taskset -c 0,2,4,6,8,10,12,14` applied
+/// to both arms: native 2.9-3.8 ms becomes 13.6-18.0 ms, a **5x** regression,
+/// while the ORT arm gets ~2x *faster*. Symmetry of the mask is not symmetry of
+/// the interference, so this warning must not recommend it.
+///
+/// Left as a warning rather than a default change on purpose. Disabling ORT's
+/// spin would measure ORT in a configuration nobody ships, trading a bias
+/// against the native arm for one against ORT; `--native-only` already produces
+/// an uncontaminated native number, and the interleave still earns its keep for
+/// drift.
+fn ort_spin_overlap_warning(
+    native_only: bool,
+    native_cpus: Option<usize>,
+    ort_intra_threads: usize,
+    ort_startup_cpus: Option<usize>,
+    ort_default_width: Option<usize>,
+) -> Option<String> {
+    if native_only {
+        return None;
+    }
+    let native_cpus = native_cpus?;
+    let span = ort_startup_cpus?;
+    let ort_width = if ort_intra_threads == 0 {
+        ort_default_width?
+    } else {
+        ort_intra_threads
+    };
+    // The wider-pool case belongs to the other warning. Printing both would
+    // describe one run with two remedies and invite the reader to apply the
+    // wrong one.
+    if ort_width > native_cpus {
+        return None;
+    }
+    // Nothing to overlap: a pool confined no wider than the native arm cannot
+    // put spin on a CPU the native arm does not already own.
+    if span <= native_cpus {
+        return None;
+    }
+    Some(format!(
+        "WARNING: the ORT pool is equal width ({ort_width}) but not equally confined -- it spans \
+         {span} CPUs while the native arm has {native_cpus}, because the ORT session is built \
+         before the native EP applies its process affinity. ORT's threads spin between runs, so a \
+         share of that spin lands on the native arm's CPUs during its timed region and inflates \
+         the native number only (measured +32% at width 8; ~78% of it recovered by \
+         ONNX_GENAI_ORT_SESSION_OPTIONS=session.intra_op.allow_spinning=0). Use --native-only for \
+         a headline native number. Do NOT taskset both arms onto the same CPUs to make it \
+         'symmetric': that concentrates the whole spin onto the native arm and measured 5x worse."
+    ))
+}
+
+///
 /// Chooses the ORT intra-op width for the timed session, matching it to the
 /// native budget when the native arm is confined and the user has not chosen a
 /// width.
@@ -1319,6 +1408,19 @@ fn main() -> Result<()> {
         args.native_only,
         onnx_runtime_hostmon::AllowedCpus::current().map(|a| a.len()),
         ort_intra_threads.max(0) as usize,
+        effective_ort_default(startup_cpus, onnx_runtime_hostmon::online_cpus()),
+    ) {
+        eprintln!("{warning}");
+    }
+    // The residue the width match leaves behind: equal count, unequal placement.
+    // `startup_cpus` is the mask ORT's pool inherited, read before the native EP
+    // narrowed the process; the realized mask below is what the native arm ended
+    // up with. Comparing the two is the whole test.
+    if let Some(warning) = ort_spin_overlap_warning(
+        args.native_only,
+        onnx_runtime_hostmon::AllowedCpus::current().map(|a| a.len()),
+        ort_intra_threads.max(0) as usize,
+        startup_cpus,
         effective_ort_default(startup_cpus, onnx_runtime_hostmon::online_cpus()),
     ) {
         eprintln!("{warning}");
@@ -1889,6 +1991,107 @@ mod host_fields_tests {
 #[cfg(test)]
 mod ort_pool_bias_tests {
     use super::*;
+
+    /// The case the width guard is deliberately silent about, and which the
+    /// measurement says is biased anyway: 8 native CPUs, an ORT pool of 8, but
+    /// that pool spanning 32. Equal count, unequal set.
+    #[test]
+    fn an_equal_width_but_unconfined_ort_pool_is_still_warned_about() {
+        assert!(
+            ort_pool_bias_warning(false, Some(8), 8, Some(32)).is_none(),
+            "precondition: the width guard considers this configuration fixed"
+        );
+        let warning = ort_spin_overlap_warning(false, Some(8), 8, Some(32), Some(32))
+            .expect("equal width with an unconfined pool measured +32% on the native arm");
+        assert!(warning.contains("spans 32"), "{warning}");
+        assert!(warning.contains("native arm has 8"), "{warning}");
+        assert!(
+            warning.contains("--native-only"),
+            "the remedy that actually produces an uncontaminated native number: {warning}"
+        );
+        assert!(
+            warning.contains("allow_spinning=0"),
+            "the mechanism is spin, so the toggle that isolates it belongs in the text: {warning}"
+        );
+    }
+
+    /// Measured, not theorised: confining both arms to one set makes the native
+    /// arm ~5x worse, because it concentrates every ORT spinner onto exactly the
+    /// CPUs being measured. A warning that suggested it would be actively
+    /// harmful advice, so the text is asserted to steer away from it.
+    #[test]
+    fn the_warning_does_not_recommend_making_the_masks_symmetric() {
+        let warning = ort_spin_overlap_warning(false, Some(8), 8, Some(32), Some(32)).unwrap();
+        assert!(
+            warning.contains("Do NOT taskset both arms"),
+            "symmetry of the mask is not symmetry of the interference: {warning}"
+        );
+    }
+
+    /// Exactly one mechanism gets named per run. A reader given two remedies for
+    /// one row applies the wrong one, and the wider-pool case has its own.
+    #[test]
+    fn the_two_warnings_are_mutually_exclusive() {
+        for (native_cpus, ort_threads, span) in [
+            (4usize, 0usize, 32usize),
+            (4, 16, 32),
+            (8, 8, 32),
+            (4, 4, 32),
+        ] {
+            let width = ort_pool_bias_warning(false, Some(native_cpus), ort_threads, Some(span));
+            let spin = ort_spin_overlap_warning(
+                false,
+                Some(native_cpus),
+                ort_threads,
+                Some(span),
+                Some(span),
+            );
+            assert!(
+                !(width.is_some() && spin.is_some()),
+                "both fired for native={native_cpus} ort={ort_threads} span={span}"
+            );
+        }
+    }
+
+    /// The silent cases, for the same reason the width guard has them: a warning
+    /// that fires on unbiased runs is one nobody reads on the biased one.
+    #[test]
+    fn an_equally_confined_or_unconfined_pair_is_silent() {
+        assert!(
+            ort_spin_overlap_warning(false, Some(8), 8, Some(8), Some(8)).is_none(),
+            "a pool confined to the native arm's own CPUs cannot overlap anything else"
+        );
+        assert!(
+            ort_spin_overlap_warning(false, Some(32), 32, Some(32), Some(32)).is_none(),
+            "an unconfined native arm competes with ORT symmetrically"
+        );
+        assert!(
+            ort_spin_overlap_warning(true, Some(8), 8, Some(32), Some(32)).is_none(),
+            "--native-only builds no interleaved pool to overlap with"
+        );
+        assert!(
+            ort_spin_overlap_warning(false, None, 8, Some(32), Some(32)).is_none(),
+            "an unreadable native mask must not synthesise a comparison"
+        );
+        assert!(
+            ort_spin_overlap_warning(false, Some(8), 8, None, Some(32)).is_none(),
+            "an unreadable startup span is the other half of the same comparison"
+        );
+    }
+
+    /// A pool sized by ORT itself (`--ort-intra-threads` unset, so 0) is the
+    /// common case, and it must be judged on the width ORT actually chose.
+    #[test]
+    fn a_self_sized_pool_is_judged_on_its_realized_width() {
+        assert!(
+            ort_spin_overlap_warning(false, Some(8), 0, Some(32), Some(8)).is_some(),
+            "ORT sized itself to 8 from the startup mask, which is the equal-width case"
+        );
+        assert!(
+            ort_spin_overlap_warning(false, Some(8), 0, Some(32), None).is_none(),
+            "an unknown self-sized width must not be guessed at"
+        );
+    }
 
     /// The mechanism is "ORT's pool spans more CPUs than the native arm may
     /// use", so the trigger is the realized mask -- which is what catches an

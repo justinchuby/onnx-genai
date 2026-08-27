@@ -968,6 +968,43 @@ python3 scripts/ort_ab/ab.py --native-only --null-control \
 these cells a paired run depressed the native median by up to 6x and pushed the null control past the
 effect being measured.
 
+**Matching the widths does not make a paired run safe (2026-08-27).** #1839 removed the *count*
+half of that bias — `resolve_ort_intra_threads` now sizes ORT's pool to the native budget — and the
+guard it shipped with is silent once the widths agree. Prompted by a cross-agent report, the
+placement half was measured directly, reading `Cpus_allowed_list` per thread from `/proc` on a live
+paired run at `--native-threads 8`: **8 ORT threads on `0-31` against every native thread on
+`0,2,4,6,8,10,12,14`**. `bench_generic` builds the ORT session *before* `InferenceSession::load`
+reaches `bound_process_to_decode_budget`, so ORT's pool inherits the startup mask and the native
+arm inherits the confined one. Equal count, unequal set — and ORT spins between runs, so a share of
+that spin lands on exactly the CPUs being timed:
+
+| arm (`gemm_nbits_llama3_8b_qkv_t8`, width 8, 40 runs, medians of 4) | native p50 | vs reference |
+|---|---|---|
+| `--native-only` (no ORT session exists) | 2.11 ms | reference |
+| paired, equal width, ORT unconfined | 2.78 ms | **+32%** |
+| paired, equal width, ORT spin disabled | 2.26 ms | +7% |
+
+So ~78% of the residue is idle spin, and the overlap predicts its size: 8 spinners over 32 CPUs put
+~2 CPUs' worth of load on the native arm's 8, and 2/8 ≈ 25% against a measured 32%.
+
+Three findings worth more than the patch. First, **the obvious remedy is the harmful one** —
+`taskset`-ing both arms onto the same 8 CPUs, to "make it symmetric", concentrates every ORT spinner
+onto the measured cores: native 2.9–3.8 ms became **13.6–18.0 ms (5x worse)** while ORT got ~2x
+faster. Symmetry of the mask is not symmetry of the interference. Second, **the asymmetry inverts
+with width**: at `--native-threads 32` it is ORT that pins one thread per CPU while the native arm
+floats across all 32, so its direction cannot be inferred from one row. Third, the predicted
+mechanism was **absent** where it was expected — a native-only A/B between a confined set containing
+this host's permanently-busy cpu0 and a clean set of the same width and topology showed no penalty
+(prod median 1.98 ms vs clean 2.15 ms), because the prefill pool work-*steals* rather than statically
+partitioning, so one slow lane is absorbed rather than stalling a barrier. That is the negative
+result that keeps the positive one honest: the tax is the co-tenant's spin, not the mask's
+membership.
+
+Shipped as a second warning (`ort_spin_overlap_warning`) keyed on the *span* rather than the width,
+verified to fire on the biased run and stay silent under `--native-only` and on an unconfined host.
+Left as a warning, not a default: disabling ORT's spin would measure ORT in a configuration nobody
+ships, trading a bias against the native arm for one against ORT.
+
 ### 9. The int4 prefill's fused dequant pack was scalar, and its row gate was measured against it (**fixed**)
 
 Section 5 fused the dequantization into the GEBP pack, so the f32 weight is never materialized: at
