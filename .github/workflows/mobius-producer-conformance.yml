@@ -80,19 +80,37 @@ jobs:
                       encoding="utf-8",
                   )
           PY
+      # The loop below is the one selector nothing else polices. `cargo run`
+      # is loud on a bad package and `validate_metadata` exits 2 when handed no
+      # path at all -- but a loop that runs zero times never invokes either. If
+      # the generator step produces nothing, or emits directories without an
+      # `inference_metadata.yaml`, `failed` stays empty and the step exits 0.
+      # A zero-package run is then indistinguishable from a healthy one, on a
+      # lane whose entire purpose is to be a signal. Counting what was actually
+      # validated is what makes the green mean something. Cf. #2055 and
+      # scripts/test_step.sh, which restore the same symmetry for test filters.
       - name: Validate package semantics
         run: |
           failed=""
+          validated=0
           for package in validation/generated/*; do
             [ -f "$package/inference_metadata.yaml" ] || continue
+            validated=$((validated + 1))
             cargo run --quiet \
               -p onnx-genai-metadata --bin validate_metadata -- "$package" \
               || failed="$failed $package"
           done
+          if [ "$validated" -eq 0 ]; then
+            echo "::error::validated 0 packages: no directory under \
+          'validation/generated' contained an inference_metadata.yaml, so this \
+          step exercised nothing and its success would prove nothing."
+            exit 1
+          fi
           if [ -n "$failed" ]; then
             echo "Invalid packages:$failed"
             exit 1
           fi
+          echo "validated $validated package(s)"
       - name: Validate shared-state pixel-flow semantics
         run: |
           cargo run --quiet \
