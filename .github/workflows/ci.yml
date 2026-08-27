@@ -417,10 +417,35 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-target.outputs.triple }}-rust-${{ steps.rust-toolchain.outputs.version }}-cargo-tools-${{ env.CARGO_LLVM_COV_VERSION }}-
 
+      # Every cheap gate from here down is guarded with `!cancelled()` rather
+      # than the implicit `success()`, for the reason #2170 gave for the CUDA
+      # lane: one failing step otherwise silences every later one, and this job
+      # runs twenty independent gates in a row. An unformatted tree -- ten
+      # seconds of work -- currently hides the other nineteen, so a tree that
+      # breaks formatting AND the dispatch manifest AND the promotion guard
+      # reports one of the three, and each fix costs another queue wait to
+      # discover the next. Serialising N independent failures into N round
+      # trips is the expensive part: the queue has been measured at ~2h, while
+      # this whole job is 13-19min.
+      #
+      # Deliberately NOT applied to the cargo steps below (clippy, the MLAS
+      # feature gates, the compile checks, the cross-target pass). Those are
+      # the minutes in this job, and running all of them after an unrelated
+      # ten-second failure would turn every trivial red into a full-length
+      # one -- which is a real cost when the queue is deep, and the reason
+      # this is not a blanket port of #2170. The twenty steps guarded here are
+      # hermetic shell/python checks plus `cargo fmt`; none of them compile
+      # anything, so unmasking them is worth seconds, not minutes.
+      #
+      # The aarch64 install and the cross-target check that consumes it stay
+      # chained on purpose: the second cannot say anything useful if the first
+      # did not run.
+      #
       # Blocking, like the clippy gate below. The sweep this exception was
       # waiting on has landed, so an unformatted tree is now a failure rather
       # than a note nobody reads.
       - name: Check formatting
+        if: ${{ !cancelled() }}
         run: cargo fmt --all -- --check
 
       # A release publishes crates one at a time against crates.io, so one
@@ -428,9 +453,11 @@ jobs:
       # the registry half-updated. Cheap to check here; expensive to discover
       # during a release.
       - name: Check publish order
+        if: ${{ !cancelled() }}
         run: python3 scripts/check_publish_order.py
 
       - name: Verify workspace test package coverage
+        if: ${{ !cancelled() }}
         run: python .github/scripts/workspace_test_packages.py verify
 
       # `verify` above answers "is every crate in *some* lane", which stayed
@@ -439,6 +466,7 @@ jobs:
       # status check run them. #1982 put a failing `shape_dispatch_gate` on
       # `main` with both required checks green; #2015 is the general case.
       - name: Verify every workspace crate is tested by a required lane
+        if: ${{ !cancelled() }}
         run: python .github/scripts/workspace_test_packages.py verify-required-tier
 
       # Both gates above read `ci.yml` and nothing else, so the stray-key rule
@@ -451,6 +479,7 @@ jobs:
       # no such backstop. Scope and host are separate choices: this reads every
       # workflow file, from a job the ruleset requires. See #2206.
       - name: Verify every workflow still defines the jobs it is recorded as defining
+        if: ${{ !cancelled() }}
         run: python .github/scripts/workspace_test_packages.py verify-workflow-integrity
 
       # Both gates above are the kind that pass by seeing nothing, so each one
@@ -461,39 +490,49 @@ jobs:
       # that -- it reported both gates as refusing while neither had run.
       # `--simulate-missing` had shipped with no caller since it was written.
       - name: Workspace test package gates can still detect (self-test)
+        if: ${{ !cancelled() }}
         run: python .github/scripts/workspace_test_packages.py self-test
 
       - name: Check the profile table matches the samples
+        if: ${{ !cancelled() }}
         run: python3 scripts/check_profile_table.py
 
       - name: Check platform-specific kernel files are named accordingly
+        if: ${{ !cancelled() }}
         run: python3 scripts/check_platform_naming.py
 
       - name: Check dispatch branches have reachability tests
+        if: ${{ !cancelled() }}
         run: python3 scripts/check_dispatch_reachability.py
 
       - name: Check dispatch manifest lint can still detect (self-test)
+        if: ${{ !cancelled() }}
         run: python3 scripts/check_dispatch_manifest.py --self-test
 
       - name: Check dispatch manifest claims have proving counters
+        if: ${{ !cancelled() }}
         run: python3 scripts/check_dispatch_manifest.py
 
       # Commands written into scripts and runbooks are never executed, so a
       # renamed feature or a deleted binary rots there indefinitely and only
       # surfaces when someone copies the line and blames their environment.
       - name: Check documented command lint can still detect (self-test)
+        if: ${{ !cancelled() }}
         run: python3 scripts/check_documented_commands.py --self-test
 
       - name: Check documented cargo commands still resolve
+        if: ${{ !cancelled() }}
         run: python3 scripts/check_documented_commands.py
 
       - name: Check feature-gated fast paths have fallback coverage
+        if: ${{ !cancelled() }}
         run: python3 scripts/check_feature_gate_coverage.py
 
       # A documented environment variable that nothing parses produces no error
       # and no effect, so the mistake survives indefinitely. `device_policy`
       # went months that way (#678). This makes the gap a CI failure.
       - name: Check documented environment variables are implemented
+        if: ${{ !cancelled() }}
         run: python3 .github/scripts/verify_documented_env_vars.py
 
       # A `#[test]` added to a CUDA target without an ignore runs on every
@@ -519,9 +558,11 @@ jobs:
       # targets: every test must acquire its target-local process mutex before
       # constructing an EP or reading process-global telemetry.
       - name: Check CUDA test source scan can still detect (self-test)
+        if: ${{ !cancelled() }}
         run: python3 .github/scripts/verify_cuda_test_honesty.py --self-test
 
       - name: Check CUDA test source contracts
+        if: ${{ !cancelled() }}
         run: python3 .github/scripts/verify_cuda_test_honesty.py --source-scan
 
       # Rust warnings are errors: clippy is blocking for every crate CI tests.
@@ -624,6 +665,7 @@ jobs:
       # so a precondition that started rejecting correct trees fails here
       # instead of on every developer's box. #1816.
       - name: Cross-compile gate preconditions (self-test)
+        if: ${{ !cancelled() }}
         run: |
           shellcheck scripts/check_cross_compile.sh scripts/check_cross_compile_test.sh
           bash scripts/check_cross_compile_test.sh
@@ -639,6 +681,7 @@ jobs:
       # and requires it to pass what the fixed shape fails, so the day it stops
       # discriminating it says so rather than going quiet.
       - name: Promotion guards fail closed (self-test)
+        if: ${{ !cancelled() }}
         run: |
           shellcheck scripts/squad_promote_guard.sh scripts/squad_promote_guard_test.sh
           bash scripts/squad_promote_guard_test.sh
@@ -652,6 +695,7 @@ jobs:
       # rather than in miri.yml so it is covered by a required lane instead of
       # by the lane it guards.
       - name: Test step wrapper still refuses an empty filter (self-test)
+        if: ${{ !cancelled() }}
         run: |
           shellcheck scripts/test_step.sh scripts/test_step_test.sh
           bash scripts/test_step_test.sh
