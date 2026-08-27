@@ -60,21 +60,93 @@ pub(crate) struct SlotCaptureState {
     pub(super) capture_quarantine_ops: HashSet<(String, String)>,
 }
 
-#[derive(Clone, Debug, Default)]
-pub(super) enum ProviderArtifactState {
-    #[default]
+#[derive(Clone, Debug)]
+enum ProviderArtifactOutcome {
     Unfinalized,
-    Pending {
-        attempted_epoch: ExecutorArtifactReadinessEpoch,
-        pending: ExecutorArtifactPending,
-    },
-    Failed {
-        attempted_epoch: ExecutorArtifactReadinessEpoch,
-        reason: String,
-    },
-    Complete {
-        finalized_epoch: ExecutorArtifactReadinessEpoch,
-    },
+    Pending(ExecutorArtifactPending),
+    Failed(String),
+    Complete,
+}
+
+/// The executor's sole authority for whether provider-owned artifacts may be
+/// used by eager execution, capture, or replay.
+#[derive(Clone, Debug)]
+pub(super) struct ProviderArtifactReadiness {
+    epoch: ExecutorArtifactReadinessEpoch,
+    outcome: ProviderArtifactOutcome,
+}
+
+impl Default for ProviderArtifactReadiness {
+    fn default() -> Self {
+        Self {
+            epoch: ExecutorArtifactReadinessEpoch::INITIAL,
+            outcome: ProviderArtifactOutcome::Unfinalized,
+        }
+    }
+}
+
+impl ProviderArtifactReadiness {
+    pub(super) fn epoch(&self) -> ExecutorArtifactReadinessEpoch {
+        self.epoch
+    }
+
+    pub(super) fn advance_to(&mut self, epoch: ExecutorArtifactReadinessEpoch) {
+        if epoch > self.epoch {
+            self.epoch = epoch;
+            self.outcome = ProviderArtifactOutcome::Unfinalized;
+        }
+    }
+
+    pub(super) fn needs_finalization(&self) -> bool {
+        matches!(self.outcome, ProviderArtifactOutcome::Unfinalized)
+    }
+
+    pub(super) fn mark_complete(&mut self) {
+        self.outcome = ProviderArtifactOutcome::Complete;
+    }
+
+    pub(super) fn mark_pending(&mut self, pending: ExecutorArtifactPending) {
+        self.outcome = ProviderArtifactOutcome::Pending(pending);
+    }
+
+    pub(super) fn mark_failed(&mut self, reason: String) {
+        self.outcome = ProviderArtifactOutcome::Failed(reason);
+    }
+
+    pub(super) fn require_complete(
+        &self,
+        provider: &str,
+        executor: ExecutorInstanceId,
+    ) -> Result<()> {
+        match &self.outcome {
+            ProviderArtifactOutcome::Complete => Ok(()),
+            ProviderArtifactOutcome::Unfinalized => {
+                Err(SessionError::ExecutionProviderArtifactsPending {
+                    provider: provider.to_string(),
+                    executor: executor.get(),
+                    readiness_epoch: self.epoch.get(),
+                    reason: "provider artifact finalization has not reached a terminal outcome"
+                        .to_string(),
+                })
+            }
+            ProviderArtifactOutcome::Pending(pending) => {
+                Err(SessionError::ExecutionProviderArtifactsPending {
+                    provider: provider.to_string(),
+                    executor: executor.get(),
+                    readiness_epoch: self.epoch.get(),
+                    reason: pending.reason(),
+                })
+            }
+            ProviderArtifactOutcome::Failed(reason) => {
+                Err(SessionError::ExecutionProviderArtifactFinalizationFailed {
+                    provider: provider.to_string(),
+                    executor: executor.get(),
+                    readiness_epoch: self.epoch.get(),
+                    reason: reason.clone(),
+                })
+            }
+        }
+    }
 }
 
 /// The compiled, runnable graph: buffers + plan + kernel cache. Owned by the
@@ -405,14 +477,10 @@ pub(crate) struct Executor {
     /// Control-flow and sequence nodes always have `None` (they don't use the
     /// kernel cache).
     pub(super) kernel_bindings: Vec<Option<KernelKey>>,
-    /// Readiness/finalization state for this executor's provider-owned
-    /// artifacts. `Pending` and `Failed` are fail-closed: neither permits
-    /// execution or capture, and the provider is not retried until compilation
-    /// advances `provider_artifact_readiness_epoch`.
-    pub(super) provider_artifact_state: ProviderArtifactState,
-    /// Monotonic generation advanced only when pre-execution compilation creates
-    /// at least one new concrete kernel specialization.
-    pub(super) provider_artifact_readiness_epoch: ExecutorArtifactReadinessEpoch,
+    /// Single readiness authority for this executor's provider-owned artifacts.
+    /// Its epoch advances with concrete kernel specializations; every execute,
+    /// capture, and replay path must observe `Complete` before enqueuing work.
+    pub(super) provider_artifact_readiness: ProviderArtifactReadiness,
     pub(super) persistent_workspace: Option<PreparedWorkspace>,
     pub(super) step_workspace: Option<PreparedWorkspace>,
     /// When set, [`Executor::release_step_workspace`] is a no-op: the StepScoped
