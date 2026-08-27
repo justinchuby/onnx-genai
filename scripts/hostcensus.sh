@@ -87,6 +87,15 @@
 # could not be read at all, almost always a process that exited between the
 # directory listing and the open. It is reported for the same reason -- so that
 # a scan which saw less than it should says so.
+#
+# Load that ARRIVES mid-window is counted (see the arrivals branch below).
+# Load that DEPARTS mid-window is not: a process seen in the first sample and
+# gone by the second has an in-window CPU that cannot be recovered, since the
+# second reading it would be differenced against does not exist. It is dropped
+# rather than guessed. That is a real under-count, and it is the one place this
+# tool errs in the reassuring direction on purpose -- but it under-reports load
+# that has already stopped competing with you, whereas an arrival is load that
+# is competing with you right now and will still be there when you start.
 set -eu
 
 interval=2
@@ -144,20 +153,37 @@ ticks=$(getconf CLK_TCK 2>/dev/null || echo 100)
 # identical burner is reported at 4.120 cores when started with `setsid` and
 # vanishes entirely when started as a plain `&` sibling.
 #
-# So only this process is skipped, and the rest needs no guard: the sampler
-# runs inside `$(...)`, so each scan happens in a subshell that exists during
-# ONE sample and has exited before the other. A pid present in only one sample
-# has no delta by construction, and `sleep` between the samples is an external
-# child whose CPU is its own and negligible. The instrument does not read
-# itself because of how it is shaped, not because it filters itself out.
+# So only this process is skipped -- and for that to be sufficient, this
+# process has to be the only one doing the scanning. It is: `sample` writes
+# into a variable in the CURRENT shell rather than being called as `$(sample)`,
+# so no subshell ever exists while /proc is being read, and the one pid that
+# accrues the scan's cost is `$$`.
+#
+# That is not a stylistic preference, it is the whole guarantee. An earlier
+# version ran each scan in `$(sample)`, and argued that the subshell needed no
+# guard because a pid present in only ONE sample has no delta. That argument
+# was true until mid-window arrivals started being counted -- an arrival IS a
+# pid present in the second sample only, which is exactly what the second
+# scan's subshell is. Review caught it; the census was charging its own scan
+# cost to `(unattributable)`, and therefore to `ungated_cores`, on every run.
+#
+# It went unnoticed because it only fires when the sampler reads its own
+# /proc entry LATE in the scan, and `/proc/[0-9]*` globs in LEXICOGRAPHIC
+# order, so a 7-digit pid beginning `10` is read very early and had accrued
+# under one tick. Reversing the scan order made it appear immediately and
+# reproducibly at 4 ticks -- 0.04 cores at `--interval 1`, against a
+# significance floor of 0.05. The safety was an accident of pid ordering,
+# which is not a safety at all.
 self_pid=$$
 
 # One sample: "pid starttime cputicks" per line, plus a count of what we could
 # not read. Only `/proc/PID/stat` is touched here -- no `readlink`, no `exec`
 # per process -- because attribution is deferred to the few PIDs that turn out
 # to have moved. On this box that is ~1200 stat reads versus ~1200 execs.
+# Sets `_rows` (and must NOT be called in a command substitution -- see above).
 sample() {
     _unreadable=0
+    _rows=""
     for _p in /proc/[0-9]*; do
         _pid=${_p#/proc/}
         [ "$_pid" = "$self_pid" ] && continue
@@ -178,14 +204,16 @@ sample() {
         # $1 is overall field 3 (state), so utime/stime/starttime (14/15/22)
         # are $12/$13/$20 here.
         [ $# -ge 20 ] || { _unreadable=$((_unreadable + 1)); continue; }
-        printf '%s %s %s\n' "$_pid" "${20}" "$(( ${12} + ${13} ))"
+        # Accumulated in-shell, not printed: `$(sample)` would fork.
+        _rows="$_rows$_pid ${20} $(( ${12} + ${13} ))
+"
     done
-    printf 'UNREADABLE %s\n' "$_unreadable"
+    _rows="${_rows}UNREADABLE $_unreadable"
 }
 
-first=$(sample)
+sample; first=$_rows
 sleep "$interval"
-second=$(sample)
+sample; second=$_rows
 
 lock_state=unknown
 lock_holder=
@@ -241,11 +269,14 @@ moved=$(
             # They can be measured exactly rather than merely disclosed: a
             # process that started inside the window has spent its ENTIRE
             # lifetime inside it, so its lifetime CPU *is* its in-window CPU.
-            # The one way this errs is a process that already existed but whose
-            # sample-1 stat could not be read -- then its whole lifetime is
+            # This errs in exactly one way: a process that already existed but
+            # whose sample-1 stat could not be read has its whole lifetime
             # charged to this window. That over-reports, which is the safe
             # direction for a tool whose job is to stop people trusting a quiet
-            # reading.
+            # reading. (It used to err in a second way: a subshell running
+            # the second scan is itself a pid present in the second sample
+            # only, so the census was charged its own scan cost. That is why
+            # `sample` now runs in this shell and not in `$(...)`.)
             if ($4 > 0) printf "%s %.4f\n", pid, $4 / ticks / iv
         }
         END {

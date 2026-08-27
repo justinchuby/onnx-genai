@@ -371,10 +371,37 @@ chk "a FREE lock says nothing listed is accounted for" \
 
 cleanup
 
+# The sampler must not run in a command substitution.
+#
+# This is a white-box assertion, deliberately, and the reason is worth stating
+# because "assert behaviour, not structure" is otherwise the right rule.
+#
+# The defect it guards is the census charging its own scan cost to
+# `(unattributable)`: a subshell running the second scan is a pid present in
+# the second sample only, which is precisely the shape of a mid-window
+# arrival. Measured, that is 4 ticks -- 0.04 cores at `--interval 1`. Ambient
+# `unattributable` on a shared box moves by more than that between two reads
+# seconds apart, so ANY behavioural cell for this would be measuring noise and
+# would pass or fail regardless of the bug. A behavioural test here would be a
+# tautology, and this file already shipped three of those.
+#
+# Worse, the bug was invisible even to a direct probe: `/proc/[0-9]*` globs
+# LEXICOGRAPHICALLY, so a 7-digit pid beginning `10` reads its own entry near
+# the start of the scan having accrued under a tick. It only reproduces when
+# the scan order is reversed. A behavioural cell would have been green on this
+# box for the wrong reason -- the same failure as a test that does not run on
+# the platform whose green check is being cited.
+#
+# So the structural fact is the guarantee, and the structural fact is what is
+# pinned.
+chk "the sampler does not run in a subshell that the census would then count" \
+    "$(grep -v '^[[:space:]]*#' "$CENSUS" \
+       | grep -cE '\$\([[:space:]]*sample[[:space:]]*\)')" "0"
+
 # Pin the assertion count. Several cells above are load-dependent, and an
 # assertion that quietly stops running is indistinguishable from one that
 # passes -- which is the whole defect this tool exists to catch, one level up.
-chk "every assertion in this file ran" "$((pass + fail + 1))" "43"
+chk "every assertion in this file ran" "$((pass + fail + 1))" "44"
 
 echo
 echo "passed=${pass} failed=${fail}"
