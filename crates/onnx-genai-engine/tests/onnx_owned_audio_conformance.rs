@@ -11,24 +11,16 @@
 //! package is driven purely through its declared `prompt_tokens` input and its
 //! `audio` output's `media` contract; nothing keys off a model family.
 
-use onnx_genai_engine::{
-    Engine, EngineConfig, GenerateOptions, GeneratePrompt, GenerateRequest, PipelineGenerateRequest,
-};
-use onnx_genai_ort::{DataType, Value};
+use onnx_genai_engine::{Engine, EngineConfig};
 use std::path::PathBuf;
+
+#[path = "common/hermetic_workflows.rs"]
+mod hermetic_workflows;
 
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/onnx_genai_workflows")
         .join(name)
-}
-
-fn options(max_new_tokens: usize) -> GenerateOptions {
-    GenerateOptions {
-        max_new_tokens,
-        seed: Some(7),
-        ..GenerateOptions::default()
-    }
 }
 
 /// Read a little-endian `u16` from a canonical PCM WAV header offset.
@@ -52,11 +44,8 @@ fn header_u32(bytes: &[u8], offset: usize) -> u32 {
 #[test]
 fn onnx_owned_speech_workflow_encodes_buffered_pcm16_wav() -> anyhow::Result<()> {
     let mut engine = Engine::from_dir(&fixture("speech_wav"), EngineConfig::default())?;
-    let request = PipelineGenerateRequest::new(GenerateRequest {
-        prompt: GeneratePrompt::TokenRows(vec![vec![2, 6, 7, 8, 9, 3]]),
-        options: options(8),
-    });
-    let outputs = engine.run_pipeline_outputs(request)?;
+    let outputs =
+        engine.run_pipeline_outputs(hermetic_workflows::speech_request(&[2, 6, 7, 8, 9, 3], 8)?)?;
 
     // The pre-adapter audio output is planar [1, channels, samples] float32.
     let audio = &outputs["audio"];
@@ -118,26 +107,7 @@ fn onnx_owned_nested_audio_workflow_executes_nested_generation() -> anyhow::Resu
     );
 
     let mut engine = Engine::from_dir(&package, EngineConfig::default())?;
-    let request = PipelineGenerateRequest::new(GenerateRequest {
-        prompt: GeneratePrompt::TokenIds(vec![0]),
-        options: options(1),
-    })
-    .with_input(
-        "request.prompt_tokens",
-        Value::from_slice_i64(&[1, 2], &[1, 2])?,
-    )
-    .with_input(
-        "package.false",
-        Value::from_raw_bytes(vec![0], &[1], DataType::Bool)?,
-    )
-    .with_input("package.zero_batch", Value::from_slice_i64(&[0], &[1])?)
-    .with_input("package.one_batch", Value::from_slice_i64(&[1], &[1])?)
-    .with_input(
-        "package.true",
-        Value::from_raw_bytes(vec![1], &[1], DataType::Bool)?,
-    );
-
-    let outputs = engine.run_pipeline_outputs(request)?;
+    let outputs = engine.run_pipeline_outputs(hermetic_workflows::tts_request(&[1, 2], 1)?)?;
     let waveform = &outputs["waveform"];
     assert_eq!(waveform.shape()[..2], [1, 1]);
     let samples = waveform.to_vec_f32()?;

@@ -15,12 +15,14 @@ use std::path::{Path, PathBuf};
 
 use onnx_genai_engine::{
     Engine, EngineConfig, EngineDecodeBackend, GenerateOptions, GeneratePrompt, GenerateRequest,
-    NativeDecodeDevice, PipelineGenerateRequest,
+    NativeDecodeDevice, PipelineGenerateRequest, pipeline::WorkflowOutputRole,
 };
 use onnx_genai_ort::{DataType, Value};
 
 #[path = "common/chained.rs"]
 mod chained;
+#[path = "common/hermetic_workflows.rs"]
+mod hermetic_workflows;
 
 // ── package + fixture helpers ────────────────────────────────────────────────
 
@@ -160,6 +162,48 @@ fn assert_parity_with(
         "ORT engine must not hold native sessions"
     );
     assert!(
+        native.models()?.sessions.is_empty(),
+        "native backend must build zero ORT sessions, found {}",
+        native.models()?.sessions.len()
+    );
+    assert!(
+        native.native_component_run_count().unwrap_or(0) > 0,
+        "native engine must have executed native component sessions"
+    );
+    Ok(native)
+}
+
+/// Like [`assert_parity`], but compares the aggregate structured value for one
+/// semantic output role. This is what request-aligned ragged token outputs use:
+/// the workflow publishes per-row tensors and the runtime derives the semantic
+/// aggregate from the role mapping rather than from a single fixed output name.
+fn assert_role_parity(
+    root: &Path,
+    request: impl Fn() -> anyhow::Result<PipelineGenerateRequest>,
+    role_name: &str,
+    role: WorkflowOutputRole,
+) -> anyhow::Result<Engine> {
+    let mut ort = ort_engine(root)?;
+    let mut native = native_engine(root)?;
+    let ort_output = ort.run_pipeline_outputs(request()?)?;
+    let native_output = native.run_pipeline_outputs(request()?)?;
+    let ort_value = ort
+        .structured_output_for_role(&ort_output, role.clone())
+        .unwrap_or_else(|| panic!("ORT run missing structured {role_name} output"));
+    let native_value = native
+        .structured_output_for_role(&native_output, role)
+        .unwrap_or_else(|| panic!("native run missing structured {role_name} output"));
+    assert_values_match(role_name, ort_value, native_value)?;
+    assert!(
+        ort.native_component_run_count().is_none(),
+        "ORT engine must not hold native sessions"
+    );
+    assert!(
+        native.models()?.sessions.is_empty(),
+        "native backend must build zero ORT sessions, found {}",
+        native.models()?.sessions.len()
+    );
+    assert!(
         native.native_component_run_count().unwrap_or(0) > 0,
         "native engine must have executed native component sessions"
     );
@@ -213,6 +257,22 @@ graph {
   input { name: "value" type { tensor_type { elem_type: 7 shape {} }}}
   input { name: "limit" type { tensor_type { elem_type: 7 shape {} }}}
   output { name: "continue" type { tensor_type { elem_type: 9 shape {} }}}
+}
+opset_import { domain: "" version: 24 }
+"#;
+
+const TOPK_INT64: &str = r#"
+ir_version: 11
+graph {
+  node { input: "input" input: "k" output: "values" output: "indices" op_type: "TopK"
+    attribute { name: "axis" i: -1 type: 2 }
+    attribute { name: "largest" i: 1 type: 2 }
+    attribute { name: "sorted" i: 1 type: 2 } }
+  name: "topk_int64"
+  input { name: "input" type { tensor_type { elem_type: 7 shape { dim { dim_value: 4 } }}}}
+  input { name: "k" type { tensor_type { elem_type: 7 shape { dim { dim_value: 1 } }}}}
+  output { name: "values" type { tensor_type { elem_type: 7 shape { dim { dim_value: 2 } }}}}
+  output { name: "indices" type { tensor_type { elem_type: 7 shape { dim { dim_value: 2 } }}}}
 }
 opset_import { domain: "" version: 24 }
 "#;
@@ -409,6 +469,49 @@ pipeline:
             value: world.selected
             output: state
             mode: replace
+"#;
+
+const TOPK_INT64_META: &str = r#"
+pipeline:
+  workflow:
+    manifest:
+      adapter_abis: {}
+      capabilities: [workflow_ssa, typed_emit]
+    inputs:
+      input:
+        contract: { dtype: int64, rank: 1, shape: [4] }
+        role: { kind: opaque }
+        source: { kind: application, name: input }
+        required: true
+      k:
+        contract: { dtype: int64, rank: 1, shape: [1] }
+        role: { kind: opaque }
+        source: { kind: application, name: k }
+        required: true
+    outputs:
+      indices:
+        contract: { dtype: int64, rank: 1, shape: [2] }
+        role: tensor
+        stage: pre_adapter
+    components:
+      topk:
+        implementation: { kind: onnx, artifact: topk.onnx.textproto }
+        ports:
+          inputs:
+            input: { dtype: int64, rank: 1, shape: [4] }
+            k: { dtype: int64, rank: 1, shape: [1] }
+          outputs:
+            values: { dtype: int64, rank: 1, shape: [2] }
+            indices: { dtype: int64, rank: 1, shape: [2] }
+    steps:
+      - kind: invoke
+        component: topk
+        inputs: { input: input, k: k }
+        outputs: { values: topk.values, indices: topk.indices }
+      - kind: emit
+        value: topk.indices
+        output: indices
+        mode: replace
 "#;
 
 // ── tests ────────────────────────────────────────────────────────────────────
@@ -624,6 +727,144 @@ fn speculative_workflow_parity() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A VLM run must keep image preprocessing, the vision encoder, the embedding
+/// pass, and the decode loop's model invocations aligned across backends.
+#[test]
+fn vlm_workflow_parity() -> anyhow::Result<()> {
+    let root = fixture("vlm");
+    assert_role_parity(
+        &root,
+        || hermetic_workflows::vlm_request(&[4, 5], 2),
+        "tokens",
+        WorkflowOutputRole::Tokens,
+    )?;
+    Ok(())
+}
+
+/// Guided diffusion exercises negative-prompt guidance, latent RNG, carried
+/// solver history, and trajectory appends in one hermetic package.
+#[test]
+fn guided_diffusion_workflow_parity() -> anyhow::Result<()> {
+    let root = fixture("diffusion_guided");
+    assert_parity(
+        &root,
+        || hermetic_workflows::guided_diffusion_request(&[7, 11], &[1, 2, 3, 4]),
+        &[
+            "latent",
+            "image",
+            "noise_estimate",
+            "latent_trajectory",
+            "rng_offset",
+        ],
+    )?;
+    Ok(())
+}
+
+/// Masked token updates are an ONNX component edge too; native must preserve
+/// the same masked replacement semantics as ORT.
+#[test]
+fn masked_workflow_parity() -> anyhow::Result<()> {
+    let root = fixture("masked");
+    assert_parity(
+        &root,
+        || hermetic_workflows::masked_request(&[0, 0], &[true, false], &[0]),
+        &["tokens"],
+    )?;
+    Ok(())
+}
+
+/// The codec family is a minimal two-component audio workflow whose waveform
+/// must round-trip identically on ORT and native.
+#[test]
+fn codec_workflow_parity() -> anyhow::Result<()> {
+    let root = fixture("codec");
+    assert_parity(
+        &root,
+        || hermetic_workflows::codec_request(&[0.25, -0.5]),
+        &["waveform"],
+    )?;
+    Ok(())
+}
+
+/// The nested TTS fixture carries predictor/talker/code histories across a
+/// loop; comparing the real producer graphs keeps native coverage honest.
+#[test]
+fn tts_workflow_parity() -> anyhow::Result<()> {
+    let root = fixture("tts");
+    assert_parity(
+        &root,
+        || hermetic_workflows::tts_request(&[1, 2, 3, 4], 2),
+        &["waveform"],
+    )?;
+    Ok(())
+}
+
+/// Video diffusion is the only hermetic fixture whose emitted tensor grows
+/// along a non-terminal time axis, so native must match ORT on that path too.
+#[test]
+fn video_workflow_parity() -> anyhow::Result<()> {
+    let root = fixture("video");
+    assert_parity(
+        &root,
+        || hermetic_workflows::video_request(5, 1),
+        &["video"],
+    )?;
+    Ok(())
+}
+
+/// The authored speech fixture proves native parity on the speech-capable
+/// audio publication path without any producer-supplied package.
+#[test]
+fn speech_wav_workflow_parity() -> anyhow::Result<()> {
+    let root = fixture("speech_wav");
+    assert_parity(
+        &root,
+        || hermetic_workflows::speech_request(&[2, 6, 7, 8, 9, 3], 8),
+        &["audio"],
+    )?;
+    Ok(())
+}
+
+/// The mixed-audio speech sibling publishes two different audio outputs; both
+/// raw tensors must still agree exactly across ORT and native.
+#[test]
+fn speech_wav_mixed_audio_workflow_parity() -> anyhow::Result<()> {
+    let root = fixture("speech_wav_mixed_audio");
+    assert_parity(
+        &root,
+        || hermetic_workflows::speech_request(&[2, 6, 7, 8, 9, 3], 8),
+        &["audio", "waveform"],
+    )?;
+    Ok(())
+}
+
+/// Multiple compatible audio outputs are an API-level ambiguity, not an
+/// execution-path difference, so the underlying workflow still must run
+/// identically on ORT and native.
+#[test]
+fn speech_wav_two_audio_workflow_parity() -> anyhow::Result<()> {
+    let root = fixture("speech_wav_two_audio");
+    assert_parity(
+        &root,
+        || hermetic_workflows::speech_request(&[2, 6, 7, 8, 9, 3], 8),
+        &["audio", "waveform"],
+    )?;
+    Ok(())
+}
+
+/// Multiple text-assembly adapters are ambiguous for the speech endpoint, but
+/// the engine-level vocoder path still needs the same native-vs-ORT coverage.
+#[test]
+fn speech_wav_two_adapters_workflow_parity() -> anyhow::Result<()> {
+    let root = fixture("speech_wav_two_adapters");
+    assert_parity(
+        &root,
+        || hermetic_workflows::speech_request(&[2, 6, 7, 8, 9, 3], 8),
+        &["audio"],
+    )?;
+    Ok(())
+}
+
 /// Blocker 1: under the Native backend the pipeline builds **zero** ORT
 /// component sessions — components execute on native `InferenceSession`s, and
 /// the package's I/O contract stays available as backend-neutral graph I/O
@@ -741,39 +982,66 @@ fn native_cuda_device_resident_multicomponent() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Fail closed: a native-unsupported op must produce an actionable error naming
-/// the component and the offending dtype — never a silent fall back to ORT. The
-/// checked `decoder` package's RNG sampler casts to uint64, which the native CPU
-/// EP does not implement.
+/// Fail closed: a native-unsupported op/dtype combination must produce an
+/// actionable error naming the component and the offending dtype — never a
+/// silent fall back to ORT. `TopK` over Int64 remains outside native CPU
+/// coverage even though ORT executes it, so the error boundary is real.
 #[test]
 fn native_unsupported_op_fails_closed() -> anyhow::Result<()> {
-    let root = fixture("decoder");
-    let request = || {
-        PipelineGenerateRequest::new(GenerateRequest {
-            prompt: GeneratePrompt::TokenIds(vec![4, 5]),
-            options: GenerateOptions {
-                max_new_tokens: 2,
-                seed: Some(7),
-                ..Default::default()
-            },
-        })
+    let root = authored_package(
+        "unsupported-topk-int64",
+        TOPK_INT64_META,
+        &[("topk.onnx.textproto", TOPK_INT64)],
+    )?;
+    let request = || -> anyhow::Result<PipelineGenerateRequest> {
+        Ok(
+            PipelineGenerateRequest::new(GenerateRequest::new(GeneratePrompt::TokenIds(vec![])))
+                .with_input(
+                    "input",
+                    Value::from_raw_bytes(
+                        [4_i64, 1_i64, 3_i64, 2_i64]
+                            .into_iter()
+                            .flat_map(|value| value.to_le_bytes())
+                            .collect(),
+                        &[4],
+                        DataType::Int64,
+                    )?,
+                )
+                .with_input(
+                    "k",
+                    Value::from_raw_bytes(
+                        [2_i64]
+                            .into_iter()
+                            .flat_map(|value| value.to_le_bytes())
+                            .collect(),
+                        &[1],
+                        DataType::Int64,
+                    )?,
+                ),
+        )
     };
     // ORT runs it fine.
     let mut ort = ort_engine(&root)?;
-    ort.run_pipeline(request())?;
+    assert_eq!(
+        ort.run_pipeline(request()?)?["indices"].to_raw_bytes()?,
+        [0_i64, 2_i64]
+            .into_iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>()
+    );
     // Native fails closed with an actionable message; it does not fall back.
     let mut native = native_engine(&root)?;
     let error = native
-        .run_pipeline(request())
+        .run_pipeline(request()?)
         .err()
         .expect("native must fail closed on an unsupported op, not fall back to ORT");
     let message = format!("{error:#}");
     assert!(
-        message.contains("token_sampler"),
+        message.contains("topk"),
         "error must name the failing component: {message}"
     );
     assert!(
-        message.contains("Uint64") || message.contains("uint64"),
+        message.contains("Int64") || message.contains("int64"),
         "error must name the unsupported dtype: {message}"
     );
     Ok(())

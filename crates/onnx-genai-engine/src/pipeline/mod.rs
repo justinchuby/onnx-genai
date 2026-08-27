@@ -469,14 +469,14 @@ impl WorkflowRuntime {
             .map(|layer| layer.bytes)
             .max()
             .unwrap_or(0);
-        // The workflow runtime executes every component through ORT sessions
-        // (the native decoder backend is rejected above), so there is no native
-        // CUDA ordinal to resolve the VRAM fraction against. The device (VRAM)
-        // capacity stays honestly `None` when it cannot be measured (#947): it
-        // is reported verbatim as `resolved_device_budget` and never borrows the
-        // host tier. The residency verdict is a separate fact, sized against the
-        // measured host-RAM ceiling, so a fitting model reads `FullResident`
-        // instead of `Unknown` without fabricating a device number.
+        // This early graph-memory accounting precedes native-device resolution,
+        // so it must not fabricate a CUDA ordinal or VRAM capacity. Native
+        // component sessions are resolved later when Native is selected; until
+        // then the device (VRAM) capacity stays honestly `None` (#947), is
+        // reported verbatim as `resolved_device_budget`, and never borrows the
+        // host tier. The residency verdict is a separate fact, sized against
+        // the measured host-RAM ceiling, so a fitting model reads
+        // `FullResident` instead of `Unknown` without inventing a device number.
         let resolved_vram_bytes = resolve_vram_limit_bytes(&config.limits, None)?;
         let residency_ceiling_bytes = resolve_memory_strategy_hot_tier_bytes(&config.limits, None)?;
         #[cfg(feature = "native-cuda")]
@@ -676,10 +676,12 @@ impl WorkflowRuntime {
         };
         let execution_islands =
             if island_reservation_admitted && decode_backend != EngineDecodeBackend::Native {
-                // Execution islands are the ORT `IoBinding` / CUDA-graph optimization.
-                // The native backend has no equivalent yet (follow-up boundary A), so
-                // under Native we keep the compiled graph's individual component nodes
-                // and drive each through the native seam — correct, just unfused.
+                // Execution islands are an ORT `IoBinding` / CUDA-graph
+                // performance optimization. Native deliberately does not plan
+                // them: it retains the compiled graph's individual component
+                // nodes and drives each through the native seam. This is a
+                // functional path without ORT fallback, not an island or
+                // performance-parity claim.
                 islands::plan_execution_islands(
                     &mut compiled_workflow.graph,
                     &workflow,
