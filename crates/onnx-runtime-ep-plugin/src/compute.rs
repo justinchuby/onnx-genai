@@ -83,6 +83,12 @@ pub enum ShapeInference {
         /// The `N` attribute: the dequantized weight's column count.
         n: usize,
     },
+    /// `pkg.nxrt::DsaIndexSelect` v1: `[B,S,H,D]` query plus indexer inputs
+    /// produces fixed-width indices `[B,1,S,top_k]`.
+    DsaIndexSelect {
+        /// Required positive `top_k` attribute, which fixes the output width.
+        top_k: usize,
+    },
     /// `QLinearMatMul`: `MatMul` semantics between input 0 and input **3**.
     ///
     /// The quantization parameters sit between the two operands
@@ -285,6 +291,19 @@ pub enum DeclineReason {
 const KERNEL_SIZED_OUTPUT_STRATEGIES: &[(&str, &str)] =
     &[("", "NonMaxSuppression"), ("", "Unique")];
 
+type ShapeSchemaBuilder =
+    fn(&Node, &[Vec<Option<usize>>], usize) -> Result<ShapeInference, &'static str>;
+
+const DSA_INDEX_SELECT_SCHEMAS: &[(i64, ShapeSchemaBuilder)] = &[(1, build_dsa_index_select)];
+
+fn resolve_shape_schema<T>(opset: i64, schemas: &[(i64, T)]) -> Option<&T> {
+    schemas
+        .iter()
+        .filter(|(since_version, _)| *since_version <= opset)
+        .max_by_key(|(since_version, _)| *since_version)
+        .map(|(_, schema)| schema)
+}
+
 fn kernel_sized_output_strategy(domain: &str, op_type: &str) -> bool {
     let domain = if domain == "ai.onnx" { "" } else { domain };
     KERNEL_SIZED_OUTPUT_STRATEGIES
@@ -486,6 +505,25 @@ impl ShapeInference {
                     reason: DeclineReason::NodeNotShapeable("MatMulNBits without a usable N attribute"),
                 },
             },
+            "DsaIndexSelect" if domain == "pkg.nxrt" => {
+                let Some(build) = resolve_shape_schema(opset, DSA_INDEX_SELECT_SCHEMAS) else {
+                    return Self::Declined {
+                        op_type: op.to_string(),
+                        domain: domain.to_string(),
+                        reason: DeclineReason::NodeNotShapeable(
+                            "DsaIndexSelect has no schema at the imported opset",
+                        ),
+                    };
+                };
+                match build(node, input_shapes, num_outputs) {
+                    Ok(rule) => rule,
+                    Err(reason) => Self::Declined {
+                        op_type: op.to_string(),
+                        domain: domain.to_string(),
+                        reason: DeclineReason::NodeNotShapeable(reason),
+                    },
+                }
+            }
 
             // ── Gemm ──────────────────────────────────────────────────────
             "Gemm" => {
@@ -707,6 +745,82 @@ fn reduction_axes_input_since(op: &str) -> Option<i64> {
 
 fn reduction_axes_are_input(op: &str, opset: i64) -> bool {
     reduction_axes_input_since(op).is_some_and(|since| opset >= since)
+}
+
+fn build_dsa_index_select(
+    node: &Node,
+    input_shapes: &[Vec<Option<usize>>],
+    num_outputs: usize,
+) -> Result<ShapeInference, &'static str> {
+    if node
+        .attributes
+        .keys()
+        .any(|name| !matches!(name.as_str(), "top_k" | "scale" | "weights_scale"))
+    {
+        return Err("DsaIndexSelect has an attribute outside the frozen v1 ABI");
+    }
+    if node.inputs.len() != 4 || input_shapes.len() != 4 {
+        return Err("DsaIndexSelect requires four input shapes");
+    }
+    if node.inputs.iter().any(Option::is_none) {
+        return Err("DsaIndexSelect inputs are all required");
+    }
+    if num_outputs != 1 {
+        return Err("DsaIndexSelect requires exactly one output");
+    }
+    let top_k = node
+        .attr("top_k")
+        .and_then(|attribute| attribute.as_int())
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|&value| value > 0)
+        .ok_or("DsaIndexSelect requires a positive integer top_k attribute")?;
+    if !node
+        .attr("scale")
+        .and_then(|attribute| attribute.as_float())
+        .is_some_and(|value| value.is_finite() && value > 0.0)
+    {
+        return Err("DsaIndexSelect requires a finite positive float scale attribute");
+    }
+    if node.attr("weights_scale").is_some_and(|attribute| {
+        attribute
+            .as_float()
+            .is_none_or(|value| !value.is_finite() || value <= 0.0)
+    }) {
+        return Err("DsaIndexSelect weights_scale must be a finite positive float");
+    }
+
+    let expected_ranks = [4usize, 3, 3, 4];
+    if input_shapes
+        .iter()
+        .zip(expected_ranks)
+        .any(|(shape, rank)| shape.len() != rank)
+    {
+        return Err("DsaIndexSelect input ranks must be query=4, key=3, weights=3, bias=4");
+    }
+
+    let same_static = |left: (usize, usize), right: (usize, usize)| match (
+        input_shapes[left.0][left.1],
+        input_shapes[right.0][right.1],
+    ) {
+        (Some(left), Some(right)) => left == right,
+        _ => true,
+    };
+    if !same_static((0, 0), (1, 0))
+        || !same_static((0, 0), (2, 0))
+        || !same_static((0, 0), (3, 0))
+        || !same_static((0, 1), (2, 1))
+        || !same_static((0, 2), (2, 2))
+        || !same_static((0, 3), (1, 2))
+        || !same_static((0, 1), (3, 2))
+        || !same_static((1, 1), (3, 3))
+    {
+        return Err("DsaIndexSelect static input dimensions are inconsistent");
+    }
+    if input_shapes[3][1].is_some_and(|heads| heads != 1) {
+        return Err("DsaIndexSelect attention_bias head-broadcast dimension must be 1");
+    }
+
+    Ok(ShapeInference::DsaIndexSelect { top_k })
 }
 
 fn build_conv(node: &Node, input_shapes: &[Vec<Option<usize>>]) -> Option<ShapeInference> {
@@ -4921,6 +5035,58 @@ fn infer_shapes(
             Ok(vec![inputs[idx].shape.to_vec()])
         }
 
+        ShapeInference::DsaIndexSelect { top_k } => {
+            if inputs.len() != 4 {
+                return Err(format!(
+                    "DsaIndexSelect: expected 4 inputs, got {}",
+                    inputs.len()
+                ));
+            }
+            for (index, input) in inputs.iter().take(3).enumerate() {
+                if !matches!(
+                    input.dtype,
+                    DataType::Float32 | DataType::Float16 | DataType::BFloat16
+                ) {
+                    return Err(format!(
+                        "DsaIndexSelect: input {index} must be Float32, Float16, or BFloat16"
+                    ));
+                }
+            }
+            if inputs[1].dtype != inputs[0].dtype || inputs[2].dtype != inputs[0].dtype {
+                return Err("DsaIndexSelect: query, key, and weights dtypes must match".into());
+            }
+            if inputs[3].dtype != DataType::Float32 {
+                return Err("DsaIndexSelect: attention_bias must be Float32".into());
+            }
+
+            let query = inputs[0].shape;
+            let key = inputs[1].shape;
+            let weights = inputs[2].shape;
+            let bias = inputs[3].shape;
+            if query.len() != 4 || key.len() != 3 || weights.len() != 3 || bias.len() != 4 {
+                return Err(
+                    "DsaIndexSelect: input ranks must be query=4, key=3, weights=3, bias=4".into(),
+                );
+            }
+            if query[0] != key[0]
+                || query[0] != weights[0]
+                || query[0] != bias[0]
+                || query[1] != weights[1]
+                || query[2] != weights[2]
+                || query[3] != key[2]
+                || query[1] != bias[2]
+                || key[1] != bias[3]
+            {
+                return Err("DsaIndexSelect: input dimensions are inconsistent".into());
+            }
+            if bias[1] != 1 {
+                return Err(
+                    "DsaIndexSelect: attention_bias head-broadcast dimension must be 1".into(),
+                );
+            }
+            Ok(vec![vec![query[0], 1, query[1], *top_k]])
+        }
+
         ShapeInference::CausalConvWithState => {
             if inputs.len() < 2 {
                 return Err(format!(
@@ -6476,14 +6642,18 @@ fn after() {}
     }
 
     use onnx_runtime_ep_api::tensor::{DevicePtr, TensorView};
-    use onnx_runtime_ir::{DataType, DeviceId};
+    use onnx_runtime_ir::{Attribute, DataType, DeviceId, Node, NodeId, ValueId};
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     fn view<'a>(shape: &'a [usize], strides: &'a [i64]) -> TensorView<'a> {
+        typed_view(DataType::Float32, shape, strides)
+    }
+
+    fn typed_view<'a>(dtype: DataType, shape: &'a [usize], strides: &'a [i64]) -> TensorView<'a> {
         TensorView::new(
             DevicePtr(std::ptr::null()),
-            DataType::Float32,
+            dtype,
             shape,
             strides,
             DeviceId::cpu(),
@@ -6713,6 +6883,169 @@ fn after() {}
                 fallback: Box::new(ShapeInference::SameAsInput(9)),
             },
             &[input],
+        );
+    }
+
+    fn dsa_index_select_node(domain: &str, version: i64, top_k: Attribute) -> Node {
+        let mut node = Node::new(
+            NodeId(0),
+            "DsaIndexSelect",
+            (0..4).map(|index| Some(ValueId(index))).collect(),
+            vec![ValueId(100)],
+        );
+        node.domain = domain.into();
+        node.version = Some(version);
+        node.attributes.insert("top_k".into(), top_k);
+        node.attributes
+            .insert("scale".into(), Attribute::Float(0.125));
+        node
+    }
+
+    fn dsa_input_shapes() -> Vec<Vec<Option<usize>>> {
+        vec![
+            vec![Some(2), Some(3), Some(4), Some(8)],
+            vec![Some(2), Some(16), Some(8)],
+            vec![Some(2), Some(3), Some(4)],
+            vec![Some(2), Some(1), Some(3), Some(16)],
+        ]
+    }
+
+    #[test]
+    fn shape_schema_resolution_selects_highest_compatible_since_version() {
+        let schemas = [(1, "v1"), (3, "v3"), (7, "v7")];
+        for (imported, expected) in [(1, "v1"), (2, "v1"), (3, "v3"), (6, "v3"), (99, "v7")] {
+            assert_eq!(resolve_shape_schema(imported, &schemas), Some(&expected));
+        }
+        assert_eq!(resolve_shape_schema(0, &schemas), None);
+    }
+
+    #[test]
+    fn dsa_index_select_resolves_v1_schema_for_later_imports() {
+        for imported_opset in [1, 2, 17] {
+            let node = dsa_index_select_node("pkg.nxrt", imported_opset, Attribute::Int(5));
+            let strategy = ShapeInference::for_node(&node, &dsa_input_shapes(), 1);
+            assert!(
+                matches!(strategy, ShapeInference::DsaIndexSelect { top_k: 5 }),
+                "imported opset {imported_opset} must resolve the sole since-version-1 schema"
+            );
+
+            let query = typed_view(DataType::BFloat16, &[2, 3, 4, 8], &[96, 32, 8, 1]);
+            let key = typed_view(DataType::BFloat16, &[2, 16, 8], &[128, 8, 1]);
+            let weights = typed_view(DataType::BFloat16, &[2, 3, 4], &[12, 4, 1]);
+            let bias = view(&[2, 1, 3, 16], &[48, 48, 16, 1]);
+            assert_eq!(
+                infer(&strategy, &[query, key, weights, bias]).unwrap(),
+                vec![vec![2, 1, 3, 5]]
+            );
+        }
+    }
+
+    #[test]
+    fn dsa_index_select_preserves_unknown_batch_and_sequence_at_capability_time() {
+        let node = dsa_index_select_node("pkg.nxrt", 1, Attribute::Int(7));
+        let shapes = vec![
+            vec![None, None, Some(4), Some(8)],
+            vec![None, Some(16), Some(8)],
+            vec![None, None, Some(4)],
+            vec![None, Some(1), None, Some(16)],
+        ];
+        assert!(matches!(
+            ShapeInference::for_node(&node, &shapes, 1),
+            ShapeInference::DsaIndexSelect { top_k: 7 }
+        ));
+    }
+
+    #[test]
+    fn dsa_index_select_declines_wrong_schema_or_static_contract() {
+        let valid = dsa_input_shapes();
+        for (label, node, shapes) in [
+            (
+                "wrong domain",
+                dsa_index_select_node("com.example", 1, Attribute::Int(4)),
+                valid.clone(),
+            ),
+            (
+                "no compatible schema",
+                dsa_index_select_node("pkg.nxrt", 0, Attribute::Int(4)),
+                valid.clone(),
+            ),
+            (
+                "non-integer top_k",
+                dsa_index_select_node("pkg.nxrt", 1, Attribute::Float(4.0)),
+                valid.clone(),
+            ),
+            (
+                "zero top_k",
+                dsa_index_select_node("pkg.nxrt", 1, Attribute::Int(0)),
+                valid.clone(),
+            ),
+            (
+                "missing scale",
+                {
+                    let mut node = dsa_index_select_node("pkg.nxrt", 1, Attribute::Int(4));
+                    node.attributes.remove("scale");
+                    node
+                },
+                valid.clone(),
+            ),
+            (
+                "unknown attribute",
+                {
+                    let mut node = dsa_index_select_node("pkg.nxrt", 1, Attribute::Int(4));
+                    node.attributes.insert("axis".into(), Attribute::Int(-1));
+                    node
+                },
+                valid.clone(),
+            ),
+            (
+                "wrong rank",
+                dsa_index_select_node("pkg.nxrt", 1, Attribute::Int(4)),
+                vec![
+                    vec![Some(2), Some(3), Some(32)],
+                    valid[1].clone(),
+                    valid[2].clone(),
+                    valid[3].clone(),
+                ],
+            ),
+            (
+                "static mismatch",
+                dsa_index_select_node("pkg.nxrt", 1, Attribute::Int(4)),
+                vec![
+                    valid[0].clone(),
+                    vec![Some(9), Some(16), Some(8)],
+                    valid[2].clone(),
+                    valid[3].clone(),
+                ],
+            ),
+        ] {
+            assert!(
+                matches!(
+                    ShapeInference::for_node(&node, &shapes, 1),
+                    ShapeInference::Declined { .. }
+                ),
+                "{label} must decline"
+            );
+        }
+    }
+
+    #[test]
+    fn dsa_index_select_runtime_shape_rule_rechecks_dtype_and_dimensions() {
+        let strategy = ShapeInference::DsaIndexSelect { top_k: 4 };
+        let query = view(&[1, 2, 3, 8], &[48, 24, 8, 1]);
+        let key = view(&[1, 16, 8], &[128, 8, 1]);
+        let weights = view(&[1, 2, 3], &[6, 3, 1]);
+        let bad_bias_dtype = typed_view(DataType::Float16, &[1, 1, 2, 16], &[32, 32, 16, 1]);
+        assert!(
+            infer(&strategy, &[query, key, weights, bad_bias_dtype])
+                .unwrap_err()
+                .contains("attention_bias must be Float32")
+        );
+
+        let bad_bias_shape = view(&[1, 2, 2, 16], &[64, 32, 16, 1]);
+        assert!(
+            infer(&strategy, &[query, key, weights, bad_bias_shape])
+                .unwrap_err()
+                .contains("head-broadcast dimension must be 1")
         );
     }
 

@@ -178,6 +178,17 @@ static STFT_DTYPES: &[DataType] = &[
 
 /// NonMaxSuppression mixes f32 geometry/thresholds with i64 limits/output.
 static NMS_DTYPES: &[DataType] = &[DataType::Float32, DataType::Int64];
+/// Exact dtype union for `pkg.nxrt::DsaIndexSelect` edges.
+///
+/// Inputs 0..=2 accept the three compute floats, input 3 is f32, and the sole
+/// output is int64. Per-slot constraints below keep the input union from
+/// widening the kernel contract.
+static DSA_INDEX_SELECT_DTYPES: &[DataType] = &[
+    DataType::Float32,
+    DataType::Float16,
+    DataType::BFloat16,
+    DataType::Int64,
+];
 
 /// Per-input-slot dtype constraints for a mixed-dtype op.
 ///
@@ -280,6 +291,12 @@ pub fn input_dtype_constraints_for_op(
         (3, F32_ONLY),
         (4, F32_ONLY),
     ];
+    static DSA_INDEX_SELECT_SLOTS: &[(usize, &[DataType])] = &[
+        (0, FLOAT_COMPUTE_DTYPES),
+        (1, FLOAT_COMPUTE_DTYPES),
+        (2, FLOAT_COMPUTE_DTYPES),
+        (3, F32_ONLY),
+    ];
     match (op_type, domain) {
         ("MatMulNBits", "com.microsoft") => MATMUL_NBITS_SLOTS,
         ("QLinearMatMul", "") => QLINEAR_MATMUL_SLOTS,
@@ -292,6 +309,22 @@ pub fn input_dtype_constraints_for_op(
         ("QMoE", "com.microsoft") => QMOE_SLOTS,
         ("STFT", "") => STFT_SLOTS,
         ("NonMaxSuppression", "") => NMS_SLOTS,
+        ("DsaIndexSelect", "pkg.nxrt") => DSA_INDEX_SELECT_SLOTS,
+        _ => &[],
+    }
+}
+
+/// Per-output-slot dtype constraints for mixed-dtype ops.
+///
+/// Unlisted outputs use the op-wide union from [`supported_dtypes_for_op`].
+/// Listed slots mirror the corresponding kernel's execute-time output checks.
+pub fn output_dtype_constraints_for_op(
+    op_type: &str,
+    domain: &str,
+) -> &'static [(usize, &'static [DataType])] {
+    static DSA_INDEX_SELECT_OUTPUTS: &[(usize, &[DataType])] = &[(0, I64_ONLY)];
+    match (op_type, domain) {
+        ("DsaIndexSelect", "pkg.nxrt") => DSA_INDEX_SELECT_OUTPUTS,
         _ => &[],
     }
 }
@@ -498,7 +531,9 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
         ("MoE", "com.microsoft") => FLOAT_COMPUTE_DTYPES,
         ("QMoE", "com.microsoft") => F32_ONLY,
 
-        // pkg.nxrt custom ops: f32-only (fail closed).
+        ("DsaIndexSelect", "pkg.nxrt") => DSA_INDEX_SELECT_DTYPES,
+
+        // Remaining pkg.nxrt custom ops: f32-only (fail closed).
         (_, "pkg.nxrt") => F32_ONLY,
 
         // CNN ops (feature-gated). `Conv` computes through MLAS in f32 and
@@ -552,6 +587,7 @@ pub mod contrib_fused;
 pub mod dense_elementwise;
 pub mod dft;
 pub mod dropout;
+pub mod dsa_index_select;
 pub mod elementwise;
 pub mod expand;
 pub mod eye_like;
@@ -1010,6 +1046,10 @@ fn build_cpu_registry_recorded_inner(
     rec.register(
         OpKey::new("IndexShare", "pkg.nxrt", 1),
         Box::new(index_share::IndexShareFactory),
+    );
+    rec.register(
+        OpKey::new("DsaIndexSelect", "pkg.nxrt", 1),
+        Box::new(dsa_index_select::DsaIndexSelectFactory),
     );
     rec.register(
         OpKey::new("VarlenAttention", "pkg.nxrt", 1),
@@ -2260,6 +2300,32 @@ pub(crate) mod testutil {
 #[cfg(test)]
 mod tests {
 
+    #[test]
+    fn dsa_index_select_advertises_exact_mixed_edge_dtypes() {
+        let dtypes = supported_dtypes_for_op("DsaIndexSelect", "pkg.nxrt");
+        assert_eq!(
+            dtypes,
+            &[
+                DataType::Float32,
+                DataType::Float16,
+                DataType::BFloat16,
+                DataType::Int64,
+            ]
+        );
+
+        let constraints = input_dtype_constraints_for_op("DsaIndexSelect", "pkg.nxrt");
+        assert_eq!(constraints.len(), 4);
+        assert_eq!(constraints[0], (0, FLOAT_COMPUTE_DTYPES));
+        assert_eq!(constraints[1], (1, FLOAT_COMPUTE_DTYPES));
+        assert_eq!(constraints[2], (2, FLOAT_COMPUTE_DTYPES));
+        assert_eq!(constraints[3], (3, F32_ONLY));
+
+        assert_eq!(
+            output_dtype_constraints_for_op("DsaIndexSelect", "pkg.nxrt"),
+            &[(0, I64_ONLY)]
+        );
+    }
+
     /// The plugin EP's node filter refuses a node unless *every* input and
     /// output dtype appears in this list, so a list written from the compute
     /// dtype alone silently excludes the whole op. `MatMulNBits` carries a
@@ -2579,6 +2645,8 @@ mod tests {
         // BitwiseAnd,
         // BitwiseOr, BitwiseXor, BitwiseNot, and Hardmax add five more.
         // MatMulNBits, BlockQuantizedMatMul, BlockQuantizedMoE, IndexShare,
+        // DsaIndexSelect (the GLM-5.2 DSA query-dependent index-selection
+        // counterpart to IndexShare),
         // VarlenAttention, PackedVarlenAttention, PackedMultiHeadAttention,
         // SparseKvGather, CompressedSparseAttention, and GroupQueryAttention add
         // private/contrib registrations.
@@ -2605,7 +2673,7 @@ mod tests {
         // its `com.microsoft` spelling.
         // `STFT` adds its opset-17 standard-domain registration.
         let mlas_registrations = if cfg!(feature = "mlas") { 6 } else { 0 };
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 105 + mlas_registrations);
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 106 + mlas_registrations);
         for op in PHASE1_OPS {
             assert!(reg.lookup(op, "", 21).is_some(), "missing factory for {op}");
         }

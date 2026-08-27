@@ -148,6 +148,26 @@ const TEST_ONLY: &[&str] = &["TotallyFakeOp"];
 /// model of production, and an op still counts as declining unless *some* point
 /// in the matrix yields a rule.
 fn declines(op_type: &str, domain: &str) -> bool {
+    if (domain, op_type) == ("pkg.nxrt", "DsaIndexSelect") {
+        let inputs = (0..4).map(|i| Some(ValueId(i))).collect();
+        let mut node = Node::new(NodeId(0), op_type, inputs, vec![ValueId(100)]);
+        node.domain = domain.to_string();
+        node.version = Some(1);
+        node.attributes.insert("top_k".into(), Attribute::Int(4));
+        node.attributes
+            .insert("scale".into(), Attribute::Float(0.125));
+        let input_shapes = vec![
+            vec![Some(2), Some(3), Some(4), Some(8)],
+            vec![Some(2), Some(16), Some(8)],
+            vec![Some(2), Some(3), Some(4)],
+            vec![Some(2), Some(1), Some(3), Some(16)],
+        ];
+        return matches!(
+            ShapeInference::for_node(&node, &input_shapes, 1),
+            ShapeInference::Declined { .. }
+        );
+    }
+
     const OPSETS: &[i64] = &[1, 13, 18, 22, 23];
     const SHAPES: &[&[usize]] = &[&[8], &[4, 8], &[2, 3, 8], &[1, 3, 8, 8]];
     /// The integer attributes `for_node` reads, with values consistent with

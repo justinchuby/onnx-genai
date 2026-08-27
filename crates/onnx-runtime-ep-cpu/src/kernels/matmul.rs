@@ -8248,6 +8248,7 @@ mod weight_cache_accounting {
             "DequantizeLinear",
             "Div",
             "Dropout",
+            "DsaIndexSelect",
             "DynamicQuantizeLinear",
             "Einsum",
             "Elu",

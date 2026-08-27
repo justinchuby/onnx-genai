@@ -1,0 +1,99 @@
+ir_version: 11
+graph {
+  node {
+    input: "query"
+    input: "key"
+    input: "weights"
+    input: "attention_bias"
+    output: "selected_indices"
+    op_type: "DsaIndexSelect"
+    attribute {
+      name: "top_k"
+      i: 2
+      type: INT
+    }
+    attribute {
+      name: "scale"
+      f: 1
+      type: FLOAT
+    }
+    domain: "pkg.nxrt"
+  }
+  name: "dsa_index_select_float_output"
+  input {
+    name: "query"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim { dim_value: 1 }
+          dim { dim_value: 2 }
+          dim { dim_value: 1 }
+          dim { dim_value: 2 }
+        }
+      }
+    }
+  }
+  input {
+    name: "key"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim { dim_value: 1 }
+          dim { dim_value: 3 }
+          dim { dim_value: 2 }
+        }
+      }
+    }
+  }
+  input {
+    name: "weights"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim { dim_value: 1 }
+          dim { dim_value: 2 }
+          dim { dim_value: 1 }
+        }
+      }
+    }
+  }
+  input {
+    name: "attention_bias"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim { dim_value: 1 }
+          dim { dim_value: 1 }
+          dim { dim_value: 2 }
+          dim { dim_value: 3 }
+        }
+      }
+    }
+  }
+  output {
+    name: "selected_indices"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim { dim_value: 1 }
+          dim { dim_value: 1 }
+          dim { dim_value: 2 }
+          dim { dim_value: 2 }
+        }
+      }
+    }
+  }
+}
+opset_import {
+  domain: ""
+  version: 24
+}
+opset_import {
+  domain: "pkg.nxrt"
+  version: 2
+}
