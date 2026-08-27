@@ -39,14 +39,16 @@ REQUIRED_JOB_NAMES = frozenset({"Fast (Linux x86_64)", "Rust quality"})
 # that stops being *defined* anywhere blocks a merge.
 #
 # "Defined" is the whole claim, and it is narrower than "runs". Reviewed and
-# measured, this gate is blind to three ways a job stops running while every
-# name it records is still present: a workflow whose `on:`/`paths:` no longer
-# fires on pull requests, a job carrying `if: false`, and a `strategy.matrix`
-# emptied or renamed -- the inventory holds the unexpanded template
-# `CLI ORT (${{ matrix.name }})`, not the check names GitHub actually reports.
-# `if: false` on a *required* job is already refused by
+# measured, this table alone is blind to three ways a job stops running while
+# every name it records is still present: a workflow whose `on:`/`paths:` no
+# longer fires on pull requests, a job carrying `if: false`, and a
+# `strategy.matrix` emptied or a row deleted -- this table holds the unexpanded
+# template `CLI ORT (${{ matrix.name }})`, not the check names GitHub actually
+# reports. `if: false` on a *required* job is already refused by
 # `verify_required_job_conditions`; on a non-required job nothing refuses it.
-# See #2210. Do not read a pass here as "these checks ran".
+# The first two are closed by `PR_TRIGGERED_WORKFLOWS` (#2210) and the third by
+# `WORKFLOW_MATRIX_CHECKS` below, each of which was measured blind first. Do
+# not read a pass in *this table* as "these checks ran".
 #
 # The names are display names -- `name:` when a job sets one, otherwise the job
 # key -- because that is what GitHub reports as the status check and what a
@@ -150,6 +152,64 @@ WORKFLOW_JOB_INVENTORY: dict[str, tuple[str, ...]] = {
     "wiki-lint.yml": (
         "Notes stand on their own",
     ),
+}
+
+UNEXPANDABLE = "<matrix this gate cannot expand>"
+
+# The check names GitHub actually reports for the matrix jobs above.
+# `WORKFLOW_JOB_INVENTORY` records a matrix job by its unexpanded template,
+# `CLI ORT (${{ matrix.name }})`, because that is the single `name:` in the
+# file. GitHub reports one check per `include:` row. Deleting a row therefore
+# removes a status check while the recorded name is still present, and the gate
+# stays green. Measured before writing this table, on the real workflow:
+# deleting the `Windows x86_64` row from `cli-ort` dropped
+# `CLI ORT (Windows x86_64)` from every pull request and
+# `verify-workflow-integrity` still returned 0. Five of this repository's pull
+# request checks are matrix rows, both Windows lanes among them.
+#
+# This is the vector the comment above `WORKFLOW_JOB_INVENTORY` recorded as
+# open ("a `strategy.matrix` emptied or renamed"). See #2210.
+#
+# `UNEXPANDABLE` is recorded rather than skipped when expanding would mean
+# guessing -- a cross-product axis, or a row with nested values, as in
+# `publish.yml`. A skipped job would make this gate's own coverage invisible,
+# which is the failure the file exists to avoid; recording it means a job that
+# newly becomes unexpandable is itself a reported difference.
+WORKFLOW_MATRIX_CHECKS: dict[str, dict[str, tuple[str, ...]]] = {
+    "ci.yml": {
+        "CLI ORT (${{ matrix.name }})": (
+            "CLI ORT (Linux x86_64)",
+            "CLI ORT (Windows x86_64)",
+        ),
+        "Rust coverage (${{ matrix.name }})": (
+            "Rust coverage (Linux x86_64)",
+            "Rust coverage (Windows x86_64)",
+            "Rust coverage (macOS arm64)",
+        ),
+    },
+    "publish-ep-plugins.yml": {
+        "nxrt-ep-cpu wheel (${{ matrix.name }})": (
+            "nxrt-ep-cpu wheel (Linux x86_64)",
+            "nxrt-ep-cpu wheel (Windows AMD64)",
+            "nxrt-ep-cpu wheel (macOS arm64)",
+            "nxrt-ep-cpu wheel (Windows ARM64)",
+        ),
+        "nxrt-ep-cuda wheel (${{ matrix.name }})": (
+            "nxrt-ep-cuda wheel (Linux x86_64)",
+        ),
+    },
+    "publish.yml": {
+        "Build ${{ matrix.package }} (${{ matrix.platform.name }})": (
+            UNEXPANDABLE,
+        ),
+    },
+    "wheels.yml": {
+        "CPU wheel (${{ matrix.name }})": (
+            "CPU wheel (Linux x86_64)",
+            "CPU wheel (Windows AMD64)",
+            "CPU wheel (macOS arm64)",
+        ),
+    },
 }
 
 # Every workflow that reports a check on every pull request, mapped to the
@@ -840,6 +900,104 @@ def parse_jobs(text: str, source: str = "<workflow>") -> dict[str, str]:
     return jobs
 
 
+# A matrix job's `name:` is a template, and WORKFLOW_JOB_INVENTORY records the
+# template rather than the checks GitHub reports. So deleting one `include:`
+# row removes a status check while every recorded name is still present.
+# Measured on `cli-ort`: deleting the `Windows x86_64` row drops
+# `CLI ORT (Windows x86_64)` from every pull request, and
+# `verify-workflow-integrity` still returned 0. Five of this repository's pull
+# request checks are matrix rows, both Windows lanes among them.
+#
+# `UNEXPANDABLE` is *recorded* rather than skipped when a matrix cannot be
+# expanded without guessing -- a cross-product axis, or a row with nested
+# values. Skipping silently would make the gate's own coverage invisible, which
+# is the failure this whole file exists to avoid. Recording it means a job that
+# newly becomes unexpandable is itself a difference the gate reports.
+_MX_VAR = re.compile(r"\$\{\{\s*matrix\.([A-Za-z_][A-Za-z0-9_.]*)\s*\}\}")
+_MX_MATRIX_LINE = re.compile(r"^(\s*)matrix:\s*$")
+_MX_INCLUDE_LINE = re.compile(r"^(\s*)include:\s*$")
+_MX_ROW_START = re.compile(r"^\s*-\s+([A-Za-z_][A-Za-z0-9_-]*):\s*(.*)$")
+_MX_ROW_KEY = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_-]*):\s*(.*)$")
+
+
+def _indent_of(line: str) -> int:
+    return len(line) - len(line.lstrip())
+
+
+def parse_matrix_rows(body: str) -> list[dict[str, str]] | None:
+    """The `include:` rows of a job's matrix, or None if expanding would guess."""
+    lines = [
+        line for line in body.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    matrix_at = next((i for i, line in enumerate(lines) if _MX_MATRIX_LINE.match(line)), None)
+    if matrix_at is None:
+        return None
+
+    matrix_indent = _indent_of(lines[matrix_at])
+    include_at = None
+    for i in range(matrix_at + 1, len(lines)):
+        indent = _indent_of(lines[i])
+        if indent <= matrix_indent:
+            break
+        if indent != matrix_indent + 2:
+            continue
+        if _MX_INCLUDE_LINE.match(lines[i]):
+            include_at = i
+        else:
+            # Another axis alongside `include:` is a cross product, and this
+            # parser will not guess at the product.
+            return None
+    if include_at is None:
+        return None
+
+    rows: list[dict[str, str]] = []
+    base = _indent_of(lines[include_at])
+    for i in range(include_at + 1, len(lines)):
+        line = lines[i]
+        if _indent_of(line) <= base:
+            break
+        if match := _MX_ROW_START.match(line):
+            rows.append({})
+        elif match := _MX_ROW_KEY.match(line):
+            pass
+        else:
+            return None
+        if not rows:
+            return None
+        key, raw = match.group(1), match.group(2).strip()
+        if not raw:
+            # A nested value; the template may reference into it.
+            return None
+        rows[-1][key] = _scalar(raw)
+    return rows or None
+
+
+def expand_job_names(name: str, body: str) -> tuple[str, ...]:
+    """The check names GitHub reports for a job, one per matrix row."""
+    variables = _MX_VAR.findall(name)
+    if not variables:
+        return (name,)
+    rows = parse_matrix_rows(body)
+    if rows is None or any("." in variable for variable in variables):
+        return (UNEXPANDABLE,)
+    expanded: list[str] = []
+    for row in rows:
+        if any(variable not in row for variable in variables):
+            return (UNEXPANDABLE,)
+        expanded.append(_MX_VAR.sub(lambda m: str(row[m.group(1)]), name))
+    return tuple(expanded)
+
+
+def expanded_check_names(jobs: dict[str, str]) -> dict[str, tuple[str, ...]]:
+    """Every matrix job in a workflow, mapped to the checks it actually reports."""
+    return {
+        name: expand_job_names(name, body)
+        for name, body in jobs.items()
+        if _MX_VAR.search(name)
+    }
+
+
 # A step's `if:` decides whether it runs at all, and this gate cannot evaluate
 # GitHub's expression language. Crediting a guarded step would let `if: false`
 # -- or a copy-pasted `if: runner.os == 'Windows'` on a Linux-only job -- remove
@@ -1386,10 +1544,55 @@ def workflow_files() -> list[Path]:
     return sorted(WORKFLOWS.glob("*.yml")) + sorted(WORKFLOWS.glob("*.yaml"))
 
 
+def _matrix_check_failures(
+    expanded: dict[str, dict[str, tuple[str, ...]]],
+    inventory: dict[str, dict[str, tuple[str, ...]]],
+) -> list[str]:
+    """Every difference between the matrix rows on disk and the recorded checks."""
+    failures: list[str] = []
+    for name in sorted(set(inventory) - set(expanded)):
+        failures.append(
+            f"{name}: recorded in WORKFLOW_MATRIX_CHECKS but defines no matrix job. "
+            "A matrix removed outright removes its checks silently."
+        )
+    for name in sorted(set(expanded) - set(inventory)):
+        failures.append(
+            f"{name}: defines matrix job(s) absent from WORKFLOW_MATRIX_CHECKS, so "
+            f"their rows are unguarded: {sorted(expanded[name])}."
+        )
+    for name in sorted(set(expanded) & set(inventory)):
+        found, recorded = expanded[name], inventory[name]
+        for template in sorted(set(recorded) - set(found)):
+            failures.append(
+                f"{name}: matrix job {template!r} is recorded but no longer defined."
+            )
+        for template in sorted(set(found) - set(recorded)):
+            failures.append(
+                f"{name}: matrix job {template!r} is not recorded in "
+                f"WORKFLOW_MATRIX_CHECKS: {list(found[template])}."
+            )
+        for template in sorted(set(found) & set(recorded)):
+            if found[template] == recorded[template]:
+                continue
+            if gone := sorted(set(recorded[template]) - set(found[template])):
+                failures.append(
+                    f"{name}: {template!r} no longer reports {gone}. A deleted "
+                    "`include:` row removes the check rather than failing it, and "
+                    "the job's recorded name does not change when it happens."
+                )
+            if added := sorted(set(found[template]) - set(recorded[template])):
+                failures.append(
+                    f"{name}: {template!r} newly reports {added}, which is not "
+                    "recorded in WORKFLOW_MATRIX_CHECKS."
+                )
+    return failures
+
+
 def verify_workflow_integrity(
     simulate_deleted_job: str | None = None,
     simulate_dropped_trigger: str | None = None,
     simulate_gated_job: str | None = None,
+    simulate_deleted_matrix_row: str | None = None,
 ) -> int:
     """Every workflow parses, defines exactly the jobs it is recorded as defining, and still runs.
 
@@ -1406,28 +1609,51 @@ def verify_workflow_integrity(
     the hostlock job, and swapping `pull_request:` for `workflow_dispatch:` in
     any workflow, each left all three gates returning 0 while printing a line
     byte-identical to a clean tree. `verify_pr_trigger_integrity` closes both.
-    Matrix `include:` row removal is the one recorded vector still open --
-    renaming the matrix variable is caught, because the recorded display name
-    holds the unexpanded template and the template itself changes.
+
+    Matrix `include:` row removal was the one recorded vector left open, and it
+    is closed by `WORKFLOW_MATRIX_CHECKS`. Measured blind first, on the real
+    workflow: deleting the `Windows x86_64` row from `cli-ort` dropped
+    `CLI ORT (Windows x86_64)` from every pull request while `verify`,
+    `verify-required-tier`, `verify-workflow-integrity` and `self-test` all
+    returned 0, because a matrix job's recorded name is the unexpanded template
+    and the template does not change when a row goes. Renaming the matrix
+    variable was already caught for that same reason.
+
+    Still open, and deliberately: a matrix this parser will not expand without
+    guessing -- a cross-product axis, or a row with a nested value, as in
+    `publish.yml` -- is recorded as `UNEXPANDABLE` rather than skipped, so its
+    rows are unguarded but its coverage is at least visible in the table.
     """
     files = workflow_files()
     failures: list[str] = []
     parsed: dict[str, list[str]] = {}
+    expanded: dict[str, dict[str, tuple[str, ...]]] = {}
     for path in files:
         if path.name not in WORKFLOW_JOB_INVENTORY:
             continue
         try:
-            found = sorted(parse_jobs(path.read_text(encoding="utf-8"), source=str(path)))
+            jobs = parse_jobs(path.read_text(encoding="utf-8"), source=str(path))
+            found = sorted(jobs)
         except SystemExit as refusal:
             failures.append(str(refusal))
             continue
         if simulate_deleted_job and simulate_deleted_job in found:
             found.remove(simulate_deleted_job)
         parsed[path.name] = found
+        if rows := expanded_check_names(jobs):
+            if simulate_deleted_matrix_row:
+                rows = {
+                    template: tuple(
+                        name for name in names if name != simulate_deleted_matrix_row
+                    )
+                    for template, names in rows.items()
+                }
+            expanded[path.name] = rows
 
     failures += _integrity_failures(
         {path.name for path in files}, parsed, WORKFLOW_JOB_INVENTORY
     )
+    failures += _matrix_check_failures(expanded, WORKFLOW_MATRIX_CHECKS)
     failures += verify_pr_trigger_integrity(
         simulate_dropped_trigger=simulate_dropped_trigger,
         simulate_gated_job=simulate_gated_job,
@@ -1457,6 +1683,8 @@ def verify_workflow_integrity(
     print(
         f"workflow job integrity ok: {len(files)} file(s), {seen} job(s) as "
         f"recorded, {len(PR_TRIGGERED_WORKFLOWS)} still reporting on pull requests"
+        f", {sum(len(names) for rows in expanded.values() for names in rows.values())}"
+        " matrix row(s) as recorded"
     )
     return 0
 
@@ -1975,6 +2203,8 @@ _WORKFLOW_INTEGRITY_ARMS = (
     "an exact match is accepted (control)",
     "a renamed job is reported in both directions",
     "every workflow file on disk is actually read",
+    "a matrix job whose rows nobody recorded",
+    "a deleted matrix row is reported",
 )
 
 
@@ -2031,6 +2261,43 @@ def _workflow_integrity_arms() -> int:
         both,
         {"a.yml": ["Alpha", "Beta renamed"], "b.yml": ["Gamma"]},
         ["no longer run", "not recorded in the inventory", "Beta renamed"],
+    )
+
+    # The matrix half. `_integrity_failures` above compares job *names*, and a
+    # matrix job's recorded name is the unexpanded template, so none of the arms
+    # above can see a row go. These drive `_matrix_check_failures` on the same
+    # shape of fixture.
+    matrix_inventory = {"a.yml": {"Alpha (${{ matrix.name }})": ("Alpha (x)", "Alpha (y)")}}
+
+    def matrix_arm(
+        label: str,
+        expanded: dict[str, dict[str, tuple[str, ...]]],
+        expect: list[str],
+    ) -> int:
+        found = _matrix_check_failures(expanded, matrix_inventory)
+        text = "\n".join(found)
+        if expect and not found:
+            print(f"  FAIL  {label}: accepted; expected it to name {expect}", file=sys.stderr)
+            return 1
+        if not expect and found:
+            print(f"  FAIL  {label}: refused a correct inventory: {found}", file=sys.stderr)
+            return 1
+        if missing := [needle for needle in expect if needle not in text]:
+            print(f"  FAIL  {label}: refused without naming {missing}", file=sys.stderr)
+            return 1
+        print(f"  ok    {label} -> {'refused' if found else 'accepted'}")
+        return 0
+
+    failures += matrix_arm(
+        "a matrix job whose rows nobody recorded",
+        {"a.yml": {"Alpha (${{ matrix.name }})": ("Alpha (x)", "Alpha (y)")},
+         "b.yml": {"Gamma (${{ matrix.name }})": ("Gamma (x)",)}},
+        ["b.yml", "unguarded"],
+    )
+    failures += matrix_arm(
+        "a deleted matrix row is reported",
+        {"a.yml": {"Alpha (${{ matrix.name }})": ("Alpha (x)",)}},
+        ["a.yml", "Alpha (y)", "no longer reports"],
     )
 
     # `verify_workflow_integrity` derives both sides of its file comparison from
@@ -2659,6 +2926,26 @@ def _self_test_arms() -> tuple[int, int]:
             1,
             ["ci.yml", "if: false"],
         ),
+        # The matrix arm. Deleting the `Windows x86_64` row from `cli-ort` was
+        # measured returning 0 from every gate, including the two above, before
+        # WORKFLOW_MATRIX_CHECKS existed: the job's recorded name is the
+        # unexpanded template, so it does not change when a row goes.
+        (
+            'verify-workflow-integrity --simulate-deleted-matrix-row '
+            '"CLI ORT (Windows x86_64)"',
+            verify_workflow_integrity,
+            {"simulate_deleted_matrix_row": "CLI ORT (Windows x86_64)"},
+            1,
+            ["ci.yml", "CLI ORT (Windows x86_64)"],
+        ),
+        (
+            'verify-workflow-integrity --simulate-deleted-matrix-row '
+            '"Rust coverage (macOS arm64)"',
+            verify_workflow_integrity,
+            {"simulate_deleted_matrix_row": "Rust coverage (macOS arm64)"},
+            1,
+            ["ci.yml", "Rust coverage (macOS arm64)"],
+        ),
         (
             "every `on:` spelling GitHub accepts reads back the same triggers",
             _probe_trigger_forms,
@@ -2797,6 +3084,10 @@ def main() -> int:
         "--simulate-gated-job",
         help="pretend one workflow's jobs carry `if: false`, to prove the guard fails",
     )
+    integrity_parser.add_argument(
+        "--simulate-deleted-matrix-row",
+        help="drop one expanded matrix check name, to prove the guard fails",
+    )
     args = parser.parse_args()
 
     if args.command == "verify":
@@ -2810,6 +3101,7 @@ def main() -> int:
             args.simulate_deleted_job,
             args.simulate_dropped_trigger,
             args.simulate_gated_job,
+            args.simulate_deleted_matrix_row,
         )
     # Windows Python writes stdout in text mode and translates "\n" into
     # "\r\n". bash splits command substitution on IFS, which contains newline
