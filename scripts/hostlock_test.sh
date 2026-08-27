@@ -345,7 +345,35 @@ sleep 2
 chk "expired lock is reported EXPIRED" "$(st state)" "EXPIRED"
 out=$($HL acquire --owner roy --ttl 600 2>&1)
 chk "expired lock is taken over" "$(st owner)" "roy"
-chk "takeover of a live holder warns loudly" "$(echo "$out" | grep -c 'WARNING')" "2"
+# Counting every WARNING line would make this arm a hostage to any unrelated
+# warning the same command later gains -- and it did gain one: the acquire now
+# also announces its own TTL. Count the two takeover messages by their text, so
+# this keeps testing the takeover and not the size of the output.
+chk "takeover of a live holder warns loudly" \
+    "$(echo "$out" | grep -cE 'still alive|numbers are now suspect')" "2"
+cleanup
+
+# A finite TTL is the one setting here that can silently corrupt a result, and
+# before this it was armed with no output at all: the party that gets reaped
+# was the only party never told. `--ttl 0` and `run` must stay quiet, or the
+# warning becomes noise on the invocations that are already safe.
+echo "== ttl arming is announced to the holder =="
+cleanup
+armed=$($HL acquire --owner leon --reason "long sweep" --ttl 600 2>&1)
+chk "a finite ttl warns that the lock expires while still running" \
+    "$(echo "$armed" | grep -c 'EXPIRES in 600s')" "1"
+chk "and names the remedy" "$(echo "$armed" | grep -c -- '--ttl 0')" "1"
+chk "and the warning does not claim a takeover has happened" \
+    "$(echo "$armed" | grep -c 'still alive')" "0"
+chk "and acquiring still succeeds" "$(st owner)" "leon"
+cleanup
+quiet=$($HL acquire --owner leon --reason "protected" --ttl 0 2>&1)
+chk "--ttl 0 arms no clock and so says nothing" \
+    "$(echo "$quiet" | grep -c 'EXPIRES')" "0"
+cleanup
+ran=$($HL run --owner leon --reason "wrapped" -- true 2>&1)
+chk "run pins ttl=0 and so says nothing either" \
+    "$(echo "$ran" | grep -c 'EXPIRES')" "0"
 cleanup
 
 echo "== run: releases on every exit path =="
@@ -3655,7 +3683,7 @@ cleanup
 # the inert R1 block and the vacuous STALE arm that this PR exists to fix.
 # Every probe branch asserts something, so the total is invariant across
 # environments; if a refactor drops a check, this fails and says so.
-chk "every assertion in this file ran" "$((pass + fail + 1))" "541"
+chk "every assertion in this file ran" "$((pass + fail + 1))" "547"
 
 echo
 echo "passed=${pass} failed=${fail}"
