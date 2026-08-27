@@ -1565,12 +1565,25 @@ flat_line() {
     # travel. A space CAN, and must -- a worktree path with a space in it is
     # ordinary, and rejecting it here would be cry-wolf.
     #
-    # The literal sentinel is rejected too, for the same reason `flat_value`
-    # rejects it: if a real value were allowed to BE the sentinel, a reader
-    # could not tell "this field was discarded" from "this field's value is
-    # that string", which is the one distinction these rows exist to make.
+    # It does NOT reject a value that is literally the sentinel, and the
+    # asymmetry with `flat_value` is deliberate rather than an oversight.
+    #
+    # `flat_value`'s sentinel rejection is observable: `prov_add` branches on
+    # its exit status to decide whether to emit a `_raw` recovery line, so a
+    # stored `@malformed` that was wrongly accepted would silently lose its
+    # recovery line. Nothing consumes THIS function's exit status that way --
+    # every caller interpolates the output string -- and for the sentinel the
+    # two branches emit identical bytes: accepted prints the value, which is
+    # `@malformed`; rejected prints `$FLAT_MALFORMED`, which is `@malformed`.
+    #
+    # So the guard would change no output, and the reassuring rationale for
+    # adding it ("otherwise a reader cannot tell a discarded field from a
+    # path literally named @malformed") is not achievable HERE at all: those
+    # two cases render the same either way. It was written, tested, and the
+    # test passed with the guard reverted. An unobservable guard with a
+    # vacuous cell is worse than no guard: it spends the reader's trust.
     case "$1" in
-        *$'\n'* | "$FLAT_MALFORMED")
+        *$'\n'*)
             printf '%s' "$FLAT_MALFORMED"
             return 1
             ;;

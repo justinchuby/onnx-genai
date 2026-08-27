@@ -40,6 +40,28 @@
 
 set -uo pipefail
 
+# A reviewer checking whether a cell is vacuous does it by reverting one
+# production change and re-running -- so the suite has to be pointable at a
+# COPY. It was not, and the failure was silent in the worst direction: `HL`
+# was assigned unconditionally below, and the `cd` here returns to the repo
+# root, so `HL=./copy.sh scripts/hostlock_test.sh` cheerfully tested the real
+# script and reported PASS for every revert. Two of my own verifications came
+# back "not covered" that way, and the honest conclusion would have been
+# "not measured".
+#
+# Resolved BEFORE the cd, because a relative override is relative to the
+# caller's directory, not this one. Unreadable is fatal rather than ignored:
+# falling back to the default is precisely the silent-vacuity behaviour.
+if [ -n "${HOSTLOCK_SCRIPT:-}" ]; then
+    case "$HOSTLOCK_SCRIPT" in
+        /*) HOSTLOCK_SCRIPT_ABS=$HOSTLOCK_SCRIPT ;;
+        *)  HOSTLOCK_SCRIPT_ABS=$PWD/$HOSTLOCK_SCRIPT ;;
+    esac
+    [ -r "$HOSTLOCK_SCRIPT_ABS" ] || {
+        echo "hostlock_test: HOSTLOCK_SCRIPT is not readable: $HOSTLOCK_SCRIPT_ABS" >&2
+        exit 1
+    }
+fi
 cd "$(dirname "$0")/.." || exit 1
 LOCK="$(pwd)/.hostlock-selftest"
 export HOSTLOCK_DIR="$LOCK"
@@ -55,7 +77,7 @@ export HOSTLOCK_DIR="$LOCK"
 # are asserted in the path-resolution section below -- with HOSTLOCK_PRIVATE_OK
 # unset for those cells, so this line cannot make them vacuous.
 export HOSTLOCK_PRIVATE_OK=1
-HL=scripts/hostlock.sh
+HL=${HOSTLOCK_SCRIPT_ABS:-scripts/hostlock.sh}
 
 pass=0
 fail=0
@@ -929,13 +951,13 @@ echo "== value-taking options require values =="
 # `${2:-default}` + a silently-failing `shift 2` spins this loop on one core
 # forever, on the box whose contention the script exists to control.
 for flag in --gate --gate-timeout --ttl --timeout --pid --owner --reason --on-gate-timeout --expect-runnable; do
-    rc=$(timeout 5 $HL acquire --owner leon "$flag" >/dev/null 2>&1; echo $?)
+    rc=$(timeout 5 "$HL" acquire --owner leon "$flag" >/dev/null 2>&1; echo $?)
     chk "$flag with no value fails fast" "$rc" "1"
 done
 chk "--gate rejects a non-integer" \
-    "$(timeout 5 $HL acquire --owner leon --gate abc >/dev/null 2>&1; echo $?)" "1"
+    "$(timeout 5 "$HL" acquire --owner leon --gate abc >/dev/null 2>&1; echo $?)" "1"
 chk "--gate-timeout rejects a non-integer" \
-    "$(timeout 5 $HL acquire --owner leon --gate 0 --gate-timeout abc >/dev/null 2>&1; echo $?)" "1"
+    "$(timeout 5 "$HL" acquire --owner leon --gate 0 --gate-timeout abc >/dev/null 2>&1; echo $?)" "1"
 cleanup
 
 echo "== provenance does not assert facts it does not have =="
@@ -2104,7 +2126,7 @@ chk "and the refusal names the process-tree remedy, so it is actionable" \
 # Controls. Without these, a change that rejected --ttl everywhere -- or one
 # that broke `run` outright -- passes all three assertions above. The refusal
 # has to be scoped to exactly `run`, and `run` itself has to still work.
-ttl_seen=$($HL run --reason "ttl default probe" -- $HL status --porcelain 2>/dev/null | sed -n 's/^ttl=//p')
+ttl_seen=$("$HL" run --reason "ttl default probe" -- "$HL" status --porcelain 2>/dev/null | sed -n 's/^ttl=//p')
 chk "run without --ttl still runs, and records ttl=0" "$ttl_seen" "0"
 $HL acquire --owner pris --ttl 600 >/dev/null 2>&1
 chk "acquire --ttl is still accepted" "$(st ttl)" "600"
@@ -2420,10 +2442,19 @@ chk "a future epoch clamps to zero rather than reporting a negative age" \
         | sed -n 's/^held_secs=//p')" "0"
 # The cry-wolf control: an ordinary epoch must still produce a real age, or
 # the clamp above could pass by pinning the whole column to zero.
+#
+# A RANGE, not equality. `lock_age` reads the clock again inside a freshly
+# spawned `provenance`, so the answer is `42 + elapsed` -- it is `>= 42` and
+# was never `== 42`. Under load this failed roughly 1 run in 20, and a flaky
+# cell here is far worse than it looks: this suite is the oracle for the
+# mutation battery, so an intermittent failure makes EVERY mutant look
+# caught. It did exactly that, and reported a guard as covered when the
+# guard had no cell at all.
 sed -i "s|^acquired_epoch=.*|acquired_epoch=$(( $(date +%s) - 42 ))|" "$LOCK/meta"
+age_ord=$($HL provenance --oneline 2>/dev/null | tr ' ' '\n' \
+    | sed -n 's/^held_secs=//p')
 chk "and an ordinary epoch still reports the true elapsed age" \
-    "$($HL provenance --oneline 2>/dev/null | tr ' ' '\n' \
-        | sed -n 's/^held_secs=//p')" "42"
+    "$([ "$age_ord" -ge 42 ] && [ "$age_ord" -le 90 ] && echo elapsed || echo "$age_ord")" "elapsed"
 $HL release >/dev/null 2>&1
 cleanup
 
@@ -2533,7 +2564,14 @@ lg_take acquire --owner leon-nlraw --ttl 600 >/dev/null 2>&1
 chk "the raw-line block really is driving a HELD lock, not a free one" \
     "$(lg_run provenance --oneline 2>/dev/null | tr ' ' '\n' \
         | sed -n 's/^hostlock_state=//p')" "HELD"
-nlraw=$(env -u HOSTLOCK_DIR HOSTLOCK_CONF="$lg_conf" HOSTLOCK_LEGACY_DIR="$lg_nl" \
+# A PAYLOAD IN THIS GRAMMAR'S OWN KEY. `$lg_nl` forges `state=FREE`, which is
+# the PORCELAIN key; the provenance key is `hostlock_state=`. Reusing it here
+# made the two last-wins cells below pass against the unfixed script -- they
+# counted a key the payload never wrote. The fix is protected either way by
+# the `legacy_dir_raw` cell, but a cell advertised as demonstrating the harm
+# has to actually demonstrate it.
+lg_nl_prov=$(printf 'a\nhostlock_state=FREE')
+nlraw=$(env -u HOSTLOCK_DIR HOSTLOCK_CONF="$lg_conf" HOSTLOCK_LEGACY_DIR="$lg_nl_prov" \
     HOSTLOCK_PRIVATE_OK=1 "$HL" provenance 2>/dev/null)
 chk "a newline in a legacy path cannot add a state line via the raw form" \
     "$(printf '%s\n' "$nlraw" | grep -c '^hostlock_state=')" "1"
@@ -2586,18 +2624,12 @@ chk "and the human line still recovers the holder pid correctly" \
         | sed -n 's/.*(pid \([0-9]*\)).*/\1/p')" "$$"
 rm -rf "$lg_leg"
 
-# `flat_line` must refuse a value that IS the sentinel, for the same reason
-# `flat_value` does. Without this a legitimate path named `@malformed` is
-# indistinguishable from a discarded one -- and in the raw-recovery line
-# that ambiguity is the whole point of the field.
-chk "flat_line treats an incoming literal sentinel as rejected" \
-    "$(env -u HOSTLOCK_DIR HOSTLOCK_CONF="$lg_conf" HOSTLOCK_LEGACY_DIR="$MALFORMED" \
-        HOSTLOCK_PRIVATE_OK=1 "$HL" status --porcelain 2>/dev/null \
-        | sed -n 's/^legacy_dir=//p')" "$MALFORMED"
-chk "and still does not reject an ordinary path (cry-wolf control)" \
-    "$(env -u HOSTLOCK_DIR HOSTLOCK_CONF="$lg_conf" HOSTLOCK_LEGACY_DIR="$lg_ok" \
-        HOSTLOCK_PRIVATE_OK=1 "$HL" status --porcelain 2>/dev/null \
-        | sed -n 's/^legacy_dir=//p')" "$lg_ok"
+# NO CELL HERE FOR "flat_line rejects the literal sentinel", because that
+# guard was removed as unobservable -- see the comment on `flat_line`. Both
+# branches render `@malformed` for a sentinel input, so no cell can tell them
+# apart, and the one written here passed with the guard reverted. Recorded
+# rather than deleted silently: the next person to notice the asymmetry with
+# `flat_value` should find out why it is there before re-adding it.
 
 rm -rf "$hl_lg" "$lg_ok" "$lg_conf"
 cleanup
@@ -3623,7 +3655,7 @@ cleanup
 # the inert R1 block and the vacuous STALE arm that this PR exists to fix.
 # Every probe branch asserts something, so the total is invariant across
 # environments; if a refactor drops a check, this fails and says so.
-chk "every assertion in this file ran" "$((pass + fail + 1))" "543"
+chk "every assertion in this file ran" "$((pass + fail + 1))" "541"
 
 echo
 echo "passed=${pass} failed=${fail}"
