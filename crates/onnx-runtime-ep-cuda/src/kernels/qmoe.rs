@@ -1227,22 +1227,25 @@ impl RouteTelemetrySourceRegistry {
         &self,
         node_id: NodeId,
         runtime: Arc<CudaRuntime>,
-    ) -> Arc<QMoERouteTelemetry> {
+    ) -> Option<Arc<QMoERouteTelemetry>> {
+        if !crate::coarse_residency::coarse_residency_profile_enabled() {
+            return None;
+        }
         let executor = ExecutorInstanceId::from_raw(self.active_executor.load(Ordering::Acquire));
         if executor == ExecutorInstanceId::UNSCOPED {
-            return Arc::new(QMoERouteTelemetry::new(runtime));
+            return Some(Arc::new(QMoERouteTelemetry::new(runtime)));
         }
         let mut sources = self
             .sources
             .lock()
             .expect("cuda_ep route-telemetry registry poisoned");
-        Arc::clone(
+        Some(Arc::clone(
             sources
                 .entry(executor)
                 .or_default()
                 .entry(node_id)
                 .or_insert_with(|| Arc::new(QMoERouteTelemetry::new(runtime))),
-        )
+        ))
     }
 
     /// Snapshot one executor's producer sources.
@@ -1348,7 +1351,7 @@ impl QMoEFactory {
         self.create_kernel_with_telemetry(
             node,
             _input_shapes,
-            Arc::new(QMoERouteTelemetry::new(Arc::clone(&self.runtime))),
+            Some(Arc::new(QMoERouteTelemetry::new(Arc::clone(&self.runtime)))),
         )
     }
 
@@ -1356,7 +1359,7 @@ impl QMoEFactory {
         &self,
         node: &Node,
         _input_shapes: &[Vec<usize>],
-        telemetry: Arc<QMoERouteTelemetry>,
+        telemetry: Option<Arc<QMoERouteTelemetry>>,
     ) -> Result<QMoEKernel> {
         let attributes = MoeAttributes::from_node(node)?;
         let bits = int_attr(node, "expert_weight_bits", 4)?;
@@ -1557,7 +1560,7 @@ pub struct QMoEKernel {
     block_size: usize,
     scratch: Mutex<ScratchPool>,
     warmed: AtomicBool,
-    telemetry: Arc<QMoERouteTelemetry>,
+    telemetry: Option<Arc<QMoERouteTelemetry>>,
 }
 
 impl QMoEKernel {
@@ -1566,32 +1569,47 @@ impl QMoEKernel {
         &self,
         config: RouteTelemetryConfig,
     ) -> std::result::Result<(), TelemetryUnsupported> {
-        self.telemetry.arm_route_telemetry(config)
+        self.telemetry
+            .as_ref()
+            .expect("the concrete QMoE telemetry test seam always provisions a producer")
+            .arm_route_telemetry(config)
     }
 
     #[doc(hidden)]
     pub fn disarm_route_telemetry(&self) {
-        self.telemetry.disarm_route_telemetry();
+        if let Some(telemetry) = &self.telemetry {
+            telemetry.disarm_route_telemetry();
+        }
     }
 
     #[doc(hidden)]
     pub fn reset_route_telemetry_boundary(&self) -> Result<()> {
-        self.telemetry.reset_route_telemetry_boundary()
+        match &self.telemetry {
+            Some(telemetry) => telemetry.reset_route_telemetry_boundary(),
+            None => Ok(()),
+        }
     }
 
     #[doc(hidden)]
     pub fn route_telemetry_snapshot(&self) -> Result<Option<TelemetrySnapshot>> {
-        self.telemetry.route_telemetry_snapshot()
+        match &self.telemetry {
+            Some(telemetry) => telemetry.route_telemetry_snapshot(),
+            None => Ok(None),
+        }
     }
 
     #[doc(hidden)]
     pub fn route_telemetry_footprint_bytes(&self) -> usize {
-        self.telemetry.route_telemetry_footprint_bytes()
+        self.telemetry
+            .as_ref()
+            .map_or(0, |telemetry| telemetry.route_telemetry_footprint_bytes())
     }
 
     #[doc(hidden)]
     pub fn route_telemetry_bitmap_addr(&self) -> Option<u64> {
-        self.telemetry.route_telemetry_bitmap_addr()
+        self.telemetry
+            .as_ref()
+            .and_then(|telemetry| telemetry.route_telemetry_bitmap_addr())
     }
 }
 
@@ -2149,7 +2167,10 @@ impl Kernel for QMoEKernel {
         // capacity — the pointers are null and the route kernel is
         // byte-identical; a capacity mismatch leaves telemetry inert for this
         // call and never fails inference.
-        let (telemetry_bitmap, telemetry_header) = self.telemetry.launch_ptrs(experts);
+        let (telemetry_bitmap, telemetry_header) = self
+            .telemetry
+            .as_ref()
+            .map_or((0, 0), |telemetry| telemetry.launch_ptrs(experts));
 
         self.launch_route(
             router_probs_ptr,
