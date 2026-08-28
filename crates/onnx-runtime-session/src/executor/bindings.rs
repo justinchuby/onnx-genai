@@ -598,6 +598,12 @@ impl Executor {
                     input.is_some_and(|value| self.graph.initializers.contains_key(&value))
                 })
                 .collect::<Vec<_>>();
+            let constant_values = resolve_kernel_constant_inputs(
+                &self.graph,
+                &self.weights,
+                &self.plan[pi].inputs,
+                &input_shapes,
+            )?;
             let opset = effective_opset(&self.graph, node);
             // Must match what dispatch computes for this node, or prepare-only
             // planning would key a different kernel than execution uses.
@@ -609,6 +615,7 @@ impl Executor {
                 &input_shapes,
                 &self.plan[pi].input_dtypes,
                 &constant_inputs,
+                &constant_values,
                 opset,
                 seq_independent,
                 self.ep.as_ref(),
@@ -745,6 +752,9 @@ impl Executor {
                 .map(|input| input.is_some_and(|value| graph.initializers.contains_key(&value)))
                 .collect::<Vec<_>>();
             kernel.set_constant_inputs(&constant_inputs);
+            let constant_values =
+                resolve_kernel_constant_inputs(graph, &self.weights, &node.inputs, &input_shapes)?;
+            kernel.prepare_constant_inputs(&constant_values, self.ep.as_ref())?;
             let metadata = input_shapes
                 .iter()
                 .zip(&node.inputs)

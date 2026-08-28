@@ -724,6 +724,9 @@ pub(super) struct InInfo {
     /// disabled or no residency); such inputs stay absent and are routed to the
     /// kernel as a lazy `KernelInput::Weight` instead of a bound view.
     pub(super) lazy_unresolved: bool,
+    /// True when the ordinary initializer buffer was deliberately omitted
+    /// because the provider promised an immutable prepared override.
+    pub(super) prepared_unresolved: bool,
     /// Keep-alive for a lazy weight the EP paged into device memory: pins the VRAM
     /// page for the kernel's lifetime, then makes it evictable when the `InInfo`
     /// is dropped after dispatch. When `Some`, `base_ptr`/`device` point at the

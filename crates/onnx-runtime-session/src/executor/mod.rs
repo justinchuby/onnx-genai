@@ -50,9 +50,9 @@ use std::time::{Duration, Instant};
 
 use onnx_runtime_ep_api::{
     CaptureRegionShapeStatus, DeviceBuffer, DeviceGraphSlot, DevicePtr, DevicePtrMut, EpError,
-    ExecutionProvider, ExternalMmapRegion, Kernel, KernelInput, KernelMatch, LazyWeight,
-    LazyWeightBoundary, ResidentWeight, StructuralCaptureDecline, TensorBacking, TensorMetadata,
-    TensorMut, TensorView, WeightHandle, WorkspaceAllocation, WorkspaceLifetime,
+    ExecutionProvider, ExternalMmapRegion, Kernel, KernelConstantInput, KernelInput, KernelMatch,
+    LazyWeight, LazyWeightBoundary, ResidentWeight, StructuralCaptureDecline, TensorBacking,
+    TensorMetadata, TensorMut, TensorView, WeightHandle, WorkspaceAllocation, WorkspaceLifetime,
     WorkspaceRequirement, WorkspaceView, lazy_weight_candidates,
 };
 

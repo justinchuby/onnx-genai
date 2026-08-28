@@ -5273,6 +5273,7 @@ fn op_capture_trace_annotates_span_with_status_and_reason() {
             )
             .annotate();
         }
+
         let recorded = events.events();
         assert_eq!(recorded.len(), 1);
         let args = recorded[0].args.as_ref().unwrap();
@@ -5314,6 +5315,843 @@ fn op_capture_trace_annotates_span_with_status_and_reason() {
             "eager ops carry no capture status"
         );
     }
+}
+
+#[cfg(feature = "gpu-tests")]
+fn sealed_bqmoe_session_graph() -> Graph {
+    fn q8_bank(experts: usize, out: usize, input: usize, seed: i8) -> Vec<u8> {
+        let blocks = input / 32;
+        let mut bytes = vec![0u8; experts * out * blocks * 34];
+        for (block_index, block) in bytes.chunks_exact_mut(34).enumerate() {
+            block[..2].copy_from_slice(&half::f16::from_f32(0.01).to_le_bytes());
+            for (index, value) in block[2..].iter_mut().enumerate() {
+                *value = seed
+                    .wrapping_add((block_index as i8).wrapping_mul(3))
+                    .wrapping_add(index as i8)
+                    .to_ne_bytes()[0];
+            }
+        }
+        bytes
+    }
+
+    let mut graph = Graph::new();
+    graph.opset_imports.insert("pkg.nxrt".into(), 1);
+    let x = graph.create_named_value("x", DataType::Float32, static_shape([1, 32]));
+    graph.add_input(x);
+    let router = graph.create_named_value("router", DataType::Float32, static_shape([1, 2]));
+    graph.add_input(router);
+    let add_bank = |graph: &mut Graph, name: &str, shape: Vec<usize>, bytes: Vec<u8>| {
+        let value =
+            graph.create_named_value(name, DataType::Uint8, static_shape(shape.iter().copied()));
+        graph.set_initializer(
+            value,
+            WeightRef::Inline(onnx_runtime_ir::TensorData::from_raw(
+                DataType::Uint8,
+                shape,
+                bytes,
+            )),
+        );
+        value
+    };
+    let fc1 = add_bank(
+        &mut graph,
+        "gate",
+        vec![2, 32, 1, 34],
+        q8_bank(2, 32, 32, 3),
+    );
+    let fc2 = add_bank(
+        &mut graph,
+        "down",
+        vec![2, 32, 1, 34],
+        q8_bank(2, 32, 32, 17),
+    );
+    let fc3 = add_bank(&mut graph, "up", vec![2, 32, 1, 34], q8_bank(2, 32, 32, 41));
+    let output = graph.create_named_value("output", DataType::Float32, static_shape([1, 32]));
+    let mut node = Node::new(
+        NodeId(0),
+        "BlockQuantizedMoE",
+        vec![
+            Some(x),
+            Some(router),
+            Some(fc1),
+            None,
+            Some(fc2),
+            None,
+            Some(fc3),
+        ],
+        vec![output],
+    );
+    node.domain = "pkg.nxrt".into();
+    node.attributes.insert("k".into(), Attribute::Int(2));
+    node.attributes.insert(
+        "activation_type".into(),
+        Attribute::String(b"silu".to_vec()),
+    );
+    node.attributes
+        .insert("normalize_routing_weights".into(), Attribute::Int(1));
+    node.attributes
+        .insert("swiglu_fusion".into(), Attribute::Int(0));
+    for name in ["fc1_format", "fc2_format", "fc3_format"] {
+        node.attributes
+            .insert(name.into(), Attribute::String(b"q8_0".to_vec()));
+    }
+    node.attributes
+        .insert("block_layout_version".into(), Attribute::Int(1));
+    graph.insert_node(node);
+    graph.add_output(output);
+    graph
+}
+
+#[cfg(feature = "gpu-tests")]
+#[test]
+fn sealed_bqmoe_executes_through_production_session_path() {
+    use onnx_runtime_ep_cpu::kernels::block_quantized_moe::BLOCK_QUANT_MOE_DENSE_EXPANSIONS;
+    use onnx_runtime_ep_cuda::CudaExecutionProvider;
+
+    let input_values = (0..32)
+        .map(|index| (index as f32 - 15.5) / 16.0)
+        .collect::<Vec<_>>();
+    let input = Tensor::from_f32(&[1, 32], &input_values).unwrap();
+    let router = Tensor::from_f32(&[1, 2], &[3.0, 1.0]).unwrap();
+
+    let mut cpu = Executor::build(
+        sealed_bqmoe_session_graph(),
+        Arc::new(WeightStore::new()),
+        Arc::new(CpuExecutionProvider::new()),
+    )
+    .unwrap();
+    let expected = cpu.run(&[("x", &input), ("router", &router)]).unwrap()[0].to_vec_f32();
+
+    let cuda = Arc::new(CudaExecutionProvider::new_default().unwrap());
+    let runtime = Arc::clone(cuda.runtime());
+    let dense_before = BLOCK_QUANT_MOE_DENSE_EXPANSIONS.load(Ordering::Relaxed);
+    let mut executor = Executor::build(
+        sealed_bqmoe_session_graph(),
+        Arc::new(WeightStore::new()),
+        cuda,
+    )
+    .unwrap();
+    let first = executor.run(&[("x", &input), ("router", &router)]).unwrap()[0].to_vec_f32();
+    let transfers = runtime.transfer_counts();
+    let allocations = runtime.allocation_counts();
+    let second = executor.run(&[("x", &input), ("router", &router)]).unwrap()[0].to_vec_f32();
+    let after_transfers = runtime.transfer_counts();
+    assert_eq!(
+        after_transfers.host_to_device - transfers.host_to_device,
+        4,
+        "only the two host boundary inputs across capture/replay may upload"
+    );
+    assert_eq!(
+        after_transfers.async_host_to_device, transfers.async_host_to_device,
+        "sealed weights must not enter the paging transfer path"
+    );
+    assert_eq!(runtime.allocation_counts(), allocations);
+    assert_eq!(
+        BLOCK_QUANT_MOE_DENSE_EXPANSIONS.load(Ordering::Relaxed),
+        dense_before,
+        "CUDA production execution must not enter the CPU dense oracle"
+    );
+    for (index, ((actual, repeat), expected)) in
+        first.iter().zip(&second).zip(&expected).enumerate()
+    {
+        let tolerance = 3e-3f32.max(expected.abs() * 3e-3);
+        assert!(
+            (actual - expected).abs() <= tolerance && actual == repeat,
+            "output {index}: actual={actual} repeat={repeat} expected={expected}"
+        );
+    }
+}
+
+#[cfg(feature = "gpu-tests")]
+#[test]
+#[ignore = "opt-in official GLM-5.2 checkpoint proof; set ONNX_GENAI_GLM52_UD_IQ1S_CHECKPOINT"]
+fn glm52_real_gated_top8_runs_through_production_session_with_f64_oracle() {
+    use onnx_runtime_ep_cpu::kernels::block_quantized_moe::{
+        BLOCK_QUANT_MOE_DENSE_EXPANSIONS, decode_expert_projection_f64,
+    };
+    use onnx_runtime_ep_cuda::CudaExecutionProvider;
+
+    const H: usize = 6144;
+    const I: usize = 2048;
+    const EXPERTS: usize = 256;
+    const K: usize = 8;
+
+    struct Case {
+        label: &'static str,
+        shard: &'static str,
+        gate_format: &'static str,
+        down_format: &'static str,
+        gate_offset: usize,
+        up_offset: usize,
+        down_offset: usize,
+        expected_per_expert: u64,
+    }
+
+    fn format_info(format: &str) -> (usize, usize) {
+        match format {
+            "iq1_s" => (256, 50),
+            "iq2_xxs" => (256, 66),
+            "iq3_xxs" => (256, 98),
+            "iq4_xs" => (256, 136),
+            "q2_k" => (256, 84),
+            "q3_k" => (256, 110),
+            _ => panic!("unexpected real-checkpoint format {format}"),
+        }
+    }
+
+    fn projection_len(format: &str, out_features: usize, in_features: usize) -> usize {
+        let (qk, block_bytes) = format_info(format);
+        EXPERTS * out_features * (in_features / qk) * block_bytes
+    }
+
+    fn real_graph(path: &std::path::Path, case: &Case) -> (Graph, [ValueId; 3]) {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert("pkg.nxrt".into(), 1);
+        let rows = graph.intern_symbol("rows");
+        let x = graph.create_named_value(
+            "x",
+            DataType::Float32,
+            vec![Dim::Symbolic(rows), Dim::Static(H)],
+        );
+        graph.add_input(x);
+        let router = graph.create_named_value(
+            "router",
+            DataType::Float32,
+            vec![Dim::Symbolic(rows), Dim::Static(EXPERTS)],
+        );
+        graph.add_input(router);
+        let add_external = |graph: &mut Graph,
+                            name: &str,
+                            format: &str,
+                            offset: usize,
+                            out_features: usize,
+                            in_features: usize| {
+            let (qk, block_bytes) = format_info(format);
+            let dims = vec![EXPERTS, out_features, in_features / qk, block_bytes];
+            let value =
+                graph.create_named_value(name, DataType::Uint8, static_shape(dims.iter().copied()));
+            graph.set_initializer(
+                value,
+                WeightRef::External {
+                    path: path.to_path_buf(),
+                    offset,
+                    length: projection_len(format, out_features, in_features),
+                    dtype: DataType::Uint8,
+                    dims,
+                },
+            );
+            value
+        };
+        let gate = add_external(&mut graph, "gate", case.gate_format, case.gate_offset, I, H);
+        let down = add_external(&mut graph, "down", case.down_format, case.down_offset, H, I);
+        let up = add_external(&mut graph, "up", case.gate_format, case.up_offset, I, H);
+        let output = graph.create_named_value(
+            "output",
+            DataType::Float32,
+            vec![Dim::Symbolic(rows), Dim::Static(H)],
+        );
+        let mut node = Node::new(
+            NodeId(0),
+            "BlockQuantizedMoE",
+            vec![
+                Some(x),
+                Some(router),
+                Some(gate),
+                None,
+                Some(down),
+                None,
+                Some(up),
+            ],
+            vec![output],
+        );
+        node.domain = "pkg.nxrt".into();
+        node.attributes.insert("k".into(), Attribute::Int(K as i64));
+        node.attributes.insert(
+            "activation_type".into(),
+            Attribute::String(b"silu".to_vec()),
+        );
+        node.attributes
+            .insert("normalize_routing_weights".into(), Attribute::Int(1));
+        node.attributes
+            .insert("swiglu_fusion".into(), Attribute::Int(0));
+        node.attributes.insert(
+            "fc1_format".into(),
+            Attribute::String(case.gate_format.as_bytes().to_vec()),
+        );
+        node.attributes.insert(
+            "fc2_format".into(),
+            Attribute::String(case.down_format.as_bytes().to_vec()),
+        );
+        node.attributes.insert(
+            "fc3_format".into(),
+            Attribute::String(case.gate_format.as_bytes().to_vec()),
+        );
+        node.attributes
+            .insert("block_layout_version".into(), Attribute::Int(1));
+        graph.insert_node(node);
+        graph.add_output(output);
+        (graph, [gate, down, up])
+    }
+
+    fn router_for(ids: &[usize; K]) -> Vec<f32> {
+        let mut logits = vec![-50.0f32; EXPERTS];
+        for (rank, &expert) in ids.iter().enumerate() {
+            logits[expert] = (K - rank) as f32;
+        }
+        logits
+    }
+
+    fn router_rows<const ROWS: usize>(routes: [&[usize; K]; ROWS]) -> Vec<f32> {
+        routes.into_iter().flat_map(router_for).collect()
+    }
+
+    fn bqmoe_kernel(
+        executor: &Executor,
+        rows: usize,
+    ) -> &onnx_runtime_ep_cuda::kernels::block_quantized_moe::BlockQuantizedMoEKernel {
+        executor
+            .cache
+            .entries
+            .iter()
+            .find_map(|(key, kernel)| {
+                (key.shapes.first().is_some_and(|shape| shape == &[rows, H]))
+                    .then(|| kernel.as_any().downcast_ref())
+                    .flatten()
+            })
+            .expect("production executor must cache BlockQuantizedMoE")
+    }
+
+    fn compile_rows(executor: &mut Executor, rows: usize) {
+        let input = *executor.input_index.get("x").unwrap();
+        let Dim::Symbolic(rows_symbol) = executor.graph.value(input).shape[0] else {
+            panic!("real checkpoint graph row axis must be symbolic");
+        };
+        let bound = HashMap::from([(rows_symbol, rows)]);
+        let resolved = executor.resolve_all(&bound).unwrap();
+        executor.compile_all(&resolved).unwrap();
+    }
+
+    fn f64_oracle(
+        case: &Case,
+        store: &WeightStore,
+        graph: &Graph,
+        weights: [ValueId; 3],
+        input: &[f32],
+        ids: &[usize; K],
+    ) -> Vec<f64> {
+        let banks = weights.map(|value| {
+            store
+                .bytes(graph.initializers.get(&value).unwrap())
+                .unwrap()
+        });
+        let gate_stride = projection_len(case.gate_format, I, H) / EXPERTS;
+        let down_stride = projection_len(case.down_format, H, I) / EXPERTS;
+        let logits = router_for(ids);
+        let maximum = ids
+            .iter()
+            .map(|&expert| f64::from(logits[expert]))
+            .fold(f64::NEG_INFINITY, f64::max);
+        let denominator: f64 = ids
+            .iter()
+            .map(|&expert| (f64::from(logits[expert]) - maximum).exp())
+            .sum();
+        let input = input.iter().copied().map(f64::from).collect::<Vec<_>>();
+        let mut output = vec![0.0f64; H];
+        for &expert in ids {
+            let gate = decode_expert_projection_f64(
+                case.gate_format,
+                &banks[0][expert * gate_stride..(expert + 1) * gate_stride],
+                I,
+                H,
+            )
+            .unwrap();
+            let up = decode_expert_projection_f64(
+                case.gate_format,
+                &banks[2][expert * gate_stride..(expert + 1) * gate_stride],
+                I,
+                H,
+            )
+            .unwrap();
+            let mut activated = vec![0.0f64; I];
+            for (feature, activated_value) in activated.iter_mut().enumerate() {
+                let row = feature * H;
+                let gate_value = gate[row..row + H]
+                    .iter()
+                    .zip(&input)
+                    .map(|(weight, value)| weight * value)
+                    .sum::<f64>();
+                let up_value = up[row..row + H]
+                    .iter()
+                    .zip(&input)
+                    .map(|(weight, value)| weight * value)
+                    .sum::<f64>();
+                *activated_value = gate_value / (1.0 + (-gate_value).exp()) * up_value;
+            }
+            drop(gate);
+            drop(up);
+            let down = decode_expert_projection_f64(
+                case.down_format,
+                &banks[1][expert * down_stride..(expert + 1) * down_stride],
+                H,
+                I,
+            )
+            .unwrap();
+            let route_weight = (f64::from(logits[expert]) - maximum).exp() / denominator;
+            for (feature, output_value) in output.iter_mut().enumerate() {
+                let row = feature * I;
+                let value = down[row..row + I]
+                    .iter()
+                    .zip(&activated)
+                    .map(|(weight, value)| weight * value)
+                    .sum::<f64>();
+                *output_value += route_weight * value;
+            }
+        }
+        output
+    }
+
+    let root = std::path::PathBuf::from(
+        std::env::var("ONNX_GENAI_GLM52_UD_IQ1S_CHECKPOINT")
+            .expect("set ONNX_GENAI_GLM52_UD_IQ1S_CHECKPOINT"),
+    );
+    let cases = [
+        Case {
+            label: "layer56-iq1s-iq3xxs",
+            shard: "GLM-5.2-UD-IQ1_S-00005-of-00006.gguf",
+            gate_format: "iq1_s",
+            down_format: "iq3_xxs",
+            gate_offset: 2_668_820_832,
+            up_offset: 3_312_933_216,
+            down_offset: 1_425_373_536,
+            expected_per_expert: 9_732_096,
+        },
+        Case {
+            label: "layer74-iq2xxs-iq3xxs",
+            shard: "GLM-5.2-UD-IQ1_S-00006-of-00006.gguf",
+            gate_format: "iq2_xxs",
+            down_format: "iq3_xxs",
+            gate_offset: 3_071_455_584,
+            up_offset: 3_916_894_560,
+            down_offset: 1_828_008_288,
+            expected_per_expert: 11_304_960,
+        },
+        Case {
+            label: "layer8-iq2xxs-iq4xs",
+            shard: "GLM-5.2-UD-IQ1_S-00002-of-00006.gguf",
+            gate_format: "iq2_xxs",
+            down_format: "iq4_xs",
+            gate_offset: 17_617_400_576,
+            up_offset: 18_464_510_720,
+            down_offset: 15_892_755_200,
+            expected_per_expert: 13_172_736,
+        },
+        Case {
+            label: "layer78-q2k-q3k",
+            shard: "GLM-5.2-UD-IQ1_S-00006-of-00006.gguf",
+            gate_format: "q2_k",
+            down_format: "q3_k",
+            gate_offset: 16_942_690_656,
+            up_offset: 18_014_622_048,
+            down_offset: 15_548_248_416,
+            expected_per_expert: 13_664_256,
+        },
+    ];
+    let input_values = (0..H)
+        .map(|index| ((index * 13 % 31) as f32 - 15.0) / 32.0)
+        .collect::<Vec<_>>();
+    let low = [0, 1, 2, 3, 4, 5, 6, 7];
+    let high = [248, 249, 250, 251, 252, 253, 254, 255];
+    let case_filter = std::env::var("ONNX_GENAI_GLM52_CASE").ok();
+
+    for case in cases {
+        if case_filter
+            .as_deref()
+            .is_some_and(|filter| filter != case.label)
+        {
+            continue;
+        }
+        let path = root.join(case.shard);
+        let (graph, weights) = real_graph(&path, &case);
+        let mut store = WeightStore::new();
+        store.map_external(&path).unwrap();
+        let oracle_graph = graph.clone();
+        let store = Arc::new(store);
+        let oracle_store = Arc::clone(&store);
+        let cuda = Arc::new(CudaExecutionProvider::new_default().unwrap());
+        let runtime = Arc::clone(cuda.runtime());
+        let before_admission_transfers = runtime.transfer_counts();
+        let dense_before = BLOCK_QUANT_MOE_DENSE_EXPANSIONS.load(Ordering::Relaxed);
+        let mut executor = Executor::build(graph, store, cuda.clone()).unwrap();
+        compile_rows(&mut executor, 2);
+        let after_admission_transfers = runtime.transfer_counts();
+        assert_eq!(
+            after_admission_transfers.host_to_device - before_admission_transfers.host_to_device,
+            3,
+            "{} must upload only the three sealed projection banks",
+            case.label
+        );
+        assert_eq!(
+            after_admission_transfers.async_host_to_device,
+            before_admission_transfers.async_host_to_device,
+            "{} sealed banks must not enter the paging transfer path",
+            case.label
+        );
+        bqmoe_kernel(&executor, 2)
+            .arm_route_telemetry(
+                onnx_runtime_ep_cuda::kernels::expert_route_telemetry::RouteTelemetryConfig {
+                    request_id: 1,
+                    device_id: runtime.ordinal(),
+                    num_experts: EXPERTS,
+                },
+            )
+            .unwrap();
+        let load_traffic = bqmoe_kernel(&executor, 2)
+            .production_traffic_snapshot()
+            .unwrap();
+        executor.warmup().unwrap();
+        let warmup_traffic = bqmoe_kernel(&executor, 2)
+            .production_traffic_snapshot()
+            .unwrap();
+        assert_eq!(
+            warmup_traffic, load_traffic,
+            "{} compile-only warmup must not create route demand",
+            case.label
+        );
+        let assert_traffic = |phase: &str,
+                              traffic: onnx_runtime_ep_cuda::BlockQuantizedMoeTraffic,
+                              routes: u64,
+                              unique_experts: u64| {
+            assert_eq!(
+                traffic.uploaded_whole_bank_bytes,
+                case.expected_per_expert * EXPERTS as u64,
+                "{} {phase} uploaded whole-bank extent",
+                case.label
+            );
+            assert_eq!(
+                traffic.logical_route_demand_bytes,
+                case.expected_per_expert * routes,
+                "{} {phase} logical route demand",
+                case.label
+            );
+            assert_eq!(
+                traffic.unique_selected_expert_bytes,
+                case.expected_per_expert * unique_experts,
+                "{} {phase} unique selected-expert extent",
+                case.label
+            );
+            assert_eq!(traffic.physical_dram_bytes, None);
+            assert_eq!(traffic.page_ins, 0);
+            assert_eq!(traffic.byte_hit_rate, None);
+        };
+        assert_traffic("load", load_traffic, 0, 0);
+
+        let mut prefill_bindings = vec![
+            executor
+                .allocate_device_binding(
+                    "x".into(),
+                    None,
+                    DataType::Float32,
+                    vec![2, H],
+                    vec![2, H],
+                )
+                .unwrap(),
+            executor
+                .allocate_device_binding(
+                    "router".into(),
+                    None,
+                    DataType::Float32,
+                    vec![2, EXPERTS],
+                    vec![2, EXPERTS],
+                )
+                .unwrap(),
+            executor
+                .allocate_device_output_binding(
+                    "output".into(),
+                    DataType::Float32,
+                    vec![2, H],
+                    vec![2, H],
+                )
+                .unwrap(),
+        ];
+        let prefill_input_bytes = (0..2)
+            .flat_map(|_| input_values.iter())
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        let repeated_router_bytes = router_rows([&low, &low])
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        prefill_bindings[0]
+            .write_bytes(0, &prefill_input_bytes)
+            .unwrap();
+        prefill_bindings[1]
+            .write_bytes(0, &repeated_router_bytes)
+            .unwrap();
+        executor
+            .run_with_device_bindings(&[], &mut prefill_bindings)
+            .unwrap();
+        let output_values = |binding: &mut DeviceIoBinding| {
+            binding
+                .read_bytes()
+                .unwrap()
+                .chunks_exact(4)
+                .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect::<Vec<_>>()
+        };
+        let repeated_prefill = output_values(&mut prefill_bindings[2]);
+        assert_eq!(
+            &repeated_prefill[..H],
+            &repeated_prefill[H..],
+            "{} repeated-route prefill rows must be deterministic",
+            case.label
+        );
+        let prefill_repeated_traffic = bqmoe_kernel(&executor, 2)
+            .production_traffic_snapshot()
+            .unwrap();
+        assert_traffic("prefill repeated", prefill_repeated_traffic, 16, 8);
+        bqmoe_kernel(&executor, 2)
+            .reset_route_telemetry_boundary()
+            .unwrap();
+        let broad_router_bytes = router_rows([&low, &high])
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        prefill_bindings[1]
+            .write_bytes(0, &broad_router_bytes)
+            .unwrap();
+        executor
+            .run_with_device_bindings(&[], &mut prefill_bindings)
+            .unwrap();
+        let broad_prefill = output_values(&mut prefill_bindings[2]);
+        assert_eq!(
+            &repeated_prefill[..H],
+            &broad_prefill[..H],
+            "{} low-ID row must not depend on the other row's routes",
+            case.label
+        );
+        let prefill_broad_traffic = bqmoe_kernel(&executor, 2)
+            .production_traffic_snapshot()
+            .unwrap();
+        assert_traffic("prefill broad", prefill_broad_traffic, 16, 16);
+        assert_eq!(
+            prefill_repeated_traffic.logical_route_demand_bytes,
+            prefill_broad_traffic.logical_route_demand_bytes,
+            "{} repeated and broad routes have equal logical demand",
+            case.label
+        );
+        assert!(
+            prefill_repeated_traffic.unique_selected_expert_bytes
+                < prefill_broad_traffic.unique_selected_expert_bytes,
+            "{} repeated routes must have a smaller unique extent",
+            case.label
+        );
+        drop(prefill_bindings);
+
+        compile_rows(&mut executor, 1);
+        bqmoe_kernel(&executor, 1)
+            .arm_route_telemetry(
+                onnx_runtime_ep_cuda::kernels::expert_route_telemetry::RouteTelemetryConfig {
+                    request_id: 2,
+                    device_id: runtime.ordinal(),
+                    num_experts: EXPERTS,
+                },
+            )
+            .unwrap();
+        let decode_load_traffic = bqmoe_kernel(&executor, 1)
+            .production_traffic_snapshot()
+            .unwrap();
+        assert_traffic("decode load", decode_load_traffic, 0, 0);
+        assert_eq!(
+            decode_load_traffic.uploaded_whole_bank_bytes, load_traffic.uploaded_whole_bank_bytes,
+            "{} decode shape must adopt the prefill shape's sealed banks",
+            case.label
+        );
+        let mut bindings = vec![
+            executor
+                .allocate_device_binding(
+                    "x".into(),
+                    None,
+                    DataType::Float32,
+                    vec![1, H],
+                    vec![1, H],
+                )
+                .unwrap(),
+            executor
+                .allocate_device_binding(
+                    "router".into(),
+                    None,
+                    DataType::Float32,
+                    vec![1, EXPERTS],
+                    vec![1, EXPERTS],
+                )
+                .unwrap(),
+            executor
+                .allocate_device_output_binding(
+                    "output".into(),
+                    DataType::Float32,
+                    vec![1, H],
+                    vec![1, H],
+                )
+                .unwrap(),
+        ];
+        let input_bytes = input_values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        let low_bytes = router_for(&low)
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        bindings[0].write_bytes(0, &input_bytes).unwrap();
+        bindings[1].write_bytes(0, &low_bytes).unwrap();
+        executor
+            .run_with_device_bindings(&[], &mut bindings)
+            .unwrap();
+        let eager_low = output_values(&mut bindings[2]);
+        bqmoe_kernel(&executor, 1)
+            .reset_route_telemetry_boundary()
+            .unwrap();
+        let capture = executor
+            .try_capture_with_device_bindings(&[], &mut bindings)
+            .unwrap();
+        if !matches!(capture, DeviceGraphCaptureResult::Captured(_)) {
+            panic!("{} production session capture was declined", case.label);
+        }
+        bqmoe_kernel(&executor, 1)
+            .reset_route_telemetry_boundary()
+            .unwrap();
+        assert!(executor.replay_device_graph(&mut bindings).unwrap());
+        let actual_low = output_values(&mut bindings[2]);
+        let decode_single_traffic = bqmoe_kernel(&executor, 1)
+            .production_traffic_snapshot()
+            .unwrap();
+        assert_traffic("decode single", decode_single_traffic, 8, 8);
+        assert_eq!(
+            eager_low, actual_low,
+            "{} eager/captured parity",
+            case.label
+        );
+        assert!(executor.replay_device_graph(&mut bindings).unwrap());
+        let repeat_low = output_values(&mut bindings[2]);
+        let decode_repeated_traffic = bqmoe_kernel(&executor, 1)
+            .production_traffic_snapshot()
+            .unwrap();
+        assert_traffic("decode repeated", decode_repeated_traffic, 16, 8);
+        bqmoe_kernel(&executor, 1)
+            .reset_route_telemetry_boundary()
+            .unwrap();
+        assert!(executor.replay_device_graph(&mut bindings).unwrap());
+        let high_bytes = router_for(&high)
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        bindings[1].write_bytes(0, &high_bytes).unwrap();
+        assert!(executor.replay_device_graph(&mut bindings).unwrap());
+        let actual_high = output_values(&mut bindings[2]);
+        let decode_broad_traffic = bqmoe_kernel(&executor, 1)
+            .production_traffic_snapshot()
+            .unwrap();
+        assert_traffic("decode broad", decode_broad_traffic, 16, 16);
+        assert_eq!(
+            decode_repeated_traffic.logical_route_demand_bytes,
+            decode_broad_traffic.logical_route_demand_bytes
+        );
+        assert!(
+            decode_repeated_traffic.unique_selected_expert_bytes
+                < decode_broad_traffic.unique_selected_expert_bytes
+        );
+        assert_eq!(actual_low, repeat_low, "{} repeatability", case.label);
+        assert!(
+            runtime.graph_segment_count().unwrap() > 0,
+            "{} must capture the production path",
+            case.label
+        );
+        assert_eq!(
+            BLOCK_QUANT_MOE_DENSE_EXPANSIONS.load(Ordering::Relaxed),
+            dense_before,
+            "{} must not enter the CPU expert fallback",
+            case.label
+        );
+        let expected_low = f64_oracle(
+            &case,
+            &oracle_store,
+            &oracle_graph,
+            weights,
+            &input_values,
+            &low,
+        );
+        let expected_high = f64_oracle(
+            &case,
+            &oracle_store,
+            &oracle_graph,
+            weights,
+            &input_values,
+            &high,
+        );
+        for (label, actual, expected) in [
+            ("low", &actual_low, &expected_low),
+            ("high", &actual_high, &expected_high),
+        ] {
+            for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
+                let tolerance = 2e-2f64.max(expected.abs() * 8e-3);
+                assert!(
+                    (f64::from(actual) - expected).abs() <= tolerance,
+                    "{} {label} output {index}: actual={actual} expected={expected} tolerance={tolerance}",
+                    case.label
+                );
+            }
+        }
+        let gate_bytes = projection_len(case.gate_format, I, H) / EXPERTS;
+        let down_bytes = projection_len(case.down_format, H, I) / EXPERTS;
+        assert_eq!(
+            gate_bytes as u64 * 2 + down_bytes as u64,
+            case.expected_per_expert
+        );
+        assert_eq!(
+            case.expected_per_expert * K as u64,
+            case.expected_per_expert * 8
+        );
+        assert_eq!(
+            case.expected_per_expert * EXPERTS as u64,
+            case.expected_per_expert * 256
+        );
+        eprintln!(
+            "{} native_cuda=true H={H} I={I} top_k={K} captures>0 replays>0 fallbacks=0 \
+             load.uploaded_whole_bank_bytes={} warmup.logical_route_demand_bytes={} \
+             prefill_repeated.logical_route_demand_bytes={} \
+             prefill_repeated.unique_selected_expert_bytes={} \
+             prefill_broad.logical_route_demand_bytes={} \
+             prefill_broad.unique_selected_expert_bytes={} \
+             decode.logical_route_demand_bytes={} decode.unique_selected_expert_bytes={} \
+             decode_repeated.logical_route_demand_bytes={} \
+             decode_repeated.unique_selected_expert_bytes={} \
+             decode_broad.logical_route_demand_bytes={} \
+             decode_broad.unique_selected_expert_bytes={} \
+             physical_dram_bytes=None page_ins=0 byte_hit_rate=None",
+            case.label,
+            load_traffic.uploaded_whole_bank_bytes,
+            warmup_traffic.logical_route_demand_bytes,
+            prefill_repeated_traffic.logical_route_demand_bytes,
+            prefill_repeated_traffic.unique_selected_expert_bytes,
+            prefill_broad_traffic.logical_route_demand_bytes,
+            prefill_broad_traffic.unique_selected_expert_bytes,
+            decode_single_traffic.logical_route_demand_bytes,
+            decode_single_traffic.unique_selected_expert_bytes,
+            decode_repeated_traffic.logical_route_demand_bytes,
+            decode_repeated_traffic.unique_selected_expert_bytes,
+            decode_broad_traffic.logical_route_demand_bytes,
+            decode_broad_traffic.unique_selected_expert_bytes,
+        );
+        assert!(executor.reset_device_graph().unwrap());
+        drop(bindings);
+        drop(executor);
+        runtime.synchronize().unwrap();
+        cuda.wait_for_deferred_releases().unwrap();
+    }
+    assert_eq!(
+        53 * 77_856_768u64 + 18 * 90_439_680 + 4 * 105_381_888 + 109_314_048,
+        6_285_164_544
+    );
 }
 
 #[test]

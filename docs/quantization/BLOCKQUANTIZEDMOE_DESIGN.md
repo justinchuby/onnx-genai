@@ -449,31 +449,41 @@ Its `no_residency_traffic` control reports one-time full-bank load bytes and
 unique selected-expert projection bytes, with `page_ins=0` and
 `byte_hit_rate=None` until the expert-indexed paging dependency lands.
 
-### 6.1 A100 validation snapshot
+### 6.1 A100 production-path validation
 
-On 2026-08-27, the release-mode opt-in probe ran on idle physical A100 GPU 7
-(`GPU-ef3c1a70-d297-933c-0c37-dbaad2136a57`) with
-`CUDA_VISIBLE_DEVICES=7` and `ONNX_GENAI_CUDA_DEVICE=0`. Each shape used an
-8-second continuous ramp, CUDA-graph batches of 128 replays, and three timed
-batches. The first decode shape was remeasured last. Logical bytes are unique
-selected projection bytes, not measured DRAM transactions.
+On 2026-08-27, the opt-in checkpoint proof ran each mixed pair separately on an
+idle physical A100, pinned with `CUDA_VISIBLE_DEVICES=6` and
+`ONNX_GENAI_CUDA_DEVICE=0`. It mmap-read the official UD-IQ1_S shards in place,
+then exercised the production `Executor`/device-binding path with all three
+independent gate/up/down banks, gated SiLU, `H=6144`, `I=2048`, and top-8
+routing. Low IDs 0–7, high IDs 248–255, repeated routes, broad-unique routes,
+eager execution, capture, and replay were compared against an independent f64
+decoder/oracle. Every pair was deterministic, reported `captures>0`,
+`replays>0`, and `fallbacks=0`, and drained graph-owned sealed allocations
+before provider teardown.
 
-| checkpoint projection pair | stage | rows | fixed load / selected read bytes | median µs | full range µs |
-|---|---|---:|---:|---:|---:|
-| IQ1_S / IQ3_XXS | decode | 1 | 7,274,496 | 413.041 | 412.644–413.177 |
-| IQ1_S / IQ3_XXS | prefill | 8 | 7,274,496 | 3,319.706 | 3,319.499–3,320.734 |
-| IQ2_XXS / IQ3_XXS | decode | 1 | 8,060,928 | 271.792 | 271.753–271.834 |
-| IQ2_XXS / IQ4_XS | decode | 1 | 9,928,704 | 261.997 | 261.997–262.005 |
-| Q2_K / Q3_K | decode | 1 | 9,535,488 | 318.347 | 318.337–318.355 |
-| IQ1_S / IQ3_XXS (repeat) | decode | 1 | 7,274,496 | 412.951 | 412.781–413.071 |
+| gate/up + down formats | one expert | one top-8 decode row | whole 256-expert bank |
+|---|---:|---:|---:|
+| IQ1_S + IQ3_XXS | 9,732,096 | 77,856,768 | 2,491,416,576 |
+| IQ2_XXS + IQ3_XXS | 11,304,960 | 90,439,680 | 2,894,069,760 |
+| IQ2_XXS + IQ4_XS | 13,172,736 | 105,381,888 | 3,372,220,416 |
+| Q2_K + Q3_K | 13,664,256 | 109,314,048 | 3,498,049,536 |
 
-Every row reported `captures=1`, `fallbacks=0`, `page_ins=0`, and
-`byte_hit_rate=None`. The probe presents one exact-geometry expert
-(`H=6144`, `I=2048`) so fixed load and selected-read bytes are equal; it does
-not claim expert-indexed paging. Base
-`aa417ad372e6c0c1d2df154ceb236ab1c3bea73e` refuses these mixed-format nodes
-and lacks the required K-quant/Q8 decode cases, so no comparable base latency
-exists and no speedup claim is made.
+The last whole-bank value is the exact product
+`13,664,256 × 256 = 3,498,049,536`; `3,498,045,536` is not arithmetically
+consistent. Across the checkpoint's 53/18/4/1 routed-layer format counts, one
+top-8 row per layer is `6,285,164,544` logical bytes.
+
+Counters are reported by phase and by meaning: one-time
+`uploaded_whole_bank_bytes`, multiplicity-preserving
+`logical_route_demand_bytes`, and `unique_selected_expert_bytes`. Repeated and
+broad-unique controls have equal logical demand but different unique extent;
+low and high IDs have equal byte quantities. `physical_dram_bytes=None`,
+`page_ins=0`, and `byte_hit_rate=None` remain the honest no-residency values.
+The warmed eager/captured-replay falsifier also observes zero host allocations,
+format parses, layout builds, H2D copies, device allocations, and forced
+operator synchronizations. Base `aa417ad372e6c0c1d2df154ceb236ab1c3bea73e`
+refuses these nodes, so no base latency or speedup claim is made.
 
 ---
 

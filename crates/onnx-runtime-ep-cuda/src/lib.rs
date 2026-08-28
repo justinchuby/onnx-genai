@@ -118,7 +118,8 @@ pub use dynamic_library::set_wheel_search_paths;
 pub use kernels::attention::AttentionKernel;
 pub use kernels::block_quantized_moe::{
     AdmittedBlockQuantizedMoeBanks, BlockQuantizedMoeBank, BlockQuantizedMoeBankIdentity,
-    BlockQuantizedMoeResidency, BlockQuantizedMoeTraffic, admit_block_quantized_moe_banks,
+    BlockQuantizedMoePreparationCounts, BlockQuantizedMoeResidency, BlockQuantizedMoeTraffic,
+    admit_block_quantized_moe_banks, block_quantized_moe_preparation_counts,
 };
 pub use kernels::csa_checkpoint::{
     CsaAttentionMode, CsaCheckpoint, CsaCheckpointJournal, CsaCursors, CsaLayerMetrics, CsaMetrics,

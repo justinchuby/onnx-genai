@@ -1,13 +1,27 @@
 //! The [`Kernel`] trait and kernel-match / cost types (§4.2).
 
+use std::any::Any;
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use onnx_runtime_ir::{DataType, TensorLayout};
 use onnx_runtime_memory_governor::MemoryRole;
 
+use crate::ExecutionProvider;
 use crate::error::Result;
 use crate::tensor::{DevicePtrMut, TensorMut, TensorView};
 use crate::weight::WeightHandle;
+
+/// One immutable graph initializer supplied during kernel preparation.
+///
+/// `bytes` borrows the session's inline storage or read-only external mmap; no
+/// copy is made to construct this descriptor.
+#[derive(Clone, Copy, Debug)]
+pub struct KernelConstantInput<'a> {
+    pub dtype: DataType,
+    pub shape: &'a [usize],
+    pub bytes: &'a [u8],
+}
 
 /// A cost estimate for running a kernel, consumed by the placement cost model
 /// (`docs/architecture/ORT2.md` §6). All time fields are in **microseconds**; a fuller model
@@ -574,8 +588,19 @@ impl WorkspaceView {
     }
 }
 
+/// Object-safe concrete-type access for provider-specific diagnostics.
+pub trait KernelType {
+    fn as_any(&self) -> &dyn Any;
+}
+
+impl<T: Any> KernelType for T {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
 /// A kernel ready to execute a specific op with specific shapes (§4.2).
-pub trait Kernel: Send {
+pub trait Kernel: Send + KernelType {
     /// Tell the kernel which positional inputs are immutable graph constants.
     ///
     /// The session calls this exactly once, immediately after construction.
@@ -583,6 +608,47 @@ pub trait Kernel: Send {
     /// never be marked constant: caching them would return stale results.
     fn set_constant_inputs(&mut self, constant_inputs: &[bool]) {
         let _ = constant_inputs;
+    }
+
+    /// Validate and bind immutable graph constants before the first launch.
+    ///
+    /// The session calls this exactly once for a newly constructed kernel,
+    /// after [`Kernel::set_constant_inputs`]. Stock kernels need no preparation.
+    fn prepare_constant_inputs(
+        &mut self,
+        constants: &[Option<KernelConstantInput<'_>>],
+        provider: &dyn ExecutionProvider,
+    ) -> Result<()> {
+        let _ = (constants, provider);
+        Ok(())
+    }
+
+    /// Share immutable preparation across shape-specialized variants of the
+    /// same session node. The executor's kernel cache is node-scoped, so this
+    /// state never crosses sessions or graph nodes.
+    fn shareable_constant_state(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
+        None
+    }
+
+    /// Adopt state returned by [`Kernel::shareable_constant_state`].
+    ///
+    /// Returns `true` when the state was recognized and installed.
+    fn adopt_shareable_constant_state(
+        &mut self,
+        state: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Result<bool> {
+        let _ = state;
+        Ok(false)
+    }
+
+    /// Replace a positional constant input with a kernel-owned immutable view.
+    ///
+    /// The session applies overrides after kernel lookup and before execution;
+    /// direct callers that bypass this binding seam are rejected by kernels
+    /// whose launch contract requires a sealed view.
+    fn constant_input_override(&self, input_idx: usize) -> Option<TensorView<'_>> {
+        let _ = input_idx;
+        None
     }
 
     /// Tell the kernel whether all of this node's outputs have fully-static

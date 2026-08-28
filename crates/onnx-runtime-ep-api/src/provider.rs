@@ -2,11 +2,15 @@
 
 use std::ffi::c_void;
 use std::ptr::NonNull;
+use std::sync::Arc;
 
 use onnx_runtime_ir::{
     DataType, DeviceId, DeviceType, Graph, GraphView, Node, NodeId, NodeIndex, Shape, TensorLayout,
 };
-use onnx_runtime_memory_governor::{ManagedAllocation, MemoryLease, MemoryRole, OwningAllocation};
+use onnx_runtime_memory_governor::{
+    AllocationIdentity, ManagedAllocation, MemoryLease, MemoryRole, OwningAllocation,
+    ProviderContextIdentity,
+};
 
 use crate::epcontext::EpContext;
 use crate::error::{EpError, Result};
@@ -704,6 +708,24 @@ pub struct RawDeviceAllocationSiteStats {
     pub pool_hit_bytes: u64,
 }
 
+/// Immutable, provider-owned device allocation prepared from graph-constant
+/// bytes before a kernel's first launch.
+///
+/// The allocation exposes only a read-only pointer plus the identities a
+/// kernel needs to reject cross-provider/runtime substitution. It cannot be
+/// converted back into a mutable [`DeviceBuffer`].
+pub trait SealedDeviceAllocation: Send + Sync {
+    fn ptr(&self) -> crate::DevicePtr;
+    fn len(&self) -> usize;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    fn device(&self) -> DeviceId;
+    fn provider_context(&self) -> ProviderContextIdentity;
+    fn allocation_identity(&self) -> AllocationIdentity;
+    fn runtime_identity(&self) -> usize;
+}
+
 /// The core EP interface. Every backend crate implements this (§4.1).
 pub trait ExecutionProvider: Send + Sync {
     /// EP identifier (snake_case, e.g. `"cpu_ep"`, `"cuda_ep"`).
@@ -736,6 +758,46 @@ pub trait ExecutionProvider: Send + Sync {
     /// continue receiving resident [`crate::TensorView`] inputs.
     fn capabilities(&self) -> ExecutionProviderCapabilities {
         ExecutionProviderCapabilities::stock()
+    }
+
+    /// Identity of the concrete runtime/context used by kernels from this EP.
+    ///
+    /// Device providers that support sealed constants override this. `None`
+    /// keeps stock providers out of the sealed-admission contract.
+    fn runtime_identity(&self) -> Option<usize> {
+        None
+    }
+
+    /// Identity of the provider memory context that owns sealed constants.
+    fn provider_context_identity(&self) -> Option<ProviderContextIdentity> {
+        None
+    }
+
+    /// Whether this provider replaces one graph-constant input with immutable
+    /// provider-owned storage during kernel preparation.
+    ///
+    /// The session may omit the ordinary resident initializer buffer only when
+    /// every consumer slot returns `true`; dispatch then requires the prepared
+    /// kernel to supply an exact [`Kernel::constant_input_override`] before the
+    /// input can reach execution. Stock providers retain the resident path.
+    fn prepares_immutable_constant(&self, node: &Node, input_idx: usize) -> bool {
+        let _ = (node, input_idx);
+        false
+    }
+
+    /// Validate-before-upload sink used by kernels with immutable graph-weight
+    /// contracts. The default fails closed; a provider must explicitly support
+    /// generation-bound sealed allocations.
+    fn upload_sealed_constant(
+        &self,
+        bytes: &[u8],
+        alignment: usize,
+    ) -> Result<Arc<dyn SealedDeviceAllocation>> {
+        let _ = (bytes, alignment);
+        Err(EpError::KernelFailed(format!(
+            "{} does not support sealed constant admission",
+            self.name()
+        )))
     }
 
     /// Page a lazy weight into device memory for live dispatch (WEIGHT_OFFLOAD

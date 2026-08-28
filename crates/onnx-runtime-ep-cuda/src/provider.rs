@@ -42,10 +42,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use onnx_runtime_ep_api::{
-    BoundBufferOwnership, Cost, DeviceBuffer, DeviceGraphSlot, EpConfig, EpError,
+    BoundBufferOwnership, Cost, DeviceBuffer, DeviceGraphSlot, DevicePtr, EpConfig, EpError,
     ExecutionProvider, ExecutionProviderCapabilities, Fence, HostToDeviceCopier, Kernel,
-    KernelMatch, LazyWeight, OpRegistry, PagedWeight, Result, WorkspaceAllocation, deny,
-    structural_input_bytes,
+    KernelMatch, LazyWeight, OpRegistry, PagedWeight, Result, SealedDeviceAllocation,
+    WorkspaceAllocation, deny, structural_input_bytes,
 };
 use onnx_runtime_ir::{
     DataType, DeviceId, DeviceType, Graph, Node, NodeId, Shape, TensorLayout, ValueId,
@@ -223,6 +223,9 @@ pub(crate) struct CudaSealedAllocation {
     runtime: Weak<CudaRuntime>,
     release_queue: Weak<CudaDeferredReleaseQueue>,
     identity: AllocationIdentity,
+    device: DeviceId,
+    provider_context: ProviderContextIdentity,
+    runtime_identity: usize,
     observer: Arc<dyn ReleaseObserver>,
 }
 
@@ -324,6 +327,40 @@ impl Drop for CudaSealedAllocation {
         if let Err(error) = self.release() {
             eprintln!("cuda_ep: WARNING: {error}");
         }
+    }
+}
+
+impl SealedDeviceAllocation for CudaSealedAllocation {
+    fn ptr(&self) -> DevicePtr {
+        DevicePtr(
+            self.buffer
+                .as_ref()
+                .expect("sealed CUDA allocation is taken only during drop")
+                .as_ptr(),
+        )
+    }
+
+    fn len(&self) -> usize {
+        self.buffer
+            .as_ref()
+            .expect("sealed CUDA allocation is taken only during drop")
+            .len()
+    }
+
+    fn device(&self) -> DeviceId {
+        self.device
+    }
+
+    fn provider_context(&self) -> ProviderContextIdentity {
+        self.provider_context
+    }
+
+    fn allocation_identity(&self) -> AllocationIdentity {
+        self.identity
+    }
+
+    fn runtime_identity(&self) -> usize {
+        self.runtime_identity
     }
 }
 
@@ -2010,6 +2047,9 @@ impl CudaExecutionProvider {
             runtime: Arc::downgrade(&self.runtime),
             release_queue: Arc::downgrade(&self.release_queue),
             identity,
+            device: self.device,
+            provider_context: self.provider_context_identity(),
+            runtime_identity: Arc::as_ptr(&self.runtime) as usize,
             observer: self.release_accounting(),
         })
     }
@@ -2437,6 +2477,34 @@ impl ExecutionProvider for CudaExecutionProvider {
 
     fn device_id(&self) -> DeviceId {
         self.device
+    }
+
+    fn runtime_identity(&self) -> Option<usize> {
+        Some(Arc::as_ptr(&self.runtime) as usize)
+    }
+
+    fn provider_context_identity(&self) -> Option<ProviderContextIdentity> {
+        Some(self.provider_context_identity())
+    }
+
+    fn prepares_immutable_constant(&self, node: &Node, input_idx: usize) -> bool {
+        node.domain == onnx_runtime_ir::RUNTIME_DOMAIN
+            && node.op_type == "BlockQuantizedMoE"
+            && matches!(input_idx, 2 | 4 | 6)
+            && node.inputs.get(input_idx).is_some_and(Option::is_some)
+    }
+
+    fn upload_sealed_constant(
+        &self,
+        bytes: &[u8],
+        alignment: usize,
+    ) -> Result<Arc<dyn SealedDeviceAllocation>> {
+        if self.runtime.is_capturing()? {
+            return Err(EpError::KernelFailed(
+                "cuda_ep: cannot admit sealed constants during CUDA graph capture".into(),
+            ));
+        }
+        Ok(Arc::new(self.upload_sealed(bytes, alignment)?))
     }
 
     fn memory_vendor_id(&self) -> u32 {

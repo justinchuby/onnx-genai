@@ -571,6 +571,11 @@ impl DenseWeightSource {
                 byte_offset: view.byte_offset,
                 len: view.byte_size(),
             },
+            TensorBacking::Sealed { .. } => {
+                return Err(error(
+                    "provider-sealed device weights cannot be admitted by the CPU kernel",
+                ));
+            }
         })
     }
 }

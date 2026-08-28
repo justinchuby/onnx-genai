@@ -647,6 +647,23 @@ fn dequantize_expert_slice(
     Ok(weight_nk)
 }
 
+/// Decode one expert projection with the authoritative CPU GGUF decoder and
+/// return row-major `[out_features, in_features]` values widened to f64.
+///
+/// This is an oracle/testing seam; production CPU execution retains its cached
+/// f32 path.
+#[doc(hidden)]
+pub fn decode_expert_projection_f64(
+    format: &str,
+    packed: &[u8],
+    out_features: usize,
+    in_features: usize,
+) -> Result<Vec<f64>> {
+    let format = BlockFormat::parse(format)?;
+    dequantize_expert_slice(format, packed, out_features, in_features)
+        .map(|values| values.into_iter().map(f64::from).collect())
+}
+
 fn validate_attributes(node: &Node) -> Result<()> {
     for name in node.attributes.keys() {
         if !matches!(

@@ -1333,11 +1333,11 @@ impl Executor {
     }
 
     /// Record initializer metadata and back resident consumers with a device
-    /// buffer. A non-host nxrt initializer used exclusively at the lazy
-    /// fused-MoE boundary deliberately has no eager buffer; the EP materializes
-    /// it through its WeightHandle on demand. If any resident consumer (or graph
-    /// output) coexists, no handle is built and the one eager buffer is shared by
-    /// every consumer. Host mmap bytes retain the existing zero-copy borrow path.
+    /// buffer. A non-host initializer used exclusively at either a lazy-weight
+    /// boundary or provider-prepared immutable-constant slots deliberately has
+    /// no eager buffer. If any resident consumer (or graph output) coexists, the
+    /// one eager buffer is retained and shared by every consumer. Host mmap bytes
+    /// retain the existing zero-copy borrow path.
     /// Preserves the `session.initializer_buffers` tracing span and its
     /// arguments.
     #[allow(clippy::type_complexity)]
@@ -1364,11 +1364,24 @@ impl Executor {
         let mut borrowed_initializers = 0_u64;
         let mut copied_initializers = 0_u64;
         let mut lazy_initializers = 0_u64;
+        let mut prepared_initializers = 0_u64;
         for (&vid, weight) in &graph.initializers {
             let dtype = weight.dtype();
             let dims = weight.dims().to_vec();
             value_dtypes.insert(vid, dtype);
             value_shapes.insert(vid, dims.iter().map(|&d| Dim::Static(d)).collect());
+            let value = graph.value(vid);
+            let prepared_only = !value.is_graph_output
+                && !value.consumers.is_empty()
+                && value.consumers.uses().into_iter().all(|(node, input_idx)| {
+                    ep.prepares_immutable_constant(graph.node(node), input_idx as usize)
+                });
+            if !ep.device_id().is_host_accessible() && prepared_only {
+                if initializer_span.is_some() {
+                    prepared_initializers += 1;
+                }
+                continue;
+            }
             if !ep.device_id().is_host_accessible() && weight_handles.contains_key(&vid) {
                 if initializer_span.is_some() {
                     lazy_initializers += 1;
@@ -1438,6 +1451,7 @@ impl Executor {
                     .with("borrowed_initializers", borrowed_initializers)
                     .with("copied_initializers", copied_initializers)
                     .with("lazy_initializers", lazy_initializers)
+                    .with("prepared_initializers", prepared_initializers)
                     .with("buffers", buffers.len() as u64),
             );
         }
@@ -2227,6 +2241,12 @@ impl Executor {
                 .iter()
                 .map(|input| input.is_some_and(|vid| self.graph.initializers.contains_key(&vid)))
                 .collect();
+            let constant_values = resolve_kernel_constant_inputs(
+                &self.graph,
+                &self.weights,
+                &self.plan[i].inputs,
+                &input_shapes,
+            )?;
             let node = self.graph.node(node_id);
             let opset = effective_opset(&self.graph, node);
             let seq_independent =
@@ -2237,6 +2257,7 @@ impl Executor {
                 &input_shapes,
                 &input_dtypes,
                 &constant_inputs,
+                &constant_values,
                 opset,
                 seq_independent,
                 self.ep.as_ref(),

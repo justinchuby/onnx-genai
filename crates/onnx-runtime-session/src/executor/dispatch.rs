@@ -511,6 +511,7 @@ impl Executor {
         let cache = &mut self.cache;
         let kernel_bindings = &mut self.kernel_bindings;
         let capture_growing = &self.capture_growing_symbols;
+        let weights = &self.weights;
         let mut ctx = KernelDispatchContext {
             ep: &ep,
             graph: &self.graph,
@@ -560,40 +561,13 @@ impl Executor {
             // the HashMap-key allocation entirely. This is the hot path during
             // steady-state decode — shapes are fixed, so every call after warmup
             // hits here. The binding is populated on miss (below) or at build.
-            if let Some(binding) = &kernel_bindings[pi] {
-                if let Some(k) = cache.get_prebound(binding, input_shapes) {
-                    k
-                } else {
-                    // Shape changed (prefill→decode or batch change). Fall through
-                    // to get_or_create which allocates the key and compiles/fetches.
-                    let constant_inputs: Vec<bool> = inputs
-                        .iter()
-                        .map(|input| {
-                            input.is_some_and(|vid| {
-                                ctx.graph.initializers.contains_key(&vid)
-                                    || ctx.views_meta.get(&vid).is_some_and(|view| {
-                                        ctx.graph.initializers.contains_key(&view.source)
-                                    })
-                            })
-                        })
-                        .collect();
-                    let (k, key) = cache.get_or_create(
-                        node_id,
-                        node,
-                        input_shapes,
-                        input_dtypes,
-                        &constant_inputs,
-                        opset,
-                        node_capture_seq_independent(ctx.graph, node, capture_growing),
-                        ep.as_ref(),
-                    )?;
-                    kernel_bindings[pi] = Some(key);
-                    k
-                }
-            } else {
+            let prebound = kernel_bindings[pi]
+                .as_ref()
+                .is_some_and(|binding| cache.has_prebound(binding, input_shapes));
+            if !prebound {
                 // No binding yet (first dispatch of this node for a symbolic
-                // graph, or a control-flow/sequence node that was skipped at
-                // build). Compute constant_inputs and go through get_or_create.
+                // graph), or the shape changed. Compute constants and go through
+                // get_or_create before taking the immutable hot-path borrow.
                 let constant_inputs: Vec<bool> = inputs
                     .iter()
                     .map(|input| {
@@ -605,20 +579,40 @@ impl Executor {
                         })
                     })
                     .collect();
-                let (k, key) = cache.get_or_create(
+                let constant_values =
+                    resolve_kernel_constant_inputs(ctx.graph, weights, inputs, input_shapes)?;
+                let (_, key) = cache.get_or_create(
                     node_id,
                     node,
                     input_shapes,
                     input_dtypes,
                     &constant_inputs,
+                    &constant_values,
                     opset,
                     node_capture_seq_independent(ctx.graph, node, capture_growing),
                     ep.as_ref(),
                 )?;
                 kernel_bindings[pi] = Some(key);
-                k
             }
+            cache
+                .get_prebound(
+                    kernel_bindings[pi]
+                        .as_ref()
+                        .expect("kernel binding installed before lookup"),
+                    input_shapes,
+                )
+                .expect("kernel binding resolved immediately before lookup")
         };
+        for (index, (view, info)) in views.iter_mut().zip(&in_infos).enumerate() {
+            if let Some(sealed) = kernel.constant_input_override(index) {
+                *view = sealed;
+            } else if info.prepared_unresolved {
+                return Err(SessionError::Internal(format!(
+                    "{}:{} kernel did not supply promised immutable override for input {index}",
+                    node.domain, node.op_type
+                )));
+            }
+        }
         // --- Zero-copy view fast path ---------------------------------------
         // Ask the kernel whether its outputs are strided views over its inputs
         // (a layout/movement op such as Slice). If so, record view metadata
@@ -714,6 +708,16 @@ impl Executor {
                     .with_byte_offset(info.byte_offset)
                     .with_backing(info.backing),
                 ),
+            }
+        }
+        for (index, (view, info)) in views.iter_mut().zip(&in_infos).enumerate() {
+            if let Some(sealed) = kernel.constant_input_override(index) {
+                *view = sealed;
+            } else if info.prepared_unresolved {
+                return Err(SessionError::Internal(format!(
+                    "{}:{} kernel did not supply promised immutable override for input {index}",
+                    node.domain, node.op_type
+                )));
             }
         }
 
@@ -1031,6 +1035,7 @@ impl Executor {
                     backing: TensorBacking::Opaque,
                     root_len: 0,
                     lazy_unresolved: false,
+                    prepared_unresolved: false,
                     paged: None,
                 });
                 continue;
@@ -1053,6 +1058,7 @@ impl Executor {
                     backing: TensorBacking::Opaque,
                     root_len: value.len,
                     lazy_unresolved: false,
+                    prepared_unresolved: false,
                     paged: None,
                 });
                 continue;
@@ -1083,6 +1089,7 @@ impl Executor {
                     backing: TensorBacking::Opaque,
                     root_len,
                     lazy_unresolved: false,
+                    prepared_unresolved: false,
                     paged: None,
                 });
                 continue;
@@ -1124,6 +1131,7 @@ impl Executor {
                             backing: TensorBacking::Opaque,
                             root_len: paged.len(),
                             lazy_unresolved: false,
+                            prepared_unresolved: false,
                             paged: Some(paged),
                         });
                     }
@@ -1139,10 +1147,33 @@ impl Executor {
                             backing: TensorBacking::Opaque,
                             root_len: 0,
                             lazy_unresolved: true,
+                            prepared_unresolved: false,
                             paged: None,
                         });
                     }
                 }
+                continue;
+            }
+            if self.graph.initializers.contains_key(&vid)
+                && self
+                    .ep
+                    .prepares_immutable_constant(self.graph.node(self.plan[pi].node_id), i)
+                && !self.buffers.contains_key(&vid)
+            {
+                in_infos.push(InInfo {
+                    present: true,
+                    dtype: input_dtypes[i],
+                    shape: input_shapes[i].clone(),
+                    strides: compute_contiguous_strides(&input_shapes[i]),
+                    byte_offset: 0,
+                    base_ptr: std::ptr::null(),
+                    device: self.ep.device_id(),
+                    backing: TensorBacking::Opaque,
+                    root_len: 0,
+                    lazy_unresolved: false,
+                    prepared_unresolved: true,
+                    paged: None,
+                });
                 continue;
             }
             let root = self.root_of(vid);
@@ -1185,6 +1216,7 @@ impl Executor {
                 backing,
                 root_len,
                 lazy_unresolved: false,
+                prepared_unresolved: false,
                 paged: None,
             });
         }

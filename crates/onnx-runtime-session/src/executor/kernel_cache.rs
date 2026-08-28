@@ -11,6 +11,42 @@ pub(crate) static PREBIND_FAST_PATH_TEST_HITS: std::sync::atomic::AtomicUsize =
 pub(crate) static PREBIND_FALLBACK_TEST_HITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+pub(super) fn resolve_kernel_constant_inputs<'a>(
+    graph: &'a Graph,
+    weights: &'a onnx_runtime_loader::WeightStore,
+    inputs: &[Option<ValueId>],
+    input_shapes: &'a [Vec<usize>],
+) -> Result<Vec<Option<KernelConstantInput<'a>>>> {
+    inputs
+        .iter()
+        .enumerate()
+        .map(|(index, input)| {
+            let Some(value) = input else {
+                return Ok(None);
+            };
+            let Some(weight) = graph.initializers.get(value) else {
+                return Ok(None);
+            };
+            let bytes = weights.bytes(weight).ok_or_else(|| {
+                SessionError::Internal(format!(
+                    "initializer value {} could not be resolved for kernel preparation",
+                    value.0
+                ))
+            })?;
+            let shape = input_shapes.get(index).ok_or_else(|| {
+                SessionError::Internal(format!(
+                    "kernel preparation has no shape for initializer input {index}"
+                ))
+            })?;
+            Ok(Some(KernelConstantInput {
+                dtype: graph.value(*value).dtype,
+                shape,
+                bytes,
+            }))
+        })
+        .collect()
+}
+
 /// Cache key for a compiled kernel (§11.1). Keyed by the concrete node and its
 /// **resolved** (concrete) input shapes: attributes are fixed per node, so this
 /// is correct, and the shape component makes it *shape-keyed* — a re-run with
@@ -866,6 +902,11 @@ impl KernelCache {
         Some(kernel)
     }
 
+    #[inline]
+    pub(super) fn has_prebound(&self, binding: &KernelKey, input_shapes: &[Vec<usize>]) -> bool {
+        binding.matches_shapes(input_shapes) && self.entries.contains_key(binding)
+    }
+
     /// Return the cached kernel for `(node, resolved_input_shapes)`, verifying
     /// EP support and compiling+inserting it on a miss. Also returns the
     /// [`KernelKey`] so the caller can store it as a pre-binding for future
@@ -881,6 +922,7 @@ impl KernelCache {
         input_shapes: &[Vec<usize>],
         input_dtypes: &[DataType],
         constant_inputs: &[bool],
+        constant_values: &[Option<KernelConstantInput<'_>>],
         opset: u64,
         capture_seq_independent: bool,
         ep: &dyn ExecutionProvider,
@@ -892,6 +934,11 @@ impl KernelCache {
         if self.entries.contains_key(&key) {
             self.hits += 1;
         } else {
+            let shared_constant_state = self
+                .entries
+                .iter()
+                .find(|(existing, _)| existing.node == key.node)
+                .and_then(|(_, kernel)| kernel.shareable_constant_state());
             // Verify the EP claims this op at these concrete shapes/layouts
             // before compiling — same gate the static path used at build.
             let shape_dims: Vec<Shape> = input_shapes
@@ -932,6 +979,14 @@ impl KernelCache {
                 Err(error) => return Err(error.into()),
             };
             kernel.set_constant_inputs(constant_inputs);
+            let adopted = if let Some(state) = shared_constant_state {
+                kernel.adopt_shareable_constant_state(state)?
+            } else {
+                false
+            };
+            if !adopted {
+                kernel.prepare_constant_inputs(constant_values, ep)?;
+            }
             kernel.set_capture_seq_independent(capture_seq_independent);
             self.entries.insert(key.clone(), kernel);
             self.last_used

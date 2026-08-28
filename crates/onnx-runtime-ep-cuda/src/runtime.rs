@@ -10,7 +10,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
-use cudarc::driver::sys::{CUdevice_attribute, CUdeviceptr, CUfunction_attribute_enum};
+use cudarc::driver::sys::{
+    CUdevice_attribute, CUdeviceptr, CUfunction, CUfunction_attribute_enum, CUmodule,
+};
 use cudarc::driver::{CudaContext, CudaEvent, CudaFunction, CudaModule, CudaStream, LaunchConfig};
 
 use onnx_runtime_ep_api::DeviceGraphSlot;
@@ -471,6 +473,70 @@ fn raw_pool_size_class(bytes: usize) -> usize {
 /// is never handed to a second runtime.
 static NEXT_RUNTIME_ID: AtomicU64 = AtomicU64::new(1);
 
+struct RawCudaModule {
+    module: CUmodule,
+    context: Arc<CudaContext>,
+}
+
+// Mirrors cudarc's `CudaModule`: the driver module is context-owned and its
+// handle may be used from threads that bind that context.
+unsafe impl Send for RawCudaModule {}
+unsafe impl Sync for RawCudaModule {}
+
+impl Drop for RawCudaModule {
+    fn drop(&mut self) {
+        let _ = self.context.bind_to_thread();
+        // SAFETY: this module was loaded exactly once by `load_raw_module` and
+        // the runtime cache is its sole owner.
+        let _ = unsafe { cudarc::driver::result::module::unload(self.module) };
+    }
+}
+
+/// Allocation-free launch handle for prepared decode kernels.
+///
+/// cudarc's safe launch builder allocates argument/event vectors on every
+/// launch. This handle retains the loaded module but accepts a fixed stack
+/// parameter array, so warmed eager execution and graph recording perform no
+/// host allocation.
+#[derive(Clone)]
+pub(crate) struct RawCudaFunction {
+    function: CUfunction,
+    _module: Arc<RawCudaModule>,
+}
+
+// CUDA function handles are immutable and cudarc gives its equivalent wrapper
+// the same cross-thread guarantees.
+unsafe impl Send for RawCudaFunction {}
+unsafe impl Sync for RawCudaFunction {}
+
+impl RawCudaFunction {
+    /// Launch with caller-owned scalar storage and a stack-backed parameter
+    /// pointer array.
+    ///
+    /// # Safety
+    /// Every entry in `kernel_params` must point to a live value matching the
+    /// loaded kernel ABI, and all referenced device storage must remain live
+    /// until the stream has consumed the launch.
+    pub(crate) unsafe fn launch(
+        &self,
+        stream: &CudaStream,
+        config: LaunchConfig,
+        kernel_params: &mut [*mut c_void],
+    ) -> std::result::Result<(), cudarc::driver::result::DriverError> {
+        // SAFETY: upheld by this method's caller contract.
+        unsafe {
+            cudarc::driver::result::launch_kernel(
+                self.function,
+                config.grid_dim,
+                config.block_dim,
+                config.shared_mem_bytes,
+                stream.cu_stream(),
+                kernel_params,
+            )
+        }
+    }
+}
+
 pub struct CudaRuntime {
     context: Arc<CudaContext>,
     stream: Arc<CudaStream>,
@@ -493,6 +559,10 @@ pub struct CudaRuntime {
     /// runtime compiles a given kernel (e.g. the fused attention softmax) at
     /// most once and reuses the loaded module for every kernel invocation.
     modules: Mutex<HashMap<&'static str, Arc<CudaModule>>>,
+    /// Raw launch modules used by kernels whose warmed host path must not
+    /// allocate. Kept separate from cudarc's safe-module cache because cudarc
+    /// does not expose a raw function handle.
+    raw_modules: Mutex<HashMap<&'static str, Arc<RawCudaModule>>>,
     /// Set after a driver rejects the toolkit's PTX ISA. Subsequent modules are
     /// compiled directly to the device's native SM CUBIN instead of repeating
     /// the failed load.
@@ -547,6 +617,7 @@ pub struct CudaRuntime {
     host_to_device_copies: AtomicU64,
     device_to_host_copies: AtomicU64,
     async_host_to_device_copies: AtomicU64,
+    forced_synchronizations: AtomicU64,
     /// Completion events recorded on a transfer/compute stream, keyed by an
     /// opaque fence id handed out to the executor inside an
     /// [`onnx_runtime_ep_api::Fence`]. `wait_*_fence` removes and waits on the
@@ -755,6 +826,7 @@ impl CudaRuntime {
             ptx_arch,
             cubin_arch,
             modules: Mutex::new(HashMap::new()),
+            raw_modules: Mutex::new(HashMap::new()),
             nvrtc_cubin_fallback: AtomicBool::new(false),
             allocations: AtomicU64::new(0),
             frees: AtomicU64::new(0),
@@ -770,6 +842,7 @@ impl CudaRuntime {
             host_to_device_copies: AtomicU64::new(0),
             device_to_host_copies: AtomicU64::new(0),
             async_host_to_device_copies: AtomicU64::new(0),
+            forced_synchronizations: AtomicU64::new(0),
             fences: Mutex::new(HashMap::new()),
             next_fence_id: AtomicU64::new(1),
             capture_error: 0,
@@ -1070,6 +1143,11 @@ impl CudaRuntime {
         }
     }
 
+    /// Number of unconditional compute-stream synchronization calls.
+    pub fn forced_synchronization_count(&self) -> u64 {
+        self.forced_synchronizations.load(Ordering::Relaxed)
+    }
+
     /// Validate a requested dynamic shared-memory allocation against the device
     /// limits and, when it exceeds the default (non-opt-in) per-block budget,
     /// opt the function into the larger dynamic size the hardware supports.
@@ -1279,6 +1357,82 @@ impl CudaRuntime {
             .map_err(|e| driver_err(&format!("loading NVRTC function '{entry}'"), e))
     }
 
+    /// Resolve a prepared raw function handle for allocation-free launches.
+    pub(crate) fn nvrtc_raw_function(
+        &self,
+        module_key: &'static str,
+        src: &str,
+        entry: &str,
+    ) -> Result<RawCudaFunction> {
+        require(CudaLibrary::Nvrtc).map_err(|message| {
+            EpError::KernelFailed(format!(
+                "cuda_ep: {message}; CPU execution remains available"
+            ))
+        })?;
+        self.bind()?;
+        let module = {
+            let mut cache = self
+                .raw_modules
+                .lock()
+                .expect("cuda_ep raw module cache poisoned");
+            if let Some(module) = cache.get(module_key) {
+                module.clone()
+            } else {
+                let include_paths = nvrtc_include_paths();
+                let _section = capture_gate::synchronizing_section();
+                let module = if self.nvrtc_cubin_fallback.load(Ordering::Relaxed) {
+                    let image = self.nvrtc_cubin_image(module_key, src, &include_paths)?;
+                    self.load_raw_module(module_key, image.as_ptr().cast())?
+                } else {
+                    let ptx = self.nvrtc_ptx(module_key, src, &include_paths)?;
+                    let image = CString::new(ptx.to_src()).map_err(|_| {
+                        EpError::KernelFailed(format!(
+                            "cuda_ep: loading NVRTC module '{module_key}': PTX contains a NUL byte"
+                        ))
+                    })?;
+                    match self.load_raw_module(module_key, image.as_ptr().cast()) {
+                        Ok(module) => module,
+                        Err(EpError::KernelFailed(message))
+                            if message.contains("CUDA_ERROR_UNSUPPORTED_PTX_VERSION") =>
+                        {
+                            self.nvrtc_cubin_fallback.store(true, Ordering::Relaxed);
+                            let image = self.nvrtc_cubin_image(module_key, src, &include_paths)?;
+                            self.load_raw_module(module_key, image.as_ptr().cast())?
+                        }
+                        Err(error) => return Err(error),
+                    }
+                };
+                cache.insert(module_key, module.clone());
+                module
+            }
+        };
+        let name = CString::new(entry).expect("static kernel entry cannot contain a NUL byte");
+        // SAFETY: `module` remains retained by the returned function handle.
+        let function = unsafe { cudarc::driver::result::module::get_function(module.module, name) }
+            .map_err(|error| driver_err(&format!("loading raw NVRTC function '{entry}'"), error))?;
+        Ok(RawCudaFunction {
+            function,
+            _module: module,
+        })
+    }
+
+    fn load_raw_module(
+        &self,
+        module_key: &'static str,
+        image: *const c_void,
+    ) -> Result<Arc<RawCudaModule>> {
+        // SAFETY: callers provide either a live NUL-terminated PTX string or a
+        // live CUBIN image for the duration of this synchronous load call.
+        let module =
+            unsafe { cudarc::driver::result::module::load_data(image) }.map_err(|error| {
+                driver_err(&format!("loading raw NVRTC module '{module_key}'"), error)
+            })?;
+        Ok(Arc::new(RawCudaModule {
+            module,
+            context: self.context.clone(),
+        }))
+    }
+
     /// PTX for `module_key`, from the on-disk cache when possible.
     ///
     /// A cached hit is returned as PTX source rather than a compiled image;
@@ -1322,6 +1476,23 @@ impl CudaRuntime {
         src: &str,
         include_paths: &[String],
     ) -> Result<Arc<CudaModule>> {
+        let image = self.nvrtc_cubin_image(module_key, src, include_paths)?;
+        self.context
+            .load_module(cudarc::nvrtc::Ptx::from_binary(image))
+            .map_err(|error| {
+                driver_err(
+                    &format!("loading NVRTC CUBIN fallback module '{module_key}'"),
+                    error,
+                )
+            })
+    }
+
+    fn nvrtc_cubin_image(
+        &self,
+        module_key: &'static str,
+        src: &str,
+        include_paths: &[String],
+    ) -> Result<Vec<u8>> {
         let key = kernel_cache::CacheKey {
             module_key,
             source: src,
@@ -1339,14 +1510,7 @@ impl CudaRuntime {
                 image
             }
         };
-        self.context
-            .load_module(cudarc::nvrtc::Ptx::from_binary(image))
-            .map_err(|error| {
-                driver_err(
-                    &format!("loading NVRTC CUBIN fallback module '{module_key}'"),
-                    error,
-                )
-            })
+        Ok(image)
     }
 
     fn compile_nvrtc_cubin(
@@ -1493,6 +1657,7 @@ impl CudaRuntime {
     /// that must observe fully-produced bytes regardless of the eager-sync
     /// deferral flag.
     fn force_synchronize(&self) -> Result<()> {
+        self.forced_synchronizations.fetch_add(1, Ordering::Relaxed);
         self.stream
             .synchronize()
             .map_err(|e| driver_err("stream synchronize", e))
