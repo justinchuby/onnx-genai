@@ -433,20 +433,28 @@
       border: 0;
     }
     .visual-legend {
-      position: sticky;
-      z-index: 2;
-      top: .6rem;
       margin: 0 0 2rem;
       padding: 1.1rem 1.2rem;
       border: 1px solid #9fb8ce;
       border-left: .45rem solid var(--navy);
       border-radius: .8rem;
-      background: rgb(255 255 255 / 96%);
+      background: var(--white);
       box-shadow: var(--shadow);
-      backdrop-filter: blur(8px);
     }
-    .visual-legend h2 { margin: 0 0 .25rem; font-size: 1.28rem; }
-    .visual-legend > p { margin-bottom: .85rem; color: var(--muted); font-size: .9rem; }
+    .visual-legend summary {
+      display: flex;
+      flex-wrap: wrap;
+      gap: .3rem .75rem;
+      align-items: baseline;
+      color: var(--navy);
+      cursor: pointer;
+      font-size: 1.08rem;
+      font-weight: 850;
+    }
+    .visual-legend summary::marker { color: var(--purple); }
+    .legend-hint { color: var(--muted); font-size: .82rem; font-weight: 650; }
+    .visual-legend[open] summary { margin-bottom: .55rem; }
+    .visual-legend .legend-intro { margin-bottom: .85rem; color: var(--muted); font-size: .9rem; }
     .legend-grid {
       display: grid;
       grid-template-columns: 1.2fr 1.15fr 1fr;
@@ -959,8 +967,8 @@
       .grid-2 { grid-template-columns: 1fr; }
       .decision-track { grid-template-columns: 1fr; }
       .trace-item { min-height: auto; }
-      .visual-legend { position: static; }
       .legend-list { grid-template-columns: 1fr; }
+      .visual-legend summary { align-items: flex-start; }
       .motion-controls { align-items: stretch; }
       .motion-controls label { justify-content: space-between; }
       .motion-status { flex-basis: 100%; }
@@ -984,7 +992,9 @@
       body { background: #fff; font-size: 11pt; }
       .skip-link, nav, .preset-row, .motion-controls { display: none; }
       .card, .code-card, .simulator, .trace-item, .callout { box-shadow: none; }
-      .visual-legend { position: static; backdrop-filter: none; }
+      .visual-legend { box-shadow: none; }
+      .visual-legend:not([open]) .legend-content { display: block !important; }
+      .visual-legend summary::after { content: " (expanded in print)"; }
       .flow-rail, .setup-track { overflow: visible; }
       .flow-node, .setup-node, .trace-item { break-inside: avoid; }
       .transaction-demo .journal-cell, .transaction-demo .transport-boundary, .transaction-demo .outcome-cell,
@@ -1029,10 +1039,11 @@
   </header>
 
   <main id="main-content" class="shell">
-    <aside class="visual-legend" aria-labelledby="visual-legend-title">
-      <h2 id="visual-legend-title">How to read the interactive diagrams</h2>
-      <p>This key remains visible while you explore. Every animation changes a documented semantic state; it never adds a scheduler rule to package metadata.</p>
-      <div class="legend-grid">
+    <details class="visual-legend">
+      <summary id="visual-legend-title">How to read the interactive diagrams <span class="legend-hint">Open the color, symbol, line, and phase key</span></summary>
+      <div class="legend-content">
+        <p class="legend-intro">Every animation changes a documented semantic state; it never adds a scheduler rule to package metadata.</p>
+        <div class="legend-grid">
         <div class="legend-group">
           <h3>Colors</h3>
           <ul class="legend-list">
@@ -1073,9 +1084,10 @@
             <span class="phase-badge post">post-commit</span>
           </div>
         </div>
+        </div>
+        <p class="legend-note"><strong>Logical row</strong> means request-visible semantic ownership. <strong>Physical slot</strong> means reusable runtime-private storage. A RowPlan selects positions; it never gives metadata a request ID or a slot identity.</p>
       </div>
-      <p class="legend-note"><strong>Logical row</strong> means request-visible semantic ownership. <strong>Physical slot</strong> means reusable runtime-private storage. A RowPlan selects positions; it never gives metadata a request ID or a slot identity.</p>
-    </aside>
+    </details>
     <section id="three-lenses" aria-labelledby="three-lenses-title">
       <p class="eyebrow">The essential split</p>
       <h2 id="three-lenses-title">One semantic contract, three owners</h2>
