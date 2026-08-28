@@ -3808,6 +3808,7 @@ mod tests {
             0,
         )?;
         Ok(Engine {
+            session_fork_origin: SessionForkOrigin::new(),
             workflow: Box::new(match shape {
                 crate::pipeline::generation::TestSessionShape::Stateless => {
                     crate::pipeline::generation::test_decoder_runtime()?
@@ -4421,6 +4422,7 @@ mod tests {
         // model. This is the honesty guarantee -- capability is not read off the
         // decode_path alone.
         let mut engine = Engine {
+            session_fork_origin: SessionForkOrigin::new(),
             workflow: Box::new(crate::pipeline::generation::test_decoder_runtime()?),
             workflow_sessions: HashMap::new(),
             workflow_session_ids: SharedSessionIds::new(),

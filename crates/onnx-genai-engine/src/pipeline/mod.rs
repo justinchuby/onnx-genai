@@ -145,7 +145,11 @@ pub struct WorkflowSessionCheckpoint {
 pub(crate) struct WorkflowSessionForkSnapshot {
     semantic_state: Vec<(String, Value)>,
     effects: Vec<(String, u64)>,
-    outputs: Vec<(String, turn_transaction::CommittedOutputState)>,
+    outputs: Vec<(
+        String,
+        OutputStreamId,
+        turn_transaction::CommittedOutputState,
+    )>,
     turn_version: u64,
 }
 
@@ -973,14 +977,33 @@ impl WorkflowRuntime {
             .filter(|((session, _), _)| session == session_id)
             .map(|((_, effect), cursor)| (effect.clone(), *cursor))
             .collect();
-        let outputs = self
-            .worker
-            .session_outputs
-            .borrow()
-            .iter()
-            .filter(|((session, _), _)| session == session_id)
-            .map(|((_, output), state)| (output.clone(), *state))
-            .collect();
+        let mut outputs = Vec::new();
+        for ((session, output, stream), state) in self.worker.session_outputs.borrow().iter() {
+            if session != session_id {
+                continue;
+            }
+            outputs.push((
+                output.clone(),
+                stream.clone(),
+                turn_transaction::CommittedOutputState {
+                    head: state.head,
+                    cursor: state.cursor,
+                    lineage: state.lineage,
+                    closed: state.closed,
+                    payload: state
+                        .payload
+                        .as_ref()
+                        .map(clone_value)
+                        .transpose()
+                        .with_context(|| {
+                            format!(
+                                "failed to clone committed output '{output}' stream '{}'",
+                                stream.0
+                            )
+                        })?,
+                },
+            ));
+        }
         Ok(WorkflowSessionForkSnapshot {
             semantic_state,
             effects,
@@ -1012,7 +1035,7 @@ impl WorkflowRuntime {
                     .session_outputs
                     .borrow()
                     .keys()
-                    .any(|(session, _)| session == session_id),
+                    .any(|(session, _, _)| session == session_id),
             "workflow session '{session_id}' already owns semantic state"
         );
 
@@ -1039,8 +1062,8 @@ impl WorkflowRuntime {
         for (effect, cursor) in snapshot.effects {
             session_effects.insert((session_id.to_string(), effect), cursor);
         }
-        for (output, state) in snapshot.outputs {
-            session_outputs.insert((session_id.to_string(), output), state);
+        for (output, stream, state) in snapshot.outputs {
+            session_outputs.insert((session_id.to_string(), output, stream), state);
         }
         session_versions.insert(session_id.to_string(), snapshot.turn_version);
         Ok(())

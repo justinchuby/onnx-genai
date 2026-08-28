@@ -63,6 +63,7 @@ impl std::fmt::Debug for SessionForkPlan {
             .debug_struct("SessionForkPlan")
             .field("source", &self.source)
             .field("position", &self.position)
+            .field("origin_generation", &self.prepared.origin().generation())
             .field("participants", &self.participants)
             .finish_non_exhaustive()
     }
@@ -137,6 +138,30 @@ pub enum SessionForkError {
         position: usize,
         reason: String,
     },
+    #[error(
+        "session fork plan for source {session} at token {position} belongs to a different runtime \
+         ownership domain (plan generation {plan_generation}, current engine generation \
+         {current_generation}); plans cannot cross engine instances, worker/session-routing \
+         domains, backend instances, or engine restarts; prepare a new plan on the engine that \
+         currently owns the source session"
+    )]
+    ForeignOrigin {
+        session: SessionId,
+        position: usize,
+        plan_generation: u64,
+        current_generation: u64,
+    },
+    #[error(
+        "session fork plan for source {session} at token {position} belongs to stale engine \
+         generation {plan_generation}; the current engine generation is {current_generation}; \
+         prepare a new plan from the current engine generation"
+    )]
+    StaleOrigin {
+        session: SessionId,
+        position: usize,
+        plan_generation: u64,
+        current_generation: u64,
+    },
     #[error("cannot publish semantic session fork: {0}")]
     Publication(String),
 }
@@ -146,7 +171,17 @@ enum PreparedSessionFork {
     Ort(Box<PreparedOrtFork>),
 }
 
+impl PreparedSessionFork {
+    fn origin(&self) -> SessionForkOrigin {
+        match self {
+            Self::Workflow(prepared) => prepared.origin,
+            Self::Ort(prepared) => prepared.origin,
+        }
+    }
+}
+
 struct PreparedWorkflowFork {
+    origin: SessionForkOrigin,
     source_version: u64,
     snapshot: crate::pipeline::WorkflowSessionForkSnapshot,
 }
@@ -158,6 +193,7 @@ enum PreparedKvFork {
 }
 
 struct PreparedOrtFork {
+    origin: SessionForkOrigin,
     source_tokens: Vec<TokenId>,
     source_kv_token_count: usize,
     source_draft: Option<(SessionId, Vec<TokenId>, usize)>,
@@ -193,6 +229,7 @@ impl Engine {
 
     /// Publish a child from a fully admitted plan.
     pub fn fork_session(&mut self, plan: SessionForkPlan) -> Result<SessionId, SessionForkError> {
+        self.validate_session_fork_origin(plan.source, plan.position, plan.prepared.origin())?;
         let SessionForkPlan {
             source,
             position,
@@ -207,6 +244,38 @@ impl Engine {
                 self.publish_ort_session_fork(source, position, *prepared)
             }
         }
+    }
+
+    fn validate_session_fork_origin(
+        &self,
+        source: SessionId,
+        position: SessionPosition,
+        origin: SessionForkOrigin,
+    ) -> Result<(), SessionForkError> {
+        if origin == self.session_fork_origin {
+            return Ok(());
+        }
+        let error = if origin.same_domain(self.session_fork_origin) {
+            SessionForkError::StaleOrigin {
+                session: source,
+                position: position.get(),
+                plan_generation: origin.generation(),
+                current_generation: self.session_fork_origin.generation(),
+            }
+        } else {
+            SessionForkError::ForeignOrigin {
+                session: source,
+                position: position.get(),
+                plan_generation: origin.generation(),
+                current_generation: self.session_fork_origin.generation(),
+            }
+        };
+        Err(error)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn advance_session_fork_generation_for_test(&mut self) {
+        self.session_fork_origin = self.session_fork_origin.next_generation_for_test();
     }
 
     fn prepare_workflow_session_fork(
@@ -257,6 +326,7 @@ impl Engine {
             position,
             participants,
             prepared: PreparedSessionFork::Workflow(PreparedWorkflowFork {
+                origin: self.session_fork_origin,
                 source_version,
                 snapshot,
             }),
@@ -553,6 +623,7 @@ impl Engine {
             position,
             participants,
             prepared: PreparedSessionFork::Ort(Box::new(PreparedOrtFork {
+                origin: self.session_fork_origin,
                 source_tokens: state.tokens.clone(),
                 source_kv_token_count: state.kv_token_count,
                 source_draft,

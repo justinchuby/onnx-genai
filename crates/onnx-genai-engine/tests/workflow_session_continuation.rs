@@ -273,6 +273,53 @@ fn semantic_fork_copies_continuation_and_output_baselines_then_diverges() -> any
 }
 
 #[test]
+fn workflow_fork_plan_cannot_cross_engine_ownership_domains() -> anyhow::Result<()> {
+    let mut engine_a = Engine::from_dir(&decoder_package(), EngineConfig::default())?;
+    let mut engine_b = Engine::from_dir(&decoder_package(), EngineConfig::default())?;
+    let source_a = engine_a.create_session()?;
+    let source_b = engine_b.create_session()?;
+    assert_eq!(
+        source_a, source_b,
+        "the regression requires colliding engine-local session ids"
+    );
+
+    let request = tokens(&[2, 4, 6, 3], 2);
+    engine_a.generate_in_session(source_a, request.clone())?;
+    engine_b.generate_in_session(source_b, request)?;
+    let position = engine_a.session_token_count(source_a)?;
+    assert_eq!(position, engine_b.session_token_count(source_b)?);
+    let before = engine_b
+        .session_conversation(source_b)?
+        .expect("workflow declares continuation");
+
+    let plan = engine_a.prepare_session_fork(source_a, SessionPosition::new(position))?;
+    let error = engine_b
+        .fork_session(plan)
+        .expect_err("a prepared workflow snapshot cannot cross engine ownership domains");
+    assert!(
+        error
+            .to_string()
+            .contains("different runtime ownership domain"),
+        "{error}"
+    );
+    assert_eq!(
+        engine_b.session_conversation(source_b)?,
+        Some(before),
+        "foreign admission must not install or mutate workflow state"
+    );
+    let next = engine_b.create_session()?;
+    assert_eq!(
+        next,
+        source_b + 1,
+        "foreign admission must not mint or expose a child id"
+    );
+    engine_b.close_session(next)?;
+    engine_b.close_session(source_b)?;
+    engine_a.close_session(source_a)?;
+    Ok(())
+}
+
+#[test]
 fn fork_rejects_uncommitted_positions_and_stale_plans_before_child_publication()
 -> anyhow::Result<()> {
     let mut engine = Engine::from_dir(&decoder_package(), EngineConfig::default())?;

@@ -2914,7 +2914,8 @@ pipeline:
                           source: { kind: application, name: initial_continue }, required: true }
     outputs:
       state: { contract: { dtype: int64, shape: [] }, role: tensor, stage: pre_adapter }
-      events: { contract: { dtype: int64, shape: [] }, role: event, stage: pre_adapter }
+      events: { contract: { dtype: int64, shape: [] }, role: event,
+                family: { kind: events }, stage: pre_adapter }
     effects:
       world_effect:
         retry: transactional

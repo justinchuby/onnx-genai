@@ -570,7 +570,9 @@ pub(crate) fn session_fork_failure(error: anyhow::Error) -> ApiError {
         }
         onnx_genai_engine::SessionForkError::UnsupportedParticipant { .. }
         | onnx_genai_engine::SessionForkError::SnapshotFailed { .. }
-        | onnx_genai_engine::SessionForkError::StalePlan { .. } => {
+        | onnx_genai_engine::SessionForkError::StalePlan { .. }
+        | onnx_genai_engine::SessionForkError::ForeignOrigin { .. }
+        | onnx_genai_engine::SessionForkError::StaleOrigin { .. } => {
             ApiError::conflict(fork.to_string())
         }
         onnx_genai_engine::SessionForkError::Publication(_) => ApiError::internal(fork.to_string()),

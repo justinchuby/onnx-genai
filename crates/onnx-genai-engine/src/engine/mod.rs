@@ -90,7 +90,7 @@ pub use metadata::graph_port_contracts;
 pub(crate) use decode_backend::*;
 pub(crate) use governor::*;
 pub use governor::{EngineGovernorError, EngineResourceGovernor, resolve_device_vram_limit_bytes};
-pub(crate) use ids::SharedSessionIds;
+pub(crate) use ids::{SessionForkOrigin, SharedSessionIds};
 pub use load::{OrtEngineWorkerFactory, OrtSessionWorkerLoadError};
 pub(crate) use load::{
     force_managed_weight_streaming_enabled, session_device_domain, validate_shared_authority_limit,
@@ -202,6 +202,7 @@ mod tests {
         )?;
 
         Ok(Engine {
+            session_fork_origin: SessionForkOrigin::new(),
             workflow: Box::new(crate::pipeline::generation::test_decoder_runtime()?),
             decode_backend: EngineDecodeBackend::Ort,
             metadata: InferenceMetadata::default(),
@@ -2149,6 +2150,76 @@ mod tests {
         assert_eq!(engine.sessions.len(), sessions_before);
         assert_eq!(engine.kv_cache.page_table.sequences.len(), sequences_before);
         engine.close_session(session_id)?;
+        Ok(())
+    }
+
+    #[test]
+    fn ort_fork_plan_rejects_cross_engine_id_collision_before_resource_mutation()
+    -> anyhow::Result<()> {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-llm")
+            .canonicalize()?;
+        let mut engine_a = Engine::from_dir(&fixture, EngineConfig::default())?;
+        let mut engine_b = Engine::from_dir(&fixture, EngineConfig::default())?;
+        let source_a = engine_a.create_session()?;
+        let source_b = engine_b.create_session()?;
+        assert_eq!(
+            source_a, source_b,
+            "the regression requires colliding engine-local session ids"
+        );
+        let sessions_before = engine_b.sessions.len();
+        let sequences_before = engine_b.kv_cache.page_table.sequences.len();
+        let pages_before = engine_b.kv_cache.page_table.pages.len();
+
+        let plan = engine_a.prepare_session_fork(source_a, SessionPosition::new(0))?;
+        let error = engine_b
+            .fork_session(plan)
+            .expect_err("an ORT snapshot cannot cross engine ownership domains");
+        assert!(matches!(error, SessionForkError::ForeignOrigin { .. }));
+        assert_eq!(engine_b.sessions.len(), sessions_before);
+        assert_eq!(
+            engine_b.kv_cache.page_table.sequences.len(),
+            sequences_before
+        );
+        assert_eq!(engine_b.kv_cache.page_table.pages.len(), pages_before);
+        let next = engine_b.create_session()?;
+        assert_eq!(
+            next,
+            source_b + 1,
+            "foreign admission must not allocate or expose a child sequence"
+        );
+        engine_b.close_session(next)?;
+        engine_b.close_session(source_b)?;
+        engine_a.close_session(source_a)?;
+        Ok(())
+    }
+
+    #[test]
+    fn fork_plan_rejects_stale_engine_generation_before_resource_mutation() -> anyhow::Result<()> {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-llm")
+            .canonicalize()?;
+        let mut engine = Engine::from_dir(&fixture, EngineConfig::default())?;
+        let source = engine.create_session()?;
+        let plan = engine.prepare_session_fork(source, SessionPosition::new(0))?;
+        let sessions_before = engine.sessions.len();
+        let sequences_before = engine.kv_cache.page_table.sequences.len();
+        engine.advance_session_fork_generation_for_test();
+
+        let error = engine
+            .fork_session(plan)
+            .expect_err("a prior engine generation must not publish a child");
+        assert!(matches!(error, SessionForkError::StaleOrigin { .. }));
+        assert_eq!(engine.sessions.len(), sessions_before);
+        assert_eq!(engine.kv_cache.page_table.sequences.len(), sequences_before);
+        let next = engine.create_session()?;
+        assert_eq!(
+            next,
+            source + 1,
+            "stale-generation admission must not allocate or expose a child"
+        );
+        engine.close_session(next)?;
+        engine.close_session(source)?;
         Ok(())
     }
 
