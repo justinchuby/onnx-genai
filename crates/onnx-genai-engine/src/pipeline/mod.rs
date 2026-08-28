@@ -140,6 +140,19 @@ pub struct WorkflowSessionCheckpoint {
     contracts: HashMap<String, TensorContract>,
 }
 
+/// Fully cloned committed workflow-session state prepared before a child
+/// identity is created.
+pub(crate) struct WorkflowSessionForkSnapshot {
+    semantic_state: Vec<(String, Value)>,
+    effects: Vec<(String, u64)>,
+    outputs: Vec<(
+        String,
+        OutputStreamId,
+        turn_transaction::CommittedOutputState,
+    )>,
+    turn_version: u64,
+}
+
 /// A request for the universal workflow interpreter.
 pub struct PipelineGenerateRequest {
     pub request: GenerateRequest,
@@ -888,6 +901,172 @@ impl WorkflowRuntime {
     /// The workflow this runtime executes.
     pub(crate) fn workflow_spec(&self) -> &onnx_genai_metadata::WorkflowSpec {
         &self.plan.workflow
+    }
+
+    pub(crate) fn resolved_state_plan(&self) -> &onnx_genai_metadata::ResolvedStatePlan {
+        &self.plan.compiled_workflow.state_plan
+    }
+
+    pub(crate) fn transaction_effect_domains(&self) -> Vec<String> {
+        self.plan
+            .compiled_workflow
+            .initial_effects
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    pub(crate) fn output_names(&self) -> Vec<String> {
+        self.plan.workflow.outputs.keys().cloned().collect()
+    }
+
+    pub(crate) fn session_turn_version(&self, session_id: &str) -> u64 {
+        self.worker
+            .session_turn_versions
+            .borrow()
+            .get(session_id)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn session_committed_position(&self, session_id: &str) -> usize {
+        self.session_conversation_len(session_id)
+            .unwrap_or_else(|| {
+                usize::try_from(self.session_turn_version(session_id)).unwrap_or(usize::MAX)
+            })
+    }
+
+    pub(crate) fn session_has_active_turn(&self, session_id: &str) -> bool {
+        self.worker.session_leases.borrow().contains(session_id)
+    }
+
+    pub(crate) fn snapshot_session_for_fork(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<WorkflowSessionForkSnapshot> {
+        let state_plan = self.resolved_state_plan();
+        let session_state = self.worker.session_state.borrow();
+        let mut semantic_state = Vec::new();
+        for (_, cell) in state_plan
+            .session_cells()
+            .filter(|(_, cell)| cell.transaction.required)
+        {
+            if let Some(value) =
+                session_state.get(&(session_id.to_string(), cell.identity.0.clone()))
+            {
+                semantic_state.push((
+                    cell.identity.0.clone(),
+                    clone_value(value).with_context(|| {
+                        format!(
+                            "failed to clone semantic workflow state '{}' ({:?}, rank {})",
+                            cell.identity.0,
+                            cell.contract.dtype,
+                            cell.contract.rank()
+                        )
+                    })?,
+                ));
+            }
+        }
+        drop(session_state);
+
+        let effects = self
+            .worker
+            .session_effects
+            .borrow()
+            .iter()
+            .filter(|((session, _), _)| session == session_id)
+            .map(|((_, effect), cursor)| (effect.clone(), *cursor))
+            .collect();
+        let mut outputs = Vec::new();
+        for ((session, output, stream), state) in self.worker.session_outputs.borrow().iter() {
+            if session != session_id {
+                continue;
+            }
+            outputs.push((
+                output.clone(),
+                stream.clone(),
+                turn_transaction::CommittedOutputState {
+                    head: state.head,
+                    cursor: state.cursor,
+                    lineage: state.lineage,
+                    closed: state.closed,
+                    payload: state
+                        .payload
+                        .as_ref()
+                        .map(clone_value)
+                        .transpose()
+                        .with_context(|| {
+                            format!(
+                                "failed to clone committed output '{output}' stream '{}'",
+                                stream.0
+                            )
+                        })?,
+                },
+            ));
+        }
+        Ok(WorkflowSessionForkSnapshot {
+            semantic_state,
+            effects,
+            outputs,
+            turn_version: self.session_turn_version(session_id),
+        })
+    }
+
+    pub(crate) fn install_session_fork(
+        &self,
+        session_id: &str,
+        snapshot: WorkflowSessionForkSnapshot,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self
+                .worker
+                .session_state
+                .borrow()
+                .keys()
+                .any(|(session, _)| session == session_id)
+                && !self
+                    .worker
+                    .session_effects
+                    .borrow()
+                    .keys()
+                    .any(|(session, _)| session == session_id)
+                && !self
+                    .worker
+                    .session_outputs
+                    .borrow()
+                    .keys()
+                    .any(|(session, _, _)| session == session_id),
+            "workflow session '{session_id}' already owns semantic state"
+        );
+
+        let mut session_state = self.worker.session_state.borrow_mut();
+        let mut session_effects = self.worker.session_effects.borrow_mut();
+        let mut session_outputs = self.worker.session_outputs.borrow_mut();
+        let mut session_versions = self.worker.session_turn_versions.borrow_mut();
+        session_state
+            .try_reserve(snapshot.semantic_state.len())
+            .context("failed to reserve workflow fork state entries")?;
+        session_effects
+            .try_reserve(snapshot.effects.len())
+            .context("failed to reserve workflow fork effect entries")?;
+        session_outputs
+            .try_reserve(snapshot.outputs.len())
+            .context("failed to reserve workflow fork output entries")?;
+        session_versions
+            .try_reserve(1)
+            .context("failed to reserve workflow fork version entry")?;
+
+        for (cell, value) in snapshot.semantic_state {
+            session_state.insert((session_id.to_string(), cell), value);
+        }
+        for (effect, cursor) in snapshot.effects {
+            session_effects.insert((session_id.to_string(), effect), cursor);
+        }
+        for (output, stream, state) in snapshot.outputs {
+            session_outputs.insert((session_id.to_string(), output, stream), state);
+        }
+        session_versions.insert(session_id.to_string(), snapshot.turn_version);
+        Ok(())
     }
 
     /// How many device→host materializations this runtime has performed.

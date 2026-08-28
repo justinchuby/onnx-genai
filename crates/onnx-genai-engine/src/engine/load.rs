@@ -97,6 +97,7 @@ impl OrtEngineWorkerFactory {
             &governor,
         )?;
         Ok(Engine {
+            session_fork_origin: SessionForkOrigin::new(),
             workflow: Box::new(self.workflow.build()),
             decode_backend: EngineDecodeBackend::Ort,
             metadata: self.metadata.clone(),
@@ -722,6 +723,7 @@ impl Engine {
             &memory_strategy_plan,
         )?;
         Ok(Self {
+            session_fork_origin: SessionForkOrigin::new(),
             workflow,
             decode_backend,
             metadata,
@@ -1437,6 +1439,7 @@ impl Engine {
             &memory_strategy_plan,
         )?;
         Ok(Self {
+            session_fork_origin: SessionForkOrigin::new(),
             workflow,
             decode_backend: EngineDecodeBackend::Native,
             metadata,

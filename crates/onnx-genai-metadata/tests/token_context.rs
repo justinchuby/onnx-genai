@@ -9,10 +9,10 @@ use std::collections::BTreeMap;
 use onnx_genai_metadata::{
     BatchLayout, ComponentContract, ComponentImplementation, InferenceMetadata, PaddedDimension,
     PortRole, RuntimeCapabilities, RuntimeInputRole, SemanticInputRole, ShapeRecurrence,
-    StateCheckpointContract, StateGroupCapabilities, StateKind, StatePortAlias, StateUpdate,
-    TensorContract, TensorDimension, WorkflowComponent, WorkflowInput, WorkflowInputSource,
-    WorkflowStateScope, WorkflowStep, classify_session_state, resolve_state_plan,
-    validate_metadata, validate_structure_and_capabilities,
+    StateCheckpointContract, StateGroupCapabilities, StateKind, StatePortAlias, StateSemanticRole,
+    StateUpdate, TensorContract, TensorDimension, WorkflowComponent, WorkflowInput,
+    WorkflowInputSource, WorkflowStateScope, WorkflowStep, classify_session_state,
+    resolve_state_plan, validate_metadata, validate_structure_and_capabilities,
 };
 
 const TOKEN_CONTEXT_CONTRACT: &str = "onnx-genai.token-context";
@@ -466,6 +466,9 @@ fn graph_internal_token_context_uses_generic_ports_and_state_groups() {
         );
         assert!(state.snapshot.snapshot && state.snapshot.fork);
         assert!(state.transaction.required);
+        assert_eq!(state.semantic_role, StateSemanticRole::TokenContextHistory);
+        let service = state.service.as_ref().expect("history has a state service");
+        assert!(service.snapshot && service.fork);
         assert_eq!(
             state.update,
             onnx_genai_metadata::StateUpdateRelation::Replace
