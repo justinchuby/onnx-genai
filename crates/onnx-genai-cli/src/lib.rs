@@ -367,26 +367,37 @@ struct GenerateArgs {
     #[arg(long)]
     no_stats: bool,
 
+    /// Prompt text, supplied with `--prompt` instead of positionally.
+    #[arg(long = "prompt", value_name = "PROMPT")]
+    prompt_flag: Option<String>,
+
     /// Prompt text, given after the model: `generate MODEL "your prompt"`.
     ///
-    /// Optional at the parser so an omitted prompt is answered with guidance
-    /// rather than clap's bare "required argument"; [`GenerateArgs::prompt`]
-    /// is what the rest of the command reads.
+    /// Both spellings are optional at the parser so their absence or duplicate
+    /// use can be answered with guidance rather than a bare clap error.
     #[arg(value_name = "PROMPT")]
-    prompt: Option<String>,
+    prompt_positional: Option<String>,
 }
 
 impl GenerateArgs {
     /// The prompt to generate from.
-    ///
-    /// The model is positional, so the prompt is too: one way to pass each of
-    /// this subcommand's two required arguments, in the order they read.
     fn take_prompt(&mut self) -> Result<String, String> {
-        self.prompt.take().ok_or_else(|| {
-            "What: no prompt was given. Why: `generate` needs text to continue. \
-             How: pass it after the model (`generate MODEL \"your prompt\"`)."
-                .to_string()
-        })
+        match (self.prompt_flag.take(), self.prompt_positional.take()) {
+            (Some(_), Some(_)) => Err(
+                "What: the prompt was given both positionally and with --prompt. \
+                 Why: `generate` accepts exactly one prompt. \
+                 How: use either `generate MODEL \"your prompt\"` or \
+                 `generate MODEL --prompt \"your prompt\"`, but not both."
+                    .to_string(),
+            ),
+            (Some(prompt), None) | (None, Some(prompt)) => Ok(prompt),
+            (None, None) => Err(
+                "What: no prompt was given. Why: `generate` needs text to continue. \
+                 How: use either `generate MODEL \"your prompt\"` or \
+                 `generate MODEL --prompt \"your prompt\"`."
+                    .to_string(),
+            ),
+        }
     }
 }
 
@@ -670,32 +681,111 @@ mod tests {
         );
     }
 
-    /// The model is positional, so the prompt is too: one way to pass each of
-    /// this subcommand's two required arguments, in the order they read.
     #[test]
-    fn generate_takes_the_model_then_the_prompt_positionally() {
-        let parsed_command_line =
-            Cli::try_parse_from(["onnx-genai", "generate", "./m", "hi"]).unwrap();
+    fn generate_prompt_spellings_preserve_quoted_and_dash_leading_text() {
+        let quoted = r#"say "hello world""#;
+        let positional = take_generate_prompt(["onnx-genai", "generate", "./m", quoted]);
+        let flag = take_generate_prompt(["onnx-genai", "generate", "./m", "--prompt", quoted]);
 
-        match parsed_command_line.command {
-            Commands::Generate(mut args) => {
-                assert_eq!(args.model, PathBuf::from("./m"));
-                assert_eq!(args.take_prompt().expect("a prompt was given"), "hi");
-            }
-            _ => panic!("expected generate command"),
-        }
+        assert_eq!(positional, quoted);
+        assert_eq!(flag, quoted);
+        assert_eq!(positional, flag);
+
+        // `--` terminates option parsing for a positional prompt, while `=`
+        // makes the dash-leading flag value unambiguously part of `--prompt`.
+        let dash_positional =
+            take_generate_prompt(["onnx-genai", "generate", "./m", "--", "-not-an-option"]);
+        let dash_flag =
+            take_generate_prompt(["onnx-genai", "generate", "./m", "--prompt=-not-an-option"]);
+
+        assert_eq!(dash_positional, "-not-an-option");
+        assert_eq!(dash_flag, "-not-an-option");
     }
 
-    /// Clap's own "required argument" text names a placeholder; someone who
-    /// typed only the model needs to be told what the second word is.
     #[test]
-    fn generate_without_a_prompt_says_what_to_type() {
+    fn generate_prompt_spellings_render_identically_raw_or_templated() {
+        let positional = take_generate_prompt(["onnx-genai", "generate", "./m", "hello there"]);
+        let flag =
+            take_generate_prompt(["onnx-genai", "generate", "./m", "--prompt", "hello there"]);
+        assert_eq!(positional, flag);
+
+        let positional_raw =
+            build_turn_prompt(None, &[ChatMessage::user(positional.clone())]).unwrap();
+        let flag_raw = build_turn_prompt(None, &[ChatMessage::user(flag.clone())]).unwrap();
+        assert_eq!(positional_raw, flag_raw);
+        assert_eq!(positional_raw, positional);
+
+        let dir = temp_dir("prompt-spelling-template");
+        fs::write(
+            dir.join("tokenizer_config.json"),
+            r#"{"chat_template":"<|user|>\n{{ messages[0].content }}\n<|assistant|>"}"#,
+        )
+        .unwrap();
+        let template = load_chat_template(&dir, false).expect("template should load");
+        let positional_templated =
+            build_turn_prompt(Some(&template), &[ChatMessage::user(positional)]).unwrap();
+        let flag_templated =
+            build_turn_prompt(Some(&template), &[ChatMessage::user(flag)]).unwrap();
+
+        assert_eq!(positional_templated, flag_templated);
+        assert_ne!(positional_templated, positional_raw);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn generate_prompt_absence_names_both_accepted_spellings() {
         let parsed_command_line = Cli::try_parse_from(["onnx-genai", "generate", "./m"]).unwrap();
 
         match parsed_command_line.command {
             Commands::Generate(mut args) => {
                 let error = args.take_prompt().expect_err("no prompt was given");
-                assert!(error.contains("generate MODEL"), "{error}");
+                assert_eq!(
+                    error,
+                    "What: no prompt was given. Why: `generate` needs text to continue. \
+                     How: use either `generate MODEL \"your prompt\"` or \
+                     `generate MODEL --prompt \"your prompt\"`."
+                );
+            }
+            _ => panic!("expected generate command"),
+        }
+    }
+
+    #[test]
+    fn generate_prompt_conflict_has_deterministic_guidance() {
+        let parsed_command_line = Cli::try_parse_from([
+            "onnx-genai",
+            "generate",
+            "./m",
+            "positional",
+            "--prompt",
+            "flag",
+        ])
+        .unwrap();
+
+        match parsed_command_line.command {
+            Commands::Generate(mut args) => {
+                let error = args
+                    .take_prompt()
+                    .expect_err("both prompt spellings were given");
+                assert_eq!(
+                    error,
+                    "What: the prompt was given both positionally and with --prompt. \
+                     Why: `generate` accepts exactly one prompt. \
+                     How: use either `generate MODEL \"your prompt\"` or \
+                     `generate MODEL --prompt \"your prompt\"`, but not both."
+                );
+            }
+            _ => panic!("expected generate command"),
+        }
+    }
+
+    fn take_generate_prompt<const N: usize>(arguments: [&str; N]) -> String {
+        let parsed_command_line = Cli::try_parse_from(arguments).unwrap();
+
+        match parsed_command_line.command {
+            Commands::Generate(mut args) => {
+                assert_eq!(args.model, PathBuf::from("./m"));
+                args.take_prompt().expect("one prompt spelling was given")
             }
             _ => panic!("expected generate command"),
         }
@@ -1016,9 +1106,8 @@ mod tests {
     }
 
     #[test]
-    fn generate_rejects_model_and_prompt_flags() {
+    fn generate_rejects_model_flag() {
         assert!(Cli::try_parse_from(["onnx-genai", "generate", "--model", "./m", "hi"]).is_err());
-        assert!(Cli::try_parse_from(["onnx-genai", "generate", "./m", "--prompt", "hi"]).is_err());
     }
 
     #[test]
