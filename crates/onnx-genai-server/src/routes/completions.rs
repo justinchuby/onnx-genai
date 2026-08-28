@@ -1,5 +1,5 @@
 use super::*;
-use crate::tool_protocol::{self, ToolParseOutcome, ToolProtocol};
+use crate::tool_protocol::{self, ToolOutputConstraint, ToolParseOutcome, ToolProtocol};
 
 pub(crate) async fn completions(
     State(state): State<AppState>,
@@ -481,6 +481,9 @@ async fn run_chat_completion(
             let reasoning = atem_reasoning_content(&output).filter(|thought| !thought.is_empty());
             let parsed = if request.has_tool_context() {
                 parse_assistant_output(handle.tool_protocol.as_ref(), output, default_finish_reason)
+                    .map_err(|error| {
+                        ApiError::internal(format!("tool protocol output rejected: {error}"))
+                    })?
                     .aligned_to(&request)
             } else {
                 ParsedAssistantOutput {
@@ -636,12 +639,11 @@ async fn stream_chat_completion(
         let mut channel_gate = PrivateChannelGate::new(handle.private_channels);
         let mut buffered_text = String::new();
         let buffer_for_tool_detection = request.has_tool_context();
+        let mut tool_stream =
+            buffer_for_tool_detection.then(tool_protocol::ToolCallStream::default);
         let result = loop {
             match driver_rx.recv().await {
                 Some(DriverEvent::Token(token)) => {
-                    if requested_top_logprobs.is_some() {
-                        continue;
-                    }
                     let finish_reason = token.finish_reason.clone();
                     // The special-token spelling is only read by an armed gate; a
                     // model with no private channel discards it, so skip the extra
@@ -659,9 +661,25 @@ async fn stream_chat_completion(
                         .await?;
                     }
                     let content = stop_buffer.push(&revealed.content);
+                    if let (Some(protocol), Some(stream)) =
+                        (handle.tool_protocol.as_ref(), tool_stream.as_mut())
+                    {
+                        let parser_chunk = spelled.as_deref().unwrap_or(&token.text);
+                        let outcome = stream.push(protocol, parser_chunk);
+                        if let Some(error) =
+                            protocol.output_error(&outcome, "SSE streaming boundary")
+                        {
+                            break Err(StreamOutputFailure::Protocol(error));
+                        }
+                    }
                     if buffer_for_tool_detection {
                         buffered_text.push_str(&content);
-                    } else if !wants_constrained_json && !content.is_empty() {
+                    }
+                    if !buffer_for_tool_detection
+                        && requested_top_logprobs.is_none()
+                        && !wants_constrained_json
+                        && !content.is_empty()
+                    {
                         send_stream_chunk(&tx, content_chunk(&id, created, &model, content, None))
                             .await?;
                     }
@@ -670,28 +688,71 @@ async fn stream_chat_completion(
                     }
                 }
                 Some(DriverEvent::Finished(result)) => break Ok(result),
-                Some(DriverEvent::Error(error)) => break Err(error),
+                Some(DriverEvent::Error(error)) => break Err(StreamOutputFailure::Driver(error)),
                 None => {
-                    break Err(DriverFailure::internal(
+                    break Err(StreamOutputFailure::Driver(DriverFailure::internal(
                         "generation stream ended before result",
-                    ));
+                    )));
                 }
             }
         };
 
         match result {
             Ok(result) => {
-                if let Some(requested_top_logprobs) = requested_top_logprobs {
-                    let mut tool_calls = if buffer_for_tool_detection {
-                        complete_tool_calls(
-                            handle.tool_protocol.as_ref(),
-                            &assistant_output_text(&result, &tokenizer),
-                        )
+                if buffer_for_tool_detection
+                    && !matches!(result.finish_reason, FinishReason::StopSequence { .. })
+                {
+                    let trailing = stop_buffer.flush();
+                    buffered_text.push_str(&trailing);
+                    if let (Some(protocol), Some(stream)) =
+                        (handle.tool_protocol.as_ref(), tool_stream.as_mut())
+                    {
+                        let outcome = stream.push(protocol, &trailing);
+                        if let Some(error) =
+                            protocol.output_error(&outcome, "SSE streaming boundary")
+                        {
+                            send_tool_protocol_stream_error(&tx, error).await?;
+                            tx.send(Ok(Event::default().data("[DONE]")))
+                                .await
+                                .context("stream receiver closed")?;
+                            return Ok(());
+                        }
+                    }
+                }
+                let parsed = if let (Some(protocol), Some(stream)) =
+                    (handle.tool_protocol.as_ref(), tool_stream)
+                {
+                    let outcome = stream.finish(protocol);
+                    if let Some(error) = protocol.output_error(&outcome, "SSE streaming boundary") {
+                        Err(error)
                     } else {
-                        Vec::new()
-                    };
-                    align_tool_calls(&mut tool_calls, &request);
-                    if tool_calls.is_empty() {
+                        Ok(parsed_tool_output(
+                            outcome,
+                            finish_reason_label(&result.finish_reason),
+                        ))
+                    }
+                } else {
+                    Ok(ParsedAssistantOutput {
+                        content: None,
+                        tool_calls: None,
+                        finish_reason: finish_reason_label(&result.finish_reason),
+                        tool_parse: ToolParseOutcome::NoCall,
+                    })
+                };
+                let parsed = match parsed {
+                    Ok(parsed) => parsed.aligned_to(&request),
+                    Err(error) => {
+                        send_tool_protocol_stream_error(&tx, error).await?;
+                        tx.send(Ok(Event::default().data("[DONE]")))
+                            .await
+                            .context("stream receiver closed")?;
+                        return Ok(());
+                    }
+                };
+                if let Some(requested_top_logprobs) = requested_top_logprobs {
+                    if let Some(tool_calls) = parsed.tool_calls {
+                        send_tool_call_deltas(&tx, (&id, created, &model), tool_calls).await?;
+                    } else {
                         send_chat_logprob_chunks(
                             &tx,
                             (&id, created, &model),
@@ -712,25 +773,12 @@ async fn stream_chat_completion(
                             ),
                         )
                         .await?;
-                    } else {
-                        send_tool_call_deltas(&tx, (&id, created, &model), tool_calls).await?;
                     }
                 } else if buffer_for_tool_detection {
-                    let parsed = parse_assistant_output(
-                        handle.tool_protocol.as_ref(),
-                        assistant_output_text(&result, &tokenizer),
-                        finish_reason_label(&result.finish_reason),
-                    )
-                    .aligned_to(&request);
                     if let Some(tool_calls) = parsed.tool_calls {
                         send_tool_call_deltas(&tx, (&id, created, &model), tool_calls).await?;
                     } else {
-                        let content = parsed.content.unwrap_or_else(|| {
-                            if !matches!(result.finish_reason, FinishReason::StopSequence { .. }) {
-                                buffered_text.push_str(&stop_buffer.flush());
-                            }
-                            buffered_text
-                        });
+                        let content = buffered_text;
                         if !content.is_empty() {
                             send_stream_chunk(
                                 &tx,
@@ -792,7 +840,7 @@ async fn stream_chat_completion(
                     .await?;
                 }
             }
-            Err(err)
+            Err(StreamOutputFailure::Driver(err))
                 if wants_constrained_json
                     && json_constraint_stopped_incomplete_message(&err.message) =>
             {
@@ -803,7 +851,7 @@ async fn stream_chat_completion(
                 .await?;
                 send_stream_chunk(&tx, done_chunk(&id, created, &model, "stop")).await?;
             }
-            Err(err) => {
+            Err(StreamOutputFailure::Driver(err)) => {
                 let error = generation_failure(err);
                 tx.send(Ok(Event::default().event("error").data(
                     serde_json::to_string(&ErrorResponse {
@@ -815,6 +863,9 @@ async fn stream_chat_completion(
                 )))
                 .await
                 .context("stream receiver closed")?;
+            }
+            Err(StreamOutputFailure::Protocol(error)) => {
+                send_tool_protocol_stream_error(&tx, error).await?;
             }
         }
 
@@ -1460,6 +1511,27 @@ pub fn build_generate_request(request: &ChatCompletionRequest) -> GenerateReques
     }
 }
 
+/// Build options for one already-resolved package protocol.
+///
+/// Callers that do not have package admission state must use
+/// [`build_generate_request`], which intentionally never guesses a protocol.
+pub fn build_generate_request_with_protocol(
+    request: &ChatCompletionRequest,
+    protocol: &ToolProtocol,
+) -> Result<GenerateRequest, tool_protocol::ToolProtocolError> {
+    let mut options =
+        build_generate_options(request, request.output_budget(DEFAULT_MAX_OUTPUT_TOKENS));
+    apply_tool_output_constraint(&mut options, protocol, request)?;
+    let rendered = protocol.render(request)?;
+    Ok(GenerateRequest {
+        prompt: GeneratePrompt::Text(build_prompt_with_tool_prefix(
+            request,
+            &rendered.fallback_prefix,
+        )),
+        options,
+    })
+}
+
 pub(crate) fn prepare_completion(
     request: &CompletionRequest,
     handle: &ModelHandle,
@@ -1629,6 +1701,11 @@ struct PromptContext<'a> {
     default_reasoning_effort: Option<ReasoningEffort>,
 }
 
+enum StreamOutputFailure {
+    Driver(DriverFailure),
+    Protocol(tool_protocol::ToolProtocolError),
+}
+
 fn prepare_generate_request(
     request: &ChatCompletionRequest,
     tokenizer: &Tokenizer,
@@ -1652,6 +1729,10 @@ fn prepare_generate_request(
         context.generation_defaults,
         &chat_sampling_overrides(request),
     );
+    if let Some(protocol) = context.tool_protocol {
+        apply_tool_output_constraint(&mut options, protocol, request)
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+    }
     Ok(PreparedGenerateRequest {
         request: GenerateRequest {
             prompt: GeneratePrompt::TokenIds(token_ids),
@@ -1722,10 +1803,19 @@ fn build_generate_options(
     if let Some(constraint) = response_format_constraint(request) {
         options.constraint = Some(constraint);
     }
-    if let Some(constraint) = forced_tool_choice_constraint(request) {
-        options.constraint = Some(constraint);
-    }
     options
+}
+
+fn apply_tool_output_constraint(
+    options: &mut GenerateOptions,
+    protocol: &ToolProtocol,
+    request: &ChatCompletionRequest,
+) -> Result<(), tool_protocol::ToolProtocolError> {
+    match protocol.output_constraint(request)? {
+        ToolOutputConstraint::Unchanged => {}
+        ToolOutputConstraint::Set(constraint) => options.constraint = constraint,
+    }
+    Ok(())
 }
 
 /// The caller's *explicit* sampling selections for a chat completion, feeding
@@ -1798,59 +1888,6 @@ fn response_format_constraint(request: &ChatCompletionRequest) -> Option<Generat
             .map(GenerateConstraint::JsonSchema),
         ResponseFormat::Text => None,
     }
-}
-
-fn forced_tool_choice_constraint(request: &ChatCompletionRequest) -> Option<GenerateConstraint> {
-    let schemas = forced_tool_choice_schemas(request)?;
-    let schema = if schemas.len() == 1 {
-        schemas.into_iter().next()?
-    } else {
-        serde_json::json!({ "anyOf": schemas })
-    };
-    let schema = serde_json::to_string(&schema).ok()?;
-    Some(GenerateConstraint::Lark(format!(
-        "start: \"<tool_call>\\n\" tool \"\\n</tool_call>\"\ntool: %json {schema}\n"
-    )))
-}
-
-fn forced_tool_choice_schemas(request: &ChatCompletionRequest) -> Option<Vec<serde_json::Value>> {
-    let tools = request
-        .tools
-        .as_ref()?
-        .iter()
-        .filter(|tool| tool.kind == "function");
-    let selected = match request.tool_choice.as_ref()? {
-        ToolChoice::Mode(ToolChoiceMode::Required) => tools.collect::<Vec<_>>(),
-        ToolChoice::Specific(choice) if choice.kind == "function" => tools
-            .filter(|tool| tool.function.name == choice.function.name)
-            .collect::<Vec<_>>(),
-        ToolChoice::Mode(ToolChoiceMode::Auto | ToolChoiceMode::None) | ToolChoice::Specific(_) => {
-            Vec::new()
-        }
-    };
-
-    let schemas = selected
-        .into_iter()
-        .map(tool_call_schema_for_tool)
-        .collect::<Vec<_>>();
-    (!schemas.is_empty()).then_some(schemas)
-}
-
-fn tool_call_schema_for_tool(tool: &ChatTool) -> serde_json::Value {
-    let arguments_schema = tool
-        .function
-        .parameters
-        .clone()
-        .unwrap_or_else(|| serde_json::json!({ "type": "object" }));
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "name": { "enum": [tool.function.name.clone()] },
-            "arguments": arguments_schema
-        },
-        "required": ["name", "arguments"],
-        "additionalProperties": false
-    })
 }
 
 fn build_generate_options_with_tokenizer(
@@ -1998,19 +2035,6 @@ fn build_prompt_with_tool_prefix(request: &ChatCompletionRequest, tool_prefix: &
     prompt
 }
 
-fn complete_tool_calls(protocol: Option<&ToolProtocol>, output: &str) -> Vec<ChatMessageToolCall> {
-    let Some(protocol) = protocol else {
-        return Vec::new();
-    };
-    let mut stream = tool_protocol::ToolCallStream::default();
-    match stream.push(protocol, output) {
-        ToolParseOutcome::Complete(calls) => calls,
-        ToolParseOutcome::NoCall
-        | ToolParseOutcome::Incomplete
-        | ToolParseOutcome::Malformed(_) => Vec::new(),
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct ParsedAssistantOutput {
     pub content: Option<String>,
@@ -2084,25 +2108,52 @@ pub fn parse_assistant_output(
     protocol: Option<&ToolProtocol>,
     output: String,
     default_finish_reason: &'static str,
-) -> ParsedAssistantOutput {
+) -> Result<ParsedAssistantOutput, tool_protocol::ToolProtocolError> {
     // OpenAI tool calls end the assistant turn. The batch row finishes normally
     // with finish_reason=tool_calls; role=tool follow-up messages are submitted
     // as a new turn rather than pausing and resuming mid-token.
     let mut stream = tool_protocol::ToolCallStream::default();
-    let outcome = protocol.map_or(ToolParseOutcome::NoCall, |protocol| {
-        stream.push(protocol, &output)
-    });
+    let outcome = match protocol {
+        Some(protocol) => {
+            stream.push(protocol, &output);
+            stream.finish(protocol)
+        }
+        None => ToolParseOutcome::NoCall,
+    };
+    if let Some(protocol) = protocol
+        && let Some(error) = protocol.output_error(&outcome, "buffered generation boundary")
+    {
+        return Err(error);
+    }
+    Ok(parsed_tool_output_with_content(
+        outcome,
+        atem_visible_content(&output).unwrap_or(output),
+        default_finish_reason,
+    ))
+}
+
+fn parsed_tool_output(
+    outcome: ToolParseOutcome,
+    default_finish_reason: &'static str,
+) -> ParsedAssistantOutput {
+    parsed_tool_output_with_content(outcome, String::new(), default_finish_reason)
+}
+
+fn parsed_tool_output_with_content(
+    outcome: ToolParseOutcome,
+    content: String,
+    default_finish_reason: &'static str,
+) -> ParsedAssistantOutput {
     if let ToolParseOutcome::Complete(tool_calls) = &outcome {
-        return ParsedAssistantOutput {
+        ParsedAssistantOutput {
             content: None,
             tool_calls: Some(tool_calls.clone()),
             finish_reason: "tool_calls",
             tool_parse: outcome,
-        };
-    }
-    {
+        }
+    } else {
         ParsedAssistantOutput {
-            content: Some(atem_visible_content(&output).unwrap_or(output)),
+            content: Some(content),
             tool_calls: None,
             finish_reason: default_finish_reason,
             tool_parse: outcome,
@@ -2571,6 +2622,22 @@ async fn send_tool_call_deltas(
     send_stream_chunk(tx, done_chunk(id, created, model, "tool_calls")).await
 }
 
+async fn send_tool_protocol_stream_error(
+    tx: &mpsc::Sender<Result<Event, Infallible>>,
+    error: tool_protocol::ToolProtocolError,
+) -> anyhow::Result<()> {
+    tx.send(Ok(Event::default().event("error").data(
+        serde_json::to_string(&ErrorResponse {
+            error: ErrorBody {
+                message: error.to_string(),
+                kind: "server_error",
+            },
+        })?,
+    )))
+    .await
+    .context("stream receiver closed")
+}
+
 fn completion_id() -> String {
     format!("chatcmpl-{}", now_unix())
 }
@@ -2642,6 +2709,52 @@ mod prompt_rendering_tests {
             generation_defaults: None,
             default_reasoning_effort,
         }
+    }
+
+    #[test]
+    fn production_generate_preparation_uses_the_declared_atem_adapter() {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "fixture",
+            "messages": [{"role": "user", "content": "use weather"}],
+            "tools": [{"type": "function", "function": {
+                "name": "weather", "parameters": {"type": "object"}
+            }}],
+            "tool_choice": "required",
+            "response_format": {"type": "json_object"}
+        }))
+        .expect("request");
+        let protocol =
+            ToolProtocol::from_declaration(&onnx_genai_metadata::ToolProtocolDeclaration {
+                identity: "atem-xml".to_string(),
+                version: "v1".to_string(),
+            })
+            .expect("declared ATEM adapter");
+        let tokenizer_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-llm/tokenizer.json");
+        let tokenizer = Tokenizer::from_file(&tokenizer_path).expect("fixture tokenizer");
+        let prepared = prepare_generate_request(
+            &request,
+            &tokenizer,
+            false,
+            &PromptContext {
+                chat_template: None,
+                tool_protocol: Some(&protocol),
+                image_placeholder: None,
+                generation_defaults: None,
+                default_reasoning_effort: None,
+            },
+            DEFAULT_MAX_OUTPUT_TOKENS,
+        )
+        .expect("production preparation");
+
+        assert_eq!(prepared.request.options.constraint, None);
+        let ToolParseOutcome::Complete(calls) = tool_protocol::ToolCallStream::default().push(
+            &protocol,
+            "<atem:invoke name=\"weather\"><atem:parameter name=\"city\">\"Paris\"</atem:parameter></atem:invoke>",
+        ) else {
+            panic!("ATEM generated envelope must parse through the declared adapter");
+        };
+        assert_eq!(calls[0].function.name, "weather");
     }
 
     #[test]
@@ -3116,6 +3229,7 @@ mod tool_name_alignment_tests {
             })
             .unwrap();
         let parsed = parse_assistant_output(Some(&protocol), output, "stop")
+            .expect("declared ATEM envelope parses")
             .aligned_to(&request_offering(&["glob", "read"]));
         let calls = parsed.tool_calls.expect("an ATEM invoke is a tool call");
         assert_eq!(calls.len(), 1);
@@ -3357,6 +3471,7 @@ mod buffered_reasoning_tests {
         assert_eq!(atem_reasoning_content(&output).as_deref(), Some("weigh it"));
         assert_eq!(
             parse_assistant_output(None, output, "stop")
+                .expect("ordinary output parses")
                 .content
                 .as_deref(),
             Some("Hi")
@@ -3374,6 +3489,7 @@ mod buffered_reasoning_tests {
         );
         assert_eq!(
             parse_assistant_output(None, output, "stop")
+                .expect("ordinary output parses")
                 .content
                 .as_deref(),
             Some("")

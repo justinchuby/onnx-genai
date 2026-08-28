@@ -40,7 +40,7 @@ use crate::{
     types::{
         AudioTranscriptionResponse, ChatChoice, ChatCompletionRequest, ChatCompletionResponse,
         ChatLogprobs, ChatMessage, ChatMessageContent, ChatMessageToolCall, ChatTokenLogprob,
-        ChatTool, ChatTopLogprob, CompletionChoice, CompletionLogprobs, CompletionRequest,
+        ChatTopLogprob, CompletionChoice, CompletionLogprobs, CompletionRequest,
         CompletionResponse, EmbeddingData, EmbeddingInput, EmbeddingRequest, EmbeddingResponse,
         EmbeddingUsage, EmbeddingVector, InputAudio, ReasoningEffort, ResponseFormat, StopInput,
         ToolChoice, ToolChoiceMode, Usage,
@@ -64,7 +64,8 @@ pub(crate) use admin::{
 #[cfg(test)]
 pub(crate) use completions::prepare_completion;
 pub use completions::{
-    ParsedAssistantOutput, build_generate_request, build_prompt, parse_assistant_output,
+    ParsedAssistantOutput, build_generate_request, build_generate_request_with_protocol,
+    build_prompt, parse_assistant_output,
 };
 pub(crate) use completions::{
     chat_completions, collect_generation_result, completions, embeddings,

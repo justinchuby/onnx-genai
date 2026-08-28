@@ -1381,6 +1381,11 @@ package:
 request/template renderer and output-envelope parser together; a package that
 does not support tools omits `tool_protocol` entirely.
 
+Forced `tool_choice` output requirements are adapter-owned too:
+`tagged-json@v1` supplies its tagged JSON grammar, while `atem-xml@v1`
+explicitly supplies no engine JSON grammar because its envelope is XML. A
+runtime must not apply one protocol's grammar to another protocol.
+
 This server currently supplies these exact v1 adapters:
 
 | Declaration | Request/template rendering | Output envelopes |
@@ -1396,6 +1401,10 @@ is `NoCall`; after an unclosed opening envelope it is `Incomplete`; a complete,
 valid sequence is `Complete`. Feeding the same UTF-8 output in arbitrary chunks
 MUST produce the same typed result as feeding it at once. This server caps each
 rendered or parsed protocol payload at 64 KiB and each collection at 32 calls.
+At the buffered-generation and SSE-streaming boundaries, `Incomplete` and
+`Malformed` are typed protocol failures that name the declared identity/version
+and boundary; they are never returned as assistant content. `NoCall` remains
+ordinary assistant content.
 
 All caller-provided tool data, template values, and model-produced envelopes are
 untrusted structured input and **MUST** be bounded and validated. Metadata grants

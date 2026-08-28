@@ -8,7 +8,7 @@ use onnx_genai_engine::GenerateConstraint;
 use onnx_genai_metadata::ToolProtocolDeclaration;
 use onnx_genai_server::{
     AppState, ChatCompletionRequest, ServerConfig, ToolCallStream, ToolParseOutcome, ToolProtocol,
-    app, build_generate_request, parse_assistant_output,
+    app, build_generate_request, build_generate_request_with_protocol, parse_assistant_output,
 };
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -983,7 +983,10 @@ fn forced_specific_tool_choice_builds_lark_tool_call_constraint() {
     }));
 
     let Some(GenerateConstraint::Lark(grammar)) =
-        build_generate_request(&request).options.constraint
+        build_generate_request_with_protocol(&request, &declared_protocol("tagged-json"))
+            .unwrap()
+            .options
+            .constraint
     else {
         panic!("expected forced tool_choice to build a Lark constraint");
     };
@@ -1027,7 +1030,10 @@ fn required_tool_choice_with_multiple_tools_allows_any_tool_schema() {
     }));
 
     let Some(GenerateConstraint::Lark(grammar)) =
-        build_generate_request(&request).options.constraint
+        build_generate_request_with_protocol(&request, &declared_protocol("tagged-json"))
+            .unwrap()
+            .options
+            .constraint
     else {
         panic!("expected forced tool_choice to build a Lark constraint");
     };
@@ -1062,11 +1068,17 @@ fn auto_and_none_tool_choice_do_not_constrain_generation() {
     }));
 
     assert_eq!(
-        build_generate_request(&auto_request).options.constraint,
+        build_generate_request_with_protocol(&auto_request, &declared_protocol("tagged-json"))
+            .unwrap()
+            .options
+            .constraint,
         None
     );
     assert_eq!(
-        build_generate_request(&none_request).options.constraint,
+        build_generate_request_with_protocol(&none_request, &declared_protocol("atem-xml"))
+            .unwrap()
+            .options
+            .constraint,
         None
     );
     let GeneratePrompt::Text(prompt) = build_generate_request(&none_request).prompt else {
@@ -1158,7 +1170,8 @@ fn declared_tagged_json_protocol_converts_multiple_calls_to_openai() {
 </tool_call>"#
             .to_string(),
         "stop",
-    );
+    )
+    .expect("valid tagged JSON call");
 
     assert_eq!(parsed.finish_reason, "tool_calls");
     assert!(parsed.content.is_none());
@@ -1197,6 +1210,46 @@ fn declared_atem_xml_protocol_converts_escaped_values_to_openai() {
 }
 
 #[test]
+fn declared_atem_xml_request_uses_its_adapter_across_generation_and_parse() {
+    let request = chat_request(json!({
+        "model": "declared-atem-package",
+        "messages": [{"role": "user", "content": "run the weather tool"}],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "weather",
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}
+            }
+        }],
+        "tool_choice": {"type": "function", "function": {"name": "weather"}},
+        "response_format": {"type": "json_object"}
+    }));
+    let protocol = declared_protocol("atem-xml");
+
+    let generation = build_generate_request_with_protocol(&request, &protocol)
+        .expect("the declared package selects its adapter");
+    assert_eq!(
+        generation.options.constraint, None,
+        "ATEM explicitly declares no JSON grammar rather than inheriting tagged-json"
+    );
+    let GeneratePrompt::Text(prompt) = generation.prompt else {
+        panic!("the fallback production prompt is text");
+    };
+    assert!(prompt.contains("<atem:tools>"), "{prompt}");
+    assert!(!prompt.contains("<|tools|>"), "{prompt}");
+
+    let parsed = parse_assistant_output(
+        Some(&protocol),
+        "<atem:invoke name=\"weather\"><atem:parameter name=\"city\">\"Paris\"</atem:parameter></atem:invoke>"
+            .to_string(),
+        "stop",
+    )
+    .expect("the generated ATEM envelope must parse through the same adapter");
+    assert_eq!(parsed.finish_reason, "tool_calls");
+    assert_eq!(parsed.tool_calls.unwrap()[0].function.name, "weather");
+}
+
+#[test]
 fn parser_returns_only_atem_user_channel_content() {
     let parsed = parse_assistant_output(
         None,
@@ -1204,7 +1257,8 @@ fn parser_returns_only_atem_user_channel_content() {
          <|start|>assistant to=user<|message|>final answer<|eot|>"
             .to_string(),
         "stop",
-    );
+    )
+    .expect("ordinary ATEM user content");
 
     assert_eq!(parsed.content.as_deref(), Some("final answer"));
     assert!(parsed.tool_calls.is_none());
@@ -1218,7 +1272,8 @@ fn parser_withholds_atem_reasoning_without_a_user_channel() {
         None,
         "<|start|>assistant to=self<|message|>private reasoning that ran long".to_string(),
         "length",
-    );
+    )
+    .expect("ordinary truncated ATEM reasoning");
 
     assert_eq!(parsed.content.as_deref(), Some(""));
     assert!(parsed.tool_calls.is_none());
@@ -1241,9 +1296,59 @@ fn declared_protocol_reports_incomplete_and_malformed_envelopes() {
 }
 
 #[test]
+fn declared_protocol_envelope_failures_are_not_assistant_content() {
+    for (identity, output, failure) in [
+        (
+            "tagged-json",
+            "<tool_call>{\"name\":\"read\"}",
+            "incomplete",
+        ),
+        (
+            "atem-xml",
+            "<atem:invoke name=\"read\"><atem:parameter name=\"path\">",
+            "incomplete",
+        ),
+        (
+            "tagged-json",
+            "<tool_call>{\"name\":}</tool_call>",
+            "malformed",
+        ),
+        (
+            "atem-xml",
+            "<atem:invoke><atem:parameter name=\"path\">x</atem:parameter></atem:invoke>",
+            "malformed",
+        ),
+    ] {
+        let error = parse_assistant_output(
+            Some(&declared_protocol(identity)),
+            output.to_string(),
+            "stop",
+        )
+        .expect_err("declared malformed or incomplete envelopes must fail closed")
+        .to_string();
+        assert!(error.contains(&format!("{identity}@v1")), "{error}");
+        assert!(error.contains(failure), "{error}");
+        assert!(error.contains("buffered generation boundary"), "{error}");
+    }
+}
+
+#[test]
+fn declared_protocol_preserves_ordinary_no_call_assistant_text() {
+    for identity in ["tagged-json", "atem-xml"] {
+        let output = "ordinary assistant text".to_string();
+        let parsed =
+            parse_assistant_output(Some(&declared_protocol(identity)), output.clone(), "stop")
+                .expect("a non-envelope is ordinary assistant text");
+        assert_eq!(parsed.content, Some(output));
+        assert!(matches!(parsed.tool_parse, ToolParseOutcome::NoCall));
+    }
+}
+
+#[test]
 fn plain_assistant_output_preserves_content() {
     let output = "ordinary assistant text".to_string();
     let parsed = parse_assistant_output(None, output.clone(), "stop");
+    let parsed = parsed.expect("ordinary assistant content");
 
     assert_eq!(parsed.content, Some(output));
     assert!(parsed.tool_calls.is_none());
