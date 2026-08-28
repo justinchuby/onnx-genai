@@ -98,6 +98,17 @@ impl PageStoreLayout {
 /// KV paging on native CUDA belongs to the VMM layer (`CudaVmmAllocator`,
 /// #740/#745/#748) rather than to this crate.
 pub trait KvPageStoreFactory: fmt::Debug + Send + Sync {
+    /// Stable backend name used in actionable migration diagnostics.
+    fn backend_name(&self) -> &'static str {
+        "custom-page-store"
+    }
+
+    /// Fail before allocation when this backend cannot represent `layout` at
+    /// `residency`. The source page remains authoritative on any error.
+    fn validate_target(&self, _residency: Device, _layout: PageStoreLayout) -> Result<(), KvError> {
+        Ok(())
+    }
+
     /// Maximum bytes allocated by `create` for this layout and residency.
     ///
     /// The page table reserves this amount before calling `create`, making it
@@ -242,6 +253,19 @@ impl KvPageStore for HostPageStore {
 pub struct HostPageStoreFactory;
 
 impl KvPageStoreFactory for HostPageStoreFactory {
+    fn backend_name(&self) -> &'static str {
+        "host-page-store"
+    }
+
+    fn validate_target(&self, residency: Device, _layout: PageStoreLayout) -> Result<(), KvError> {
+        if residency == Device::Disk {
+            return Err(KvError::PageStoreAllocationFailed(
+                "host-page-store has no disk page representation".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     fn allocation_bytes(&self, _residency: Device, layout: PageStoreLayout) -> u64 {
         layout.host_allocated_bytes()
     }
@@ -703,20 +727,57 @@ impl Page {
                 bytes_copied: 0,
             });
         }
-        let mut replacement = factory.create(target, self.store_layout)?;
+        let storage_types = self.storage_type_summary();
+        let migration_error = |error: KvError| KvError::StateMigrationFailed {
+            page_id: self.id,
+            storage_types: storage_types.clone(),
+            backend: factory.backend_name(),
+            from,
+            to: target,
+            reason: error.to_string(),
+        };
+        factory
+            .validate_target(target, self.store_layout)
+            .map_err(migration_error)?;
+        let mut replacement = factory
+            .create(target, self.store_layout)
+            .map_err(migration_error)?;
         if replacement.residency() != target {
-            return Err(KvError::PageStoreWrongResidency {
+            return Err(migration_error(KvError::PageStoreWrongResidency {
                 requested: target,
                 actual: replacement.residency(),
-            });
+            }));
         }
-        let bytes_copied = self.store.copy_to(replacement.as_mut())?;
+        let bytes_copied = self
+            .store
+            .copy_to(replacement.as_mut())
+            .map_err(migration_error)?;
         self.store = replacement;
         Ok(PageMigration {
             from,
             to: target,
             bytes_copied,
         })
+    }
+
+    fn storage_type_summary(&self) -> String {
+        let mut types = Vec::new();
+        for storage in &self.storage_layout {
+            let name = match storage.dtype {
+                KvDType::F32 => "f32",
+                KvDType::Int8 => "int8",
+                KvDType::Fp8E4M3Fn => "fp8-e4m3fn",
+                KvDType::Fp8E5M2 => "fp8-e5m2",
+            };
+            if !types.contains(&name) {
+                types.push(name);
+            }
+        }
+        if types.is_empty() {
+            "bookkeeping-only".to_owned()
+        } else {
+            types.join(",")
+        }
     }
 
     /// Bytes this page's storage actually occupies.
@@ -2097,7 +2158,7 @@ mod migration_tests {
                 },
                 LayerKvDType {
                     key: KvDType::Fp8E4M3Fn,
-                    value: KvDType::F32,
+                    value: KvDType::Fp8E5M2,
                 },
             ],
         };
@@ -2183,6 +2244,22 @@ mod migration_tests {
         table.set_migration_factory(Arc::new(HostPageStoreFactory));
         table.migrate_page(page_id, Device::Cpu).unwrap();
         assert_eq!(snapshot(&table.pages[&page_id]), before);
+    }
+
+    #[test]
+    fn unsupported_migration_names_state_types_backend_and_keeps_source() {
+        let (mut table, page_id) = mixed_table();
+        let before = snapshot(&table.pages[&page_id]);
+
+        let error = table.migrate_page(page_id, Device::Disk).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains(&format!("page {page_id}")));
+        assert!(message.contains("f32,int8,fp8-e4m3fn,fp8-e5m2"));
+        assert!(message.contains("host-page-store"));
+        assert!(message.contains("Disk"));
+        assert_eq!(table.pages[&page_id].residency(), Device::Gpu(0));
+        assert_eq!(snapshot(&table.pages[&page_id]), before);
+        assert_eq!(table.pages[&page_id].filled, 1);
     }
 
     #[test]

@@ -2108,13 +2108,14 @@ impl Engine {
         // integration test. If injection is not possible we fall back to the
         // reporting-only `lookup_extension`, never claiming a hit we can't serve.
         if self.connector.is_active() {
-            let injected = self.try_connector_kv_injection(state, prompt_tokens, in_process_hit)?;
+            let injected =
+                self.try_connector_kv_injection(session_id, state, prompt_tokens, in_process_hit)?;
             if let Some(total) = injected {
                 return Ok(in_process_hit.max(total));
             }
             let _ = self
                 .connector
-                .lookup_extension(prompt_tokens, in_process_hit);
+                .lookup_extension(session_id, prompt_tokens, in_process_hit);
         }
         Ok(in_process_hit)
     }
@@ -2131,6 +2132,7 @@ impl Engine {
     /// input to feed.
     fn try_connector_kv_injection(
         &mut self,
+        session_id: SessionId,
         state: &mut EngineSession,
         prompt_tokens: &[TokenId],
         in_process_hit: usize,
@@ -2156,9 +2158,13 @@ impl Engine {
         // Leave at least one prompt token to feed the decoder: cap the fetch to
         // `prompt_len - 1` tokens so `fetched_tokens` equals what we inject.
         let max_tokens = prompt_tokens.len().saturating_sub(1);
-        let outcome =
-            self.connector
-                .fetch_extension(prompt_tokens, boundary, max_tokens, Device::Cpu);
+        let outcome = self.connector.fetch_extension(
+            session_id,
+            prompt_tokens,
+            boundary,
+            max_tokens,
+            Device::Cpu,
+        );
         if outcome.fetched_tokens == 0 {
             return Ok(None);
         }
@@ -2432,7 +2438,7 @@ impl Engine {
     /// chunk in the connector. Best-effort: any gating failure or extraction
     /// error skips storing (never surfaced to inference). See
     /// [`crate::connector_bridge::ConnectorBridge::store_prefix_with`].
-    fn store_connector_prefix(&mut self, state: &EngineSession) {
+    fn store_connector_prefix(&mut self, session_id: SessionId, state: &EngineSession) {
         if !state.decode_state.runner_supports_kv_handoff() {
             return;
         }
@@ -2458,6 +2464,7 @@ impl Engine {
             }
         };
         self.connector.store_prefix_with(
+            session_id,
             &state.tokens,
             state.kv_token_count,
             |chunk_start, num_tokens| {
@@ -2478,7 +2485,7 @@ impl Engine {
         // runners with f32 KV can hand off owned tensors; other paths skip
         // (store is a no-op for the default `Null` connector regardless).
         if self.connector.is_active() {
-            self.store_connector_prefix(state);
+            self.store_connector_prefix(session_id, state);
         }
         if state.decode_state.uses_token_prefix_cache() {
             if prompt_len > 0 && prompt_len <= state.kv_token_count {
