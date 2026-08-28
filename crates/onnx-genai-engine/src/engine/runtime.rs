@@ -2062,46 +2062,6 @@ impl Engine {
         session_state::rewind_to(&mut OrtSessions(self), session_id, position)
     }
 
-    /// Capability for session fork, if the selected backend supports safe CoW
-    /// fork at the engine level.
-    ///
-    /// Current ORT decode runners do not expose clone/import semantics strong
-    /// enough to fork without deep-copying or aliasing mutable KV, so this
-    /// returns `None` today. A future supported backend should return `Some` and
-    /// route fork through [`Engine::fork_session`].
-    pub fn session_fork_capability(&self) -> Option<SessionForkCapability> {
-        None
-    }
-
-    /// Fork a persistent session at a logical token boundary.
-    ///
-    /// Callers can obtain `capability` only from
-    /// [`Engine::session_fork_capability`], which is `None` for all current
-    /// backends. Keeping the capability token in the signature prevents
-    /// unsupported engines from being asked to fork through the typed API.
-    pub fn fork_session(
-        &mut self,
-        _capability: &SessionForkCapability,
-        source: SessionId,
-        position: SessionPosition,
-    ) -> anyhow::Result<SessionId> {
-        self.require_ort_backend("session fork")?;
-        let state = self
-            .sessions
-            .get(&source)
-            .with_context(|| format!("session {source} not found"))?;
-        let position = position.get();
-        let current = state.tokens.len();
-        if position > current {
-            anyhow::bail!(
-                "cannot fork session {source} at token {position}; current length is {current}"
-            );
-        }
-        anyhow::bail!(
-            "session fork is not yet enabled: safe CoW fork requires cloneable/importable decoder state aligned with paged KV; current ORT runner/static-cache paths would require deep-copying or unsafe KV aliasing"
-        )
-    }
-
     /// Reset a persistent session, freeing its current state while keeping the id usable.
     pub fn reset_session(&mut self, session_id: SessionId) -> anyhow::Result<()> {
         // Resetting is the same promise for every package: the id stays usable
@@ -2127,7 +2087,7 @@ impl Engine {
         session_state::reset(&mut OrtSessions(self), session_id)
     }
 
-    fn new_target_decode_state(&self) -> anyhow::Result<DecodeState> {
+    pub(crate) fn new_target_decode_state(&self) -> anyhow::Result<DecodeState> {
         let session = self
             .session
             .as_ref()

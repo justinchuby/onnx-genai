@@ -727,6 +727,14 @@ impl WorkerPool {
         }
     }
 
+    /// Reserve a child session on the worker that owns its fork source.
+    pub(crate) fn reserve_session_on(
+        &self,
+        worker: WorkerId,
+    ) -> Result<SessionPlacementReservation, WorkerUnavailable> {
+        self.worker(worker)?.reserve_session()
+    }
+
     /// Reserve one stateless turn on the least-loaded healthy worker.
     pub(crate) fn reserve_stateless_turn(
         &self,

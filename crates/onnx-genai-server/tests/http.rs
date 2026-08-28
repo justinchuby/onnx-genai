@@ -685,6 +685,106 @@ async fn session_ids_are_random_csprng_tokens() {
 }
 
 #[tokio::test]
+async fn session_fork_endpoint_returns_an_independent_child() {
+    let app = test_app().await;
+    let source = create_http_session(app.clone()).await;
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/sessions/{source}/fork"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({ "position": 0 }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, body) = response_json(response).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["object"], "session");
+    let child = body["id"].as_str().unwrap().to_string();
+    assert_ne!(source, child);
+
+    for id in [source, child] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/v1/sessions/{id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+}
+
+#[tokio::test]
+async fn session_fork_endpoint_reports_the_unsupported_participant_before_child() {
+    let app = test_app().await;
+    let source = create_http_session(app.clone()).await;
+    let generated = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("X-Session-Id", &source)
+                .body(Body::from(
+                    json!({
+                        "model": "tiny-llm",
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "max_tokens": 1
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(generated.status(), StatusCode::OK);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/sessions/{source}/fork"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({ "position": 0 }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, body) = response_json(response).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("runner-owned decoder KV"),
+        "{body}"
+    );
+
+    let closed = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/v1/sessions/{source}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(closed.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
 async fn sessions_are_lru_evicted_at_configured_cap() {
     let app = test_app_with_config(ServerConfig {
         max_output_tokens: 16,
