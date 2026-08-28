@@ -598,6 +598,14 @@ const MATRIX: &[Row] = &[
         true,
         Some("decoder"),
     ),
+    row(
+        "tests/fixtures/tiny-tool-call/inference_metadata.yaml",
+        1,
+        SingleGraph,
+        Some("decoder"),
+        true,
+        Some("decoder"),
+    ),
     // ── crate-local fixtures ─────────────────────────────────────────────────
     // DFlash has distinct proposer and verifier graphs and is therefore not
     // classified as a single-decoder workflow.

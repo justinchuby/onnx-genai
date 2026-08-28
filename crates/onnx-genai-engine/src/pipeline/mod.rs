@@ -39,6 +39,7 @@ mod output;
 mod row_state;
 mod runtime_state;
 pub mod speculative;
+mod tool_protocol;
 mod turn_transaction;
 mod workflow;
 
@@ -59,6 +60,10 @@ pub use output::{
     TypedRevisionEnvelope, TypedRevisionOperation, WorkflowOutputPublication,
 };
 pub use row_state::{RowPlan, RowScopedState, RowTable, check_selection, gather_rows};
+pub use tool_protocol::{
+    GenerationStopReason, StagedOutputCheckpoint, StagedOutputObservation,
+    StagedOutputObservationError, ToolCallStagedOutputObserver,
+};
 pub(crate) use turn_transaction::TurnTransaction;
 pub use turn_transaction::{
     OutputPublicationBaseline, TurnAbortReason, TurnBaselineId, TurnCommittedBaseline,
@@ -381,6 +386,8 @@ pub(crate) struct WorkflowSessionForkSnapshot {
 /// A request for the universal workflow interpreter.
 pub struct PipelineGenerateRequest {
     pub request: GenerateRequest,
+    /// Transport-neutral policy for interpreting generated tool-call output.
+    pub tool_call_policy: crate::ToolCallPolicy,
     /// Application tensors keyed by a declared package input or application source name.
     pub inputs: PipelineTensors,
     /// Identity used by session-scoped workflow state cells.
@@ -396,6 +403,7 @@ impl PipelineGenerateRequest {
     pub fn new(request: GenerateRequest) -> Self {
         Self {
             request,
+            tool_call_policy: crate::ToolCallPolicy::Disabled,
             inputs: HashMap::new(),
             session_id: None,
             component_overrides: HashMap::new(),
@@ -425,6 +433,11 @@ impl PipelineGenerateRequest {
 
     pub fn with_generation_control(mut self, control: GenerationControl) -> Self {
         self.generation_control = Some(control);
+        self
+    }
+
+    pub fn with_tool_call_policy(mut self, policy: crate::ToolCallPolicy) -> Self {
+        self.tool_call_policy = policy;
         self
     }
 }

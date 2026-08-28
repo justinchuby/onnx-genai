@@ -30,6 +30,7 @@ fn finish_reason_name(reason: &FinishReason) -> String {
         FinishReason::EosToken => "eos_token".to_string(),
         FinishReason::StopSequence { index } => format!("stop_sequence:{index}"),
         FinishReason::Length => "length".to_string(),
+        FinishReason::ToolCalls => "tool_calls".to_string(),
     }
 }
 

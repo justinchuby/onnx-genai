@@ -63,10 +63,7 @@ pub(crate) use admin::{
 };
 #[cfg(test)]
 pub(crate) use completions::prepare_completion;
-pub use completions::{
-    ParsedAssistantOutput, build_generate_request, build_generate_request_with_protocol,
-    build_prompt, parse_assistant_output,
-};
+pub use completions::{build_generate_request, build_generate_request_with_protocol, build_prompt};
 pub(crate) use completions::{
     chat_completions, collect_generation_result, completions, embeddings,
 };

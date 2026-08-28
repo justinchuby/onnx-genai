@@ -12,9 +12,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use onnx_genai_engine::pipeline::speculative::DFlashGenerationCancelled;
 use onnx_genai_engine::{
-    Engine, EngineConfig, GenerateOptions, GeneratePrompt, GenerateRequest, GenerationBoundary,
-    GenerationControl, PackageExecutionError, PipelineGenerateRequest, SessionForkError,
-    SessionPosition, package_execution_error,
+    Engine, EngineConfig, FinishReason, GenerateOptions, GeneratePrompt, GenerateRequest,
+    GenerationBoundary, GenerationControl, PackageExecutionError, PipelineGenerateRequest,
+    SessionForkError, SessionPosition, ToolCallPolicy, package_execution_error,
 };
 use onnx_genai_ort::{DataType, Environment, Session, SessionOptions, Value};
 use rand::rngs::StdRng;
@@ -795,6 +795,38 @@ fn package_with_target_scales_and_weights(
     Ok(root)
 }
 
+fn install_tool_protocol_tokenizer(root: &Path, token: u64, text: &str) -> anyhow::Result<()> {
+    let metadata_path = root.join("inference_metadata.yaml");
+    let metadata = fs::read_to_string(&metadata_path)?.replacen(
+        "package:\n  tokenizer:",
+        "package:\n  tool_protocol: { identity: tagged-json, version: v1 }\n  tokenizer:",
+        1,
+    );
+    fs::write(metadata_path, metadata)?;
+    let mut vocab = serde_json::Map::from_iter(
+        (0..4).map(|value| (format!("token_{value}"), serde_json::Value::from(value))),
+    );
+    vocab.insert("<unk>".to_string(), serde_json::Value::from(1));
+    vocab.retain(|_, value| value.as_u64() != Some(token));
+    vocab.insert(text.to_string(), serde_json::Value::from(token));
+    let tokenizer = serde_json::json!({
+        "version": "1.0",
+        "truncation": null,
+        "padding": null,
+        "added_tokens": [],
+        "normalizer": null,
+        "pre_tokenizer": null,
+        "post_processor": null,
+        "decoder": null,
+        "model": {"type": "WordLevel", "vocab": vocab, "unk_token": "<unk>"}
+    });
+    fs::write(
+        root.join("tokenizer.json"),
+        serde_json::to_vec_pretty(&tokenizer)?,
+    )?;
+    Ok(())
+}
+
 fn run_proposer(
     session: &Session,
     target_features: &[f32],
@@ -1117,6 +1149,34 @@ fn engine_dispatches_dflash_v1_to_real_target_and_proposer_sessions() -> anyhow:
             "1"
         );
     }
+    Ok(())
+}
+
+#[test]
+fn dflash_waits_for_budget_boundary_across_complete_call_blocks() -> anyhow::Result<()> {
+    let root = package("1", false, &[2, 2, 2, 2, 2, 2, 2, 2])?;
+    install_tool_protocol_tokenizer(
+        &root,
+        0,
+        r#"<tool_call>{"name":"weather","arguments":{"city":"Paris"}}</tool_call>"#,
+    )?;
+    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+    let result = engine.generate_with_pipeline_request(
+        PipelineGenerateRequest::new(GenerateRequest {
+            prompt: GeneratePrompt::TokenIds(vec![1, 2]),
+            options: GenerateOptions {
+                max_new_tokens: 8,
+                greedy: true,
+                stop_on_eos: false,
+                ..GenerateOptions::default()
+            },
+        })
+        .with_tool_call_policy(ToolCallPolicy::Auto),
+    )?;
+    assert_eq!(result.token_ids, vec![0; 8]);
+    assert_eq!(result.finish_reason, FinishReason::ToolCalls);
+    assert_eq!(result.tool_calls.len(), 8);
+    assert!(result.tool_calls.iter().all(|call| call.name == "weather"));
     Ok(())
 }
 

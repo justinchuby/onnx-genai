@@ -53,8 +53,8 @@ pub use crate::config::{
     MirostatConfig, MirostatVersion, MtpCacheScope, MtpConfig, MtpHiddenLayout, MtpWeightSource,
     PrioritizedGenerateRequest, PrioritizedGenerateResult, RecurrentPrefixCacheStats,
     RewindTokenCount, SamplingOverrides, ScheduledGenerateArrival, SessionCheckpoint, SessionId,
-    SessionPosition, SpeculativeMode, TokenLogprob, WeightAccessPattern, WeightPlacementReport,
-    XtcConfig, parse_device_policy, parse_resource_limit,
+    SessionPosition, SpeculativeMode, TokenLogprob, ToolCallPolicy, WeightAccessPattern,
+    WeightPlacementReport, XtcConfig, parse_device_policy, parse_resource_limit,
 };
 pub use crate::connector_bridge::{ConnectorLookupOutcome, ConnectorStats};
 pub(crate) use crate::speculative::{

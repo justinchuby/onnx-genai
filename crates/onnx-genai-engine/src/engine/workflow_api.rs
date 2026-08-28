@@ -223,10 +223,22 @@ impl Engine {
     pub fn generate_with_pipeline_callbacks(
         &mut self,
         request: PipelineGenerateRequest,
+        on_admitted: Option<&mut dyn FnMut()>,
+        callback: Option<&mut GenerateTokenCallback<'_>>,
+    ) -> anyhow::Result<GenerateResult> {
+        self.generate_with_pipeline_tool_policy_callbacks(request, on_admitted, callback)
+    }
+
+    pub fn generate_with_pipeline_tool_policy_callbacks(
+        &mut self,
+        request: PipelineGenerateRequest,
         mut on_admitted: Option<&mut dyn FnMut()>,
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
         self.require_workflow_execution_admitted()?;
+        // Fail closed on the exact declared protocol before scheduler
+        // admission, workflow session binding, or specialized driver state.
+        let _ = self.tool_call_observer(&request.tool_call_policy)?;
         if request.generation_control.is_some()
             && self
                 .workflow_runtime()
@@ -248,15 +260,22 @@ impl Engine {
         // request that asked for none of it.
         let prompt_only = request.inputs.is_empty() && request.component_overrides.is_empty();
         if prompt_only && self.holds_decode_core() {
+            let tool_call_policy = request.tool_call_policy.clone();
             return match request.session_id.as_deref().and_then(|id| id.parse().ok()) {
                 Some(session) if self.sessions.contains_key(&session) => self
-                    .generate_in_session_with_callbacks(
+                    .generate_in_session_with_tool_policy_callbacks(
                         session,
                         request.request,
+                        tool_call_policy,
                         on_admitted,
                         callback,
                     ),
-                _ => self.generate_with_callbacks(request.request, on_admitted, callback),
+                _ => self.generate_with_tool_policy_callbacks(
+                    request.request,
+                    tool_call_policy,
+                    on_admitted,
+                    callback,
+                ),
             };
         }
         // Everything that reaches here runs the declared workflow: a
@@ -332,14 +351,33 @@ impl Engine {
         }
         let options = request.request.options.clone();
         let tokenizer = runtime.package_tokenizer();
+        let mut observer = self.tool_call_observer(&request.tool_call_policy)?;
         if runtime.candidate_tree_diagnostic().is_some() {
-            return runtime.run_candidate_tree_generation(&options, request, tokenizer, callback);
+            return runtime.run_candidate_tree_generation(
+                &options,
+                request,
+                tokenizer,
+                observer.as_mut(),
+                callback,
+            );
         }
         if runtime.dflash_diagnostic().is_some() {
-            return runtime.run_dflash_generation(&options, request, tokenizer, callback);
+            return runtime.run_dflash_generation(
+                &options,
+                request,
+                tokenizer,
+                observer.as_mut(),
+                callback,
+            );
         }
         crate::pipeline::generation::run_declared_generation(
-            runtime, &options, tokenizer, request, None, callback,
+            runtime,
+            &options,
+            tokenizer,
+            request,
+            None,
+            observer.as_mut(),
+            callback,
         )
     }
 

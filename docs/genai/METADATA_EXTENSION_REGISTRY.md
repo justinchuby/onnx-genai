@@ -22,8 +22,8 @@ Packages declare an extension only through its typed declaration location. The r
 
 | Identity | Surface | Schema floor | Declaration location | Normative reference | Admission consumer | Fallback | Current status |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `tagged-json@v1` | tool protocol | `v1.3` | `package.tool_protocol` | §4.3a, §15 | `onnx_genai_server::tool_protocol::resolve` | semantic-required (fail closed) | implemented |
-| `atem-xml@v1` | tool protocol | `v1.3` | `package.tool_protocol` | §4.3a, §15 | `onnx_genai_server::tool_protocol::resolve` | semantic-required (fail closed) | implemented |
+| `tagged-json@v1` | tool protocol | `v1.3` | `package.tool_protocol` | §4.3a, §15 | `onnx_genai_metadata::tool_protocol::resolve` | semantic-required (fail closed) | implemented |
+| `atem-xml@v1` | tool protocol | `v1.3` | `package.tool_protocol` | §4.3a, §15 | `onnx_genai_metadata::tool_protocol::resolve` | semantic-required (fail closed) | implemented |
 | `onnx-genai.token-context@1` | component contract | `v1.4` | `pipeline.workflow.components.<name>.contract` | §12, §15 | `onnx_genai_metadata::validate_token_context_component` | semantic-required (fail closed) | implemented |
 | `onnx-genai.speculative@1` | speculative execution contract | `v1.6` | `speculative.identity + speculative.version` | §13 | `onnx_genai_engine::WorkflowExecutionAdmission` | semantic-required (fail closed) | partial; see admission consumer |
 | `onnx-genai.dflash-flat-block@1` | speculative execution contract | `v1.6` | `speculative.proposal_execution { kind: dflash_flat_block, version }` | §13 | `onnx_genai_engine::WorkflowExecutionAdmission` | semantic-required (fail closed) | partial; see admission consumer |

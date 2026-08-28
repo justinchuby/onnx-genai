@@ -1531,11 +1531,18 @@ This server currently supplies these exact v1 adapters:
 For both adapters, explicit IDs are preserved and absent IDs become stable
 `call_<index>` values in envelope order. Duplicate IDs, empty/oversized names
 or IDs, excess calls, non-whitespace envelope interstitials, invalid JSON, and
-text outside XML parameters are malformed. Before an opening envelope parsing
-is `NoCall`; after an unclosed opening envelope it is `Incomplete`; a complete,
-valid sequence is `Complete`. Feeding the same UTF-8 output in arbitrary chunks
-MUST produce the same typed result as feeding it at once. This server caps each
-rendered or parsed protocol payload at 64 KiB and each collection at 32 calls.
+text outside XML parameters are malformed. Neither v1 protocol declares an
+unambiguous end marker for a sequence containing one or more adjacent calls.
+Before an opening envelope parsing is `NoCall`; after an unclosed opening
+envelope it is `Incomplete`; one or more closed envelopes are `CompleteSoFar`
+and remain nonterminal because another adjacent envelope may follow. Only an
+independent declared generation terminal boundary (EOS, stop sequence, committed
+budget, or context limit) applies parser `finish` and produces
+`TerminalComplete`. A host integration, including #2326, **MUST** stop on
+`TerminalComplete` or that finish boundary, never on `CompleteSoFar` or a chunk
+boundary. Feeding the same UTF-8 output in arbitrary chunks MUST produce the
+same typed result as feeding it at once. This server caps the whole accumulated
+rendered or parsed protocol sequence at 64 KiB and each collection at 32 calls.
 At the buffered-generation and SSE-streaming boundaries, `Incomplete` and
 `Malformed` are typed protocol failures that name the declared identity/version
 and boundary; they are never returned as assistant content. `NoCall` remains
