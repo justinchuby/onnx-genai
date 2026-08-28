@@ -483,6 +483,29 @@ struct NativeSessions<'a>(&'a mut Engine);
 #[cfg(feature = "native-backend")]
 struct NativeSessionsRef<'a>(&'a Engine);
 
+/// Commit a logical rewind only after any required materialized-state rewind.
+///
+/// A target at or beyond the decoder cursor removes only unmaterialized logical
+/// tokens, so capability checks for a physical CSA/HCA rewind do not apply.
+#[cfg(feature = "native-backend")]
+fn apply_native_rewind<T>(
+    logical_tokens: Option<&mut Vec<T>>,
+    logical_target: usize,
+    materialized_len: Option<usize>,
+    rewind_materialized: impl FnOnce(usize) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    if let Some(current) = materialized_len {
+        let target = logical_target.min(current);
+        if target < current {
+            rewind_materialized(target)?;
+        }
+    }
+    if let Some(tokens) = logical_tokens {
+        tokens.truncate(logical_target);
+    }
+    Ok(())
+}
+
 #[cfg(feature = "native-backend")]
 impl SessionLen for NativeSessions<'_> {
     fn logical_len(&self, id: SessionId) -> Option<usize> {
@@ -500,25 +523,41 @@ impl SessionLen for NativeSessionsRef<'_> {
 #[cfg(feature = "native-backend")]
 impl SessionStore for NativeSessions<'_> {
     fn validate_rewind(&self, _id: SessionId, _target: CheckedPosition) -> anyhow::Result<()> {
-        // The native decoder always admits a rewind and clamps to its own
-        // materialized length in `rewind`; there is no runner/draft state to
-        // reject it the way ORT's does.
+        // The native decoder validates any required physical move before the
+        // logical tail is committed in `rewind`.
         Ok(())
     }
 
     fn rewind(&mut self, id: SessionId, target: CheckedPosition) -> anyhow::Result<()> {
         let engine = &mut *self.0;
         let position = target.get();
-        if let Some(state) = engine.native_sessions.get_mut(&id) {
-            state.tokens.truncate(position);
-        }
-        if engine.native_active_session == Some(id) {
-            let native = engine
-                .native_session
-                .as_mut()
-                .context("native decoder session is unavailable")?;
-            native.rewind(position.min(native.current_len()))?;
-        }
+        let materialized_len = if engine.native_active_session == Some(id) {
+            Some(
+                engine
+                    .native_session
+                    .as_ref()
+                    .context("native decoder session is unavailable")?
+                    .current_len(),
+            )
+        } else {
+            None
+        };
+        let native_session = &mut engine.native_session;
+        let logical_tokens = engine
+            .native_sessions
+            .get_mut(&id)
+            .map(|state| &mut state.tokens);
+        apply_native_rewind(
+            logical_tokens,
+            position,
+            materialized_len,
+            |physical_target| {
+                native_session
+                    .as_mut()
+                    .context("native decoder session is unavailable")?
+                    .rewind(physical_target)
+            },
+        )?;
         let last_access = engine.touch_native_session();
         if let Some(state) = engine.native_sessions.get_mut(&id) {
             state.last_access = last_access;
@@ -3546,6 +3585,58 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn native_zero_count_rewind_does_not_touch_materialized_state() {
+        let mut tokens = (0..10).collect::<Vec<_>>();
+        let mut physical_called = false;
+        apply_native_rewind(Some(&mut tokens), 10, Some(8), |_| {
+            physical_called = true;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(tokens.len(), 10);
+        assert!(!physical_called);
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn native_logical_tail_can_shrink_without_rewinding_materialized_state() {
+        let mut tokens = (0..10).collect::<Vec<_>>();
+        let mut physical_called = false;
+        apply_native_rewind(Some(&mut tokens), 9, Some(8), |_| {
+            physical_called = true;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(tokens.len(), 9);
+        assert!(!physical_called);
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn native_failed_physical_rewind_is_retryable_without_logical_drift() {
+        let mut tokens = (0..10).collect::<Vec<_>>();
+        let before = tokens.clone();
+        let mut attempts = Vec::new();
+        let error = apply_native_rewind(Some(&mut tokens), 7, Some(8), |target| {
+            attempts.push(target);
+            anyhow::bail!("synthetic physical refusal")
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "synthetic physical refusal");
+        assert_eq!(tokens, before);
+
+        apply_native_rewind(Some(&mut tokens), 7, Some(8), |target| {
+            attempts.push(target);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(attempts, [7, 7]);
+        assert_eq!(tokens, (0..7).collect::<Vec<_>>());
+    }
+
     #[cfg(feature = "native-backend")]
     use crate::ProcessorChain;
     use std::path::Path;
