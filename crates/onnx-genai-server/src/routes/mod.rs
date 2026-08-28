@@ -74,7 +74,7 @@ pub(crate) use images::{
     a1111_img2img, a1111_models, a1111_options, a1111_samplers, a1111_txt2img, openai_images,
 };
 pub(crate) use multimodal::audio_transcriptions;
-pub(crate) use sessions::{create_session, delete_session};
+pub(crate) use sessions::{create_session, delete_session, fork_session};
 pub(crate) use speech::audio_speech;
 
 const SESSION_ID_HEADER: &str = "x-session-id";
@@ -388,6 +388,11 @@ pub(crate) struct SessionResponse {
     object: &'static str,
 }
 
+#[derive(Debug, Deserialize)]
+pub(crate) struct SessionForkRequest {
+    position: usize,
+}
+
 #[derive(Debug, Serialize)]
 struct ErrorResponse {
     error: ErrorBody,
@@ -542,6 +547,38 @@ pub(crate) fn session_create_failure(error: anyhow::Error) -> ApiError {
     }
 }
 
+pub(crate) fn session_fork_failure(error: anyhow::Error) -> ApiError {
+    if let Some(unavailable) = error
+        .chain()
+        .find_map(|source| source.downcast_ref::<crate::worker::WorkerUnavailable>())
+    {
+        return ApiError::unavailable(unavailable.to_string());
+    }
+    let Some(fork) = error
+        .chain()
+        .find_map(|source| source.downcast_ref::<onnx_genai_engine::SessionForkError>())
+    else {
+        return ApiError::internal(format!("session fork failed: {error}"));
+    };
+    match fork {
+        onnx_genai_engine::SessionForkError::SessionNotFound { .. } => {
+            ApiError::not_found(fork.to_string())
+        }
+        onnx_genai_engine::SessionForkError::PositionOutOfBounds { .. }
+        | onnx_genai_engine::SessionForkError::PositionNotCommitted { .. } => {
+            ApiError::invalid_request(fork.to_string())
+        }
+        onnx_genai_engine::SessionForkError::UnsupportedParticipant { .. }
+        | onnx_genai_engine::SessionForkError::SnapshotFailed { .. }
+        | onnx_genai_engine::SessionForkError::StalePlan { .. }
+        | onnx_genai_engine::SessionForkError::ForeignOrigin { .. }
+        | onnx_genai_engine::SessionForkError::StaleOrigin { .. } => {
+            ApiError::conflict(fork.to_string())
+        }
+        onnx_genai_engine::SessionForkError::Publication(_) => ApiError::internal(fork.to_string()),
+    }
+}
+
 /// The status a package refusal actually is, read off the variant.
 ///
 /// Shared by every layer that can raise one — session creation, generation, and
@@ -551,6 +588,9 @@ pub(crate) fn session_create_failure(error: anyhow::Error) -> ApiError {
 pub(crate) fn package_capability_failure(capability: PackageCapabilityError) -> ApiError {
     match capability {
         PackageCapabilityError::NoSessionState => ApiError::conflict(capability.to_string()),
+        PackageCapabilityError::DFlashExecutionUnavailable { .. } => {
+            ApiError::conflict(capability.to_string())
+        }
         PackageCapabilityError::ConversationOverBound { .. } => {
             ApiError::invalid_request(capability.to_string())
         }

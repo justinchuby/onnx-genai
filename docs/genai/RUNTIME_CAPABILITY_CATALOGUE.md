@@ -39,4 +39,5 @@ admission identifiers drift. Extension identifiers remain open and namespaced.
 | `explicit_transfer` |
 | `token_context` |
 | `canonical_speculation` |
+| `dflash_flat_block` |
 <!-- capability-catalogue:end -->

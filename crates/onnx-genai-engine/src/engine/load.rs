@@ -97,6 +97,7 @@ impl OrtEngineWorkerFactory {
             &governor,
         )?;
         Ok(Engine {
+            session_fork_origin: SessionForkOrigin::new(),
             workflow: Box::new(self.workflow.build()),
             decode_backend: EngineDecodeBackend::Ort,
             metadata: self.metadata.clone(),
@@ -319,19 +320,35 @@ impl Engine {
         // that foreign format into this project's one representation — and which
         // needs a resolvable model directory, something a composite workflow
         // package (components in subdirectories) deliberately does not present.
-        let metadata = match onnx_genai_metadata::parser::load_metadata_from_dir(model_dir)
-            .map_err(|error| anyhow::anyhow!("{error}"))?
-        {
-            Some(metadata) => Some(metadata),
-            None => onnx_genai_ort::ModelDirectory::load(model_dir)
+        let metadata = if onnx_genai_metadata::find_metadata_path(model_dir).is_some() {
+            let mut capability_error = None;
+            let directory =
+                match onnx_genai_ort::PipelineModelDirectory::load_with_metadata_preflight(
+                    model_dir,
+                    |metadata| {
+                        crate::pipeline::WorkflowExecutionAdmission::from_metadata(metadata)
+                            .require_supported()
+                            .map_err(|error| {
+                                capability_error = Some(error.clone());
+                                onnx_genai_ort::OrtError::InvalidArgument(error.to_string())
+                            })
+                    },
+                ) {
+                    Ok(directory) => directory,
+                    Err(_) if capability_error.is_some() => {
+                        return Err(capability_error.expect("guarded by is_some").into());
+                    }
+                    Err(error) => return Err(anyhow::anyhow!("{error}")),
+                };
+            return Ok(directory.spec.workflow);
+        } else {
+            onnx_genai_ort::ModelDirectory::load(model_dir)
                 .ok()
-                .and_then(|directory| load_inference_metadata(&directory).ok()),
+                .and_then(|directory| load_inference_metadata(&directory).ok())
         };
-        if let Some(metadata) = metadata.as_ref() {
-            onnx_genai_metadata::validate_metadata(metadata).map_err(|errors| {
-                anyhow::anyhow!("Invalid inference metadata: {}", errors.join("; "))
-            })?;
-            crate::pipeline::admit_speculative_runtime(metadata.speculative.as_ref())?;
+        if let Some(metadata) = &metadata {
+            crate::pipeline::WorkflowExecutionAdmission::from_metadata(metadata)
+                .require_supported()?;
         }
         metadata
             .as_ref()
@@ -772,6 +789,7 @@ impl Engine {
             &memory_strategy_plan,
         )?;
         Ok(Self {
+            session_fork_origin: SessionForkOrigin::new(),
             workflow,
             decode_backend,
             metadata,
@@ -1509,6 +1527,7 @@ impl Engine {
             &memory_strategy_plan,
         )?;
         Ok(Self {
+            session_fork_origin: SessionForkOrigin::new(),
             workflow,
             decode_backend: EngineDecodeBackend::Native,
             metadata,

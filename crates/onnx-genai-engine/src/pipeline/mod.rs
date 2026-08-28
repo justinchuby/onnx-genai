@@ -12,8 +12,8 @@ use anyhow::Context;
 use onnx_genai_metadata::decoder_workflow::IterationPolicy;
 use onnx_genai_metadata::{
     ComponentImplementation, DeviceKind, LiteralValue, RuntimeInputRole, ScalarValue,
-    SpeculativeContract, SpeculativeProposalExecution, TensorContract, TensorDimension,
-    WorkflowEmitMode, WorkflowInputSource, WorkflowNode, WorkflowSpec,
+    TensorContract, TensorDimension, WorkflowEmitMode, WorkflowInputSource, WorkflowNode,
+    WorkflowSpec,
 };
 use onnx_genai_ort::{
     DataType, PipelineModelDirectory, PipelineModels, SessionOptions, Tokenizer, Value,
@@ -29,6 +29,7 @@ mod arg_reduce;
 mod audio;
 mod batching;
 mod device_ops;
+mod execution_admission;
 pub(crate) mod generation;
 mod islands;
 #[cfg(feature = "native-backend")]
@@ -47,6 +48,7 @@ pub use batching::{
     BatchContractError, ComposedOwnership, OwnershipLevelValues, PackedOwnership,
     PackedRequestView, PackedTensor, PackedValueView, RebasedI64Slice, batch_contract_error,
 };
+pub(crate) use execution_admission::WorkflowExecutionAdmission;
 pub(crate) use generation::validate_generation_workflow;
 pub use islands::ExecutionIslandDiagnostic;
 pub use onnx_genai_metadata::WorkflowOutputRole;
@@ -69,36 +71,6 @@ pub use workflow::{
 pub(crate) use workflow::{
     PerTokenCursorIneligible, WorkflowGenerationCursor, WorkflowNodeHost, WorkflowNodeRequest,
 };
-
-/// Admit only speculative package contracts for which this runtime has a
-/// package-dispatch executor.
-///
-/// Metadata validation owns protocol identity, exact version, and topology.
-/// This runtime gate owns implementation capability and must run before model,
-/// session, state, or output construction.
-pub(crate) fn admit_speculative_runtime(
-    contract: Option<&SpeculativeContract>,
-) -> anyhow::Result<()> {
-    let Some(contract) = contract else {
-        return Ok(());
-    };
-    if !matches!(
-        contract.proposal_execution,
-        SpeculativeProposalExecution::CandidateTree { .. }
-    ) {
-        return Ok(());
-    }
-    anyhow::bail!(
-        "package declares canonical candidate-tree speculation \
-         (onnx-genai.speculative@{}), but this runtime has no candidate-tree \
-         package-dispatch capability or executor. Refusing to silently run plain or MTP \
-         generation without the declared proposer, target verification, accepted-prefix \
-         commit, and rollback participants. Upgrade to a runtime that implements \
-         candidate-tree dispatch, or re-export this package with a supported canonical \
-         proposal execution.",
-        contract.version
-    );
-}
 
 pub fn has_buffered_pcm16_wav_output(workflow: &WorkflowSpec) -> bool {
     audio::has_buffered_pcm16_wav_output(workflow)
@@ -164,10 +136,98 @@ impl std::ops::Deref for PipelineOutputs {
     }
 }
 
+#[cfg(test)]
+mod dflash_constructor_admission_tests {
+    use super::*;
+    use crate::memory_authority::{DeviceCompatibilityDomain, DeviceMemoryAuthority};
+    use onnx_runtime_memory_governor::ProcessMemoryManager;
+    use std::path::PathBuf;
+
+    struct PanicAuthorityProvider;
+
+    impl MemoryAuthorityProvider for PanicAuthorityProvider {
+        fn process_memory_manager(&self) -> ProcessMemoryManager {
+            panic!("DFlash admission must precede authority allocation")
+        }
+
+        fn validate_limit(
+            &self,
+            _domain: &DeviceCompatibilityDomain,
+            _requested: crate::ResourceLimit,
+        ) -> anyhow::Result<()> {
+            panic!("DFlash admission must precede authority validation")
+        }
+
+        fn authority(
+            &self,
+            _domain: &DeviceCompatibilityDomain,
+            _resolved_limit_bytes: u64,
+        ) -> anyhow::Result<DeviceMemoryAuthority> {
+            panic!("DFlash admission must precede device authority allocation")
+        }
+    }
+
+    fn fixture() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dflash-admission")
+    }
+
+    fn assert_dflash_refusal(error: anyhow::Error) {
+        assert!(matches!(
+            crate::engine::package_capability_error(&error),
+            Some(crate::engine::PackageCapabilityError::DFlashExecutionUnavailable {
+                version,
+                capability,
+            }) if version == "1"
+                && capability == onnx_genai_metadata::capabilities::DFLASH_FLAT_BLOCK
+        ));
+    }
+
+    #[test]
+    fn every_direct_workflow_constructor_refuses_before_model_or_authority_allocation() {
+        let root = fixture();
+        assert!(
+            PipelineModelDirectory::load(&root).is_err(),
+            "the empty ONNX files make this a loader spy: reaching component admission must fail"
+        );
+
+        let error = WorkflowRuntime::from_dir_with_session_options(
+            &root,
+            EngineConfig::default(),
+            SessionOptions::default(),
+        )
+        .err()
+        .expect("direct workflow construction must refuse DFlash");
+        assert_dflash_refusal(error);
+
+        let error = WorkflowRuntime::from_dir_with_session_options_and_memory_authority_provider(
+            &root,
+            EngineConfig::default(),
+            SessionOptions::default(),
+            Arc::new(PanicAuthorityProvider),
+        )
+        .err()
+        .expect("provider workflow construction must refuse DFlash");
+        assert_dflash_refusal(error);
+    }
+}
+
 /// Replayable snapshot of semantic session-scoped workflow state.
 pub struct WorkflowSessionCheckpoint {
     semantic_state: HashMap<String, Value>,
     contracts: HashMap<String, TensorContract>,
+}
+
+/// Fully cloned committed workflow-session state prepared before a child
+/// identity is created.
+pub(crate) struct WorkflowSessionForkSnapshot {
+    semantic_state: Vec<(String, Value)>,
+    effects: Vec<(String, u64)>,
+    outputs: Vec<(
+        String,
+        OutputStreamId,
+        turn_transaction::CommittedOutputState,
+    )>,
+    turn_version: u64,
 }
 
 /// A request for the universal workflow interpreter.
@@ -442,7 +502,9 @@ impl WorkflowRuntime {
         models: PipelineModels,
         speculative: Option<onnx_genai_metadata::SpeculativeContract>,
     ) -> anyhow::Result<Self> {
-        admit_speculative_runtime(speculative.as_ref())?;
+        let execution_admission =
+            WorkflowExecutionAdmission::from_speculative(speculative.as_ref());
+        execution_admission.require_supported()?;
         let compiled_workflow = onnx_genai_metadata::compile_workflow(&workflow)
             .map_err(|error| anyhow::anyhow!("Failed to lower workflow metadata: {error}"))?;
         let row_wise_outputs = workflow::workflow_row_wise_outputs(&compiled_workflow.graph);
@@ -460,6 +522,7 @@ impl WorkflowRuntime {
                 device_bridge_components,
                 memory_strategy_plan,
                 decode_backend,
+                execution_admission,
                 adapter_service: None,
                 preprocessing: None,
                 speculative,
@@ -492,12 +555,31 @@ impl WorkflowRuntime {
         session_options: SessionOptions,
         authority_provider: Option<SharedMemoryAuthorityProvider>,
     ) -> anyhow::Result<(Self, EngineResourceGovernor)> {
+        let mut capability_error = None;
         let directory =
-            PipelineModelDirectory::load_with_metadata_preflight(pipeline_dir, |metadata| {
-                admit_speculative_runtime(metadata.speculative.as_ref())
-                    .map_err(|error| onnx_genai_ort::OrtError::InvalidArgument(error.to_string()))
-            })
-            .map_err(|error| anyhow::anyhow!("Failed to resolve workflow package: {error}"))?;
+            match PipelineModelDirectory::load_with_metadata_preflight(pipeline_dir, |metadata| {
+                WorkflowExecutionAdmission::from_metadata(metadata)
+                    .require_supported()
+                    .map_err(|error| {
+                        capability_error = Some(error.clone());
+                        onnx_genai_ort::OrtError::InvalidArgument(error.to_string())
+                    })
+            }) {
+                Ok(directory) => directory,
+                Err(_) if capability_error.is_some() => {
+                    return Err(capability_error.expect("guarded by is_some").into());
+                }
+                Err(error) => {
+                    return Err(anyhow::anyhow!(
+                        "Failed to resolve workflow package: {error}"
+                    ));
+                }
+            };
+        let execution_admission = directory
+            .metadata
+            .as_ref()
+            .map(WorkflowExecutionAdmission::from_metadata)
+            .unwrap_or(WorkflowExecutionAdmission::Admitted);
         let decode_backend = validate_pipeline_backend_request(config.decode_backend)?;
         let authority_domain = crate::engine::session_device_domain(&session_options)?;
         crate::engine::validate_shared_authority_limit(
@@ -821,6 +903,7 @@ impl WorkflowRuntime {
                     device_bridge_components,
                     memory_strategy_plan,
                     decode_backend,
+                    execution_admission,
                     adapter_service: directory.adapters,
                     preprocessing: directory.preprocessing,
                     speculative,
@@ -840,6 +923,29 @@ impl WorkflowRuntime {
 
     pub fn decode_backend(&self) -> EngineDecodeBackend {
         self.plan.decode_backend
+    }
+
+    pub(crate) fn require_execution_admitted(&self) -> anyhow::Result<()> {
+        self.plan.execution_admission.require_supported()?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_execution_admission_for_test(
+        &mut self,
+        admission: WorkflowExecutionAdmission,
+    ) {
+        Arc::get_mut(&mut self.plan)
+            .expect("a fresh test runtime has one plan owner")
+            .execution_admission = admission;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn output_publication_state_for_test(&self) -> (usize, usize) {
+        (
+            self.worker.session_outputs.borrow().len(),
+            self.worker.last_output_publications.borrow().len(),
+        )
     }
 
     /// The immutable plan this runtime executes (§3.1).
@@ -923,6 +1029,172 @@ impl WorkflowRuntime {
     /// The workflow this runtime executes.
     pub(crate) fn workflow_spec(&self) -> &onnx_genai_metadata::WorkflowSpec {
         &self.plan.workflow
+    }
+
+    pub(crate) fn resolved_state_plan(&self) -> &onnx_genai_metadata::ResolvedStatePlan {
+        &self.plan.compiled_workflow.state_plan
+    }
+
+    pub(crate) fn transaction_effect_domains(&self) -> Vec<String> {
+        self.plan
+            .compiled_workflow
+            .initial_effects
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    pub(crate) fn output_names(&self) -> Vec<String> {
+        self.plan.workflow.outputs.keys().cloned().collect()
+    }
+
+    pub(crate) fn session_turn_version(&self, session_id: &str) -> u64 {
+        self.worker
+            .session_turn_versions
+            .borrow()
+            .get(session_id)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn session_committed_position(&self, session_id: &str) -> usize {
+        self.session_conversation_len(session_id)
+            .unwrap_or_else(|| {
+                usize::try_from(self.session_turn_version(session_id)).unwrap_or(usize::MAX)
+            })
+    }
+
+    pub(crate) fn session_has_active_turn(&self, session_id: &str) -> bool {
+        self.worker.session_leases.borrow().contains(session_id)
+    }
+
+    pub(crate) fn snapshot_session_for_fork(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<WorkflowSessionForkSnapshot> {
+        let state_plan = self.resolved_state_plan();
+        let session_state = self.worker.session_state.borrow();
+        let mut semantic_state = Vec::new();
+        for (_, cell) in state_plan
+            .session_cells()
+            .filter(|(_, cell)| cell.transaction.required)
+        {
+            if let Some(value) =
+                session_state.get(&(session_id.to_string(), cell.identity.0.clone()))
+            {
+                semantic_state.push((
+                    cell.identity.0.clone(),
+                    clone_value(value).with_context(|| {
+                        format!(
+                            "failed to clone semantic workflow state '{}' ({:?}, rank {})",
+                            cell.identity.0,
+                            cell.contract.dtype,
+                            cell.contract.rank()
+                        )
+                    })?,
+                ));
+            }
+        }
+        drop(session_state);
+
+        let effects = self
+            .worker
+            .session_effects
+            .borrow()
+            .iter()
+            .filter(|((session, _), _)| session == session_id)
+            .map(|((_, effect), cursor)| (effect.clone(), *cursor))
+            .collect();
+        let mut outputs = Vec::new();
+        for ((session, output, stream), state) in self.worker.session_outputs.borrow().iter() {
+            if session != session_id {
+                continue;
+            }
+            outputs.push((
+                output.clone(),
+                stream.clone(),
+                turn_transaction::CommittedOutputState {
+                    head: state.head,
+                    cursor: state.cursor,
+                    lineage: state.lineage,
+                    closed: state.closed,
+                    payload: state
+                        .payload
+                        .as_ref()
+                        .map(clone_value)
+                        .transpose()
+                        .with_context(|| {
+                            format!(
+                                "failed to clone committed output '{output}' stream '{}'",
+                                stream.0
+                            )
+                        })?,
+                },
+            ));
+        }
+        Ok(WorkflowSessionForkSnapshot {
+            semantic_state,
+            effects,
+            outputs,
+            turn_version: self.session_turn_version(session_id),
+        })
+    }
+
+    pub(crate) fn install_session_fork(
+        &self,
+        session_id: &str,
+        snapshot: WorkflowSessionForkSnapshot,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self
+                .worker
+                .session_state
+                .borrow()
+                .keys()
+                .any(|(session, _)| session == session_id)
+                && !self
+                    .worker
+                    .session_effects
+                    .borrow()
+                    .keys()
+                    .any(|(session, _)| session == session_id)
+                && !self
+                    .worker
+                    .session_outputs
+                    .borrow()
+                    .keys()
+                    .any(|(session, _, _)| session == session_id),
+            "workflow session '{session_id}' already owns semantic state"
+        );
+
+        let mut session_state = self.worker.session_state.borrow_mut();
+        let mut session_effects = self.worker.session_effects.borrow_mut();
+        let mut session_outputs = self.worker.session_outputs.borrow_mut();
+        let mut session_versions = self.worker.session_turn_versions.borrow_mut();
+        session_state
+            .try_reserve(snapshot.semantic_state.len())
+            .context("failed to reserve workflow fork state entries")?;
+        session_effects
+            .try_reserve(snapshot.effects.len())
+            .context("failed to reserve workflow fork effect entries")?;
+        session_outputs
+            .try_reserve(snapshot.outputs.len())
+            .context("failed to reserve workflow fork output entries")?;
+        session_versions
+            .try_reserve(1)
+            .context("failed to reserve workflow fork version entry")?;
+
+        for (cell, value) in snapshot.semantic_state {
+            session_state.insert((session_id.to_string(), cell), value);
+        }
+        for (effect, cursor) in snapshot.effects {
+            session_effects.insert((session_id.to_string(), effect), cursor);
+        }
+        for (output, stream, state) in snapshot.outputs {
+            session_outputs.insert((session_id.to_string(), output, stream), state);
+        }
+        session_versions.insert(session_id.to_string(), snapshot.turn_version);
+        Ok(())
     }
 
     /// How many device→host materializations this runtime has performed.

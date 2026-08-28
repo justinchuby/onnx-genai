@@ -23,6 +23,14 @@ use crate::pipeline::{
 };
 
 impl Engine {
+    /// Defense-in-depth for public entries on an already-built runtime.
+    ///
+    /// Runtime construction is the canonical admission boundary. This reads
+    /// the same stored typed decision; it never reclassifies metadata.
+    pub(crate) fn reject_undispatched_dflash_generation(&self) -> anyhow::Result<()> {
+        self.workflow.require_execution_admitted()
+    }
+
     /// How many device→host materializations this runtime has performed.
     ///
     /// A proposal chain's per-token work is supposed to stay on the device that
@@ -128,6 +136,7 @@ impl Engine {
         &mut self,
         request: PipelineGenerateRequest,
     ) -> anyhow::Result<PipelineTensors> {
+        self.reject_undispatched_dflash_generation()?;
         let request = self.apply_pipeline_request_defaults(request)?;
         self.workflow_runtime_mut().run_pipeline(request)
     }
@@ -139,6 +148,7 @@ impl Engine {
         &mut self,
         request: PipelineGenerateRequest,
     ) -> anyhow::Result<WorkflowExecutionPlan<'_>> {
+        self.reject_undispatched_dflash_generation()?;
         let request = self.apply_pipeline_request_defaults(request)?;
         WorkflowExecutionPlan::new(self.workflow_runtime(), request)
     }
@@ -147,6 +157,7 @@ impl Engine {
         &mut self,
         request: PipelineGenerateRequest,
     ) -> anyhow::Result<PipelineOutputs> {
+        self.reject_undispatched_dflash_generation()?;
         let request = self.apply_pipeline_request_defaults(request)?;
         self.workflow_runtime_mut().run_pipeline_outputs(request)
     }
@@ -167,6 +178,7 @@ impl Engine {
         &mut self,
         request: PipelineGenerateRequest,
     ) -> anyhow::Result<PipelineTensors> {
+        self.reject_undispatched_dflash_generation()?;
         let request = self.apply_pipeline_request_defaults(request)?;
         self.workflow_runtime_mut().run_pipeline_retained(request)
     }
@@ -189,6 +201,7 @@ impl Engine {
         mut on_admitted: Option<&mut dyn FnMut()>,
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
+        self.reject_undispatched_dflash_generation()?;
         // A request that binds no tensors is a prompt, and a prompt is served
         // by the ordinary entry point — which admits through the scheduler,
         // reuses a cached prefix, and routes the declared decode step to the
@@ -328,6 +341,7 @@ impl Engine {
         &self,
         request: PipelineGenerateRequest,
     ) -> anyhow::Result<crate::pipeline::WorkflowExecutionPlan<'_>> {
+        self.reject_undispatched_dflash_generation()?;
         let request = self.apply_pipeline_request_defaults(request)?;
         self.workflow_runtime().prepare_workflow_execution(request)
     }
@@ -391,12 +405,74 @@ impl Engine {
         Some(&*self.workflow).and_then(WorkflowRuntime::speculative_contract)
     }
 
+    pub fn dflash_diagnostic(&self) -> Option<crate::pipeline::speculative::DFlashDiagnostic> {
+        self.workflow_runtime().dflash_diagnostic()
+    }
+
     pub fn propose_chained(
         &self,
         run: &PipelineTensors,
         options: crate::pipeline::speculative::ChainedProposalOptions,
     ) -> anyhow::Result<crate::pipeline::speculative::ChainedProposal> {
         self.workflow_runtime().propose_chained(run, options)
+    }
+
+    pub fn propose_dflash(
+        &self,
+        run: &PipelineTensors,
+        options: crate::pipeline::speculative::DFlashProposalOptions,
+    ) -> anyhow::Result<crate::pipeline::speculative::DFlashProposal> {
+        self.reject_undispatched_dflash_generation()?;
+        self.workflow_runtime().propose_dflash(run, options)
+    }
+
+    pub fn verify_dflash(
+        &self,
+        verified: &PipelineTensors,
+        proposal: &crate::pipeline::speculative::DFlashProposal,
+        mode: crate::pipeline::speculative::DFlashVerificationMode,
+    ) -> anyhow::Result<crate::pipeline::speculative::DFlashAcceptance> {
+        self.reject_undispatched_dflash_generation()?;
+        self.workflow_runtime()
+            .verify_dflash(verified, proposal, mode)
+    }
+
+    pub fn begin_dflash_state_transaction(
+        &self,
+        current: &PipelineTensors,
+    ) -> anyhow::Result<crate::pipeline::speculative::DFlashStateTransaction> {
+        self.reject_undispatched_dflash_generation()?;
+        self.workflow_runtime()
+            .begin_dflash_state_transaction(current)
+    }
+
+    pub fn commit_dflash_state_transaction(
+        &self,
+        transaction: crate::pipeline::speculative::DFlashStateTransaction,
+        current: &mut PipelineTensors,
+        proposal: &crate::pipeline::speculative::DFlashProposal,
+        verified: &PipelineTensors,
+        acceptance: &crate::pipeline::speculative::DFlashAcceptance,
+    ) -> anyhow::Result<crate::pipeline::TurnTransactionOutcome> {
+        self.reject_undispatched_dflash_generation()?;
+        self.workflow_runtime().commit_dflash_state_transaction(
+            transaction,
+            current,
+            proposal,
+            verified,
+            acceptance,
+        )
+    }
+
+    pub fn abort_dflash_state_transaction(
+        &self,
+        transaction: crate::pipeline::speculative::DFlashStateTransaction,
+        current: &mut PipelineTensors,
+        reason: crate::pipeline::TurnAbortReason,
+    ) -> anyhow::Result<crate::pipeline::TurnTransactionOutcome> {
+        self.reject_undispatched_dflash_generation()?;
+        self.workflow_runtime()
+            .abort_dflash_state_transaction(transaction, current, reason)
     }
 
     pub fn accept_chained_proposal(
@@ -458,5 +534,148 @@ impl Engine {
     #[cfg(feature = "native-backend")]
     pub fn native_device_residency_counts(&self) -> Option<(u64, u64)> {
         Some(&*self.workflow).and_then(WorkflowRuntime::native_device_residency_counts)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pipeline::WorkflowExecutionAdmission;
+    use onnx_genai_scheduler::{ModelKvConfig, ResourceLimits};
+
+    fn refused_engine() -> anyhow::Result<Engine> {
+        let mut runtime = crate::pipeline::generation::test_decoder_runtime()?;
+        runtime.set_execution_admission_for_test(WorkflowExecutionAdmission::DFlashUnavailable {
+            version: "1".to_string(),
+            capability: onnx_genai_metadata::capabilities::DFLASH_FLAT_BLOCK,
+        });
+        let governor = crate::engine::EngineResourceGovernor::new(
+            ResourceLimits::default(),
+            false,
+            ModelKvConfig::known(1, 1),
+            0,
+        )?;
+        Engine::from_workflow(runtime, governor)
+    }
+
+    fn request() -> PipelineGenerateRequest {
+        PipelineGenerateRequest::new(crate::GenerateRequest::new(
+            crate::GeneratePrompt::TokenIds(vec![1]),
+        ))
+    }
+
+    fn assert_dflash_refusal(error: anyhow::Error) {
+        let capability =
+            crate::engine::package_capability_error(&error).expect("refusal stays typed");
+        assert!(matches!(
+            capability,
+            crate::engine::PackageCapabilityError::DFlashExecutionUnavailable {
+                ref version,
+                ref capability,
+            } if version == "1"
+                && capability == onnx_genai_metadata::capabilities::DFLASH_FLAT_BLOCK
+        ));
+    }
+
+    #[test]
+    fn every_engine_execution_family_consumes_the_canonical_admission() -> anyhow::Result<()> {
+        let mut engine = refused_engine()?;
+        let before_runs = engine.workflow_performance_diagnostic().runs;
+        let before_sessions = engine.sessions.len();
+        let before_outputs = engine.workflow.output_publication_state_for_test();
+        let mut admitted = false;
+        let mut published = false;
+        let mut on_admitted = || admitted = true;
+        let mut on_token = |_| {
+            published = true;
+            Ok(())
+        };
+
+        assert_dflash_refusal(
+            engine
+                .generate_with_callbacks(
+                    crate::GenerateRequest::new(crate::GeneratePrompt::TokenIds(vec![1])),
+                    Some(&mut on_admitted),
+                    Some(&mut on_token),
+                )
+                .expect_err("plain generation must refuse"),
+        );
+        assert_dflash_refusal(
+            engine
+                .generate_in_session_with_callback(
+                    1,
+                    crate::GenerateRequest::new(crate::GeneratePrompt::TokenIds(vec![1])),
+                    Some(&mut on_token),
+                )
+                .expect_err("session generation must refuse"),
+        );
+        assert_dflash_refusal(
+            engine
+                .generate_with_pipeline_callbacks(
+                    request(),
+                    Some(&mut on_admitted),
+                    Some(&mut on_token),
+                )
+                .expect_err("pipeline generation must refuse"),
+        );
+        assert_dflash_refusal(
+            engine
+                .run_pipeline(request())
+                .err()
+                .expect("run_pipeline must refuse"),
+        );
+        assert_dflash_refusal(
+            engine
+                .run_pipeline_outputs(request())
+                .err()
+                .expect("run_pipeline_outputs must refuse"),
+        );
+        assert_dflash_refusal(
+            engine
+                .run_pipeline_retained(request())
+                .err()
+                .expect("retained execution must refuse"),
+        );
+        let prepared = engine.prepare_pipeline(request());
+        assert_dflash_refusal(prepared.err().expect("prepare_pipeline must refuse"));
+        let prepared = engine.prepare_workflow_execution(request());
+        assert_dflash_refusal(
+            prepared
+                .err()
+                .expect("prepare_workflow_execution must refuse"),
+        );
+        assert_dflash_refusal(
+            engine
+                .propose_dflash(
+                    &PipelineTensors::new(),
+                    crate::pipeline::speculative::DFlashProposalOptions {
+                        anchor_token: 1,
+                        width: 1,
+                        context_start_position: 0,
+                        mode: crate::pipeline::speculative::DFlashProposalMode::Greedy,
+                        eos_token_ids: Vec::new(),
+                    },
+                )
+                .expect_err("manual proposal must refuse"),
+        );
+        assert_dflash_refusal(
+            engine
+                .begin_dflash_state_transaction(&PipelineTensors::new())
+                .expect_err("manual state transaction must refuse"),
+        );
+
+        assert!(
+            !admitted,
+            "refusal must precede scheduler admission callback"
+        );
+        assert!(!published, "refusal must precede output callback");
+        assert_eq!(engine.sessions.len(), before_sessions);
+        assert_eq!(engine.workflow_performance_diagnostic().runs, before_runs);
+        assert_eq!(
+            engine.workflow.output_publication_state_for_test(),
+            before_outputs,
+            "DFlash refusal must precede S4 output stream/transaction creation"
+        );
+        Ok(())
     }
 }

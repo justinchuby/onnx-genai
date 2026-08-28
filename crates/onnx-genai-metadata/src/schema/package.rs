@@ -557,6 +557,41 @@ pub enum SpeculativeProposalExecution {
     /// One proposer invocation returns the complete token block.
     #[default]
     Block,
+    /// One DFlash invocation predicts every masked position of a flat block in
+    /// parallel from explicitly bound target hidden features.
+    ///
+    /// Version 1 is the base DFlash architecture. Version 2 adds the DFlash 2
+    /// selector and block-local convolution through [`DFlashStructure`];
+    /// neither version is inferred from optional ports or tensor names.
+    DflashFlatBlock {
+        /// Exact structural ABI version implemented by the reader.
+        #[schemars(length(min = 1))]
+        version: String,
+        /// Target hidden features and how they become one proposer input.
+        conditioning: Box<DFlashConditioning>,
+        /// Anchor/masked-position layout and the proposer inputs carrying it.
+        block: Box<DFlashBlockLayout>,
+        /// Proposer and verifier outputs consumed by the generic runtime.
+        outputs: Box<DFlashOutputs>,
+        /// Immutable target initializers reused by the proposer.
+        shared_weights: Box<DFlashSharedWeights>,
+        /// Mutable state cells owned only by the drafter.
+        ///
+        /// Every cell is also present in the enclosing contract's
+        /// `rollback_state`; the separate set distinguishes private draft
+        /// state from target state without creating another rollback authority.
+        #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+        draft_private_state: BTreeSet<String>,
+        /// How every rollback participant commits exactly one accepted prefix.
+        ///
+        /// The keys must equal the enclosing contract's `rollback_state`.
+        /// Sequence state is truncated on its declared state-group sequence
+        /// axis. Fixed recurrent state selects an explicitly emitted
+        /// per-prefix snapshot; a runtime never guesses from a port name.
+        accepted_prefix_state: Box<BTreeMap<String, DFlashStateCommit>>,
+        /// Base DFlash or an exact versioned structural extension.
+        structure: Box<DFlashStructure>,
+    },
     /// Repeated proposer invocations form an autoregressive proposal chain.
     Chained {
         /// Proposer input port receiving the previous selected token embedding.
@@ -721,6 +756,178 @@ pub enum CandidateTreeTopology {
         #[schemars(length(min = 1))]
         output: String,
     },
+}
+
+/// Explicit target-feature conditioning for a DFlash proposer.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DFlashConditioning {
+    /// Target component outputs, in concatenation order.
+    ///
+    /// A source must be a floating rank-3 `[batch, sequence, hidden]` output
+    /// with semantic role `hidden_states`. Layer selection is therefore
+    /// producer-authored provenance, not a runtime model-family lookup.
+    #[schemars(length(min = 1))]
+    pub sources: Vec<SpeculativeValueRef>,
+    /// Proposer input receiving the fused target features.
+    #[schemars(length(min = 1))]
+    pub proposer_input: String,
+    /// Structural operation used to combine multiple sources.
+    pub combination: DFlashFeatureCombination,
+}
+
+/// How target hidden features are fused before DFlash consumes them.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DFlashFeatureCombination {
+    /// Concatenate sources in declaration order along `axis`.
+    Concatenate { axis: usize },
+}
+
+/// Flat anchor-plus-mask block presented to one DFlash invocation.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DFlashBlockLayout {
+    /// Proposer input receiving target-embedding rows for the anchor followed
+    /// by the masked candidate positions.
+    #[schemars(length(min = 1))]
+    pub noise_embeddings_input: String,
+    /// Proposer input receiving a boolean tensor with `true` exactly at masked
+    /// candidate positions and `false` at the anchor.
+    #[schemars(length(min = 1))]
+    pub masked_positions_input: String,
+    /// Proposer input receiving absolute positions for target context followed
+    /// by the flat block.
+    #[schemars(length(min = 1))]
+    pub position_ids_input: String,
+    /// Proposer input receiving validity for target context followed by the
+    /// flat block.
+    #[schemars(length(min = 1))]
+    pub attention_mask_input: String,
+    /// Position holding the verifier-produced anchor token.
+    pub anchor_position: usize,
+    /// First position predicted in parallel. Validation requires this to be
+    /// exactly one past `anchor_position`.
+    pub first_candidate_position: usize,
+    /// Token whose shared target embedding initializes masked positions.
+    pub mask_token_id: u32,
+}
+
+/// Typed outputs of DFlash proposal and verification.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DFlashOutputs {
+    /// Proposer output containing selected candidate token ids
+    /// `[batch, proposal]`.
+    #[schemars(length(min = 1))]
+    pub candidate_tokens: String,
+    /// Full-vocabulary proposal probabilities `[batch, proposal, vocabulary]`.
+    ///
+    /// Absence is valid for greedy-only execution. A sampling request must be
+    /// rejected before invoking the proposer when this field is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposal_probabilities: Option<String>,
+    /// Target output containing exact verification logits
+    /// `[batch, proposal_plus_bonus, vocabulary]`.
+    pub verifier_logits: SpeculativeValueRef,
+}
+
+/// Immutable target weights DFlash reuses.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DFlashSharedWeights {
+    /// Target token embedding table used for anchor and mask rows.
+    pub input_embedding: TokenEmbeddingSource,
+    /// Target output projection passed read-only to the proposer.
+    pub output_projection: DFlashOutputProjection,
+}
+
+/// Target LM-head initializer and the proposer input that borrows it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DFlashOutputProjection {
+    /// Component owning the immutable initializer.
+    #[schemars(length(min = 1))]
+    pub component: String,
+    /// Exact initializer name.
+    #[schemars(length(min = 1))]
+    pub initializer: String,
+    /// Proposer input receiving the initializer as a read-only tensor.
+    #[schemars(length(min = 1))]
+    pub proposer_input: String,
+    /// Matrix layout required by the proposer graph.
+    pub layout: DFlashProjectionLayout,
+}
+
+/// Layout of the shared output projection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DFlashProjectionLayout {
+    HiddenVocabulary,
+    VocabularyHidden,
+}
+
+/// How one speculative state cell is reduced to the accepted prefix.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DFlashStateCommit {
+    /// The component's ordinary state output grows on its declared sequence
+    /// axis and is truncated to `baseline + accepted`.
+    Sequence { source: SpeculativeValueRef },
+    /// The component emits one complete fixed-state snapshot for each possible
+    /// accepted length, including prefix zero.
+    PrefixSnapshots {
+        source: SpeculativeValueRef,
+        /// Axis enumerating prefix lengths `0..=proposal`.
+        axis: usize,
+    },
+}
+
+/// Exact DFlash structural family.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DFlashStructure {
+    /// Base DFlash: parallel masked-block prediction with target KV injection.
+    Base,
+    /// DFlash 2: base DFlash plus an explicit adjacent-candidate selector and
+    /// block-local dynamic convolution.
+    SelectorConvolutionV1 {
+        selector: DFlashSelectorContract,
+        convolution: DFlashConvolutionContract,
+    },
+}
+
+/// DFlash 2 adjacent-candidate selector ABI.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DFlashSelectorContract {
+    /// Proposer output containing the selected path `[batch, proposal]`.
+    #[schemars(length(min = 1))]
+    pub selected_tokens_output: String,
+    /// Proposer output containing top-k candidate ids
+    /// `[batch, proposal, candidates]`.
+    #[schemars(length(min = 1))]
+    pub candidate_ids_output: String,
+    /// Proposer output containing the selected conditional distribution over
+    /// `candidate_ids_output`, required for sampling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conditional_probabilities_output: Option<String>,
+    #[schemars(range(min = 1))]
+    pub top_k: usize,
+    #[schemars(range(min = 1))]
+    pub rank: usize,
+}
+
+/// DFlash 2 block-local grouped dynamic convolution ABI.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DFlashConvolutionContract {
+    #[schemars(range(min = 2))]
+    pub kernel_size: usize,
+    #[schemars(range(min = 1))]
+    pub group_size: usize,
+    /// The first candidate reads the anchor representation as its predecessor.
+    pub first_position_reads_anchor: bool,
 }
 
 /// An explicit reference to a value a workflow component produces.

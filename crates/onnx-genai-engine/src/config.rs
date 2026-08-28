@@ -447,11 +447,12 @@ pub enum SpeculativeMode {
 /// Identifier for a persistent generation session.
 pub type SessionId = SequenceId;
 
-/// Absolute logical token position within a persistent session.
+/// Absolute committed logical position within a persistent session.
 ///
-/// Newtyping token positions keeps APIs from accepting an arbitrary `usize`
-/// where a session boundary is required. Use [`SessionPosition::new`] at the
-/// boundary where a caller intentionally converts from a raw count.
+/// This is a token boundary for autoregressive sessions and a committed
+/// invocation boundary for a generic stateful workflow that declares no token
+/// continuation. Newtyping positions keeps APIs from accepting an arbitrary
+/// `usize` where a session boundary is required.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SessionPosition(usize);
 
@@ -494,17 +495,6 @@ pub struct SessionCheckpoint {
     pub session_id: SessionId,
     /// Logical token position retained by the checkpoint.
     pub position: SessionPosition,
-}
-
-/// Capability token required to request a session fork.
-///
-/// Engines return this token only for decode configurations that can fork
-/// without deep-copying KV or aliasing mutable decoder state. Current backends
-/// return `None`, so unsupported engines cannot be asked to fork through the
-/// typed API.
-#[derive(Debug, Clone)]
-pub struct SessionForkCapability {
-    pub(crate) _private: (),
 }
 
 /// Distributed KV connector backend selection (DESIGN §38, K3).

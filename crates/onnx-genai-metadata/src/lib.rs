@@ -103,6 +103,8 @@ pub mod capabilities {
         TOKEN_CONTEXT = "token_context";
         /// Versioned workflow-native speculative proposal and verification.
         CANONICAL_SPECULATION = "canonical_speculation";
+        /// Target-hidden-conditioned DFlash flat-block speculative proposal.
+        DFLASH_FLAT_BLOCK = "dflash_flat_block";
     }
 }
 
@@ -139,18 +141,18 @@ pub use session_state::{
 };
 pub use state_plan::{
     ResolvedStateCell, ResolvedStatePlan, StateCarrySource, StateCarrySourceKind, StateFinalWriter,
-    StateIdentity, StateLifecycle, StateReader, StateSnapshotParticipation, StateSource,
-    StateTransactionParticipation, StateUpdateRelation, StateWriter, resolve_state_plan,
-    validate_state_plan,
+    StateIdentity, StateLifecycle, StateReader, StateSemanticRole, StateServiceParticipation,
+    StateSnapshotParticipation, StateSource, StateTransactionParticipation, StateUpdateRelation,
+    StateWriter, resolve_state_plan, validate_state_plan,
 };
 pub use validation::{
     CapabilityReport, PipelineValidationError, RuntimeCapabilities, derived_capabilities, validate,
     validate_metadata, validate_pipeline_spec, validate_structure_and_capabilities,
 };
 pub use version::{
-    BATCHING_SCHEMA_VERSION, CANONICAL_SPECULATION_SCHEMA_VERSION, INITIAL_SCHEMA_VERSION,
-    OUTPUT_PROTOCOL_SCHEMA_VERSION, SUPPORTED_SCHEMA_VERSION, SchemaVersion,
-    TOKEN_AUTHORITY_SCHEMA_VERSION, TOOL_PROTOCOL_SCHEMA_VERSION,
+    BATCHING_SCHEMA_VERSION, CANONICAL_SPECULATION_SCHEMA_VERSION, DFLASH_SCHEMA_VERSION,
+    INITIAL_SCHEMA_VERSION, OUTPUT_PROTOCOL_SCHEMA_VERSION, SUPPORTED_SCHEMA_VERSION,
+    SchemaVersion, TOKEN_AUTHORITY_SCHEMA_VERSION, TOOL_PROTOCOL_SCHEMA_VERSION,
 };
 
 /// Generates the inference-metadata JSON Schema with deterministic object-key ordering.

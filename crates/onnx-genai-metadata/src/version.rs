@@ -57,6 +57,8 @@ pub const TOKEN_CONTEXT_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 4)
 /// The version that made workflow-native, versioned speculative contracts the
 /// only portable speculative authority.
 pub const CANONICAL_SPECULATION_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 6);
+/// The version that introduced the generalized DFlash flat-block contract.
+pub const DFLASH_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 6);
 
 /// The version that introduced output publication families and typed revision
 /// envelopes.

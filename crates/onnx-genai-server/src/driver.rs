@@ -127,6 +127,13 @@ pub(crate) enum DriverCommand {
         acknowledgement: std::sync::mpsc::Receiver<()>,
         response: tokio::sync::oneshot::Sender<anyhow::Result<SessionId>>,
     },
+    ForkSession {
+        source: SessionLeaseGuard,
+        position: onnx_genai_engine::SessionPosition,
+        reservation: SessionPlacementReservation,
+        acknowledgement: std::sync::mpsc::Receiver<()>,
+        response: tokio::sync::oneshot::Sender<anyhow::Result<SessionId>>,
+    },
     CloseSession {
         lease: SessionLeaseGuard,
         accounting: SessionCloseAccounting,
@@ -815,6 +822,46 @@ impl EngineDriver {
             .send(())
             .map_err(|_| anyhow::anyhow!("engine driver stopped"))?;
         Ok(SessionPlacement::new(pending.worker, engine_session_id))
+    }
+
+    /// Fork a session on its owning worker while holding the source lease.
+    pub(crate) async fn fork_session(
+        &self,
+        source: SessionLeaseGuard,
+        position: onnx_genai_engine::SessionPosition,
+    ) -> anyhow::Result<SessionPlacement> {
+        anyhow::ensure!(
+            source.model() == &self.model,
+            "session lease for model '{}' cannot be forked on model '{}'",
+            source.model(),
+            self.model,
+        );
+        let placement = source.placement();
+        let reservation = self
+            .workers
+            .reserve_session_on(placement.worker)
+            .map_err(anyhow::Error::new)?;
+        let (response, rx) = tokio::sync::oneshot::channel();
+        let (acknowledgement, acknowledgement_rx) = std::sync::mpsc::sync_channel(1);
+        self.workers
+            .sender_for(placement.worker)
+            .map_err(anyhow::Error::new)?
+            .send(DriverCommand::ForkSession {
+                source,
+                position,
+                reservation,
+                acknowledgement: acknowledgement_rx,
+                response,
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("engine driver stopped"))?;
+        let child = rx
+            .await
+            .map_err(|_| anyhow::anyhow!("engine driver stopped"))??;
+        acknowledgement
+            .send(())
+            .map_err(|_| anyhow::anyhow!("engine driver stopped"))?;
+        Ok(SessionPlacement::new(placement.worker, child))
     }
 
     async fn enqueue_session_creation(&self) -> anyhow::Result<PendingSessionCreation> {
@@ -1961,6 +2008,48 @@ fn handle_driver_command(engine: &mut Engine, command: DriverCommand) {
             };
             if response.send(Ok(session_id)).is_err() || acknowledgement.recv().is_err() {
                 let _ = engine.close_session(session_id);
+                return;
+            }
+            committed.persist();
+        }
+        DriverCommand::ForkSession {
+            source,
+            position,
+            reservation,
+            acknowledgement,
+            response,
+        } => {
+            let held_source = source;
+            let plan = match engine
+                .prepare_session_fork(held_source.placement().engine_session_id, position)
+            {
+                Ok(plan) => plan,
+                Err(error) => {
+                    drop(held_source);
+                    let _ = response.send(Err(anyhow::Error::new(error)));
+                    return;
+                }
+            };
+            let child = match engine.fork_session(plan) {
+                Ok(child) => child,
+                Err(error) => {
+                    drop(held_source);
+                    let _ = response.send(Err(anyhow::Error::new(error)));
+                    return;
+                }
+            };
+            let committed = match reservation.commit() {
+                Ok(committed) => committed,
+                Err(error) => {
+                    let _ = engine.close_session(child);
+                    drop(held_source);
+                    let _ = response.send(Err(anyhow::Error::new(error)));
+                    return;
+                }
+            };
+            drop(held_source);
+            if response.send(Ok(child)).is_err() || acknowledgement.recv().is_err() {
+                let _ = engine.close_session(child);
                 return;
             }
             committed.persist();

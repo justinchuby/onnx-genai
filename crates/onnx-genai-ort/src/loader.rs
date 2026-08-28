@@ -342,8 +342,9 @@ impl PipelineModelDirectory {
         let spec = metadata.pipeline.clone().ok_or_else(|| {
             OrtError::InvalidArgument("metadata has no pipeline section".to_string())
         })?;
-        onnx_genai_metadata::validate_metadata(&metadata)
-            .map_err(|errors| OrtError::InvalidArgument(errors.join("; ")))?;
+        onnx_genai_metadata::validate_metadata(&metadata).map_err(|errors| {
+            OrtError::InvalidArgument(format!("Invalid inference metadata: {}", errors.join("; ")))
+        })?;
         preflight(&metadata)?;
         let preprocessing = metadata.preprocessing.clone();
         let adapters = metadata.adapters.clone();

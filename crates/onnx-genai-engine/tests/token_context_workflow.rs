@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use onnx_genai_engine::{
-    Engine, EngineConfig, GenerateOptions, GeneratePrompt, GenerateRequest, PipelineGenerateRequest,
+    Engine, EngineConfig, GenerateOptions, GeneratePrompt, GenerateRequest,
+    PipelineGenerateRequest, SessionForkParticipantKind, SessionPosition,
 };
 use onnx_genai_ort::{DataType, Value};
 
@@ -89,10 +90,149 @@ fn package(geometry: Geometry) -> anyhow::Result<PathBuf> {
     Ok(root)
 }
 
-fn failing_after_publication_package(geometry: Geometry) -> anyhow::Result<PathBuf> {
+fn package_with_generic_feature_state(geometry: Geometry) -> anyhow::Result<PathBuf> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../target/test-fixtures/token-context")
-        .join(format!("{}-transaction-failure", geometry.name));
+        .join(format!("{}-generic-feature-fork", geometry.name));
+    fs::create_dir_all(&root)?;
+    let mut document = metadata(geometry);
+    document = document.replacen(
+        "    inputs:\n      token_ids:",
+        r#"    inputs:
+      initial_generic_feature:
+        contract:
+          dtype: int64
+          shape: [batch]
+          batch_layout: { kind: request_aligned, axis: 0 }
+        role: { kind: opaque }
+        source: { kind: application, name: initial_generic_feature }
+        required: true
+      token_ids:"#,
+        1,
+    );
+    document = document.replacen(
+        "    components:\n      token_context:",
+        r#"    components:
+      generic_feature:
+        implementation: { kind: onnx, artifact: generic-feature.onnx.textproto }
+        ports:
+          inputs:
+            feature_state:
+              dtype: int64
+              shape: [batch]
+              batch_layout: { kind: request_aligned, axis: 0 }
+            delta:
+              dtype: int64
+              shape: [batch]
+              batch_layout: { kind: request_aligned, axis: 0 }
+          outputs:
+            next_feature:
+              dtype: int64
+              shape: [batch]
+              batch_layout: { kind: request_aligned, axis: 0 }
+      token_context:"#,
+        1,
+    );
+    document = document.replacen(
+        "    state:\n      token_history:",
+        r#"    state:
+      generic_feature:
+        contract:
+          dtype: int64
+          shape: [batch]
+          batch_layout: { kind: request_aligned, axis: 0 }
+        class: semantic
+        scope: session
+        initializer: initial_generic_feature
+        recurrence: { kind: invariant }
+        management: runtime
+        release_boundary: session
+        service_group: generic_feature
+      token_history:"#,
+        1,
+    );
+    document = document.replacen(
+        "    outputs:\n      hidden_states:",
+        r#"    outputs:
+      generic_feature:
+        contract:
+          dtype: int64
+          shape: [batch]
+          batch_layout: { kind: request_aligned, axis: 0 }
+        role: tensor
+        stage: pre_adapter
+      hidden_states:"#,
+        1,
+    );
+    document = document.replacen(
+        "      - { kind: emit, value: context.output, output: hidden_states, mode: replace }",
+        r#"      - kind: invoke
+        component: generic_feature
+        inputs: { feature_state: initial_generic_feature, delta: accepted_len }
+        outputs: { next_feature: context.next_feature }
+      - { kind: emit, value: context.next_feature, output: generic_feature, mode: replace }
+      - { kind: emit, value: context.output, output: hidden_states, mode: replace }"#,
+        1,
+    );
+    document = document.replacen(
+        "        groups:\n          token_history:",
+        r#"        groups:
+          generic_feature:
+            kind: encoder
+            layout: b
+            update: { kind: replace }
+            capabilities: { snapshot: true, fork: true }
+            checkpoint: { adapter: onnx-genai.tensor-checkpoint, version: "1" }
+            ports:
+              generic_feature:
+                generic_feature:
+                  input: feature_state
+                  output: next_feature
+          token_history:"#,
+        1,
+    );
+    fs::write(root.join("inference_metadata.yaml"), document)?;
+    fs::write(root.join("token-context.onnx.textproto"), model(geometry))?;
+    fs::write(
+        root.join("generic-feature.onnx.textproto"),
+        r#"
+ir_version: 8
+graph {
+  name: "generic_feature"
+  node {
+    input: "feature_state"
+    input: "delta"
+    output: "next_feature"
+    op_type: "Add"
+  }
+  input {
+    name: "feature_state"
+    type { tensor_type { elem_type: 7 shape { dim { dim_param: "batch" } } } }
+  }
+  input {
+    name: "delta"
+    type { tensor_type { elem_type: 7 shape { dim { dim_param: "batch" } } } }
+  }
+  output {
+    name: "next_feature"
+    type { tensor_type { elem_type: 7 shape { dim { dim_param: "batch" } } } }
+  }
+}
+opset_import { version: 13 }
+"#,
+    )?;
+    Ok(root)
+}
+
+fn failing_after_publication_package(geometry: Geometry) -> anyhow::Result<PathBuf> {
+    static NEXT_FAILURE_PACKAGE: AtomicU64 = AtomicU64::new(0);
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/test-fixtures/token-context")
+        .join(format!(
+            "{}-transaction-failure-{}",
+            geometry.name,
+            NEXT_FAILURE_PACKAGE.fetch_add(1, Ordering::Relaxed)
+        ));
     fs::create_dir_all(&root)?;
     let mut document = metadata(geometry);
     document = document.replacen(
@@ -473,7 +613,7 @@ pipeline:
             kind: recurrent
             layout: bt
             update: {{ kind: replace }}
-            capabilities: {{ snapshot: true, fork: true }}
+            capabilities: {{ snapshot: true, fork: true, cascade: [conv_history] }}
             checkpoint: {{ adapter: onnx-genai.tensor-checkpoint, version: "1" }}
             ports:
               token_context:
@@ -1403,6 +1543,192 @@ fn failed_selected_turn_restores_both_histories_output_and_sibling_rows() -> any
         Some(&[1]),
     )?)?;
     assert_token_context_outputs_equal(&actual_sibling, &expected_sibling)?;
+    Ok(())
+}
+
+#[test]
+fn semantic_session_fork_clones_token_and_convolution_histories_for_both_geometries()
+-> anyhow::Result<()> {
+    for geometry in [QWEN_REDUCED, ALTERNATE] {
+        let root = package(geometry)?;
+        let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+        let parent = engine.create_session()?;
+        let parent_name = parent.to_string();
+        let prefix = [5, 7];
+        engine.run_pipeline(request(geometry, &parent_name, &prefix, 0)?)?;
+
+        let plan = engine.prepare_session_fork(parent, SessionPosition::new(1))?;
+        for state in ["token_history", "conv_history"] {
+            assert!(
+                plan.participants().iter().any(|participant| {
+                    participant.kind == SessionForkParticipantKind::TokenContextHistory
+                        && participant.name == state
+                }),
+                "fork plan omitted {state}: {:?}",
+                plan.participants()
+            );
+        }
+        assert!(
+            plan.participants().iter().any(|participant| {
+                participant.kind == SessionForkParticipantKind::OutputPublication
+                    && participant.name == "hidden_states"
+            }),
+            "fork plan omitted output head/lineage state"
+        );
+        assert!(plan.participants().iter().any(|participant| {
+            participant.kind == SessionForkParticipantKind::SpeculativeCascade
+                && participant.name == "token_history->conv_history"
+        }));
+        let child = engine.fork_session(plan)?;
+        let child_name = child.to_string();
+
+        let parent_run =
+            engine.run_pipeline(request(geometry, &parent_name, &[11], prefix.len())?)?;
+        let child_run =
+            engine.run_pipeline(request(geometry, &child_name, &[13], prefix.len())?)?;
+        let mut parent_control = Engine::from_dir(&root, EngineConfig::default())?;
+        let expected_parent = outputs(
+            &mut parent_control,
+            geometry,
+            "expected-parent",
+            &[&prefix, &[11]],
+        )?;
+        let mut child_control = Engine::from_dir(&root, EngineConfig::default())?;
+        let expected_child = outputs(
+            &mut child_control,
+            geometry,
+            "expected-child",
+            &[&prefix, &[13]],
+        )?;
+
+        assert_eq!(parent_run["token_history"].to_vec_i64()?, expected_parent.1);
+        assert_close(
+            &parent_run["conv_history"].to_vec_f32()?,
+            &expected_parent.2,
+        );
+        assert_eq!(child_run["token_history"].to_vec_i64()?, expected_child.1);
+        assert_close(&child_run["conv_history"].to_vec_f32()?, &expected_child.2);
+        assert_ne!(
+            parent_run["token_history"].to_vec_i64()?,
+            child_run["token_history"].to_vec_i64()?,
+            "parent and child histories must diverge independently"
+        );
+
+        engine.close_session(parent)?;
+        let continued_child =
+            engine.run_pipeline(request(geometry, &child_name, &[17], prefix.len() + 1)?)?;
+        let mut continued_control = Engine::from_dir(&root, EngineConfig::default())?;
+        let expected_continued = outputs(
+            &mut continued_control,
+            geometry,
+            "expected-continued",
+            &[&prefix, &[13], &[17]],
+        )?;
+        assert_eq!(
+            continued_child["token_history"].to_vec_i64()?,
+            expected_continued.1
+        );
+        assert_close(
+            &continued_child["conv_history"].to_vec_f32()?,
+            &expected_continued.2,
+        );
+        engine.close_session(child)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn forked_token_context_sessions_abort_retry_and_commit_independently() -> anyhow::Result<()> {
+    let geometry = ALTERNATE;
+    let root = failing_after_publication_package(geometry)?;
+    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+    let parent = engine.create_session()?;
+    let parent_name = parent.to_string();
+    let prefix = [&[3, 5][..], &[17, 19][..], &[29, 31][..]];
+    engine.run_pipeline(request_rows(geometry, &parent_name, &prefix, 0, None)?)?;
+    let child =
+        engine.fork_session(engine.prepare_session_fork(parent, SessionPosition::new(1))?)?;
+    let child_name = child.to_string();
+    let source_tokens = [&[23][..], &[37][..], &[41][..]];
+
+    let failed = request_rows(geometry, &parent_name, &source_tokens, 2, Some(&[2, 0]))?
+        .with_input("failure_index", Value::from_slice_i64(&[999], &[])?);
+    let error = match engine.run_pipeline(failed) {
+        Ok(_) => panic!("parent turn must fail after staging state and output"),
+        Err(error) => error,
+    };
+    assert!(format!("{error:#}").contains("Gather"), "{error:#}");
+
+    let child_result = engine.run_pipeline(request_rows(
+        geometry,
+        &child_name,
+        &source_tokens,
+        2,
+        Some(&[1]),
+    )?)?;
+    let parent_retry = engine.run_pipeline(request_rows(
+        geometry,
+        &parent_name,
+        &source_tokens,
+        2,
+        Some(&[2, 0]),
+    )?)?;
+
+    let mut parent_control = Engine::from_dir(&root, EngineConfig::default())?;
+    parent_control.run_pipeline(request_rows(geometry, "parent-control", &prefix, 0, None)?)?;
+    let expected_parent = parent_control.run_pipeline(request_rows(
+        geometry,
+        "parent-control",
+        &source_tokens,
+        2,
+        Some(&[2, 0]),
+    )?)?;
+    assert_token_context_outputs_equal(&parent_retry, &expected_parent)?;
+
+    let mut child_control = Engine::from_dir(&root, EngineConfig::default())?;
+    child_control.run_pipeline(request_rows(geometry, "child-control", &prefix, 0, None)?)?;
+    let expected_child = child_control.run_pipeline(request_rows(
+        geometry,
+        "child-control",
+        &source_tokens,
+        2,
+        Some(&[1]),
+    )?)?;
+    assert_token_context_outputs_equal(&child_result, &expected_child)?;
+    engine.close_session(parent)?;
+    engine.close_session(child)?;
+    Ok(())
+}
+
+#[test]
+fn semantic_fork_clones_alternate_generic_feature_state() -> anyhow::Result<()> {
+    let geometry = ALTERNATE;
+    let root = package_with_generic_feature_state(geometry)?;
+    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+    let parent = engine.create_session()?;
+    let parent_name = parent.to_string();
+    let generic_request = |session: &str, tokens: &[i64], position: usize| {
+        Ok::<_, anyhow::Error>(request(geometry, session, tokens, position)?.with_input(
+            "initial_generic_feature",
+            Value::from_slice_i64(&[0], &[1])?,
+        ))
+    };
+    engine.run_pipeline(generic_request(&parent_name, &[3, 5], 0)?)?;
+    let plan = engine.prepare_session_fork(parent, SessionPosition::new(1))?;
+    assert!(plan.participants().iter().any(|participant| {
+        participant.kind == SessionForkParticipantKind::GenericFeatureState
+            && participant.name == "generic_feature"
+    }));
+    let child = engine.fork_session(plan)?;
+
+    let parent_run = engine.run_pipeline(generic_request(&parent_name, &[7], 2)?)?;
+    let child_request = generic_request(&child.to_string(), &[11], 2)?
+        .with_input("accepted_len", Value::from_slice_i64(&[0], &[1])?);
+    let child_run = engine.run_pipeline(child_request)?;
+    assert_eq!(parent_run["generic_feature"].to_vec_i64()?, [3]);
+    assert_eq!(child_run["generic_feature"].to_vec_i64()?, [2]);
+    engine.close_session(parent)?;
+    engine.close_session(child)?;
     Ok(())
 }
 

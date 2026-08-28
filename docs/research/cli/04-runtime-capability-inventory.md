@@ -64,9 +64,14 @@ Cost model: fork is O(number of prefix pages retained), with no tensor payload c
 
 Constraints: fork position must be <= sequence length and not before `retained_start` (`paged_cache.rs:741-752`), so sliding-window evicted gaps cannot be forked. The API is sequence-oriented, so REPL fork is effectively batch==1 conversation branching. The page table has GPU/CPU/Disk concepts, but divergent writes currently allocate `Device::Gpu(0)` (`paged_cache.rs:596-601`, `636-642`). Native engine sessions are not supported.
 
-Missing: there is **no engine-level `fork_session` API**. A correct fork must clone/truncate logical tokens, target `DecodeState`, target KV, draft session/KV, and state latches from `EngineSession` (`crates/onnx-genai-engine/src/session.rs:11-24`), not just call `kv_cache.fork`.
+Landed: `Engine::prepare_session_fork` produces one typed plan covering logical
+tokens/positions, target and draft `DecodeState`, KV, fixed state, workflow
+state/effects, and output baselines; `Engine::fork_session` consumes it. The
+server routes `POST /v1/sessions/{id}/fork` to the source worker.
 
-**REPL shape:** `/fork [name]`, `/fork [name] --turn N`, `/fork [name] --tokens N`. **Needs new runtime API**, likely `pub fn fork_session(&mut self, source: SessionId, position: usize) -> anyhow::Result<SessionId>`. Effort **L**.
+**REPL shape:** `/fork [name]`, `/fork [name] --turn N`, `/fork [name] --tokens N`.
+Prepare the plan first so unsupported participants are reported before a child
+identity exists.
 
 ## 3. KV rewind / truncation
 

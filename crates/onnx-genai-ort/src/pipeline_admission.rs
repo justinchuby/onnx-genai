@@ -34,7 +34,7 @@ struct ComponentSignature {
     ///
     /// Populated from the loader's decoded model inventory, so external-data
     /// initializers resolved from sidecar files are included. This is what a
-    /// folded-carry `token_embedding.table` must resolve against.
+    /// speculative shared-weight relationship must resolve against.
     initializers: BTreeSet<String>,
 }
 
@@ -46,12 +46,12 @@ pub(crate) fn validate_pipeline_admission(
     let signatures = inspect_component_signatures(model_paths)?;
     validate_workflow_signatures(&spec.workflow, &signatures)?;
     if let Some(speculative) = speculative {
-        validate_speculative_token_embedding(speculative, &signatures)?;
+        validate_speculative_shared_initializers(speculative, &signatures)?;
     }
     Ok(())
 }
 
-/// Resolve a folded-carry `token_embedding.table` against the target model's
+/// Resolve every declared speculative shared weight against the target model's
 /// real initializer inventory, fail-closed.
 ///
 /// The metadata validator already checks the *structural* contract: the
@@ -59,47 +59,58 @@ pub(crate) fn validate_pipeline_admission(
 /// ONNX component, and the table string must be non-empty. It cannot, however,
 /// see inside the ONNX artifact, so a producer can still name a table that does
 /// not exist. A folded-carry proposer gathers `embed(last_token)` from this
-/// exact initializer and reads no embedding weight inside its own graph, so a
-/// dangling table would silently break generation. Admission has already loaded
-/// every ONNX component, so here the declared table is required to match a real
-/// initializer the target model owns. The error names the component and table.
-fn validate_speculative_token_embedding(
+/// exact initializer, while DFlash borrows both the target embedding and output
+/// projection. A dangling relationship would silently break proposal semantics.
+/// Admission has already inspected every ONNX component, so each declared name
+/// must match a real target initializer.
+fn validate_speculative_shared_initializers(
     speculative: &onnx_genai_metadata::SpeculativeContract,
     signatures: &BTreeMap<String, ComponentSignature>,
 ) -> Result<()> {
-    // Only a chained proposer with a folded carry names an embedding table; a
-    // block proposer or a chained proposer without a folded carry does not.
-    let onnx_genai_metadata::SpeculativeProposalExecution::Chained {
-        token_embedding: Some(embedding),
-        ..
-    } = &speculative.proposal_execution
-    else {
-        return Ok(());
+    let required = match &speculative.proposal_execution {
+        onnx_genai_metadata::SpeculativeProposalExecution::Chained {
+            token_embedding: Some(embedding),
+            ..
+        } => vec![(
+            "token_embedding.table",
+            embedding.component.as_str(),
+            embedding.table.as_str(),
+        )],
+        onnx_genai_metadata::SpeculativeProposalExecution::DflashFlatBlock {
+            shared_weights,
+            ..
+        } => vec![
+            (
+                "DFlash input_embedding.table",
+                shared_weights.input_embedding.component.as_str(),
+                shared_weights.input_embedding.table.as_str(),
+            ),
+            (
+                "DFlash output_projection.initializer",
+                shared_weights.output_projection.component.as_str(),
+                shared_weights.output_projection.initializer.as_str(),
+            ),
+        ],
+        _ => Vec::new(),
     };
-    let signature = signatures.get(&embedding.component).ok_or_else(|| {
-        OrtError::InvalidArgument(format!(
-            "package admission rejected speculative token_embedding: component \
-             '{component}' has no inspected ONNX model, so its embedding table \
-             '{table}' cannot be resolved. How to fix: declare \
-             token_embedding.component as the speculative target ONNX component \
-             that owns the '{table}' initializer",
-            component = embedding.component,
-            table = embedding.table,
-        ))
-    })?;
-    if !signature.initializers.contains(&embedding.table) {
-        return Err(OrtError::InvalidArgument(format!(
-            "package admission rejected speculative token_embedding: table \
-             '{table}' is not an initializer of target component '{component}'. A \
-             folded-carry proposer gathers embed(last_token) from this exact \
-             initializer, so it must resolve to a real weight in the target \
-             model/artifact. How to fix: set token_embedding.table to an \
-             initializer name declared by component '{component}' (declared \
-             initializers: {available})",
-            table = embedding.table,
-            component = embedding.component,
-            available = summarize_initializers(&signature.initializers),
-        )));
+    for (field, component, initializer) in required {
+        let signature = signatures.get(component).ok_or_else(|| {
+            OrtError::InvalidArgument(format!(
+                "package admission rejected speculative {field}: component '{component}' has no \
+                 inspected ONNX model, so initializer '{initializer}' cannot be resolved. How \
+                 to fix: name the speculative target ONNX component that owns the initializer"
+            ))
+        })?;
+        if !signature.initializers.contains(initializer) {
+            return Err(OrtError::InvalidArgument(format!(
+                "package admission rejected speculative {field}: '{initializer}' is not an \
+                 initializer of target component '{component}'. Shared speculative weights are \
+                 immutable target relationships, not names the runtime may guess or duplicate. \
+                 How to fix: emit the exact target initializer name (declared initializers: \
+                 {available})",
+                available = summarize_initializers(&signature.initializers),
+            )));
+        }
     }
     Ok(())
 }
@@ -793,7 +804,7 @@ mod tests {
         assert!(inventory.contains("const_1d_1"));
 
         let speculative = chained_speculative_with_table("const_1d_0");
-        validate_speculative_token_embedding(&speculative, &signatures)
+        validate_speculative_shared_initializers(&speculative, &signatures)
             .expect("a table matching a real initializer must be admitted");
     }
 
@@ -802,7 +813,7 @@ mod tests {
         let signatures = verifier_signatures();
         // Non-empty and structurally valid, but absent from the target model.
         let speculative = chained_speculative_with_table("model.embed_tokens.weight");
-        let err = validate_speculative_token_embedding(&speculative, &signatures)
+        let err = validate_speculative_shared_initializers(&speculative, &signatures)
             .expect_err("a dangling embedding table must be rejected fail-closed");
         let message = err.to_string();
         assert!(
@@ -827,7 +838,7 @@ mod tests {
         {
             embedding.component = "ghost".to_string();
         }
-        let err = validate_speculative_token_embedding(&speculative, &signatures)
+        let err = validate_speculative_shared_initializers(&speculative, &signatures)
             .expect_err("an embedding component with no inspected model must be rejected");
         assert!(err.to_string().contains("ghost"));
     }
@@ -852,7 +863,7 @@ mod tests {
         .join("\n");
         let speculative: onnx_genai_metadata::SpeculativeContract =
             serde_yaml::from_str(&yaml).expect("block speculative contract should parse");
-        validate_speculative_token_embedding(&speculative, &signatures)
+        validate_speculative_shared_initializers(&speculative, &signatures)
             .expect("a proposer without a folded-carry token_embedding needs no inventory check");
     }
 }

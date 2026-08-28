@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use onnx_genai_engine::{
     Engine, EngineConfig, GeneratePrompt, GenerateRequest, PipelineGenerateRequest,
+    SessionForkParticipantKind, SessionPosition,
 };
 use onnx_genai_ort::{DataType, SessionOptions, Value};
 
@@ -2913,7 +2914,12 @@ pipeline:
                           source: { kind: application, name: initial_continue }, required: true }
     outputs:
       state: { contract: { dtype: int64, shape: [] }, role: tensor, stage: pre_adapter }
-      events: { contract: { dtype: int64, shape: [] }, role: event, stage: pre_adapter }
+      events: { contract: { dtype: int64, shape: [] }, role: event,
+                family: { kind: events }, stage: pre_adapter }
+    effects:
+      world_effect:
+        retry: transactional
+        speculation_safety: { kind: clonable }
     components:
       binding:
         implementation: { kind: binding }
@@ -2935,6 +2941,7 @@ pipeline:
             current: current
             update: update
             next: next
+        effects: [world_effect]
       predicate:
         implementation: { kind: onnx, artifact: less.onnx.textproto }
         ports:
@@ -3043,6 +3050,8 @@ pipeline:
         ],
     )?;
     let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+    let world_session = engine.create_session()?;
+    let world_session_name = world_session.to_string();
     let first_options = onnx_genai_engine::GenerateOptions {
         max_new_tokens: 4,
         ..Default::default()
@@ -3051,7 +3060,7 @@ pipeline:
         prompt: GeneratePrompt::TokenIds(vec![]),
         options: first_options,
     })
-    .with_session_id("world-a")
+    .with_session_id(world_session_name.clone())
     .with_input(
         "run_branch",
         Value::from_raw_bytes(vec![1], &[], onnx_genai_ort::DataType::Bool)?,
@@ -3064,6 +3073,16 @@ pipeline:
     .with_input("increment", Value::from_slice_i64(&[1], &[])?)
     .with_input("limit", Value::from_slice_i64(&[3], &[])?);
     assert_eq!(engine.run_pipeline(first)?["state"].to_vec_i64()?, [3]);
+    let fork_plan = engine.prepare_session_fork(world_session, SessionPosition::new(1))?;
+    assert!(fork_plan.participants().iter().any(|participant| {
+        participant.kind == SessionForkParticipantKind::GenericFeatureState
+            && participant.name == "world"
+    }));
+    assert!(fork_plan.participants().iter().any(|participant| {
+        participant.kind == SessionForkParticipantKind::TransactionalEffect
+            && participant.name == "world_effect"
+    }));
+    let forked_world = engine.fork_session(fork_plan)?;
 
     let second_options = onnx_genai_engine::GenerateOptions {
         max_new_tokens: 1,
@@ -3073,7 +3092,7 @@ pipeline:
         prompt: GeneratePrompt::TokenIds(vec![]),
         options: second_options,
     })
-    .with_session_id("world-a")
+    .with_session_id(world_session_name.clone())
     .with_input(
         "run_branch",
         Value::from_raw_bytes(vec![1], &[], onnx_genai_ort::DataType::Bool)?,
@@ -3087,6 +3106,27 @@ pipeline:
     .with_input("limit", Value::from_slice_i64(&[5], &[])?);
     assert_eq!(engine.run_pipeline(second)?["state"].to_vec_i64()?, [4]);
 
+    let forked = PipelineGenerateRequest::new(GenerateRequest {
+        prompt: GeneratePrompt::TokenIds(vec![]),
+        options: onnx_genai_engine::GenerateOptions {
+            max_new_tokens: 1,
+            ..Default::default()
+        },
+    })
+    .with_session_id(forked_world.to_string())
+    .with_input(
+        "run_branch",
+        Value::from_raw_bytes(vec![1], &[], onnx_genai_ort::DataType::Bool)?,
+    )
+    .with_input(
+        "initial_continue",
+        Value::from_raw_bytes(vec![1], &[], DataType::Bool)?,
+    )
+    .with_input("initial", Value::from_slice_i64(&[0], &[])?)
+    .with_input("increment", Value::from_slice_i64(&[3], &[])?)
+    .with_input("limit", Value::from_slice_i64(&[9], &[])?);
+    assert_eq!(engine.run_pipeline(forked)?["state"].to_vec_i64()?, [6]);
+
     let third_options = onnx_genai_engine::GenerateOptions {
         max_new_tokens: 1,
         ..Default::default()
@@ -3095,7 +3135,7 @@ pipeline:
         prompt: GeneratePrompt::TokenIds(vec![]),
         options: third_options,
     })
-    .with_session_id("world-a")
+    .with_session_id(world_session_name)
     .with_input(
         "run_branch",
         Value::from_raw_bytes(vec![1], &[], onnx_genai_ort::DataType::Bool)?,
@@ -3108,6 +3148,8 @@ pipeline:
     .with_input("increment", Value::from_slice_i64(&[1], &[])?)
     .with_input("limit", Value::from_slice_i64(&[5], &[])?);
     assert_eq!(engine.run_pipeline(third)?["state"].to_vec_i64()?, [5]);
+    engine.close_session(world_session)?;
+    engine.close_session(forked_world)?;
     Ok(())
 }
 
