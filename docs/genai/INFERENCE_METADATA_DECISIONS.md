@@ -571,27 +571,63 @@ Every session turn uses one typed visibility mode:
 
 - **`commit_only`** is the default. Output becomes committed only at the turn's
   single commit point. A runtime **MAY** compute or buffer intermediate values,
-  but it **MUST NOT** expose them as committed output.
+  but it **MUST NOT** expose them as provisional or committed output. On abort,
+  it discards those buffered outputs and restores the admitted baseline.
 - **`provisional_revisions`** permits typed provisional revision events before
-  the turn commits. If the turn aborts, every provisional revision from that
-  turn **MUST** be retracted through the same typed protocol. A runtime unable
-  to preserve that behavior **MUST** reject the mode before mutation begins.
+  the turn commits. If the turn aborts, the workflow-output contract **MUST**
+  expose the typed `abort_to_baseline` transaction outcome defined below. A
+  runtime unable to preserve that behavior **MUST** reject the mode before
+  mutation begins.
 
 There is no caller-controlled/manual commit mode in this contract.
+
+#### Transaction baseline and outcome
+
+At turn admission, before mutation or provisional publication, the runtime
+**MUST** establish exactly one committed baseline for the enclosing transaction.
+That baseline covers:
+
+- one checkpoint or equivalent undo root for the complete semantic state write
+  set; and
+- each declared workflow output stream's committed head or cursor, including
+  committed revision lineage and stream-closure state where applicable.
+
+The baseline and turn have stable typed identities. Every provisional
+publication carries the enclosing transaction identity, output and stream
+identity, deterministic sequence, and the revision identity and lineage/base
+required by its operation. The runtime **MUST NOT** infer an abort target from
+emit order, output names, payload content, component-map iteration order, or
+any other incidental representation.
+
+`abort_to_baseline` is a typed **transaction outcome**, not a fifth operation in
+the per-stream revision algebra and not an operation an ordinary `emit` may
+author. In `provisional_revisions` mode, it identifies the aborted transaction
+and the recorded committed output heads/cursors sufficiently for an adapter or
+consumer to invalidate every provisional publication owned by that transaction
+and restore its observed view to the baseline. A runtime **MUST NOT** require a
+consumer to guess or replay arbitrary inverse payload operations. Metadata
+defines this semantic outcome; transport-specific encoding and delivery remain
+outside metadata.
+
+Abort restores the complete semantic state write set and every output stream to
+the recorded baseline. Commit atomically advances them from that old baseline
+to the new committed state and output heads/cursors. A partial advance is not a
+commit.
 
 A turn's semantic write set includes every participant whose value can affect
 the next invocation or an observed result: KV, recurrent and convolution state,
 RNG, grammar/constraint state, conversation continuation, declared effect
 domains, and publications. An exclusive session lease prevents concurrent
 writers; it does not make one writer atomic. A conforming atomic-turn runtime
-**MUST** commit or abort the complete write set as one unit. A state or effect
-domain that cannot participate in the declared mode **MUST** cause admission to
-fail before mutation begins.
+**MUST** commit or abort the complete write set as one unit. A state, effect, or
+output domain that cannot participate in the declared mode **MUST** cause
+admission to fail before mutation begins.
 
-#### Closed revision algebra
+#### Closed per-stream revision algebra
 
 A typed-revision output uses a versioned envelope with stream identity, revision
-identity, deterministic order, typed payload where applicable, and exactly one
+identity, enclosing transaction identity, deterministic sequence, revision
+lineage/base where required, typed payload where applicable, and exactly one
 operation from this closed algebra:
 
 | Operation | Meaning |
@@ -601,14 +637,19 @@ operation from this closed algebra:
 | `retract` | Invalidate the named provisional revision and any value that depends on it. |
 | `finalize` | Optionally close this revision stream before the enclosing turn ends; later operations for that stream are invalid. |
 
+The per-stream `retract` operation invalidates named revision lineage within one
+stream. It **MUST NOT** be overloaded as the enclosing transaction's abort
+mechanism; that role belongs exclusively to `abort_to_baseline`.
+
 Unknown operations or envelope versions **MUST** fail closed. Turn commit and
 stream closure are distinct. By default the enclosing successful turn commit
 both commits and finalizes every still-open revision stream. An explicit
 `finalize` is optional and closes one stream early, which permits another output
 to continue while guaranteeing that no later operation in the turn may alter
 the closed stream. Its final committed status still depends on the enclosing
-turn commit. If that turn aborts, the provisional early close is retracted with
-the rest of the uncommitted turn.
+turn commit. If that turn aborts, `abort_to_baseline` invalidates the provisional
+early close with every other publication owned by the turn and restores the
+recorded committed stream head and closure state.
 
 Revision ownership follows workflow dataflow and effect ordering. A runtime
 **MUST NOT** select a stream's final writer from component-map iteration order,
@@ -1843,18 +1884,25 @@ they do not by themselves prove an atomic turn. End-to-end atomic-turn support
 requires the complete write set and publication modes defined in
 [§6.4](#64-workflow-output-publication-turns-and-revisions).
 
-A runtime claiming atomic-turn conformance **MUST** establish one before-turn
-snapshot or equivalent undo path, one commit point, and one abort path spanning
-KV, recurrent/convolution state, RNG, grammar/constraint state, conversation
-continuation, transactional effects, and workflow output publications.
-Cancellation, execution failure, and commit failure **MUST** use the same
+A runtime claiming atomic-turn conformance **MUST** establish the single
+admission baseline defined in
+[§6.4](#64-workflow-output-publication-turns-and-revisions): one before-turn
+checkpoint or equivalent undo root spanning KV, recurrent/convolution state, RNG,
+grammar/constraint state, conversation continuation, and transactional
+effects, plus the committed head/cursor of every workflow output stream. It
+**MUST** have one commit point and one `abort_to_baseline` path for that complete
+set. Cancellation, execution failure, and commit failure **MUST** use the same
 all-or-nothing abort semantics.
 
 The acceptance proof is fault injection immediately before and after every
 mutation and publication boundary. After each injected failure, a subsequent
 turn must observe either the complete old state or the complete committed new
-state according to the declared mode, never a mixture. Specialized decoder
-paths and the generic workflow interpreter are held to the same proof.
+state and output heads/cursors according to the declared mode, never a mixture.
+For provisional revisions, an observing adapter or consumer must also return
+exactly to the recorded committed baseline after the typed transaction abort;
+the proof **MUST NOT** depend on output names, payload inspection, emit order,
+or map iteration. Specialized decoder paths and the generic workflow
+interpreter are held to the same proof.
 
 #### 12.5d One cross-invocation state mechanism
 
@@ -2685,7 +2733,7 @@ their listed proof lands:
 | --- | --- | --- |
 | Shape is the sole rank authority; `Any` is an unconstrained dimension | Schema still serializes `rank` and optional `shape` | Atomic schema/parser/importer/exporter/runtime/example migration and fail-closed legacy-field tests |
 | Transport-neutral workflow output publication plus ordinary emits is distinct from API/network delivery | Current schema stores mode on individual emits and advertises redundant `streaming_emit` | Migrate to one output protocol family with permitted per-emit operations; remove `streaming_emit` without replacement; prove host observability without inferring transport delivery |
-| Commit-only default and provisional typed revisions; successful workflow/turn commit establishes ordinary-output finality and finalizes open revision streams, while optional `finalize` closes one revision stream early | No complete revision envelope or whole-turn coordinator | Protocol state-machine tests covering default commit finality, optional early close, post-close rejection, abort retraction, and the complete boundary fault matrix |
+| Atomic admission baseline covers the complete semantic state write set and every output's committed head/cursor; commit advances all heads atomically, while provisional revision abort uses typed `abort_to_baseline`; successful commit establishes default finality and optional `finalize` closes one stream early | No complete revision envelope, transaction baseline, or whole-turn coordinator | Protocol tests covering transaction identity, deterministic sequence and lineage, commit-default finality, optional early close, post-close rejection, consumer-visible abort-to-baseline, non-inference of rollback targets, and the complete boundary fault matrix |
 | Native typed/versioned tool registry v1 | Server still tries family formats in order | Two declared protocols, arbitrary chunk-boundary tests, and unknown-version fail-closed behavior |
 | Generic cross-invocation state/dataflow | Existing cells and state groups cover the pieces; complete cross-path proof is pending | Fixtures proving external initialization and internal carry with identical lifecycle rules across KV, recurrent, feature-stream, and audio-window examples |
 | Workflow-native speculative contract is the sole authority | Legacy `SpeculatorConfig` remains in parser/runtime paths | Producer migration and real MTP execution without legacy-only discovery |
