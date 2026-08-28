@@ -57,8 +57,9 @@ property of `crates/onnx-genai-metadata/src/schema/`. Section
    implementation-selection reports are runtime and API concerns.
 7. **API or network streaming.** HTTP/SSE/gRPC/WebSocket framing, flushing,
    buffering, retry, reconnect, backpressure, and disconnect behavior are
-   runtime/API contracts. Metadata describes internal publication only; see
-   [§6.4](#64-internal-publication-turns-and-revisions).
+   runtime/API contracts. Metadata describes transport-neutral publication to
+   the workflow output boundary, not delivery beyond that boundary; see
+   [§6.4](#64-workflow-output-publication-turns-and-revisions).
 
 ---
 
@@ -100,7 +101,7 @@ The package states **what must be true for execution to be correct**:
 - generation defaults and the structural override surface;
 - legal sharding and replication facts;
 - correctness dependencies for cache reuse;
-- typed internal publication and revision semantics;
+- typed workflow output publication and revision semantics;
 - the exact versioned tool render/parse protocol a package requires;
 - cross-invocation state identity, lifecycle, initialization, dataflow, update,
   and commit/rollback semantics.
@@ -335,8 +336,8 @@ or producer that defines them and MUST still fail closed when unavailable.
 | `telemetry_adapter` | adapters | Versioned timestamp/elapsed adapter ABI. | A component contract/adapter ABI `onnx-genai.telemetry@1`; validator-derived. | Enforce exact action bindings and effect semantics; reject unknown actions instead of approximating timing. | Adaptive proposal metrics; optional unless the workflow invokes it. |
 | `nested_control_flow` | syntax/IR | Loops or branches nested inside structural workflow nodes. | Any compiled loop or branch; validator-derived and manifest-required. | Preserve lexical SSA, zero-trip loops, branch phi results, and effect joins at every nesting level or reject. | Diffusion, autoregressive, weather, and nested audio/music workflows. |
 | `loop_induction_values` | syntax/IR | A typed zero-based iteration value visible to policy components. | A loop with `iteration`; validator-derived and manifest-required. | Produce the declared scalar/per-row induction tensor and keep it scoped to the loop. | Diffusion scheduler lookup, termination equations, nested codec loops; depends on nested control-flow support. |
-| `typed_emit` | syntax/IR | Publication of a typed SSA value to a declared workflow output. | Every compiled `emit`; validator-derived and manifest-required. | Enforce output contract, mode, row semantics, and effect ordering; reject undeclared or incompatible output publication. | All canonical workflows that return or incrementally publish values. |
-| `streaming_emit` | syntax/IR | Internal incremental event publication during workflow execution. The current spelling does **not** mean API or network streaming. | An `emit` with `mode: event`; validator-derived. | Preserve internal event order and effect semantics without converting the event silently to only a final value. It grants no HTTP/SSE/gRPC/WebSocket delivery capability. | Workflow event outputs; depends on `typed_emit`. |
+| `typed_emit` | syntax/IR | Publication of a typed SSA value to a declared, host-observable workflow output boundary. | Every compiled `emit`; validator-derived and manifest-required. | Enforce output contract, mode, row semantics, and effect ordering; reject undeclared or incompatible output publication. | All canonical workflows that return or incrementally publish values. |
+| `streaming_emit` | syntax/IR | Incremental discrete-event publication to a workflow output boundary. The current spelling does **not** mean API or network streaming. | An `emit` with `mode: event`; validator-derived. | Preserve workflow output event order and effect semantics without converting the event silently to only a materialized value. It grants no HTTP/SSE/gRPC/WebSocket delivery capability. | Workflow event outputs; depends on `typed_emit`. |
 | `emit_valid_length` | syntax/IR | Ragged valid-prefix publication from a fixed-capacity tensor. | An `emit` with `valid_length`; validator-derived and manifest-required. | Slice each request row to its valid prefix, maintain positional row ownership through compaction, and reject incompatible output layout. | Speculative accepted-token prefixes and masked generation; depends on `typed_emit`. |
 | `input_presence` | syntax/IR | An observable boolean for whether an optional caller/application tensor was supplied. | Any workflow input with `present_as`; validator requires the manifest entry. | Set the presence SSA value from actual caller presence, require control flow before optional use, and never fabricate sentinel tensors. | Text-only requests to a VLM and optional audio/image inputs; typically combines with `nested_control_flow`. |
 | `explicit_transfer` | syntax/IR | A device-transfer node in the planner's lowered internal IR. | Derived only from internal `WorkflowNode::Transfer`; authored workflow steps MUST NOT serialize transfers. | Execute the transfer with correct ordering/device semantics or reject the lowered plan. | Heterogeneous placement; no authored model example because placement owns transfer insertion. |
@@ -467,7 +468,7 @@ model-family dispatch:
 | `invoke` | binds named values to a component's ports |
 | `loop` | setup, body, condition, `max_iterations`, induction value, carried state |
 | `branch` | selects one case; exports only declared phi results and effect joins |
-| `emit` | publishes an internal incremental or final package output |
+| `emit` | publishes a typed value to its declared workflow output boundary |
 
 Control-flow *location* defines lifecycle. A value produced inside a loop body
 is loop-scoped; a value carried across iterations is a declared carried cell.
@@ -513,13 +514,17 @@ A branch exports only values its declared phi mapping names. Every case **MUST**
 produce every exported value, and effect joins **MUST** be declared. This keeps
 liveness and effect ordering decidable without executing the branch.
 
-### 6.4 Internal publication, turns, and revisions
+### 6.4 Workflow output publication, turns, and revisions
 
-Publication is a workflow semantic operation. It is not transport delivery.
-Metadata says nothing about whether an API flushes, which network framing is
-used, or whether a disconnected client can reconnect. An implementation
-**MUST NOT** infer such a promise from an output protocol, `emit`, `event`, or
-the current `streaming_emit` capability spelling.
+`emit` publishes a typed SSA value from workflow execution to its declared
+workflow output boundary. That boundary is outward-facing and observable
+through the host runtime contract, subject to the declared turn visibility
+mode; it is not merely an interpreter-internal notification. Publication does
+not imply delivery through HTTP, SSE, gRPC, WebSocket, or any other network/API
+transport. Metadata says nothing about flush timing, framing, buffering,
+reconnect, or backpressure, and an implementation **MUST NOT** infer such a
+promise from an output protocol, `emit`, `event`, or the current
+`streaming_emit` capability spelling.
 
 Publication has two authority levels:
 
@@ -553,6 +558,12 @@ implements current `replace`, `append`, or `event` emits.
 An output cannot mix these families. Output protocol, row-wise behavior, payload
 type, and growth-axis rules are output-level invariants; control flow and effect
 tokens determine the order of individual publications.
+
+Ordinary materialized values and discrete events do not require an explicit
+`finalize` operation. A successful workflow or enclosing turn commit establishes
+their final committed status. A typed-revision stream is likewise finalized by
+the enclosing turn commit unless it was closed earlier by the optional
+`finalize` operation described below.
 
 #### Turn publication modes
 
@@ -588,12 +599,15 @@ operation from this closed algebra:
 | `append` | Add the payload after the current provisional value on the declared growth axis. |
 | `replace` | Make the payload the stream's current provisional value. |
 | `retract` | Invalidate the named provisional revision and any value that depends on it. |
-| `finalize` | Mark the current revision final if the enclosing turn commits; later ordinary operations for that stream are invalid. |
+| `finalize` | Optionally close this revision stream before the enclosing turn ends; later operations for that stream are invalid. |
 
 Unknown operations or envelope versions **MUST** fail closed. Turn commit and
-stream finality are distinct. `finalize` says no later revision may alter that
-stream after commit; the enclosing turn commit says the turn's complete write
-set became durable and visible. An abort retracts a provisional `finalize` with
+stream closure are distinct. By default the enclosing successful turn commit
+both commits and finalizes every still-open revision stream. An explicit
+`finalize` is optional and closes one stream early, which permits another output
+to continue while guaranteeing that no later operation in the turn may alter
+the closed stream. Its final committed status still depends on the enclosing
+turn commit. If that turn aborts, the provisional early close is retracted with
 the rest of the uncommitted turn.
 
 Revision ownership follows workflow dataflow and effect ordering. A runtime
@@ -1827,14 +1841,14 @@ conversation to lose, and its session is an ordinary handle.
 exclusive leases, individual checkpoints, and speculative rollback exist, but
 they do not by themselves prove an atomic turn. End-to-end atomic-turn support
 requires the complete write set and publication modes defined in
-[§6.4](#64-internal-publication-turns-and-revisions).
+[§6.4](#64-workflow-output-publication-turns-and-revisions).
 
 A runtime claiming atomic-turn conformance **MUST** establish one before-turn
 snapshot or equivalent undo path, one commit point, and one abort path spanning
 KV, recurrent/convolution state, RNG, grammar/constraint state, conversation
-continuation, transactional effects, and internal publications. Cancellation,
-execution failure, and commit failure **MUST** use the same all-or-nothing abort
-semantics.
+continuation, transactional effects, and workflow output publications.
+Cancellation, execution failure, and commit failure **MUST** use the same
+all-or-nothing abort semantics.
 
 The acceptance proof is fault injection immediately before and after every
 mutation and publication boundary. After each injected failure, a subsequent
@@ -1859,7 +1873,7 @@ The source and destination of state follow from explicit workflow structure:
 - loop-carry outputs, state-service output aliases, and explicit workflow writes
   declare writers; and
 - `ShapeRecurrence`, `StateGroupContract::update`, capabilities/cascades, and
-  [§6.4](#64-internal-publication-turns-and-revisions) declare update,
+  [§6.4](#64-workflow-output-publication-turns-and-revisions) declare update,
   commit, abort, snapshot, fork, and rollback behavior.
 
 `StateManagement` answers who owns physical storage. It **MUST NOT** be
@@ -2670,8 +2684,8 @@ their listed proof lands:
 | Accepted contract | Current status | Proof required before claiming support |
 | --- | --- | --- |
 | Shape is the sole rank authority; `Any` is an unconstrained dimension | Schema still serializes `rank` and optional `shape` | Atomic schema/parser/importer/exporter/runtime/example migration and fail-closed legacy-field tests |
-| Output-level publication protocol plus ordinary workflow emits is distinct from API/network streaming | Current schema stores mode on individual emits and advertises redundant `streaming_emit` | Migrate to one output protocol family with permitted per-emit operations; remove `streaming_emit` without replacement; prove no transport claim |
-| Commit-only default and provisional typed revisions with `append`/`replace`/`retract`/`finalize` | No complete revision envelope or whole-turn coordinator | Protocol state-machine tests plus a boundary fault matrix across every semantic carrier and publication |
+| Transport-neutral workflow output publication plus ordinary emits is distinct from API/network delivery | Current schema stores mode on individual emits and advertises redundant `streaming_emit` | Migrate to one output protocol family with permitted per-emit operations; remove `streaming_emit` without replacement; prove host observability without inferring transport delivery |
+| Commit-only default and provisional typed revisions; successful workflow/turn commit establishes ordinary-output finality and finalizes open revision streams, while optional `finalize` closes one revision stream early | No complete revision envelope or whole-turn coordinator | Protocol state-machine tests covering default commit finality, optional early close, post-close rejection, abort retraction, and the complete boundary fault matrix |
 | Native typed/versioned tool registry v1 | Server still tries family formats in order | Two declared protocols, arbitrary chunk-boundary tests, and unknown-version fail-closed behavior |
 | Generic cross-invocation state/dataflow | Existing cells and state groups cover the pieces; complete cross-path proof is pending | Fixtures proving external initialization and internal carry with identical lifecycle rules across KV, recurrent, feature-stream, and audio-window examples |
 | Workflow-native speculative contract is the sole authority | Legacy `SpeculatorConfig` remains in parser/runtime paths | Producer migration and real MTP execution without legacy-only discovery |
@@ -3192,4 +3206,4 @@ The original approved decisions map to sections as follows.
 | 26–32 (state) | [§12](#12-state) |
 | 33–36 (generation, speculative, LoRA, state quantization) | [§9](#9-adapters-lora), [§13](#13-speculative-execution), [§14](#14-generation), [§12.7](#127-state-representation-and-quantization) |
 | 37–39 (distributed execution) | [§16](#16-distributed-execution) |
-| Review decisions accepted from #2302/#2303 | [§4.5](#45-tensor-shape-is-the-sole-rank-authority), [§6.4](#64-internal-publication-turns-and-revisions), [§8](#8-batching-varlen-and-paged-attention), [§12.3](#123-capabilities-and-cascade), [§12.5](#125-sessions), [§12.6](#126-private-state-and-checkpoints), [§12.8](#128-stateful-graph-internal-token-context-features), [§13](#13-speculative-execution), [§15](#15-preprocessing-and-generated-inputs), [§20.4](#204-accepted-contracts-awaiting-implementation-proof) |
+| Review decisions accepted from #2302/#2303 | [§4.5](#45-tensor-shape-is-the-sole-rank-authority), [§6.4](#64-workflow-output-publication-turns-and-revisions), [§8](#8-batching-varlen-and-paged-attention), [§12.3](#123-capabilities-and-cascade), [§12.5](#125-sessions), [§12.6](#126-private-state-and-checkpoints), [§12.8](#128-stateful-graph-internal-token-context-features), [§13](#13-speculative-execution), [§15](#15-preprocessing-and-generated-inputs), [§20.4](#204-accepted-contracts-awaiting-implementation-proof) |
