@@ -1329,13 +1329,21 @@ fn portable_checkpoints_are_distinct_from_private_state_transfer() {
         "{failures:?}"
     );
 
-    // Declaring the versioned adapter is what makes the export legal.
+    // A standardized declaration is still not execution support. The exact
+    // pair remains typed, but this build refuses it until the portable adapter
+    // named by the registry exists.
     let portable = exported.replace(
         "            capabilities:",
         "            checkpoint: { adapter: onnx-genai.kv-checkpoint, version: \"1\" }\n            \
          capabilities:",
     );
-    validate_metadata(&parse(&portable)).expect("a declared checkpoint adapter permits export");
+    let failures = errors(&portable);
+    assert!(
+        failures.iter().any(|error| {
+            error.contains("onnx-genai.kv-checkpoint@1") && error.contains("known, but unavailable")
+        }),
+        "{failures:?}"
+    );
     let checkpoint = group(&portable).checkpoint.expect("checkpoint");
     assert_eq!(checkpoint.adapter, "onnx-genai.kv-checkpoint");
     assert_eq!(checkpoint.version, "1");
@@ -1496,13 +1504,19 @@ fn runtime_owned_state_cannot_be_exported_under_an_alias() {
         "exporting runtime-owned state under an alias must be rejected: {reported:?}"
     );
 
-    // Declaring the versioned adapter is what makes the aliased export legal.
+    // Declaring a known pair cannot bypass its unavailable registry status.
     let portable = aliased.replace(
         "            capabilities:",
         "            checkpoint: { adapter: onnx-genai.kv-checkpoint, version: \"1\" }\n            \
          capabilities:",
     );
-    validate_metadata(&parse(&portable)).expect("a declared checkpoint adapter permits export");
+    let failures = errors(&portable);
+    assert!(
+        failures.iter().any(|error| {
+            error.contains("onnx-genai.kv-checkpoint@1") && error.contains("known, but unavailable")
+        }),
+        "{failures:?}"
+    );
 }
 
 #[test]

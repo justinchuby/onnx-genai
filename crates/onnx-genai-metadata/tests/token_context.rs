@@ -8,11 +8,10 @@ use std::collections::BTreeMap;
 
 use onnx_genai_metadata::{
     BatchLayout, ComponentContract, ComponentImplementation, InferenceMetadata, PaddedDimension,
-    PortRole, RuntimeInputRole, SemanticInputRole, ShapeRecurrence, StateCheckpointContract,
-    StateGroupCapabilities, StateKind, StatePortAlias, StateSemanticRole, StateUpdate,
-    TensorContract, TensorDimension, WorkflowComponent, WorkflowInput, WorkflowInputSource,
-    WorkflowStateScope, WorkflowStep, classify_session_state, resolve_state_plan,
-    validate_metadata,
+    PortRole, RuntimeInputRole, SemanticInputRole, ShapeRecurrence, StateGroupCapabilities,
+    StateKind, StatePortAlias, StateSemanticRole, StateUpdate, TensorContract, TensorDimension,
+    WorkflowComponent, WorkflowInput, WorkflowInputSource, WorkflowStateScope, WorkflowStep,
+    classify_session_state, resolve_state_plan, validate_metadata,
 };
 
 const TOKEN_CONTEXT_CONTRACT: &str = "onnx-genai.token-context";
@@ -167,10 +166,7 @@ fn fixture() -> InferenceMetadata {
         fork: true,
         cascade: Default::default(),
     };
-    token_group.checkpoint = Some(StateCheckpointContract {
-        adapter: "onnx-genai.tensor-checkpoint".to_string(),
-        version: "1".to_string(),
-    });
+    token_group.checkpoint = None;
     token_group.ports = BTreeMap::from([(
         "model".to_string(),
         BTreeMap::from([(
@@ -201,10 +197,7 @@ fn fixture() -> InferenceMetadata {
         .groups
         .get_mut("causal_conv_history")
         .expect("convolution state group exists")
-        .checkpoint = Some(StateCheckpointContract {
-        adapter: "onnx-genai.tensor-checkpoint".to_string(),
-        version: "1".to_string(),
-    });
+        .checkpoint = None;
     serving
         .state_service
         .groups
@@ -445,8 +438,8 @@ fn graph_internal_token_context_uses_generic_ports_and_state_groups() {
                 .groups
                 .get(history)
                 .and_then(|group| group.checkpoint.as_ref())
-                .is_some(),
-            "{history} declares portable checkpoint handling"
+                .is_none(),
+            "{history} uses core runtime snapshot/fork semantics, not a portable checkpoint adapter"
         );
         assert_eq!(
             carriers.carrier(history),

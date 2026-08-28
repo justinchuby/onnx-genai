@@ -364,7 +364,8 @@ fn retired_streaming_emit_is_rejected_with_output_family_migration_guidance() {
     let document = r#"
 pipeline:
   workflow:
-    manifest: {}
+    manifest:
+      capabilities: [streaming_emit]
     components: {}
     steps: []
 "#;

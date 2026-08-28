@@ -115,6 +115,104 @@ pub struct ExtensionDescriptor {
     pub status: SupportStatus,
 }
 
+/// Runtime support offered by the consumer that owns one extension surface.
+///
+/// Registry membership and consumer support are separate facts. An exact pair
+/// may be standardized but unavailable in this build, or implemented only for
+/// a narrower backend/profile than the package requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtensionConsumerSupport {
+    Supported {
+        scope: &'static str,
+    },
+    Unsupported {
+        scope: &'static str,
+        reason: &'static str,
+        guidance: &'static str,
+    },
+}
+
+/// Proof that one exact registry pair is supported by its declared consumer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdmittedExtension {
+    pub descriptor: &'static ExtensionDescriptor,
+    pub consumer: &'static str,
+    pub scope: &'static str,
+}
+
+/// Exact-pair extension admission failure.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ExtensionAdmissionError {
+    #[error(
+        "{path} requires extension '{identity}@{version}' on the {surface} surface, but identity \
+         '{identity}' is not registered there. Registered exact pairs for this surface: \
+         {supported}. {guidance}"
+    )]
+    UnknownIdentity {
+        path: String,
+        identity: String,
+        version: String,
+        surface: &'static str,
+        supported: String,
+        guidance: &'static str,
+    },
+    #[error(
+        "{path} requires extension '{identity}@{version}' on the {surface} surface, but that \
+         version is not registered. Registered versions for '{identity}': {supported_versions}. \
+         {guidance}"
+    )]
+    UnknownVersion {
+        path: String,
+        identity: String,
+        version: String,
+        surface: &'static str,
+        supported_versions: String,
+        guidance: &'static str,
+    },
+    #[error(
+        "{path} requires extension '{identity}@{version}' on the {surface} surface, but the exact \
+         pair is registered for {registered_surface}. Declare it only at \
+         '{registered_declaration}', or use a registered {surface} pair. {guidance}"
+    )]
+    WrongSurface {
+        path: String,
+        identity: String,
+        version: String,
+        surface: &'static str,
+        registered_surface: &'static str,
+        registered_declaration: &'static str,
+        guidance: &'static str,
+    },
+    #[error(
+        "{path} requires known extension '{identity}@{version}', but its authoritative registry \
+         status is '{status}' at consumer '{consumer}' (scope: {scope}). Refusing before \
+         artifact/session/state allocation. {guidance}"
+    )]
+    RegistryUnavailable {
+        path: String,
+        identity: String,
+        version: String,
+        status: &'static str,
+        consumer: &'static str,
+        scope: &'static str,
+        guidance: &'static str,
+    },
+    #[error(
+        "{path} requires extension '{identity}@{version}', but consumer '{consumer}' does not \
+         support the requested backend/profile (scope: {scope}): {reason}. Refusing before \
+         artifact/session/state allocation. {guidance}"
+    )]
+    ConsumerUnavailable {
+        path: String,
+        identity: String,
+        version: String,
+        consumer: &'static str,
+        scope: &'static str,
+        reason: &'static str,
+        guidance: &'static str,
+    },
+}
+
 const V1: SchemaVersion = INITIAL_SCHEMA_VERSION;
 
 pub const TAGGED_JSON_V1: ExtensionId = ExtensionId::new("tagged-json", "v1");
@@ -330,7 +428,7 @@ pub const BUILTIN_EXTENSIONS: &[ExtensionDescriptor] = &[
         schema_floor: V1,
         declaration: "pipeline.workflow.serving.state_service.groups.<name>.checkpoint",
         normative_reference: "§12.6",
-        admission_consumer: "runtime checkpoint adapter registration",
+        admission_consumer: "onnx_genai_metadata::validation::validate_checkpoint_extension",
         fallback: FallbackClass::SemanticRequired,
         status: SupportStatus::KnownButUnavailable,
     },
@@ -373,6 +471,110 @@ pub fn find(identity: &str, version: &str) -> Option<&'static ExtensionDescripto
     BUILTIN_EXTENSIONS
         .iter()
         .find(|descriptor| descriptor.id.identity == identity && descriptor.id.version == version)
+}
+
+/// Admit one exact extension pair through the authoritative registry and the
+/// consumer that implements its declared surface.
+///
+/// This is the shared distinction between syntax, registry knowledge, and
+/// runtime support. Callers must never interpret [`find`] success as execution
+/// support.
+pub fn admit_exact(
+    surface: ExtensionSurface,
+    identity: &str,
+    version: &str,
+    path: impl Into<String>,
+    support: ExtensionConsumerSupport,
+    guidance: &'static str,
+) -> Result<AdmittedExtension, Box<ExtensionAdmissionError>> {
+    let path = path.into();
+    let exact = find(identity, version);
+    let descriptor = match exact {
+        Some(descriptor) if descriptor.surface == surface => descriptor,
+        Some(descriptor) => {
+            return Err(Box::new(ExtensionAdmissionError::WrongSurface {
+                path,
+                identity: identity.to_string(),
+                version: version.to_string(),
+                surface: surface.as_str(),
+                registered_surface: descriptor.surface.as_str(),
+                registered_declaration: descriptor.declaration,
+                guidance,
+            }));
+        }
+        None => {
+            let versions = BUILTIN_EXTENSIONS
+                .iter()
+                .filter(|descriptor| {
+                    descriptor.surface == surface && descriptor.id.identity == identity
+                })
+                .map(|descriptor| descriptor.id.version)
+                .collect::<Vec<_>>();
+            if !versions.is_empty() {
+                return Err(Box::new(ExtensionAdmissionError::UnknownVersion {
+                    path,
+                    identity: identity.to_string(),
+                    version: version.to_string(),
+                    surface: surface.as_str(),
+                    supported_versions: versions.join(", "),
+                    guidance,
+                }));
+            }
+            let supported = BUILTIN_EXTENSIONS
+                .iter()
+                .filter(|descriptor| descriptor.surface == surface)
+                .map(|descriptor| descriptor.id.wire_name())
+                .collect::<Vec<_>>();
+            return Err(Box::new(ExtensionAdmissionError::UnknownIdentity {
+                path,
+                identity: identity.to_string(),
+                version: version.to_string(),
+                surface: surface.as_str(),
+                supported: if supported.is_empty() {
+                    "none".to_string()
+                } else {
+                    supported.join(", ")
+                },
+                guidance,
+            }));
+        }
+    };
+
+    let scope = match support {
+        ExtensionConsumerSupport::Supported { scope }
+        | ExtensionConsumerSupport::Unsupported { scope, .. } => scope,
+    };
+    let consumer = descriptor.admission_consumer;
+    if descriptor.status == SupportStatus::KnownButUnavailable {
+        return Err(Box::new(ExtensionAdmissionError::RegistryUnavailable {
+            path,
+            identity: identity.to_string(),
+            version: version.to_string(),
+            status: descriptor.status.as_str(),
+            consumer,
+            scope,
+            guidance,
+        }));
+    }
+    if let ExtensionConsumerSupport::Unsupported {
+        reason, guidance, ..
+    } = support
+    {
+        return Err(Box::new(ExtensionAdmissionError::ConsumerUnavailable {
+            path,
+            identity: identity.to_string(),
+            version: version.to_string(),
+            consumer,
+            scope,
+            reason,
+            guidance,
+        }));
+    }
+    Ok(AdmittedExtension {
+        descriptor,
+        consumer,
+        scope,
+    })
 }
 
 /// Render the committed, discoverable extension registry.

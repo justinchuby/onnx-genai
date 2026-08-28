@@ -143,30 +143,6 @@ pipeline:
             axis: 0
         role: tensor
         stage: pre_adapter
-      key_cache:
-        contract:
-          dtype: float32
-          shape:
-          - batch
-          - cache_capacity
-          - 4
-          batch_layout:
-            kind: request_aligned
-            axis: 0
-        role: tensor
-        stage: pre_adapter
-      value_cache:
-        contract:
-          dtype: float32
-          shape:
-          - batch
-          - cache_capacity
-          - 4
-          batch_layout:
-            kind: request_aligned
-            axis: 0
-        role: tensor
-        stage: pre_adapter
     components:
       model:
         batch_capacity: { uniform_dimensions: [cache_capacity] }
@@ -568,9 +544,6 @@ pipeline:
               rollback_positions: 8
               snapshot: true
               fork: true
-            checkpoint:
-              adapter: onnx-genai.kv-checkpoint
-              version: '1'
             ports:
               model:
                 key_cache:
@@ -685,14 +658,6 @@ pipeline:
     - kind: emit
       value: write_indices
       output: write_indices
-      mode: replace
-    - kind: emit
-      value: key_cache
-      output: key_cache
-      mode: replace
-    - kind: emit
-      value: value_cache
-      output: value_cache
       mode: replace
 package:
   tokenizer:

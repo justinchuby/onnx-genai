@@ -40,7 +40,7 @@ Packages declare an extension only through its typed declaration location. The r
 | `onnxruntime.lora-adapter@1` | adapter artifact loader | `v1.0` | `adapters.artifacts.<name>.weights[].loader_capability` | §9 | `onnx_genai_metadata::validate_adapter_service` | semantic-required (fail closed) | implemented |
 | `onnx-genai.adapters.hf-peft@1` | adapter artifact loader | `v1.0` | `adapters.artifacts.<name>.weights[].loader_capability` | §9 | `onnx_genai_metadata::validate_adapter_service` | semantic-required (fail closed) | implemented |
 | `onnx-genai.adapters.safetensors@1` | adapter artifact loader | `v1.0` | `adapters.artifacts.<name>.weights[].loader_capability` | §9 | `onnx_genai_metadata::validate_adapter_service` | semantic-required (fail closed) | implemented |
-| `onnx-genai.kv-checkpoint@1` | state checkpoint adapter | `v1.0` | `pipeline.workflow.serving.state_service.groups.<name>.checkpoint` | §12.6 | `runtime checkpoint adapter registration` | semantic-required (fail closed) | known, but unavailable (fail closed) |
+| `onnx-genai.kv-checkpoint@1` | state checkpoint adapter | `v1.0` | `pipeline.workflow.serving.state_service.groups.<name>.checkpoint` | §12.6 | `onnx_genai_metadata::validation::validate_checkpoint_extension` | semantic-required (fail closed) | known, but unavailable (fail closed) |
 
 ## Open extension surfaces
 

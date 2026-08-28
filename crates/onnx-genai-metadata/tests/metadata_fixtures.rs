@@ -291,7 +291,7 @@ fn minimal_workflow_document_is_valid() {
 schema_version: v1
 pipeline:
   workflow:
-    manifest: {{}}
+    manifest: {}
     components:
       noop:
         implementation:
@@ -313,7 +313,7 @@ fn optional_input_presence_is_an_explicit_branch_predicate() {
 schema_version: v1
 pipeline:
   workflow:
-    manifest: {{}}
+    manifest: {}
     inputs:
       request.image:
         contract: { dtype: uint8, shape: [encoded_bytes] }
@@ -344,7 +344,7 @@ fn optional_tensor_without_default_or_presence_is_rejected() {
 schema_version: v1
 pipeline:
   workflow:
-    manifest: {{}}
+    manifest: {}
     inputs:
       request.image:
         contract: { dtype: uint8, shape: [encoded_bytes] }
@@ -371,7 +371,7 @@ fn optional_tensor_must_only_be_read_in_its_presence_branch() {
 schema_version: v1
 pipeline:
   workflow:
-    manifest: {{}}
+    manifest: {}
     inputs:
       request.image:
         contract: { dtype: uint8, shape: [encoded_bytes] }
@@ -407,7 +407,7 @@ fn request_presence_rejects_roles_with_implicit_defaults() {
 schema_version: v1
 pipeline:
   workflow:
-    manifest: {{}}
+    manifest: {}
     inputs:
       request.temperature:
         contract: { dtype: float32, shape: [1] }

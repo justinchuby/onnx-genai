@@ -152,25 +152,11 @@ fn package_with_generic_feature_state(geometry: Geometry) -> anyhow::Result<Path
         1,
     );
     document = document.replacen(
-        "    outputs:\n      hidden_states:",
-        r#"    outputs:
-      generic_feature:
-        contract:
-          dtype: int64
-          shape: [batch]
-          batch_layout: { kind: request_aligned, axis: 0 }
-        role: tensor
-        stage: pre_adapter
-      hidden_states:"#,
-        1,
-    );
-    document = document.replacen(
         "      - { kind: emit, value: context.output, output: hidden_states, mode: replace }",
         r#"      - kind: invoke
         component: generic_feature
         inputs: { feature_state: initial_generic_feature, delta: accepted_len }
-        outputs: { next_feature: context.next_feature }
-      - { kind: emit, value: context.next_feature, output: generic_feature, mode: replace }
+        outputs: { next_feature: generic_feature }
       - { kind: emit, value: context.output, output: hidden_states, mode: replace }"#,
         1,
     );
@@ -182,7 +168,6 @@ fn package_with_generic_feature_state(geometry: Geometry) -> anyhow::Result<Path
             layout: b
             update: { kind: replace }
             capabilities: { snapshot: true, fork: true }
-            checkpoint: { adapter: onnx-genai.tensor-checkpoint, version: "1" }
             ports:
               generic_feature:
                 generic_feature:
@@ -489,24 +474,10 @@ pipeline:
           padding: [{{ dimension: sequence, valid_lengths: valid_lengths }}]
         role: tensor
         stage: pre_adapter
-      token_history:
-        contract:
-          dtype: int64
-          shape: [batch, {context_len}]
-          batch_layout: {{ kind: request_aligned, axis: 0 }}
-        role: tensor
-        stage: pre_adapter
       valid_lengths:
         contract:
           dtype: int64
           shape: [batch]
-          batch_layout: {{ kind: request_aligned, axis: 0 }}
-        role: tensor
-        stage: pre_adapter
-      conv_history:
-        contract:
-          dtype: float32
-          shape: [batch, {channels}, {conv_history_len}]
           batch_layout: {{ kind: request_aligned, axis: 0 }}
         role: tensor
         stage: pre_adapter
@@ -594,11 +565,9 @@ pipeline:
           conv_history: initial_conv_history
         outputs:
           output: context.output
-          next_token_history: context.next_tokens
-          next_conv_history: context.next_conv
+          next_token_history: token_history
+          next_conv_history: conv_history
       - {{ kind: emit, value: context.output, output: hidden_states, mode: replace }}
-      - {{ kind: emit, value: context.next_tokens, output: token_history, mode: replace }}
-      - {{ kind: emit, value: context.next_conv, output: conv_history, mode: replace }}
       - {{ kind: emit, value: accepted_len, output: valid_lengths, mode: replace }}
     serving:
       active: active
@@ -611,7 +580,6 @@ pipeline:
             layout: bt
             update: {{ kind: replace }}
             capabilities: {{ snapshot: true, fork: true, cascade: [conv_history] }}
-            checkpoint: {{ adapter: onnx-genai.tensor-checkpoint, version: "1" }}
             ports:
               token_context:
                 token_history:
@@ -622,7 +590,6 @@ pipeline:
             layout: bch
             update: {{ kind: replace }}
             capabilities: {{ snapshot: true, fork: true }}
-            checkpoint: {{ adapter: onnx-genai.tensor-checkpoint, version: "1" }}
             ports:
               token_context:
                 conv_history:
@@ -1436,7 +1403,7 @@ fn outputs(
     let mut final_tokens = Vec::new();
     let mut final_conv = Vec::new();
     for chunk in chunks {
-        let run = engine.run_pipeline(request(geometry, session, chunk, position)?)?;
+        let run = engine.run_pipeline_retained(request(geometry, session, chunk, position)?)?;
         hidden.extend(run["hidden_states"].to_vec_f32()?);
         final_tokens = run["token_history"].to_vec_i64()?;
         final_conv = run["conv_history"].to_vec_f32()?;
@@ -1492,14 +1459,14 @@ fn failed_selected_turn_restores_both_histories_output_and_sibling_rows() -> any
         "failed-sibling",
         "expected-sibling",
     ] {
-        engine.run_pipeline(request_rows(geometry, session, &prefixes, 0, None)?)?;
+        engine.run_pipeline_retained(request_rows(geometry, session, &prefixes, 0, None)?)?;
     }
 
     let source_tokens = [&[23][..], &[37][..], &[41][..]];
     for session in ["failed-retry", "failed-sibling"] {
         let failed = request_rows(geometry, session, &source_tokens, 2, Some(&[2, 0]))?
             .with_input("failure_index", Value::from_slice_i64(&[999], &[])?);
-        let error = match engine.run_pipeline(failed) {
+        let error = match engine.run_pipeline_retained(failed) {
             Ok(_) => panic!("the post-publication gather must fail the admitted turn"),
             Err(error) => error,
         };
@@ -1509,14 +1476,14 @@ fn failed_selected_turn_restores_both_histories_output_and_sibling_rows() -> any
         );
     }
 
-    let expected_retry = engine.run_pipeline(request_rows(
+    let expected_retry = engine.run_pipeline_retained(request_rows(
         geometry,
         "expected-retry",
         &source_tokens,
         2,
         Some(&[2, 0]),
     )?)?;
-    let actual_retry = engine.run_pipeline(request_rows(
+    let actual_retry = engine.run_pipeline_retained(request_rows(
         geometry,
         "failed-retry",
         &source_tokens,
@@ -1525,14 +1492,14 @@ fn failed_selected_turn_restores_both_histories_output_and_sibling_rows() -> any
     )?)?;
     assert_token_context_outputs_equal(&actual_retry, &expected_retry)?;
 
-    let expected_sibling = engine.run_pipeline(request_rows(
+    let expected_sibling = engine.run_pipeline_retained(request_rows(
         geometry,
         "expected-sibling",
         &source_tokens,
         2,
         Some(&[1]),
     )?)?;
-    let actual_sibling = engine.run_pipeline(request_rows(
+    let actual_sibling = engine.run_pipeline_retained(request_rows(
         geometry,
         "failed-sibling",
         &source_tokens,
@@ -1552,7 +1519,7 @@ fn semantic_session_fork_clones_token_and_convolution_histories_for_both_geometr
         let parent = engine.create_session()?;
         let parent_name = parent.to_string();
         let prefix = [5, 7];
-        engine.run_pipeline(request(geometry, &parent_name, &prefix, 0)?)?;
+        engine.run_pipeline_retained(request(geometry, &parent_name, &prefix, 0)?)?;
 
         let plan = engine.prepare_session_fork(parent, SessionPosition::new(1))?;
         for state in ["token_history", "conv_history"] {
@@ -1580,9 +1547,9 @@ fn semantic_session_fork_clones_token_and_convolution_histories_for_both_geometr
         let child_name = child.to_string();
 
         let parent_run =
-            engine.run_pipeline(request(geometry, &parent_name, &[11], prefix.len())?)?;
+            engine.run_pipeline_retained(request(geometry, &parent_name, &[11], prefix.len())?)?;
         let child_run =
-            engine.run_pipeline(request(geometry, &child_name, &[13], prefix.len())?)?;
+            engine.run_pipeline_retained(request(geometry, &child_name, &[13], prefix.len())?)?;
         let mut parent_control = Engine::from_dir(&root, EngineConfig::default())?;
         let expected_parent = outputs(
             &mut parent_control,
@@ -1612,8 +1579,12 @@ fn semantic_session_fork_clones_token_and_convolution_histories_for_both_geometr
         );
 
         engine.close_session(parent)?;
-        let continued_child =
-            engine.run_pipeline(request(geometry, &child_name, &[17], prefix.len() + 1)?)?;
+        let continued_child = engine.run_pipeline_retained(request(
+            geometry,
+            &child_name,
+            &[17],
+            prefix.len() + 1,
+        )?)?;
         let mut continued_control = Engine::from_dir(&root, EngineConfig::default())?;
         let expected_continued = outputs(
             &mut continued_control,
@@ -1642,7 +1613,7 @@ fn forked_token_context_sessions_abort_retry_and_commit_independently() -> anyho
     let parent = engine.create_session()?;
     let parent_name = parent.to_string();
     let prefix = [&[3, 5][..], &[17, 19][..], &[29, 31][..]];
-    engine.run_pipeline(request_rows(geometry, &parent_name, &prefix, 0, None)?)?;
+    engine.run_pipeline_retained(request_rows(geometry, &parent_name, &prefix, 0, None)?)?;
     let child =
         engine.fork_session(engine.prepare_session_fork(parent, SessionPosition::new(1))?)?;
     let child_name = child.to_string();
@@ -1650,20 +1621,20 @@ fn forked_token_context_sessions_abort_retry_and_commit_independently() -> anyho
 
     let failed = request_rows(geometry, &parent_name, &source_tokens, 2, Some(&[2, 0]))?
         .with_input("failure_index", Value::from_slice_i64(&[999], &[])?);
-    let error = match engine.run_pipeline(failed) {
+    let error = match engine.run_pipeline_retained(failed) {
         Ok(_) => panic!("parent turn must fail after staging state and output"),
         Err(error) => error,
     };
     assert!(format!("{error:#}").contains("Gather"), "{error:#}");
 
-    let child_result = engine.run_pipeline(request_rows(
+    let child_result = engine.run_pipeline_retained(request_rows(
         geometry,
         &child_name,
         &source_tokens,
         2,
         Some(&[1]),
     )?)?;
-    let parent_retry = engine.run_pipeline(request_rows(
+    let parent_retry = engine.run_pipeline_retained(request_rows(
         geometry,
         &parent_name,
         &source_tokens,
@@ -1672,8 +1643,14 @@ fn forked_token_context_sessions_abort_retry_and_commit_independently() -> anyho
     )?)?;
 
     let mut parent_control = Engine::from_dir(&root, EngineConfig::default())?;
-    parent_control.run_pipeline(request_rows(geometry, "parent-control", &prefix, 0, None)?)?;
-    let expected_parent = parent_control.run_pipeline(request_rows(
+    parent_control.run_pipeline_retained(request_rows(
+        geometry,
+        "parent-control",
+        &prefix,
+        0,
+        None,
+    )?)?;
+    let expected_parent = parent_control.run_pipeline_retained(request_rows(
         geometry,
         "parent-control",
         &source_tokens,
@@ -1683,8 +1660,14 @@ fn forked_token_context_sessions_abort_retry_and_commit_independently() -> anyho
     assert_token_context_outputs_equal(&parent_retry, &expected_parent)?;
 
     let mut child_control = Engine::from_dir(&root, EngineConfig::default())?;
-    child_control.run_pipeline(request_rows(geometry, "child-control", &prefix, 0, None)?)?;
-    let expected_child = child_control.run_pipeline(request_rows(
+    child_control.run_pipeline_retained(request_rows(
+        geometry,
+        "child-control",
+        &prefix,
+        0,
+        None,
+    )?)?;
+    let expected_child = child_control.run_pipeline_retained(request_rows(
         geometry,
         "child-control",
         &source_tokens,
@@ -1710,7 +1693,7 @@ fn semantic_fork_clones_alternate_generic_feature_state() -> anyhow::Result<()> 
             Value::from_slice_i64(&[0], &[1])?,
         ))
     };
-    engine.run_pipeline(generic_request(&parent_name, &[3, 5], 0)?)?;
+    engine.run_pipeline_retained(generic_request(&parent_name, &[3, 5], 0)?)?;
     let plan = engine.prepare_session_fork(parent, SessionPosition::new(1))?;
     assert!(plan.participants().iter().any(|participant| {
         participant.kind == SessionForkParticipantKind::GenericFeatureState
@@ -1718,10 +1701,10 @@ fn semantic_fork_clones_alternate_generic_feature_state() -> anyhow::Result<()> 
     }));
     let child = engine.fork_session(plan)?;
 
-    let parent_run = engine.run_pipeline(generic_request(&parent_name, &[7], 2)?)?;
+    let parent_run = engine.run_pipeline_retained(generic_request(&parent_name, &[7], 2)?)?;
     let child_request = generic_request(&child.to_string(), &[11], 2)?
         .with_input("accepted_len", Value::from_slice_i64(&[0], &[1])?);
-    let child_run = engine.run_pipeline(child_request)?;
+    let child_run = engine.run_pipeline_retained(child_request)?;
     assert_eq!(parent_run["generic_feature"].to_vec_i64()?, [3]);
     assert_eq!(child_run["generic_feature"].to_vec_i64()?, [2]);
     engine.close_session(parent)?;
@@ -1795,7 +1778,7 @@ fn executable_token_context_preserves_chunk_decode_checkpoint_and_release_semant
                 &[1, 1, geometry.channels() as i64],
             )?,
         );
-        let error = match engine.run_pipeline(invalid) {
+        let error = match engine.run_pipeline_retained(invalid) {
             Ok(_) => panic!("a mismatched sequence shape must abort before state commit"),
             Err(error) => error,
         };
@@ -1816,7 +1799,7 @@ fn executable_token_context_preserves_chunk_decode_checkpoint_and_release_semant
         let row_zero_prefix = [3, 5];
         let row_one_prefix = [17, 19];
         let row_two_prefix = [29, 31];
-        engine.run_pipeline(request_rows(
+        engine.run_pipeline_retained(request_rows(
             geometry,
             "batched",
             &[&row_zero_prefix, &row_one_prefix, &row_two_prefix],
@@ -1825,7 +1808,7 @@ fn executable_token_context_preserves_chunk_decode_checkpoint_and_release_semant
         )?)?;
         let source_tokens = [&[23][..], &[37][..], &[41][..]];
         let invalid_selection = request_rows(geometry, "batched", &source_tokens, 2, Some(&[3]))?;
-        let error = match engine.run_pipeline(invalid_selection) {
+        let error = match engine.run_pipeline_retained(invalid_selection) {
             Ok(_) => panic!("an out-of-range row selection must fail before state commit"),
             Err(error) => error,
         };
@@ -1849,15 +1832,19 @@ fn executable_token_context_preserves_chunk_decode_checkpoint_and_release_semant
             "row-two-reference",
             &[&row_two_prefix],
         )?;
-        let row_zero = engine.run_pipeline(request(
+        let row_zero = engine.run_pipeline_retained(request(
             geometry,
             "row-zero-reference",
             source_tokens[0],
             2,
         )?)?;
-        let row_two =
-            engine.run_pipeline(request(geometry, "row-two-reference", source_tokens[2], 2)?)?;
-        let cloned = engine.run_pipeline(request_rows(
+        let row_two = engine.run_pipeline_retained(request(
+            geometry,
+            "row-two-reference",
+            source_tokens[2],
+            2,
+        )?)?;
+        let cloned = engine.run_pipeline_retained(request_rows(
             geometry,
             "batched",
             &source_tokens,
@@ -1879,7 +1866,7 @@ fn executable_token_context_preserves_chunk_decode_checkpoint_and_release_semant
 
         let selected_checkpoint = engine.checkpoint_workflow_session("batched")?;
         let continuation_rows = [&[43][..], &[47][..], &[53][..]];
-        let shrunk = engine.run_pipeline(request_rows(
+        let shrunk = engine.run_pipeline_retained(request_rows(
             geometry,
             "batched",
             &continuation_rows,
@@ -1887,7 +1874,7 @@ fn executable_token_context_preserves_chunk_decode_checkpoint_and_release_semant
             Some(&[2, 0]),
         )?)?;
         engine.restore_workflow_session_checkpoint("batched", &selected_checkpoint)?;
-        let replayed_shrink = engine.run_pipeline(request_rows(
+        let replayed_shrink = engine.run_pipeline_retained(request_rows(
             geometry,
             "batched",
             &continuation_rows,
@@ -1907,13 +1894,13 @@ fn executable_token_context_preserves_chunk_decode_checkpoint_and_release_semant
             &replayed_shrink["conv_history"].to_vec_f32()?,
         );
 
-        let row_zero_continued = engine.run_pipeline(request(
+        let row_zero_continued = engine.run_pipeline_retained(request(
             geometry,
             "row-zero-reference",
             continuation_rows[2],
             3,
         )?)?;
-        let row_two_continued = engine.run_pipeline(request(
+        let row_two_continued = engine.run_pipeline_retained(request(
             geometry,
             "row-two-reference",
             continuation_rows[0],
@@ -1963,10 +1950,10 @@ fn padded_rows_ignore_invalid_tokens_through_selection_restore_and_decode() -> a
         let changed_padding = [&[5, 7, 11][..], &[13, 44, 45][..], &[17, 19, 33][..]];
         let lengths = [3, 1, 2];
 
-        let padded = engine.run_pipeline(request_padded_rows(
+        let padded = engine.run_pipeline_retained(request_padded_rows(
             geometry, "padded", &original, &lengths, 0, None,
         )?)?;
-        let changed = engine.run_pipeline(request_padded_rows(
+        let changed = engine.run_pipeline_retained(request_padded_rows(
             geometry,
             "changed-padding",
             &changed_padding,
@@ -1992,7 +1979,7 @@ fn padded_rows_ignore_invalid_tokens_through_selection_restore_and_decode() -> a
             let valid = &row[..valid_length];
             let reference_session = format!("padded-reference-{row_index}");
             let reference =
-                engine.run_pipeline(request(geometry, &reference_session, valid, 0)?)?;
+                engine.run_pipeline_retained(request(geometry, &reference_session, valid, 0)?)?;
             let token_start = row_index * geometry.context_len();
             let token_end = token_start + geometry.context_len();
             assert_eq!(
@@ -2018,7 +2005,7 @@ fn padded_rows_ignore_invalid_tokens_through_selection_restore_and_decode() -> a
         let continuation = [&[23, 90][..], &[29, 31][..], &[37, 91][..]];
         let changed_continuation = [&[23, 42][..], &[29, 31][..], &[37, 66][..]];
         let continuation_lengths = [1, 2, 1];
-        let selected = engine.run_pipeline(request_padded_rows(
+        let selected = engine.run_pipeline_retained(request_padded_rows(
             geometry,
             "padded",
             &continuation,
@@ -2027,7 +2014,7 @@ fn padded_rows_ignore_invalid_tokens_through_selection_restore_and_decode() -> a
             Some(&[2, 0]),
         )?)?;
         engine.restore_workflow_session_checkpoint("padded", &checkpoint)?;
-        let selected_with_changed_padding = engine.run_pipeline(request_padded_rows(
+        let selected_with_changed_padding = engine.run_pipeline_retained(request_padded_rows(
             geometry,
             "padded",
             &changed_continuation,
@@ -2053,14 +2040,19 @@ fn padded_rows_ignore_invalid_tokens_through_selection_restore_and_decode() -> a
             "the row plan must compact the logical committed extents with token and state rows"
         );
 
-        let decoded =
-            engine.run_pipeline(request_rows(geometry, "padded", &[&[43], &[47]], 4, None)?)?;
-        engine.run_pipeline(request(geometry, "padded-reference-2", &[37], 2)?)?;
+        let decoded = engine.run_pipeline_retained(request_rows(
+            geometry,
+            "padded",
+            &[&[43], &[47]],
+            4,
+            None,
+        )?)?;
+        engine.run_pipeline_retained(request(geometry, "padded-reference-2", &[37], 2)?)?;
         let row_two_reference =
-            engine.run_pipeline(request(geometry, "padded-reference-2", &[43], 3)?)?;
-        engine.run_pipeline(request(geometry, "padded-reference-0", &[23], 3)?)?;
+            engine.run_pipeline_retained(request(geometry, "padded-reference-2", &[43], 3)?)?;
+        engine.run_pipeline_retained(request(geometry, "padded-reference-0", &[23], 3)?)?;
         let row_zero_reference =
-            engine.run_pipeline(request(geometry, "padded-reference-0", &[47], 4)?)?;
+            engine.run_pipeline_retained(request(geometry, "padded-reference-0", &[47], 4)?)?;
         let mut expected_tokens = row_two_reference["token_history"].to_vec_i64()?;
         expected_tokens.extend(row_zero_reference["token_history"].to_vec_i64()?);
         assert_eq!(decoded["token_history"].to_vec_i64()?, expected_tokens);
@@ -2086,7 +2078,7 @@ fn padded_rows_require_in_range_structural_valid_lengths() -> anyhow::Result<()>
     )?
     .with_input("accepted_len", Value::from_slice_i64(&[3, 4], &[2])?);
 
-    let error = match engine.run_pipeline(request) {
+    let error = match engine.run_pipeline_retained(request) {
         Ok(_) => panic!("an over-extent valid length must fail before component execution"),
         Err(error) => error,
     };

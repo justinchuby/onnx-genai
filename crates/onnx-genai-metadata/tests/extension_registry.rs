@@ -1,7 +1,9 @@
 use onnx_genai_metadata::{
     extensions::{
-        ATEM_XML_V1, BUILTIN_EXTENSIONS, DFLASH_FLAT_BLOCK_V1, FallbackClass, SPECULATIVE_V1,
-        SupportStatus, TAGGED_JSON_V1, TOKEN_CONTEXT_V1, extension_registry_markdown, find,
+        ATEM_XML_V1, BUILTIN_EXTENSIONS, DFLASH_FLAT_BLOCK_V1, ExtensionAdmissionError,
+        ExtensionConsumerSupport, ExtensionSurface, FallbackClass, KV_CHECKPOINT_V1,
+        SPECULATIVE_V1, SupportStatus, TAGGED_JSON_V1, TOKEN_CONTEXT_V1, admit_exact,
+        extension_registry_markdown, find,
     },
     inference_metadata_schema_json, parse_metadata,
     version::{
@@ -50,6 +52,15 @@ fn registry_lists_exact_current_optional_semantic_extensions() {
             .all(|descriptor| descriptor.fallback == FallbackClass::SemanticRequired),
         "runtime optimizations are not package extension requirements"
     );
+    let unique = BUILTIN_EXTENSIONS
+        .iter()
+        .map(|descriptor| (descriptor.id.identity, descriptor.id.version))
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        unique.len(),
+        BUILTIN_EXTENSIONS.len(),
+        "every extension identity/version pair must have exactly one authoritative row"
+    );
     assert!(BUILTIN_EXTENSIONS.iter().any(|descriptor| {
         descriptor.id.identity == "onnx-genai.dflash-flat-block"
             && descriptor.status == SupportStatus::KnownButUnavailable
@@ -77,6 +88,104 @@ fn registry_lists_exact_current_optional_semantic_extensions() {
             .expect("registered DFlash")
             .schema_floor,
         DFLASH_SCHEMA_VERSION
+    );
+}
+
+#[test]
+fn exact_pair_admission_separates_registry_knowledge_from_consumer_support() {
+    let admitted = admit_exact(
+        ExtensionSurface::ToolProtocol,
+        TAGGED_JSON_V1.identity,
+        TAGGED_JSON_V1.version,
+        "package.tool_protocol",
+        ExtensionConsumerSupport::Supported {
+            scope: "tagged-json v1 envelopes",
+        },
+        "select a supported tool protocol",
+    )
+    .expect("an exact implemented pair with a matching reader is admitted");
+    assert_eq!(admitted.descriptor.id, TAGGED_JSON_V1);
+
+    let error = admit_exact(
+        ExtensionSurface::ToolProtocol,
+        TAGGED_JSON_V1.identity,
+        TAGGED_JSON_V1.version,
+        "package.tool_protocol",
+        ExtensionConsumerSupport::Unsupported {
+            scope: "CPU profile",
+            reason: "the requested backend/profile is outside this reader's support scope",
+            guidance: "select the supported backend/profile",
+        },
+        "select a supported tool protocol",
+    )
+    .expect_err("registry-known must not imply runtime-supported");
+    assert!(matches!(
+        *error,
+        ExtensionAdmissionError::ConsumerUnavailable { .. }
+    ));
+    let message = error.to_string();
+    assert!(
+        message.contains("tagged-json@v1")
+            && message.contains("CPU profile")
+            && message.contains("backend/profile"),
+        "{message}"
+    );
+}
+
+#[test]
+fn checkpoint_exact_pairs_fail_closed_with_registry_guidance() {
+    let support = ExtensionConsumerSupport::Unsupported {
+        scope: "portable state checkpoint adapters on every backend/profile",
+        reason: "no portable checkpoint adapter is installed",
+        guidance: "omit checkpoint to keep state private",
+    };
+    let known = admit_exact(
+        ExtensionSurface::StateCheckpoint,
+        KV_CHECKPOINT_V1.identity,
+        KV_CHECKPOINT_V1.version,
+        "pipeline.workflow.serving.state_service.groups.decoder_cache.checkpoint",
+        support,
+        "use a registered implemented checkpoint pair or omit checkpoint",
+    )
+    .expect_err("known unavailable checkpoint must fail closed");
+    assert!(matches!(
+        *known,
+        ExtensionAdmissionError::RegistryUnavailable { .. }
+    ));
+
+    let version = admit_exact(
+        ExtensionSurface::StateCheckpoint,
+        KV_CHECKPOINT_V1.identity,
+        "2",
+        "pipeline.workflow.serving.state_service.groups.decoder_cache.checkpoint",
+        support,
+        "use a registered implemented checkpoint pair or omit checkpoint",
+    )
+    .expect_err("unknown checkpoint version must fail closed");
+    assert!(matches!(
+        *version,
+        ExtensionAdmissionError::UnknownVersion { .. }
+    ));
+
+    let identity = admit_exact(
+        ExtensionSurface::StateCheckpoint,
+        "onnx-genai.tensor-checkpoint",
+        "1",
+        "pipeline.workflow.serving.state_service.groups.decoder_cache.checkpoint",
+        support,
+        "use a registered implemented checkpoint pair or omit checkpoint",
+    )
+    .expect_err("invented checkpoint identity must fail closed");
+    assert!(matches!(
+        *identity,
+        ExtensionAdmissionError::UnknownIdentity { .. }
+    ));
+    let message = identity.to_string();
+    assert!(
+        message.contains("onnx-genai.tensor-checkpoint@1")
+            && message.contains("onnx-genai.kv-checkpoint@1")
+            && message.contains("decoder_cache"),
+        "{message}"
     );
 }
 

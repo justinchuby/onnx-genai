@@ -390,7 +390,7 @@ model:
   artifacts: []
 pipeline:
   workflow:
-    manifest: {{}}
+    manifest: {}
     inputs: {}
     outputs:
       audio:

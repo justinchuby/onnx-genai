@@ -4,8 +4,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::extensions::{
     ADAPTERS_HF_PEFT_V1, ADAPTERS_JSON_V1, ADAPTERS_SAFETENSORS_V1, ADAPTERS_V1,
-    DFLASH_FLAT_BLOCK_V1, DFLASH_FLAT_BLOCK_V2, GRAMMAR_GUIDANCE_V1, ORT_LORA_ADAPTER_V1,
-    PARAMETER_OVERLAY_V1, SPECULATIVE_V1, TELEMETRY_V1, TOKEN_CONTEXT_V1,
+    DFLASH_FLAT_BLOCK_V1, DFLASH_FLAT_BLOCK_V2, ExtensionConsumerSupport, ExtensionSurface,
+    GRAMMAR_GUIDANCE_V1, ORT_LORA_ADAPTER_V1, PARAMETER_OVERLAY_V1, SPECULATIVE_V1, TELEMETRY_V1,
+    TOKEN_CONTEXT_V1, admit_exact,
 };
 use crate::schema::{InferenceMetadata, PipelineSpec, WorkflowNode, WorkflowSpec, WorkflowStep};
 
@@ -2501,10 +2502,42 @@ fn validate_workflow(
         .map(|serving| &serving.state_service)
     {
         for (group_name, group) in &state_service.groups {
+            validate_checkpoint_extension(group_name, group, errors);
             if group.layout.trim().is_empty() {
                 errors.push(format!(
                     "state service group '{group_name}' layout must not be empty"
                 ));
+            }
+
+            fn validate_checkpoint_extension(
+                group_name: &str,
+                group: &crate::schema::StateGroupContract,
+                errors: &mut Vec<String>,
+            ) {
+                let Some(checkpoint) = &group.checkpoint else {
+                    return;
+                };
+                let path = format!(
+                    "pipeline.workflow.serving.state_service.groups.{group_name}.checkpoint \
+                     (state kind {:?})",
+                    group.kind
+                );
+                if let Err(error) = admit_exact(
+                    ExtensionSurface::StateCheckpoint,
+                    &checkpoint.adapter,
+                    &checkpoint.version,
+                    path,
+                    ExtensionConsumerSupport::Unsupported {
+                        scope: "portable state checkpoint adapters on every backend/profile",
+                        reason: "this runtime has no portable checkpoint adapter implementation",
+                        guidance: "omit checkpoint to keep this state runtime-private; do not use session \
+                                   snapshot/fork APIs as a portable checkpoint adapter",
+                    },
+                    "Use an exact registered checkpoint adapter/version implemented by the selected runtime, \
+                     or omit checkpoint to keep the state private.",
+                ) {
+                    errors.push(error.to_string());
+                }
             }
             if let Some(logical_lengths) = &group.logical_lengths {
                 match workflow.state.get(logical_lengths) {
