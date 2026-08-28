@@ -99,6 +99,7 @@ pub struct DFlashProposal {
     pub probabilities: Option<DFlashProposalProbabilities>,
     /// Proposer outputs retained for accepted-prefix draft-state commit.
     proposer_outputs: PipelineTensors,
+    conditioning_trace: Vec<DFlashConditioningTrace>,
     verification_seed: u64,
 }
 
@@ -284,6 +285,34 @@ pub struct DFlashDiagnostic {
     pub draft_private_state: Vec<String>,
     pub structure: &'static str,
     pub shared_batching_supported: bool,
+}
+
+/// One target feature tensor that actually conditioned a committed DFlash
+/// proposal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DFlashConditioningTrace {
+    pub source: String,
+    pub shape: Vec<i64>,
+}
+
+/// Transport-neutral evidence from one committed DFlash block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DFlashBlockTrace {
+    pub conditioning: Vec<DFlashConditioningTrace>,
+    pub proposer_candidates: Vec<i64>,
+    pub accepted: usize,
+    pub committed_tokens: Vec<i64>,
+}
+
+/// Typed cancellation of an admitted DFlash generation.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "DFlash generation cancelled {boundary}; the admitted turn aborted to its explicit \
+     committed baseline"
+)]
+pub struct DFlashGenerationCancelled {
+    pub boundary: super::GenerationBoundary,
+    pub outcome: super::TurnTransactionOutcome,
 }
 
 /// S3 transaction participant for target, draft-private, recurrent, and
@@ -724,6 +753,7 @@ impl WorkflowRuntime {
                  before transaction admission"
             );
         }
+        let control = request.generation_control.clone().unwrap_or_default();
 
         // Bind once, before any component executes.  `WorkflowExecutionPlan`
         // owns normal request/default/shape admission; taking the values before
@@ -780,11 +810,16 @@ impl WorkflowRuntime {
                 budget_cap: None,
             });
         }
+        let turn = super::TurnTransaction::admit_runtime_participant(
+            self.worker.next_turn_transaction_id(),
+        );
         let mut context_start = i64::try_from(initial_tokens.len())
             .context("DFlash prompt length exceeds the absolute position type")?;
         let mut generated = Vec::with_capacity(options.max_new_tokens);
         let mut random = StdRng::seed_from_u64(options.seed.unwrap_or(0));
         let mut finish_reason = FinishReason::MaxTokens;
+        let mut staged_block_traces = Vec::new();
+        let mut staged_contract_executions = 0_u64;
 
         // The initial target invocation produces the hidden state that
         // conditions the first flat proposal.  It is real component execution,
@@ -835,7 +870,13 @@ impl WorkflowRuntime {
             // context participant *before* the proposer or verifier can
             // advance one.  All error exits below resolve this same
             // transaction back to that complete baseline.
-            let transaction = self.begin_dflash_state_transaction(&state)?;
+            let transaction = self.observe_dflash_block_checkpoint(
+                &control,
+                &turn,
+                super::GenerationBoundary::BeforeProposer,
+                self.begin_dflash_state_transaction(&state)?,
+                &mut state,
+            )?;
             let proposal = match self.propose_dflash(&values, proposal_options) {
                 Ok(proposal) => proposal,
                 Err(error) => {
@@ -844,9 +885,17 @@ impl WorkflowRuntime {
                         &mut state,
                         super::TurnAbortReason::ExecutionFailure,
                     );
+                    let _ = turn.abort(super::TurnAbortReason::ExecutionFailure);
                     return Err(error.context("DFlash proposer execution failed before commit"));
                 }
             };
+            let transaction = self.observe_dflash_block_checkpoint(
+                &control,
+                &turn,
+                super::GenerationBoundary::AfterProposer,
+                transaction,
+                &mut state,
+            )?;
             let mut block = Vec::with_capacity(proposal.tokens.len() + 1);
             block.push(anchor);
             block.extend_from_slice(&proposal.tokens);
@@ -857,8 +906,16 @@ impl WorkflowRuntime {
                     &mut state,
                     super::TurnAbortReason::ExecutionFailure,
                 );
+                let _ = turn.abort(super::TurnAbortReason::ExecutionFailure);
                 return Err(error.context("DFlash verifier execution failed before commit"));
             }
+            let transaction = self.observe_dflash_block_checkpoint(
+                &control,
+                &turn,
+                super::GenerationBoundary::AfterVerifier,
+                transaction,
+                &mut state,
+            )?;
             // `invoke_dflash_target` updated the driver's SSA map in place.
             // Borrowing it through a separate binding makes the commit's
             // target-output provenance explicit and avoids any caller-provided
@@ -878,6 +935,7 @@ impl WorkflowRuntime {
                         &mut state,
                         super::TurnAbortReason::ExecutionFailure,
                     );
+                    let _ = turn.abort(super::TurnAbortReason::ExecutionFailure);
                     return Err(error.context("DFlash acceptance failed before commit"));
                 }
             };
@@ -916,9 +974,17 @@ impl WorkflowRuntime {
                     &mut state,
                     super::TurnAbortReason::ExecutionFailure,
                 );
+                let _ = turn.abort(super::TurnAbortReason::ExecutionFailure);
                 return Err(error
                     .context("DFlash accepted-path target reconditioning failed before commit"));
             }
+            let transaction = self.observe_dflash_block_checkpoint(
+                &control,
+                &turn,
+                super::GenerationBoundary::BeforeAcceptedPrefixCommit,
+                transaction,
+                &mut state,
+            )?;
             if let Err(error) = self.commit_dflash_state_transaction(
                 transaction,
                 &mut state,
@@ -927,8 +993,15 @@ impl WorkflowRuntime {
                 &committed_acceptance,
                 committed_path.len(),
             ) {
+                let _ = turn.abort(super::TurnAbortReason::CommitFailure);
                 return Err(error.context("DFlash accepted-prefix state commit failed"));
             }
+            staged_block_traces.push(DFlashBlockTrace {
+                conditioning: proposal.conditioning_trace.clone(),
+                proposer_candidates: proposal.tokens.clone(),
+                accepted: committed_acceptance.accepted,
+                committed_tokens: committed_path.clone(),
+            });
 
             for (port, value) in &proposal.proposer_outputs {
                 if let Some(value_name) = plan.proposer_outputs.get(port) {
@@ -953,9 +1026,7 @@ impl WorkflowRuntime {
                     break;
                 }
             }
-            self.record_contract_execution(
-                onnx_genai_metadata::decoder_workflow::SPECULATIVE_BLOCK_CONTRACT,
-            );
+            staged_contract_executions = staged_contract_executions.saturating_add(1);
             if finish_reason == FinishReason::EosToken {
                 break;
             }
@@ -965,7 +1036,44 @@ impl WorkflowRuntime {
             .map(|tokenizer| tokenizer.decode(&generated))
             .transpose()?
             .unwrap_or_default();
-        self.commit_dflash_session_state(&plan, session_id.as_deref(), &state)?;
+        match control.begin_commit() {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(anyhow::Error::new(DFlashGenerationCancelled {
+                    boundary: super::GenerationBoundary::BeforeSemanticCommit,
+                    outcome: turn.abort(super::TurnAbortReason::Cancellation),
+                }));
+            }
+            Err(error) => {
+                let _ = turn.abort(super::TurnAbortReason::ExecutionFailure);
+                return Err(
+                    error.context("DFlash generation checkpoint failed before semantic commit")
+                );
+            }
+        }
+        if let Err(error) = self.commit_dflash_session_state(&plan, session_id.as_deref(), &state) {
+            control.abort_commit();
+            let _ = turn.abort(super::TurnAbortReason::CommitFailure);
+            return Err(error.context("DFlash semantic state commit failed"));
+        }
+        for _ in 0..staged_contract_executions {
+            self.record_contract_execution(
+                onnx_genai_metadata::decoder_workflow::SPECULATIVE_BLOCK_CONTRACT,
+            );
+        }
+        *self.worker.last_dflash_block_traces.borrow_mut() = staged_block_traces;
+        let _ = turn.committed();
+        control.finish_commit();
+        if control
+            .observe_after_commit(super::GenerationBoundary::BeforeOutputPublication)
+            .context("DFlash output checkpoint failed after semantic commit")?
+            && callback.is_some()
+        {
+            anyhow::bail!(
+                "DFlash output delivery was cancelled after semantic commit; committed state \
+                 remains durable and output will not be replayed automatically"
+            );
+        }
         // The entire generated token stream is staged in `generated` until all
         // model execution and accepted-prefix commits have succeeded.  Callback
         // failure is therefore delivery-only: state is already committed and is
@@ -997,6 +1105,39 @@ impl WorkflowRuntime {
             logprobs: None,
             budget_cap: None,
         })
+    }
+
+    fn observe_dflash_block_checkpoint(
+        &self,
+        control: &super::GenerationControl,
+        turn: &super::TurnTransaction,
+        boundary: super::GenerationBoundary,
+        transaction: DFlashStateTransaction,
+        state: &mut PipelineTensors,
+    ) -> anyhow::Result<DFlashStateTransaction> {
+        match control.observe(boundary) {
+            Ok(false) => Ok(transaction),
+            Ok(true) => {
+                let _ = self.abort_dflash_state_transaction(
+                    transaction,
+                    state,
+                    super::TurnAbortReason::Cancellation,
+                );
+                Err(anyhow::Error::new(DFlashGenerationCancelled {
+                    boundary,
+                    outcome: turn.abort(super::TurnAbortReason::Cancellation),
+                }))
+            }
+            Err(error) => {
+                let _ = self.abort_dflash_state_transaction(
+                    transaction,
+                    state,
+                    super::TurnAbortReason::ExecutionFailure,
+                );
+                let _ = turn.abort(super::TurnAbortReason::ExecutionFailure);
+                Err(error.context(format!("DFlash generation checkpoint failed {boundary}")))
+            }
+        }
     }
 
     /// Seed transaction-local DFlash participants from the committed workflow
@@ -1234,6 +1375,7 @@ impl WorkflowRuntime {
         let ops = super::device_ops::tensor_ops_for_residency(residency)?;
 
         let mut hidden_sources = Vec::with_capacity(plan.conditioning.sources.len());
+        let mut conditioning_trace = Vec::with_capacity(plan.conditioning.sources.len());
         let mut batch = None;
         let mut context = None;
         let mut hidden_total = 0usize;
@@ -1302,6 +1444,10 @@ impl WorkflowRuntime {
             hidden_total = hidden_total
                 .checked_add(source_hidden)
                 .context("DFlash conditioning hidden width overflow")?;
+            conditioning_trace.push(DFlashConditioningTrace {
+                source: format!("{}::{}", source.component, source.output),
+                shape: shape.to_vec(),
+            });
             hidden_sources.push(ops.adopt(value).with_context(|| {
                 format!(
                     "bring DFlash conditioning source {}::{} onto {residency}",
@@ -1591,6 +1737,7 @@ impl WorkflowRuntime {
             tokens,
             probabilities,
             proposer_outputs,
+            conditioning_trace,
             verification_seed,
         })
     }

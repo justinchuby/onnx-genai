@@ -23,6 +23,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 mod adapters;
 mod arg_reduce;
@@ -77,6 +78,191 @@ pub fn has_buffered_pcm16_wav_output(workflow: &WorkflowSpec) -> bool {
 }
 
 pub use audio::buffered_pcm16_wav_output_names;
+
+const GENERATION_ACTIVE: u8 = 0;
+const GENERATION_CANCELLED: u8 = 1;
+const GENERATION_COMMITTING: u8 = 2;
+const GENERATION_COMMITTED: u8 = 3;
+
+/// Portable transaction boundaries at which a generation can observe
+/// cancellation or a caller-provided execution guard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GenerationBoundary {
+    BeforeProposer,
+    AfterProposer,
+    AfterVerifier,
+    BeforeAcceptedPrefixCommit,
+    BeforeSemanticCommit,
+    BeforeOutputPublication,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "{operation} cannot accept request-scoped generation control for {runtime}; use a \
+     cancellation-capable generation path rather than silently dropping the signal"
+)]
+pub struct GenerationControlUnsupported {
+    pub operation: &'static str,
+    pub runtime: &'static str,
+}
+
+impl std::fmt::Display for GenerationBoundary {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::BeforeProposer => "before proposer execution",
+            Self::AfterProposer => "after proposer execution",
+            Self::AfterVerifier => "after verifier execution",
+            Self::BeforeAcceptedPrefixCommit => "before accepted-prefix commit",
+            Self::BeforeSemanticCommit => "before semantic commit",
+            Self::BeforeOutputPublication => "before output publication",
+        })
+    }
+}
+
+/// Request-scoped cancellation and deterministic transaction checkpoints.
+///
+/// `cancel` races with `begin_commit` through one atomic state transition. If
+/// cancellation wins, no semantic state can commit. If commit wins, later
+/// cancellation is delivery or next-turn behavior and cannot roll back the
+/// committed turn.
+#[derive(Clone)]
+pub struct GenerationControl {
+    state: Arc<AtomicU8>,
+    cancellation_probe: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    checkpoint:
+        Option<Arc<dyn Fn(GenerationBoundary) -> anyhow::Result<()> + Send + Sync + 'static>>,
+}
+
+impl std::fmt::Debug for GenerationControl {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GenerationControl")
+            .field("state", &self.state.load(Ordering::Acquire))
+            .field("has_cancellation_probe", &self.cancellation_probe.is_some())
+            .field("has_checkpoint", &self.checkpoint.is_some())
+            .finish()
+    }
+}
+
+impl Default for GenerationControl {
+    fn default() -> Self {
+        Self {
+            state: Arc::new(AtomicU8::new(GENERATION_ACTIVE)),
+            cancellation_probe: None,
+            checkpoint: None,
+        }
+    }
+}
+
+impl GenerationControl {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Observe an existing cancellation authority, such as a closed response
+    /// stream, without introducing a second request lifecycle.
+    pub fn from_cancellation_probe(probe: impl Fn() -> bool + Send + Sync + 'static) -> Self {
+        Self {
+            cancellation_probe: Some(Arc::new(probe)),
+            ..Self::default()
+        }
+    }
+
+    /// Install a portable execution checkpoint.
+    ///
+    /// Returning an error aborts the admitted turn as an execution failure.
+    /// This is useful for watchdogs and deterministic fault testing; it does
+    /// not bypass the transaction or publication boundary.
+    pub fn with_checkpoint(
+        mut self,
+        checkpoint: impl Fn(GenerationBoundary) -> anyhow::Result<()> + Send + Sync + 'static,
+    ) -> Self {
+        self.checkpoint = Some(Arc::new(checkpoint));
+        self
+    }
+
+    /// Request cancellation. Returns true only when cancellation wins the
+    /// linearization race against semantic commit.
+    pub fn cancel(&self) -> bool {
+        self.state
+            .compare_exchange(
+                GENERATION_ACTIVE,
+                GENERATION_CANCELLED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn observe(&self, boundary: GenerationBoundary) -> anyhow::Result<bool> {
+        match self.state.load(Ordering::Acquire) {
+            GENERATION_CANCELLED => return Ok(true),
+            GENERATION_COMMITTING | GENERATION_COMMITTED => return Ok(false),
+            _ => {}
+        }
+        if let Some(checkpoint) = &self.checkpoint {
+            checkpoint(boundary)?;
+        }
+        if self
+            .cancellation_probe
+            .as_ref()
+            .is_some_and(|probe| probe())
+        {
+            self.cancel();
+        }
+        Ok(self.state.load(Ordering::Acquire) == GENERATION_CANCELLED)
+    }
+
+    fn begin_commit(&self) -> anyhow::Result<bool> {
+        if self.observe(GenerationBoundary::BeforeSemanticCommit)? {
+            return Ok(false);
+        }
+        match self.state.compare_exchange(
+            GENERATION_ACTIVE,
+            GENERATION_COMMITTING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => Ok(true),
+            Err(GENERATION_CANCELLED) => Ok(false),
+            Err(state) => anyhow::bail!(
+                "generation control cannot begin a second semantic commit from state {state}"
+            ),
+        }
+    }
+
+    fn finish_commit(&self) {
+        let previous = self
+            .state
+            .compare_exchange(
+                GENERATION_COMMITTING,
+                GENERATION_COMMITTED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .expect("semantic commit must own the generation control");
+        debug_assert_eq!(previous, GENERATION_COMMITTING);
+    }
+
+    fn abort_commit(&self) {
+        let _ = self.state.compare_exchange(
+            GENERATION_COMMITTING,
+            GENERATION_CANCELLED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    fn observe_after_commit(&self, boundary: GenerationBoundary) -> anyhow::Result<bool> {
+        if let Some(checkpoint) = &self.checkpoint {
+            checkpoint(boundary)?;
+        }
+        Ok(self
+            .cancellation_probe
+            .as_ref()
+            .is_some_and(|probe| probe()))
+    }
+}
 
 pub type PipelineTensors = HashMap<String, Value>;
 
@@ -196,6 +382,9 @@ pub struct PipelineGenerateRequest {
     pub session_id: Option<String>,
     /// Application-selected package components that replace overridable components.
     pub component_overrides: HashMap<String, String>,
+    /// Request lifecycle and transaction checkpoints. Absence means the caller
+    /// supplied no cancellation authority.
+    pub generation_control: Option<GenerationControl>,
 }
 
 impl PipelineGenerateRequest {
@@ -205,6 +394,7 @@ impl PipelineGenerateRequest {
             inputs: HashMap::new(),
             session_id: None,
             component_overrides: HashMap::new(),
+            generation_control: None,
         }
     }
 
@@ -225,6 +415,11 @@ impl PipelineGenerateRequest {
     ) -> Self {
         self.component_overrides
             .insert(component.into(), replacement.into());
+        self
+    }
+
+    pub fn with_generation_control(mut self, control: GenerationControl) -> Self {
+        self.generation_control = Some(control);
         self
     }
 }
@@ -269,6 +464,10 @@ pub(crate) struct WorkflowRuntime {
 impl WorkflowRuntime {
     pub(crate) fn take_committed_output_publications(&mut self) -> Vec<WorkflowOutputPublication> {
         std::mem::take(&mut *self.worker.last_output_publications.borrow_mut())
+    }
+
+    pub(crate) fn take_dflash_block_traces(&mut self) -> Vec<speculative::DFlashBlockTrace> {
+        std::mem::take(&mut *self.worker.last_dflash_block_traces.borrow_mut())
     }
 }
 
@@ -1684,7 +1883,7 @@ impl WorkflowRuntime {
 
 #[cfg(test)]
 mod tests {
-    use super::workflow_initializer_reservation_bytes;
+    use super::{GenerationControl, workflow_initializer_reservation_bytes};
 
     #[test]
     fn fused_workflow_reserves_source_and_every_linked_initializer_copy() {
@@ -1709,6 +1908,35 @@ mod tests {
             workflow_initializer_reservation_bytes(u64::MAX, 1, true).is_err(),
             "managed accounting still validates the topology-derived maximum"
         );
+    }
+
+    #[test]
+    fn cancellation_and_commit_have_one_atomic_winner() {
+        for _ in 0..256 {
+            let control = GenerationControl::new();
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let commit_control = control.clone();
+            let commit_barrier = barrier.clone();
+            let commit = std::thread::spawn(move || {
+                commit_barrier.wait();
+                let committed = commit_control.begin_commit().unwrap();
+                if committed {
+                    commit_control.finish_commit();
+                }
+                committed
+            });
+            let cancel_control = control.clone();
+            let cancel = std::thread::spawn(move || {
+                barrier.wait();
+                cancel_control.cancel()
+            });
+            let committed = commit.join().unwrap();
+            let cancelled = cancel.join().unwrap();
+            assert_ne!(
+                committed, cancelled,
+                "the race must linearize to either committed-new or aborted-old"
+            );
+        }
     }
 
     #[cfg(feature = "ort-cuda")]

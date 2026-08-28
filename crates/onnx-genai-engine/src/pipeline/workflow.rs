@@ -1022,6 +1022,7 @@ impl<'a> WorkflowExecutionPlan<'a> {
             inputs,
             session_id,
             component_overrides,
+            generation_control: _,
         } = request;
         let workflow = &engine.plan.workflow;
         let session_turn_version = session_id.as_ref().map(|session| {

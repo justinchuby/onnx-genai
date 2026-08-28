@@ -206,6 +206,15 @@ impl Engine {
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
         self.reject_undispatched_dflash_generation()?;
+        if request.generation_control.is_some()
+            && self.workflow_runtime().dflash_diagnostic().is_none()
+        {
+            return Err(crate::pipeline::GenerationControlUnsupported {
+                operation: "Engine::generate_with_pipeline_callbacks",
+                runtime: "a non-DFlash workflow",
+            }
+            .into());
+        }
         // A request that binds no tensors is a prompt, and a prompt is served
         // by the ordinary entry point — which admits through the scheduler,
         // reuses a cached prefix, and routes the declared decode step to the
@@ -415,6 +424,16 @@ impl Engine {
 
     pub fn dflash_diagnostic(&self) -> Option<crate::pipeline::speculative::DFlashDiagnostic> {
         self.workflow_runtime().dflash_diagnostic()
+    }
+
+    /// Take execution evidence from the last committed DFlash turn.
+    ///
+    /// Aborted turns publish no traces, matching state, output, and contract
+    /// execution visibility.
+    pub fn take_dflash_block_traces(
+        &mut self,
+    ) -> Vec<crate::pipeline::speculative::DFlashBlockTrace> {
+        self.workflow_runtime_mut().take_dflash_block_traces()
     }
 
     pub fn propose_chained(
