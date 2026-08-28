@@ -32,8 +32,8 @@ use std::collections::BTreeMap;
 use anyhow::Context as _;
 use onnx_genai_metadata::{
     CandidateTreeTopology, DFlashStateCommit, DFlashStructure, SpeculativeContract,
-    SpeculativeProposalExecution, SpeculativeRecurrenceBinding, StatePortAccess,
-    WorkflowOutputFamily, WorkflowSpec, WorkflowStep,
+    SpeculativeProposalExecution, SpeculativeRecurrenceBinding, StatePortAccess, WorkflowSpec,
+    WorkflowStep,
 };
 use onnx_genai_ort::{DataType, Value};
 use rand::rngs::StdRng;
@@ -514,6 +514,51 @@ fn finish_candidate_tree_without_generation(
     })
 }
 
+fn candidate_tree_tokens_from_committed_publications(
+    publications: &[super::WorkflowOutputPublication],
+    output: &str,
+) -> anyhow::Result<Vec<u32>> {
+    let mut tokens = Vec::new();
+    for publication in publications {
+        let payload = match publication {
+            super::WorkflowOutputPublication::Materialized {
+                output: published,
+                payload,
+                ..
+            }
+            | super::WorkflowOutputPublication::Event {
+                output: published,
+                payload,
+                ..
+            } if published == output => Some(payload),
+            super::WorkflowOutputPublication::Revision(envelope)
+                if envelope.output == output
+                    && envelope.operation == super::TypedRevisionOperation::Append =>
+            {
+                envelope.payload.as_ref()
+            }
+            super::WorkflowOutputPublication::Revision(envelope) if envelope.output == output => {
+                anyhow::ensure!(
+                    envelope.operation == super::TypedRevisionOperation::Finalize,
+                    "candidate-tree canonical output '{output}' committed unexpected {:?} \
+                     revision operation",
+                    envelope.operation
+                );
+                None
+            }
+            _ => None,
+        };
+        if let Some(payload) = payload {
+            tokens.extend(payload.to_vec_i64()?.into_iter().map(|token| {
+                u32::try_from(token).context(
+                    "candidate-tree canonical generated-token output contains a token outside uint32",
+                )
+            }).collect::<anyhow::Result<Vec<_>>>()?);
+        }
+    }
+    Ok(tokens)
+}
+
 struct CandidateTreeWorkflowHost<'a> {
     runtime: &'a WorkflowRuntime,
     plan: CandidateTreeExecutionPlan,
@@ -526,6 +571,7 @@ struct CandidateTreeWorkflowHost<'a> {
     candidate_state: Option<PipelineTensors>,
     pending: Option<PendingCandidateTree>,
     generated: Vec<u32>,
+    authoritative_tokens: Vec<u32>,
     traces: Vec<CandidateTreeBlockTrace>,
     blocks: u64,
     finish_reason: FinishReason,
@@ -756,46 +802,7 @@ impl CandidateTreeWorkflowHost<'_> {
         Ok(())
     }
 
-    fn publish_accepted(
-        &self,
-        accepted: &[u32],
-        publication_journal: &mut Option<super::output::OutputPublicationJournal>,
-    ) -> anyhow::Result<()> {
-        if !self.plan.publish_tokens_at_seam {
-            return Ok(());
-        }
-        let output = self
-            .runtime
-            .plan
-            .workflow
-            .outputs
-            .get(&self.plan.token_output)
-            .expect("candidate-tree admission resolved the token output");
-        let mode = match &output.family {
-            WorkflowOutputFamily::Materialized | WorkflowOutputFamily::Revisions { .. } => {
-                onnx_genai_metadata::WorkflowEmitMode::Append
-            }
-            WorkflowOutputFamily::Events => onnx_genai_metadata::WorkflowEmitMode::Event,
-        };
-        let journal = publication_journal.as_mut().context(
-            "candidate-tree accepted path has no enclosing S4 output publication journal",
-        )?;
-        for token in accepted {
-            journal.publish(
-                &self.plan.token_output,
-                None,
-                &mode,
-                Some(Value::from_slice_i64(&[i64::from(*token)], &[1])?),
-            )?;
-        }
-        Ok(())
-    }
-
-    fn complete_target(
-        &mut self,
-        values: &mut PipelineTensors,
-        publication_journal: &mut Option<super::output::OutputPublicationJournal>,
-    ) -> anyhow::Result<Vec<i64>> {
+    fn complete_target(&mut self, values: &mut PipelineTensors) -> anyhow::Result<Vec<i64>> {
         let pending = self.pending.take().with_context(|| {
             format!(
                 "candidate-tree target at {} ran without proposer {} at {} on the same authored \
@@ -858,7 +865,6 @@ impl CandidateTreeWorkflowHost<'_> {
         let mut accepted_context = pending.context.clone();
         accepted_context.extend(committed.iter().copied().map(i64::from));
         self.recompute_accepted_state(&accepted_context, &committed, &pending.tree, values)?;
-        self.publish_accepted(&committed, publication_journal)?;
         self.traces.push(CandidateTreeBlockTrace {
             candidates: pending
                 .tree
@@ -912,12 +918,8 @@ impl CandidateTreeWorkflowHost<'_> {
         Ok(accepted_context)
     }
 
-    fn execute_target(
-        &mut self,
-        values: &mut PipelineTensors,
-        publication_journal: &mut Option<super::output::OutputPublicationJournal>,
-    ) -> anyhow::Result<()> {
-        let mut context = self.complete_target(values, publication_journal)?;
+    fn execute_target(&mut self, values: &mut PipelineTensors) -> anyhow::Result<()> {
+        let mut context = self.complete_target(values)?;
         if self.plan.execution_mode == CandidateTreeExecutionMode::DrainAtSeam {
             while self.generated.len() < self.options.max_new_tokens
                 && self.finish_reason != FinishReason::EosToken
@@ -927,7 +929,7 @@ impl CandidateTreeWorkflowHost<'_> {
                     .is_some_and(|limit| context.len() >= limit)
             {
                 self.invoke_proposer(context, values)?;
-                context = self.complete_target(values, publication_journal)?;
+                context = self.complete_target(values)?;
             }
             if self
                 .options
@@ -1005,15 +1007,23 @@ impl super::workflow::WorkflowNodeHost for CandidateTreeWorkflowHost<'_> {
             self.plan.proposer_path,
             self.plan.target_path
         );
+        anyhow::ensure!(
+            self.authoritative_tokens == self.generated,
+            "candidate-tree canonical generated-token output '{}' at {:?} diverged from the \
+             committed accepted-path record before semantic commit; the authored S4 emit must \
+             publish every accepted token exactly once",
+            self.plan.token_output_authority.output(),
+            self.plan.token_output_authority
+        );
         self.observe(super::GenerationBoundary::BeforeAcceptedPathCommit)?;
         self.text = self
             .tokenizer
-            .map(|tokenizer| tokenizer.decode(&self.generated))
+            .map(|tokenizer| tokenizer.decode(&self.authoritative_tokens))
             .transpose()
             .context("decode committed candidate-tree output before semantic commit")?
             .unwrap_or_default();
         self.token_text = self
-            .generated
+            .authoritative_tokens
             .iter()
             .map(|token| {
                 self.tokenizer
@@ -1062,6 +1072,21 @@ impl super::workflow::WorkflowNodeHost for CandidateTreeWorkflowHost<'_> {
         self.control.abort_commit();
     }
 
+    fn observe_staged_generation_tokens(
+        &mut self,
+        tokens: &[crate::TokenId],
+    ) -> anyhow::Result<()> {
+        self.authoritative_tokens.extend_from_slice(tokens);
+        anyhow::ensure!(
+            self.generated.starts_with(&self.authoritative_tokens),
+            "candidate-tree canonical generated-token output '{}' at {:?} emitted tokens that \
+             are not the committed accepted-path record",
+            self.plan.token_output_authority.output(),
+            self.plan.token_output_authority
+        );
+        Ok(())
+    }
+
     fn execute_contract_node(
         &mut self,
         request: super::workflow::WorkflowNodeRequest<'_>,
@@ -1086,7 +1111,7 @@ impl super::workflow::WorkflowNodeHost for CandidateTreeWorkflowHost<'_> {
             return Ok(true);
         }
         if request.component == self.plan.target {
-            self.execute_target(request.values, request.publication_journal)?;
+            self.execute_target(request.values)?;
             return Ok(true);
         }
         Ok(false)
@@ -1677,6 +1702,7 @@ impl WorkflowRuntime {
             candidate_state: None,
             pending: None,
             generated: Vec::with_capacity(options.max_new_tokens),
+            authoritative_tokens: Vec::with_capacity(options.max_new_tokens),
             traces: Vec::new(),
             blocks: 0,
             finish_reason: FinishReason::MaxTokens,
@@ -1691,6 +1717,16 @@ impl WorkflowRuntime {
             let mut hosted: Option<&mut dyn super::workflow::WorkflowNodeHost> = Some(&mut host);
             execution.execute_retained_with_host(&mut hosted)?;
         }
+        let published_tokens = candidate_tree_tokens_from_committed_publications(
+            &self.worker.last_output_publications.borrow(),
+            host.plan.token_output_authority.output(),
+        )?;
+        anyhow::ensure!(
+            published_tokens == host.authoritative_tokens,
+            "candidate-tree committed S4 output '{}' diverged from its admitted authored \
+             accepted-path publication plan",
+            host.plan.token_output_authority.output()
+        );
         if host.finish_reason == FinishReason::MaxTokens
             && self.last_generation_ended_by_predicate()
         {
@@ -1724,11 +1760,11 @@ impl WorkflowRuntime {
             Ok(_) => {}
         }
         if let Some(callback) = callback.as_mut() {
-            for (index, token) in host.generated.iter().copied().enumerate() {
+            for (index, token) in published_tokens.iter().copied().enumerate() {
                 if let Err(error) = callback(crate::config::GenerateToken {
                     token_id: token,
                     text: host.token_text[index].clone(),
-                    finish_reason: (index + 1 == host.generated.len())
+                    finish_reason: (index + 1 == published_tokens.len())
                         .then(|| host.finish_reason.clone()),
                 }) {
                     return Err(anyhow::Error::new(CandidateTreeOutputDeliveryError {
@@ -1740,7 +1776,7 @@ impl WorkflowRuntime {
         }
         Ok(GenerateResult {
             text: host.text,
-            token_ids: host.generated,
+            token_ids: published_tokens,
             finish_reason: host.finish_reason,
             tool_calls,
             prefix_cache_hit_len: 0,

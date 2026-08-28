@@ -80,8 +80,33 @@ pub(crate) struct CandidateTreeExecutionPlan {
     pub(crate) target_probabilities_value: Option<String>,
     pub(crate) rollback_state: std::collections::BTreeSet<String>,
     pub(crate) max_proposal_width: usize,
-    pub(crate) token_output: String,
-    pub(crate) publish_tokens_at_seam: bool,
+    pub(crate) token_output_authority: CandidateTreeTokenOutputAuthority,
+}
+
+/// The one S4 publication path for accepted candidate tokens.
+///
+/// Candidate execution never creates an output independently of the authored
+/// workflow. Admission retains the exact canonical output and every source
+/// location that proved it consumes the runtime's accepted-path binding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CandidateTreeTokenOutputAuthority {
+    AuthoredEmit {
+        output: String,
+        sites: Vec<CandidateTreeTokenEmitSite>,
+    },
+}
+
+impl CandidateTreeTokenOutputAuthority {
+    pub(crate) fn output(&self) -> &str {
+        match self {
+            Self::AuthoredEmit { output, .. } => output,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CandidateTreeTokenEmitSite {
+    pub(crate) path: String,
 }
 
 /// The one typed answer to whether this runtime may execute a loaded workflow.
@@ -426,6 +451,12 @@ impl CandidateTreeExecutionPlan {
                  'tokens', but the authored workflow declares {token_outputs:?}"
             ));
         };
+        let token_output_authority = resolve_candidate_tree_token_output_authority(
+            workflow,
+            binding,
+            token_output,
+            &target_location,
+        )?;
         let plan = Self {
             version: contract.version.clone(),
             proposer: contract.proposer.clone(),
@@ -455,8 +486,7 @@ impl CandidateTreeExecutionPlan {
             target_probabilities_value,
             rollback_state: contract.rollback_state.clone(),
             max_proposal_width: contract.max_proposal_width,
-            token_output: token_output.clone(),
-            publish_tokens_at_seam: !workflow_emits_output(&workflow.steps, token_output),
+            token_output_authority,
         };
         plan.validate_state_authority(workflow)?;
         Ok(plan)
@@ -956,6 +986,10 @@ enum CandidateTreeRegionStep {
     Emit {
         path: String,
         output: String,
+        value: String,
+        when: Option<String>,
+        valid_length: Option<String>,
+        mode: onnx_genai_metadata::WorkflowEmitMode,
     },
 }
 
@@ -1037,7 +1071,7 @@ fn candidate_tree_seam_locations(
                 CandidateTreeRegionStep::Boundary { path, kind } => {
                     format!("{kind} at {path}")
                 }
-                CandidateTreeRegionStep::Emit { path, output } => {
+                CandidateTreeRegionStep::Emit { path, output, .. } => {
                     format!("emit into '{output}' at {path}")
                 }
             })
@@ -1151,38 +1185,366 @@ fn collect_candidate_tree_regions(
                     );
                 }
             }
-            WorkflowStep::Emit { output, .. } => {
+            WorkflowStep::Emit {
+                output,
+                value,
+                when,
+                valid_length,
+                mode,
+                ..
+            } => {
                 regions
                     .entry(control.to_vec())
                     .or_default()
                     .push(CandidateTreeRegionStep::Emit {
                         path: step_path,
                         output: output.clone(),
+                        value: value.clone(),
+                        when: when.clone(),
+                        valid_length: valid_length.clone(),
+                        mode: mode.clone(),
                     });
             }
         }
     }
 }
 
-fn workflow_emits_output(steps: &[WorkflowStep], output: &str) -> bool {
-    steps.iter().any(|step| match step {
-        WorkflowStep::Emit {
-            output: emitted, ..
-        } => emitted == output,
-        WorkflowStep::Sequence { steps } => workflow_emits_output(steps, output),
-        WorkflowStep::Loop { setup, steps, .. } => {
-            workflow_emits_output(setup, output) || workflow_emits_output(steps, output)
+#[derive(Debug, Clone)]
+struct CandidateTreeTokenEmitDefinition {
+    path: String,
+    control: Vec<CandidateTreeControlFrame>,
+    region_index: usize,
+    value: String,
+    when: Option<String>,
+    valid_length: Option<String>,
+    mode: onnx_genai_metadata::WorkflowEmitMode,
+}
+
+#[derive(Debug, Clone)]
+struct CandidateTreePhiDefinition {
+    path: String,
+    control: Vec<CandidateTreeControlFrame>,
+    region_index: usize,
+    incoming: Vec<(String, String)>,
+}
+
+fn resolve_candidate_tree_token_output_authority(
+    workflow: &WorkflowSpec,
+    accepted_path_binding: &str,
+    token_output: &str,
+    target_location: &CandidateTreeInvocationLocation,
+) -> Result<CandidateTreeTokenOutputAuthority, String> {
+    let mut regions = std::collections::BTreeMap::new();
+    collect_candidate_tree_regions(
+        &workflow.steps,
+        "pipeline.workflow.steps",
+        &[],
+        &mut regions,
+    );
+    let (target_control, target_index) = regions
+        .iter()
+        .find_map(|(control, steps)| {
+            steps.iter().enumerate().find_map(|(index, step)| {
+                matches!(
+                    step,
+                    CandidateTreeRegionStep::Invoke { location, .. }
+                        if location.path == target_location.path
+                )
+                .then(|| (control.clone(), index))
+            })
+        })
+        .ok_or_else(|| {
+            format!(
+                "candidate-tree target at {} disappeared while proving the canonical generated-token output",
+                target_location.path
+            )
+        })?;
+
+    let mut branch_regions = std::collections::BTreeMap::new();
+    let mut token_emits = Vec::new();
+    for (control, steps) in &regions {
+        for (region_index, step) in steps.iter().enumerate() {
+            match step {
+                CandidateTreeRegionStep::Boundary {
+                    path,
+                    kind: "branch",
+                } => {
+                    branch_regions.insert(path.clone(), (control.clone(), region_index));
+                }
+                CandidateTreeRegionStep::Emit {
+                    path,
+                    output,
+                    value,
+                    when,
+                    valid_length,
+                    mode,
+                } if output == token_output => {
+                    token_emits.push(CandidateTreeTokenEmitDefinition {
+                        path: path.clone(),
+                        control: control.clone(),
+                        region_index,
+                        value: value.clone(),
+                        when: when.clone(),
+                        valid_length: valid_length.clone(),
+                        mode: mode.clone(),
+                    });
+                }
+                _ => {}
+            }
         }
-        WorkflowStep::Branch { cases, default, .. } => {
-            cases
-                .values()
-                .any(|step| workflow_emits_output(std::slice::from_ref(step), output))
-                || default
-                    .as_deref()
-                    .is_some_and(|step| workflow_emits_output(std::slice::from_ref(step), output))
-        }
-        WorkflowStep::Invoke { .. } => false,
+    }
+
+    if token_emits.len() != 1 {
+        let paths = token_emits
+            .iter()
+            .map(|emit| emit.path.as_str())
+            .collect::<Vec<_>>();
+        return Err(format!(
+            "candidate-tree canonical generated-token output '{token_output}' requires exactly one \
+             authored emit site, but found {} at {paths:?}; host publication is unavailable, so \
+             remove duplicates and emit the accepted-path binding once",
+            token_emits.len()
+        ));
+    }
+    let emit = token_emits
+        .pop()
+        .expect("the exactly-one canonical token emit is present");
+    if emit.control != target_control || emit.region_index <= target_index {
+        return Err(format!(
+            "candidate-tree canonical generated-token emit at {} is not dominated by target {} \
+             on the same control path. Setup, root, branch-local, after-loop, and zero-trip \
+             paths cannot publish the accepted path; place the emit after the target in its \
+             exact sequence region",
+            emit.path, target_location.path
+        ));
+    }
+    if emit.when.is_some() || emit.valid_length.is_some() {
+        return Err(format!(
+            "candidate-tree canonical generated-token emit at {} conditionally suppresses or \
+             slices the accepted path (when={:?}, valid_length={:?}); publish the complete \
+             committed accepted-path binding without a guard or transform",
+            emit.path, emit.when, emit.valid_length
+        ));
+    }
+    if !matches!(
+        emit.mode,
+        onnx_genai_metadata::WorkflowEmitMode::Append
+            | onnx_genai_metadata::WorkflowEmitMode::Event
+    ) {
+        return Err(format!(
+            "candidate-tree canonical generated-token emit at {} uses {:?}; use append or event \
+             so every committed accepted-path record remains visible to S4 and GenerateResult",
+            emit.path, emit.mode
+        ));
+    }
+
+    let mut phi_definitions = std::collections::BTreeMap::new();
+    collect_candidate_tree_phi_definitions(
+        &workflow.steps,
+        "pipeline.workflow.steps",
+        &[],
+        &branch_regions,
+        &mut phi_definitions,
+    )?;
+    prove_candidate_tree_token_output_value(
+        workflow,
+        &emit.value,
+        accepted_path_binding,
+        &target_control,
+        target_index,
+        &phi_definitions,
+        &mut std::collections::BTreeSet::new(),
+    )
+    .map_err(|reason| {
+        format!(
+            "candidate-tree canonical generated-token emit at {} does not consume accepted-path \
+             binding '{accepted_path_binding}': {reason}",
+            emit.path
+        )
+    })?;
+
+    Ok(CandidateTreeTokenOutputAuthority::AuthoredEmit {
+        output: token_output.to_string(),
+        sites: vec![CandidateTreeTokenEmitSite { path: emit.path }],
     })
+}
+
+fn collect_candidate_tree_phi_definitions(
+    steps: &[WorkflowStep],
+    path: &str,
+    control: &[CandidateTreeControlFrame],
+    branch_regions: &std::collections::BTreeMap<String, (Vec<CandidateTreeControlFrame>, usize)>,
+    definitions: &mut std::collections::BTreeMap<String, Vec<CandidateTreePhiDefinition>>,
+) -> Result<(), String> {
+    for (index, step) in steps.iter().enumerate() {
+        let step_path = format!("{path}[{index}]");
+        match step {
+            WorkflowStep::Sequence { steps } => collect_candidate_tree_phi_definitions(
+                steps,
+                &format!("{step_path}.steps"),
+                control,
+                branch_regions,
+                definitions,
+            )?,
+            WorkflowStep::Loop { setup, steps, .. } => {
+                let mut setup_control = control.to_vec();
+                setup_control.push(CandidateTreeControlFrame::LoopSetup {
+                    path: step_path.clone(),
+                });
+                collect_candidate_tree_phi_definitions(
+                    setup,
+                    &format!("{step_path}.setup"),
+                    &setup_control,
+                    branch_regions,
+                    definitions,
+                )?;
+                let mut body_control = control.to_vec();
+                body_control.push(CandidateTreeControlFrame::LoopBody {
+                    path: step_path.clone(),
+                });
+                collect_candidate_tree_phi_definitions(
+                    steps,
+                    &format!("{step_path}.steps"),
+                    &body_control,
+                    branch_regions,
+                    definitions,
+                )?;
+            }
+            WorkflowStep::Branch {
+                cases,
+                default,
+                outputs,
+                ..
+            } => {
+                let (definition_control, region_index) =
+                    branch_regions.get(&step_path).cloned().ok_or_else(|| {
+                        format!(
+                            "branch at {step_path} is absent from candidate-tree dominance analysis"
+                        )
+                    })?;
+                for (value, phi) in outputs {
+                    let mut incoming =
+                        Vec::with_capacity(cases.len() + usize::from(default.is_some()));
+                    for case in cases.keys() {
+                        let source = phi.cases.get(case).ok_or_else(|| {
+                            format!(
+                                "transparent phi '{value}' at {step_path}.outputs.{value} has no \
+                                 input for reachable branch case '{case}'"
+                            )
+                        })?;
+                        incoming.push((format!("case '{case}'"), source.clone()));
+                    }
+                    if default.is_some() {
+                        let source = phi.default.as_ref().ok_or_else(|| {
+                            format!(
+                                "transparent phi '{value}' at {step_path}.outputs.{value} has no \
+                                 input for its reachable default branch"
+                            )
+                        })?;
+                        incoming.push(("default".to_string(), source.clone()));
+                    }
+                    definitions.entry(value.clone()).or_default().push(
+                        CandidateTreePhiDefinition {
+                            path: format!("{step_path}.outputs.{value}"),
+                            control: definition_control.clone(),
+                            region_index,
+                            incoming,
+                        },
+                    );
+                }
+                for (key, branch) in cases {
+                    let mut branch_control = control.to_vec();
+                    branch_control.push(CandidateTreeControlFrame::BranchCase {
+                        path: step_path.clone(),
+                        key: key.clone(),
+                    });
+                    collect_candidate_tree_phi_definitions(
+                        std::slice::from_ref(branch),
+                        &format!("{step_path}.cases[{key}]"),
+                        &branch_control,
+                        branch_regions,
+                        definitions,
+                    )?;
+                }
+                if let Some(default) = default {
+                    let mut branch_control = control.to_vec();
+                    branch_control.push(CandidateTreeControlFrame::BranchDefault {
+                        path: step_path.clone(),
+                    });
+                    collect_candidate_tree_phi_definitions(
+                        std::slice::from_ref(default),
+                        &format!("{step_path}.default"),
+                        &branch_control,
+                        branch_regions,
+                        definitions,
+                    )?;
+                }
+            }
+            WorkflowStep::Invoke { .. } | WorkflowStep::Emit { .. } => {}
+        }
+    }
+    Ok(())
+}
+
+fn prove_candidate_tree_token_output_value(
+    workflow: &WorkflowSpec,
+    value: &str,
+    accepted_path_binding: &str,
+    target_control: &[CandidateTreeControlFrame],
+    target_index: usize,
+    phi_definitions: &std::collections::BTreeMap<String, Vec<CandidateTreePhiDefinition>>,
+    visiting: &mut std::collections::BTreeSet<String>,
+) -> Result<(), String> {
+    if value == accepted_path_binding {
+        return Ok(());
+    }
+    let definitions = phi_definitions.get(value).ok_or_else(|| {
+        format!(
+            "value '{value}' is not the accepted-path binding and has no declared transparent \
+             phi provenance; its provenance is {}",
+            describe_value_provenance(workflow, &workflow.steps, value)
+        )
+    })?;
+    let [definition] = definitions.as_slice() else {
+        return Err(format!(
+            "value '{value}' has {} transparent phi definitions, so its accepted-path identity \
+             is ambiguous",
+            definitions.len()
+        ));
+    };
+    if definition.control != target_control || definition.region_index <= target_index {
+        return Err(format!(
+            "transparent phi '{}' at {} does not execute after the candidate target on its exact \
+             control path, so it may preserve an earlier placeholder rather than the committed \
+             accepted path",
+            value, definition.path
+        ));
+    }
+    if !visiting.insert(value.to_string()) {
+        return Err(format!(
+            "transparent phi '{}' at {} is cyclic",
+            value, definition.path
+        ));
+    }
+    let result = definition.incoming.iter().try_for_each(|(arm, source)| {
+        prove_candidate_tree_token_output_value(
+            workflow,
+            source,
+            accepted_path_binding,
+            target_control,
+            target_index,
+            phi_definitions,
+            visiting,
+        )
+        .map_err(|reason| {
+            format!(
+                "{arm} of transparent phi '{}' at {}: {reason}",
+                value, definition.path
+            )
+        })
+    });
+    visiting.remove(value);
+    result
 }
 
 #[cfg(test)]

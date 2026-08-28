@@ -78,9 +78,15 @@ pipeline:
         source: {kind: literal}
         required: false
         default: 0
+      accepted_prefix:
+        contract: {dtype: int64, shape: [batch, Any], batch_layout: {kind: request_aligned, axis: 0}}
+        role: {kind: opaque}
+        source: {kind: literal}
+        required: false
+        default: 0
     outputs:
       tokens:
-        contract: {dtype: int64, shape: [1]}
+        contract: {dtype: int64, shape: [batch, Any], batch_layout: {kind: request_aligned, axis: 0}}
         role: tokens
         family: {kind: events}
         stage: pre_adapter
@@ -140,6 +146,7 @@ pipeline:
         target_probabilities: verified.probabilities
         target_state_out: verified.state
         token_context_out: verified.token_context
+    - {kind: emit, value: accepted_prefix, output: tokens, mode: event}
     state:
       proposer_private:
         contract: {dtype: float32, shape: [batch, 2], batch_layout: {kind: request_aligned, axis: 0}}
@@ -342,9 +349,15 @@ pipeline:
         source: {kind: literal}
         required: false
         default: 0
+      selected_branch:
+        contract: {dtype: int64, shape: [batch, Any], batch_layout: {kind: request_aligned, axis: 0}}
+        role: {kind: opaque}
+        source: {kind: literal}
+        required: false
+        default: 0
     outputs:
       tokens:
-        contract: {dtype: int64, shape: [1]}
+        contract: {dtype: int64, shape: [batch, Any], batch_layout: {kind: request_aligned, axis: 0}}
         role: tokens
         family: {kind: revisions, version: "1"}
         stage: pre_adapter
@@ -404,6 +417,7 @@ pipeline:
         path_probabilities: verification.probabilities
         recurrent_cube_out: verification.recurrent
         token_window_out: verification.history
+    - {kind: emit, value: selected_branch, output: tokens, mode: append}
     state:
       proposer_private:
         contract: {dtype: float32, shape: [batch, 3], batch_layout: {kind: request_aligned, axis: 0}}
@@ -978,7 +992,7 @@ fn composed_parent_metadata(continue_loop: bool, reorder_components: bool) -> St
 
     let original_outputs = r#"    outputs:
       tokens:
-        contract: {dtype: int64, shape: [1]}
+        contract: {dtype: int64, shape: [batch, Any], batch_layout: {kind: request_aligned, axis: 0}}
         role: tokens
         family: {kind: events}
         stage: pre_adapter
@@ -1324,6 +1338,194 @@ fn candidate_token_binding_requires_exact_proposer_ssa_provenance_before_loading
 }
 
 #[test]
+fn canonical_candidate_output_refuses_unproved_emit_values_before_component_loading()
+-> anyhow::Result<()> {
+    for (value, provenance) in [
+        ("request.tokens", "workflow input 'request.tokens'"),
+        (
+            "runtime.position_ids",
+            "workflow input 'runtime.position_ids'",
+        ),
+        (
+            "proposed.tokens",
+            "component 'proposer' output port 'candidate_tokens'",
+        ),
+    ] {
+        let root = parent_package(&[-1, -1, 0, 1, 2, 4], &[2, 0, 4, 0, 0, 0, 0])?;
+        replace_metadata(&root, |metadata| {
+            metadata.replacen(
+                "{kind: emit, value: accepted_prefix, output: tokens, mode: event}",
+                &format!("{{kind: emit, value: {value}, output: tokens, mode: event}}"),
+                1,
+            )
+        })?;
+        assert_preload_candidate_refusal(
+            &root,
+            &[
+                "canonical generated-token emit",
+                "accepted-path binding 'accepted_prefix'",
+                value,
+                provenance,
+            ],
+        )?;
+    }
+
+    let setup_event = composed_parent_package(true, false)?;
+    replace_metadata(&setup_event, |metadata| {
+        metadata.replacen(
+            "{kind: emit, value: accepted_prefix, output: tokens, mode: event}",
+            "{kind: emit, value: setup.event, output: tokens, mode: event}",
+            1,
+        )
+    })?;
+    assert_preload_candidate_refusal(
+        &setup_event,
+        &[
+            "canonical generated-token emit",
+            "accepted-path binding 'accepted_prefix'",
+            "setup.event",
+            "component 'setup' output port 'setup_event'",
+        ],
+    )?;
+
+    let transformed = parent_package(&[-1, -1, 0, 1, 2, 4], &[2, 0, 4, 0, 0, 0, 0])?;
+    replace_metadata(&transformed, |metadata| {
+        metadata
+            .replacen(
+                "      proposer:\n",
+                "      transparent_transform:\n        implementation: {kind: onnx, artifact: transform.onnx.textproto}\n        ports:\n          inputs: {}\n          outputs:\n            accepted_tokens: {dtype: int64, shape: [batch, Any], batch_layout: {kind: request_aligned, axis: 0}}\n        row_scope: {axis: 0, stateful: false}\n      proposer:\n",
+                1,
+            )
+            .replacen(
+                "    - kind: invoke\n      component: proposer\n",
+                "    - kind: invoke\n      component: transparent_transform\n      outputs: {accepted_tokens: transformed.accepted}\n    - kind: invoke\n      component: proposer\n",
+                1,
+            )
+            .replacen(
+                "{kind: emit, value: accepted_prefix, output: tokens, mode: event}",
+                "{kind: emit, value: transformed.accepted, output: tokens, mode: event}",
+                1,
+            )
+    })?;
+    assert_preload_candidate_refusal(
+        &transformed,
+        &[
+            "canonical generated-token emit",
+            "transformed.accepted",
+            "component 'transparent_transform' output port 'accepted_tokens'",
+        ],
+    )?;
+    Ok(())
+}
+
+#[test]
+fn canonical_candidate_output_requires_one_dominated_proven_emit() -> anyhow::Result<()> {
+    let duplicate = parent_package(&[-1, -1, 0, 1, 2, 4], &[2, 0, 4, 0, 0, 0, 0])?;
+    replace_metadata(&duplicate, |metadata| {
+        metadata.replacen(
+            "{kind: emit, value: accepted_prefix, output: tokens, mode: event}",
+            "{kind: emit, value: accepted_prefix, output: tokens, mode: event}\n    - {kind: emit, value: accepted_prefix, output: tokens, mode: event}",
+            1,
+        )
+    })?;
+    assert_preload_candidate_refusal(
+        &duplicate,
+        &[
+            "canonical generated-token output 'tokens'",
+            "exactly one authored emit site",
+        ],
+    )?;
+
+    let branch = composed_parent_package(true, false)?;
+    replace_metadata(&branch, |metadata| {
+        metadata.replacen(
+            "          branch.state:\n            cases: {\"true\": branch.true.state}\n            default: branch.false.state\n      - {kind: emit, value: accepted_prefix, output: tokens, mode: event}",
+            "          branch.state:\n            cases: {\"true\": branch.true.state}\n            default: branch.false.state\n          emitted.accepted:\n            cases: {\"true\": accepted_prefix}\n            default: setup.event\n      - {kind: emit, value: emitted.accepted, output: tokens, mode: event}",
+            1,
+        )
+    })?;
+    assert_preload_candidate_refusal(
+        &branch,
+        &[
+            "default",
+            "setup.event",
+            "component 'setup' output port 'setup_event'",
+        ],
+    )?;
+
+    let after_loop = composed_parent_package(true, false)?;
+    replace_metadata(&after_loop, |metadata| {
+        metadata
+            .replacen(
+                "      - {kind: emit, value: accepted_prefix, output: tokens, mode: event}\n",
+                "",
+                1,
+            )
+            .replacen(
+                "    - {kind: emit, value: root.post, output: root_events, mode: event}",
+                "    - {kind: emit, value: root.post, output: root_events, mode: event}\n    - {kind: emit, value: accepted_prefix, output: tokens, mode: event}",
+                1,
+            )
+    })?;
+    assert_preload_candidate_refusal(
+        &after_loop,
+        &[
+            "canonical generated-token emit",
+            "not dominated",
+            "after-loop",
+        ],
+    )?;
+
+    let phi = composed_parent_package(true, false)?;
+    replace_metadata(&phi, |metadata| {
+        metadata.replacen(
+            "          branch.state:\n            cases: {\"true\": branch.true.state}\n            default: branch.false.state\n      - {kind: emit, value: accepted_prefix, output: tokens, mode: event}",
+            "          branch.state:\n            cases: {\"true\": branch.true.state}\n            default: branch.false.state\n          emitted.accepted:\n            cases: {\"true\": accepted_prefix}\n            default: accepted_prefix\n      - {kind: emit, value: emitted.accepted, output: tokens, mode: event}",
+            1,
+        )
+    })?;
+    let mut engine = Engine::from_dir(&phi, EngineConfig::default())?;
+    let result = engine.generate(greedy_request(3))?;
+    assert_eq!(result.token_ids, vec![2, 4, 0]);
+    Ok(())
+}
+
+#[test]
+fn candidate_output_authority_matches_s4_result_callback_and_tool_observer() -> anyhow::Result<()> {
+    let root = parent_package(&[-1, -1, 0, 1, 2, 4], &[2, 0, 4, 0, 0, 0, 0])?;
+    let tool = r#"<tool_call>{"name":"weather","arguments":{}}</tool_call>"#;
+    install_tool_protocol_tokenizer(&root, &[(2, tool)])?;
+    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+    let mut callback = Vec::new();
+    let mut observe_callback = |token: onnx_genai_engine::GenerateToken| {
+        callback.push((token.token_id, token.text));
+        Ok(())
+    };
+    let result = engine.generate_with_pipeline_tool_policy_callbacks(
+        PipelineGenerateRequest::new(greedy_request(1)).with_tool_call_policy(ToolCallPolicy::Auto),
+        None,
+        Some(&mut observe_callback),
+    )?;
+    assert_eq!(result.token_ids, vec![2]);
+    assert_eq!(result.text, tool);
+    assert_eq!(callback, vec![(2, tool.to_string())]);
+    assert_eq!(
+        result
+            .tool_calls
+            .iter()
+            .map(|call| call.name.as_str())
+            .collect::<Vec<_>>(),
+        ["weather"]
+    );
+    let publications = engine.take_committed_workflow_publications();
+    let [WorkflowOutputPublication::Event { payload, .. }] = publications.as_slice() else {
+        panic!("candidate output must have one authored S4 event")
+    };
+    assert_eq!(payload.to_vec_i64()?, vec![2]);
+    Ok(())
+}
+
+#[test]
 fn topology_and_driver_owned_target_inputs_have_proved_sources_before_loading() -> anyhow::Result<()>
 {
     let direct_topology = ancestor_package()?;
@@ -1506,7 +1708,9 @@ fn sampling_candidate_path_executes_inside_the_composed_workflow() -> anyhow::Re
 fn token_output_identity_is_selected_by_role_not_by_name() -> anyhow::Result<()> {
     let root = parent_package(&[-1, -1, 0, 1, 2, 4], &[2, 0, 4, 0, 0, 0, 0])?;
     replace_metadata(&root, |metadata| {
-        metadata.replacen("      tokens:\n", "      generated_ids:\n", 1)
+        metadata
+            .replacen("      tokens:\n", "      generated_ids:\n", 1)
+            .replacen("output: tokens", "output: generated_ids", 1)
     })?;
     let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
     let result = engine.generate(greedy_request(3))?;
@@ -2332,24 +2536,20 @@ fn committed_outputs_are_ordered_exactly_once_and_callback_failure_is_delivery_o
     let result = engine.generate(greedy_request(3))?;
     assert_eq!(result.token_ids, vec![2, 4, 0]);
     let publications = engine.take_committed_workflow_publications();
-    assert_eq!(publications.len(), 3);
-    for (index, publication) in publications.iter().enumerate() {
-        let WorkflowOutputPublication::Event {
+    let [
+        WorkflowOutputPublication::Event {
             sequence,
             payload,
             finality,
             ..
-        } = publication
-        else {
-            panic!("parent fixture must publish discrete token events")
-        };
-        assert_eq!(sequence.0, index as u64 + 1);
-        assert_eq!(
-            payload.to_vec_i64()?,
-            vec![i64::from(result.token_ids[index])]
-        );
-        assert_eq!(*finality, OutputFinality::Final);
-    }
+        },
+    ] = publications.as_slice()
+    else {
+        panic!("parent fixture must publish one accepted-path token event")
+    };
+    assert_eq!(sequence.0, 1);
+    assert_eq!(payload.to_vec_i64()?, vec![2, 4, 0]);
+    assert_eq!(*finality, OutputFinality::Final);
 
     let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
     let session = engine.create_session()?;
@@ -2380,14 +2580,21 @@ fn revision_fixture_finalizes_after_committed_token_appends() -> anyhow::Result<
     let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
     let result = engine.generate(sampling_request(17, 3))?;
     let publications = engine.take_committed_workflow_publications();
-    assert_eq!(publications.len(), result.token_ids.len() + 1);
-    for publication in &publications[..result.token_ids.len()] {
-        let WorkflowOutputPublication::Revision(envelope) = publication else {
-            panic!("sampling fixture must publish typed revisions")
-        };
-        assert_eq!(envelope.operation, TypedRevisionOperation::Append);
-        assert_eq!(envelope.finality, OutputFinality::Final);
-    }
+    assert_eq!(publications.len(), 2);
+    let WorkflowOutputPublication::Revision(append) = &publications[0] else {
+        panic!("sampling fixture must publish an accepted-path revision")
+    };
+    assert_eq!(append.operation, TypedRevisionOperation::Append);
+    assert_eq!(append.finality, OutputFinality::Final);
+    assert_eq!(
+        append.payload.as_ref().unwrap().to_vec_i64()?,
+        result
+            .token_ids
+            .iter()
+            .copied()
+            .map(i64::from)
+            .collect::<Vec<_>>()
+    );
     let WorkflowOutputPublication::Revision(finalize) = publications.last().unwrap() else {
         panic!("revision stream must finalize")
     };
