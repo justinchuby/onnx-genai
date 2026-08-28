@@ -256,6 +256,7 @@ graph {
   output { name: "proposal_probabilities" type { tensor_type { elem_type: 1 shape { dim { dim_value: 1 } dim { dim_value: 7 } dim { dim_value: 6 } } } } }
   output { name: "private_state_out" type { tensor_type { elem_type: 1 shape { dim { dim_value: 1 } dim { dim_value: 2 } } } } }
 }
+
 opset_import { domain: "" version: 18 }
 "#;
 
@@ -1264,6 +1265,10 @@ fn composed_candidate_tree_runs_setup_branches_effects_and_all_outputs() -> anyh
         panic!("candidate accepted path must flow through the authored token emit")
     };
     assert_eq!(payload.to_vec_i64()?, vec![2, 4, 0]);
+    assert_eq!(
+        published_token_ids(&publications, "tokens")?,
+        result.token_ids
+    );
     let WorkflowOutputPublication::Materialized { payload, .. } = &publications[3] else {
         panic!("post-branch phi must publish a materialized value")
     };
@@ -1492,7 +1497,7 @@ fn canonical_candidate_output_requires_one_dominated_proven_emit() -> anyhow::Re
 
 #[test]
 fn candidate_output_authority_matches_s4_result_callback_and_tool_observer() -> anyhow::Result<()> {
-    let root = parent_package(&[-1, -1, 0, 1, 2, 4], &[2, 0, 4, 0, 0, 0, 0])?;
+    let root = composed_parent_package(true, false)?;
     let tool = r#"<tool_call>{"name":"weather","arguments":{}}</tool_call>"#;
     install_tool_protocol_tokenizer(&root, &[(2, tool)])?;
     let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
@@ -1518,10 +1523,7 @@ fn candidate_output_authority_matches_s4_result_callback_and_tool_observer() -> 
         ["weather"]
     );
     let publications = engine.take_committed_workflow_publications();
-    let [WorkflowOutputPublication::Event { payload, .. }] = publications.as_slice() else {
-        panic!("candidate output must have one authored S4 event")
-    };
-    assert_eq!(payload.to_vec_i64()?, vec![2]);
+    assert_eq!(published_token_ids(&publications, "tokens")?, vec![2]);
     Ok(())
 }
 
@@ -1701,6 +1703,10 @@ fn sampling_candidate_path_executes_inside_the_composed_workflow() -> anyhow::Re
         1,
         "the authored loop owns one candidate-tree seam entry"
     );
+    assert_eq!(
+        published_token_ids(&engine.take_committed_workflow_publications(), "tokens")?,
+        result.token_ids
+    );
     Ok(())
 }
 
@@ -1790,6 +1796,11 @@ fn composed_loop_does_not_reenter_after_candidate_budget_or_eos_stop() -> anyhow
             Some(&1),
             "{label} must preserve exactly-once loop setup"
         );
+        assert_eq!(
+            published_token_ids(&engine.take_committed_workflow_publications(), "tokens")?,
+            result.token_ids,
+            "{label} S4 record must be the generated result"
+        );
     }
     Ok(())
 }
@@ -1834,6 +1845,44 @@ fn expect_error<T>(result: anyhow::Result<T>, message: &str) -> anyhow::Error {
         Ok(_) => panic!("{message}"),
         Err(error) => error,
     }
+}
+
+fn published_token_ids(
+    publications: &[WorkflowOutputPublication],
+    output: &str,
+) -> anyhow::Result<Vec<u32>> {
+    let mut tokens = Vec::new();
+    for publication in publications {
+        let payload = match publication {
+            WorkflowOutputPublication::Materialized {
+                output: published,
+                payload,
+                ..
+            }
+            | WorkflowOutputPublication::Event {
+                output: published,
+                payload,
+                ..
+            } if published == output => Some(payload),
+            WorkflowOutputPublication::Revision(envelope)
+                if envelope.output == output
+                    && envelope.operation == TypedRevisionOperation::Append =>
+            {
+                envelope.payload.as_ref()
+            }
+            _ => None,
+        };
+        if let Some(payload) = payload {
+            tokens.extend(
+                payload
+                    .to_vec_i64()?
+                    .into_iter()
+                    .map(|token| u32::try_from(token).map_err(anyhow::Error::from))
+                    .collect::<anyhow::Result<Vec<_>>>()?,
+            );
+        }
+    }
+    Ok(tokens)
 }
 
 #[test]
