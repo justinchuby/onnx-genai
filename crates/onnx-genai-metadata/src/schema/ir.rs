@@ -90,6 +90,12 @@ pub struct PaddedDimension {
     /// Value giving how many leading entries of `dimension` are real, one entry
     /// per position of the axes outer to it.
     ///
+    /// When those outer axes include the owning value's request axis, this
+    /// companion declares the same request-aligned/request-expanded layout and
+    /// follows the same positional row plan. When the padded dimension is
+    /// outside the request axis, the companion is genuinely broadcast and
+    /// declares `shared`.
+    ///
     /// It resolves in the namespace of the contract's owner: a sibling port for
     /// a component port, a workflow value for a workflow input, output, or
     /// state cell.
