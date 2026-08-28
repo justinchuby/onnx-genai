@@ -98,3 +98,50 @@ scripts/compare_runtimes.sh
 
 Each runtime specification is `NAME|BASE_URL|MODEL|FORMAT|SETTINGS`. Keep format and
 quantization labels exact; a comparison across unlabeled quantizations is not meaningful.
+
+## Session concurrency and ORT worker sharding
+
+`session_concurrency` emits a versioned JSON report plus a concise Markdown table. Its
+synthetic mode exercises the production lease map, least-loaded worker selection, counters,
+command channels, and owner threads around deterministic fixed CPU work. It is suitable for
+fast regression checks, but its throughput is not a model-performance claim. Reports contain
+summary statistics by default; add `--raw-samples` when individual timing samples are needed.
+
+```bash
+cargo run --release -p onnx-genai-bench \
+  --no-default-features --features session-concurrency \
+  --bin session_concurrency -- \
+  --mode synthetic --workers 1,2,4 --concurrency 1,2,4,8 \
+  --warmups 3 --iterations 100 --work-units 5000000 \
+  --output docs/benchmarks/session-concurrency-synthetic.json
+```
+
+Real ORT mode uses the committed `tiny-llm` fixture by default. It measures direct
+`DecodeSession`, direct `Engine`, and server-driver paths before the W=1/2/4 matrix, so model
+compute, workflow/interpreter cost, and dispatch/queue cost remain separate. Measured requests
+force a cold start, record prefix-cache hits, and fail if any prompt state is reused. Correctness
+gates serialize as `null` when the requested matrix cannot exercise them. Governor snapshots
+report used, limit, and headroom independently for host, disk, and device tiers.
+
+```bash
+cargo run --release -p onnx-genai-bench \
+  --no-default-features --features session-concurrency \
+  --bin session_concurrency -- \
+  --mode ort --provider cpu --intra-op-threads 1 \
+  --workers 1,2,4 --concurrency 1,2,4,8 \
+  --warmups 10 --iterations 10000 --max-new-tokens 4 \
+  --output docs/benchmarks/session-concurrency-ort-cpu.json
+```
+
+Run publishable timings through `scripts/hostlock.sh run`; the JSON records whether the
+measurement window was protected. CUDA requires a GPU-enabled ONNX Runtime:
+
+```bash
+cargo run --release -p onnx-genai-bench \
+  --no-default-features --features session-concurrency-cuda \
+  --bin session_concurrency -- \
+  --mode ort --provider cuda --intra-op-threads 1 \
+  --workers 1,2,4 --concurrency 1,2,4,8 \
+  --warmups 10 --iterations 10000 --max-new-tokens 4 \
+  --output docs/benchmarks/session-concurrency-ort-cuda.json
+```

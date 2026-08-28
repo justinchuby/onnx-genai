@@ -205,10 +205,11 @@ pub(crate) enum DriverCommand {
         request: Box<GenerateRequest>,
         response: std::sync::mpsc::SyncSender<anyhow::Result<GenerateResult>>,
     },
-    #[cfg(test)]
+    #[cfg(any(test, feature = "benchmark"))]
     Block {
         entered: std::sync::mpsc::SyncSender<()>,
         release: std::sync::mpsc::Receiver<()>,
+        completed: Option<std::sync::mpsc::SyncSender<()>>,
     },
     #[cfg(test)]
     Panic,
@@ -944,6 +945,17 @@ impl EngineDriver {
         request: GenerateRequest,
         input: Option<MultimodalInput>,
     ) -> Result<DriverGeneration, GenerateSubmitError> {
+        self.generate_routed(session, request, input)
+            .await
+            .map(|(_, generation)| generation)
+    }
+
+    async fn generate_routed(
+        &self,
+        session: Option<SessionLeaseGuard>,
+        request: GenerateRequest,
+        input: Option<MultimodalInput>,
+    ) -> Result<(WorkerId, DriverGeneration), GenerateSubmitError> {
         // A session-bound generation goes to the worker holding its KV state;
         // a stateless one goes to the worker that serves unbound work.
         debug_assert!(
@@ -998,10 +1010,22 @@ impl EngineDriver {
             crate::metrics::generation_queue_cancelled();
             return Err(GenerateSubmitError::DriverStopped);
         }
-        Ok(DriverGeneration {
-            admission: admission_rx,
-            events: rx,
-        })
+        Ok((
+            worker,
+            DriverGeneration {
+                admission: admission_rx,
+                events: rx,
+            },
+        ))
+    }
+
+    #[cfg(feature = "benchmark")]
+    pub(crate) async fn benchmark_generate(
+        &self,
+        session: Option<SessionLeaseGuard>,
+        request: GenerateRequest,
+    ) -> Result<(WorkerId, DriverGeneration), GenerateSubmitError> {
+        self.generate_routed(session, request, None).await
     }
 
     /// Run a small generation while blocking the calling thread. Used only by
@@ -2074,10 +2098,17 @@ fn handle_driver_command(engine: &mut Engine, command: DriverCommand) {
             barrier.wait();
             let _ = response.send(engine.generate_in_session(session_id, *request));
         }
-        #[cfg(test)]
-        DriverCommand::Block { entered, release } => {
+        #[cfg(any(test, feature = "benchmark"))]
+        DriverCommand::Block {
+            entered,
+            release,
+            completed,
+        } => {
             let _ = entered.send(());
             let _ = release.recv();
+            if let Some(completed) = completed {
+                let _ = completed.send(());
+            }
         }
         #[cfg(test)]
         DriverCommand::Panic => panic!("injected worker failure"),
@@ -2387,6 +2418,7 @@ mod admission_tests {
             .send(DriverCommand::Block {
                 entered: entered_tx,
                 release: release_rx,
+                completed: None,
             })
             .await
             .unwrap();

@@ -10,6 +10,15 @@ publish = false
 [features]
 default = ["cuda-13000"]
 bench-ort = ["dep:onnx-genai-ort"]
+session-concurrency = [
+    "dep:onnx-genai-server",
+    "dep:serde",
+]
+session-concurrency-cuda = [
+    "session-concurrency",
+    "onnx-genai-server/ort-cuda",
+    "onnx-genai-server/cuda-13000",
+]
 bench-native = [
     "onnx-genai-engine/native-backend",
     "dep:onnx-genai-ort",
@@ -103,6 +112,7 @@ onnx-genai-kv = { workspace = true }
 onnx-genai-metadata = { workspace = true }
 onnx-genai-ort = { path = "../onnx-genai-ort", version = "=0.1.0-dev.5", default-features = false, optional = true }
 onnx-genai-runtime-config = { workspace = true }
+onnx-genai-server = { path = "../onnx-genai-server", version = "=0.1.0-dev.5", default-features = false, features = ["benchmark", "metrics"], optional = true }
 onnx-runtime-ep-cpu = { workspace = true, optional = true }
 onnx-runtime-ep-api = { workspace = true, optional = true }
 onnx-runtime-ep-cuda = { path = "../onnx-runtime-ep-cuda", version = "=0.1.0-dev.5", optional = true, default-features = false }
@@ -112,6 +122,7 @@ prost = { workspace = true }
 onnx-runtime-session = { path = "../onnx-runtime-session", version = "=0.1.0-dev.5", optional = true, default-features = false }
 onnx-runtime-tracer = { workspace = true, optional = true }
 serde_json = { workspace = true }
+serde = { workspace = true, optional = true }
 tokenizers = { workspace = true }
 tokio = { workspace = true }
 
@@ -164,6 +175,10 @@ required-features = ["bench-native"]
 [[bin]]
 name = "bench_decode_gap"
 required-features = ["bench-native"]
+
+[[bin]]
+name = "session_concurrency"
+required-features = ["session-concurrency"]
 
 [[bin]]
 name = "cuda_place"

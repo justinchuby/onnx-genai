@@ -194,7 +194,7 @@ impl SessionLeases {
     }
 
     /// How many sessions hold a lease right now. Tests assert nothing leaked.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "benchmark"))]
     pub(crate) fn held(&self) -> usize {
         self.shards.iter().map(|shard| lock(shard).len()).sum()
     }
