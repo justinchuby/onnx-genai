@@ -86,10 +86,6 @@ impl Default for ProviderArtifactReadiness {
 }
 
 impl ProviderArtifactReadiness {
-    pub(super) fn epoch(&self) -> ExecutorArtifactReadinessEpoch {
-        self.epoch
-    }
-
     pub(super) fn advance_to(&mut self, epoch: ExecutorArtifactReadinessEpoch) {
         if epoch > self.epoch {
             self.epoch = epoch;
@@ -101,16 +97,28 @@ impl ProviderArtifactReadiness {
         matches!(self.outcome, ProviderArtifactOutcome::Unfinalized)
     }
 
-    pub(super) fn mark_complete(&mut self) {
-        self.outcome = ProviderArtifactOutcome::Complete;
-    }
-
-    pub(super) fn mark_pending(&mut self, pending: ExecutorArtifactPending) {
-        self.outcome = ProviderArtifactOutcome::Pending(pending);
-    }
-
-    pub(super) fn mark_failed(&mut self, reason: String) {
-        self.outcome = ProviderArtifactOutcome::Failed(reason);
+    /// Finalize the current specialization exactly once, then require its
+    /// outcome before any eager execution, capture, or replay.
+    pub(super) fn finalize_if_needed(
+        &mut self,
+        ep: &dyn ExecutionProvider,
+        executor: ExecutorInstanceId,
+        graph: &Graph,
+    ) -> Result<()> {
+        if self.needs_finalization() {
+            match ep.finalize_executor_artifacts(executor, graph, self.epoch) {
+                Ok(ExecutorArtifactFinalization::Complete) => {
+                    self.outcome = ProviderArtifactOutcome::Complete;
+                }
+                Ok(ExecutorArtifactFinalization::Pending(pending)) => {
+                    self.outcome = ProviderArtifactOutcome::Pending(pending);
+                }
+                Err(error) => {
+                    self.outcome = ProviderArtifactOutcome::Failed(error.to_string());
+                }
+            }
+        }
+        self.require_complete(ep.name(), executor)
     }
 
     pub(super) fn require_complete(

@@ -55,8 +55,9 @@ impl ExecutorInstanceId {
 
 /// Monotonic executor-local epoch for concrete kernel/producer readiness.
 ///
-/// The session advances this only when pre-execution compilation creates at
-/// least one new kernel specialization. A provider that returns
+/// The session advances this at the kernel-cache publication chokepoint whenever
+/// any build, binding-preparation, or runtime-dispatch path creates a new
+/// specialization. A provider that returns
 /// [`ExecutorArtifactFinalization::Pending`] is not called again for the same
 /// epoch: another attempt requires a concrete compilation transition.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1551,8 +1552,9 @@ pub trait ExecutionProvider: Send + Sync {
     ///
     /// Static build and every newly compiled symbolic/dynamic specialization
     /// invoke this same idempotent path after kernel factories have published
-    /// their producer handles and before any execution or capture. `readiness`
-    /// advances only when concrete compilation does; the executor never calls a
+    /// their producer handles and before any execution, capture, or replay.
+    /// `readiness` advances at every executor kernel-cache miss, including
+    /// binding preparation and runtime dispatch; the executor never calls a
     /// provider twice for the same pending/failed epoch. Structural declines
     /// may latch as [`ExecutorArtifactFinalization::Complete`];
     /// readiness-dependent absence returns
