@@ -18,8 +18,8 @@ use onnx_genai_ort::PipelineModels;
 use crate::config::{GenerateResult, GenerateTokenCallback};
 use crate::engine::Engine;
 use crate::pipeline::{
-    PipelineGenerateRequest, PipelineOutputs, PipelineTensors, WorkflowPerformanceDiagnostic,
-    WorkflowRuntime,
+    PipelineGenerateRequest, PipelineOutputs, PipelineTensors, WorkflowExecutionPlan,
+    WorkflowPerformanceDiagnostic, WorkflowRuntime,
 };
 
 impl Engine {
@@ -130,6 +130,17 @@ impl Engine {
     ) -> anyhow::Result<PipelineTensors> {
         let request = self.apply_pipeline_request_defaults(request)?;
         self.workflow_runtime_mut().run_pipeline(request)
+    }
+
+    /// Bind a workflow request once and execute its immutable canonical inputs
+    /// repeatedly. Per-execution row selection and intermediate values remain
+    /// private to [`WorkflowExecutionPlan::execute`].
+    pub fn prepare_pipeline(
+        &mut self,
+        request: PipelineGenerateRequest,
+    ) -> anyhow::Result<WorkflowExecutionPlan<'_>> {
+        let request = self.apply_pipeline_request_defaults(request)?;
+        WorkflowExecutionPlan::new(self.workflow_runtime(), request)
     }
 
     pub fn run_pipeline_outputs(

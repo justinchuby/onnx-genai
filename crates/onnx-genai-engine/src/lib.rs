@@ -37,8 +37,9 @@ pub mod speculative;
 pub use onnx_genai_scheduler::SchedulerAdmissionError;
 
 pub use batched::{
-    BatchOccupancy, BatchingCapability, ContinuousBatchAdmission, ContinuousBatchEvent,
-    ContinuousBatchHandle, ContinuousBatchManager,
+    BatchOccupancy, BatchingCapability, ContinuousBatchAdmission, ContinuousBatchDiagnostic,
+    ContinuousBatchEvent, ContinuousBatchHandle, ContinuousBatchManager,
+    ContinuousBatchRowDiagnostic,
 };
 pub use connector_bridge::{ConnectorLookupOutcome, ConnectorStats};
 pub use embedding::{EmbeddingOptions, EmbeddingPooling};
@@ -174,8 +175,8 @@ pub struct VmmArenaStats {
 pub use onnx_runtime_session::DecodePrecision;
 pub use pipeline::{
     AdapterActivation, AdapterLifecycleDiagnostic, AdapterSelection, EncodedAudio,
-    PipelineGenerateRequest, PipelineTensors, RowScopedState, RowTable, WorkflowSessionCheckpoint,
-    is_missing_required_input, validate_pipeline_backend_request,
+    PipelineGenerateRequest, PipelineTensors, RowPlan, RowScopedState, RowTable,
+    WorkflowSessionCheckpoint, is_missing_required_input, validate_pipeline_backend_request,
 };
 pub use sampling::{CategoricalSampler, GreedySampler, Sampler};
 pub use speculative::{
