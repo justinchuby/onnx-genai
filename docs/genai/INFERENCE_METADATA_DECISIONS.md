@@ -475,17 +475,37 @@ is loop-scoped; a value carried across iterations is a declared carried cell.
 
 Canonical autoregressive lifecycle is structural, not a serialized phase:
 
-- root-prefix steps initialize the invocation and perform prefill;
-- the top-level generation loop performs per-token work; and
+- authored root-prefix steps execute in order before the loop and may perform
+  restoration, initialization, preprocessing, or prefill;
+- the loop's `setup` executes exactly once on loop entry;
+- the loop condition is checked before each bounded body iteration, which
+  performs per-token work for an autoregressive generation loop; and
 - root-suffix steps perform post-generation work.
 
-For an optimized autoregressive generation workflow, the generation loop's
-`setup` **MUST** be empty. Prefill, restoration, and one-time initialization
-belong in the root prefix. A reader that selects the optimized per-token path
-**MUST** reject a non-empty generation-loop `setup`; it **MUST NOT** invent
-execute-once behavior or silently fall back while claiming the optimized
-contract. This restriction is about the optimized autoregressive path, not a
-removal of generic loop setup from the structural IR.
+`setup` is authored executable semantics, not a placement hint. It runs before
+the loop bound and initial carries are consumed and before the first condition
+test. It still runs when the body takes zero trips because the bound is zero or
+the initial condition is false. Setup values may depend on root/prefill outputs
+and may seed the bound, condition, carries, or body; setup effects participate
+in ordinary lexical effect ordering. Moving setup into the root prefix is not
+generally semantics-preserving and is permitted only as a proven compiler
+transformation that preserves dataflow, scope, cardinality, and effects.
+
+An optimized autoregressive runtime has two conforming choices:
+
+1. execute a compatible `setup` exactly once, then drive the optimized
+   per-token body with the same bound, pre-body condition ordering, carries,
+   effects, and zero-trip behavior as the generic interpreter; or
+2. decline only that optimized path and execute the workflow through the
+   generic interpreter.
+
+It **MUST NOT** reject an otherwise executable package solely because
+`setup` is non-empty. A fast-path compatibility decision **MUST** occur before
+setup mutation/effects, or restart from a transaction baseline that proves
+setup is not duplicated. A diagnostic declining the fast path **MUST** name the
+unsupported setup operation, effect, or other incompatible property. Root
+prefix remains appropriate for one-time work authored there; it is not a
+normative relocation target for loop setup.
 
 `transfer` is **internal lowered IR only**. The planner introduces transfers when
 it assigns placement. A metadata document **MUST NOT** serialize one.
@@ -1975,9 +1995,14 @@ the other.
 #### Prefill/decode lifecycle and final-writer ownership
 
 Separate prefill and decode artifacts are ordinary workflow components, not
-model-family phases. For optimized autoregressive execution, restoration,
-empty-state initialization, preprocessing, and prefill occur in the root prefix
-([§6.1](#61-structural-ir)); decode occurs in the top-level loop.
+model-family phases. Restoration, empty-state initialization, preprocessing,
+and prefill execute wherever workflow dataflow authors them. A root prefix is
+the conventional location when those operations precede the loop; a
+generation-loop `setup` remains an exactly-once loop-entry region and may
+consume root/prefill outputs or seed loop-local values and effects. An optimized
+runtime must preserve that structure or use the generic fallback defined in
+[§6.1](#61-structural-ir); it must not relocate setup merely because the work
+runs once.
 
 For a later session turn, the dataflow **MUST** distinguish restored prior state
 from empty initialization, pass prior state to incremental prefill when the
@@ -2734,6 +2759,7 @@ their listed proof lands:
 | Shape is the sole rank authority; `Any` is an unconstrained dimension | Schema still serializes `rank` and optional `shape` | Atomic schema/parser/importer/exporter/runtime/example migration and fail-closed legacy-field tests |
 | Transport-neutral workflow output publication plus ordinary emits is distinct from API/network delivery | Current schema stores mode on individual emits and advertises redundant `streaming_emit` | Migrate to one output protocol family with permitted per-emit operations; remove `streaming_emit` without replacement; prove host observability without inferring transport delivery |
 | Atomic admission baseline covers the complete semantic state write set and every output's committed head/cursor; commit advances all heads atomically, while provisional revision abort uses typed `abort_to_baseline`; successful commit establishes default finality and optional `finalize` closes one stream early | No complete revision envelope, transaction baseline, or whole-turn coordinator | Protocol tests covering transaction identity, deterministic sequence and lineage, commit-default finality, optional early close, post-close rejection, consumer-visible abort-to-baseline, non-inference of rollback targets, and the complete boundary fault matrix |
+| Authored `loop.setup` has exactly-once loop-entry semantics; an optimized autoregressive path executes compatible setup or falls back to the generic interpreter | Generic workflow execution runs setup before bound/carry initialization and condition checks, including zero-trip loops; the per-token generation cursor currently rejects every non-empty setup instead of selecting compatible execution or fallback | Optimized/generic parity for setup-derived bounds, conditions, carries, values, and effects; zero-bound and initially-false zero-trip tests; exactly-once setup under success/error/cancellation; unsupported-operation diagnostics and mutation-free generic fallback |
 | Native typed/versioned tool registry v1 | Server still tries family formats in order | Two declared protocols, arbitrary chunk-boundary tests, and unknown-version fail-closed behavior |
 | Generic cross-invocation state/dataflow | Existing cells and state groups cover the pieces; complete cross-path proof is pending | Fixtures proving external initialization and internal carry with identical lifecycle rules across KV, recurrent, feature-stream, and audio-window examples |
 | Workflow-native speculative contract is the sole authority | Legacy `SpeculatorConfig` remains in parser/runtime paths | Producer migration and real MTP execution without legacy-only discovery |
