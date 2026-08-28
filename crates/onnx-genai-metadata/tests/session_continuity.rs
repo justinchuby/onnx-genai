@@ -118,14 +118,23 @@ fn a_well_formed_conversation_validates() {
     assert!(reported.is_empty(), "{reported:?}");
 }
 
-/// The lease and the capability are one statement: a reader that cannot honour
-/// leased state must be able to see that it is being asked to.
+/// Session leasing is a core consequence of typed session state, not an entry
+/// in the retired workflow capability list.
 #[test]
-fn a_conversation_requires_the_session_lease_capability() {
-    rejects(
-        &document(&conversation_cell(&[]), "typed_emit"),
-        "session_state_lease",
-    );
+fn a_conversation_lease_is_derived_without_a_capability_flag() {
+    for retired_manifest_spelling in [
+        "typed_emit",
+        "session_state_lease, bounded_state_recurrence",
+    ] {
+        let reported = errors(&document(
+            &conversation_cell(&[]),
+            retired_manifest_spelling,
+        ));
+        assert!(
+            reported.is_empty(),
+            "retired manifest spelling must not control typed lease semantics: {reported:?}"
+        );
+    }
 }
 
 #[test]
