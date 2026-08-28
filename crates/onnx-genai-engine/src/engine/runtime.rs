@@ -712,6 +712,16 @@ impl Engine {
         reject_native_request_speculation(&request.options)?;
         request.options.validate()?;
         let mut options = request.options;
+        if matches!(options.speculative_mode, Some(SpeculativeMode::Mtp(_)))
+            && !options.selects_greedily()
+        {
+            self.metadata
+                .speculative
+                .as_ref()
+                .context("native MTP mode was selected without a canonical speculative contract")?
+                .admit_sampling()
+                .map_err(anyhow::Error::msg)?;
+        }
         self.apply_eos_defaults(&mut options)?;
         let prompt_tokens = self.tokenize_prompt(&request.prompt)?;
         if prompt_tokens.is_empty() {
@@ -1120,7 +1130,27 @@ impl Engine {
             request.with_session_id(session_id.to_string()),
             on_admitted,
             callback,
-        )?;
+        );
+        let delivery_commit = result
+            .as_ref()
+            .err()
+            .and_then(|error| {
+                error
+                    .downcast_ref::<crate::pipeline::speculative::CandidateTreeOutputDeliveryError>(
+                    )
+            })
+            .map(|error| error.committed_tokens);
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                if let Some(committed) = delivery_commit
+                    && let Some(count) = self.workflow_sessions.get_mut(&session_id)
+                {
+                    *count = count.saturating_add(committed);
+                }
+                return Err(error);
+            }
+        };
         // A package that declares its conversation knows how long it is; asking
         // it is what keeps `session_token_count` the same number a decode-core
         // session reports — prompt and generated tokens both — rather than the
@@ -1421,6 +1451,7 @@ impl Engine {
         admission_callback: Option<&mut dyn FnMut()>,
         token_callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
+        self.require_workflow_execution_admitted()?;
         // One entry point, one interpreter, one declared loop. What varies is
         // whether this runtime holds the fused decode session that implements
         // the package's declared `autoregressive-decode` step. Without one, the
@@ -1465,6 +1496,7 @@ impl Engine {
                 );
             }
         }
+
         let session_id = self.create_session()?;
         let result = self.generate_in_session_with_priority_and_callback(
             session_id,
@@ -1480,6 +1512,29 @@ impl Engine {
             (Err(error), _) => Err(error),
             (Ok(_), Err(error)) => Err(error),
         }
+    }
+
+    /// Generate through the ordinary Engine surface with a request-scoped
+    /// cancellation authority and transaction checkpoints.
+    pub fn generate_with_control_callbacks(
+        &mut self,
+        request: GenerateRequest,
+        control: crate::pipeline::GenerationControl,
+        admission_callback: Option<&mut dyn FnMut()>,
+        token_callback: Option<&mut GenerateTokenCallback<'_>>,
+    ) -> anyhow::Result<GenerateResult> {
+        if self.holds_decode_core() {
+            return Err(crate::pipeline::GenerationControlUnsupported {
+                operation: "Engine::generate_with_control_callbacks",
+                runtime: "the fused decode backend",
+            }
+            .into());
+        }
+        self.generate_with_pipeline_callbacks(
+            crate::pipeline::PipelineGenerateRequest::new(request).with_generation_control(control),
+            admission_callback,
+            token_callback,
+        )
     }
 
     /// Generate text in a persistent session, reusing the session's accumulated KV state.
@@ -1538,6 +1593,31 @@ impl Engine {
         )
     }
 
+    /// Continue an interpreted workflow session with request-scoped
+    /// cancellation and transaction checkpoints.
+    pub fn generate_in_session_with_control_callbacks(
+        &mut self,
+        session_id: SessionId,
+        request: GenerateRequest,
+        control: crate::pipeline::GenerationControl,
+        admission_callback: Option<&mut dyn FnMut()>,
+        token_callback: Option<&mut GenerateTokenCallback<'_>>,
+    ) -> anyhow::Result<GenerateResult> {
+        if self.holds_decode_core() {
+            return Err(crate::pipeline::GenerationControlUnsupported {
+                operation: "Engine::generate_in_session_with_control_callbacks",
+                runtime: "the fused decode backend",
+            }
+            .into());
+        }
+        self.generate_in_workflow_session(
+            session_id,
+            crate::pipeline::PipelineGenerateRequest::new(request).with_generation_control(control),
+            admission_callback,
+            token_callback,
+        )
+    }
+
     /// Generate text in a persistent session using a caller-supplied [`Sampler`].
     ///
     /// The custom sampler replaces the built-in greedy/categorical token
@@ -1571,6 +1651,7 @@ impl Engine {
         mut admission_callback: Option<&mut dyn FnMut()>,
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
+        self.require_workflow_execution_admitted()?;
         // A package with no decode core keeps its conversation in the
         // session-scoped cells its workflow declares. Routing here rather than
         // in one of the wrappers above is what makes every `generate_in_session`
@@ -2062,46 +2143,6 @@ impl Engine {
         session_state::rewind_to(&mut OrtSessions(self), session_id, position)
     }
 
-    /// Capability for session fork, if the selected backend supports safe CoW
-    /// fork at the engine level.
-    ///
-    /// Current ORT decode runners do not expose clone/import semantics strong
-    /// enough to fork without deep-copying or aliasing mutable KV, so this
-    /// returns `None` today. A future supported backend should return `Some` and
-    /// route fork through [`Engine::fork_session`].
-    pub fn session_fork_capability(&self) -> Option<SessionForkCapability> {
-        None
-    }
-
-    /// Fork a persistent session at a logical token boundary.
-    ///
-    /// Callers can obtain `capability` only from
-    /// [`Engine::session_fork_capability`], which is `None` for all current
-    /// backends. Keeping the capability token in the signature prevents
-    /// unsupported engines from being asked to fork through the typed API.
-    pub fn fork_session(
-        &mut self,
-        _capability: &SessionForkCapability,
-        source: SessionId,
-        position: SessionPosition,
-    ) -> anyhow::Result<SessionId> {
-        self.require_ort_backend("session fork")?;
-        let state = self
-            .sessions
-            .get(&source)
-            .with_context(|| format!("session {source} not found"))?;
-        let position = position.get();
-        let current = state.tokens.len();
-        if position > current {
-            anyhow::bail!(
-                "cannot fork session {source} at token {position}; current length is {current}"
-            );
-        }
-        anyhow::bail!(
-            "session fork is not yet enabled: safe CoW fork requires cloneable/importable decoder state aligned with paged KV; current ORT runner/static-cache paths would require deep-copying or unsafe KV aliasing"
-        )
-    }
-
     /// Reset a persistent session, freeing its current state while keeping the id usable.
     pub fn reset_session(&mut self, session_id: SessionId) -> anyhow::Result<()> {
         // Resetting is the same promise for every package: the id stays usable
@@ -2127,7 +2168,7 @@ impl Engine {
         session_state::reset(&mut OrtSessions(self), session_id)
     }
 
-    fn new_target_decode_state(&self) -> anyhow::Result<DecodeState> {
+    pub(crate) fn new_target_decode_state(&self) -> anyhow::Result<DecodeState> {
         let session = self
             .session
             .as_ref()
@@ -3848,6 +3889,7 @@ mod tests {
             0,
         )?;
         Ok(Engine {
+            session_fork_origin: SessionForkOrigin::new(),
             workflow: Box::new(match shape {
                 crate::pipeline::generation::TestSessionShape::Stateless => {
                     crate::pipeline::generation::test_decoder_runtime()?
@@ -4461,6 +4503,7 @@ mod tests {
         // model. This is the honesty guarantee -- capability is not read off the
         // decode_path alone.
         let mut engine = Engine {
+            session_fork_origin: SessionForkOrigin::new(),
             workflow: Box::new(crate::pipeline::generation::test_decoder_runtime()?),
             workflow_sessions: HashMap::new(),
             workflow_session_ids: SharedSessionIds::new(),

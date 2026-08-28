@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use onnx_genai_metadata::{PipelineSpec, TensorDimension};
 use onnx_runtime_loader::proto::onnx::{ValueInfoProto, tensor_shape_proto, type_proto};
-use onnx_std::ir::{DataType, Dim};
+use onnx_std::ir::DataType;
 
 use crate::{OrtError, Result};
 
@@ -34,8 +34,10 @@ struct ComponentSignature {
     ///
     /// Populated from the loader's decoded model inventory, so external-data
     /// initializers resolved from sidecar files are included. This is what a
-    /// folded-carry `token_embedding.table` must resolve against.
+    /// speculative shared-weight relationship must resolve against.
     initializers: BTreeSet<String>,
+    /// Graph outputs transitively reached by each graph input or initializer.
+    reachable_outputs: BTreeMap<String, BTreeSet<String>>,
 }
 
 pub(crate) fn validate_pipeline_admission(
@@ -46,12 +48,134 @@ pub(crate) fn validate_pipeline_admission(
     let signatures = inspect_component_signatures(model_paths)?;
     validate_workflow_signatures(&spec.workflow, &signatures)?;
     if let Some(speculative) = speculative {
-        validate_speculative_token_embedding(speculative, &signatures)?;
+        validate_speculative_shared_initializers(speculative, &signatures)?;
+        validate_dflash_required_input_reachability(speculative, &signatures)?;
     }
     Ok(())
 }
 
-/// Resolve a folded-carry `token_embedding.table` against the target model's
+fn validate_dflash_required_input_reachability(
+    speculative: &onnx_genai_metadata::SpeculativeContract,
+    signatures: &BTreeMap<String, ComponentSignature>,
+) -> Result<()> {
+    let onnx_genai_metadata::SpeculativeProposalExecution::DflashFlatBlock {
+        conditioning,
+        block,
+        outputs,
+        shared_weights,
+        ..
+    } = &speculative.proposal_execution
+    else {
+        return Ok(());
+    };
+    let proposer = signatures.get(&speculative.proposer).ok_or_else(|| {
+        OrtError::InvalidArgument(format!(
+            "DFlash proposer '{}' has no inspected ONNX graph",
+            speculative.proposer
+        ))
+    })?;
+    let target = signatures.get(&speculative.target).ok_or_else(|| {
+        OrtError::InvalidArgument(format!(
+            "DFlash target '{}' has no inspected ONNX graph",
+            speculative.target
+        ))
+    })?;
+    let mut semantic_outputs = BTreeSet::from([outputs.candidate_tokens.clone()]);
+    if let Some(probabilities) = outputs.proposal_probabilities.as_ref() {
+        semantic_outputs.insert(probabilities.clone());
+    }
+    for (field, port) in [
+        (
+            "conditioning.proposer_input",
+            conditioning.proposer_input.as_str(),
+        ),
+        (
+            "block.noise_embeddings_input",
+            block.noise_embeddings_input.as_str(),
+        ),
+        (
+            "block.masked_positions_input",
+            block.masked_positions_input.as_str(),
+        ),
+        (
+            "block.position_ids_input",
+            block.position_ids_input.as_str(),
+        ),
+        (
+            "block.attention_mask_input",
+            block.attention_mask_input.as_str(),
+        ),
+        (
+            "shared_weights.output_projection.proposer_input",
+            shared_weights.output_projection.proposer_input.as_str(),
+        ),
+    ] {
+        let reached = proposer
+            .reachable_outputs
+            .get(port)
+            .cloned()
+            .unwrap_or_default();
+        if reached.is_disjoint(&semantic_outputs) {
+            return Err(OrtError::InvalidArgument(format!(
+                "package admission rejected DFlash {field} port '{port}' on proposer '{}': the \
+                 ONNX graph does not connect this required semantic input to candidate output \
+                 '{}'{}; decorative or unused DFlash inputs would make the declared block \
+                 semantics false. Connect the input into the proposer computation that produces \
+                 the declared candidates/probabilities.",
+                speculative.proposer,
+                outputs.candidate_tokens,
+                outputs
+                    .proposal_probabilities
+                    .as_deref()
+                    .map(|name| format!(" or probability output '{name}'"))
+                    .unwrap_or_default(),
+            )));
+        }
+    }
+
+    let conditioning_outputs = conditioning
+        .sources
+        .iter()
+        .map(|source| source.output.clone())
+        .collect::<BTreeSet<_>>();
+    let embedding_reached = target
+        .reachable_outputs
+        .get(&shared_weights.input_embedding.table)
+        .cloned()
+        .unwrap_or_default();
+    if !conditioning_outputs.is_subset(&embedding_reached) {
+        let missing = conditioning_outputs
+            .difference(&embedding_reached)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(OrtError::InvalidArgument(format!(
+            "package admission rejected DFlash input_embedding.table initializer '{}' on target \
+             '{}': it does not reach declared conditioning output(s) [{missing}]. A shared token \
+             embedding must participate in the target features the proposer consumes, not exist \
+             only as decorative initializer metadata.",
+            shared_weights.input_embedding.table, speculative.target
+        )));
+    }
+    let projection_reached = target
+        .reachable_outputs
+        .get(&shared_weights.output_projection.initializer)
+        .cloned()
+        .unwrap_or_default();
+    if !projection_reached.contains(&speculative.verification.target_output.output) {
+        return Err(OrtError::InvalidArgument(format!(
+            "package admission rejected DFlash output_projection.initializer '{}' on target '{}': \
+             it does not reach verifier output '{}'. The declared shared LM head must be consumed \
+             by both target verification and proposer projection dataflow.",
+            shared_weights.output_projection.initializer,
+            speculative.target,
+            speculative.verification.target_output.output
+        )));
+    }
+    Ok(())
+}
+
+/// Resolve every declared speculative shared weight against the target model's
 /// real initializer inventory, fail-closed.
 ///
 /// The metadata validator already checks the *structural* contract: the
@@ -59,47 +183,58 @@ pub(crate) fn validate_pipeline_admission(
 /// ONNX component, and the table string must be non-empty. It cannot, however,
 /// see inside the ONNX artifact, so a producer can still name a table that does
 /// not exist. A folded-carry proposer gathers `embed(last_token)` from this
-/// exact initializer and reads no embedding weight inside its own graph, so a
-/// dangling table would silently break generation. Admission has already loaded
-/// every ONNX component, so here the declared table is required to match a real
-/// initializer the target model owns. The error names the component and table.
-fn validate_speculative_token_embedding(
+/// exact initializer, while DFlash borrows both the target embedding and output
+/// projection. A dangling relationship would silently break proposal semantics.
+/// Admission has already inspected every ONNX component, so each declared name
+/// must match a real target initializer.
+fn validate_speculative_shared_initializers(
     speculative: &onnx_genai_metadata::SpeculativeContract,
     signatures: &BTreeMap<String, ComponentSignature>,
 ) -> Result<()> {
-    // Only a chained proposer with a folded carry names an embedding table; a
-    // block proposer or a chained proposer without a folded carry does not.
-    let onnx_genai_metadata::SpeculativeProposalExecution::Chained {
-        token_embedding: Some(embedding),
-        ..
-    } = &speculative.proposal_execution
-    else {
-        return Ok(());
+    let required = match &speculative.proposal_execution {
+        onnx_genai_metadata::SpeculativeProposalExecution::Chained {
+            token_embedding: Some(embedding),
+            ..
+        } => vec![(
+            "token_embedding.table",
+            embedding.component.as_str(),
+            embedding.table.as_str(),
+        )],
+        onnx_genai_metadata::SpeculativeProposalExecution::DflashFlatBlock {
+            shared_weights,
+            ..
+        } => vec![
+            (
+                "DFlash input_embedding.table",
+                shared_weights.input_embedding.component.as_str(),
+                shared_weights.input_embedding.table.as_str(),
+            ),
+            (
+                "DFlash output_projection.initializer",
+                shared_weights.output_projection.component.as_str(),
+                shared_weights.output_projection.initializer.as_str(),
+            ),
+        ],
+        _ => Vec::new(),
     };
-    let signature = signatures.get(&embedding.component).ok_or_else(|| {
-        OrtError::InvalidArgument(format!(
-            "package admission rejected speculative token_embedding: component \
-             '{component}' has no inspected ONNX model, so its embedding table \
-             '{table}' cannot be resolved. How to fix: declare \
-             token_embedding.component as the speculative target ONNX component \
-             that owns the '{table}' initializer",
-            component = embedding.component,
-            table = embedding.table,
-        ))
-    })?;
-    if !signature.initializers.contains(&embedding.table) {
-        return Err(OrtError::InvalidArgument(format!(
-            "package admission rejected speculative token_embedding: table \
-             '{table}' is not an initializer of target component '{component}'. A \
-             folded-carry proposer gathers embed(last_token) from this exact \
-             initializer, so it must resolve to a real weight in the target \
-             model/artifact. How to fix: set token_embedding.table to an \
-             initializer name declared by component '{component}' (declared \
-             initializers: {available})",
-            table = embedding.table,
-            component = embedding.component,
-            available = summarize_initializers(&signature.initializers),
-        )));
+    for (field, component, initializer) in required {
+        let signature = signatures.get(component).ok_or_else(|| {
+            OrtError::InvalidArgument(format!(
+                "package admission rejected speculative {field}: component '{component}' has no \
+                 inspected ONNX model, so initializer '{initializer}' cannot be resolved. How \
+                 to fix: name the speculative target ONNX component that owns the initializer"
+            ))
+        })?;
+        if !signature.initializers.contains(initializer) {
+            return Err(OrtError::InvalidArgument(format!(
+                "package admission rejected speculative {field}: '{initializer}' is not an \
+                 initializer of target component '{component}'. Shared speculative weights are \
+                 immutable target relationships, not names the runtime may guess or duplicate. \
+                 How to fix: emit the exact target initializer name (declared initializers: \
+                 {available})",
+                available = summarize_initializers(&signature.initializers),
+            )));
+        }
     }
     Ok(())
 }
@@ -496,7 +631,7 @@ fn inspect_component_signatures(
 }
 
 fn inspect_component_signature(component: &str, path: &Path) -> Result<ComponentSignature> {
-    let model = if path
+    let bytes = if path
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("textproto"))
     {
@@ -507,7 +642,7 @@ fn inspect_component_signature(component: &str, path: &Path) -> Result<Component
                 format!("the ONNX textproto could not be read: {error}"),
             )
         })?;
-        onnx_std::textproto::from_textproto(&text).map_err(|error| {
+        onnx_runtime_loader::proto::textproto_to_binary(&text).map_err(|error| {
             component_inspection_error(
                 component,
                 path,
@@ -515,22 +650,19 @@ fn inspect_component_signature(component: &str, path: &Path) -> Result<Component
             )
         })
     } else {
-        onnx_std::load_model(path).map_err(|error| {
+        std::fs::read(path).map_err(|error| {
             component_inspection_error(
                 component,
                 path,
-                format!("the ONNX model could not be loaded: {error}"),
+                format!("the ONNX model could not be read: {error}"),
             )
         })
     }?;
-    // Admission must inspect the retained protobuf before scanning the execution
-    // projection: graph_builder.rs:118-121 and 143-147 intentionally omit empty
-    // GraphProto input/output names from the loaded IR.
-    let source_proto = model.to_proto().map_err(|error| {
+    let source_proto = onnx_runtime_loader::proto::decode_model(&bytes).map_err(|error| {
         component_inspection_error(
             component,
             path,
-            format!("the retained ONNX protobuf could not be inspected: {error}"),
+            format!("the ONNX protobuf could not be decoded: {error}"),
         )
     })?;
     let source_graph = source_proto.graph.as_ref().ok_or_else(|| {
@@ -574,6 +706,22 @@ fn inspect_component_signature(component: &str, path: &Path) -> Result<Component
         .iter()
         .map(|name| name.to_string())
         .collect();
+    let graph_outputs = source_graph
+        .output
+        .iter()
+        .map(|output| output.name.as_str())
+        .collect::<BTreeSet<_>>();
+    for source in source_graph
+        .input
+        .iter()
+        .map(|input| input.name.as_str())
+        .chain(initializer_names.iter().copied())
+    {
+        signature.reachable_outputs.insert(
+            source.to_string(),
+            reachable_graph_outputs(source_graph, source, &graph_outputs),
+        );
+    }
 
     for input in &source_graph.input {
         let name = input.name.clone();
@@ -585,29 +733,46 @@ fn inspect_component_signature(component: &str, path: &Path) -> Result<Component
             .insert(name, raw_input_signature(component, path, input)?);
     }
 
-    for output in &model.graph.outputs {
-        let value = model.graph.value(*output);
-        let name = value
-            .name
-            .clone()
-            .expect("validated GraphProto output names survive loader projection");
-        signature.outputs.insert(
-            name,
-            PortSignature {
-                dtype: value.dtype,
-                shape: value
-                    .shape
-                    .iter()
-                    .map(|dimension| match dimension {
-                        Dim::Static(value) => PortDimension::Static(*value),
-                        Dim::Symbolic(_) => PortDimension::Dynamic,
-                    })
-                    .collect(),
-            },
-        );
+    for output in &source_graph.output {
+        let name = output.name.clone();
+        signature
+            .outputs
+            .insert(name, raw_port_signature(component, path, output, "output")?);
     }
 
     Ok(signature)
+}
+
+fn reachable_graph_outputs(
+    graph: &onnx_runtime_loader::proto::onnx::GraphProto,
+    source: &str,
+    graph_outputs: &BTreeSet<&str>,
+) -> BTreeSet<String> {
+    let mut reachable = BTreeSet::from([source.to_string()]);
+    loop {
+        let mut changed = false;
+        for node in &graph.node {
+            if node
+                .input
+                .iter()
+                .any(|input| !input.is_empty() && reachable.contains(input))
+            {
+                for output in &node.output {
+                    if !output.is_empty() {
+                        changed |= reachable.insert(output.clone());
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    graph_outputs
+        .iter()
+        .filter(|output| reachable.contains(**output))
+        .map(|output| (*output).to_string())
+        .collect()
 }
 
 fn raw_input_signature(
@@ -615,11 +780,20 @@ fn raw_input_signature(
     path: &Path,
     input: &ValueInfoProto,
 ) -> Result<PortSignature> {
-    let tensor = input
+    raw_port_signature(component, path, input, "input")
+}
+
+fn raw_port_signature(
+    component: &str,
+    path: &Path,
+    value: &ValueInfoProto,
+    direction: &str,
+) -> Result<PortSignature> {
+    let tensor = value
         .r#type
         .as_ref()
-        .and_then(|input_type| input_type.value.as_ref())
-        .and_then(|input_type| match input_type {
+        .and_then(|value_type| value_type.value.as_ref())
+        .and_then(|value_type| match value_type {
             type_proto::Value::TensorType(tensor) => Some(tensor),
             _ => None,
         })
@@ -628,8 +802,8 @@ fn raw_input_signature(
                 component,
                 path,
                 format!(
-                    "ONNX graph input '{}' does not declare a tensor type",
-                    input.name
+                    "ONNX graph {direction} '{}' does not declare a tensor type",
+                    value.name
                 ),
             )
         })?;
@@ -638,8 +812,8 @@ fn raw_input_signature(
             component,
             path,
             format!(
-                "ONNX graph input '{}' declares unsupported tensor dtype {}",
-                input.name, tensor.elem_type
+                "ONNX graph {direction} '{}' declares unsupported tensor dtype {}",
+                value.name, tensor.elem_type
             ),
         )
     })?;
@@ -759,6 +933,8 @@ mod tests {
     /// `token_embedding` names the verifier component and the given table.
     fn chained_speculative_with_table(table: &str) -> onnx_genai_metadata::SpeculativeContract {
         let yaml = [
+            "identity: onnx-genai.speculative".to_string(),
+            "version: '1'".to_string(),
             "proposer: proposer".to_string(),
             "target: verifier".to_string(),
             "proposal_execution:".to_string(),
@@ -771,6 +947,9 @@ mod tests {
             "vocabulary:".to_string(),
             "  kind: identical".to_string(),
             "max_proposal_width: 4".to_string(),
+            "verification:".to_string(),
+            "  target_output: {component: verifier, output: logits}".to_string(),
+            "  accepted_path: {kind: runtime, binding: accepted_prefix}".to_string(),
         ]
         .join("\n");
         serde_yaml::from_str(&yaml).expect("speculative contract YAML should parse")
@@ -788,7 +967,7 @@ mod tests {
         assert!(inventory.contains("const_1d_1"));
 
         let speculative = chained_speculative_with_table("const_1d_0");
-        validate_speculative_token_embedding(&speculative, &signatures)
+        validate_speculative_shared_initializers(&speculative, &signatures)
             .expect("a table matching a real initializer must be admitted");
     }
 
@@ -797,7 +976,7 @@ mod tests {
         let signatures = verifier_signatures();
         // Non-empty and structurally valid, but absent from the target model.
         let speculative = chained_speculative_with_table("model.embed_tokens.weight");
-        let err = validate_speculative_token_embedding(&speculative, &signatures)
+        let err = validate_speculative_shared_initializers(&speculative, &signatures)
             .expect_err("a dangling embedding table must be rejected fail-closed");
         let message = err.to_string();
         assert!(
@@ -822,7 +1001,7 @@ mod tests {
         {
             embedding.component = "ghost".to_string();
         }
-        let err = validate_speculative_token_embedding(&speculative, &signatures)
+        let err = validate_speculative_shared_initializers(&speculative, &signatures)
             .expect_err("an embedding component with no inspected model must be rejected");
         assert!(err.to_string().contains("ghost"));
     }
@@ -831,6 +1010,8 @@ mod tests {
     fn a_block_proposer_without_a_folded_carry_is_ignored() {
         let signatures = verifier_signatures();
         let yaml = [
+            "identity: onnx-genai.speculative",
+            "version: '1'",
             "proposer: proposer",
             "target: verifier",
             "proposal_execution:",
@@ -838,11 +1019,14 @@ mod tests {
             "vocabulary:",
             "  kind: identical",
             "max_proposal_width: 4",
+            "verification:",
+            "  target_output: {component: verifier, output: logits}",
+            "  accepted_path: {kind: runtime, binding: accepted_prefix}",
         ]
         .join("\n");
         let speculative: onnx_genai_metadata::SpeculativeContract =
             serde_yaml::from_str(&yaml).expect("block speculative contract should parse");
-        validate_speculative_token_embedding(&speculative, &signatures)
+        validate_speculative_shared_initializers(&speculative, &signatures)
             .expect("a proposer without a folded-carry token_embedding needs no inventory check");
     }
 }

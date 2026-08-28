@@ -812,7 +812,7 @@ pub enum WorkflowInputSource {
     Artifact { path: String },
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WorkflowOutput {
     pub contract: TensorContract,
@@ -822,8 +822,13 @@ pub struct WorkflowOutput {
     /// The default preserves documents authored before output protocols were
     /// introduced. New schema-versioned documents must state this field; see
     /// the parser's version gate.
+    #[serde(default)]
     pub family: WorkflowOutputFamily,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Whether `family` was explicitly authored rather than supplied by the
+    /// pre-v1.5 compatibility default.
+    #[doc(hidden)]
+    #[schemars(skip)]
+    pub family_authored: bool,
     pub value_range: Option<PixelValueRange>,
     pub stage: OutputStage,
     /// Concrete media delivery contract for a post-processing output.
@@ -832,7 +837,6 @@ pub struct WorkflowOutput {
     /// nor can it carry the sample rate and channel count required by an audio
     /// serving API. This remains architecture-neutral and intentionally contains
     /// no model-family identifiers or artifact fingerprints.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media: Option<MediaOutputContract>,
 }
 
@@ -847,12 +851,30 @@ struct WorkflowOutputWire {
     contract: TensorContract,
     role: WorkflowOutputRole,
     #[serde(default)]
-    family: WorkflowOutputFamily,
+    family: AuthoredWorkflowOutputFamily,
     #[serde(default)]
     value_range: Option<PixelValueRange>,
     stage: OutputStage,
     #[serde(default)]
     media: Option<MediaOutputContract>,
+}
+
+#[derive(Default)]
+struct AuthoredWorkflowOutputFamily {
+    value: WorkflowOutputFamily,
+    authored: bool,
+}
+
+impl<'de> Deserialize<'de> for AuthoredWorkflowOutputFamily {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(Self {
+            value: WorkflowOutputFamily::deserialize(deserializer)?,
+            authored: true,
+        })
+    }
 }
 
 impl<'de> Deserialize<'de> for WorkflowOutput {
@@ -864,11 +886,40 @@ impl<'de> Deserialize<'de> for WorkflowOutput {
         Ok(Self {
             contract: wire.contract,
             role: wire.role,
-            family: wire.family,
+            family: wire.family.value,
+            family_authored: wire.family.authored,
             value_range: wire.value_range,
             stage: wire.stage,
             media: wire.media,
         })
+    }
+}
+
+impl Serialize for WorkflowOutput {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct as _;
+
+        let mut fields = 3;
+        fields += usize::from(self.family_authored);
+        fields += usize::from(self.value_range.is_some());
+        fields += usize::from(self.media.is_some());
+        let mut output = serializer.serialize_struct("WorkflowOutput", fields)?;
+        output.serialize_field("contract", &self.contract)?;
+        output.serialize_field("role", &self.role)?;
+        if self.family_authored {
+            output.serialize_field("family", &self.family)?;
+        }
+        if let Some(value_range) = &self.value_range {
+            output.serialize_field("value_range", value_range)?;
+        }
+        output.serialize_field("stage", &self.stage)?;
+        if let Some(media) = &self.media {
+            output.serialize_field("media", media)?;
+        }
+        output.end()
     }
 }
 

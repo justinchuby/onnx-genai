@@ -61,6 +61,142 @@ pub(crate) struct DecodeTurnBaseline {
 }
 
 impl DecodeState {
+    pub(crate) fn fixed_state_names(&self) -> Vec<String> {
+        let mut names = self
+            .io
+            .state_pairs
+            .iter()
+            .map(|(input, _)| input.clone())
+            .collect::<Vec<_>>();
+        for name in self.loop_state.keys() {
+            if !names.contains(name) {
+                names.push(name.clone());
+            }
+        }
+        names.sort();
+        names
+    }
+
+    /// Clone every mutable decoder value into a freshly constructed state for
+    /// a semantic session fork.
+    ///
+    /// `target` must come from the same engine/model configuration. Fixed
+    /// recurrent and convolution bindings are deep-cloned. A runner is admitted
+    /// only when it can export owned KV and the fresh runner can import it;
+    /// fixed shared-buffer/static-cache identities are refused before a child
+    /// sequence is created.
+    pub(crate) fn clone_for_session_fork(
+        &self,
+        mut target: DecodeState,
+        materialized_len: usize,
+        participant: &str,
+        backend: &str,
+    ) -> anyhow::Result<DecodeState> {
+        if self.has_test_runner_marker() {
+            anyhow::bail!(
+                "cannot fork participant '{participant}' state type 'runner-backed test backend' \
+                 on backend '{backend}': the backend declares no independent clone/import \
+                 capability"
+            );
+        }
+        if self.use_kv {
+            let actual = self.current_kv_len();
+            anyhow::ensure!(
+                actual == materialized_len,
+                "cannot fork participant '{participant}' on backend '{backend}': decoder KV \
+                 materialization is at token {actual}, but the committed semantic baseline is at \
+                 token {materialized_len}; materialize the complete committed prefix first"
+            );
+        }
+
+        let mut loop_state = HashMap::with_capacity(self.loop_state.len());
+        for (name, value) in &self.loop_state {
+            loop_state.insert(
+                name.clone(),
+                clone_value(value).with_context(|| {
+                    format!(
+                        "cannot fork participant '{participant}' fixed state '{name}' with dtype \
+                         {:?} on backend '{backend}'",
+                        value.dtype()
+                    )
+                })?,
+            );
+        }
+
+        match (&self.runner, &mut target.runner) {
+            (None, None) => {
+                let mut past = HashMap::with_capacity(self.past.len());
+                for (name, value) in &self.past {
+                    past.insert(
+                        name.clone(),
+                        clone_value(value).with_context(|| {
+                            format!(
+                                "cannot fork participant '{participant}' KV tensor '{name}' with \
+                                 dtype {:?} on backend '{backend}'",
+                                value.dtype()
+                            )
+                        })?,
+                    );
+                }
+                target.past = past;
+                target.kv_len = self.kv_len;
+            }
+            (Some(DecodeRunner::PastPresent(source)), Some(DecodeRunner::PastPresent(target))) => {
+                if source.mode() != DecodeKvMode::ZeroCopyRebind
+                    || target.mode() != DecodeKvMode::ZeroCopyRebind
+                {
+                    anyhow::bail!(
+                        "cannot fork participant '{participant}' state type \
+                         'past-present shared-buffer KV' on backend '{backend}': the runner owns \
+                         fixed mutable buffers with no independent export/import path; configure \
+                         zero-copy rebind KV or use a backend that implements semantic clone"
+                    );
+                }
+                if materialized_len > 0 {
+                    let exported = source.export_kv().with_context(|| {
+                        format!(
+                            "cannot export participant '{participant}' from backend '{backend}'"
+                        )
+                    })?;
+                    target
+                        .import_kv(materialized_len, exported)
+                        .with_context(|| {
+                            format!(
+                                "cannot import participant '{participant}' into an independent \
+                             backend '{backend}' runner"
+                            )
+                        })?;
+                }
+            }
+            (Some(DecodeRunner::StaticCache(_)), Some(DecodeRunner::StaticCache(_))) => {
+                anyhow::bail!(
+                    "cannot fork participant '{participant}' state type 'indexed static-cache \
+                     buffers' on backend '{backend}': the runner exposes a rewind cursor but no \
+                     independent buffer clone/import operation"
+                );
+            }
+            #[cfg(feature = "native-backend")]
+            (Some(DecodeRunner::Native(_)), Some(DecodeRunner::Native(_))) => {
+                anyhow::bail!(
+                    "cannot fork participant '{participant}' state type 'native decoder KV and \
+                     recurrent state' on backend '{backend}': native per-session snapshot/import \
+                     is not implemented"
+                );
+            }
+            _ => {
+                anyhow::bail!(
+                    "cannot fork participant '{participant}' on backend '{backend}': source and \
+                     child decoder state resolved different runner types"
+                );
+            }
+        }
+
+        target.loop_state = loop_state;
+        target.next_positions = self.next_positions.clone();
+        target.retained_kv_len = self.retained_kv_len;
+        Ok(target)
+    }
+
     /// Construct decode state from metadata or unambiguous tensor shapes.
     pub(crate) fn new_with_io(
         session: &dyn GraphIo,

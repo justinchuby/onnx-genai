@@ -52,10 +52,9 @@ pub use crate::config::{
     MemoryPolicyApplication, MemoryStrategy, MemoryStrategyDecision, MemoryStrategyPlan,
     MirostatConfig, MirostatVersion, MtpCacheScope, MtpConfig, MtpHiddenLayout, MtpWeightSource,
     PrioritizedGenerateRequest, PrioritizedGenerateResult, RecurrentPrefixCacheStats,
-    RewindTokenCount, SamplingOverrides, ScheduledGenerateArrival, SessionCheckpoint,
-    SessionForkCapability, SessionId, SessionPosition, SpeculativeMode, TokenLogprob,
-    WeightAccessPattern, WeightPlacementReport, XtcConfig, parse_device_policy,
-    parse_resource_limit,
+    RewindTokenCount, SamplingOverrides, ScheduledGenerateArrival, SessionCheckpoint, SessionId,
+    SessionPosition, SpeculativeMode, TokenLogprob, WeightAccessPattern, WeightPlacementReport,
+    XtcConfig, parse_device_policy, parse_resource_limit,
 };
 pub use crate::connector_bridge::{ConnectorLookupOutcome, ConnectorStats};
 pub(crate) use crate::speculative::{
@@ -81,6 +80,7 @@ mod model;
 mod placement;
 mod runtime;
 pub(crate) use runtime::apply_eos_policy;
+mod session_fork;
 pub(crate) mod session_state;
 mod speculative_load;
 mod workflow_api;
@@ -90,7 +90,7 @@ pub use metadata::graph_port_contracts;
 pub(crate) use decode_backend::*;
 pub(crate) use governor::*;
 pub use governor::{EngineGovernorError, EngineResourceGovernor, resolve_device_vram_limit_bytes};
-pub(crate) use ids::SharedSessionIds;
+pub(crate) use ids::{SessionForkOrigin, SharedSessionIds};
 pub use load::{OrtEngineWorkerFactory, OrtSessionWorkerLoadError};
 pub(crate) use load::{
     force_managed_weight_streaming_enabled, session_device_domain, validate_shared_authority_limit,
@@ -102,6 +102,9 @@ pub use model::Engine;
 pub(crate) use model::*;
 #[cfg(feature = "native-backend")]
 pub(crate) use placement::plan_static_weight_placement;
+pub use session_fork::{
+    SessionForkError, SessionForkParticipant, SessionForkParticipantKind, SessionForkPlan,
+};
 pub(crate) use speculative_load::*;
 
 #[cfg(test)]
@@ -199,6 +202,7 @@ mod tests {
         )?;
 
         Ok(Engine {
+            session_fork_origin: SessionForkOrigin::new(),
             workflow: Box::new(crate::pipeline::generation::test_decoder_runtime()?),
             decode_backend: EngineDecodeBackend::Ort,
             metadata: InferenceMetadata::default(),
@@ -2118,29 +2122,314 @@ mod tests {
     }
 
     #[test]
-    fn tiny_fixture_session_fork_fails_closed_until_runner_state_supported() -> anyhow::Result<()> {
+    fn tiny_fixture_session_fork_fails_before_child_for_unsupported_runner_state()
+    -> anyhow::Result<()> {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/tiny-llm")
             .canonicalize()?;
         let mut engine = Engine::from_dir(&fixture, EngineConfig::default())?;
         let session_id = engine.create_session()?;
-        assert!(engine.session_fork_capability().is_none());
+        engine
+            .sessions
+            .get_mut(&session_id)
+            .expect("session exists")
+            .decode_state = DecodeState::for_test_runner_backed();
+        let sessions_before = engine.sessions.len();
+        let sequences_before = engine.kv_cache.page_table.sequences.len();
 
         let error = engine
-            .fork_session(
-                &SessionForkCapability { _private: () },
-                session_id,
-                SessionPosition::new(0),
-            )
-            .expect_err("fork must fail closed until decode state can be cloned safely");
+            .prepare_session_fork(session_id, SessionPosition::new(0))
+            .expect_err("shared-buffer runner state must fail before a child exists");
 
+        let message = error.to_string();
         assert!(
-            error
-                .to_string()
-                .contains("session fork is not yet enabled"),
-            "unexpected fork error: {error}"
+            message.contains("target.decoder_state")
+                && message.contains("runner-backed test backend")
+                && message.contains("ort"),
+            "unexpected fork error: {message}"
         );
+        assert_eq!(engine.sessions.len(), sessions_before);
+        assert_eq!(engine.kv_cache.page_table.sequences.len(), sequences_before);
         engine.close_session(session_id)?;
+        Ok(())
+    }
+
+    #[test]
+    fn ort_fork_plan_rejects_cross_engine_id_collision_before_resource_mutation()
+    -> anyhow::Result<()> {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-llm")
+            .canonicalize()?;
+        let mut engine_a = Engine::from_dir(&fixture, EngineConfig::default())?;
+        let mut engine_b = Engine::from_dir(&fixture, EngineConfig::default())?;
+        let source_a = engine_a.create_session()?;
+        let source_b = engine_b.create_session()?;
+        assert_eq!(
+            source_a, source_b,
+            "the regression requires colliding engine-local session ids"
+        );
+        let sessions_before = engine_b.sessions.len();
+        let sequences_before = engine_b.kv_cache.page_table.sequences.len();
+        let pages_before = engine_b.kv_cache.page_table.pages.len();
+
+        let plan = engine_a.prepare_session_fork(source_a, SessionPosition::new(0))?;
+        let error = engine_b
+            .fork_session(plan)
+            .expect_err("an ORT snapshot cannot cross engine ownership domains");
+        assert!(matches!(error, SessionForkError::ForeignOrigin { .. }));
+        assert_eq!(engine_b.sessions.len(), sessions_before);
+        assert_eq!(
+            engine_b.kv_cache.page_table.sequences.len(),
+            sequences_before
+        );
+        assert_eq!(engine_b.kv_cache.page_table.pages.len(), pages_before);
+        let next = engine_b.create_session()?;
+        assert_eq!(
+            next,
+            source_b + 1,
+            "foreign admission must not allocate or expose a child sequence"
+        );
+        engine_b.close_session(next)?;
+        engine_b.close_session(source_b)?;
+        engine_a.close_session(source_a)?;
+        Ok(())
+    }
+
+    #[test]
+    fn fork_plan_rejects_stale_engine_generation_before_resource_mutation() -> anyhow::Result<()> {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-llm")
+            .canonicalize()?;
+        let mut engine = Engine::from_dir(&fixture, EngineConfig::default())?;
+        let source = engine.create_session()?;
+        let plan = engine.prepare_session_fork(source, SessionPosition::new(0))?;
+        let sessions_before = engine.sessions.len();
+        let sequences_before = engine.kv_cache.page_table.sequences.len();
+        engine.advance_session_fork_generation_for_test();
+
+        let error = engine
+            .fork_session(plan)
+            .expect_err("a prior engine generation must not publish a child");
+        assert!(matches!(error, SessionForkError::StaleOrigin { .. }));
+        assert_eq!(engine.sessions.len(), sessions_before);
+        assert_eq!(engine.kv_cache.page_table.sequences.len(), sequences_before);
+        let next = engine.create_session()?;
+        assert_eq!(
+            next,
+            source + 1,
+            "stale-generation admission must not allocate or expose a child"
+        );
+        engine.close_session(next)?;
+        engine.close_session(source)?;
+        Ok(())
+    }
+
+    #[test]
+    fn semantic_forked_paged_sessions_diverge_and_prefix_hits_create_no_lineage()
+    -> anyhow::Result<()> {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-llm")
+            .canonicalize()?;
+        let mut engine = Engine::from_dir(&fixture, EngineConfig::default())?;
+        engine.decode_path = ModelDecodePath::Generic;
+        let parent = engine.create_session()?;
+        let prompt = vec![2, 4, 3];
+        let mut first = GenerateRequest::new(GeneratePrompt::TokenIds(prompt.clone()));
+        first.options.max_new_tokens = 2;
+        first.options.temperature = 0.0;
+        first.options.stop_on_eos = false;
+        engine.generate_in_session(parent, first.clone())?;
+        let fork_position = engine.session_token_count(parent)?;
+        let parent_tokens = engine.sessions[&parent].tokens.clone();
+        let parent_pages = engine
+            .kv_cache
+            .page_table
+            .get_sequence(parent)
+            .expect("parent KV sequence")
+            .to_vec();
+
+        let plan = engine.prepare_session_fork(parent, SessionPosition::new(fork_position))?;
+        assert!(plan.participants().iter().any(|participant| {
+            participant.kind == SessionForkParticipantKind::Kv && participant.name == "target.kv"
+        }));
+        let child = engine.fork_session(plan)?;
+        assert_eq!(engine.sessions[&child].tokens, parent_tokens);
+        assert_eq!(
+            engine
+                .kv_cache
+                .page_table
+                .get_sequence(child)
+                .expect("child KV sequence"),
+            parent_pages.as_slice(),
+            "the immutable prefix may be shared copy-on-write"
+        );
+
+        let mut parent_turn = GenerateRequest::new(GeneratePrompt::TokenIds(vec![5]));
+        parent_turn.options.max_new_tokens = 1;
+        parent_turn.options.temperature = 0.0;
+        parent_turn.options.stop_on_eos = false;
+        let mut child_turn = parent_turn.clone();
+        child_turn.prompt = GeneratePrompt::TokenIds(vec![6]);
+        engine.generate_in_session(parent, parent_turn)?;
+        engine.generate_in_session(child, child_turn)?;
+        assert_ne!(
+            engine.sessions[&parent].tokens,
+            engine.sessions[&child].tokens
+        );
+        assert_eq!(
+            &engine.sessions[&parent].tokens[..fork_position],
+            parent_tokens.as_slice()
+        );
+        assert_eq!(
+            &engine.sessions[&child].tokens[..fork_position],
+            parent_tokens.as_slice()
+        );
+
+        let rollback_plan =
+            engine.prepare_session_fork(parent, SessionPosition::new(fork_position))?;
+        let rollback_child = engine.fork_session(rollback_plan)?;
+        assert_eq!(
+            engine.sessions[&rollback_child].tokens, parent_tokens,
+            "a retained committed position must reproduce its exact content"
+        );
+        let parent_before_rollback_child = engine.sessions[&parent].tokens.clone();
+        let mut rollback_turn = GenerateRequest::new(GeneratePrompt::TokenIds(vec![8]));
+        rollback_turn.options.max_new_tokens = 1;
+        rollback_turn.options.temperature = 0.0;
+        rollback_turn.options.stop_on_eos = false;
+        engine.generate_in_session(rollback_child, rollback_turn)?;
+        assert_eq!(
+            engine.sessions[&parent].tokens, parent_before_rollback_child,
+            "advancing a rollback-bound fork must not mutate its parent"
+        );
+        let child_before_parent_rollback = engine.sessions[&child].tokens.clone();
+        let rollback_child_before_parent_rollback = engine.sessions[&rollback_child].tokens.clone();
+        engine.rewind_session_to(parent, SessionPosition::new(fork_position))?;
+        assert_eq!(
+            engine.sessions[&child].tokens, child_before_parent_rollback,
+            "accepted-prefix rollback in one branch must not alter a sibling"
+        );
+        assert_eq!(
+            engine.sessions[&rollback_child].tokens,
+            rollback_child_before_parent_rollback
+        );
+
+        let reused = engine.create_session()?;
+        let sessions_before_lookup = engine.sessions.len();
+        let reused_result = engine.generate_in_session(reused, first)?;
+        assert!(
+            reused_result.prefix_cache_hit_len > 0,
+            "the control session must exercise prefix-cache reuse"
+        );
+        assert_eq!(
+            engine.sessions.len(),
+            sessions_before_lookup,
+            "a cache hit must not mint a hidden child session"
+        );
+        let parent_after_hit = engine.sessions[&parent].tokens.clone();
+        engine.reset_session(reused)?;
+        engine.close_session(reused)?;
+        assert_eq!(
+            engine.sessions[&parent].tokens, parent_after_hit,
+            "cache reuse carries no parent/child semantic identity"
+        );
+
+        engine.close_session(parent)?;
+        let child_count = engine.session_token_count(child)?;
+        let mut final_turn = GenerateRequest::new(GeneratePrompt::TokenIds(vec![7]));
+        final_turn.options.max_new_tokens = 1;
+        final_turn.options.temperature = 0.0;
+        final_turn.options.stop_on_eos = false;
+        engine.generate_in_session(child, final_turn)?;
+        assert!(engine.session_token_count(child)? > child_count);
+        engine.close_session(rollback_child)?;
+        engine.close_session(child)?;
+        assert!(!engine.kv_cache.page_table.sequences.contains_key(&parent));
+        assert!(!engine.kv_cache.page_table.sequences.contains_key(&child));
+        assert!(
+            !engine
+                .kv_cache
+                .page_table
+                .sequences
+                .contains_key(&rollback_child)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn semantic_fork_clones_zero_copy_target_and_speculative_draft_cascade() -> anyhow::Result<()> {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-llm")
+            .canonicalize()?;
+        let mut engine = Engine::from_dir(
+            &fixture,
+            EngineConfig {
+                draft_model: Some(fixture.clone()),
+                num_speculative_tokens: 2,
+                ..EngineConfig::default()
+            },
+        )?;
+        let parent = engine.create_session()?;
+        let mut first = GenerateRequest::new(GeneratePrompt::TokenIds(vec![2, 4, 3]));
+        first.options.max_new_tokens = 3;
+        first.options.temperature = 0.0;
+        first.options.stop_on_eos = false;
+        first.options.num_speculative_tokens = Some(2);
+        engine.generate_in_session(parent, first)?;
+        let position = engine.session_token_count(parent)?;
+        let parent_draft = engine.sessions[&parent]
+            .draft
+            .as_ref()
+            .context("draft session exists")?;
+        let draft_tokens = parent_draft.tokens.clone();
+        let draft_kv_count = parent_draft.kv_token_count;
+        let draft_seq = parent_draft.seq;
+
+        let plan = engine.prepare_session_fork(parent, SessionPosition::new(position))?;
+        assert!(plan.participants().iter().any(|participant| {
+            participant.kind == SessionForkParticipantKind::SpeculativeCascade
+                && participant.name == "draft"
+        }));
+        let child = engine.fork_session(plan)?;
+        let child_draft = engine.sessions[&child]
+            .draft
+            .as_ref()
+            .context("forked draft session exists")?;
+        assert_ne!(child_draft.seq, draft_seq);
+        assert_eq!(child_draft.tokens, draft_tokens);
+        assert_eq!(child_draft.kv_token_count, draft_kv_count);
+        assert_eq!(
+            engine.sessions[&child].tokens,
+            engine.sessions[&parent].tokens
+        );
+
+        let mut parent_turn = GenerateRequest::new(GeneratePrompt::TokenIds(vec![5]));
+        parent_turn.options.max_new_tokens = 1;
+        parent_turn.options.temperature = 0.0;
+        parent_turn.options.stop_on_eos = false;
+        parent_turn.options.num_speculative_tokens = Some(2);
+        let mut child_turn = parent_turn.clone();
+        child_turn.prompt = GeneratePrompt::TokenIds(vec![6]);
+        engine.generate_in_session(parent, parent_turn)?;
+        engine.generate_in_session(child, child_turn)?;
+        assert_ne!(
+            engine.sessions[&parent].tokens,
+            engine.sessions[&child].tokens
+        );
+        assert_ne!(
+            engine.sessions[&parent]
+                .draft
+                .as_ref()
+                .context("parent draft remains")?
+                .seq,
+            engine.sessions[&child]
+                .draft
+                .as_ref()
+                .context("child draft remains")?
+                .seq
+        );
+        engine.close_session(parent)?;
+        engine.close_session(child)?;
         Ok(())
     }
 

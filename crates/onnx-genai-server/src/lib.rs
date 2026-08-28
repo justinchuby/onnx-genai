@@ -78,6 +78,7 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/status", get(routes::status))
         .route("/v1/resources", get(routes::resources))
         .route("/v1/sessions", post(routes::create_session))
+        .route("/v1/sessions/{id}/fork", post(routes::fork_session))
         .route("/v1/sessions/{id}", delete(routes::delete_session))
         .route("/v1/completions", post(routes::completions))
         .route("/v1/embeddings", post(routes::embeddings))

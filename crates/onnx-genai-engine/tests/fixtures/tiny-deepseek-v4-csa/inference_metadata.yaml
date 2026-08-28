@@ -913,7 +913,7 @@ pipeline:
         next: body.accepted_len
       - cell: sequence
         next: step.token
-schema_version: v1.2
+schema_version: v1.5
 package:
   tokenizer:
     algorithm: bpe

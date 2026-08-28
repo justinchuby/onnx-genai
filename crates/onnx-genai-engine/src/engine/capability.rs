@@ -51,6 +51,65 @@ pub enum PackageCapabilityError {
         /// The session whose exclusive lease is already held.
         session: String,
     },
+    /// The package declares a canonical candidate tree this runtime can
+    /// validate but cannot execute transactionally.
+    #[error(
+        "package declares canonical candidate-tree speculation \
+         (onnx-genai.speculative@{version}), but this runtime cannot execute the declared \
+         candidate-tree variant: {reason}. Refusing before component/session/state/output \
+         mutation rather than silently running plain, MTP, or DFlash generation. Re-export the \
+         package with the exact version-1 ORT candidate-tree ABI or select a runtime that \
+         implements this variant."
+    )]
+    CandidateTreeExecutionUnavailable {
+        /// Exact canonical speculation contract version declared by the package.
+        version: String,
+        /// Structural or backend feature the candidate-tree driver lacks.
+        reason: String,
+    },
+    /// Raw workflow/component execution would expose a partial proposer/target
+    /// choreography without accepted-path commit authority.
+    #[error(
+        "{operation} cannot execute a canonical candidate-tree package directly: raw \
+         pipeline/component APIs cannot preserve target-verified accepted-path state and output \
+         semantics. Use Engine generation/session generation so the transaction-owned \
+         candidate-tree driver runs proposer, verifier, accepted-path recomputation, atomic \
+         commit, and publication."
+    )]
+    CandidateTreeRawWorkflowApi {
+        /// Public operation that was refused before component execution.
+        operation: String,
+    },
+    /// The package declares a DFlash ABI/backend pair this runtime has not
+    /// implemented. The production driver accepts only the base v1 contract
+    /// through the portable ORT component execution seam.
+    #[error(
+        "package declares DFlash flat-block speculation \
+         (onnx-genai.dflash-flat-block@{version}) and requires capability '{capability}', but this \
+         runtime implements only the exact v1/base contract through the ORT component backend. \
+         Refusing before workflow mutation rather than silently running a different speculative \
+         mode. Re-export the package as v1/base for the ORT backend or use a runtime that \
+         implements this version/backend pair."
+    )]
+    DFlashExecutionUnavailable {
+        /// Exact DFlash contract version declared by the package.
+        version: String,
+        /// Derived capability that requires the unavailable execution driver.
+        capability: String,
+    },
+    /// DFlash components cannot be executed as an ordinary workflow pass:
+    /// doing so would bypass verification and accepted-prefix commit.
+    #[error(
+        "public workflow operation '{operation}' cannot execute a DFlash package because raw \
+         target/proposer execution would bypass verifier-owned acceptance and the S3 \
+         accepted-prefix transaction. Use `Engine::generate`, \
+         `Engine::generate_in_session`, or `Engine::generate_with_pipeline_request`; the \
+         runtime-owned DFlash driver is the only execution authority."
+    )]
+    DFlashRawWorkflowApi {
+        /// Public operation that would have bypassed the DFlash driver.
+        operation: String,
+    },
 }
 
 impl PackageCapabilityError {

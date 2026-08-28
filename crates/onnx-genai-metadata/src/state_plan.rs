@@ -8,8 +8,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::schema::{
-    StateReleaseBoundary, StateUpdate, WorkflowCarry, WorkflowSpec, WorkflowStateClass,
-    WorkflowStateScope, WorkflowStep,
+    StateKind, StateManagement, StateReleaseBoundary, StateUpdate, TensorContract, WorkflowCarry,
+    WorkflowSpec, WorkflowStateClass, WorkflowStateScope, WorkflowStep,
 };
 
 /// Stable semantic identity of one mutable workflow location.
@@ -81,7 +81,34 @@ pub enum StateUpdateRelation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StateLifecycle {
     pub scope: WorkflowStateScope,
+    pub management: StateManagement,
     pub release: Option<StateReleaseBoundary>,
+}
+
+/// Semantic role of a state cell for snapshot, fork, and transaction planning.
+///
+/// This is derived once beside the rest of [`ResolvedStatePlan`]. Runtimes must
+/// not rebuild the classification from state names, tensor shapes, or storage
+/// policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StateSemanticRole {
+    AttentionKv,
+    RecurrentOrConvolution,
+    TokenContextHistory,
+    GrammarConstraint,
+    Continuation,
+    GenericFeature,
+}
+
+/// State-service facts needed to decide portable snapshot and fork legality.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateServiceParticipation {
+    pub group: String,
+    pub kind: StateKind,
+    pub rollback_positions: Option<usize>,
+    pub snapshot: bool,
+    pub fork: bool,
+    pub cascade: BTreeSet<String>,
 }
 
 /// Snapshot and fork eligibility of a cell's complete semantic value.
@@ -104,7 +131,10 @@ pub struct StateTransactionParticipation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedStateCell {
     pub identity: StateIdentity,
+    pub contract: TensorContract,
+    pub semantic_role: StateSemanticRole,
     pub lifecycle: StateLifecycle,
+    pub service: Option<StateServiceParticipation>,
     pub source: StateSource,
     pub readers: Vec<StateReader>,
     pub writers: Vec<StateWriter>,
@@ -118,6 +148,7 @@ pub struct ResolvedStateCell {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ResolvedStatePlan {
     cells: BTreeMap<String, ResolvedStateCell>,
+    services: BTreeMap<String, StateServiceParticipation>,
     carry_sources: BTreeMap<(String, String), StateCarrySource>,
     terminal_candidates: BTreeMap<String, BTreeSet<TerminalCandidate>>,
     flow_errors: Vec<String>,
@@ -137,6 +168,16 @@ impl ResolvedStatePlan {
     pub fn session_cells(&self) -> impl Iterator<Item = (&str, &ResolvedStateCell)> {
         self.cells()
             .filter(|(_, cell)| cell.lifecycle.scope == WorkflowStateScope::Session)
+    }
+
+    pub fn service(&self, group: &str) -> Option<&StateServiceParticipation> {
+        self.services.get(group)
+    }
+
+    pub fn services(&self) -> impl Iterator<Item = (&str, &StateServiceParticipation)> {
+        self.services
+            .iter()
+            .map(|(group, service)| (group.as_str(), service))
     }
 
     pub fn carry_source(&self, carry: &WorkflowCarry) -> Option<&StateCarrySource> {
@@ -190,6 +231,23 @@ pub fn resolve_state_plan(workflow: &WorkflowSpec) -> ResolvedStatePlan {
         .serving
         .as_ref()
         .map(|serving| &serving.state_service.groups);
+    let services = groups
+        .into_iter()
+        .flat_map(|groups| groups.iter())
+        .map(|(name, group)| {
+            (
+                name.clone(),
+                StateServiceParticipation {
+                    group: name.clone(),
+                    kind: group.kind,
+                    rollback_positions: group.capabilities.rollback_positions,
+                    snapshot: group.capabilities.snapshot,
+                    fork: group.capabilities.fork,
+                    cascade: group.capabilities.cascade.clone(),
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
     let mut cells = BTreeMap::new();
 
     for (name, state) in &workflow.state {
@@ -209,6 +267,11 @@ pub fn resolve_state_plan(workflow: &WorkflowSpec) -> ResolvedStatePlan {
 
         let mut update = StateUpdateRelation::Replace;
         let mut snapshot = StateSnapshotParticipation::default();
+        let service = state
+            .service_group
+            .as_deref()
+            .and_then(|name| services.get(name))
+            .cloned();
         if let Some(group) = state
             .service_group
             .as_deref()
@@ -274,15 +337,58 @@ pub fn resolve_state_plan(workflow: &WorkflowSpec) -> ResolvedStatePlan {
                 },
             })
             .or_else(|| terminal_writer.map(StateFinalWriter::Writer));
+        let component_contracts = readers
+            .iter()
+            .filter_map(|reader| match reader {
+                StateReader::ComponentPort { component, .. } => Some(component.as_str()),
+                StateReader::LoopCarry { .. } => None,
+            })
+            .chain(
+                writers
+                    .iter()
+                    .filter_map(|writer| writer.component.as_deref()),
+            )
+            .filter_map(|component| {
+                workflow
+                    .components
+                    .get(component)
+                    .and_then(|component| component.contract.as_ref())
+                    .map(|contract| contract.id.as_str())
+            })
+            .collect::<BTreeSet<_>>();
+        let semantic_role = if matches!(final_writer, Some(StateFinalWriter::Continuation { .. })) {
+            StateSemanticRole::Continuation
+        } else if component_contracts.contains("onnx-genai.token-context") {
+            StateSemanticRole::TokenContextHistory
+        } else if component_contracts.contains("onnx-genai.grammar-guidance") {
+            StateSemanticRole::GrammarConstraint
+        } else {
+            match service.as_ref().map(|service| service.kind) {
+                Some(
+                    StateKind::FullAttention
+                    | StateKind::SlidingAttention
+                    | StateKind::MultiLatentAttention
+                    | StateKind::CompressedAttention,
+                ) => StateSemanticRole::AttentionKv,
+                Some(StateKind::Recurrent) => StateSemanticRole::RecurrentOrConvolution,
+                Some(StateKind::CrossAttention | StateKind::Encoder) | None => {
+                    StateSemanticRole::GenericFeature
+                }
+            }
+        };
 
         cells.insert(
             name.clone(),
             ResolvedStateCell {
                 identity: StateIdentity(name.clone()),
+                contract: state.contract.clone(),
+                semantic_role,
                 lifecycle: StateLifecycle {
                     scope: state.scope.clone(),
+                    management: state.management,
                     release: state.release_boundary,
                 },
+                service,
                 source: StateSource {
                     binding: state.initializer.clone(),
                 },
@@ -299,6 +405,7 @@ pub fn resolve_state_plan(workflow: &WorkflowSpec) -> ResolvedStatePlan {
     }
     ResolvedStatePlan {
         cells,
+        services,
         carry_sources: flow.carry_sources,
         terminal_candidates: flow.terminal_candidates,
         flow_errors: flow.errors,

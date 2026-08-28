@@ -12,9 +12,9 @@ use onnx_genai::{
 use onnx_genai_engine::{
     BatchingCapability, ContinuousBatchAdmission, ContinuousBatchEvent, ContinuousBatchHandle,
     ContinuousBatchManager, EmbeddingOptions, EncodedAudio, EngineGovernorError,
-    EngineMemoryAccounting, FimConfig, GovernorSnapshot, KvNotApplicable, KvTelemetry,
-    MemoryStrategyPlan, OrtEngineWorkerFactory, PipelineGenerateRequest, ResourceLimit,
-    SchedulerAdmissionError,
+    EngineMemoryAccounting, FimConfig, GenerationControl, GovernorSnapshot, KvNotApplicable,
+    KvTelemetry, MemoryStrategyPlan, OrtEngineWorkerFactory, PipelineGenerateRequest,
+    ResourceLimit, SchedulerAdmissionError,
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 
@@ -123,6 +123,13 @@ impl BatchingReport {
 
 pub(crate) enum DriverCommand {
     CreateSession {
+        reservation: SessionPlacementReservation,
+        acknowledgement: std::sync::mpsc::Receiver<()>,
+        response: tokio::sync::oneshot::Sender<anyhow::Result<SessionId>>,
+    },
+    ForkSession {
+        source: SessionLeaseGuard,
+        position: onnx_genai_engine::SessionPosition,
         reservation: SessionPlacementReservation,
         acknowledgement: std::sync::mpsc::Receiver<()>,
         response: tokio::sync::oneshot::Sender<anyhow::Result<SessionId>>,
@@ -815,6 +822,46 @@ impl EngineDriver {
             .send(())
             .map_err(|_| anyhow::anyhow!("engine driver stopped"))?;
         Ok(SessionPlacement::new(pending.worker, engine_session_id))
+    }
+
+    /// Fork a session on its owning worker while holding the source lease.
+    pub(crate) async fn fork_session(
+        &self,
+        source: SessionLeaseGuard,
+        position: onnx_genai_engine::SessionPosition,
+    ) -> anyhow::Result<SessionPlacement> {
+        anyhow::ensure!(
+            source.model() == &self.model,
+            "session lease for model '{}' cannot be forked on model '{}'",
+            source.model(),
+            self.model,
+        );
+        let placement = source.placement();
+        let reservation = self
+            .workers
+            .reserve_session_on(placement.worker)
+            .map_err(anyhow::Error::new)?;
+        let (response, rx) = tokio::sync::oneshot::channel();
+        let (acknowledgement, acknowledgement_rx) = std::sync::mpsc::sync_channel(1);
+        self.workers
+            .sender_for(placement.worker)
+            .map_err(anyhow::Error::new)?
+            .send(DriverCommand::ForkSession {
+                source,
+                position,
+                reservation,
+                acknowledgement: acknowledgement_rx,
+                response,
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("engine driver stopped"))?;
+        let child = rx
+            .await
+            .map_err(|_| anyhow::anyhow!("engine driver stopped"))??;
+        acknowledgement
+            .send(())
+            .map_err(|_| anyhow::anyhow!("engine driver stopped"))?;
+        Ok(SessionPlacement::new(placement.worker, child))
     }
 
     async fn enqueue_session_creation(&self) -> anyhow::Result<PendingSessionCreation> {
@@ -1965,6 +2012,48 @@ fn handle_driver_command(engine: &mut Engine, command: DriverCommand) {
             }
             committed.persist();
         }
+        DriverCommand::ForkSession {
+            source,
+            position,
+            reservation,
+            acknowledgement,
+            response,
+        } => {
+            let held_source = source;
+            let plan = match engine
+                .prepare_session_fork(held_source.placement().engine_session_id, position)
+            {
+                Ok(plan) => plan,
+                Err(error) => {
+                    drop(held_source);
+                    let _ = response.send(Err(anyhow::Error::new(error)));
+                    return;
+                }
+            };
+            let child = match engine.fork_session(plan) {
+                Ok(child) => child,
+                Err(error) => {
+                    drop(held_source);
+                    let _ = response.send(Err(anyhow::Error::new(error)));
+                    return;
+                }
+            };
+            let committed = match reservation.commit() {
+                Ok(committed) => committed,
+                Err(error) => {
+                    let _ = engine.close_session(child);
+                    drop(held_source);
+                    let _ = response.send(Err(anyhow::Error::new(error)));
+                    return;
+                }
+            };
+            drop(held_source);
+            if response.send(Ok(child)).is_err() || acknowledgement.recv().is_err() {
+                let _ = engine.close_session(child);
+                return;
+            }
+            committed.persist();
+        }
         DriverCommand::CloseSession {
             lease,
             accounting,
@@ -2273,6 +2362,18 @@ fn run_generation(
             return;
         }
     };
+    let cancellation_events = events.clone();
+    let generation_control =
+        GenerationControl::from_cancellation_probe(move || cancellation_events.is_closed());
+    let specialized_speculation =
+        engine.candidate_tree_diagnostic().is_some() || engine.dflash_diagnostic().is_some();
+    let bound = bound.map(|request| {
+        if specialized_speculation {
+            request.with_generation_control(generation_control.clone())
+        } else {
+            request
+        }
+    });
     let mut admission = Some(admission);
     let mut callback = |token: GenerateToken| -> anyhow::Result<()> {
         metrics.token();
@@ -2298,6 +2399,21 @@ fn run_generation(
                 Some(&mut admitted),
                 Some(&mut callback),
             ),
+            (None, session) if specialized_speculation => match session {
+                Some(session) => engine.generate_in_session_with_control_callbacks(
+                    session,
+                    request,
+                    generation_control,
+                    Some(&mut admitted),
+                    Some(&mut callback),
+                ),
+                None => engine.generate_with_control_callbacks(
+                    request,
+                    generation_control,
+                    Some(&mut admitted),
+                    Some(&mut callback),
+                ),
+            },
             (None, Some(session_id)) => engine.generate_in_session_with_callbacks(
                 session_id,
                 request,

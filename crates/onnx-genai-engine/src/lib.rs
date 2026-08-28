@@ -54,9 +54,10 @@ pub use engine::{
     MirostatConfig, MirostatVersion, MtpCacheScope, MtpConfig, MtpHiddenLayout, MtpWeightSource,
     OrtEngineWorkerFactory, OrtSessionWorkerLoadError, PackageCapabilityError,
     PrioritizedGenerateRequest, PrioritizedGenerateResult, RewindTokenCount, SamplingOverrides,
-    ScheduledGenerateArrival, SessionCheckpoint, SessionForkCapability, SessionId, SessionPosition,
-    SessionPrefillCarry, SpeculativeMode, TokenLogprob, WeightAccessPattern, WeightPlacementReport,
-    XtcConfig, package_capability_error, parse_device_policy, parse_resource_limit,
+    ScheduledGenerateArrival, SessionCheckpoint, SessionForkError, SessionForkParticipant,
+    SessionForkParticipantKind, SessionForkPlan, SessionId, SessionPosition, SessionPrefillCarry,
+    SpeculativeMode, TokenLogprob, WeightAccessPattern, WeightPlacementReport, XtcConfig,
+    package_capability_error, parse_device_policy, parse_resource_limit,
     resolve_device_vram_limit_bytes,
 };
 pub use fim::{FimConfig, FimFormat};
@@ -177,8 +178,9 @@ pub struct VmmArenaStats {
 pub use onnx_runtime_session::DecodePrecision;
 pub use pipeline::{
     AdapterActivation, AdapterLifecycleDiagnostic, AdapterSelection, EncodedAudio,
-    PipelineGenerateRequest, PipelineTensors, RowPlan, RowScopedState, RowTable,
-    WorkflowSessionCheckpoint, is_missing_required_input, validate_pipeline_backend_request,
+    GenerationBoundary, GenerationControl, GenerationControlUnsupported, PipelineGenerateRequest,
+    PipelineTensors, RowPlan, RowScopedState, RowTable, WorkflowSessionCheckpoint,
+    is_missing_required_input, validate_pipeline_backend_request,
 };
 pub use sampling::{CategoricalSampler, GreedySampler, Sampler};
 pub use speculative::{

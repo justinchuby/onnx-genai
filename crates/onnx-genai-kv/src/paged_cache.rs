@@ -924,6 +924,26 @@ impl PagedKvCache {
             .ok_or(KvError::SequenceNotFound(seq))?;
         Ok(())
     }
+
+    /// Validate that a semantic fork can reference the exact retained prefix
+    /// without creating a child sequence or changing page reference counts.
+    pub fn validate_fork(&self, source: SequenceId, position: usize) -> Result<(), KvError> {
+        let retained_start = self.retained_start(source)?;
+        let length = self.len(source)?;
+        if position < retained_start {
+            return Err(KvError::PositionEvicted {
+                position,
+                retained_start,
+            });
+        }
+        if position > length {
+            return Err(KvError::InvalidPosition { position, length });
+        }
+        self.page_table
+            .get_sequence(source)
+            .ok_or(KvError::SequenceNotFound(source))?;
+        Ok(())
+    }
 }
 
 impl KvCacheOps for PagedKvCache {
@@ -969,18 +989,9 @@ impl KvCacheOps for PagedKvCache {
     }
 
     fn fork(&mut self, source: SequenceId, position: usize) -> Result<SequenceId, KvError> {
-        let retained_start = self.retained_start(source)?;
-        let length = self.len(source)?;
-        if position < retained_start {
-            return Err(KvError::PositionEvicted {
-                position,
-                retained_start,
-            });
-        }
-        if position > length {
-            return Err(KvError::InvalidPosition { position, length });
-        }
+        self.validate_fork(source, position)?;
 
+        let retained_start = self.retained_start(source)?;
         let page_size = self.page_table.page_size;
         let sink = self.sink_len(source)?;
         let pages_needed = self.buffer_index(source, position)?.div_ceil(page_size);

@@ -1,11 +1,12 @@
 # Speculative decoding with separate proposer and verifier graph ABIs.
-schema_version: v1
+schema_version: v1.6
 pipeline:
   workflow:
     manifest:
       capabilities:
       - workflow_ssa
       - typed_emit
+      - canonical_speculation
     inputs:
       request.input_ids:
         contract:
@@ -113,9 +114,14 @@ pipeline:
       output: tokens
       mode: replace
 speculative:
+  identity: onnx-genai.speculative
+  version: '1'
   proposer: proposer
   target: verifier
   vocabulary:
     kind: identical
   max_proposal_width: 4
   distribution_preserving: true
+  verification:
+    target_output: {component: verifier, output: accepted_tokens}
+    accepted_path: {kind: component, value: {component: verifier, output: accepted_tokens}}

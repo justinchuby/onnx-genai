@@ -2,7 +2,7 @@ use std::path::Path;
 
 use onnx_genai_metadata::{
     CompressedRecordFormat, CompressionRatio, StateGroupProperties, StateKind, StatePortRole,
-    StateUpdate, load_metadata_from_dir, validate_metadata,
+    StateSemanticRole, StateUpdate, load_metadata_from_dir, resolve_state_plan, validate_metadata,
 };
 
 fn fixture() -> onnx_genai_metadata::InferenceMetadata {
@@ -77,6 +77,27 @@ fn canonical_schedule_lowers_exact_21_20_properties() {
             .count(),
         20
     );
+}
+
+#[test]
+fn compressed_records_and_carries_are_attention_state() {
+    let metadata = fixture();
+    let workflow = &metadata
+        .pipeline
+        .as_ref()
+        .expect("fixture declares pipeline")
+        .workflow;
+    let plan = resolve_state_plan(workflow);
+
+    for state in ["compressed_records.0.kv", "compressed_carries.0.kv"] {
+        assert_eq!(
+            plan.cell(state)
+                .expect("compressed state is planned")
+                .semantic_role,
+            StateSemanticRole::AttentionKv,
+            "{state}"
+        );
+    }
 }
 
 #[test]

@@ -128,6 +128,8 @@ pub(crate) struct WorkflowPlan {
     pub(crate) device_bridge_components: HashSet<String>,
     pub(crate) memory_strategy_plan: MemoryStrategyPlan,
     pub(crate) decode_backend: EngineDecodeBackend,
+    /// Canonical construction-time decision reused by every execution entry.
+    pub(crate) execution_admission: super::WorkflowExecutionAdmission,
     pub(crate) adapter_service: Option<onnx_genai_metadata::AdapterServiceContract>,
     pub(crate) preprocessing: Option<PreprocessingSpec>,
     /// The package's speculative compatibility contract, when it declares one.
@@ -261,6 +263,14 @@ pub(crate) struct WorkerRuntimeState {
     /// declared normalizer joins them for the same reason: it changes what the
     /// cached rows are, not merely where they live.
     pub(crate) embedding_tables: RefCell<HashMap<EmbeddingTableKey, Rc<EmbeddingTable>>>,
+    /// Immutable non-embedding initializers borrowed across components by a
+    /// declared speculative contract.
+    ///
+    /// DFlash passes the target LM head into the proposer as a read-only input.
+    /// Loading that matrix once per proposal would turn a metadata lookup into
+    /// the dominant draft cost, while copying it into the proposer artifact
+    /// would violate the declared shared-weight relationship.
+    pub(crate) shared_initializers: RefCell<HashMap<(String, String), Rc<onnx_genai_ort::Value>>>,
     /// Session-scoped workflow cells, keyed by `(session id, cell)`.
     ///
     /// Per-session state living on the owning worker: §3.2 storage under §3.3
@@ -278,6 +288,13 @@ pub(crate) struct WorkerRuntimeState {
     /// This worker is thread-bound, so the execution plan can take the journal
     /// immediately without a second synchronization protocol.
     pub(crate) last_output_publications: RefCell<Vec<WorkflowOutputPublication>>,
+    /// Committed candidate-tree execution evidence. Failed/aborted turns never
+    /// replace this journal.
+    pub(crate) last_candidate_tree_block_traces:
+        RefCell<Vec<super::speculative::CandidateTreeBlockTrace>>,
+    /// DFlash execution evidence is staged with the turn and becomes visible
+    /// only after the same semantic commit as state and output.
+    pub(crate) last_dflash_block_traces: RefCell<Vec<super::speculative::DFlashBlockTrace>>,
     /// Sessions with a pass in flight, for leases declared `policy: exclusive`.
     ///
     /// Two turns of one conversation that both read the history before either
@@ -334,10 +351,13 @@ impl Default for WorkerRuntimeState {
             component_allocators: RefCell::new(HashMap::new()),
             component_outputs: RefCell::new(HashMap::new()),
             embedding_tables: RefCell::new(HashMap::new()),
+            shared_initializers: RefCell::new(HashMap::new()),
             session_state: RefCell::new(HashMap::new()),
             session_effects: RefCell::new(HashMap::new()),
             session_outputs: RefCell::new(HashMap::new()),
             last_output_publications: RefCell::new(Vec::new()),
+            last_candidate_tree_block_traces: RefCell::new(Vec::new()),
+            last_dflash_block_traces: RefCell::new(Vec::new()),
             session_leases: RefCell::new(HashSet::new()),
             session_turn_versions: RefCell::new(HashMap::new()),
             iteration_runtimes: RefCell::new(BTreeMap::new()),
