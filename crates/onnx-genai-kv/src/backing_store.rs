@@ -225,6 +225,7 @@ mod tests {
 
     fn key(chunk_hash: u64) -> KvCacheKey {
         KvCacheKey {
+            isolation: crate::KvCacheIsolation::Session(1),
             model_id: "backing-store-test".to_owned(),
             layer_range: 0..2,
             chunk_hash,

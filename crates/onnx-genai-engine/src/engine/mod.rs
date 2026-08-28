@@ -2182,6 +2182,9 @@ mod tests {
                     page_size: chunk_size,
                     ..onnx_genai_kv::LocalTieredConfig::default()
                 }),
+                isolation: crate::config::KvConnectorIsolation::SharedDomain(
+                    "tiny-llm-connector-tests".to_owned(),
+                ),
                 chunk_size,
                 ..KvConnectorConfig::default()
             },
@@ -2296,6 +2299,37 @@ mod tests {
             reuse_result.token_ids, baseline_ids,
             "connector-reuse output must match full recompute exactly"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn local_tiered_session_isolation_prevents_cross_session_reuse() -> anyhow::Result<()> {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-llm")
+            .canonicalize()?;
+        let mut config = local_tiered_engine_config(2);
+        config.kv_connector.isolation = crate::config::KvConnectorIsolation::Session;
+        let mut engine = Engine::from_dir(&fixture, config)?;
+
+        let prompt = vec![10, 11, 12, 13, 14, 15];
+        let mut warm = GenerateRequest::new(GeneratePrompt::TokenIds(prompt.clone()));
+        warm.options.max_new_tokens = 1;
+        warm.options.temperature = 0.0;
+        warm.options.stop_on_eos = false;
+        engine.generate(warm)?;
+        assert!(engine.last_connector_stats().stores > 0);
+
+        engine.token_prefix_cache.clear();
+        engine.prefix_cache = PrefixCache::new();
+
+        let mut isolated = GenerateRequest::new(GeneratePrompt::TokenIds(prompt));
+        isolated.options.max_new_tokens = 1;
+        isolated.options.temperature = 0.0;
+        isolated.options.stop_on_eos = false;
+        engine.generate(isolated)?;
+        let stats = engine.last_connector_stats();
+        assert_eq!(stats.chunk_hits, 0);
+        assert_eq!(stats.fetched_tokens, 0);
         Ok(())
     }
 }

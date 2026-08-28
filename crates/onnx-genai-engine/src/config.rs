@@ -462,6 +462,17 @@ pub enum KvConnectorBackend {
     LocalTiered(LocalTieredConfig),
 }
 
+/// Isolation policy for reusable connector state.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum KvConnectorIsolation {
+    /// Partition connector state by engine session. This is the safe default.
+    #[default]
+    Session,
+    /// Permit reuse across sessions in one explicitly configured tenancy or
+    /// reuse domain. The value is opaque and never interpreted.
+    SharedDomain(String),
+}
+
 /// Generic configuration for wiring a [`KvCacheConnector`](onnx_genai_kv::KvCacheConnector)
 /// into the engine (DESIGN §38, K3).
 ///
@@ -475,6 +486,8 @@ pub struct KvConnectorConfig {
     /// Opaque model identity used to namespace cache keys. `None` => derived
     /// from the model directory name.
     pub model_id: Option<String>,
+    /// Runtime isolation boundary for reusable state.
+    pub isolation: KvConnectorIsolation,
     /// Tokens per cached chunk for keying. `0` => [`DEFAULT_CHUNK_SIZE`].
     pub chunk_size: usize,
     /// Priority applied to chunks stored to the connector.
@@ -489,6 +502,7 @@ impl Default for KvConnectorConfig {
         Self {
             backend: KvConnectorBackend::Null,
             model_id: None,
+            isolation: KvConnectorIsolation::Session,
             chunk_size: DEFAULT_CHUNK_SIZE,
             store_priority: CachePriority::Session,
             recompute_ms_per_token: 0.05,

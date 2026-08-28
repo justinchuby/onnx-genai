@@ -3,8 +3,8 @@
 //! This module wires the connector abstraction (K1) and its concrete backends
 //! (K2, e.g. [`onnx_genai_kv::LocalTieredConnector`]) into the engine's existing
 //! prefix-cache-hit path. It is deliberately **model-agnostic**: the only
-//! per-model input is the opaque [`KvCacheKey::model_id`] namespace string —
-//! nothing here branches on a specific model.
+//! key inputs are opaque isolation and model namespaces; nothing here branches
+//! on a specific model or execution provider.
 //!
 //! ## What is LIVE vs DEFERRED (K4)
 //!
@@ -39,10 +39,12 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use onnx_genai_kv::{
-    CachePriority, Device, KvCacheConnector, KvCacheKey, KvCacheLocation, KvPayload, KvStoreEntry,
-    NullConnector, TokenChunk, chunk_tokens,
+    CachePriority, Device, KvCacheConnector, KvCacheIsolation, KvCacheKey, KvCacheLocation,
+    KvPayload, KvStoreEntry, NullConnector, RuntimeTieringPolicy, StateStorageDisposition,
+    TokenChunk, chunk_tokens,
 };
 
+use crate::config::{KvConnectorIsolation, SessionId};
 use crate::logits::TokenId;
 
 /// Connector activity accumulated across a generation, for metrics and tests.
@@ -113,6 +115,7 @@ pub(crate) struct ConnectorBridge {
     active: bool,
     /// Opaque model namespace for keys (never branched on).
     model_id: String,
+    isolation: KvConnectorIsolation,
     /// Tokens per cached chunk.
     chunk_size: usize,
     /// Layer span covered by stored KV (full model: `0..num_layers`).
@@ -133,6 +136,7 @@ impl ConnectorBridge {
             runtime: None,
             active: false,
             model_id: String::new(),
+            isolation: KvConnectorIsolation::Session,
             chunk_size: onnx_genai_kv::DEFAULT_CHUNK_SIZE,
             layer_range: 0..0,
             store_priority: CachePriority::Session,
@@ -146,11 +150,18 @@ impl ConnectorBridge {
     pub(crate) fn new(
         connector: Arc<dyn KvCacheConnector>,
         model_id: String,
+        isolation: KvConnectorIsolation,
         chunk_size: usize,
         layer_range: Range<usize>,
         store_priority: CachePriority,
         recompute_ms_per_token: f64,
     ) -> anyhow::Result<Self> {
+        if matches!(&isolation, KvConnectorIsolation::SharedDomain(domain) if domain.is_empty()) {
+            anyhow::bail!(
+                "KV connector shared isolation domain must be non-empty; use session isolation \
+                 or configure an explicit tenancy/reuse domain"
+            );
+        }
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
             .map_err(|e| anyhow::anyhow!("failed to build KV connector runtime: {e}"))?;
@@ -159,6 +170,7 @@ impl ConnectorBridge {
             runtime: Some(runtime),
             active: true,
             model_id,
+            isolation,
             chunk_size: chunk_size.max(1),
             layer_range,
             store_priority,
@@ -189,8 +201,14 @@ impl ConnectorBridge {
             .block_on(fut)
     }
 
-    fn key_for(&self, chunk: &TokenChunk) -> KvCacheKey {
-        chunk.to_key(self.model_id.clone(), self.layer_range.clone())
+    fn key_for(&self, session_id: SessionId, chunk: &TokenChunk) -> KvCacheKey {
+        let isolation = match &self.isolation {
+            KvConnectorIsolation::Session => KvCacheIsolation::Session(session_id),
+            KvConnectorIsolation::SharedDomain(domain) => {
+                KvCacheIsolation::SharedDomain(domain.clone())
+            }
+        };
+        chunk.to_key(isolation, self.model_id.clone(), self.layer_range.clone())
     }
 
     /// Report how far the connector could extend the prefix hit beyond the
@@ -207,6 +225,7 @@ impl ConnectorBridge {
     /// alter prefill, so generation output is unaffected.
     pub(crate) fn lookup_extension(
         &mut self,
+        session_id: SessionId,
         prompt_tokens: &[TokenId],
         in_process_hit: usize,
     ) -> ConnectorLookupOutcome {
@@ -233,7 +252,10 @@ impl ConnectorBridge {
         if candidate_chunks.is_empty() {
             return ConnectorLookupOutcome::default();
         }
-        let keys: Vec<KvCacheKey> = candidate_chunks.iter().map(|c| self.key_for(c)).collect();
+        let keys: Vec<KvCacheKey> = candidate_chunks
+            .iter()
+            .map(|c| self.key_for(session_id, c))
+            .collect();
 
         let connector = Arc::clone(&self.connector);
         let locations = match self.block_on(connector.lookup_batch(&keys)) {
@@ -251,8 +273,11 @@ impl ConnectorBridge {
             let Some(load_ms) = location_load_ms(location) else {
                 break; // NotFound → prefix broken, stop extending.
             };
-            let recompute_ms = key.num_tokens as f64 * self.recompute_ms_per_token;
-            if load_ms > recompute_ms {
+            if !RuntimeTieringPolicy::prefer_restore(
+                load_ms,
+                key.num_tokens as usize,
+                self.recompute_ms_per_token,
+            ) {
                 break; // Cheaper to recompute this chunk than to fetch it.
             }
             outcome.chunk_hits += 1;
@@ -283,6 +308,7 @@ impl ConnectorBridge {
     /// inference.
     pub(crate) fn store_prefix_with<F>(
         &mut self,
+        session_id: SessionId,
         tokens: &[TokenId],
         resident_len: usize,
         mut extract: F,
@@ -315,10 +341,13 @@ impl ConnectorBridge {
                 }
             };
             let entry = KvStoreEntry {
-                key: self.key_for(chunk),
+                key: self.key_for(session_id, chunk),
                 kv_data: payload,
                 priority,
                 ttl: None,
+                // This bridge only stores lossless F32 copies whose original
+                // prompt can be prefetched again on a miss.
+                disposition: StateStorageDisposition::new(true, true),
             };
             match self.block_on(connector.store(entry)) {
                 Ok(()) => self.stats.stores += 1,
@@ -349,6 +378,7 @@ impl ConnectorBridge {
     /// injected.
     pub(crate) fn fetch_extension(
         &mut self,
+        session_id: SessionId,
         prompt_tokens: &[TokenId],
         boundary: usize,
         max_tokens: usize,
@@ -377,7 +407,10 @@ impl ConnectorBridge {
             return outcome;
         }
 
-        let keys: Vec<KvCacheKey> = candidates.iter().map(|chunk| self.key_for(chunk)).collect();
+        let keys: Vec<KvCacheKey> = candidates
+            .iter()
+            .map(|chunk| self.key_for(session_id, chunk))
+            .collect();
         let connector = Arc::clone(&self.connector);
         self.stats.lookups += keys.len();
         let locations = match self.block_on(connector.lookup_batch(&keys)) {
@@ -397,11 +430,14 @@ impl ConnectorBridge {
             let Some(load_ms) = location_load_ms(location) else {
                 break; // Miss — contiguous run ends here.
             };
-            let recompute_ms = num_tokens as f64 * self.recompute_ms_per_token;
-            if load_ms > recompute_ms {
+            if !RuntimeTieringPolicy::prefer_restore(
+                load_ms,
+                num_tokens,
+                self.recompute_ms_per_token,
+            ) {
                 break; // Fetching costs more than recompute — stop.
             }
-            let key = self.key_for(chunk);
+            let key = self.key_for(session_id, chunk);
             let fetched = match self.block_on(connector.fetch(&key, target)) {
                 Ok(fetched) => fetched,
                 Err(error) => {
@@ -551,9 +587,18 @@ mod tests {
     }
 
     fn bridge_over(connector: Arc<dyn KvCacheConnector>, chunk_size: usize) -> ConnectorBridge {
+        bridge_over_with_isolation(connector, chunk_size, KvConnectorIsolation::Session)
+    }
+
+    fn bridge_over_with_isolation(
+        connector: Arc<dyn KvCacheConnector>,
+        chunk_size: usize,
+        isolation: KvConnectorIsolation,
+    ) -> ConnectorBridge {
         ConnectorBridge::new(
             connector,
             "test-model".to_string(),
+            isolation,
             chunk_size,
             0..2,
             CachePriority::Session,
@@ -562,14 +607,18 @@ mod tests {
         .unwrap()
     }
 
+    const TEST_SESSION: SessionId = 7;
+
     #[test]
     fn null_bridge_is_inert() {
         let mut bridge = ConnectorBridge::null();
         assert!(!bridge.is_active());
         let tokens: Vec<TokenId> = (0..1000).collect();
-        let outcome = bridge.lookup_extension(&tokens, 0);
+        let outcome = bridge.lookup_extension(TEST_SESSION, &tokens, 0);
         assert_eq!(outcome, ConnectorLookupOutcome::default());
-        bridge.store_prefix_with(&tokens, tokens.len(), |_, n| Ok(fake_payload(n)));
+        bridge.store_prefix_with(TEST_SESSION, &tokens, tokens.len(), |_, n| {
+            Ok(fake_payload(n))
+        });
         assert_eq!(bridge.stats(), &ConnectorStats::default());
     }
 
@@ -579,7 +628,9 @@ mod tests {
         let mut bridge = bridge_over(spy.clone(), 4);
         // 10 tokens, chunk_size 4 => 2 complete chunks + 1 partial (skipped).
         let tokens: Vec<TokenId> = (0..10).collect();
-        bridge.store_prefix_with(&tokens, tokens.len(), |_, n| Ok(fake_payload(n)));
+        bridge.store_prefix_with(TEST_SESSION, &tokens, tokens.len(), |_, n| {
+            Ok(fake_payload(n))
+        });
         assert_eq!(bridge.stats().stores, 2);
         assert_eq!(spy.stored.lock().unwrap().len(), 2);
     }
@@ -590,7 +641,7 @@ mod tests {
         let mut bridge = bridge_over(spy.clone(), 4);
         let tokens: Vec<TokenId> = (0..10).collect();
         // Only 4 tokens resident => exactly one full chunk.
-        bridge.store_prefix_with(&tokens, 4, |_, n| Ok(fake_payload(n)));
+        bridge.store_prefix_with(TEST_SESSION, &tokens, 4, |_, n| Ok(fake_payload(n)));
         assert_eq!(bridge.stats().stores, 1);
     }
 
@@ -605,7 +656,7 @@ mod tests {
             (chunks[2].hash, 1.0),
         ]));
         let mut bridge = bridge_over(spy, 4);
-        let outcome = bridge.lookup_extension(&tokens, 4);
+        let outcome = bridge.lookup_extension(TEST_SESSION, &tokens, 4);
         assert_eq!(outcome.chunk_hits, 2);
         assert_eq!(outcome.would_extend_tokens, 8);
         // Reporting-only path: no tokens actually fetched/injected here.
@@ -619,7 +670,7 @@ mod tests {
         // Chunk 1 resident, chunk 2 missing => extension stops after one chunk.
         let spy = Arc::new(SpyConnector::resident(&[(chunks[1].hash, 0.0)]));
         let mut bridge = bridge_over(spy, 4);
-        let outcome = bridge.lookup_extension(&tokens, 4);
+        let outcome = bridge.lookup_extension(TEST_SESSION, &tokens, 4);
         assert_eq!(outcome.chunk_hits, 1);
         assert_eq!(outcome.would_extend_tokens, 4);
     }
@@ -631,7 +682,7 @@ mod tests {
         // Load estimate 100ms/chunk but recompute is 4 tokens * 1.0 = 4ms.
         let spy = Arc::new(SpyConnector::resident(&[(chunks[1].hash, 100.0)]));
         let mut bridge = bridge_over(spy, 4);
-        let outcome = bridge.lookup_extension(&tokens, 4);
+        let outcome = bridge.lookup_extension(TEST_SESSION, &tokens, 4);
         assert_eq!(outcome.chunk_hits, 0);
         assert_eq!(outcome.would_extend_tokens, 0);
     }
@@ -643,7 +694,7 @@ mod tests {
         let spy = Arc::new(SpyConnector::resident(&[(chunks[1].hash, 0.0)]));
         let mut bridge = bridge_over(spy, 4);
         // Boundary 3 is not a multiple of chunk_size => no extension attempted.
-        let outcome = bridge.lookup_extension(&tokens, 3);
+        let outcome = bridge.lookup_extension(TEST_SESSION, &tokens, 3);
         assert_eq!(outcome, ConnectorLookupOutcome::default());
         assert_eq!(bridge.stats().lookups, 0);
     }
@@ -659,13 +710,67 @@ mod tests {
         let mut bridge = bridge_over(connector, 4);
         let tokens: Vec<TokenId> = (0..12).collect();
         // Store the whole prefix, then a fresh request reuses tokens[4..].
-        bridge.store_prefix_with(&tokens, tokens.len(), |_, n| Ok(fake_payload(n)));
+        bridge.store_prefix_with(TEST_SESSION, &tokens, tokens.len(), |_, n| {
+            Ok(fake_payload(n))
+        });
         assert_eq!(bridge.stats().stores, 3);
 
-        let outcome = bridge.lookup_extension(&tokens, 4);
+        let outcome = bridge.lookup_extension(TEST_SESSION, &tokens, 4);
         // Chunks 1 and 2 are resident (hot => 0ms load) so both extend.
         assert_eq!(outcome.chunk_hits, 2);
         assert_eq!(outcome.would_extend_tokens, 8);
+    }
+
+    #[test]
+    fn session_isolation_is_default_and_shared_domain_is_explicit() {
+        let tokens: Vec<TokenId> = (0..8).collect();
+
+        let private_connector =
+            Arc::new(LocalTieredConnector::new(LocalTieredConfig::default()).unwrap());
+        let mut private = bridge_over(private_connector, 4);
+        private.store_prefix_with(TEST_SESSION, &tokens, tokens.len(), |_, n| {
+            Ok(fake_payload(n))
+        });
+        assert_eq!(
+            private
+                .lookup_extension(TEST_SESSION + 1, &tokens, 0)
+                .chunk_hits,
+            0
+        );
+
+        let shared_connector =
+            Arc::new(LocalTieredConnector::new(LocalTieredConfig::default()).unwrap());
+        let mut shared = bridge_over_with_isolation(
+            shared_connector,
+            4,
+            KvConnectorIsolation::SharedDomain("tenant-a".to_owned()),
+        );
+        shared.store_prefix_with(TEST_SESSION, &tokens, tokens.len(), |_, n| {
+            Ok(fake_payload(n))
+        });
+        assert_eq!(
+            shared
+                .lookup_extension(TEST_SESSION + 1, &tokens, 0)
+                .chunk_hits,
+            2
+        );
+    }
+
+    #[test]
+    fn empty_shared_domain_is_rejected_before_connector_use() {
+        let result = ConnectorBridge::new(
+            Arc::new(NullConnector),
+            "test-model".to_owned(),
+            KvConnectorIsolation::SharedDomain(String::new()),
+            4,
+            0..1,
+            CachePriority::Session,
+            1.0,
+        );
+        let Err(error) = result else {
+            panic!("empty shared domain must fail");
+        };
+        assert!(error.to_string().contains("must be non-empty"));
     }
 
     #[test]
@@ -678,10 +783,12 @@ mod tests {
         let connector = Arc::new(LocalTieredConnector::new(config).unwrap());
         let mut bridge = bridge_over(connector, 4);
         let tokens: Vec<TokenId> = (0..12).collect();
-        bridge.store_prefix_with(&tokens, tokens.len(), |_, n| Ok(fake_payload(n)));
+        bridge.store_prefix_with(TEST_SESSION, &tokens, tokens.len(), |_, n| {
+            Ok(fake_payload(n))
+        });
 
         // From boundary 4: chunks 1 and 2 are resident and cheap => fetch both.
-        let outcome = bridge.fetch_extension(&tokens, 4, tokens.len(), Device::Cpu);
+        let outcome = bridge.fetch_extension(TEST_SESSION, &tokens, 4, tokens.len(), Device::Cpu);
         assert_eq!(outcome.chunk_hits, 2);
         assert_eq!(outcome.fetched_tokens, 8);
         assert_eq!(outcome.chunks.len(), 2);
@@ -704,8 +811,11 @@ mod tests {
             .unwrap(),
         );
         let mut resident = bridge_over(resident_connector, 4);
-        resident.store_prefix_with(&tokens, tokens.len(), |_, n| Ok(fake_payload(n)));
-        let expected = resident.fetch_extension(&tokens, 0, tokens.len(), Device::Gpu(0));
+        resident.store_prefix_with(TEST_SESSION, &tokens, tokens.len(), |_, n| {
+            Ok(fake_payload(n))
+        });
+        let expected =
+            resident.fetch_extension(TEST_SESSION, &tokens, 0, tokens.len(), Device::Gpu(0));
 
         let parent = std::env::temp_dir().join(format!(
             "onnx-genai-engine-disk-kv-test-{}-{}",
@@ -729,9 +839,11 @@ mod tests {
         );
         let disk_for_assert = Arc::clone(&disk_connector);
         let mut disk = bridge_over(disk_connector, 4);
-        disk.store_prefix_with(&tokens, tokens.len(), |_, n| Ok(fake_payload(n)));
+        disk.store_prefix_with(TEST_SESSION, &tokens, tokens.len(), |_, n| {
+            Ok(fake_payload(n))
+        });
         assert!(disk_for_assert.spill_count().unwrap() >= 2);
-        let actual = disk.fetch_extension(&tokens, 0, tokens.len(), Device::Gpu(0));
+        let actual = disk.fetch_extension(TEST_SESSION, &tokens, 0, tokens.len(), Device::Gpu(0));
 
         // Fetched payloads are the exact K/V input used by continuation decode.
         assert_eq!(actual.chunks.len(), expected.chunks.len());
@@ -756,9 +868,11 @@ mod tests {
         let connector = Arc::new(LocalTieredConnector::new(config).unwrap());
         let mut bridge = bridge_over(connector, 4);
         let tokens: Vec<TokenId> = (0..12).collect();
-        bridge.store_prefix_with(&tokens, tokens.len(), |_, n| Ok(fake_payload(n)));
+        bridge.store_prefix_with(TEST_SESSION, &tokens, tokens.len(), |_, n| {
+            Ok(fake_payload(n))
+        });
         // Boundary 3 is not chunk-aligned => nothing fetched.
-        let outcome = bridge.fetch_extension(&tokens, 3, tokens.len(), Device::Cpu);
+        let outcome = bridge.fetch_extension(TEST_SESSION, &tokens, 3, tokens.len(), Device::Cpu);
         assert_eq!(outcome.fetched_tokens, 0);
         assert!(outcome.chunks.is_empty());
     }
