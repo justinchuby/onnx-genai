@@ -612,6 +612,7 @@ impl Executor {
                 opset,
                 seq_independent,
                 self.instance_id,
+                &mut self.provider_artifact_readiness,
                 self.ep.as_ref(),
             )?;
             self.kernel_bindings[pi] = Some(key);
@@ -1014,12 +1015,17 @@ impl Executor {
                 "mixed-provider device-graph replay",
             ));
         }
-        // Fast replay bypasses the scoped runner, so it must consult the same
+        // Fast replay bypasses the scoped runner, so it must drive the same
         // executor-local authority that gates eager execution and capture.
-        // Pending, failed, or not-yet-finalized specializations are never
-        // permission to relaunch an older installed graph.
-        self.provider_artifact_readiness
-            .require_complete(self.ep.name(), self.instance_id)?;
+        // A cache miss published by binding preparation can leave the authority
+        // unfinalized; complete that transition here exactly once. Pending or
+        // failed outcomes remain latched until a later cache miss advances the
+        // epoch and are never permission to relaunch an older installed graph.
+        self.provider_artifact_readiness.finalize_if_needed(
+            self.ep.as_ref(),
+            self.instance_id,
+            &self.graph,
+        )?;
         let external = self.prepare_external_bindings(bindings)?;
         let signature = Self::binding_signature(bindings);
         if self.cap().device_graph_signature.as_ref() != Some(&signature) {

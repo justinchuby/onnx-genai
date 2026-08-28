@@ -2205,30 +2205,11 @@ impl Executor {
         resolved: &HashMap<ValueId, Vec<usize>>,
     ) -> Result<()> {
         self.compile_ready_kernels(resolved)?;
-        if !self.provider_artifact_readiness.needs_finalization() {
-            return self
-                .provider_artifact_readiness
-                .require_complete(self.ep.name(), self.instance_id);
-        }
-
-        let epoch = self.provider_artifact_readiness.epoch();
-        match self
-            .ep
-            .finalize_executor_artifacts(self.instance_id, &self.graph, epoch)
-        {
-            Ok(ExecutorArtifactFinalization::Complete) => {
-                self.provider_artifact_readiness.mark_complete();
-            }
-            Ok(ExecutorArtifactFinalization::Pending(pending)) => {
-                self.provider_artifact_readiness.mark_pending(pending);
-            }
-            Err(error) => {
-                self.provider_artifact_readiness
-                    .mark_failed(error.to_string());
-            }
-        }
-        self.provider_artifact_readiness
-            .require_complete(self.ep.name(), self.instance_id)
+        self.provider_artifact_readiness.finalize_if_needed(
+            self.ep.as_ref(),
+            self.instance_id,
+            &self.graph,
+        )
     }
 
     /// Compile every leaf kernel whose inputs are currently resolved.
@@ -2313,12 +2294,9 @@ impl Executor {
                 opset,
                 seq_independent,
                 self.instance_id,
+                &mut self.provider_artifact_readiness,
                 self.ep.as_ref(),
             )?;
-            self.provider_artifact_readiness
-                .advance_to(ExecutorArtifactReadinessEpoch::new(
-                    self.cache.stats().misses,
-                ));
             // Pre-populate the kernel binding so the first decode step already
             // hits the zero-alloc fast path for static-shape graphs.
             self.kernel_bindings[i] = Some(key);

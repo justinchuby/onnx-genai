@@ -15,7 +15,7 @@ use onnx_runtime_ep_api::{
     CaptureSupport, DeviceBuffer, EpConfig, EpError, ExecutionProvider,
     ExecutorArtifactFinalization, ExecutorArtifactPending, ExecutorArtifactReadinessEpoch,
     ExecutorInstanceId, Fence, Kernel, KernelMatch, Result as EpResult, TensorMetadata, TensorMut,
-    TensorView, WorkspaceRequirement,
+    TensorView, ViewOutput, WorkspaceRequirement,
 };
 use onnx_runtime_ep_cpu::CpuExecutionProvider;
 use onnx_runtime_ir::{
@@ -288,6 +288,19 @@ impl Kernel for FinalizationCheckingKernel {
 
     fn supports_strided_input(&self, input_idx: usize) -> bool {
         self.inner.supports_strided_input(input_idx)
+    }
+
+    fn view_outputs(
+        &self,
+        inputs: &[TensorView],
+        output_shapes: &[Vec<usize>],
+        num_outputs: usize,
+    ) -> Option<Vec<ViewOutput>> {
+        self.inner.view_outputs(inputs, output_shapes, num_outputs)
+    }
+
+    fn may_produce_views(&self) -> bool {
+        self.inner.may_produce_views()
     }
 
     fn capture_support(&self) -> CaptureSupport {
@@ -2033,6 +2046,82 @@ fn symbolic_gelu_model() -> Vec<u8> {
     encode_model(&Model::new(&graph)).expect("encode symbolic Gelu model")
 }
 
+fn symbolic_matmul_model() -> Vec<u8> {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 20);
+    let rows = graph.intern_symbol("rows");
+    let x = input_shaped(
+        &mut graph,
+        "x",
+        DataType::Float32,
+        vec![Dim::Symbolic(rows), Dim::Static(2)],
+    );
+    let weight = f32_init(
+        &mut graph,
+        "weight",
+        &[2, 2],
+        &[
+            1.0, 0.0, //
+            0.0, 1.0,
+        ],
+    );
+    let y = graph.create_named_value(
+        "y",
+        DataType::Float32,
+        vec![Dim::Symbolic(rows), Dim::Static(2)],
+    );
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "MatMul",
+        vec![Some(x), Some(weight)],
+        vec![y],
+    ));
+    graph.add_output(y);
+    encode_model(&Model::new(&graph)).expect("encode symbolic MatMul model")
+}
+
+fn runtime_dispatch_specialization_model() -> Vec<u8> {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 20);
+    let elements = graph.intern_symbol("elements");
+    let data = input_shaped(
+        &mut graph,
+        "data",
+        DataType::Float32,
+        vec![Dim::Symbolic(elements)],
+    );
+    let shape = input(&mut graph, "shape", DataType::Int64, &[2]);
+    let rows = graph.intern_symbol("runtime_rows");
+    let columns = graph.intern_symbol("runtime_columns");
+    let reshaped = graph.create_named_value(
+        "reshaped",
+        DataType::Float32,
+        vec![Dim::Symbolic(rows), Dim::Symbolic(columns)],
+    );
+    graph.mark_value_shape_unknown(reshaped);
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "Reshape",
+        vec![Some(data), Some(shape)],
+        vec![reshaped],
+    ));
+    let bias = f32_init(&mut graph, "bias", &[1], &[0.5]);
+    let y = graph.create_named_value(
+        "y",
+        DataType::Float32,
+        vec![Dim::Symbolic(rows), Dim::Symbolic(columns)],
+    );
+    graph.mark_value_shape_unknown(y);
+    graph.insert_node(Node::new(
+        NodeId(1),
+        "Add",
+        vec![Some(reshaped), Some(bias)],
+        vec![y],
+    ));
+    graph.add_output(y);
+    encode_model(&Model::new(&graph)).expect("encode runtime-dispatch specialization model")
+}
+
 fn scoped_count(
     counts: &Mutex<HashMap<ExecutorInstanceId, usize>>,
     executor: ExecutorInstanceId,
@@ -2491,6 +2580,194 @@ fn single_graph_fast_replay_obeys_pending_failed_and_ready_specializations() {
 
     drop(session);
     assert_eq!(scoped_count(&drains, executor), 1);
+}
+
+#[test]
+fn binding_preparation_cache_misses_revoke_fast_replay_until_terminal() {
+    let downloads = Arc::new(AtomicUsize::new(0));
+    let ep = HostDownloadCountingEp::new_fast_replay_lifecycle(downloads);
+    let compiles = ep.kernel_compiles();
+    let finalizations = ep.route_finalizations();
+    let terminal_outcomes = ep.route_terminal_outcomes();
+    let executions = ep.kernel_executions();
+    let fast_replays = ep.graph_fast_replays();
+    let ep = Arc::new(ep);
+    let mut session = InferenceSession::builder()
+        .model_bytes(&symbolic_matmul_model())
+        .execution_provider(ep)
+        .build()
+        .expect("build binding-preparation lifecycle session");
+    let executor = session.executor_instance_id();
+
+    let input = session
+        .allocate_device_binding(
+            "x",
+            None::<String>,
+            DataType::Float32,
+            vec![1, 2],
+            vec![1, 2],
+        )
+        .expect("allocate captured MatMul input");
+    let output = session
+        .allocate_device_output_binding("y", DataType::Float32, vec![1, 2], vec![1, 2])
+        .expect("allocate captured MatMul output");
+    let mut captured_bindings = vec![input, output];
+    captured_bindings[0]
+        .write_bytes(0, &f32_bytes(&[1.0, 2.0]))
+        .expect("seed captured MatMul input");
+    assert!(matches!(
+        session
+            .try_capture_with_device_bindings(&[], &mut captured_bindings)
+            .expect("initial specialization finalizes and captures"),
+        DeviceGraphCaptureResult::Captured(_)
+    ));
+    assert_eq!(scoped_count(&compiles, executor), 1);
+    assert_eq!(scoped_count(&finalizations, executor), 1);
+    assert_eq!(scoped_count(&executions, executor), 1);
+
+    let mut prepared_binding_sets = Vec::new();
+    for (rows, expected_epoch, expected_attempt) in [(2, 2, 2), (3, 3, 3), (4, 4, 4)] {
+        let input = session
+            .allocate_device_binding(
+                "x",
+                None::<String>,
+                DataType::Float32,
+                vec![rows, 2],
+                vec![rows, 2],
+            )
+            .expect("allocate prepared MatMul input");
+        let output = session
+            .allocate_device_output_binding("y", DataType::Float32, vec![rows, 2], vec![rows, 2])
+            .expect("allocate prepared MatMul output");
+        prepared_binding_sets.push(vec![input, output]);
+        session
+            .prepare_with_device_bindings(
+                &[],
+                prepared_binding_sets
+                    .last_mut()
+                    .expect("just pushed prepared bindings"),
+            )
+            .expect("binding preparation publishes a new specialization");
+        assert_eq!(scoped_count(&compiles, executor), expected_epoch);
+
+        let result = session.replay_device_graph(&mut captured_bindings);
+        match expected_attempt {
+            2 => assert_artifacts_pending(
+                result.expect_err("prepared specialization keeps replay pending"),
+                executor,
+                expected_epoch as u64,
+            ),
+            3 => assert!(matches!(
+                result.expect_err("prepared specialization makes replay fail closed"),
+                SessionError::ExecutionProviderArtifactFinalizationFailed {
+                    executor: actual_executor,
+                    readiness_epoch,
+                    ..
+                } if actual_executor == executor.get()
+                    && readiness_epoch == expected_epoch as u64
+            )),
+            4 => assert!(result.expect("ready prepared specialization permits replay")),
+            _ => unreachable!(),
+        }
+        assert_eq!(scoped_count(&finalizations, executor), expected_attempt);
+        assert_eq!(
+            scoped_count(&executions, executor),
+            1,
+            "binding preparation and readiness checks must not execute kernels"
+        );
+    }
+    assert_eq!(scoped_count(&terminal_outcomes, executor), 2);
+    assert_eq!(fast_replays.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn runtime_dispatch_cache_miss_finalizes_before_kernel_use() {
+    let downloads = Arc::new(AtomicUsize::new(0));
+    let ep = HostDownloadCountingEp::new_fast_replay_lifecycle(downloads);
+    let compiles = ep.kernel_compiles();
+    let finalizations = ep.route_finalizations();
+    let terminal_outcomes = ep.route_terminal_outcomes();
+    let executions = ep.kernel_executions();
+    let ep = Arc::new(ep);
+    let mut session = InferenceSession::builder()
+        .model_bytes(&runtime_dispatch_specialization_model())
+        .execution_provider(ep)
+        .build()
+        .expect("build runtime-dispatch lifecycle session");
+    let executor = session.executor_instance_id();
+
+    let data2 = Tensor::from_f32(&[2], &[-1.0, 1.0]).unwrap();
+    let shape12 = i64_tensor(&[2], &[1, 2]);
+    let error = session
+        .run(&[("data", &data2), ("shape", &shape12)])
+        .expect_err("runtime Add specialization remains pending");
+    assert_artifacts_pending(error, executor, 2);
+    assert_eq!(
+        scoped_count(&compiles, executor),
+        2,
+        "preflight compiles Reshape and runtime dispatch compiles Add"
+    );
+    assert_eq!(scoped_count(&finalizations, executor), 2);
+    assert_eq!(
+        scoped_count(&executions, executor),
+        0,
+        "the Reshape is a view and pending blocks the runtime-compiled Add"
+    );
+
+    let error = session
+        .run(&[("data", &data2), ("shape", &shape12)])
+        .expect_err("same runtime specialization remains latched pending");
+    assert_artifacts_pending(error, executor, 2);
+    assert_eq!(
+        scoped_count(&finalizations, executor),
+        2,
+        "pending epoch must not busy-retry"
+    );
+    assert_eq!(scoped_count(&executions, executor), 0);
+
+    let data4 = Tensor::from_f32(&[4], &[-1.0, 0.0, 1.0, 2.0]).unwrap();
+    let shape22 = i64_tensor(&[2], &[2, 2]);
+    let error = session
+        .run(&[("data", &data4), ("shape", &shape22)])
+        .expect_err("new preflight specialization reaches the injected failure");
+    assert!(matches!(
+        error,
+        SessionError::ExecutionProviderArtifactFinalizationFailed {
+            executor: actual_executor,
+            readiness_epoch: 3,
+            ..
+        } if actual_executor == executor.get()
+    ));
+    assert_eq!(scoped_count(&compiles, executor), 3);
+    assert_eq!(scoped_count(&finalizations, executor), 3);
+    assert_eq!(scoped_count(&executions, executor), 0);
+
+    let error = session
+        .run(&[("data", &data4), ("shape", &shape22)])
+        .expect_err("same preflight specialization remains latched failed");
+    assert!(matches!(
+        error,
+        SessionError::ExecutionProviderArtifactFinalizationFailed {
+            readiness_epoch: 3,
+            ..
+        }
+    ));
+    assert_eq!(
+        scoped_count(&finalizations, executor),
+        3,
+        "failed epoch must not busy-retry"
+    );
+
+    let data6 = Tensor::from_f32(&[6], &[-1.0, 0.0, 1.0, 2.0, 3.0, 4.0]).unwrap();
+    let shape32 = i64_tensor(&[2], &[3, 2]);
+    let outputs = session
+        .run(&[("data", &data6), ("shape", &shape32)])
+        .expect("later preflight and runtime specializations both finalize");
+    assert_eq!(outputs[0].shape, vec![3, 2]);
+    assert_eq!(scoped_count(&compiles, executor), 5);
+    assert_eq!(scoped_count(&finalizations, executor), 5);
+    assert_eq!(scoped_count(&terminal_outcomes, executor), 3);
+    assert_eq!(scoped_count(&executions, executor), 1);
 }
 
 #[test]
