@@ -169,6 +169,7 @@ pipeline:
           dtype: int64
           shape: [batch, sequence]
           batch_layout: {{ kind: request_aligned, axis: 0 }}
+          padding: [{{ dimension: sequence, valid_lengths: accepted_len }}]
         role: {{ kind: runtime, version: v1, role: prompt_tokens }}
         source: {{ kind: application, name: token_ids }}
         required: true
@@ -177,6 +178,7 @@ pipeline:
           dtype: float32
           shape: [batch, sequence, {channels}]
           batch_layout: {{ kind: request_aligned, axis: 0 }}
+          padding: [{{ dimension: sequence, valid_lengths: accepted_len }}]
         role: {{ kind: opaque }}
         source: {{ kind: application, name: inputs_embeds }}
         required: true
@@ -223,8 +225,8 @@ pipeline:
       row_selection:
         contract:
           dtype: int64
-          shape: [batch]
-          batch_layout: {{ kind: request_aligned, axis: 0 }}
+          shape: [selected_batch]
+          batch_layout: {{ kind: shared }}
         role: {{ kind: runtime, version: v1, role: row_selection }}
         source: {{ kind: application, name: row_selection }}
         required: false
@@ -235,12 +237,20 @@ pipeline:
           dtype: float32
           shape: [batch, sequence, {channels}]
           batch_layout: {{ kind: request_aligned, axis: 0 }}
+          padding: [{{ dimension: sequence, valid_lengths: valid_lengths }}]
         role: tensor
         stage: pre_adapter
       token_history:
         contract:
           dtype: int64
           shape: [batch, {context_len}]
+          batch_layout: {{ kind: request_aligned, axis: 0 }}
+        role: tensor
+        stage: pre_adapter
+      valid_lengths:
+        contract:
+          dtype: int64
+          shape: [batch]
           batch_layout: {{ kind: request_aligned, axis: 0 }}
         role: tensor
         stage: pre_adapter
@@ -260,9 +270,15 @@ pipeline:
               dtype: int64
               shape: [batch, sequence]
               batch_layout: {{ kind: request_aligned, axis: 0 }}
+              padding: [{{ dimension: sequence, valid_lengths: valid_lengths }}]
             inputs_embeds:
               dtype: float32
               shape: [batch, sequence, {channels}]
+              batch_layout: {{ kind: request_aligned, axis: 0 }}
+              padding: [{{ dimension: sequence, valid_lengths: valid_lengths }}]
+            valid_lengths:
+              dtype: int64
+              shape: [batch]
               batch_layout: {{ kind: request_aligned, axis: 0 }}
             token_history:
               dtype: int64
@@ -277,6 +293,7 @@ pipeline:
               dtype: float32
               shape: [batch, sequence, {channels}]
               batch_layout: {{ kind: request_aligned, axis: 0 }}
+              padding: [{{ dimension: sequence, valid_lengths: valid_lengths }}]
             next_token_history:
               dtype: int64
               shape: [batch, {context_len}]
@@ -323,6 +340,7 @@ pipeline:
         inputs:
           token_ids: token_ids
           inputs_embeds: inputs_embeds
+          valid_lengths: accepted_len
           token_history: initial_token_history
           conv_history: initial_conv_history
         outputs:
@@ -332,6 +350,7 @@ pipeline:
       - {{ kind: emit, value: context.output, output: hidden_states, mode: replace }}
       - {{ kind: emit, value: context.next_tokens, output: token_history, mode: replace }}
       - {{ kind: emit, value: context.next_conv, output: conv_history, mode: replace }}
+      - {{ kind: emit, value: accepted_len, output: valid_lengths, mode: replace }}
     serving:
       active: active
       done: done
@@ -497,6 +516,7 @@ fn model(geometry: Geometry) -> String {
         &["batch".into(), "sequence".into(), channels.to_string()],
         false,
     ));
+    graph.push_str(&value_info("valid_lengths", 7, &["batch".into()], false));
     graph.push_str(&value_info(
         "token_history",
         7,
@@ -539,19 +559,21 @@ fn model(geometry: Geometry) -> String {
     graph.push_str(&initializer_i64("slice_axis_1", &[1], &[1]));
     graph.push_str(&initializer_i64("slice_axis_0", &[1], &[0]));
     graph.push_str(&initializer_i64("slice_step_1", &[1], &[1]));
-    graph.push_str(&initializer_i64("slice_end", &[1], &[i64::MAX]));
-    graph.push_str(&initializer_i64(
-        "next_token_start",
-        &[1],
-        &[-(context as i64)],
-    ));
-    graph.push_str(&initializer_i64(
-        "next_conv_start",
-        &[1],
-        &[-(conv_history as i64)],
-    ));
-    graph.push_str(&initializer_i64("conv_axis_2", &[1], &[2]));
     graph.push_str(&initializer_i64("axes_last", &[1], &[-1]));
+    graph.push_str(&initializer_i64("axes_one", &[1], &[1]));
+    graph.push_str(&initializer_i64("zero_i64", &[], &[0]));
+    graph.push_str(&initializer_i64("one_i64", &[], &[1]));
+    graph.push_str(&initializer_i64("shape_index_sequence", &[1], &[1]));
+    graph.push_str(&initializer_i64(
+        "token_history_offsets",
+        &[1, context],
+        &(0..context as i64).collect::<Vec<_>>(),
+    ));
+    graph.push_str(&initializer_i64(
+        "conv_history_offsets",
+        &[1, conv_history],
+        &(0..conv_history as i64).collect::<Vec<_>>(),
+    ));
     graph.push_str(&initializer_i64("axes_minus_two", &[1], &[-2]));
     graph.push_str(&initializer_i64("rms_axes", &[1], &[-1]));
     graph.push_str(&initializer_i64(
@@ -603,9 +625,46 @@ fn model(geometry: Geometry) -> String {
         &conv_weights,
     ));
 
+    graph.push_str(&node("Shape", &["token_ids"], "token_ids_shape", ""));
+    graph.push_str(&node(
+        "Gather",
+        &["token_ids_shape", "shape_index_sequence"],
+        "sequence_extent",
+        " attribute { name: \"axis\" i: 0 type: 2 }",
+    ));
+    graph.push_str(&node(
+        "Squeeze",
+        &["sequence_extent", "slice_axis_0"],
+        "sequence_extent_scalar",
+        "",
+    ));
+    graph.push_str(&node(
+        "Range",
+        &["zero_i64", "sequence_extent_scalar", "one_i64"],
+        "sequence_positions",
+        "",
+    ));
+    graph.push_str(&node(
+        "Unsqueeze",
+        &["valid_lengths", "axes_one"],
+        "valid_lengths_column",
+        "",
+    ));
+    graph.push_str(&node(
+        "Less",
+        &["sequence_positions", "valid_lengths_column"],
+        "valid_tokens",
+        "",
+    ));
+    graph.push_str(&node(
+        "Where",
+        &["valid_tokens", "token_ids", "zero_i64"],
+        "valid_token_ids",
+        "",
+    ));
     graph.push_str(&node(
         "Concat",
-        &["token_history", "token_ids"],
+        &["token_history", "valid_token_ids"],
         "all_tokens",
         " attribute { name: \"axis\" i: 1 type: 2 }",
     ));
@@ -665,7 +724,12 @@ fn model(geometry: Geometry) -> String {
             &[*multiplier],
         ));
     }
-    graph.push_str(&node("Mul", &["token_ids", "multiplier_0"], "mixed_1", ""));
+    graph.push_str(&node(
+        "Mul",
+        &["valid_token_ids", "multiplier_0"],
+        "mixed_1",
+        "",
+    ));
     for order in 2..=geometry.ngram_size {
         let previous = if order == 2 {
             "mixed_1".to_string()
@@ -922,30 +986,66 @@ fn model(geometry: Geometry) -> String {
         "ple_output",
         "",
     ));
-    graph.push_str(&node("Add", &["inputs_embeds", "ple_output"], "output", ""));
     graph.push_str(&node(
-        "Slice",
-        &[
-            "all_tokens",
-            "next_token_start",
-            "slice_end",
-            "slice_axis_1",
-            "slice_step_1",
-        ],
-        "next_token_history",
+        "Cast",
+        &["valid_tokens"],
+        "valid_tokens_f32",
+        " attribute { name: \"to\" i: 1 type: 2 }",
+    ));
+    graph.push_str(&node(
+        "Unsqueeze",
+        &["valid_tokens_f32", "axes_last"],
+        "valid_tokens_f32_column",
         "",
     ));
     graph.push_str(&node(
-        "Slice",
-        &[
-            "conv_all",
-            "next_conv_start",
-            "slice_end",
-            "conv_axis_2",
-            "slice_step_1",
-        ],
-        "next_conv_history",
+        "Mul",
+        &["ple_output", "valid_tokens_f32_column"],
+        "valid_ple_output",
         "",
+    ));
+    graph.push_str(&node(
+        "Add",
+        &["inputs_embeds", "valid_ple_output"],
+        "output",
+        "",
+    ));
+    graph.push_str(&node(
+        "Add",
+        &["valid_lengths_column", "token_history_offsets"],
+        "next_token_indices",
+        "",
+    ));
+    graph.push_str(&node(
+        "GatherElements",
+        &["all_tokens", "next_token_indices"],
+        "next_token_history",
+        " attribute { name: \"axis\" i: 1 type: 2 }",
+    ));
+    graph.push_str(&node(
+        "Add",
+        &["valid_lengths_column", "conv_history_offsets"],
+        "next_conv_indices_flat",
+        "",
+    ));
+    graph.push_str(&node(
+        "Unsqueeze",
+        &["next_conv_indices_flat", "axes_one"],
+        "next_conv_indices_column",
+        "",
+    ));
+    graph.push_str(&node("Shape", &["conv_history"], "conv_history_shape", ""));
+    graph.push_str(&node(
+        "Expand",
+        &["next_conv_indices_column", "conv_history_shape"],
+        "next_conv_indices",
+        "",
+    ));
+    graph.push_str(&node(
+        "GatherElements",
+        &["conv_all", "next_conv_indices"],
+        "next_conv_history",
+        " attribute { name: \"axis\" i: 2 type: 2 }",
     ));
     graph.push_str("}\nopset_import { version: 18 }\n");
     graph
@@ -967,11 +1067,34 @@ fn request_rows(
     base_offset: usize,
     selection: Option<&[i64]>,
 ) -> anyhow::Result<PipelineGenerateRequest> {
+    let sequence = rows.first().map_or(0, |row| row.len());
+    request_padded_rows(
+        geometry,
+        session,
+        rows,
+        &vec![sequence; rows.len()],
+        base_offset,
+        selection,
+    )
+}
+
+fn request_padded_rows(
+    geometry: Geometry,
+    session: &str,
+    rows: &[&[i64]],
+    valid_lengths: &[usize],
+    base_offset: usize,
+    selection: Option<&[i64]>,
+) -> anyhow::Result<PipelineGenerateRequest> {
     anyhow::ensure!(!rows.is_empty(), "at least one row is required");
     let sequence = rows[0].len();
     anyhow::ensure!(
         rows.iter().all(|row| row.len() == sequence),
         "test rows must have equal sequence lengths"
+    );
+    anyhow::ensure!(
+        valid_lengths.len() == rows.len() && valid_lengths.iter().all(|&length| length <= sequence),
+        "test valid lengths must provide one in-range extent per row"
     );
     let batch = rows.len();
     let channels = geometry.channels();
@@ -1036,7 +1159,13 @@ fn request_rows(
     )
     .with_input(
         "accepted_len",
-        Value::from_slice_i64(&vec![sequence as i64; batch], &[batch as i64])?,
+        Value::from_slice_i64(
+            &valid_lengths
+                .iter()
+                .map(|&length| length as i64)
+                .collect::<Vec<_>>(),
+            &[batch as i64],
+        )?,
     );
     if let Some(selection) = selection {
         request = request.with_input(
@@ -1161,50 +1290,128 @@ fn executable_token_context_preserves_chunk_decode_checkpoint_and_release_semant
             geometry.channels() * geometry.conv_history_len()
         );
 
-        let left_prefix = [3, 5];
-        let right_prefix = [17, 19];
+        let row_zero_prefix = [3, 5];
+        let row_one_prefix = [17, 19];
+        let row_two_prefix = [29, 31];
         engine.run_pipeline(request_rows(
             geometry,
             "batched",
-            &[&left_prefix, &right_prefix],
+            &[&row_zero_prefix, &row_one_prefix, &row_two_prefix],
             0,
             None,
         )?)?;
-        let invalid_selection = request_rows(geometry, "batched", &[&[23]], 2, Some(&[2]))?;
+        let source_tokens = [&[23][..], &[37][..], &[41][..]];
+        let invalid_selection = request_rows(geometry, "batched", &source_tokens, 2, Some(&[3]))?;
         let error = match engine.run_pipeline(invalid_selection) {
             Ok(_) => panic!("an out-of-range row selection must fail before state commit"),
             Err(error) => error,
         };
         let message = format!("{error:#}");
         assert!(
-            message.contains("failed to compact session state")
-                && message.contains("row index 2")
-                && message.contains("shape [2"),
+            message.contains("destination 0")
+                && message.contains("source row 3")
+                && message.contains("only 3 rows"),
             "{message}"
         );
-        let compacted =
-            engine.run_pipeline(request_rows(geometry, "batched", &[&[23]], 2, Some(&[1]))?)?;
+
         outputs(
             &mut engine,
             geometry,
-            "compaction-reference",
-            &[&right_prefix],
+            "row-zero-reference",
+            &[&row_zero_prefix],
         )?;
-        let reference =
-            engine.run_pipeline(request(geometry, "compaction-reference", &[23], 2)?)?;
+        outputs(
+            &mut engine,
+            geometry,
+            "row-two-reference",
+            &[&row_two_prefix],
+        )?;
+        let row_zero = engine.run_pipeline(request(
+            geometry,
+            "row-zero-reference",
+            source_tokens[0],
+            2,
+        )?)?;
+        let row_two =
+            engine.run_pipeline(request(geometry, "row-two-reference", source_tokens[2], 2)?)?;
+        let cloned = engine.run_pipeline(request_rows(
+            geometry,
+            "batched",
+            &source_tokens,
+            2,
+            Some(&[2, 2, 0]),
+        )?)?;
+        let mut expected_hidden = row_two["hidden_states"].to_vec_f32()?;
+        expected_hidden.extend(row_two["hidden_states"].to_vec_f32()?);
+        expected_hidden.extend(row_zero["hidden_states"].to_vec_f32()?);
+        assert_close(&cloned["hidden_states"].to_vec_f32()?, &expected_hidden);
+        let mut expected_tokens = row_two["token_history"].to_vec_i64()?;
+        expected_tokens.extend(row_two["token_history"].to_vec_i64()?);
+        expected_tokens.extend(row_zero["token_history"].to_vec_i64()?);
+        assert_eq!(cloned["token_history"].to_vec_i64()?, expected_tokens);
+        let mut expected_conv = row_two["conv_history"].to_vec_f32()?;
+        expected_conv.extend(row_two["conv_history"].to_vec_f32()?);
+        expected_conv.extend(row_zero["conv_history"].to_vec_f32()?);
+        assert_close(&cloned["conv_history"].to_vec_f32()?, &expected_conv);
+
+        let selected_checkpoint = engine.checkpoint_workflow_session("batched")?;
+        let continuation_rows = [&[43][..], &[47][..], &[53][..]];
+        let shrunk = engine.run_pipeline(request_rows(
+            geometry,
+            "batched",
+            &continuation_rows,
+            3,
+            Some(&[2, 0]),
+        )?)?;
+        engine.restore_workflow_session_checkpoint("batched", &selected_checkpoint)?;
+        let replayed_shrink = engine.run_pipeline(request_rows(
+            geometry,
+            "batched",
+            &continuation_rows,
+            3,
+            Some(&[2, 0]),
+        )?)?;
         assert_close(
-            &compacted["hidden_states"].to_vec_f32()?,
-            &reference["hidden_states"].to_vec_f32()?,
+            &shrunk["hidden_states"].to_vec_f32()?,
+            &replayed_shrink["hidden_states"].to_vec_f32()?,
         );
         assert_eq!(
-            compacted["token_history"].to_vec_i64()?,
-            reference["token_history"].to_vec_i64()?,
-            "row selection keeps the selected row's token context and releases the other row"
+            shrunk["token_history"].to_vec_i64()?,
+            replayed_shrink["token_history"].to_vec_i64()?
         );
         assert_close(
-            &compacted["conv_history"].to_vec_f32()?,
-            &reference["conv_history"].to_vec_f32()?,
+            &shrunk["conv_history"].to_vec_f32()?,
+            &replayed_shrink["conv_history"].to_vec_f32()?,
         );
+
+        let row_zero_continued = engine.run_pipeline(request(
+            geometry,
+            "row-zero-reference",
+            continuation_rows[2],
+            3,
+        )?)?;
+        let row_two_continued = engine.run_pipeline(request(
+            geometry,
+            "row-two-reference",
+            continuation_rows[0],
+            3,
+        )?)?;
+        let mut expected_shrunk_hidden = row_zero_continued["hidden_states"].to_vec_f32()?;
+        expected_shrunk_hidden.extend(row_two_continued["hidden_states"].to_vec_f32()?);
+        assert_close(
+            &shrunk["hidden_states"].to_vec_f32()?,
+            &expected_shrunk_hidden,
+        );
+        let mut expected_shrunk_tokens = row_zero_continued["token_history"].to_vec_i64()?;
+        expected_shrunk_tokens.extend(row_two_continued["token_history"].to_vec_i64()?);
+        assert_eq!(
+            shrunk["token_history"].to_vec_i64()?,
+            expected_shrunk_tokens,
+            "the same shrink plan selects request tokens and both restored histories"
+        );
+        let mut expected_shrunk_conv = row_zero_continued["conv_history"].to_vec_f32()?;
+        expected_shrunk_conv.extend(row_two_continued["conv_history"].to_vec_f32()?);
+        assert_close(&shrunk["conv_history"].to_vec_f32()?, &expected_shrunk_conv);
 
         let session = engine.create_session()?;
         let session_name = session.to_string();
@@ -1221,6 +1428,150 @@ fn executable_token_context_preserves_chunk_decode_checkpoint_and_release_semant
         assert_close(&before_reset.2, &after_reset.2);
         engine.close_session(session)?;
     }
+    Ok(())
+}
+
+#[test]
+fn padded_rows_ignore_invalid_tokens_through_selection_restore_and_decode() -> anyhow::Result<()> {
+    for geometry in [QWEN_REDUCED, ALTERNATE] {
+        let root = package(geometry)?;
+        let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+        let original = [&[5, 7, 11][..], &[13, 88, 89][..], &[17, 19, 77][..]];
+        let changed_padding = [&[5, 7, 11][..], &[13, 44, 45][..], &[17, 19, 33][..]];
+        let lengths = [3, 1, 2];
+
+        let padded = engine.run_pipeline(request_padded_rows(
+            geometry, "padded", &original, &lengths, 0, None,
+        )?)?;
+        let changed = engine.run_pipeline(request_padded_rows(
+            geometry,
+            "changed-padding",
+            &changed_padding,
+            &lengths,
+            0,
+            None,
+        )?)?;
+        assert_close(
+            &padded["hidden_states"].to_vec_f32()?,
+            &changed["hidden_states"].to_vec_f32()?,
+        );
+        assert_eq!(
+            padded["token_history"].to_vec_i64()?,
+            changed["token_history"].to_vec_i64()?
+        );
+        assert_close(
+            &padded["conv_history"].to_vec_f32()?,
+            &changed["conv_history"].to_vec_f32()?,
+        );
+        assert_eq!(padded["valid_lengths"].to_vec_i64()?, [3, 1, 2]);
+
+        for (row_index, (row, &valid_length)) in original.iter().zip(&lengths).enumerate() {
+            let valid = &row[..valid_length];
+            let reference_session = format!("padded-reference-{row_index}");
+            let reference =
+                engine.run_pipeline(request(geometry, &reference_session, valid, 0)?)?;
+            let token_start = row_index * geometry.context_len();
+            let token_end = token_start + geometry.context_len();
+            assert_eq!(
+                &padded["token_history"].to_vec_i64()?[token_start..token_end],
+                reference["token_history"].to_vec_i64()?
+            );
+            let conv_row = geometry.channels() * geometry.conv_history_len();
+            let conv_start = row_index * conv_row;
+            assert_close(
+                &padded["conv_history"].to_vec_f32()?[conv_start..conv_start + conv_row],
+                &reference["conv_history"].to_vec_f32()?,
+            );
+            let padded_hidden = padded["hidden_states"].to_vec_f32()?;
+            let valid_hidden = valid_length * geometry.channels();
+            let hidden_start = row_index * original[0].len() * geometry.channels();
+            assert_close(
+                &padded_hidden[hidden_start..hidden_start + valid_hidden],
+                &reference["hidden_states"].to_vec_f32()?,
+            );
+        }
+
+        let checkpoint = engine.checkpoint_workflow_session("padded")?;
+        let continuation = [&[23, 90][..], &[29, 31][..], &[37, 91][..]];
+        let changed_continuation = [&[23, 42][..], &[29, 31][..], &[37, 66][..]];
+        let continuation_lengths = [1, 2, 1];
+        let selected = engine.run_pipeline(request_padded_rows(
+            geometry,
+            "padded",
+            &continuation,
+            &continuation_lengths,
+            3,
+            Some(&[2, 0]),
+        )?)?;
+        engine.restore_workflow_session_checkpoint("padded", &checkpoint)?;
+        let selected_with_changed_padding = engine.run_pipeline(request_padded_rows(
+            geometry,
+            "padded",
+            &changed_continuation,
+            &continuation_lengths,
+            3,
+            Some(&[2, 0]),
+        )?)?;
+        assert_close(
+            &selected["hidden_states"].to_vec_f32()?,
+            &selected_with_changed_padding["hidden_states"].to_vec_f32()?,
+        );
+        assert_eq!(
+            selected["token_history"].to_vec_i64()?,
+            selected_with_changed_padding["token_history"].to_vec_i64()?
+        );
+        assert_close(
+            &selected["conv_history"].to_vec_f32()?,
+            &selected_with_changed_padding["conv_history"].to_vec_f32()?,
+        );
+        assert_eq!(
+            selected["valid_lengths"].to_vec_i64()?,
+            [1, 1],
+            "the row plan must compact the logical committed extents with token and state rows"
+        );
+
+        let decoded =
+            engine.run_pipeline(request_rows(geometry, "padded", &[&[43], &[47]], 4, None)?)?;
+        engine.run_pipeline(request(geometry, "padded-reference-2", &[37], 2)?)?;
+        let row_two_reference =
+            engine.run_pipeline(request(geometry, "padded-reference-2", &[43], 3)?)?;
+        engine.run_pipeline(request(geometry, "padded-reference-0", &[23], 3)?)?;
+        let row_zero_reference =
+            engine.run_pipeline(request(geometry, "padded-reference-0", &[47], 4)?)?;
+        let mut expected_tokens = row_two_reference["token_history"].to_vec_i64()?;
+        expected_tokens.extend(row_zero_reference["token_history"].to_vec_i64()?);
+        assert_eq!(decoded["token_history"].to_vec_i64()?, expected_tokens);
+        let mut expected_conv = row_two_reference["conv_history"].to_vec_f32()?;
+        expected_conv.extend(row_zero_reference["conv_history"].to_vec_f32()?);
+        assert_close(&decoded["conv_history"].to_vec_f32()?, &expected_conv);
+    }
+    Ok(())
+}
+
+#[test]
+fn padded_rows_require_in_range_structural_valid_lengths() -> anyhow::Result<()> {
+    let geometry = QWEN_REDUCED;
+    let root = package(geometry)?;
+    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+    let request = request_padded_rows(
+        geometry,
+        "invalid-padding",
+        &[&[5, 7, 11], &[13, 17, 19]],
+        &[3, 3],
+        0,
+        None,
+    )?
+    .with_input("accepted_len", Value::from_slice_i64(&[3, 4], &[2])?);
+
+    let error = match engine.run_pipeline(request) {
+        Ok(_) => panic!("an over-extent valid length must fail before component execution"),
+        Err(error) => error,
+    };
+    let message = format!("{error:#}");
+    assert!(message.contains("padding.valid_lengths"), "{message}");
+    assert!(message.contains("accepted_len"), "{message}");
+    assert!(message.contains("0..=3"), "{message}");
+    assert!(message.contains("row 1"), "{message}");
     Ok(())
 }
 

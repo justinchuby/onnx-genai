@@ -1078,6 +1078,7 @@ impl<'a> WorkflowExecutionPlan<'a> {
             )?;
         }
         let request_count = super::batching::validate_workflow_batch_inputs(workflow, &values)?;
+        validate_workflow_padding_values(workflow, &values)?;
         // The bound the continuation cell declares is the package's own context
         // limit, and this is the only place it can be checked: a continuation is
         // deliberately not loop-carried, so it never reaches the carry path's
@@ -3659,7 +3660,9 @@ impl WorkflowRuntime {
                 match &input.source {
                     WorkflowInputSource::Request => match &input.role {
                         onnx_genai_metadata::SemanticInputRole::Runtime { role, .. } => {
-                            workflow_request_value(role, request, &input.contract)?
+                            workflow_request_value(role, request, &input.contract).with_context(
+                                || format!("binding workflow request input '{name}'"),
+                            )?
                         }
                         onnx_genai_metadata::SemanticInputRole::Opaque => {
                             anyhow::bail!(
@@ -3820,7 +3823,9 @@ fn workflow_request_value(
                 let columns = rows[0].len();
                 anyhow::ensure!(
                     rows.iter().all(|row| row.len() == columns),
-                    "multi-row prompt token rows must have equal lengths"
+                    "multi-row prompt token rows must have equal lengths; padded or ragged prompt \
+                     execution requires a rectangular token tensor plus an explicit \
+                     padding.valid_lengths companion"
                 );
                 let data = rows
                     .iter()
@@ -4428,6 +4433,50 @@ pub(super) fn validate_workflow_value(
             },
             TensorDimension::Fixed(_) => {}
             TensorDimension::Any => {}
+        }
+    }
+    Ok(())
+}
+
+fn validate_workflow_padding_values(
+    workflow: &WorkflowSpec,
+    values: &PipelineTensors,
+) -> anyhow::Result<()> {
+    for (name, input) in &workflow.inputs {
+        let Some(value) = values.get(name) else {
+            continue;
+        };
+        for padding in &input.contract.padding {
+            let axis = input
+                .contract
+                .shape
+                .iter()
+                .position(|dimension| {
+                    dimension == &TensorDimension::Symbol(padding.dimension.clone())
+                })
+                .with_context(|| {
+                    format!(
+                        "workflow input '{name}' padding dimension '{}' is not present in its shape",
+                        padding.dimension
+                    )
+                })?;
+            let extent = value.shape()[axis];
+            let lengths = values.get(&padding.valid_lengths).with_context(|| {
+                format!(
+                    "workflow input '{name}' requires padding.valid_lengths companion '{}'",
+                    padding.valid_lengths
+                )
+            })?;
+            for (row, length) in lengths.to_vec_i64()?.into_iter().enumerate() {
+                anyhow::ensure!(
+                    (0..=extent).contains(&length),
+                    "workflow input '{name}' padding.valid_lengths companion '{}' row {row} is \
+                     {length}, expected an explicit logical extent in 0..={extent} for padded \
+                     dimension '{}'",
+                    padding.valid_lengths,
+                    padding.dimension
+                );
+            }
         }
     }
     Ok(())
@@ -6060,7 +6109,9 @@ mod workflow_sampling_binding_tests {
                 Ok(_) => panic!("ragged rows must fail"),
                 Err(error) => error,
             };
-        assert!(error.to_string().contains("equal lengths"));
+        let message = error.to_string();
+        assert!(message.contains("equal lengths"), "{message}");
+        assert!(message.contains("padding.valid_lengths"), "{message}");
     }
 
     #[test]

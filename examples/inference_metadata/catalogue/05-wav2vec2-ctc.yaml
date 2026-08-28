@@ -60,7 +60,8 @@ pipeline:
           shape:
           - batch
           batch_layout:
-            kind: shared
+            kind: request_aligned
+            axis: 0
         role: tensor
         stage: pre_adapter
     components:
@@ -104,7 +105,8 @@ pipeline:
               shape:
               - batch
               batch_layout:
-                kind: shared
+                kind: request_aligned
+                axis: 0
     state: {}
     steps:
     - kind: invoke

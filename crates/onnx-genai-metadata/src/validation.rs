@@ -3684,12 +3684,23 @@ fn validate_padding(
                 companion.dtype
             ));
         }
-        if !companion.batch_layout.is_shared() {
+        let companion_keeps_request_axis = contract
+            .batch_layout
+            .request_axis()
+            .is_some_and(|request_axis| request_axis < axis);
+        let expected_layout = if companion_keeps_request_axis {
+            &contract.batch_layout
+        } else {
+            &crate::schema::BatchLayout::Shared
+        };
+        if &companion.batch_layout != expected_layout {
             errors.push(format!(
-                "{path} valid_lengths '{valid_lengths}' declares {} but must declare shared; it \
-                 has one entry per position of the axes outer to '{dimension}', which is not a \
-                 request row count",
-                companion.batch_layout.kind_name()
+                "{path} valid_lengths '{valid_lengths}' declares {} but must declare {}; it has \
+                 one entry per position of the axes outer to '{dimension}' and must preserve the \
+                 owning value's request-row layout exactly when that request axis is outer to the \
+                 padded dimension",
+                companion.batch_layout.kind_name(),
+                expected_layout.kind_name(),
             ));
         }
         validate_valid_lengths_shape(

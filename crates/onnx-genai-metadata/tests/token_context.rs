@@ -248,6 +248,96 @@ fn fixture() -> InferenceMetadata {
     metadata
 }
 
+fn add_request_aligned_padding(metadata: &mut InferenceMetadata) {
+    let workflow = &mut metadata.pipeline.as_mut().expect("pipeline").workflow;
+    let padding = vec![PaddedDimension {
+        dimension: "sequence".to_string(),
+        valid_lengths: "request.token_lengths".to_string(),
+    }];
+    for input in ["request.hidden_states", "request.token_ids"] {
+        workflow
+            .inputs
+            .get_mut(input)
+            .expect("padded workflow input")
+            .contract
+            .padding = padding.clone();
+    }
+    workflow.inputs.insert(
+        "request.token_lengths".to_string(),
+        WorkflowInput {
+            contract: contract("int64", &["batch"]),
+            role: SemanticInputRole::Opaque,
+            source: WorkflowInputSource::Application {
+                name: "token_lengths".to_string(),
+            },
+            required: true,
+            default: None,
+            present_as: None,
+            externally_suppliable: false,
+        },
+    );
+
+    let model = workflow.components.get_mut("model").expect("model");
+    let component_padding = vec![PaddedDimension {
+        dimension: "sequence".to_string(),
+        valid_lengths: "valid_lengths".to_string(),
+    }];
+    for input in ["inputs_embeds", "token_ids"] {
+        model
+            .ports
+            .inputs
+            .get_mut(input)
+            .expect("padded component input")
+            .padding = component_padding.clone();
+    }
+    model
+        .ports
+        .inputs
+        .insert("valid_lengths".to_string(), contract("int64", &["batch"]));
+    let inputs = workflow
+        .steps
+        .iter_mut()
+        .find_map(|step| match step {
+            WorkflowStep::Invoke {
+                component, inputs, ..
+            } if component == "model" => Some(inputs),
+            _ => None,
+        })
+        .expect("model invoke");
+    inputs.insert(
+        "valid_lengths".to_string(),
+        "request.token_lengths".to_string(),
+    );
+}
+
+#[test]
+fn padded_sequence_valid_lengths_follow_the_outer_request_axis() {
+    let mut metadata = fixture();
+    add_request_aligned_padding(&mut metadata);
+    validate_metadata(&metadata).expect("request-aligned valid lengths are structurally valid");
+
+    metadata
+        .pipeline
+        .as_mut()
+        .expect("pipeline")
+        .workflow
+        .inputs
+        .get_mut("request.token_lengths")
+        .expect("valid lengths")
+        .contract
+        .batch_layout = BatchLayout::Shared;
+    let errors =
+        validate_metadata(&metadata).expect_err("shared valid lengths lose request-row ownership");
+    assert!(
+        errors.iter().any(|error| {
+            error.contains("request.token_lengths")
+                && error.contains("must declare request_aligned")
+                && error.contains("preserve")
+        }),
+        "{errors:#?}"
+    );
+}
+
 #[test]
 fn token_context_requires_new_reader_and_runtime_admission() {
     let mut old = fixture();
