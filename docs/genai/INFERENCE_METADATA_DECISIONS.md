@@ -1171,6 +1171,10 @@ Full-sequence, chunked-prefill, and decode execution **MUST** agree at equivalen
 boundaries. Geometry and table contents are package facts; placement, sharding,
 offload, prefetch, and memory budgets are runtime policy.
 
+The checked-in Qwen4-Exp equation/vector provenance is documented in
+[`QWEN4_EXP_PLE_REFERENCE.md`](QWEN4_EXP_PLE_REFERENCE.md). It is deterministic
+synthetic-weight conformance evidence, not an official-checkpoint parity claim.
+
 ---
 
 ## 13. Speculative execution
@@ -1889,13 +1893,14 @@ pipeline:
       logits:
         contract:
           shape: [batch, frames, vocab]
+          batch_layout: { kind: request_aligned, axis: 0 }
           padding:
             - { dimension: frames, valid_lengths: frame_lengths }
       frame_lengths:
         contract:
           dtype: int64
           shape: [batch]
-          batch_layout: { kind: shared }
+          batch_layout: { kind: request_aligned, axis: 0 }
 profiles:
   transcription:
     outputs:
