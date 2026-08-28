@@ -27,6 +27,9 @@ onnx-genai version                       # version + execution providers
 `generate`, `run`, and `show` accept either a model directory or a config file
 inside it (a file resolves to its parent directory).
 
+For `generate`, `MODEL PROMPT` is the canonical invocation. `--prompt PROMPT`
+is also supported; supply exactly one prompt, not both forms.
+
 ### Interactive REPL controls
 
 In `onnx-genai run`, press **Ctrl-C** while a response is generating to cancel
