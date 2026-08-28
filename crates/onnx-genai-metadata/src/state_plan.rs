@@ -146,6 +146,24 @@ impl ResolvedStatePlan {
 struct TerminalCandidate {
     binding: String,
     writer: Option<StateWriter>,
+    provenance: ControlFlowProvenance,
+}
+
+/// The structural scope that owns a terminal value.
+///
+/// A component/port/binding triple identifies a value producer, but not the
+/// branch edge that makes that producer's value visible. Branch cases must keep
+/// their identity until a declared phi exports the selected value.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum ControlFlowProvenance {
+    Enclosing,
+    BranchEdge { branch: usize, edge: usize },
+}
+
+impl ControlFlowProvenance {
+    fn is_local_to(&self, branch: usize) -> bool {
+        matches!(self, Self::BranchEdge { branch: owner, .. } if *owner == branch)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -154,6 +172,7 @@ struct StateFlowAnalysis {
     carry_sources: BTreeMap<(String, String), StateCarrySource>,
     terminal_candidates: BTreeMap<String, BTreeSet<TerminalCandidate>>,
     errors: Vec<String>,
+    next_branch: usize,
 }
 
 /// Resolve state source, readers, writers, and final writers from explicit
@@ -416,8 +435,16 @@ pub fn validate_state_plan(workflow: &WorkflowSpec, plan: &ResolvedStatePlan) ->
 fn analyze_state_flow(workflow: &WorkflowSpec) -> StateFlowAnalysis {
     type Flow = BTreeMap<String, BTreeSet<TerminalCandidate>>;
 
-    fn singleton(binding: String, writer: Option<StateWriter>) -> BTreeSet<TerminalCandidate> {
-        BTreeSet::from([TerminalCandidate { binding, writer }])
+    fn singleton(
+        binding: String,
+        writer: Option<StateWriter>,
+        provenance: ControlFlowProvenance,
+    ) -> BTreeSet<TerminalCandidate> {
+        BTreeSet::from([TerminalCandidate {
+            binding,
+            writer,
+            provenance,
+        }])
     }
 
     fn invoke_writers(
@@ -464,9 +491,10 @@ fn analyze_state_flow(workflow: &WorkflowSpec) -> StateFlowAnalysis {
         steps: &[WorkflowStep],
         mut flow: Flow,
         analysis: &mut StateFlowAnalysis,
+        provenance: ControlFlowProvenance,
     ) -> Flow {
         for step in steps {
-            flow = walk_step(workflow, step, flow, analysis);
+            flow = walk_step(workflow, step, flow, analysis, provenance.clone());
         }
         flow
     }
@@ -476,14 +504,20 @@ fn analyze_state_flow(workflow: &WorkflowSpec) -> StateFlowAnalysis {
         step: &WorkflowStep,
         mut flow: Flow,
         analysis: &mut StateFlowAnalysis,
+        provenance: ControlFlowProvenance,
     ) -> Flow {
         match step {
-            WorkflowStep::Sequence { steps } => walk_sequence(workflow, steps, flow, analysis),
+            WorkflowStep::Sequence { steps } => {
+                walk_sequence(workflow, steps, flow, analysis, provenance)
+            }
             WorkflowStep::Invoke {
                 component, outputs, ..
             } => {
                 for (cell, writer) in invoke_writers(workflow, component, outputs) {
-                    flow.insert(cell, singleton(writer.binding.clone(), Some(writer)));
+                    flow.insert(
+                        cell,
+                        singleton(writer.binding.clone(), Some(writer), provenance.clone()),
+                    );
                 }
                 flow
             }
@@ -493,7 +527,7 @@ fn analyze_state_flow(workflow: &WorkflowSpec) -> StateFlowAnalysis {
                 carried,
                 ..
             } => {
-                let setup_flow = walk_sequence(workflow, setup, flow, analysis);
+                let setup_flow = walk_sequence(workflow, setup, flow, analysis, provenance.clone());
                 let mut body_flow = setup_flow.clone();
                 let mut carried_cells = BTreeSet::new();
                 for carry in carried {
@@ -572,9 +606,13 @@ fn analyze_state_flow(workflow: &WorkflowSpec) -> StateFlowAnalysis {
                     analysis
                         .carries
                         .push((carry.cell.clone(), carry.next.clone(), source));
-                    body_flow.insert(carry.cell.clone(), singleton(carry.cell.clone(), None));
+                    body_flow.insert(
+                        carry.cell.clone(),
+                        singleton(carry.cell.clone(), None, provenance.clone()),
+                    );
                 }
-                let body_flow = walk_sequence(workflow, steps, body_flow, analysis);
+                let body_flow =
+                    walk_sequence(workflow, steps, body_flow, analysis, provenance.clone());
                 let mut exit_flow = setup_flow;
                 for (cell, candidates) in body_flow {
                     if !carried_cells.contains(&cell) {
@@ -590,7 +628,7 @@ fn analyze_state_flow(workflow: &WorkflowSpec) -> StateFlowAnalysis {
                     };
                     exit_flow.insert(
                         carry.cell.clone(),
-                        singleton(carry.cell.clone(), Some(writer)),
+                        singleton(carry.cell.clone(), Some(writer), provenance.clone()),
                     );
                 }
                 exit_flow
@@ -601,18 +639,36 @@ fn analyze_state_flow(workflow: &WorkflowSpec) -> StateFlowAnalysis {
                 outputs,
                 ..
             } => {
+                let branch = analysis.next_branch;
+                analysis.next_branch += 1;
                 let case_flows = cases
                     .iter()
-                    .map(|(case, step)| {
+                    .enumerate()
+                    .map(|(edge, (case, step))| {
                         (
                             case.as_str(),
-                            walk_step(workflow, step, flow.clone(), analysis),
+                            walk_step(
+                                workflow,
+                                step,
+                                flow.clone(),
+                                analysis,
+                                ControlFlowProvenance::BranchEdge { branch, edge },
+                            ),
                         )
                     })
                     .collect::<Vec<_>>();
-                let default_flow = default
-                    .as_deref()
-                    .map(|step| walk_step(workflow, step, flow.clone(), analysis));
+                let default_flow = default.as_deref().map(|step| {
+                    walk_step(
+                        workflow,
+                        step,
+                        flow.clone(),
+                        analysis,
+                        ControlFlowProvenance::BranchEdge {
+                            branch,
+                            edge: cases.len(),
+                        },
+                    )
+                });
                 let mut joined = flow.clone();
                 for cell in workflow.state.keys() {
                     let mut candidates = BTreeSet::new();
@@ -622,7 +678,11 @@ fn analyze_state_flow(workflow: &WorkflowSpec) -> StateFlowAnalysis {
                     if let Some(default_flow) = &default_flow {
                         candidates.extend(default_flow.get(cell).cloned().unwrap_or_default());
                     }
-                    if candidates.len() <= 1 {
+                    if candidates.len() <= 1
+                        && candidates
+                            .iter()
+                            .all(|candidate| !candidate.provenance.is_local_to(branch))
+                    {
                         joined.insert(cell.clone(), candidates);
                         continue;
                     }
@@ -663,7 +723,10 @@ fn analyze_state_flow(workflow: &WorkflowSpec) -> StateFlowAnalysis {
                             port: None,
                             binding: output.clone(),
                         };
-                        joined.insert(cell.clone(), singleton(output.clone(), Some(writer)));
+                        joined.insert(
+                            cell.clone(),
+                            singleton(output.clone(), Some(writer), provenance.clone()),
+                        );
                     } else {
                         joined.insert(cell.clone(), candidates);
                     }
@@ -677,10 +740,25 @@ fn analyze_state_flow(workflow: &WorkflowSpec) -> StateFlowAnalysis {
     let initial = workflow
         .state
         .iter()
-        .map(|(cell, state)| (cell.clone(), singleton(state.initializer.clone(), None)))
+        .map(|(cell, state)| {
+            (
+                cell.clone(),
+                singleton(
+                    state.initializer.clone(),
+                    None,
+                    ControlFlowProvenance::Enclosing,
+                ),
+            )
+        })
         .collect();
     let mut analysis = StateFlowAnalysis::default();
-    analysis.terminal_candidates = walk_sequence(workflow, &workflow.steps, initial, &mut analysis);
+    analysis.terminal_candidates = walk_sequence(
+        workflow,
+        &workflow.steps,
+        initial,
+        &mut analysis,
+        ControlFlowProvenance::Enclosing,
+    );
     analysis
 }
 
@@ -996,6 +1074,89 @@ mod tests {
                 cases: BTreeMap::from([
                     ("0".to_string(), "prefill.cache".to_string()),
                     ("1".to_string(), "decode.cache".to_string()),
+                ]),
+                default: None,
+            },
+        );
+        let plan = resolve_state_plan(&workflow);
+        assert_eq!(
+            plan.cell("cache")
+                .and_then(|state| state.final_writer.clone()),
+            Some(StateFinalWriter::Writer(StateWriter {
+                id: "branch:joined.cache".to_string(),
+                component: None,
+                port: None,
+                binding: "joined.cache".to_string(),
+            }))
+        );
+        assert!(
+            validate_state_plan(&workflow, &plan)
+                .iter()
+                .all(|error| !error.contains("ambiguous terminal writers"))
+        );
+    }
+
+    #[test]
+    fn branch_local_writers_with_equal_bindings_still_require_an_output_phi() {
+        let mut workflow = workflow(include_str!(
+            "../../../examples/inference_metadata/catalogue/18-static-cache-indexed-scatter.yaml"
+        ));
+        let state = workflow
+            .state
+            .get_mut("cache")
+            .expect("fixture declares cache state");
+        state.scope = WorkflowStateScope::Session;
+        workflow.steps.push(WorkflowStep::Branch {
+            predicate: "request.position".to_string(),
+            cases: BTreeMap::from([
+                (
+                    "0".to_string(),
+                    WorkflowStep::Invoke {
+                        component: "decoder".to_string(),
+                        inputs: BTreeMap::new(),
+                        outputs: BTreeMap::from([(
+                            "present_cache".to_string(),
+                            "branch.cache".to_string(),
+                        )]),
+                    },
+                ),
+                (
+                    "1".to_string(),
+                    WorkflowStep::Invoke {
+                        component: "decoder".to_string(),
+                        inputs: BTreeMap::new(),
+                        outputs: BTreeMap::from([(
+                            "present_cache".to_string(),
+                            "branch.cache".to_string(),
+                        )]),
+                    },
+                ),
+            ]),
+            default: None,
+            outputs: BTreeMap::new(),
+        });
+
+        let errors = validate_state_plan(&workflow, &resolve_state_plan(&workflow));
+        assert!(
+            errors.iter().any(|error| {
+                error.contains("cache")
+                    && error.contains("branch.cache")
+                    && error.contains("explicit branch output")
+            }),
+            "{errors:?}"
+        );
+
+        let WorkflowStep::Branch { outputs, .. } =
+            workflow.steps.last_mut().expect("test appended a branch")
+        else {
+            unreachable!()
+        };
+        outputs.insert(
+            "joined.cache".to_string(),
+            crate::schema::WorkflowBranchOutput {
+                cases: BTreeMap::from([
+                    ("0".to_string(), "branch.cache".to_string()),
+                    ("1".to_string(), "branch.cache".to_string()),
                 ]),
                 default: None,
             },

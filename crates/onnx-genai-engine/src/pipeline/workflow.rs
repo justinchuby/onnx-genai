@@ -6423,6 +6423,44 @@ steps:
         }
     }
 
+    struct BranchStateAdvanceHost;
+
+    impl WorkflowNodeHost for BranchStateAdvanceHost {
+        fn hosted_contracts(&self) -> &'static [&'static str] {
+            &["test.state.branch_advance"]
+        }
+
+        fn execute_contract_node(
+            &mut self,
+            request: WorkflowNodeRequest<'_>,
+        ) -> anyhow::Result<bool> {
+            if request.contract != "test.state.branch_advance" {
+                return Ok(false);
+            }
+            let state = request
+                .inputs
+                .get("state")
+                .and_then(|input| request.values.get(input))
+                .context("branch writer state is available")?
+                .to_vec_i64()?[0];
+            let increment = request
+                .inputs
+                .get("increment")
+                .and_then(|input| request.values.get(input))
+                .context("branch writer increment is available")?
+                .to_vec_i64()?[0];
+            let output = request
+                .outputs
+                .get("state")
+                .context("branch writer state output is bound")?;
+            request.values.insert(
+                output.clone(),
+                Value::from_slice_i64(&[state + increment], &[1])?,
+            );
+            Ok(true)
+        }
+    }
+
     impl WorkflowNodeHost for WrongCardinalityHost {
         fn hosted_contracts(&self) -> &'static [&'static str] {
             super::super::generation::DECODE_CORE_CONTRACTS
@@ -6838,6 +6876,126 @@ steps:
             vec![22],
             "the next turn restores once, then each sequential loop carries the preceding update"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn branch_phi_commits_the_selected_same_writer_value() -> anyhow::Result<()> {
+        let workflow: WorkflowSpec = serde_yaml::from_str(
+            r#"
+manifest: {}
+inputs:
+  state:
+    contract: { dtype: int64, rank: 1, shape: [1] }
+    role: { kind: opaque }
+    source: { kind: application, name: state }
+  choose:
+    contract: { dtype: int64, rank: 0, shape: [] }
+    role: { kind: opaque }
+    source: { kind: application, name: choose }
+  add_zero:
+    contract: { dtype: int64, rank: 0, shape: [] }
+    role: { kind: opaque }
+    source: { kind: application, name: add_zero }
+  add_ten:
+    contract: { dtype: int64, rank: 0, shape: [] }
+    role: { kind: opaque }
+    source: { kind: application, name: add_ten }
+  active:
+    contract: { dtype: bool, rank: 0, shape: [] }
+    role: { kind: opaque }
+    source: { kind: literal }
+    required: false
+    default: true
+  done:
+    contract: { dtype: bool, rank: 0, shape: [] }
+    role: { kind: opaque }
+    source: { kind: literal }
+    required: false
+    default: false
+outputs: {}
+components:
+  writer:
+    implementation: { kind: binding }
+    contract: { id: test.state.branch_advance, version: "1" }
+    ports:
+      inputs:
+        state: { dtype: int64, rank: 1, shape: [1] }
+        increment: { dtype: int64, rank: 0, shape: [] }
+      outputs:
+        state: { dtype: int64, rank: 1, shape: [1] }
+state:
+  accumulator:
+    contract: { dtype: int64, rank: 1, shape: [1] }
+    scope: session
+    initializer: state
+    recurrence: { kind: invariant }
+    service_group: memory
+    management: runtime
+    release_boundary: session
+serving:
+  active: active
+  done: done
+  state_service:
+    groups:
+      memory:
+        kind: recurrent
+        layout: scalar
+        update: { kind: replace }
+        ports:
+          writer:
+            accumulator: { input: state, output: state }
+steps:
+  - kind: branch
+    predicate: choose
+    cases:
+      "0":
+        kind: invoke
+        component: writer
+        inputs: { state: state, increment: add_zero }
+        outputs: { state: branch.next }
+      "1":
+        kind: invoke
+        component: writer
+        inputs: { state: state, increment: add_ten }
+        outputs: { state: branch.next }
+    outputs:
+      joined.accumulator:
+        cases: { "0": branch.next, "1": branch.next }
+"#,
+        )?;
+        let runtime = test_runtime(workflow);
+        let request = PipelineGenerateRequest::new(GenerateRequest::new(GeneratePrompt::TokenIds(
+            Vec::new(),
+        )))
+        .with_input(
+            "state",
+            Value::from_slice_i64(&[5], &[1]).expect("initial state"),
+        )
+        .with_input(
+            "choose",
+            Value::from_slice_i64(&[1], &[]).expect("selected branch"),
+        )
+        .with_input(
+            "add_zero",
+            Value::from_slice_i64(&[0], &[]).expect("zero increment"),
+        )
+        .with_input(
+            "add_ten",
+            Value::from_slice_i64(&[10], &[]).expect("selected increment"),
+        )
+        .with_session_id("branch-phi");
+        let mut plan =
+            WorkflowExecutionPlan::new_hosted(&runtime, request, &["test.state.branch_advance"])?;
+        let mut host = BranchStateAdvanceHost;
+        let mut hosted: Option<&mut dyn WorkflowNodeHost> = Some(&mut host);
+        plan.execute_retained_with_host(&mut hosted)?;
+
+        let state = runtime.worker.session_state.borrow();
+        let committed = state
+            .get(&("branch-phi".to_string(), "accumulator".to_string()))
+            .context("selected branch value was committed through its phi")?;
+        assert_eq!(committed.to_vec_i64()?, vec![15]);
         Ok(())
     }
 }
