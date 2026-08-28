@@ -45,6 +45,11 @@ pub enum ContinuousBatchEvent {
         handle: ContinuousBatchHandle,
         result: GenerateResult,
     },
+    Aborted {
+        handle: ContinuousBatchHandle,
+        outcome: crate::pipeline::TurnTransactionOutcome,
+        error: String,
+    },
 }
 
 #[derive(Debug)]
@@ -74,6 +79,7 @@ struct ContinuousBatchRow {
     max_context: Option<usize>,
     state: DecodeLoopState,
     pending: Option<RowPending>,
+    turn: ContinuousBatchTurn,
 }
 
 /// A row's prepared next-token input after one decode step.
@@ -89,6 +95,71 @@ enum RowPending {
     HostLogits(Vec<f32>),
     /// The token id already selected entirely on the device.
     DeviceToken(TokenId),
+}
+
+#[derive(Clone)]
+struct ContinuousBatchRowBaseline {
+    context_tokens: Vec<TokenId>,
+    generated_tokens: Vec<TokenId>,
+    generated_text: String,
+    step: usize,
+    prefix_cache_hit_len: usize,
+    logprobs: Option<Vec<crate::config::TokenLogprob>>,
+    rng: SamplingRng,
+}
+
+impl ContinuousBatchRowBaseline {
+    fn capture(context_tokens: &[TokenId], state: &DecodeLoopState) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            state.custom_sampler.is_none(),
+            "continuous batching cannot admit an atomic row turn with a custom sampler whose \
+             state has no snapshot/restore contract; use isolated execution"
+        );
+        Ok(Self {
+            context_tokens: context_tokens.to_vec(),
+            generated_tokens: state.generated_tokens.clone(),
+            generated_text: state.generated_text.clone(),
+            step: state.step,
+            prefix_cache_hit_len: state.prefix_cache_hit_len,
+            logprobs: state.logprobs.clone(),
+            rng: state.rng.clone(),
+        })
+    }
+
+    fn restore(&self, row: &mut ContinuousBatchRow) {
+        row.context_tokens.clone_from(&self.context_tokens);
+        row.state
+            .generated_tokens
+            .clone_from(&self.generated_tokens);
+        row.state.generated_text.clone_from(&self.generated_text);
+        row.state.step = self.step;
+        row.state.prefix_cache_hit_len = self.prefix_cache_hit_len;
+        row.state.logprobs.clone_from(&self.logprobs);
+        row.state.rng.clone_from(&self.rng);
+        row.pending = None;
+    }
+}
+
+struct ContinuousBatchTurn {
+    authority: crate::pipeline::TurnTransaction,
+    baseline: ContinuousBatchRowBaseline,
+    backend: onnx_genai_ort::decode::BatchedRowSnapshot,
+    output_baseline: usize,
+    staged_tokens: Vec<TokenId>,
+    staged_events: Vec<ContinuousBatchEvent>,
+}
+
+impl ContinuousBatchTurn {
+    fn stage_token(&mut self, handle: ContinuousBatchHandle, token: crate::config::GenerateToken) {
+        self.staged_tokens.push(token.token_id);
+        self.staged_events
+            .push(ContinuousBatchEvent::Token { handle, token });
+    }
+
+    fn stage_finished(&mut self, handle: ContinuousBatchHandle, result: GenerateResult) {
+        self.staged_events
+            .push(ContinuousBatchEvent::Finished { handle, result });
+    }
 }
 
 impl ContinuousBatchRow {
@@ -220,6 +291,9 @@ pub struct ContinuousBatchManager<'a> {
     /// load-bearing: a row whose tokens stopped reaching the stream would
     /// otherwise be invisible behind the event queue the caller actually reads.
     committed_per_row: Vec<Vec<i64>>,
+    /// Row/output-head pairs whose provisional authored emits must be restored
+    /// after the current cursor iteration returns from the hosted node.
+    pending_output_rollbacks: Vec<(usize, usize)>,
     /// Declared passes this manager has completed.
     ///
     /// A pass that ended while work remained would restart transparently on the
@@ -273,6 +347,7 @@ pub struct ContinuousBatchDiagnostic {
     pub committed_output_journal: Vec<Vec<i64>>,
     pub pending_token_handles: Vec<ContinuousBatchHandle>,
     pub pending_completion_handles: Vec<ContinuousBatchHandle>,
+    pub pending_abort_handles: Vec<ContinuousBatchHandle>,
 }
 
 impl BatchOccupancy {
@@ -313,6 +388,12 @@ impl<'a> ContinuousBatchManager<'a> {
             anyhow::bail!("continuous batch max_batch must be greater than zero");
         }
         for row in 0..max_batch {
+            decode.snapshot_row(row).map_err(|error| {
+                anyhow::anyhow!(
+                    "cannot admit atomic continuous-batch rows: backend row {row} has no complete \
+                     snapshot/restore contract: {error}"
+                )
+            })?;
             decode
                 .deactivate_row(row)
                 .map_err(|e| anyhow::anyhow!("Failed to initialize continuous row {row}: {e}"))?;
@@ -345,6 +426,7 @@ impl<'a> ContinuousBatchManager<'a> {
             // rather than a number invented to be large.
             iteration_bound: metadata_max_context.unwrap_or(static_max_len).max(1),
             committed_per_row: vec![Vec::new(); max_batch],
+            pending_output_rollbacks: Vec::new(),
             passes: 0,
         })
     }
@@ -422,8 +504,12 @@ impl<'a> ContinuousBatchManager<'a> {
         };
         let ran = {
             let mut host: Option<&mut dyn WorkflowNodeHost> = Some(self);
-            cursor.advance(&runtime, &mut host)?
+            cursor.advance(&runtime, &mut host)
         };
+        for (row, output_head) in self.pending_output_rollbacks.drain(..) {
+            cursor.restore_emitted_token_row(&runtime, row, output_head)?;
+        }
+        let ran = ran?;
         if ran {
             self.cursor = Some(cursor);
             return Ok(());
@@ -519,25 +605,95 @@ impl<'a> ContinuousBatchManager<'a> {
             })
             .collect::<Vec<_>>();
 
-        let mut committed: Vec<Option<TokenId>> = vec![None; self.rows.len()];
+        let mut committed = vec![None; self.rows.len()];
+        let mut finished_rows = Vec::new();
         for row_index in ready_rows {
             let mut row = self.rows[row_index]
                 .take()
                 .context("ready continuous row disappeared")?;
-            let (token, finished) = self.advance_row(&mut row)?;
-            committed[row_index] = Some(token);
-            self.committed_per_row[row_index].push(i64::from(token));
-            if finished {
-                self.decode
-                    .deactivate_row(row_index)
-                    .map_err(|e| anyhow::anyhow!("Failed to deactivate continuous row: {e}"))?;
-            } else {
-                self.rows[row_index] = Some(row);
+            match self.advance_row(&mut row) {
+                Ok((token, true)) => {
+                    committed[row_index] = Some(token);
+                    finished_rows.push((row_index, row));
+                }
+                Ok((token, false)) => {
+                    committed[row_index] = Some(token);
+                    self.rows[row_index] = Some(row);
+                }
+                Err(error) => {
+                    self.rows[row_index] = Some(row);
+                    self.abort_row(
+                        row_index,
+                        crate::pipeline::TurnAbortReason::ExecutionFailure,
+                        format!("{error:#}"),
+                    )?;
+                }
             }
         }
 
-        self.decode_next_pending_rows()?;
-        self.publish_row_outputs(request, &committed)
+        let advancing_rows = self
+            .rows
+            .iter()
+            .enumerate()
+            .filter_map(|(row_index, row)| {
+                row.as_ref()
+                    .is_some_and(|row| row.pending.is_none())
+                    .then_some(row_index)
+            })
+            .collect::<Vec<_>>();
+        if let Err(error) = self.decode_next_pending_rows() {
+            let message = format!("{error:#}");
+            for row_index in advancing_rows {
+                if self.rows[row_index].is_some() {
+                    self.abort_row(
+                        row_index,
+                        crate::pipeline::TurnAbortReason::ExecutionFailure,
+                        message.clone(),
+                    )?;
+                }
+            }
+        }
+        if let Err(error) = self.publish_row_outputs(request, &committed) {
+            let message = format!("{error:#}");
+            for (row_index, row) in finished_rows.drain(..) {
+                self.abort_detached_row(
+                    row_index,
+                    row,
+                    crate::pipeline::TurnAbortReason::CommitFailure,
+                    message.clone(),
+                )?;
+            }
+            let live_rows = self
+                .rows
+                .iter()
+                .enumerate()
+                .filter_map(|(row, state)| state.is_some().then_some(row))
+                .collect::<Vec<_>>();
+            for row in live_rows {
+                self.abort_row(
+                    row,
+                    crate::pipeline::TurnAbortReason::CommitFailure,
+                    message.clone(),
+                )?;
+            }
+            return Err(error);
+        }
+        for (row_index, row) in finished_rows {
+            if let Err(error) = self.decode.deactivate_row(row_index) {
+                self.abort_detached_row(
+                    row_index,
+                    row,
+                    crate::pipeline::TurnAbortReason::CommitFailure,
+                    format!("failed to deactivate completed continuous row: {error}"),
+                )?;
+                continue;
+            }
+            self.committed_per_row[row_index]
+                .extend(row.turn.staged_tokens.iter().copied().map(i64::from));
+            let _ = row.turn.authority.committed();
+            self.events.extend(row.turn.staged_events);
+        }
+        Ok(())
     }
 
     /// Rows that will decode again on the next iteration.
@@ -681,6 +837,30 @@ impl<'a> ContinuousBatchManager<'a> {
         true
     }
 
+    /// Cancel a queued request or atomically abort an admitted row.
+    ///
+    /// An active row is first restored to its admission-time baseline, then
+    /// released. Its staged token/completion events are discarded and replaced
+    /// by one typed abort outcome.
+    pub fn cancel(&mut self, handle: ContinuousBatchHandle) -> anyhow::Result<bool> {
+        if self.cancel_pending(handle) {
+            return Ok(true);
+        }
+        let Some(row) = self
+            .rows
+            .iter()
+            .position(|row| row.as_ref().is_some_and(|row| row.handle == handle))
+        else {
+            return Ok(false);
+        };
+        self.abort_row(
+            row,
+            crate::pipeline::TurnAbortReason::Cancellation,
+            "continuous batch request was cancelled".to_string(),
+        )?;
+        Ok(true)
+    }
+
     pub fn max_batch(&self) -> usize {
         self.rows.len()
     }
@@ -736,11 +916,15 @@ impl<'a> ContinuousBatchManager<'a> {
             .collect::<anyhow::Result<Vec<_>>>()?;
         let mut pending_token_handles = Vec::new();
         let mut pending_completion_handles = Vec::new();
+        let mut pending_abort_handles = Vec::new();
         for event in &self.events {
             match event {
                 ContinuousBatchEvent::Token { handle, .. } => pending_token_handles.push(*handle),
                 ContinuousBatchEvent::Finished { handle, .. } => {
                     pending_completion_handles.push(*handle);
+                }
+                ContinuousBatchEvent::Aborted { handle, .. } => {
+                    pending_abort_handles.push(*handle);
                 }
             }
         }
@@ -750,6 +934,7 @@ impl<'a> ContinuousBatchManager<'a> {
             committed_output_journal: self.committed_per_row.clone(),
             pending_token_handles,
             pending_completion_handles,
+            pending_abort_handles,
         })
     }
 
@@ -770,6 +955,53 @@ impl<'a> ContinuousBatchManager<'a> {
         } else {
             self.decode.logits_d2h_stats()
         }
+    }
+
+    fn abort_row(
+        &mut self,
+        row_index: usize,
+        reason: crate::pipeline::TurnAbortReason,
+        error: String,
+    ) -> anyhow::Result<()> {
+        let row = self.rows[row_index]
+            .take()
+            .with_context(|| format!("continuous row {row_index} disappeared before abort"))?;
+        self.abort_detached_row(row_index, row, reason, error)
+    }
+
+    fn abort_detached_row(
+        &mut self,
+        row_index: usize,
+        mut row: ContinuousBatchRow,
+        reason: crate::pipeline::TurnAbortReason,
+        error: String,
+    ) -> anyhow::Result<()> {
+        self.decode
+            .restore_row(row_index, &row.turn.backend)
+            .map_err(|restore| {
+                anyhow::anyhow!(
+                    "failed to restore continuous row {row_index} to its admitted baseline after \
+                     '{error}': {restore}"
+                )
+            })?;
+        let baseline = row.turn.baseline.clone();
+        baseline.restore(&mut row);
+        self.decode.deactivate_row(row_index).map_err(|release| {
+            anyhow::anyhow!(
+                "restored continuous row {row_index} after '{error}', but failed to release it: \
+                 {release}"
+            )
+        })?;
+        let handle = row.handle;
+        self.pending_output_rollbacks
+            .push((row_index, row.turn.output_baseline));
+        let outcome = row.turn.authority.abort(reason);
+        self.events.push_back(ContinuousBatchEvent::Aborted {
+            handle,
+            outcome,
+            error,
+        });
+        Ok(())
     }
 
     fn max_context_for_request(&self, options: &GenerateOptions) -> Option<usize> {
@@ -805,6 +1037,13 @@ impl<'a> ContinuousBatchManager<'a> {
             .map_err(|e| anyhow::anyhow!("Failed to assign continuous row: {e}"))?;
         let rng = SamplingRng::for_row(pending.options.seed, row_index);
         let loop_state = DecodeLoopState::with_rng(0, rng, pending.options.top_logprobs);
+        let baseline = ContinuousBatchRowBaseline::capture(&pending.prompt_tokens, &loop_state)?;
+        let backend = self.decode.snapshot_row(row_index).map_err(|error| {
+            anyhow::anyhow!(
+                "cannot admit atomic continuous row {row_index}: failed to snapshot its assigned \
+                 backend state: {error}"
+            )
+        })?;
         let row = ContinuousBatchRow {
             handle: pending.handle,
             context_tokens: pending.prompt_tokens,
@@ -813,6 +1052,16 @@ impl<'a> ContinuousBatchManager<'a> {
             max_context: pending.max_context,
             state: loop_state,
             pending: None,
+            turn: ContinuousBatchTurn {
+                authority: crate::pipeline::TurnTransaction::admit_runtime_participant(
+                    self.runtime.next_turn_transaction_id(),
+                ),
+                baseline,
+                backend,
+                output_baseline: self.committed_per_row[row_index].len(),
+                staged_tokens: Vec::new(),
+                staged_events: Vec::new(),
+            },
         };
         self.rows[row_index] = Some(row);
         Ok(())
@@ -864,10 +1113,7 @@ impl<'a> ContinuousBatchManager<'a> {
             Some(&mut callback),
         )?;
         if let Some(token) = emitted_token {
-            self.events.push_back(ContinuousBatchEvent::Token {
-                handle: row.handle,
-                token,
-            });
+            row.turn.stage_token(row.handle, token);
         }
 
         let finish_reason = match finish_reason {
@@ -892,16 +1138,14 @@ impl<'a> ContinuousBatchManager<'a> {
         };
 
         if let Some(reason) = finish_reason {
-            self.events.push_back(ContinuousBatchEvent::Finished {
-                handle: row.handle,
-                result: finish_result(
-                    self.tokenizer,
-                    &row.state.generated_tokens,
-                    reason,
-                    row.state.prefix_cache_hit_len,
-                    row.state.logprobs.as_deref(),
-                )?,
-            });
+            let result = finish_result(
+                self.tokenizer,
+                &row.state.generated_tokens,
+                reason,
+                row.state.prefix_cache_hit_len,
+                row.state.logprobs.as_deref(),
+            )?;
+            row.turn.stage_finished(row.handle, result);
             Ok((token_id, true))
         } else {
             Ok((token_id, false))
@@ -1657,12 +1901,29 @@ impl Engine {
 
             manager.step()?;
             for event in manager.poll() {
-                if let ContinuousBatchEvent::Finished { handle, result } = event {
-                    let index = *handle_to_index
-                        .get(&handle.id)
-                        .with_context(|| format!("continuous handle {} is unmapped", handle.id))?;
-                    results[index] = Some(result);
-                    scheduler.complete(index as u64);
+                match event {
+                    ContinuousBatchEvent::Finished { handle, result } => {
+                        let index = *handle_to_index.get(&handle.id).with_context(|| {
+                            format!("continuous handle {} is unmapped", handle.id)
+                        })?;
+                        results[index] = Some(result);
+                        scheduler.complete(index as u64);
+                    }
+                    ContinuousBatchEvent::Aborted {
+                        handle,
+                        outcome,
+                        error,
+                    } => {
+                        let index = *handle_to_index.get(&handle.id).with_context(|| {
+                            format!("continuous handle {} is unmapped", handle.id)
+                        })?;
+                        scheduler.complete(index as u64);
+                        anyhow::bail!(
+                            "scheduled continuous batch request {index} aborted as \
+                             {outcome:?}: {error}"
+                        );
+                    }
+                    ContinuousBatchEvent::Token { .. } => {}
                 }
             }
         }
@@ -1717,11 +1978,24 @@ fn collect_finished_events(
     results: &mut [Option<GenerateResult>],
 ) -> anyhow::Result<()> {
     for event in events {
-        if let ContinuousBatchEvent::Finished { handle, result } = event {
-            let slot = results
-                .get_mut(handle.id)
-                .with_context(|| format!("continuous handle {} is out of range", handle.id))?;
-            *slot = Some(result);
+        match event {
+            ContinuousBatchEvent::Finished { handle, result } => {
+                let slot = results
+                    .get_mut(handle.id)
+                    .with_context(|| format!("continuous handle {} is out of range", handle.id))?;
+                *slot = Some(result);
+            }
+            ContinuousBatchEvent::Aborted {
+                handle,
+                outcome,
+                error,
+            } => {
+                anyhow::bail!(
+                    "continuous batch request {} aborted as {outcome:?}: {error}",
+                    handle.id
+                );
+            }
+            ContinuousBatchEvent::Token { .. } => {}
         }
     }
     Ok(())
@@ -1888,6 +2162,40 @@ impl<'a> BatchedDecodeSession<'a> for NativeBatchedDecodeSession<'a> {
             .map_err(|e| native_err("native continuous assign_row", e))
     }
 
+    fn snapshot_row(
+        &mut self,
+        row: usize,
+    ) -> onnx_genai_ort::Result<onnx_genai_ort::decode::BatchedRowSnapshot> {
+        if !self.session.snapshot_batch_row_supported() {
+            return Err(onnx_genai_ort::OrtError::InvalidArgument(
+                "native continuous batching cannot admit an atomic row turn because this \
+                 decoder carries fixed recurrent/convolution state without an independent \
+                 row-slice snapshot; use isolated execution"
+                    .to_string(),
+            ));
+        }
+        Ok(onnx_genai_ort::decode::BatchedRowSnapshot::new(
+            row,
+            self.session
+                .batch_row_len(row)
+                .map_err(|e| native_err("native continuous snapshot row length", e))?,
+            self.session
+                .batch_row_is_active(row)
+                .map_err(|e| native_err("native continuous snapshot row activity", e))?,
+        ))
+    }
+
+    fn restore_row(
+        &mut self,
+        row: usize,
+        snapshot: &onnx_genai_ort::decode::BatchedRowSnapshot,
+    ) -> onnx_genai_ort::Result<()> {
+        snapshot.validate_row(row)?;
+        self.session
+            .restore_batch_row(row, snapshot.logical_len(), snapshot.active())
+            .map_err(|e| native_err("native continuous restore_row", e))
+    }
+
     fn step_select(
         &mut self,
         next_token_ids: &[i64],
@@ -2020,6 +2328,23 @@ mod tests {
             ))
         }
 
+        fn snapshot_row(
+            &mut self,
+            row: usize,
+        ) -> onnx_genai_ort::Result<onnx_genai_ort::decode::BatchedRowSnapshot> {
+            Ok(onnx_genai_ort::decode::BatchedRowSnapshot::new(
+                row, 0, false,
+            ))
+        }
+
+        fn restore_row(
+            &mut self,
+            _row: usize,
+            _snapshot: &onnx_genai_ort::decode::BatchedRowSnapshot,
+        ) -> onnx_genai_ort::Result<()> {
+            Ok(())
+        }
+
         fn step_select(
             &mut self,
             _next_token_ids: &[i64],
@@ -2062,6 +2387,23 @@ mod tests {
         }
 
         fn assign_row(&mut self, _row: usize) -> onnx_genai_ort::Result<()> {
+            Ok(())
+        }
+
+        fn snapshot_row(
+            &mut self,
+            row: usize,
+        ) -> onnx_genai_ort::Result<onnx_genai_ort::decode::BatchedRowSnapshot> {
+            Ok(onnx_genai_ort::decode::BatchedRowSnapshot::new(
+                row, 0, true,
+            ))
+        }
+
+        fn restore_row(
+            &mut self,
+            _row: usize,
+            _snapshot: &onnx_genai_ort::decode::BatchedRowSnapshot,
+        ) -> onnx_genai_ort::Result<()> {
             Ok(())
         }
 
@@ -2322,6 +2664,8 @@ mod tests {
         active: Vec<bool>,
         row_logits: Vec<Vec<f32>>,
         device: bool,
+        steps: usize,
+        fail_on_step: Option<usize>,
     }
 
     impl ScriptedBatchDecode {
@@ -2335,7 +2679,26 @@ mod tests {
                 active: vec![false; batch],
                 row_logits,
                 device,
+                steps: 0,
+                fail_on_step: None,
             }
+        }
+
+        fn fail_once_on_step(mut self, step: usize) -> Self {
+            self.fail_on_step = Some(step);
+            self
+        }
+
+        fn begin_step(&mut self) -> onnx_genai_ort::Result<()> {
+            self.steps += 1;
+            if self.fail_on_step == Some(self.steps) {
+                self.fail_on_step = None;
+                return Err(OrtError::InvalidArgument(format!(
+                    "deliberate batched forward failure at step {}",
+                    self.steps
+                )));
+            }
+            Ok(())
         }
 
         fn wrap(&self, buffer: Vec<Vec<f32>>) -> BatchStepLogits {
@@ -2378,12 +2741,42 @@ mod tests {
             Ok(())
         }
 
+        fn snapshot_row(
+            &mut self,
+            row: usize,
+        ) -> onnx_genai_ort::Result<onnx_genai_ort::decode::BatchedRowSnapshot> {
+            Ok(onnx_genai_ort::decode::BatchedRowSnapshot::new(
+                row,
+                self.row_len[row],
+                self.active[row],
+            ))
+        }
+
+        fn restore_row(
+            &mut self,
+            row: usize,
+            snapshot: &onnx_genai_ort::decode::BatchedRowSnapshot,
+        ) -> onnx_genai_ort::Result<()> {
+            snapshot.validate_row(row)?;
+            if snapshot.logical_len() > self.row_len[row] {
+                return Err(OrtError::InvalidArgument(format!(
+                    "cannot restore scripted row {row} forward from {} to {}",
+                    self.row_len[row],
+                    snapshot.logical_len()
+                )));
+            }
+            self.row_len[row] = snapshot.logical_len();
+            self.active[row] = snapshot.active();
+            Ok(())
+        }
+
         fn step_select(
             &mut self,
             _next_token_ids: &[i64],
             _position_ids: &[i64],
             advance_rows: &[bool],
         ) -> onnx_genai_ort::Result<BatchStepLogits> {
+            self.begin_step()?;
             // Physical-row indexed buffer.
             let buffer = (0..self.batch)
                 .map(|r| self.row_logits[r].clone())
@@ -2401,6 +2794,7 @@ mod tests {
             _next_token_ids: &[i64],
             _position_ids: &[i64],
         ) -> onnx_genai_ort::Result<BatchStepLogits> {
+            self.begin_step()?;
             // Active-row ordered buffer.
             let active = self.active_rows();
             let buffer = active.iter().map(|&r| self.row_logits[r].clone()).collect();
@@ -2522,6 +2916,193 @@ mod tests {
         assert_eq!(stats.bytes, 2 * vocab as u128 * u128::from(LOGIT_BYTES));
     }
 
+    #[test]
+    fn commit_only_defers_token_and_completion_events_until_the_row_finishes() {
+        let tokenizer = test_tokenizer();
+        let vocab = 8;
+        let mut manager = ContinuousBatchManager::new(
+            Box::new(ScriptedBatchDecode::new(
+                vec![one_hot(vocab, 3)],
+                vocab,
+                false,
+            )),
+            &tokenizer,
+            Vec::new(),
+            None,
+            1,
+            batch_runtime(),
+        )
+        .unwrap();
+        let mut request = greedy_req(1);
+        request.options.max_new_tokens = 3;
+        let handle = manager.submit(request).unwrap();
+
+        for generated in 0..3 {
+            manager.step().unwrap();
+            assert!(
+                manager.poll().is_empty(),
+                "row {handle:?} leaked a success-shaped event with only {generated} committed \
+                 tokens"
+            );
+            assert!(
+                manager.diagnostic().unwrap().committed_output_journal[0].is_empty(),
+                "the public output journal advanced before the turn committed"
+            );
+        }
+
+        manager.step().unwrap();
+        let events = manager.poll();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, ContinuousBatchEvent::Token { .. }))
+                .count(),
+            3
+        );
+        assert!(matches!(
+            events.last(),
+            Some(ContinuousBatchEvent::Finished {
+                handle: finished,
+                ..
+            }) if *finished == handle
+        ));
+        assert_eq!(
+            manager.diagnostic().unwrap().committed_output_journal[0],
+            vec![3, 3, 3]
+        );
+    }
+
+    #[test]
+    fn cancelling_one_row_restores_its_baseline_without_rewinding_its_sibling() {
+        let tokenizer = test_tokenizer();
+        let vocab = 8;
+        let mut manager = ContinuousBatchManager::new(
+            Box::new(ScriptedBatchDecode::new(
+                vec![one_hot(vocab, 1), one_hot(vocab, 2)],
+                vocab,
+                false,
+            )),
+            &tokenizer,
+            Vec::new(),
+            None,
+            2,
+            batch_runtime(),
+        )
+        .unwrap();
+        let mut first_request = greedy_req(1);
+        first_request.options.max_new_tokens = 3;
+        let first = manager.submit(first_request.clone()).unwrap();
+        let mut sibling_request = greedy_req(1);
+        sibling_request.options.max_new_tokens = 3;
+        let sibling = manager.submit(sibling_request).unwrap();
+
+        manager.step().unwrap();
+        manager.step().unwrap();
+        assert!(manager.poll().is_empty());
+        let before_abort = manager.diagnostic().unwrap();
+        assert_eq!(before_abort.rows[1].generated_tokens, 1);
+        assert_eq!(before_abort.rows[1].resident_tokens, 2);
+
+        assert!(manager.cancel(first).unwrap());
+        let abort_events = manager.poll();
+        assert!(matches!(
+            abort_events.as_slice(),
+            [ContinuousBatchEvent::Aborted {
+                handle,
+                outcome: crate::pipeline::TurnTransactionOutcome::AbortToBaseline {
+                    reason: crate::pipeline::TurnAbortReason::Cancellation,
+                    ..
+                },
+                ..
+            }] if *handle == first
+        ));
+        let after_abort = manager.diagnostic().unwrap();
+        assert!(after_abort.rows[0].handle.is_none());
+        assert_eq!(after_abort.rows[0].resident_tokens, 0);
+        assert_eq!(after_abort.rows[1].handle, Some(sibling));
+        assert_eq!(after_abort.rows[1].generated_tokens, 1);
+        assert_eq!(after_abort.rows[1].resident_tokens, 2);
+        assert!(after_abort.committed_output_journal[0].is_empty());
+
+        let retry = manager.submit(first_request).unwrap();
+        let mut token_events: HashMap<usize, Vec<TokenId>> = HashMap::new();
+        let mut finished = HashMap::new();
+        let mut guard = 0;
+        while manager.has_pending_work() {
+            manager.step().unwrap();
+            for event in manager.poll() {
+                match event {
+                    ContinuousBatchEvent::Token { handle, token } => {
+                        token_events
+                            .entry(handle.id)
+                            .or_default()
+                            .push(token.token_id);
+                    }
+                    ContinuousBatchEvent::Finished { handle, result } => {
+                        finished.insert(handle.id, result);
+                    }
+                    ContinuousBatchEvent::Aborted { error, .. } => {
+                        panic!("retry unexpectedly aborted: {error}")
+                    }
+                }
+            }
+            guard += 1;
+            assert!(guard < 100, "runaway retry");
+        }
+        manager.drain().unwrap();
+
+        assert!(!finished.contains_key(&first.id));
+        assert_eq!(token_events[&sibling.id], vec![2, 2, 2]);
+        assert_eq!(token_events[&retry.id], vec![1, 1, 1]);
+        assert_eq!(finished[&sibling.id].token_ids, vec![2, 2, 2]);
+        assert_eq!(finished[&retry.id].token_ids, vec![1, 1, 1]);
+    }
+
+    #[test]
+    fn a_forward_failure_retracts_staged_output_and_retry_replays_from_admission() {
+        let tokenizer = test_tokenizer();
+        let vocab = 8;
+        let decode =
+            ScriptedBatchDecode::new(vec![one_hot(vocab, 4)], vocab, false).fail_once_on_step(2);
+        let mut manager = ContinuousBatchManager::new(
+            Box::new(decode),
+            &tokenizer,
+            Vec::new(),
+            None,
+            1,
+            batch_runtime(),
+        )
+        .unwrap();
+        let mut request = greedy_req(1);
+        request.options.max_new_tokens = 2;
+        let aborted = manager.submit(request.clone()).unwrap();
+
+        manager.step().unwrap();
+        manager.step().unwrap();
+        let events = manager.poll();
+        assert!(matches!(
+            events.as_slice(),
+            [ContinuousBatchEvent::Aborted {
+                handle,
+                outcome: crate::pipeline::TurnTransactionOutcome::AbortToBaseline {
+                    reason: crate::pipeline::TurnAbortReason::ExecutionFailure,
+                    ..
+                },
+                error,
+            }] if *handle == aborted && error.contains("deliberate batched forward failure")
+        ));
+        let restored = manager.diagnostic().unwrap();
+        assert!(restored.rows[0].handle.is_none());
+        assert_eq!(restored.rows[0].resident_tokens, 0);
+        assert!(restored.committed_output_journal[0].is_empty());
+
+        let retry = manager.submit(request).unwrap();
+        let tokens = drive_to_completion(&mut manager);
+        manager.drain().unwrap();
+        assert_eq!(tokens[&retry.id], vec![4, 4]);
+        assert!(!tokens.contains_key(&aborted.id));
+    }
+
     fn drive_to_completion(manager: &mut ContinuousBatchManager) -> HashMap<usize, Vec<TokenId>> {
         let mut tokens: HashMap<usize, Vec<TokenId>> = HashMap::new();
         let mut guard = 0;
@@ -2599,6 +3180,9 @@ mod tests {
                         late = Some(manager.submit(request).unwrap());
                     }
                     ContinuousBatchEvent::Finished { .. } => {}
+                    ContinuousBatchEvent::Aborted { error, .. } => {
+                        panic!("unexpected aborted row: {error}")
+                    }
                 }
             }
             guard += 1;

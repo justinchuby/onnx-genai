@@ -189,6 +189,14 @@ impl ConnectorBridge {
         &self.stats
     }
 
+    /// Restore the last committed connector-activity journal after an admitted
+    /// turn aborts. Physical tier placement remains runtime policy; this only
+    /// prevents an uncommitted turn's lookup/fetch/store activity from becoming
+    /// the caller-visible "last generation" result.
+    pub(crate) fn restore_stats(&mut self, stats: ConnectorStats) {
+        self.stats = stats;
+    }
+
     /// Clear the accumulated stats (called at the start of each generation).
     pub(crate) fn reset_stats(&mut self) {
         self.stats = ConnectorStats::default();

@@ -1203,6 +1203,31 @@ impl NativeDecodeSession {
             .row_len(row)
     }
 
+    pub fn batch_row_is_active(&self, row: usize) -> anyhow::Result<bool> {
+        self.cuda
+            .as_ref()
+            .context("native batch row activity requires a CUDA decode session")?
+            .row_is_active(row)
+    }
+
+    pub fn snapshot_batch_row_supported(&self) -> bool {
+        self.cuda
+            .as_ref()
+            .is_some_and(DecodeCudaState::supports_row_transactions)
+    }
+
+    pub fn restore_batch_row(
+        &mut self,
+        row: usize,
+        target_len: usize,
+        active: bool,
+    ) -> anyhow::Result<()> {
+        self.cuda
+            .as_mut()
+            .context("native batch row restore requires a CUDA decode session")?
+            .restore_row(row, target_len, active)
+    }
+
     /// The pinned persistent-decode batch extent (1 unless
     /// `ONNX_GENAI_NATIVE_DECODE_BATCH` requested batch-N and a CUDA session was
     /// built). Lets a harness confirm the session actually bound the batch grid.

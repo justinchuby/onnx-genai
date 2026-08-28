@@ -36,6 +36,7 @@ mod native_component;
 mod row_state;
 mod runtime_state;
 pub mod speculative;
+mod turn_transaction;
 mod workflow;
 
 pub use adapters::{AdapterActivation, AdapterLifecycleDiagnostic, AdapterSelection};
@@ -49,6 +50,12 @@ pub(crate) use generation::validate_generation_workflow;
 pub use islands::ExecutionIslandDiagnostic;
 pub use onnx_genai_metadata::WorkflowOutputRole;
 pub use row_state::{RowPlan, RowScopedState, RowTable, check_selection, gather_rows};
+pub(crate) use turn_transaction::TurnTransaction;
+pub use turn_transaction::{
+    OutputPublicationBaseline, TurnAbortReason, TurnBaselineId, TurnCommittedBaseline,
+    TurnPublicationMode, TurnStateBaseline, TurnTransactionAdmissionError, TurnTransactionId,
+    TurnTransactionOutcome,
+};
 pub use workflow::{
     MISSING_REQUIRED_INPUT, WorkflowExecutionPlan, WorkflowPerformanceDiagnostic,
     is_missing_required_input, workflow_carries_session_state,
@@ -1009,6 +1016,18 @@ impl WorkflowRuntime {
             .session_state
             .borrow_mut()
             .retain(|(session, _), _| session != session_id);
+        self.worker
+            .session_effects
+            .borrow_mut()
+            .retain(|(session, _), _| session != session_id);
+        self.worker
+            .session_outputs
+            .borrow_mut()
+            .retain(|(session, _), _| session != session_id);
+        self.worker
+            .session_turn_versions
+            .borrow_mut()
+            .remove(session_id);
     }
 
     /// Length of the conversation this session has accumulated, when the
@@ -1024,14 +1043,12 @@ impl WorkflowRuntime {
     /// Whether this package continues a conversation by putting it in front of
     /// the next turn's prompt.
     ///
-    /// True only for `SessionStateCarrier::PromptContinuation`, read from the
-    /// shared classifier. Every other carrier hands its lease back inside the
-    /// graph or inside a decode core's own state, so nothing is prepended and a
-    /// request must not be charged for it.
+    /// True only for a canonical state-plan continuation writer. Every other
+    /// carrier hands its lease back inside the graph or inside a decode core's
+    /// own state, so nothing is prepended and a request must not be charged for
+    /// it.
     pub(crate) fn prepends_session_conversation(&self) -> bool {
-        onnx_genai_metadata::classify_session_state(self.workflow_spec())
-            .prompt_continuation()
-            .is_some()
+        self.session_continuation_cell().is_some()
     }
 
     /// Tokens this runtime will put in front of the next turn's prompt.
@@ -1064,8 +1081,7 @@ impl WorkflowRuntime {
         session_id: &str,
         tokens: &[i64],
     ) -> anyhow::Result<()> {
-        let facts = onnx_genai_metadata::classify_session_state(self.workflow_spec());
-        let cell = facts.prompt_continuation().context(
+        let cell = self.session_continuation_cell().context(
             "this workflow declares no prompt continuation, so it has no conversation to seed",
         )?;
         let rows = i64::try_from(tokens.len())?;
@@ -1077,8 +1093,7 @@ impl WorkflowRuntime {
     }
 
     pub(crate) fn session_prepended_prompt_len(&self, session_id: &str) -> usize {
-        let facts = onnx_genai_metadata::classify_session_state(self.workflow_spec());
-        let Some(cell) = facts.prompt_continuation() else {
+        let Some(cell) = self.session_continuation_cell() else {
             return 0;
         };
         self.worker
@@ -1096,7 +1111,7 @@ impl WorkflowRuntime {
     /// also the answer to "what has this session heard" — reported from the
     /// lease itself rather than from a count kept beside it.
     pub(crate) fn session_conversation(&self, session_id: &str) -> Option<Vec<i64>> {
-        let (cell, _, _, _) = workflow::workflow_prompt_continuation(self.workflow_spec())?;
+        let cell = self.session_continuation_cell()?;
         Some(
             self.worker
                 .session_state
@@ -1105,6 +1120,20 @@ impl WorkflowRuntime {
                 .map(|value| value.to_vec_i64().unwrap_or_default())
                 .unwrap_or_default(),
         )
+    }
+
+    fn session_continuation_cell(&self) -> Option<&str> {
+        self.plan
+            .compiled_workflow
+            .state_plan
+            .session_cells()
+            .find_map(|(cell, state)| {
+                matches!(
+                    state.final_writer,
+                    Some(onnx_genai_metadata::StateFinalWriter::Continuation { .. })
+                )
+                .then_some(cell)
+            })
     }
 
     pub fn memory_strategy_plan(&self) -> &MemoryStrategyPlan {
@@ -2056,7 +2085,8 @@ mod state_split_contracts {
     #[test]
     fn a_session_continues_from_the_workers_own_cells() -> anyhow::Result<()> {
         let runtime = generation::test_conversation_decoder_runtime()?;
-        let (cell, _, _, _) = workflow::workflow_prompt_continuation(runtime.workflow_spec())
+        let cell = runtime
+            .session_continuation_cell()
             .context("the conversation fixture must declare a prompt continuation")?;
         assert!(runtime.prepends_session_conversation());
 
