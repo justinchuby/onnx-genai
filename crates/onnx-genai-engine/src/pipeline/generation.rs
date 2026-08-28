@@ -277,10 +277,17 @@ fn validate_runtime_managed_values(
             // State the runtime already manages (the KV service group) never
             // becomes an SSA value in the first place; only ordinary outputs
             // are at issue here.
-            if workflow
-                .state
-                .values()
-                .any(|cell| cell.service_group.is_some() && cell.initializer == *value)
+            if onnx_genai_metadata::resolve_state_plan(workflow)
+                .cells()
+                .any(|(_, cell)| {
+                    cell.source.binding == *value
+                        && cell.readers.iter().any(|reader| {
+                            matches!(
+                                reader,
+                                onnx_genai_metadata::StateReader::ComponentPort { .. }
+                            )
+                        })
+                })
             {
                 continue;
             }
@@ -790,11 +797,17 @@ pub(crate) fn runtime_managed_seeds(workflow: &WorkflowSpec) -> HashSet<String> 
     }
     let mut seeds: HashSet<String> = HashSet::new();
     let mut non_runtime_seeds: HashSet<String> = HashSet::new();
-    for cell in workflow.state.values() {
-        if cell.management == onnx_genai_metadata::StateManagement::Runtime {
-            seeds.insert(cell.initializer.clone());
+    for (_, cell) in onnx_genai_metadata::resolve_state_plan(workflow).cells() {
+        let group_backed = cell.readers.iter().any(|reader| {
+            matches!(
+                reader,
+                onnx_genai_metadata::StateReader::ComponentPort { .. }
+            )
+        });
+        if group_backed {
+            seeds.insert(cell.source.binding.clone());
         } else {
-            non_runtime_seeds.insert(cell.initializer.clone());
+            non_runtime_seeds.insert(cell.source.binding.clone());
         }
     }
     seeds

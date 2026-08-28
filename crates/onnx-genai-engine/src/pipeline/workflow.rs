@@ -664,124 +664,6 @@ impl Drop for SessionLeaseGuard<'_> {
     }
 }
 
-/// The SSA value a step binds to one component port.
-///
-/// The lease is written to that value, and not to a name only one of the ways a
-/// component can be invoked would consult: a component may run generically, be
-/// fused into an execution island, be implemented by a host contract, or be
-/// redirected by a component override, and all four resolve their inputs from
-/// the SSA value the step named. Validation refuses a document where a step
-/// could then overwrite it, so writing it before the pass is sound.
-fn session_group_port_binding<'a>(
-    steps: &'a [onnx_genai_metadata::WorkflowStep],
-    component: &str,
-    port: &str,
-) -> Option<&'a str> {
-    fn walk<'a>(
-        step: &'a onnx_genai_metadata::WorkflowStep,
-        component: &str,
-        port: &str,
-    ) -> Option<&'a str> {
-        use onnx_genai_metadata::WorkflowStep as Step;
-        match step {
-            Step::Sequence { steps } => steps.iter().find_map(|step| walk(step, component, port)),
-            Step::Invoke {
-                component: invoked,
-                inputs,
-                ..
-            } => (invoked == component)
-                .then(|| inputs.get(port).map(String::as_str))
-                .flatten(),
-            Step::Loop { setup, steps, .. } => setup
-                .iter()
-                .chain(steps)
-                .find_map(|step| walk(step, component, port)),
-            Step::Branch { cases, default, .. } => cases
-                .values()
-                .find_map(|step| walk(step, component, port))
-                .or_else(|| {
-                    default
-                        .as_ref()
-                        .and_then(|step| walk(step, component, port))
-                }),
-            Step::Emit { .. } => None,
-        }
-    }
-    steps.iter().find_map(|step| walk(step, component, port))
-}
-
-/// The SSA value a pass left in a group-backed session cell.
-///
-/// The group's alias names the `output` port that advances the state; the step
-/// that invoked the component names the value that port was bound to. Reading
-/// the port through the step is what keeps this independent of how any
-/// particular package spells its values.
-///
-/// The last binding wins: a component invoked several times in one pass has
-/// advanced the state each time, and the lease keeps where it ended.
-fn session_group_output_value(
-    workflow: &WorkflowSpec,
-    cell: &str,
-    values: &PipelineTensors,
-) -> Option<String> {
-    fn walk(
-        step: &onnx_genai_metadata::WorkflowStep,
-        component: &str,
-        port: &str,
-        values: &PipelineTensors,
-        found: &mut Option<String>,
-    ) {
-        use onnx_genai_metadata::WorkflowStep as Step;
-        match step {
-            Step::Sequence { steps } => {
-                steps
-                    .iter()
-                    .for_each(|step| walk(step, component, port, values, found));
-            }
-            Step::Invoke {
-                component: invoked,
-                outputs,
-                ..
-            } => {
-                if invoked == component
-                    && let Some(value) = outputs.get(port)
-                    && values.contains_key(value)
-                {
-                    *found = Some(value.clone());
-                }
-            }
-            Step::Loop { setup, steps, .. } => {
-                setup
-                    .iter()
-                    .chain(steps)
-                    .for_each(|step| walk(step, component, port, values, found));
-            }
-            Step::Branch { cases, default, .. } => {
-                cases
-                    .values()
-                    .for_each(|step| walk(step, component, port, values, found));
-                if let Some(default) = default {
-                    walk(default, component, port, values, found);
-                }
-            }
-            Step::Emit { .. } => {}
-        }
-    }
-    for (component, alias) in onnx_genai_metadata::session_group_aliases(workflow, cell) {
-        let Some(port) = alias.output.as_deref() else {
-            continue;
-        };
-        let mut found = None;
-        for step in &workflow.steps {
-            walk(step, component, port, values, &mut found);
-        }
-        if found.is_some() {
-            return found;
-        }
-    }
-    None
-}
-
 /// Tokens a pass published to one declared output.
 ///
 /// This is the same selection [`super::PipelineOutputs`] makes and that the
@@ -1418,6 +1300,7 @@ impl<'a> WorkflowExecutionPlan<'a> {
         // no lease to read, so each cell starts from the initializer it
         // declares; refusing here would make declaring a conversation cost a
         // package the ability to answer one question.
+        let state_plan = onnx_genai_metadata::resolve_state_plan(workflow);
         let session_state = onnx_genai_metadata::classify_session_state(workflow);
         // Taken before the lease is read and released when the pass ends,
         // whichever way it ends. Declared session contracts validate as
@@ -1452,31 +1335,20 @@ impl<'a> WorkflowExecutionPlan<'a> {
                     onnx_genai_metadata::SessionStateCarrier::LoopCarry => {
                         values.insert(session_state_value_name(cell), value);
                     }
-                    // A group holds the storage, and the graph reaches it
-                    // through the `input` port its alias declares. The lease is
-                    // bound at that port rather than written over the SSA value
-                    // the cell's initializer names: that value may be produced
-                    // by a step — which would overwrite the lease and restart
-                    // the session with no error — and may be read by consumers
-                    // the group has nothing to do with.
+                    // Bind through the resolved reader edge. The plan is shared
+                    // with validation, so storage policy cannot select a
+                    // different state source at execution time.
                     onnx_genai_metadata::SessionStateCarrier::StateServiceGroup => {
-                        for (component, alias) in
-                            onnx_genai_metadata::session_group_aliases(workflow, cell)
-                        {
-                            let bound = session_group_port_binding(
-                                &workflow.steps,
-                                component,
-                                &alias.input,
-                            )
-                            .with_context(|| {
-                                format!(
-                                    "session state '{cell}' is held by a state service group \
-                                     whose alias reads component '{component}' port '{}', but no \
-                                     step binds it",
-                                    alias.input
-                                )
-                            })?;
-                            values.insert(bound.to_string(), clone_value(&value)?);
+                        let state = state_plan.cell(cell).with_context(|| {
+                            format!("resolved state plan has no session state '{cell}'")
+                        })?;
+                        for reader in &state.readers {
+                            let onnx_genai_metadata::StateReader::ComponentPort { binding, .. } =
+                                reader
+                            else {
+                                continue;
+                            };
+                            values.insert(binding.clone(), clone_value(&value)?);
                         }
                     }
                     // Bound into the prompt before this plan was built.
@@ -1525,7 +1397,7 @@ impl<'a> WorkflowExecutionPlan<'a> {
             let continuation = workflow_prompt_continuation(workflow)
                 .map(|(cell, _, tokens_output, _)| (cell.to_string(), tokens_output.to_string()));
             let mut updates = Vec::new();
-            for (cell, carrier) in session_state.carried() {
+            for (cell, _carrier) in session_state.carried() {
                 let state = workflow
                     .state
                     .get(cell)
@@ -1584,24 +1456,16 @@ impl<'a> WorkflowExecutionPlan<'a> {
                 // alias's `output` port, so the value bound to that port is the
                 // one to keep — reading the initializer instead would store the
                 // value the pass *started* from and replay it forever.
-                let group_output =
-                    if carrier == onnx_genai_metadata::SessionStateCarrier::StateServiceGroup {
-                        // Fail closed. Falling back to the initializer here would
-                        // store the value the pass *started* from, so the next turn
-                        // would replay this one — a wrong answer that looks like a
-                        // working session. A group cell advanced inside a branch is
-                        // the shape that reaches this.
-                        Some(session_group_output_value(workflow, cell, &values).with_context(|| {
-                        format!(
-                            "session state '{cell}' is held by a state service group, but this \
-                             pass bound no value to the group's output port for it, so the lease \
-                             could only be stored as the value the turn started from"
-                        )
-                    })?)
-                    } else {
-                        None
-                    };
-                let value_ref = group_output.as_deref().unwrap_or_else(|| {
+                let final_binding = state_plan
+                    .cell(cell)
+                    .and_then(|state| state.final_writer.as_ref())
+                    .and_then(|writer| match writer {
+                        onnx_genai_metadata::StateFinalWriter::Writer(writer) => {
+                            Some(writer.binding.as_str())
+                        }
+                        onnx_genai_metadata::StateFinalWriter::Continuation { .. } => None,
+                    });
+                let value_ref = final_binding.unwrap_or_else(|| {
                     final_state_refs
                         .get(cell)
                         .map(String::as_str)
@@ -7048,11 +6912,21 @@ impl WorkflowRuntime {
             let seeded = values
                 .get(&session_state_value_name(&carry.cell))
                 .or_else(|| values.get(&carry.current));
-            // A runtime-managed cell whose seed the package never materializes
-            // is the service's buffer, not an SSA value. Recording the
-            // reference is what the interpreter owes it; inventing a tensor
-            // would be a second answer about where that buffer lives.
-            if seeded.is_none() && state.management == onnx_genai_metadata::StateManagement::Runtime
+            // A state whose resolved readers include a component port is
+            // supplied by the service at that port when it has no materialized
+            // source.  Storage policy is irrelevant: the binding plan is the
+            // only authority for this decision.
+            if seeded.is_none()
+                && onnx_genai_metadata::resolve_state_plan(workflow)
+                    .cell(&carry.cell)
+                    .is_some_and(|cell| {
+                        cell.readers.iter().any(|reader| {
+                            matches!(
+                                reader,
+                                onnx_genai_metadata::StateReader::ComponentPort { .. }
+                            )
+                        })
+                    })
             {
                 final_state_refs.insert(carry.cell.clone(), carry.next.clone());
                 continue;
