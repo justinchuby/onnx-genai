@@ -395,12 +395,21 @@ pub struct ExpertShardFacts {
 
 /// Portable compatibility facts for speculative decoding.
 ///
-/// Proposal width, tree shape, scheduling, kernels, and whether speculation is
-/// enabled at all are runtime decisions.
+/// This is the only portable authority for a speculative step.  In particular,
+/// a runtime must not supplement it from a HuggingFace sidecar, a filename, a
+/// model family, or an inferred graph convention. Proposal width, scheduling,
+/// batching, kernels, and enablement remain runtime decisions.
 // Not `Eq`: a chained proposer's declared embedding normalizer is a real number.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SpeculativeContract {
+    /// Exact built-in contract identity. Unknown identities are not a
+    /// best-effort proposal format; they are an unsupported execution contract.
+    #[schemars(length(min = 1))]
+    pub identity: String,
+    /// Exact identity version understood by the runtime.
+    #[schemars(length(min = 1))]
+    pub version: String,
     /// Workflow component that proposes tokens.
     #[schemars(length(min = 1))]
     pub proposer: String,
@@ -415,15 +424,28 @@ pub struct SpeculativeContract {
     /// to `max_proposal_width`.
     #[serde(default)]
     pub proposal_execution: SpeculativeProposalExecution,
-    /// Proposer ports bound to target-owned values, by semantic role.
+    /// Proposer input ports bound to target-owned values, by semantic role.
+    ///
+    /// The keys are protocol roles and the values are declared proposer ports;
+    /// neither side is recovered from a name or tensor shape at runtime.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub port_bindings: BTreeMap<String, String>,
+    /// Target ports bound for verification, by protocol role.
+    ///
+    /// This is intentionally separate from [`Self::port_bindings`]: a target
+    /// port and a proposer port may have the same spelling while carrying
+    /// unrelated values.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub target_port_bindings: BTreeMap<String, String>,
     /// State groups the proposer shares with the target.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub shared_state: BTreeSet<String>,
-    /// Target initializers the proposer borrows.
+    /// Immutable target initializers the proposer borrows.
+    ///
+    /// The component and initializer are both required. A bare string used to
+    /// force a loader to guess which target artifact owned an initializer.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
-    pub shared_weights: BTreeSet<String>,
+    pub shared_weights: BTreeSet<SpeculativeInitializerRef>,
     /// How the proposer's vocabulary relates to the target's.
     pub vocabulary: SpeculativeVocabulary,
     /// Maximum number of proposed positions this package can undo.
@@ -439,9 +461,92 @@ pub struct SpeculativeContract {
     /// the caller must opt in explicitly.
     #[serde(default)]
     pub distribution_preserving: bool,
+    /// Exact values the verifier produces and the declared accepted-path
+    /// publication binding. Sampling is legal only when `probabilities` is
+    /// present; this is not inferred from `distribution_preserving`.
+    pub verification: SpeculativeVerification,
     /// State groups that must roll back when a proposal is rejected.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub rollback_state: BTreeSet<String>,
+}
+
+impl SpeculativeContract {
+    /// Admit distribution-preserving sampling only when both distributions were
+    /// declared. Greedy verification is intentionally a separate structural
+    /// path and needs no probability tensor.
+    pub fn admit_sampling(&self) -> Result<(), String> {
+        if self.verification.probabilities.is_none() {
+            return Err("speculative sampling was requested, but \
+                 speculative.verification.probabilities is absent. Declare both \
+                 proposal and target probability outputs for \
+                 distribution-preserving rejection sampling, or use greedy verification."
+                .to_string());
+        }
+        if !self.distribution_preserving {
+            return Err(
+                "speculative sampling was requested, but this contract does not claim \
+                 distribution_preserving. Use greedy verification or re-export a proposer \
+                 with exact proposal/target probability correction."
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
+/// A component-owned immutable initializer used by a speculative proposer.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SpeculativeInitializerRef {
+    /// Component whose ONNX artifact owns the initializer.
+    #[schemars(length(min = 1))]
+    pub component: String,
+    /// Exact ONNX initializer name.
+    #[schemars(length(min = 1))]
+    pub initializer: String,
+}
+
+/// Explicit verifier outputs for a speculative proposal.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SpeculativeVerification {
+    /// Target output used by the declared acceptance rule.
+    pub target_output: SpeculativeValueRef,
+    /// Explicit accepted-path output binding.
+    ///
+    /// A runtime-owned acceptance implementation names a stable binding such as
+    /// `accepted_prefix`; a graph-owned implementation names the component
+    /// output that provides it. Either way the binding is declared, rather than
+    /// selected from an output name or emission order.
+    pub accepted_path: SpeculativeAcceptedPath,
+    /// Proposal and target probability outputs used for exact rejection
+    /// sampling. Omission means this contract is greedy-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probabilities: Option<SpeculativeProbabilityOutputs>,
+}
+
+/// The authority that produces the accepted candidate path.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SpeculativeAcceptedPath {
+    /// The registered speculative executor publishes the accepted path under a
+    /// protocol binding. It remains an explicit output of the contract.
+    Runtime {
+        #[schemars(length(min = 1))]
+        binding: String,
+    },
+    /// A workflow component produces the accepted path.
+    Component { value: SpeculativeValueRef },
+}
+
+/// Probability outputs needed for distribution-preserving sampling.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SpeculativeProbabilityOutputs {
+    /// Per-candidate probabilities emitted by the proposer.
+    pub proposal: SpeculativeValueRef,
+    /// Target probabilities for the corresponding candidate positions.
+    pub target: SpeculativeValueRef,
 }
 
 /// Execution shape of a speculative proposer.
@@ -508,6 +613,113 @@ pub enum SpeculativeProposalExecution {
         /// present.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         token_embedding: Option<TokenEmbeddingSource>,
+    },
+    /// A multi-token-prediction head conditioned on an explicitly named target
+    /// hidden-state output. Its head inputs, outputs, shared weights, and
+    /// private-state lifetime are all declared here; it is not selected by a
+    /// model family or a legacy sidecar.
+    Mtp {
+        /// Target output that seeds the first MTP step.
+        target_hidden: SpeculativeValueRef,
+        /// MTP-head input receiving `target_hidden`.
+        #[schemars(length(min = 1))]
+        target_hidden_input: String,
+        /// MTP-head input receiving the selected token embedding.
+        #[schemars(length(min = 1))]
+        token_embedding_input: String,
+        /// MTP-head output projected through the declared shared LM head.
+        #[schemars(length(min = 1))]
+        hidden_output: String,
+        /// Shape of the target hidden state and MTP-head hidden-state input.
+        /// `bsh` is `[batch, sequence, hidden]`; `bshc` additionally carries
+        /// `hc_mult` before the feature axis.
+        #[serde(default)]
+        hidden_layout: MtpHiddenStateLayout,
+        /// Feature width of the declared hidden-state binding.
+        #[schemars(range(min = 1))]
+        hidden_size: usize,
+        /// Number of lanes in a `bshc` hidden state. The value is one for
+        /// `bsh`; declaring it prevents a runtime from guessing a lane axis.
+        #[serde(default = "one")]
+        #[schemars(range(min = 1))]
+        hc_mult: usize,
+        /// Optional MTP-head replacement-state output.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        state_output: Option<String>,
+        /// The target embedding and LM-head initializers MTP shares. Their
+        /// component ownership is explicit so no loader searches artifacts.
+        weights: MtpSharedWeights,
+        /// MTP private-state behavior between proposal blocks.
+        #[serde(default)]
+        state: MtpProposalState,
+    },
+    /// A generic branching candidate tree.
+    ///
+    /// The tree shape is proposal data: a runtime may pick a width and schedule
+    /// it, but it must receive the candidate ids and exactly one declared
+    /// topology representation from this proposer.
+    CandidateTree {
+        /// Proposer output carrying flattened candidate token IDs.
+        #[schemars(length(min = 1))]
+        candidate_tokens: String,
+        /// Parent-pointer or ancestor-mask topology over `candidate_tokens`.
+        topology: CandidateTreeTopology,
+    },
+}
+
+fn one() -> usize {
+    1
+}
+
+/// Layout of the target activation consumed by an MTP head.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MtpHiddenStateLayout {
+    /// `[batch, sequence, hidden]`.
+    #[default]
+    Bsh,
+    /// `[batch, sequence, hc_mult, hidden]`.
+    Bshc,
+}
+
+/// Exact immutable weight sharing used by an MTP head.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MtpSharedWeights {
+    pub embedding: SpeculativeInitializerRef,
+    pub lm_head: SpeculativeInitializerRef,
+}
+
+/// Whether MTP private state is reset or retained after a proposal.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum MtpProposalState {
+    /// The head has no state that survives a proposal. It is reset on every
+    /// outcome and therefore cannot become a hidden transaction participant.
+    #[default]
+    ProposalLocal,
+    /// The head state is retained only through the accepted prefix. Every
+    /// named cell must be a rollback participant.
+    AcceptedPrefix {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        recurrent: Vec<SpeculativeRecurrenceBinding>,
+    },
+}
+
+/// One of the two non-interchangeable candidate-tree topology encodings.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CandidateTreeTopology {
+    /// One parent index per flattened candidate (`-1`/a declared root sentinel
+    /// is represented by the producer's tensor contract).
+    ParentIndices {
+        #[schemars(length(min = 1))]
+        output: String,
+    },
+    /// Boolean ancestor matrix over flattened candidates.
+    AncestorMask {
+        #[schemars(length(min = 1))]
+        output: String,
     },
 }
 

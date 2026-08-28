@@ -54,11 +54,11 @@
 #   * Rollback: a rejected proposal rewinds every target KV cell; the folded carry
 #     has no state cell and is recomputed from committed tokens, so it is not in
 #     `rollback_state`.
-schema_version: v1
+schema_version: v1.5
 pipeline:
   workflow:
     manifest:
-      capabilities: [workflow_ssa, typed_emit, serving_service_contract]
+      capabilities: [workflow_ssa, typed_emit, serving_service_contract, canonical_speculation]
     inputs:
       request.active:
         contract: {dtype: bool, shape: [batch], batch_layout: {kind: request_aligned, axis: 0}}
@@ -275,6 +275,8 @@ pipeline:
                 sliding_key_0: {input: shared_kv.sliding_attention.key, access: read_only, role: key}
                 sliding_value_0: {input: shared_kv.sliding_attention.value, access: read_only, role: value}
 speculative:
+  identity: onnx-genai.speculative
+  version: '1'
   proposer: assistant
   target: target
   proposal_execution:
@@ -303,4 +305,7 @@ speculative:
   vocabulary: {kind: identical}
   max_proposal_width: 4
   distribution_preserving: true
+  verification:
+    target_output: {component: target, output: logits}
+    accepted_path: {kind: runtime, binding: accepted_prefix}
   rollback_state: [full_key_0, full_value_0, full_key_1, full_value_1, sliding_key_0, sliding_value_0]

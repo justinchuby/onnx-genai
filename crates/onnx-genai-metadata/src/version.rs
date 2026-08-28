@@ -39,7 +39,7 @@ impl fmt::Display for SchemaVersion {
 pub const INITIAL_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 0);
 
 /// The newest version this build can read.
-pub const SUPPORTED_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 4);
+pub const SUPPORTED_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 5);
 
 /// The version that first carried encoder batching, padding, ownership levels,
 /// and the video preprocessing program.
@@ -53,6 +53,10 @@ pub const TOOL_PROTOCOL_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 3)
 
 /// The version that introduced the graph-internal token-context contract.
 pub const TOKEN_CONTEXT_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 4);
+
+/// The version that made workflow-native, versioned speculative contracts the
+/// only portable speculative authority.
+pub const CANONICAL_SPECULATION_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 5);
 
 /// Normalize a declared `schema_version` spelling.
 ///
@@ -148,7 +152,7 @@ mod tests {
 
     #[test]
     fn a_canonical_version_prints_the_way_a_document_should_write_it() {
-        assert_eq!(SUPPORTED_SCHEMA_VERSION.to_string(), "v1.4");
+        assert_eq!(SUPPORTED_SCHEMA_VERSION.to_string(), "v1.5");
         assert_eq!(INITIAL_SCHEMA_VERSION.to_string(), "v1.0");
     }
 
@@ -164,7 +168,7 @@ mod tests {
     fn a_spelling_no_one_can_compare_says_how_to_write_one() {
         let error = normalize(Some("latest")).expect_err("'latest' is not a version");
         assert!(
-            error.contains("'v<major>.<minor>'") && error.contains("v1.4"),
+            error.contains("'v<major>.<minor>'") && error.contains("v1.5"),
             "{error}"
         );
         assert!(normalize(Some("v1.2.3")).is_err());
@@ -186,12 +190,12 @@ mod tests {
 
     #[test]
     fn a_newer_minor_is_refused_by_number_rather_than_by_field_name() {
-        let error = gate(Some("1.5")).expect_err("1.5 is newer than this build");
+        let error = gate(Some("1.6")).expect_err("1.6 is newer than this build");
         assert!(
-            error.contains("declares inference-metadata schema version v1.5"),
+            error.contains("declares inference-metadata schema version v1.6"),
             "{error}"
         );
-        assert!(error.contains("reads up to v1.4"), "{error}");
+        assert!(error.contains("reads up to v1.5"), "{error}");
         assert!(error.contains("refuses fields it does not know"), "{error}");
     }
 
@@ -210,6 +214,10 @@ mod tests {
             gate(Some("1.3")).expect("1.3"),
             TOOL_PROTOCOL_SCHEMA_VERSION
         );
-        assert_eq!(gate(Some("1.4")).expect("1.4"), SUPPORTED_SCHEMA_VERSION);
+        assert_eq!(
+            gate(Some("1.4")).expect("1.4"),
+            TOKEN_CONTEXT_SCHEMA_VERSION
+        );
+        assert_eq!(gate(Some("1.5")).expect("1.5"), SUPPORTED_SCHEMA_VERSION);
     }
 }

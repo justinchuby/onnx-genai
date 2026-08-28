@@ -1161,6 +1161,60 @@ must declare candidate tokens, parent topology or mask, verification outputs,
 accepted path, proposal probabilities required for sampling, and rollback of all
 affected state. Unknown proposal-contract identities or versions fail closed.
 
+The v1.5 wire shape makes those facts independently inspectable:
+
+```yaml
+speculative:
+  identity: onnx-genai.speculative
+  version: "1"
+  proposer: draft_component
+  target: target_component
+  port_bindings: { target_context: draft_input }
+  target_port_bindings: { tokens: target_input, scores: target_output }
+  shared_state: [target_cache_group]
+  shared_weights:
+    - { component: target_component, initializer: token_embedding }
+  vocabulary: { kind: identical }
+  max_proposal_width: 8             # rollback safety bound, never scheduling policy
+  distribution_preserving: true
+  proposal_execution:
+    kind: candidate_tree
+    candidate_tokens: candidate_token_ids
+    topology: { kind: parent_indices, output: candidate_parents }
+    # or: { kind: ancestor_mask, output: candidate_ancestors }
+  verification:
+    target_output: { component: target_component, output: target_logits }
+    accepted_path: { kind: runtime, binding: accepted_prefix }
+    probabilities:
+      proposal: { component: draft_component, output: proposal_probabilities }
+      target: { component: target_component, output: target_probabilities }
+  rollback_state: [target_key, target_value, draft_recurrence]
+```
+
+`candidate_tokens` and the selected topology name **proposer output ports**.
+The flattened parent vector is parent-before-child; an ancestor mask is
+transitive, includes its diagonal, and has no forward edges. A runtime never
+creates a tree by sorting names or interpreting a tensor payload. A target
+output, a component-owned accepted path, or a runtime accepted-prefix binding
+is likewise an explicit protocol output—not a convention based on `logits` or
+emission order.
+
+An MTP head uses the same outer contract with
+`proposal_execution.kind: mtp`. It explicitly names the target hidden output,
+head input ports, projected hidden output, hidden layout/lane count, target
+embedding and LM-head initializer owners, and whether its private state is
+proposal-local or retained through the accepted prefix. Retained MTP state names
+every recurrent cell and each must be in `rollback_state`. The graph may contain
+any number of recurrent groups; target state, proposer state, their cascades,
+and composed token-context histories commit or restore as one transaction.
+
+Greedy verification consumes `target_output`. Sampling is a different
+structural path: it is rejected before mutation unless both probability outputs
+are declared and `distribution_preserving: true`. On rejection it samples from
+the normalized positive residual `(p - q)+`; a fully accepted path samples one
+target bonus token. This is the distribution-preserving speculative rule, not
+argmax dressed as sampling.
+
 ### 13.2 What the runtime owns
 
 Proposal width K, tree shape, scheduling, kernels, and whether speculation runs
@@ -1504,6 +1558,7 @@ Packages written against the previous contract migrate as follows:
 | top-level `model.io` | declare port roles in `components.<c>.ports.roles` and cache ports in the owning `state_service` group |
 | `model.io.static_cache` | `state_service.groups.<g>.update` (`indexed_scatter`, `write_indices_ports`, `kv_length_ports`) plus `role`/`layer` on the group's port pairs |
 | `pipeline.models.<c>.io` | deleted with the composite IR; use `components.<c>.ports` |
+| `config.json.speculator_config` / MTP sidecar | import once into versioned `speculative` proposer, verification, state, and weight bindings; legacy-only packages refuse before mutation |
 | inferred tool format / `supports_tools` | declare exact `package.tool_protocol.identity` and `.version`, or omit the section when tools are unsupported |
 
 Every removed field is rejected by name, so migration failures are precise rather

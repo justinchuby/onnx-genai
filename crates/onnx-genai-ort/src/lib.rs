@@ -85,10 +85,6 @@ pub use managed_cuda_allocator::{ManagedCudaAllocatorConfig, ManagedCudaAllocato
 pub use mtp::{
     MtpDecodeOptions, MtpDecodeSession, MtpDraftKvMode, MtpHeadSignature, MtpStepOutput,
 };
-pub use onnx_genai_metadata::{
-    ProposalType, SpeculatorConfig, SpeculatorConfigSource, SpeculatorDescriptor,
-    SpeculatorProposerKind, SpeculatorProposerStatus, SpeculatorVerifier, detect_speculator,
-};
 pub use onnx_genai_runtime_config::EpSelection;
 pub use onnx_model_package::SelectionRequest as ModelPackageSelection;
 pub use session::{

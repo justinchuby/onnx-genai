@@ -1,18 +1,13 @@
 //! Public generation API types and configuration.
 
 use crate::logits::{StopSequence, TokenId};
+use anyhow::Context as _;
 use onnx_genai_kv::{CachePriority, DEFAULT_CHUNK_SIZE, KvDType, LocalTieredConfig, SequenceId};
 use onnx_genai_metadata::{GenerationContract, GenerationDefaults};
-// The sidecar-descriptor mapping is native-only; an ORT-only build imports none
-// of these.
-#[cfg(feature = "native-backend")]
-use onnx_genai_metadata::{
-    MtpHiddenLayout as MetadataMtpHiddenLayout, MtpKvMode as MetadataMtpKvMode, MtpProposerSpec,
-};
 use onnx_genai_ort::{Eagle3DraftKvMode, MtpDraftKvMode};
 use onnx_genai_scheduler::{Priority, ResourceLimit, ResourceLimits, SchedulerConfig};
 use serde::Deserialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Error returned when a user-facing resource limit cannot be parsed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -227,6 +222,15 @@ pub enum MtpHiddenLayout {
     Bshc,
 }
 
+impl From<onnx_genai_metadata::MtpHiddenStateLayout> for MtpHiddenLayout {
+    fn from(value: onnx_genai_metadata::MtpHiddenStateLayout) -> Self {
+        match value {
+            onnx_genai_metadata::MtpHiddenStateLayout::Bsh => Self::Bsh,
+            onnx_genai_metadata::MtpHiddenStateLayout::Bshc => Self::Bshc,
+        }
+    }
+}
+
 /// Lifetime of an MTP sidecar's private KV state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MtpCacheScope {
@@ -289,52 +293,107 @@ impl ResolvedMtpConfig {
         }
     }
 
-    /// Resolve sidecar-discovered MTP settings without expanding the stable
-    /// public hand-authored [`MtpConfig`] surface.
-    ///
-    /// Everything except the vocabulary comes from the sidecar's own
-    /// declaration; the vocabulary belongs to the *target* (the head borrows the
-    /// target's LM-head initializer), so the caller supplies it from the
-    /// package's declared model capabilities.
-    ///
-    /// Only the native decode path resolves a sidecar proposer, so this stays
-    /// gated with its single consumer rather than sitting dead in an ORT-only
-    /// build.
-    #[cfg(feature = "native-backend")]
-    pub(crate) fn from_sidecar_descriptor(spec: &MtpProposerSpec, vocab_size: usize) -> Self {
-        let public_config = MtpConfig {
-            head_model: spec.model.clone(),
-            target_hidden_output: spec.target_hidden_output.clone(),
-            embedding_weights: PathBuf::from(&spec.embedding_initializer),
-            lm_head_weights: PathBuf::from(&spec.lm_head_initializer),
-            vocab_size,
-            hidden_size: spec.target_hidden_size,
-            kv_mode: MtpDraftKvMode::GrowCache,
-            num_speculative_tokens: spec.num_speculative_tokens,
+    /// Resolve an MTP head exclusively from the workflow-native speculative
+    /// declaration. The width is runtime policy and is clamped by the
+    /// declaration's rollback bound; every graph binding and shared weight
+    /// remains package metadata.
+    pub(crate) fn from_canonical_metadata(
+        metadata: &onnx_genai_metadata::InferenceMetadata,
+        package_root: &Path,
+        vocab_size: usize,
+        requested_drafts: usize,
+    ) -> anyhow::Result<Self> {
+        use onnx_genai_metadata::{
+            ComponentImplementation, MtpProposalState, SpeculativeProposalExecution,
         };
-        Self {
-            public_config,
-            target_hidden_layout: match spec.target_hidden_layout {
-                MetadataMtpHiddenLayout::Bsh => MtpHiddenLayout::Bsh,
-                MetadataMtpHiddenLayout::Bshc => MtpHiddenLayout::Bshc,
-            },
-            embedding_weights: MtpWeightSource::TargetInitializer(
-                spec.embedding_initializer.clone(),
+
+        let speculative = metadata
+            .speculative
+            .as_ref()
+            .context("MTP loading requires a workflow-native speculative declaration")?;
+        let SpeculativeProposalExecution::Mtp {
+            target_hidden,
+            target_hidden_input: _,
+            token_embedding_input: _,
+            hidden_output,
+            hidden_layout,
+            hidden_size,
+            hc_mult,
+            state_output,
+            weights,
+            state,
+        } = &speculative.proposal_execution
+        else {
+            anyhow::bail!(
+                "this package's canonical speculative declaration is not an MTP proposer; \
+                     select its declared proposal executor rather than supplying a legacy MTP sidecar"
+            );
+        };
+        let workflow = &metadata
+            .pipeline
+            .as_ref()
+            .context("MTP loading requires pipeline.workflow")?
+            .workflow;
+        let proposer = workflow
+            .components
+            .get(&speculative.proposer)
+            .with_context(|| {
+                format!(
+                    "canonical MTP proposer '{}' is not a workflow component",
+                    speculative.proposer
+                )
+            })?;
+        let ComponentImplementation::Onnx { artifact } = &proposer.implementation else {
+            anyhow::bail!(
+                "canonical MTP proposer '{}' must name an ONNX artifact",
+                speculative.proposer
+            );
+        };
+        let max_drafts = speculative.max_proposal_width.checked_sub(1).context(
+            "canonical MTP max_proposal_width must reserve one target-guaranteed position",
+        )?;
+        anyhow::ensure!(
+            max_drafts > 0,
+            "canonical MTP max_proposal_width must be at least 2 (one guaranteed target token \
+                 plus one draft)"
+        );
+        let num_speculative_tokens = requested_drafts.min(max_drafts).max(1);
+        let (target_hidden_layout, cache_scope, kv_mode) = match state {
+            MtpProposalState::ProposalLocal => (
+                MtpHiddenLayout::from(*hidden_layout),
+                MtpCacheScope::ProposalLocal,
+                MtpDraftKvMode::HiddenThreaded,
             ),
-            lm_head_weights: MtpWeightSource::TargetInitializer(spec.lm_head_initializer.clone()),
-            hc_mult: spec.hc_mult,
-            mtp_hidden_output: spec.mtp_hidden_output.clone(),
-            // A head that threads a recurrent state declares its output name; a
-            // pure-attention (proposal-local) head declares none. The sidecar
-            // schema keeps this optional, so honor exactly what was declared
-            // rather than inventing a phantom "mtp_state" output the head does
-            // not expose (which would make `MtpDecodeSession` reject it).
-            mtp_state_output: spec.mtp_state_output.clone(),
-            cache_scope: match spec.kv_mode {
-                MetadataMtpKvMode::ProposalLocal => MtpCacheScope::ProposalLocal,
-                MetadataMtpKvMode::AcceptedPrefix => MtpCacheScope::AcceptedPrefix,
-            },
-        }
+            MtpProposalState::AcceptedPrefix { .. } => (
+                MtpHiddenLayout::from(*hidden_layout),
+                MtpCacheScope::AcceptedPrefix,
+                MtpDraftKvMode::GrowCache,
+            ),
+        };
+        let public_config = MtpConfig {
+            head_model: package_root.join(artifact),
+            target_hidden_output: target_hidden.output.clone(),
+            embedding_weights: PathBuf::from(&weights.embedding.initializer),
+            lm_head_weights: PathBuf::from(&weights.lm_head.initializer),
+            vocab_size,
+            hidden_size: *hidden_size,
+            kv_mode,
+            num_speculative_tokens,
+        };
+        Ok(Self {
+            embedding_weights: MtpWeightSource::TargetInitializer(
+                weights.embedding.initializer.clone(),
+            ),
+            lm_head_weights: MtpWeightSource::TargetInitializer(
+                weights.lm_head.initializer.clone(),
+            ),
+            public_config,
+            target_hidden_layout,
+            hc_mult: *hc_mult,
+            mtp_hidden_output: hidden_output.clone(),
+            mtp_state_output: state_output.clone(),
+            cache_scope,
+        })
     }
 }
 
@@ -1642,112 +1701,34 @@ pub(crate) fn validate_eagle3_config(config: &Eagle3Config) -> anyhow::Result<()
 mod mtp_config_tests {
     use super::*;
 
-    /// A discovered sidecar spec must survive the hop into the engine's
-    /// resolved config without losing a declared fact.
-    ///
-    /// The native loader no longer reads a metadata speculation block, so this
-    /// mapping is the only place the sidecar's own declarations become
-    /// executable settings: a silent drop here (a layout, an optional state
-    /// output, or the KV lifetime) would surface much later as a head that
-    /// refuses to run.
-    #[cfg(feature = "native-backend")]
     #[test]
-    fn a_discovered_sidecar_maps_onto_the_resolved_config_intact() {
-        let spec = MtpProposerSpec {
-            model: "/models/target/mtp/model.onnx".into(),
-            num_speculative_tokens: 4,
-            target_hidden_output: "hidden_states".into(),
-            target_hidden_layout: MetadataMtpHiddenLayout::Bshc,
-            target_hidden_size: 4096,
-            hc_mult: 4,
-            mtp_hidden_output: "mtp_hidden".into(),
-            mtp_state_output: Some("mtp_state".into()),
-            kv_mode: MetadataMtpKvMode::ProposalLocal,
-            embedding_initializer: "model.embed_tokens.weight".into(),
-            lm_head_initializer: "lm_head.weight".into(),
-        };
-
-        // The vocabulary is the target's, not the sidecar's, so it arrives from
-        // the caller rather than from the spec.
-        let config = ResolvedMtpConfig::from_sidecar_descriptor(&spec, 129_280);
+    fn canonical_mtp_configuration_keeps_metadata_and_runtime_policy_separate() {
+        let metadata: onnx_genai_metadata::InferenceMetadata = serde_yaml::from_str(include_str!(
+            "../../../tests/fixtures/tiny-mtp-full/inference_metadata.yaml"
+        ))
+        .expect("canonical MTP fixture parses");
+        onnx_genai_metadata::validate_metadata(&metadata)
+            .expect("canonical MTP fixture is a complete portable contract");
+        let config = ResolvedMtpConfig::from_canonical_metadata(
+            &metadata,
+            Path::new("/models/target"),
+            32,
+            99,
+        )
+        .expect("canonical MTP configuration resolves");
 
         assert_eq!(
             config.public_config.head_model,
-            std::path::Path::new("/models/target/mtp/model.onnx")
+            Path::new("/models/target/mtp/model.onnx.textproto")
         );
-        assert_eq!(config.public_config.target_hidden_output, "hidden_states");
-        assert_eq!(config.target_hidden_layout, MtpHiddenLayout::Bshc);
-        assert_eq!(
-            config.embedding_weights,
-            MtpWeightSource::TargetInitializer("model.embed_tokens.weight".into())
-        );
-        assert_eq!(
-            config.lm_head_weights,
-            MtpWeightSource::TargetInitializer("lm_head.weight".into())
-        );
-        assert_eq!(config.public_config.vocab_size, 129_280);
-        assert_eq!(config.public_config.hidden_size, 4096);
-        assert_eq!(config.hc_mult, 4);
-        assert_eq!(config.mtp_hidden_output, "mtp_hidden");
-        assert_eq!(config.mtp_state_output.as_deref(), Some("mtp_state"));
-        assert_eq!(config.public_config.num_speculative_tokens, 4);
-        assert_eq!(config.cache_scope, MtpCacheScope::ProposalLocal);
-        validate_resolved_mtp_config(&config).expect("resolved config validates");
-    }
-
-    /// A pure-attention (proposal-local) head declares no recurrent state
-    /// output. The `None` has to stay `None`: inventing a phantom `mtp_state`
-    /// name would make the decode session demand an output the head does not
-    /// expose.
-    #[cfg(feature = "native-backend")]
-    #[test]
-    fn a_head_that_threads_no_state_keeps_its_absent_state_output() {
-        let spec = MtpProposerSpec {
-            model: "/models/target/mtp/model.onnx".into(),
-            num_speculative_tokens: 1,
-            target_hidden_output: "hidden_states.63".into(),
-            target_hidden_layout: MetadataMtpHiddenLayout::Bsh,
-            target_hidden_size: 5120,
-            hc_mult: 1,
-            mtp_hidden_output: "mtp_hidden".into(),
-            mtp_state_output: None,
-            kv_mode: MetadataMtpKvMode::ProposalLocal,
-            embedding_initializer: "model.embed_tokens.weight".into(),
-            lm_head_initializer: "lm_head.weight".into(),
-        };
-
-        let config = ResolvedMtpConfig::from_sidecar_descriptor(&spec, 248_320);
-
-        assert_eq!(config.mtp_state_output, None);
+        assert_eq!(config.public_config.target_hidden_output, "hidden_states.0");
+        assert_eq!(config.public_config.hidden_size, 16);
+        assert_eq!(config.public_config.num_speculative_tokens, 7);
         assert_eq!(config.target_hidden_layout, MtpHiddenLayout::Bsh);
         assert_eq!(config.hc_mult, 1);
+        assert_eq!(config.mtp_state_output, None);
         assert_eq!(config.cache_scope, MtpCacheScope::ProposalLocal);
         validate_resolved_mtp_config(&config).expect("resolved config validates");
-    }
-
-    /// `accepted_prefix` is declarable but not executable, so the lifetime must
-    /// arrive intact at the loader that rejects it rather than being flattened
-    /// into the proposal-local default here.
-    #[cfg(feature = "native-backend")]
-    #[test]
-    fn an_accepted_prefix_lifetime_reaches_the_loader_that_refuses_it() {
-        let spec = MtpProposerSpec {
-            model: "/models/target/mtp/model.onnx".into(),
-            num_speculative_tokens: 2,
-            target_hidden_output: "hidden_states".into(),
-            target_hidden_layout: MetadataMtpHiddenLayout::Bsh,
-            target_hidden_size: 2048,
-            hc_mult: 1,
-            mtp_hidden_output: "mtp_hidden".into(),
-            mtp_state_output: None,
-            kv_mode: MetadataMtpKvMode::AcceptedPrefix,
-            embedding_initializer: "model.embed_tokens.weight".into(),
-            lm_head_initializer: "lm_head.weight".into(),
-        };
-
-        let config = ResolvedMtpConfig::from_sidecar_descriptor(&spec, 1_024);
-
-        assert_eq!(config.cache_scope, MtpCacheScope::AcceptedPrefix);
     }
 
     #[test]

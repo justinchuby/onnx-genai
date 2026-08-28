@@ -334,10 +334,11 @@ fn serving_workflow(
     };
     format!(
         r#"
+schema_version: v1.5
 pipeline:
   workflow:
     manifest:
-      capabilities: [workflow_ssa, serving_service_contract{linear_effects}]
+      capabilities: [workflow_ssa, serving_service_contract, canonical_speculation{linear_effects}]
     inputs:
       active:
         contract: {{ dtype: bool, shape: [batch], batch_layout: {{ kind: request_aligned, axis: 0 }} }}
@@ -362,7 +363,12 @@ pipeline:
 {effects}
       verifier:
         implementation: {{ kind: onnx, artifact: verifier.onnx }}
-        ports: {{}}
+        ports:
+          inputs:
+            past_key_values: {{ dtype: float16, shape: [batch, heads, sequence, head_dim], optional: true, batch_layout: {{ kind: request_aligned, axis: 0 }} }}
+          outputs:
+            present_key_values: {{ dtype: float16, shape: [batch, heads, sequence, head_dim], optional: true, batch_layout: {{ kind: request_aligned, axis: 0 }} }}
+            verification: {{ dtype: float32, shape: [batch, sequence, vocabulary], optional: true, batch_layout: {{ kind: request_aligned, axis: 0 }} }}
     state:
       cache:
         contract: {{ dtype: float16, shape: [batch, heads, sequence, head_dim], batch_layout: {{ kind: request_aligned, axis: 0 }} }}
@@ -411,13 +417,18 @@ fn speculative_block(width: usize) -> String {
     format!(
         r#"
 speculative:
+  identity: onnx-genai.speculative
+  version: '1'
   proposer: proposer
   target: verifier
   vocabulary: {{ kind: identical }}
   max_proposal_width: {width}
-  shared_state: [cache]
+  shared_state: [decoder_cache]
   shared_weights: []
   distribution_preserving: true
+  verification:
+    target_output: {{ component: verifier, output: verification }}
+    accepted_path: {{ kind: runtime, binding: accepted_prefix }}
   rollback_state: [cache]
 "#
     )
@@ -505,6 +516,8 @@ fn chained_proposer_requires_typed_ports_and_rollbackable_recurrence() {
         "",
         r#"
 speculative:
+  identity: onnx-genai.speculative
+  version: '1'
   proposer: proposer
   target: verifier
   proposal_execution:
@@ -516,6 +529,9 @@ speculative:
   vocabulary: { kind: mapped, artifact: draft_to_target.npy }
   max_proposal_width: 4
   distribution_preserving: true
+  verification:
+    target_output: { component: verifier, output: verification }
+    accepted_path: { kind: runtime, binding: accepted_prefix }
   rollback_state: [cache]
 "#,
     )
@@ -523,11 +539,11 @@ speculative:
         "        ports: {}",
         r#"        ports:
           inputs:
-            inputs_embeds: { dtype: float16, shape: [batch, heads, sequence, head_dim] }
-            past_state: { dtype: float16, shape: [batch, heads, sequence, head_dim] }
+            inputs_embeds: { dtype: float16, shape: [batch, heads, sequence, head_dim], batch_layout: { kind: request_aligned, axis: 0 } }
+            past_state: { dtype: float16, shape: [batch, heads, sequence, head_dim], batch_layout: { kind: request_aligned, axis: 0 } }
           outputs:
-            draft_logits: { dtype: float16, shape: [batch, heads, sequence, head_dim] }
-            next_state: { dtype: float16, shape: [batch, heads, sequence, head_dim] }"#,
+            draft_logits: { dtype: float16, shape: [batch, heads, sequence, head_dim], batch_layout: { kind: request_aligned, axis: 0 } }
+            next_state: { dtype: float16, shape: [batch, heads, sequence, head_dim], batch_layout: { kind: request_aligned, axis: 0 } }"#,
         1,
     )
     .replacen(

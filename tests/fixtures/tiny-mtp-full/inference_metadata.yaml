@@ -1,11 +1,17 @@
-# Canonical single-decoder package.
+# Canonical single-decoder package with a workflow-native MTP proposer.
 #
 # The graph ABI is declared where every package declares it: the workflow's
 # component ports and roles, and the state_service group that owns the KV
 # cache. A single decoder is not a special package shape — it is a workflow
 # with one ONNX component and one runtime-bound token policy.
+schema_version: v1.5
 model:
   max_sequence_length: 16
+  vocab_size: 32
+package:
+  tokenizer:
+    special_tokens:
+      eos_token_id: [0]
 pipeline:
   workflow:
     manifest:
@@ -19,6 +25,7 @@ pipeline:
       - streaming_emit
       - typed_emit
       - workflow_ssa
+      - canonical_speculation
     inputs:
       application.attention_mask:
         contract:
@@ -253,6 +260,58 @@ pipeline:
           parameters: {}
         application_overridable: false
         effects: []
+      mtp:
+        implementation:
+          kind: onnx
+          artifact: mtp/model.onnx.textproto
+        ports:
+          inputs:
+            inputs_embeds:
+              dtype: float32
+              shape: [batch, sequence, hidden]
+              optional: false
+              batch_layout: {kind: request_aligned, axis: 0}
+            hidden_states:
+              dtype: float32
+              shape: [batch, sequence, hidden]
+              optional: false
+              batch_layout: {kind: request_aligned, axis: 0}
+            attention_mask:
+              dtype: int64
+              shape: [batch, total_sequence]
+              optional: false
+              batch_layout: {kind: request_aligned, axis: 0}
+            position_ids:
+              dtype: int64
+              shape: [batch, sequence]
+              optional: false
+              batch_layout: {kind: request_aligned, axis: 0}
+            past_key_values.0.key:
+              dtype: float32
+              shape: [batch, mtp_kv_heads, past_sequence, mtp_head_dim]
+              optional: false
+              batch_layout: {kind: request_aligned, axis: 0}
+            past_key_values.0.value:
+              dtype: float32
+              shape: [batch, mtp_kv_heads, past_sequence, mtp_head_dim]
+              optional: false
+              batch_layout: {kind: request_aligned, axis: 0}
+          outputs:
+            mtp_hidden:
+              dtype: float32
+              shape: [batch, sequence, hidden]
+              optional: false
+              batch_layout: {kind: request_aligned, axis: 0}
+            present.0.key:
+              dtype: float32
+              shape: [batch, mtp_kv_heads, total_sequence, mtp_head_dim]
+              optional: false
+              batch_layout: {kind: request_aligned, axis: 0}
+            present.0.value:
+              dtype: float32
+              shape: [batch, mtp_kv_heads, total_sequence, mtp_head_dim]
+              optional: false
+              batch_layout: {kind: request_aligned, axis: 0}
       token_policy:
         implementation:
           kind: binding
@@ -419,6 +478,7 @@ pipeline:
               prefix_reusable: true
               evictable_prefix: true
             capabilities:
+              rollback_positions: 8
               snapshot: true
               fork: true
             ports:
@@ -487,3 +547,33 @@ pipeline:
         next: body.accepted_len
       - cell: sequence
         next: step.token
+speculative:
+  identity: onnx-genai.speculative
+  version: '1'
+  proposer: mtp
+  target: decoder
+  proposal_execution:
+    kind: mtp
+    target_hidden: {component: decoder, output: hidden_states.0}
+    target_hidden_input: hidden_states
+    token_embedding_input: inputs_embeds
+    hidden_output: mtp_hidden
+    hidden_layout: bsh
+    hidden_size: 16
+    hc_mult: 1
+    weights:
+      embedding: {component: decoder, initializer: transformer.wte.weight}
+      lm_head: {component: decoder, initializer: lm_head.weight_t}
+    state: {kind: proposal_local}
+  target_port_bindings: {tokens: input_ids, scores: logits}
+  shared_state: []
+  shared_weights:
+  - {component: decoder, initializer: transformer.wte.weight}
+  - {component: decoder, initializer: lm_head.weight_t}
+  vocabulary: {kind: identical}
+  max_proposal_width: 8
+  distribution_preserving: false
+  verification:
+    target_output: {component: decoder, output: logits}
+    accepted_path: {kind: runtime, binding: accepted_prefix}
+  rollback_state: [decoder_kv.0000, decoder_kv.0001]

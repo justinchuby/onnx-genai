@@ -727,21 +727,35 @@ pub fn load_pipeline_spec(path: &Path) -> Result<PipelineSpec, crate::MetadataEr
     Ok(spec)
 }
 
-/// Detect a legacy HuggingFace speculator package from `config.json`.
+/// Inspect a legacy HuggingFace speculator sidecar at the explicit migration
+/// boundary.
 ///
-/// Detection is best-effort so malformed or unrelated external configuration
-/// does not change normal model-directory loading behavior.
-pub fn detect_speculator(model_dir: &Path) -> Option<SpeculatorDescriptor> {
+/// This function is deliberately not a runtime discovery hook. A caller may
+/// use its result to construct a complete workflow-native declaration, or to
+/// report precisely why the legacy sidecar lacks facts the canonical contract
+/// requires. No execution path consumes this descriptor.
+pub fn inspect_legacy_speculator_for_migration(
+    model_dir: &Path,
+) -> Result<Option<SpeculatorDescriptor>, crate::MetadataError> {
     let config_path = model_dir.join("config.json");
-    let content = std::fs::read_to_string(config_path).ok()?;
-    let config = serde_json::from_str::<HuggingFaceModelConfig>(&content)
-        .ok()?
-        .speculator_config?;
-    Some(SpeculatorDescriptor::from_config(
+    if !config_path.is_file() {
+        return Ok(None);
+    }
+    let content = std::fs::read_to_string(&config_path).map_err(crate::MetadataError::Io)?;
+    let parsed = serde_json::from_str::<HuggingFaceModelConfig>(&content).map_err(|error| {
+        crate::MetadataError::Parse(format!(
+            "legacy config '{}' cannot be read for speculative migration: {error}",
+            config_path.display()
+        ))
+    })?;
+    let Some(config) = parsed.speculator_config else {
+        return Ok(None);
+    };
+    Ok(Some(SpeculatorDescriptor::from_config(
         model_dir,
         config,
         SpeculatorConfigSource::HuggingFaceConfig,
-    ))
+    )))
 }
 
 #[derive(serde::Deserialize)]

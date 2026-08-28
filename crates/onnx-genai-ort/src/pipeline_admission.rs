@@ -759,6 +759,8 @@ mod tests {
     /// `token_embedding` names the verifier component and the given table.
     fn chained_speculative_with_table(table: &str) -> onnx_genai_metadata::SpeculativeContract {
         let yaml = [
+            "identity: onnx-genai.speculative".to_string(),
+            "version: '1'".to_string(),
             "proposer: proposer".to_string(),
             "target: verifier".to_string(),
             "proposal_execution:".to_string(),
@@ -771,6 +773,9 @@ mod tests {
             "vocabulary:".to_string(),
             "  kind: identical".to_string(),
             "max_proposal_width: 4".to_string(),
+            "verification:".to_string(),
+            "  target_output: {component: verifier, output: logits}".to_string(),
+            "  accepted_path: {kind: runtime, binding: accepted_prefix}".to_string(),
         ]
         .join("\n");
         serde_yaml::from_str(&yaml).expect("speculative contract YAML should parse")
