@@ -33,6 +33,7 @@ pub(crate) mod generation;
 mod islands;
 #[cfg(feature = "native-backend")]
 mod native_component;
+mod output;
 mod row_state;
 mod runtime_state;
 pub mod speculative;
@@ -49,6 +50,11 @@ pub use batching::{
 pub(crate) use generation::validate_generation_workflow;
 pub use islands::ExecutionIslandDiagnostic;
 pub use onnx_genai_metadata::WorkflowOutputRole;
+pub use output::{
+    OutputFinality, OutputLineage, OutputRevision, OutputSequence, OutputStreamId,
+    RevisionEnvelopeValidationError, RevisionEnvelopeValidator, TYPED_REVISION_PROTOCOL_VERSION,
+    TypedRevisionEnvelope, TypedRevisionOperation, WorkflowOutputPublication,
+};
 pub use row_state::{RowPlan, RowScopedState, RowTable, check_selection, gather_rows};
 pub(crate) use turn_transaction::TurnTransaction;
 pub use turn_transaction::{
@@ -80,6 +86,7 @@ pub type PipelineTensors = HashMap<String, Value>;
 pub struct PipelineOutputs {
     tensors: PipelineTensors,
     rows: BTreeMap<String, Vec<String>>,
+    publications: Vec<WorkflowOutputPublication>,
 }
 
 impl PipelineOutputs {
@@ -89,6 +96,12 @@ impl PipelineOutputs {
 
     pub fn into_tensors(self) -> PipelineTensors {
         self.tensors
+    }
+
+    pub(crate) fn into_tensors_and_publications(
+        self,
+    ) -> (PipelineTensors, Vec<WorkflowOutputPublication>) {
+        (self.tensors, self.publications)
     }
 
     pub fn aggregate(&self, output: &str) -> Option<&Value> {
@@ -104,6 +117,12 @@ impl PipelineOutputs {
             .enumerate()
             .filter_map(|(row, name)| self.tensors.get(name).map(|value| (row, value)))
             .collect()
+    }
+
+    /// Every output publication in authored execution order. These envelopes
+    /// are semantic records; serving adapters choose their own framing.
+    pub fn publications(&self) -> &[WorkflowOutputPublication] {
+        &self.publications
     }
 }
 
@@ -198,6 +217,12 @@ pub(crate) struct WorkflowRuntime {
     /// their plugin/provider teardown outlive every component and execution-island
     /// session that may still call back into them.
     _ort_environment: Option<Arc<onnx_genai_ort::Environment>>,
+}
+
+impl WorkflowRuntime {
+    pub(crate) fn take_committed_output_publications(&mut self) -> Vec<WorkflowOutputPublication> {
+        std::mem::take(&mut *self.worker.last_output_publications.borrow_mut())
+    }
 }
 
 /// Immutable construction plan for another hosted single-decoder worker.
@@ -1023,7 +1048,7 @@ impl WorkflowRuntime {
         self.worker
             .session_outputs
             .borrow_mut()
-            .retain(|(session, _), _| session != session_id);
+            .retain(|(session, _, _), _| session != session_id);
         self.worker
             .session_turn_versions
             .borrow_mut()

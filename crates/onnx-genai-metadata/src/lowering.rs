@@ -237,6 +237,7 @@ impl Compiler<'_> {
                 when,
                 valid_length,
                 output,
+                stream,
                 mode,
                 axis,
             } => Ok(WorkflowNode::Emit {
@@ -244,6 +245,7 @@ impl Compiler<'_> {
                 when: when.clone(),
                 valid_length: valid_length.clone(),
                 output: output.clone(),
+                stream: stream.clone(),
                 mode: mode.clone(),
                 axis: *axis,
                 effect_name: "stream".to_string(),

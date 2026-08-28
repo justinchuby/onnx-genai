@@ -353,7 +353,7 @@ pipeline:
     manifest:
       adapter_abis: {}
       capabilities:
-        [workflow_ssa, typed_emit, streaming_emit,
+        [workflow_ssa, typed_emit,
          nested_control_flow, session_state_lease, linear_effects]
     inputs:
       initial: { contract: { dtype: int64, shape: [] }, role: { kind: opaque },

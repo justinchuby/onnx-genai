@@ -151,6 +151,18 @@ impl Engine {
         self.workflow_runtime_mut().run_pipeline_outputs(request)
     }
 
+    /// Take the ordered workflow publications produced by the most recently
+    /// committed generation on this engine worker.
+    ///
+    /// Publications are installed only after semantic commit. Transport
+    /// delivery can therefore fail without rolling back the committed turn.
+    pub fn take_committed_workflow_publications(
+        &mut self,
+    ) -> Vec<crate::pipeline::WorkflowOutputPublication> {
+        self.workflow_runtime_mut()
+            .take_committed_output_publications()
+    }
+
     pub fn run_pipeline_retained(
         &mut self,
         request: PipelineGenerateRequest,

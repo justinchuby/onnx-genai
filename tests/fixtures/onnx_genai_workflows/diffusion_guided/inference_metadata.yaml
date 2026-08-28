@@ -140,6 +140,7 @@ pipeline:
             axis: 0
         role: image
         value_range: negative_one_to_one
+        family: { kind: materialized }
         stage: pre_adapter
       latent:
         contract:
@@ -153,6 +154,7 @@ pipeline:
             kind: request_aligned
             axis: 0
         role: tensor
+        family: { kind: materialized }
         stage: pre_adapter
       noise_estimate:
         contract:
@@ -166,6 +168,7 @@ pipeline:
             kind: request_aligned
             axis: 0
         role: tensor
+        family: { kind: materialized }
         stage: pre_adapter
       latent_trajectory:
         contract:
@@ -179,6 +182,7 @@ pipeline:
             kind: request_aligned
             axis: 0
         role: tensor
+        family: { kind: materialized }
         stage: pre_adapter
       rng_offset:
         contract:
@@ -189,6 +193,7 @@ pipeline:
             kind: request_aligned
             axis: 0
         role: tensor
+        family: { kind: materialized }
         stage: pre_adapter
     components:
       text_encoder:

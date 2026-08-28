@@ -18,7 +18,7 @@ model:
 pipeline:
   workflow:
     manifest:
-      capabilities: [workflow_ssa, linear_effects, typed_emit, streaming_emit,
+      capabilities: [workflow_ssa, linear_effects, typed_emit,
                      nested_control_flow, loop_induction_values,
                      serving_service_contract]
 
@@ -41,6 +41,7 @@ pipeline:
         contract: {dtype: int64, shape: [batch, sequence],
                    batch_layout: {kind: request_aligned, axis: 0}}
         role: tokens
+        family: { kind: materialized }
         stage: pre_adapter
 
     components:

@@ -12,6 +12,8 @@ use onnx_genai_metadata::{ResolvedStatePlan, StateIdentity};
 use onnx_genai_ort::Value;
 use std::collections::{BTreeMap, HashMap};
 
+use super::OutputStreamId;
+
 /// Stable identity of an admitted turn.  It is not an output revision number.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TurnTransactionId(pub u64);
@@ -42,12 +44,26 @@ impl std::fmt::Debug for TurnStateBaseline {
 ///
 /// These are deliberately typed independently of payloads: payload contents,
 /// output names, and container traversal order cannot select a rollback target.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Default)]
 pub struct OutputPublicationBaseline {
     pub head: u64,
     pub cursor: u64,
     pub lineage: u64,
     pub closed: bool,
+    pub payload: Option<Value>,
+}
+
+impl std::fmt::Debug for OutputPublicationBaseline {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OutputPublicationBaseline")
+            .field("head", &self.head)
+            .field("cursor", &self.cursor)
+            .field("lineage", &self.lineage)
+            .field("closed", &self.closed)
+            .field("payload", &self.payload.as_ref().map(Value::shape))
+            .finish()
+    }
 }
 
 /// The complete immutable baseline for an admitted turn.
@@ -57,7 +73,7 @@ pub struct TurnCommittedBaseline {
     pub transaction: TurnTransactionId,
     pub states: BTreeMap<StateIdentity, TurnStateBaseline>,
     pub effects: BTreeMap<String, u64>,
-    pub outputs: BTreeMap<String, OutputPublicationBaseline>,
+    pub outputs: BTreeMap<(String, OutputStreamId), OutputPublicationBaseline>,
 }
 
 /// Why an admitted turn did not commit.
@@ -117,12 +133,26 @@ pub enum TurnTransactionAdmissionError {
     StateSnapshot { state: String, message: String },
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Default)]
 pub(crate) struct CommittedOutputState {
     pub(crate) head: u64,
     pub(crate) cursor: u64,
     pub(crate) lineage: u64,
     pub(crate) closed: bool,
+    pub(crate) payload: Option<Value>,
+}
+
+impl std::fmt::Debug for CommittedOutputState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CommittedOutputState")
+            .field("head", &self.head)
+            .field("cursor", &self.cursor)
+            .field("lineage", &self.lineage)
+            .field("closed", &self.closed)
+            .field("payload", &self.payload.as_ref().map(Value::shape))
+            .finish()
+    }
 }
 
 /// The state staged by one turn.  Its fields are private so callers cannot
@@ -133,7 +163,7 @@ pub(crate) struct TurnTransaction {
     session: Option<String>,
     staged_states: BTreeMap<StateIdentity, TurnStateBaseline>,
     staged_effects: BTreeMap<String, u64>,
-    staged_outputs: BTreeMap<String, CommittedOutputState>,
+    staged_outputs: BTreeMap<(String, OutputStreamId), CommittedOutputState>,
     publication_mode: TurnPublicationMode,
 }
 
@@ -168,7 +198,7 @@ impl TurnTransaction {
         outputs: impl IntoIterator<Item = String>,
         session_state: &HashMap<(String, String), Value>,
         session_effects: &HashMap<(String, String), u64>,
-        session_outputs: &HashMap<(String, String), CommittedOutputState>,
+        session_outputs: &HashMap<(String, String, OutputStreamId), CommittedOutputState>,
         publication_mode: TurnPublicationMode,
     ) -> Result<Self, TurnTransactionAdmissionError> {
         let mut states = BTreeMap::new();
@@ -218,26 +248,56 @@ impl TurnTransaction {
             staged_effects.insert(effect.clone(), cursor);
             effects.insert(effect, cursor);
         }
-        for output in outputs {
+        let outputs = outputs
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        for output in &outputs {
             if publication_mode == TurnPublicationMode::ProvisionalRevisions {
                 return Err(
-                    TurnTransactionAdmissionError::UnretractableProvisionalOutput { output },
+                    TurnTransactionAdmissionError::UnretractableProvisionalOutput {
+                        output: output.clone(),
+                    },
                 );
             }
-            let committed = session
-                .and_then(|session| session_outputs.get(&(session.to_string(), output.clone())))
-                .copied()
-                .unwrap_or_default();
+        }
+        if let Some(session) = session {
+            for ((owner, output, stream), committed) in session_outputs {
+                if owner != session || !outputs.contains(output) {
+                    continue;
+                }
+                let committed = clone_committed_output_state(committed).map_err(|error| {
+                    TurnTransactionAdmissionError::StateSnapshot {
+                        state: format!("output '{output}' stream '{}'", stream.0),
+                        message: format!("{error:#}"),
+                    }
+                })?;
+                let baseline = clone_output_state_as_baseline(&committed).map_err(|error| {
+                    TurnTransactionAdmissionError::StateSnapshot {
+                        state: format!("output '{output}' stream '{}'", stream.0),
+                        message: format!("{error:#}"),
+                    }
+                })?;
+                output_baselines.insert((output.clone(), stream.clone()), baseline);
+                staged_outputs.insert((output.clone(), stream.clone()), committed);
+            }
+        }
+        for output in outputs {
+            let identity = (output.clone(), OutputStreamId(output.clone()));
+            if staged_outputs.contains_key(&identity) {
+                continue;
+            }
+            let committed = CommittedOutputState::default();
             output_baselines.insert(
-                output.clone(),
+                identity.clone(),
                 OutputPublicationBaseline {
                     head: committed.head,
                     cursor: committed.cursor,
                     lineage: committed.lineage,
                     closed: committed.closed,
+                    payload: None,
                 },
             );
-            staged_outputs.insert(output, committed);
+            staged_outputs.insert(identity, committed);
         }
 
         Ok(Self {
@@ -263,21 +323,33 @@ impl TurnTransaction {
             .find_map(|(identity, value)| (identity.0 == state).then_some(value))
     }
 
+    pub(crate) fn id(&self) -> TurnTransactionId {
+        self.baseline.transaction
+    }
+
+    pub(crate) fn output_baselines(
+        &self,
+    ) -> anyhow::Result<BTreeMap<(String, OutputStreamId), OutputPublicationBaseline>> {
+        self.baseline
+            .outputs
+            .iter()
+            .map(|(identity, baseline)| Ok((identity.clone(), clone_output_baseline(baseline)?)))
+            .collect()
+    }
+
     pub(crate) fn stage_state(&mut self, state: StateIdentity, value: Value) {
         self.staged_states
             .insert(state, TurnStateBaseline::Present(value));
     }
 
-    /// Stage output advancement from the typed output identity, never from an
-    /// emitted payload or the order a map happens to be traversed.
-    pub(crate) fn stage_output(&mut self, output: &str, publications: u64) {
-        let state = self
-            .staged_outputs
-            .get_mut(output)
-            .expect("output was admitted into this transaction");
-        state.head = state.head.saturating_add(publications);
-        state.cursor = state.cursor.saturating_add(publications);
-        state.lineage = state.lineage.saturating_add(publications);
+    /// Replace the complete per-stream output write set resolved by the
+    /// canonical publication journal. There is no output-level count or
+    /// default-stream inference that can collapse independent streams.
+    pub(crate) fn stage_outputs(
+        &mut self,
+        outputs: BTreeMap<(String, OutputStreamId), CommittedOutputState>,
+    ) {
+        self.staged_outputs = outputs;
     }
 
     pub(crate) fn stage_effects(&mut self) {
@@ -294,7 +366,7 @@ impl TurnTransaction {
         &mut self,
         session_state: &mut HashMap<(String, String), Value>,
         session_effects: &mut HashMap<(String, String), u64>,
-        session_outputs: &mut HashMap<(String, String), CommittedOutputState>,
+        session_outputs: &mut HashMap<(String, String, OutputStreamId), CommittedOutputState>,
     ) -> anyhow::Result<TurnTransactionOutcome> {
         let Some(session) = &self.session else {
             return Ok(TurnTransactionOutcome::Committed {
@@ -320,8 +392,13 @@ impl TurnTransaction {
         let output_writes = self
             .staged_outputs
             .iter()
-            .map(|(output, state)| ((session.clone(), output.clone()), *state))
-            .collect::<Vec<_>>();
+            .map(|((output, stream), state)| {
+                Ok((
+                    (session.clone(), output.clone(), stream.clone()),
+                    clone_committed_output_state(state)?,
+                ))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
         session_state
             .try_reserve(state_writes.len())
             .context("failed to reserve the atomic turn state write set")?;
@@ -379,9 +456,79 @@ fn clone_state_baseline(value: &TurnStateBaseline) -> anyhow::Result<TurnStateBa
     }
 }
 
+fn clone_output_baseline(
+    value: &OutputPublicationBaseline,
+) -> anyhow::Result<OutputPublicationBaseline> {
+    Ok(OutputPublicationBaseline {
+        head: value.head,
+        cursor: value.cursor,
+        lineage: value.lineage,
+        closed: value.closed,
+        payload: value.payload.as_ref().map(clone_value).transpose()?,
+    })
+}
+
+fn clone_committed_output_state(
+    value: &CommittedOutputState,
+) -> anyhow::Result<CommittedOutputState> {
+    Ok(CommittedOutputState {
+        head: value.head,
+        cursor: value.cursor,
+        lineage: value.lineage,
+        closed: value.closed,
+        payload: value.payload.as_ref().map(clone_value).transpose()?,
+    })
+}
+
+fn clone_output_state_as_baseline(
+    value: &CommittedOutputState,
+) -> anyhow::Result<OutputPublicationBaseline> {
+    Ok(OutputPublicationBaseline {
+        head: value.head,
+        cursor: value.cursor,
+        lineage: value.lineage,
+        closed: value.closed,
+        payload: value.payload.as_ref().map(clone_value).transpose()?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn key(session: &str, output: &str, stream: &str) -> (String, String, OutputStreamId) {
+        (
+            session.to_string(),
+            output.to_string(),
+            OutputStreamId(stream.to_string()),
+        )
+    }
+
+    fn output_state(head: u64, cursor: u64, lineage: u64, closed: bool) -> CommittedOutputState {
+        CommittedOutputState {
+            head,
+            cursor,
+            lineage,
+            closed,
+            payload: None,
+        }
+    }
+
+    fn output_state_with_payload(
+        head: u64,
+        cursor: u64,
+        lineage: u64,
+        closed: bool,
+        payload: i64,
+    ) -> anyhow::Result<CommittedOutputState> {
+        Ok(CommittedOutputState {
+            head,
+            cursor,
+            lineage,
+            closed,
+            payload: Some(Value::from_slice_i64(&[payload], &[1])?),
+        })
+    }
 
     #[test]
     fn commit_advances_complete_effect_and_output_write_set() -> anyhow::Result<()> {
@@ -391,13 +538,8 @@ mod tests {
             (("other".to_string(), "grammar".to_string()), 9),
         ]);
         let mut outputs = HashMap::from([(
-            ("session".to_string(), "tokens".to_string()),
-            CommittedOutputState {
-                head: 3,
-                cursor: 4,
-                lineage: 5,
-                closed: false,
-            },
+            key("session", "tokens", "text"),
+            output_state(3, 4, 5, false),
         )]);
         let mut turn = TurnTransaction::admit(
             TurnTransactionId(7),
@@ -411,7 +553,10 @@ mod tests {
             TurnPublicationMode::CommitOnly,
         )?;
         turn.stage_effects();
-        turn.stage_output("tokens", 2);
+        turn.stage_outputs(BTreeMap::from([(
+            ("tokens".to_string(), OutputStreamId("text".to_string())),
+            output_state(5, 6, 7, false),
+        )]));
         assert_eq!(
             turn.commit(&mut states, &mut effects, &mut outputs)?,
             TurnTransactionOutcome::Committed {
@@ -421,14 +566,15 @@ mod tests {
         );
         assert_eq!(effects[&("session".to_string(), "grammar".to_string())], 5);
         assert_eq!(effects[&("other".to_string(), "grammar".to_string())], 9);
+        let committed = &outputs[&key("session", "tokens", "text")];
         assert_eq!(
-            outputs[&("session".to_string(), "tokens".to_string())],
-            CommittedOutputState {
-                head: 5,
-                cursor: 6,
-                lineage: 7,
-                closed: false,
-            }
+            (
+                committed.head,
+                committed.cursor,
+                committed.lineage,
+                committed.closed
+            ),
+            (5, 6, 7, false)
         );
         Ok(())
     }
@@ -476,5 +622,119 @@ mod tests {
             TurnTransactionAdmissionError::UnretractableProvisionalOutput { output }
             if output == "tokens"
         ));
+    }
+
+    #[test]
+    fn named_stream_state_is_atomic_across_abort_and_commit() -> anyhow::Result<()> {
+        let mut states = HashMap::new();
+        let mut effects = HashMap::new();
+        let mut outputs = HashMap::from([
+            (
+                key("session", "answer", "analysis"),
+                output_state_with_payload(2, 3, 2, false, 20)?,
+            ),
+            (
+                key("session", "answer", "final"),
+                output_state_with_payload(4, 5, 4, true, 40)?,
+            ),
+        ]);
+        let mut aborted = TurnTransaction::admit(
+            TurnTransactionId(31),
+            Some("session"),
+            &ResolvedStatePlan::default(),
+            std::iter::empty::<String>(),
+            ["answer".to_string()],
+            &states,
+            &effects,
+            &outputs,
+            TurnPublicationMode::CommitOnly,
+        )?;
+        aborted.stage_outputs(BTreeMap::from([
+            (
+                ("answer".to_string(), OutputStreamId("analysis".to_string())),
+                output_state_with_payload(6, 7, 6, true, 60)?,
+            ),
+            (
+                ("answer".to_string(), OutputStreamId("retry".to_string())),
+                output_state_with_payload(1, 2, 1, true, 10)?,
+            ),
+        ]));
+        assert_eq!(
+            aborted.abort(TurnAbortReason::Cancellation),
+            TurnTransactionOutcome::AbortToBaseline {
+                transaction: TurnTransactionId(31),
+                baseline: TurnBaselineId(31),
+                reason: TurnAbortReason::Cancellation,
+            }
+        );
+        assert_eq!(
+            (
+                outputs[&key("session", "answer", "analysis")].head,
+                outputs[&key("session", "answer", "analysis")].closed,
+                outputs[&key("session", "answer", "analysis")]
+                    .payload
+                    .as_ref()
+                    .expect("analysis payload")
+                    .to_vec_i64()?,
+                outputs[&key("session", "answer", "final")].head,
+                outputs[&key("session", "answer", "final")].closed,
+                outputs[&key("session", "answer", "final")]
+                    .payload
+                    .as_ref()
+                    .expect("final payload")
+                    .to_vec_i64()?,
+            ),
+            (2, false, vec![20], 4, true, vec![40])
+        );
+        assert!(!outputs.contains_key(&key("session", "answer", "retry")));
+
+        let mut committed = TurnTransaction::admit(
+            TurnTransactionId(32),
+            Some("session"),
+            &ResolvedStatePlan::default(),
+            std::iter::empty::<String>(),
+            ["answer".to_string()],
+            &states,
+            &effects,
+            &outputs,
+            TurnPublicationMode::CommitOnly,
+        )?;
+        committed.stage_outputs(BTreeMap::from([
+            (
+                ("answer".to_string(), OutputStreamId("analysis".to_string())),
+                output_state_with_payload(6, 7, 6, true, 60)?,
+            ),
+            (
+                ("answer".to_string(), OutputStreamId("final".to_string())),
+                output_state_with_payload(4, 5, 4, true, 40)?,
+            ),
+            (
+                ("answer".to_string(), OutputStreamId("retry".to_string())),
+                output_state_with_payload(1, 2, 1, true, 10)?,
+            ),
+        ]));
+        committed.commit(&mut states, &mut effects, &mut outputs)?;
+        assert_eq!(
+            (
+                outputs[&key("session", "answer", "analysis")].head,
+                outputs[&key("session", "answer", "analysis")].closed,
+                outputs[&key("session", "answer", "analysis")]
+                    .payload
+                    .as_ref()
+                    .expect("analysis payload")
+                    .to_vec_i64()?,
+                outputs[&key("session", "answer", "final")].head,
+                outputs[&key("session", "answer", "final")].closed,
+                outputs[&key("session", "answer", "retry")].head,
+                outputs[&key("session", "answer", "retry")].closed,
+                outputs[&key("session", "answer", "retry")]
+                    .payload
+                    .as_ref()
+                    .expect("retry payload")
+                    .to_vec_i64()?,
+            ),
+            (6, true, vec![60], 4, true, 1, true, vec![10])
+        );
+        Ok(())
     }
 }

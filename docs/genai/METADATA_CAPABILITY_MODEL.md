@@ -491,6 +491,7 @@ pipeline:
           shape: [batch, sequence_len, hidden]
           batch_layout: {kind: request_aligned, axis: 0}
         role: tensor
+        family: { kind: materialized }
         stage: post_adapter
 
     components:
