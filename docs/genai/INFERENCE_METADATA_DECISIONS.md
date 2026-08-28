@@ -366,14 +366,14 @@ Those strings select a versioned semantic ABI or state bound and are validated
 at the structure that owns them. They do not become negotiated capabilities
 merely because older comments used the word "capability" broadly.
 
-**Implementation status — unimplemented migration acceptance criteria.** The
-semantic term for `streaming_emit` is **incremental publication**. The accepted
-replacement identifier for the next schema change is
-`incremental_publication`, because it names the property metadata actually
-controls. Under the pre-release compatibility rule, that migration **MUST**
-replace `streaming_emit` rather than retain an alias. Until the schema migration
-lands, the current identifier remains serialized, but readers and documentation
-**MUST NOT** interpret it as a transport-delivery promise.
+**Implementation status — unimplemented migration acceptance criteria.**
+`streaming_emit` is a redundant capability spelling: the output protocol and
+the structural `emit` already state whether execution publishes discrete
+events. The next schema change **MUST** remove `streaming_emit` without a
+replacement capability or compatibility alias. Until that migration lands, the
+current identifier remains serialized for schema/catalogue consistency, but
+readers and documentation **MUST NOT** interpret it as a transport-delivery
+promise.
 
 `continuous_batching` is also not a capability identifier. It was retired
 because a runtime may always execute requests separately without changing
@@ -516,31 +516,55 @@ liveness and effect ordering decidable without executing the branch.
 ### 6.4 Internal publication, turns, and revisions
 
 Publication is a workflow semantic operation. It is not transport delivery.
-An `emit` identifies when an SSA value becomes an internal package output and
-how it updates that output. Metadata says nothing about whether an API flushes
-at that point, which network framing is used, or whether a disconnected client
-can reconnect. An implementation **MUST NOT** infer any such promise from
-`emit`, `event`, `streaming_emit`, or the future
-`incremental_publication` identifier.
+Metadata says nothing about whether an API flushes, which network framing is
+used, or whether a disconnected client can reconnect. An implementation
+**MUST NOT** infer such a promise from an output protocol, `emit`, `event`, or
+the current `streaming_emit` capability spelling.
 
-**Implementation status — unimplemented acceptance criteria.** The transaction
-and revision vocabulary below is accepted, but the checked-in schema and runtime
-do not yet implement it end to end. Until they do, a runtime **MUST NOT**
-advertise atomic-turn or revision-envelope conformance merely because it
+Publication has two authority levels:
+
+1. A workflow **output contract** declares exactly one protocol family:
+   **materialized value**, **discrete events**, or **typed revisions**.
+2. An individual `emit` selects an operation permitted by that family and
+   publishes a typed SSA value with its declared guard, valid length, and effect
+   ordering. It **MUST NOT** redefine the output's protocol family.
+
+This permits different emit sites to append or replace parts of one
+materialized value, or to carry different revision operations, without creating
+a second answer to what the output means. Every emit targeting one output must
+validate against the same output-level protocol and payload contract.
+
+**Implementation status — unimplemented acceptance criteria.** The checked-in
+schema still stores publication mode on individual emits and the runtime does
+not implement the complete transaction and revision vocabulary below. Until
+the output-level protocol migration and runtime proof land, a runtime **MUST
+NOT** advertise atomic-turn or revision-protocol conformance merely because it
 implements current `replace`, `append`, or `event` emits.
+
+#### Output protocol families
+
+- A **materialized value** has one current typed value. Its emits may replace
+  that value or append typed payload on a declared growth axis.
+- **Discrete events** publish ordered typed occurrences without constructing
+  one accumulated value.
+- **Typed revisions** publish a versioned revision envelope. Each emit carries
+  one operation from the closed revision algebra below.
+
+An output cannot mix these families. Output protocol, row-wise behavior, payload
+type, and growth-axis rules are output-level invariants; control flow and effect
+tokens determine the order of individual publications.
 
 #### Turn publication modes
 
-Every session turn uses one typed publication mode:
+Every session turn uses one typed visibility mode:
 
 - **`commit_only`** is the default. Output becomes committed only at the turn's
   single commit point. A runtime **MAY** compute or buffer intermediate values,
   but it **MUST NOT** expose them as committed output.
-- **`provisional_revisions`** permits typed provisional publications before the
-  turn commits. The runtime **MAY** overwrite provisional output through the
-  typed `replace` operation. If the turn aborts, every provisional publication
-  from that turn **MUST** be retracted or withheld from observers that cannot
-  process retraction.
+- **`provisional_revisions`** permits typed provisional revision events before
+  the turn commits. If the turn aborts, every provisional revision from that
+  turn **MUST** be retracted through the same typed protocol. A runtime unable
+  to preserve that behavior **MUST** reject the mode before mutation begins.
 
 There is no caller-controlled/manual commit mode in this contract.
 
@@ -555,9 +579,9 @@ fail before mutation begins.
 
 #### Closed revision algebra
 
-A revision-capable output uses a versioned typed envelope with stream identity,
-revision identity, deterministic order, typed payload where applicable, and
-exactly one operation from this closed algebra:
+A typed-revision output uses a versioned envelope with stream identity, revision
+identity, deterministic order, typed payload where applicable, and exactly one
+operation from this closed algebra:
 
 | Operation | Meaning |
 | --- | --- |
@@ -566,13 +590,11 @@ exactly one operation from this closed algebra:
 | `retract` | Invalidate the named provisional revision and any value that depends on it. |
 | `finalize` | Mark the current revision final if the enclosing turn commits; later ordinary operations for that stream are invalid. |
 
-Unknown operations or envelope versions **MUST** fail closed. `event` is a
-workflow publication mode, not a fifth revision operation: when an event carries
-a revision envelope, its payload contains one of the four operations above.
-Turn commit and stream finality are distinct. `finalize` says no later revision
-may alter that stream after commit; the enclosing turn commit says the turn's
-complete write set became durable and visible. An abort discards or retracts a
-provisional `finalize` with the rest of the uncommitted turn.
+Unknown operations or envelope versions **MUST** fail closed. Turn commit and
+stream finality are distinct. `finalize` says no later revision may alter that
+stream after commit; the enclosing turn commit says the turn's complete write
+set became durable and visible. An abort retracts a provisional `finalize` with
+the rest of the uncommitted turn.
 
 Revision ownership follows workflow dataflow and effect ordering. A runtime
 **MUST NOT** select a stream's final writer from component-map iteration order,
@@ -1930,6 +1952,47 @@ policy type is `onnx_genai_kv::KvQuantPolicy`.
 This does not touch **model-weight** quantization intent, which remains in
 `quantization` and is a published property of the package.
 
+### 12.8 Stateful graph-internal token-context features
+
+**Implementation status — unimplemented acceptance criteria.** A model may
+derive a residual feature from explicit token identities and bounded token
+history inside one or more graph components. The generalized contract is a
+stateful graph-internal token-context feature, not a model or architecture enum.
+
+The authoritative structure is the ordinary workflow graph, typed component
+ports, and state groups. A representative implementation may perform
+deterministic multi-order n-gram hashing, learned embedding lookup,
+residual-conditioned projection or gating, dilated depthwise convolution with
+convolution history, and additive residual injection. Those computations remain
+inside the graph or a generic typed component; metadata **MUST NOT** dispatch on
+`Qwen`, `PLE`, `Engram`, or another model-family name.
+
+Token identity is an explicit input. If the decoder also accepts
+`inputs_embeds`, the workflow **MUST** bind a separate typed token-ID value for
+the token-context component. A runtime **MUST NOT** attempt to recover token IDs
+by reverse-searching an embedding table: embeddings are not an injective or
+stable token identity.
+
+Every semantic history has its own state cell and group. Token-ID history and
+convolution history are distinct participants with explicit initialization,
+recurrence, update, release, checkpoint, fork, compaction, and rollback
+semantics. Chunked prefill and single-token decode must therefore be equivalent
+to full-sequence execution at the same boundaries, including explicit reset or
+EOS behavior.
+
+Embedding-table dimensions, n-gram orders, hash count and construction,
+projection width, convolution geometry and dilation, injection layers, and
+state shapes are graph/package facts. Table placement, physical sharding,
+owner routing, host offload, asynchronous prefetch, and memory budgets are
+runtime policy.
+
+Qwen3.8 Flash Next is the first conformance fixture for this generalized
+contract, not a dispatch key. Support requires reference-equivalent hash IDs,
+lookup values, residual deltas, chunked-prefill/decode behavior, checkpoint and
+restore, row compaction, and speculative rollback. A second synthetic fixture
+with different orders, geometry, convolution, injection points, and state sizes
+is required before claiming the implementation is architecture-agnostic.
+
 ---
 
 ## 13. Speculative execution
@@ -2042,7 +2105,7 @@ workflow declares `bitwise` or `distribution_preserving` equivalence
 Otherwise the caller must opt in — by naming a mode on the request or in the
 engine configuration.
 
-### 13.7 Evidence-gated speculative and n-gram forms
+### 13.7 DFlash and candidate-tree proposals
 
 #### Candidate trees
 
@@ -2059,25 +2122,37 @@ ABI.
 
 #### DFlash
 
-`DFlash` is currently only a recognized proposal-type spelling and has no
-accepted algorithm, topology, graph ABI, state contract, implementation, or
-conformance fixture in this repository. It is unsupported. A reader **MUST**
-fail closed rather than infer semantics from the name, route it through another
-proposer, or publish a support claim. Schema work may begin only after
-authoritative algorithm and artifact evidence supplies those missing facts.
+**Implementation status — accepted contract awaiting implementation proof.**
+DFlash is a flat-block speculative proposal method: a block-diffusion draft
+component is conditioned on explicitly selected target hidden features,
+predicts masked candidate positions in parallel, and supplies a block for exact
+target verification. It is independent of the token-context feature contract in
+[§12.8](#128-stateful-graph-internal-token-context-features).
 
-#### Learned PLE
+The package declares typed artifact ports for target hidden outputs, feature
+fusion, the masked block, positions, draft-private state, candidate tokens, and
+the proposal distribution required for sampling. Reuse of target embedding or
+output-head weights is explicit immutable sharing; copied weights are ordinary
+draft-owned artifacts. The draft cache is private even when immutable weights
+are shared.
 
-A learned PLE n-gram embedding is model computation, not prompt-lookup
-speculation. It belongs inside an ONNX graph when exportable, or in a generic
-typed component with explicit ports and state when it is not. It **MUST NOT** be
-dispatched by model family or represented as prompt-history matching merely
-because both use the phrase “n-gram.”
+The target verifies the candidate block through the canonical speculative
+contract. Greedy execution accepts the longest matching prefix. Sampling may be
+enabled only when the proposer supplies the probabilities needed for
+distribution-preserving rejection sampling. Target and draft state must both
+commit exactly the accepted prefix and roll back or crop every rejected suffix,
+including transitive state cascades.
 
-No verified Flash-Next PLE artifact, port ABI, or executable fixture exists in
-this repository. PLE-specific schema and runtime claims are therefore deferred
-until an audited artifact establishes its actual inputs, outputs, dimensions,
-state, and update semantics.
+Proposal width and scheduling are runtime choices within declared bounds.
+Capability admission must cover EOS inside a block, zero and full acceptance,
+context exhaustion, cancellation, verifier failure, batching, and compaction.
+Two structurally distinct target/draft fixtures are required before support is
+claimed; model identity is never a dispatch key.
+
+DFlash 2 selects one candidate path from per-position candidates. That is not a
+candidate tree, and candidate-tree schema work **MUST NOT** block DFlash or
+DFlash 2 implementation. Additional selector or convolution semantics require
+an explicit versioned contract rather than silently changing baseline DFlash.
 
 ---
 
@@ -2595,17 +2670,21 @@ their listed proof lands:
 | Accepted contract | Current status | Proof required before claiming support |
 | --- | --- | --- |
 | Shape is the sole rank authority; `Any` is an unconstrained dimension | Schema still serializes `rank` and optional `shape` | Atomic schema/parser/importer/exporter/runtime/example migration and fail-closed legacy-field tests |
-| Internal incremental publication is distinct from API/network streaming | Current capability spelling is `streaming_emit` | Clean replacement with `incremental_publication`, no alias, plus tests proving no transport claim |
-| Commit-only default and provisional revisions with `append`/`replace`/`retract`/`finalize` | No complete revision envelope or whole-turn coordinator | Boundary fault matrix across every semantic carrier and publication |
+| Output-level publication protocol plus ordinary workflow emits is distinct from API/network streaming | Current schema stores mode on individual emits and advertises redundant `streaming_emit` | Migrate to one output protocol family with permitted per-emit operations; remove `streaming_emit` without replacement; prove no transport claim |
+| Commit-only default and provisional typed revisions with `append`/`replace`/`retract`/`finalize` | No complete revision envelope or whole-turn coordinator | Protocol state-machine tests plus a boundary fault matrix across every semantic carrier and publication |
 | Native typed/versioned tool registry v1 | Server still tries family formats in order | Two declared protocols, arbitrary chunk-boundary tests, and unknown-version fail-closed behavior |
 | Generic cross-invocation state/dataflow | Existing cells and state groups cover the pieces; complete cross-path proof is pending | Fixtures proving external initialization and internal carry with identical lifecycle rules across KV, recurrent, feature-stream, and audio-window examples |
 | Workflow-native speculative contract is the sole authority | Legacy `SpeculatorConfig` remains in parser/runtime paths | Producer migration and real MTP execution without legacy-only discovery |
+| Stateful graph-internal token-context feature subgraphs | Generic graph/state primitives exist; Qwen3.8 Flash Next PLE is not implemented end to end | Explicit token IDs, full/chunked parity, checkpoint/restore, compaction, speculative rollback, Qwen reference fixture, and alternate-geometry fixture |
+| DFlash flat-block speculative proposals | Parser recognizes the proposal type but returns `NotYetSupported` | Typed target/draft ports and state, exact verification, greedy and probability-backed sampling, rollback/fault/batching tests, and two structurally distinct fixtures |
 | Complete session fork | Metadata bounds and partial state primitives exist | All-carrier parent/child divergence and capability-admission tests |
 | Split prefill/decode final-writer semantics | Workflow SSA can express ordering; multiturn proof is incomplete | Two-turn restored-state → incremental-prefill → decode → commit fixture |
 
-DFlash, serialized candidate-tree proposals, and learned PLE are not entries in
-this table because they are not accepted-but-unimplemented contracts. They are
-unsupported evidence-gated research topics under [§13.7](#137-evidence-gated-speculative-and-n-gram-forms).
+Serialized candidate-tree proposals remain evidence-gated and independent of
+DFlash. They are not an accepted contract until a producer artifact establishes
+the candidate tokens, parent topology or mask, verification outputs, accepted
+path, and rollback semantics described in
+[§13.7](#137-dflash-and-candidate-tree-proposals).
 
 ---
 
@@ -3113,4 +3192,4 @@ The original approved decisions map to sections as follows.
 | 26–32 (state) | [§12](#12-state) |
 | 33–36 (generation, speculative, LoRA, state quantization) | [§9](#9-adapters-lora), [§13](#13-speculative-execution), [§14](#14-generation), [§12.7](#127-state-representation-and-quantization) |
 | 37–39 (distributed execution) | [§16](#16-distributed-execution) |
-| Review decisions accepted from #2302/#2303 | [§4.5](#45-tensor-shape-is-the-sole-rank-authority), [§6.4](#64-internal-publication-turns-and-revisions), [§8](#8-batching-varlen-and-paged-attention), [§12.3](#123-capabilities-and-cascade), [§12.5](#125-sessions), [§12.6](#126-private-state-and-checkpoints), [§13](#13-speculative-execution), [§15](#15-preprocessing-and-generated-inputs), [§20.4](#204-accepted-contracts-awaiting-implementation-proof) |
+| Review decisions accepted from #2302/#2303 | [§4.5](#45-tensor-shape-is-the-sole-rank-authority), [§6.4](#64-internal-publication-turns-and-revisions), [§8](#8-batching-varlen-and-paged-attention), [§12.3](#123-capabilities-and-cascade), [§12.5](#125-sessions), [§12.6](#126-private-state-and-checkpoints), [§12.8](#128-stateful-graph-internal-token-context-features), [§13](#13-speculative-execution), [§15](#15-preprocessing-and-generated-inputs), [§20.4](#204-accepted-contracts-awaiting-implementation-proof) |
