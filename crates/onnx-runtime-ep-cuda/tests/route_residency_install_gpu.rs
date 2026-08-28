@@ -19,8 +19,9 @@
 //!   (`RouteResidencyBindingReject::NoPerBankReservation`) — the residual is the
 //!   per-bank dedicated VMM reservation, disclosed in the decision record — with
 //!   **no** silent whole-bank / default-success and **no** boundary installed,
-//! * the default-off path installs nothing, retains nothing, and touches no
-//!   route diagnostics at all (a pure inert early return).
+//! * the default-off path allocates/registers no producer, installs nothing,
+//!   retains nothing, and touches no route diagnostics at all (a pure inert
+//!   early return).
 //!
 //! No transition is fabricated: on the shipped shared-reservation residency the
 //! honest outcome is a typed decline, and these tests assert exactly that.
@@ -159,6 +160,35 @@ fn qmoe_graph() -> (Graph, NodeId, Vec<ValueId>) {
     )
 }
 
+fn block_quantized_moe_graph() -> (Graph, NodeId) {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert("pkg.nxrt".into(), 1);
+    let input = graph.create_named_value("hidden", DataType::Float32, static_shape([4]));
+    let router = graph.create_named_value("router_probs", DataType::Float32, static_shape([4]));
+    let weight = inline_u8_initializer(&mut graph, "experts");
+    let output = graph.create_named_value("output", DataType::Float32, static_shape([4]));
+    let mut node = Node::new(
+        NodeId(0),
+        "BlockQuantizedMoE",
+        vec![Some(input), Some(router), Some(weight)],
+        vec![output],
+    );
+    node.domain = "pkg.nxrt".to_string();
+    for (name, value) in [
+        ("k", Attribute::Int(2)),
+        ("activation_type", Attribute::String(b"silu".to_vec())),
+        ("normalize_routing_weights", Attribute::Int(0)),
+        ("swiglu_fusion", Attribute::Int(0)),
+        ("fc1_format", Attribute::String(b"mxfp4".to_vec())),
+        ("fc2_format", Attribute::String(b"mxfp4".to_vec())),
+    ] {
+        node.attributes.insert(name.into(), value);
+    }
+    let node_id = graph.insert_node(node);
+    graph.add_output(output);
+    (graph, node_id)
+}
+
 /// Compile the graph's `QMoE` node through the EP's own factory so the actual
 /// executing `QMoEKernel` registers as this EP's route-telemetry producer —
 /// exactly the path the session's `compile_all` pre-warm takes. Returns the
@@ -207,6 +237,8 @@ fn enabled_build_binds_real_producer_and_declines_without_per_bank_reservation()
         "nothing retained before an enabled build"
     );
 
+    gate_on();
+
     // Compile the QMoE node through the EP's factory: the executing kernel
     // registers itself as the EP-owned producer (goal 2, no test double).
     let _kernel = compile_qmoe_through_ep(&provider, executor, &graph, node_id);
@@ -224,7 +256,6 @@ fn enabled_build_binds_real_producer_and_declines_without_per_bank_reservation()
 
     // Invoke the exact transition the session executor calls after resolved
     // compilation.
-    gate_on();
     assert_eq!(
         provider
             .finalize_executor_artifacts(executor, &graph, ExecutorArtifactReadinessEpoch::new(1),)
@@ -391,9 +422,68 @@ fn readiness_absence_does_not_latch_and_concurrent_finalize_is_idempotent() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 2: the default-off build path is inert — nothing installed, nothing
-// retained, and no route diagnostics are even touched, even though a real
-// producer exists. Byte-for-byte: the shipped default creates no boundary work.
+// Test 2: BQMoE has no executor-scoped producer publication path, so source
+// absence is a terminal typed decline rather than permanent Pending.
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "requires idle CUDA device; CUDA_VISIBLE_DEVICES=<idle> --ignored"]
+fn block_quantized_moe_without_producer_is_terminal_not_pending() {
+    let _guard = GPU_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let provider = match offload_provider_or_skip("bqmoe-terminal") {
+        Some(provider) => provider,
+        None => return,
+    };
+    let (graph, node_id) = block_quantized_moe_graph();
+    let executor = ExecutorInstanceId::fresh();
+    gate_on();
+
+    let _kernel = provider
+        .get_kernel_for_executor(executor, graph.node(node_id), &[], 1)
+        .expect("compile the real BlockQuantizedMoE kernel");
+    assert!(
+        provider.route_telemetry_sources(executor).is_empty(),
+        "BlockQuantizedMoE compilation has no executor-scoped producer publication path"
+    );
+
+    assert_eq!(
+        provider
+            .finalize_executor_artifacts(executor, &graph, ExecutorArtifactReadinessEpoch::new(1),)
+            .expect("unsupported producer capability is a typed decline"),
+        ExecutorArtifactFinalization::Complete
+    );
+    let status = provider.route_residency_executor_status(executor);
+    assert_eq!(status.finalization_attempts, 1);
+    assert!(status.pending.is_none(), "BQMoE must not remain pending");
+    assert!(matches!(
+        status.outcome,
+        Some(onnx_runtime_ep_cuda::route_residency::RouteResidencyInstallOutcome::Rejected(
+            onnx_runtime_ep_cuda::route_residency::RouteResidencyBindingReject::TelemetryProducerUnsupported {
+                node,
+                boundary: onnx_runtime_ep_api::LazyWeightBoundary::BlockQuantizedMoe,
+            }
+        )) if node == node_id
+    ));
+
+    assert_eq!(
+        provider
+            .finalize_executor_artifacts(executor, &graph, ExecutorArtifactReadinessEpoch::new(2),)
+            .expect("terminal decline remains idempotent"),
+        ExecutorArtifactFinalization::Complete
+    );
+    assert_eq!(
+        provider
+            .route_residency_executor_status(executor)
+            .finalization_attempts,
+        1,
+        "unsupported producer capability cannot busy-retry"
+    );
+    gate_off();
+}
+
+// ---------------------------------------------------------------------------
+// Test 3: the default-off build path is inert — no producer allocation or
+// registration, no install/retention, and no route diagnostics.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -414,10 +504,14 @@ fn disabled_build_installs_and_retains_nothing() {
     let executor = ExecutorInstanceId::fresh();
     let _kernel = compile_qmoe_through_ep(&provider, executor, &graph, node_id);
     assert!(
+        provider.route_telemetry_sources(executor).is_empty(),
+        "default-off compilation must not register a producer"
+    );
+    assert!(
         provider
-            .route_telemetry_sources(executor)
-            .contains_key(&node_id),
-        "a real producer still exists; the disabled guarantee is about install/retain, not existence"
+            .route_telemetry_producer(executor, node_id)
+            .is_none(),
+        "default-off compilation must not allocate/retain a telemetry Arc"
     );
 
     gate_off();
@@ -446,9 +540,13 @@ fn disabled_build_installs_and_retains_nothing() {
             .is_none(),
         "default-off retains no bank artifacts"
     );
+    let status = provider.route_residency_executor_status(executor);
+    assert_eq!(status.producer_nodes, 0);
+    assert_eq!(status.finalization_attempts, 0);
+    assert!(status.pending.is_none());
+    assert!(status.outcome.is_none());
 
-    // Draining the (never-installed) boundary is a safe no-op that also clears
-    // the EP-owned producer registry and any retained artifacts on teardown.
+    // Draining the never-installed boundary is a safe no-op.
     provider.drain_executor_artifacts(executor);
     assert!(
         provider.route_telemetry_sources(executor).is_empty(),

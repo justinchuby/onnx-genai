@@ -1912,8 +1912,10 @@ impl CudaExecutionProvider {
     /// Finalize one executor's real QMoE route-residency artifacts.
     ///
     /// `NoTelemetrySource` is readiness-dependent and returns `Pending` without
-    /// recording or latching a decline. Every structural outcome is terminal
-    /// and idempotent. The shipped default-off path returns before touching the
+    /// recording or latching a decline only for boundary kinds whose producer
+    /// can be published by a later resolved compilation. Unsupported producer
+    /// kinds are structural, terminal declines. Every structural outcome is
+    /// idempotent. The shipped default-off path returns before touching the
     /// executor-state map.
     pub fn finalize_route_residency_for_executor(
         &self,

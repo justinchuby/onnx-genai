@@ -528,9 +528,17 @@ pub enum RouteResidencyBindingReject {
     /// silently covering only one. Multi-bank binding is a later slice.
     MultipleBanksUnsupported { groups: usize },
     /// The discovered group's node has no armed route-telemetry producer source
-    /// (its kernel never surfaced a window source to the EP). Without a producer
-    /// there is no window to consume, so no binding is installed.
+    /// yet, but its boundary publishes one during resolved kernel compilation.
+    /// Without a producer there is no window to consume, so no binding is
+    /// installed until a later readiness epoch.
     NoTelemetrySource { node: NodeId },
+    /// This boundary has no executor-scoped route-telemetry producer
+    /// publication path. Waiting for another readiness epoch cannot change that,
+    /// so the binding is terminally declined rather than left pending forever.
+    TelemetryProducerUnsupported {
+        node: NodeId,
+        boundary: LazyWeightBoundary,
+    },
     /// A group member weight has no region catalog — it was not classified/
     /// loaded, so the boundary consumer could not map its regions.
     MissingCatalog { value: ValueId },
@@ -563,6 +571,12 @@ impl RouteResidencyBindingReject {
             }
             RouteResidencyBindingReject::NoTelemetrySource { node } => {
                 format!("expert group node {node:?} has no armed telemetry source")
+            }
+            RouteResidencyBindingReject::TelemetryProducerUnsupported { node, boundary } => {
+                format!(
+                    "expert group node {node:?} at {boundary:?} has no supported executor-scoped \
+                     route-telemetry producer"
+                )
             }
             RouteResidencyBindingReject::MissingCatalog { value } => {
                 format!("bank value {value:?} has no region catalog")
@@ -627,7 +641,19 @@ pub(crate) fn validate_route_residency_binding(
     }
     let group = groups.pop().expect("exactly one group");
     if !has_source(group.node) {
-        return Err(RouteResidencyBindingReject::NoTelemetrySource { node: group.node });
+        return Err(
+            if group
+                .boundary
+                .route_telemetry_producer_may_appear_after_compilation()
+            {
+                RouteResidencyBindingReject::NoTelemetrySource { node: group.node }
+            } else {
+                RouteResidencyBindingReject::TelemetryProducerUnsupported {
+                    node: group.node,
+                    boundary: group.boundary,
+                }
+            },
+        );
     }
     for member in &group.members {
         if !has_catalog(*member) {
@@ -1024,6 +1050,20 @@ mod binding_tests {
         )
     }
 
+    fn block_quantized_moe_node(graph: &mut Graph) -> (NodeId, ValueId) {
+        let input = graph.create_named_value("input", DataType::Float32, shape1(4));
+        let weight = inline_initializer(graph, "experts");
+        let output = graph.create_named_value("output", DataType::Float32, shape1(4));
+        let mut node = onnx_runtime_ir::Node::new(
+            NodeId(0),
+            "BlockQuantizedMoE",
+            vec![Some(input), Some(weight)],
+            vec![output],
+        );
+        node.domain = "pkg.nxrt".to_string();
+        (graph.insert_node(node), weight)
+    }
+
     fn always(_: NodeId) -> bool {
         true
     }
@@ -1079,6 +1119,26 @@ mod binding_tests {
         let err = validate_route_residency_binding(&graph, |_| false, always_v, always_v)
             .expect_err("no source");
         assert_eq!(err, RouteResidencyBindingReject::NoTelemetrySource { node });
+    }
+
+    #[test]
+    fn missing_block_quantized_moe_producer_is_terminally_unsupported() {
+        let mut graph = Graph::new();
+        let (node, _) = block_quantized_moe_node(&mut graph);
+        let err = validate_route_residency_binding(&graph, |_| false, always_v, always_v)
+            .expect_err("BlockQuantizedMoE has no deferred producer");
+        assert_eq!(
+            err,
+            RouteResidencyBindingReject::TelemetryProducerUnsupported {
+                node,
+                boundary: LazyWeightBoundary::BlockQuantizedMoe,
+            }
+        );
+        let reason = err.reason();
+        assert!(
+            reason.contains("BlockQuantizedMoe") && reason.contains("no supported"),
+            "terminal reason names the unsupported boundary capability: {reason}"
+        );
     }
 
     #[test]
