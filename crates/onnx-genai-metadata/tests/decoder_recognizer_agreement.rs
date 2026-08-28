@@ -498,6 +498,16 @@ const MATRIX: &[Row] = &[
         true,
         Some("decoder"),
     ),
+    // The zero-bound second loop exercises the per-token cursor's generic
+    // fallback. It does not alter the sole decoder component or its contract.
+    row(
+        "tests/fixtures/tiny-llm-cursor-fallback/inference_metadata.yaml",
+        1,
+        SingleGraph,
+        Some("decoder"),
+        true,
+        Some("decoder"),
+    ),
     row(
         "tests/fixtures/tiny-llm-explicit-io/inference_metadata.yaml",
         1,

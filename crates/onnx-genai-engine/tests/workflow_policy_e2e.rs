@@ -2893,7 +2893,7 @@ pipeline:
     manifest:
       adapter_abis: {}
       capabilities:
-        [workflow_ssa, linear_effects, typed_emit, streaming_emit,
+        [workflow_ssa, linear_effects, typed_emit,
          nested_control_flow, session_state_lease]
     inputs:
       initial: { contract: { dtype: int64, shape: [] }, role: { kind: opaque },
@@ -3160,7 +3160,7 @@ pipeline:
     manifest:
       adapter_abis: {}
       capabilities:
-        [workflow_ssa, linear_effects, typed_emit, streaming_emit,
+        [workflow_ssa, linear_effects, typed_emit,
          nested_control_flow, session_state_lease, advisory_state]
     inputs:
       initial: { contract: { dtype: int64, shape: [] },
@@ -3393,7 +3393,7 @@ pipeline:
     manifest:
       adapter_abis: {}
       capabilities:
-        [workflow_ssa, linear_effects, typed_emit, streaming_emit, nested_control_flow]
+        [workflow_ssa, linear_effects, typed_emit, nested_control_flow]
     inputs:
       accept:
         contract: { dtype: bool, shape: [] }

@@ -100,7 +100,7 @@ impl<'a> Lowering<'a> {
         let mut document = Map::new();
         document.insert(
             "schema_version".to_owned(),
-            json!(onnx_genai_metadata::SCHEMA_VERSION),
+            json!(onnx_genai_metadata::OUTPUT_PROTOCOL_SCHEMA_VERSION.to_string()),
         );
         document.insert(
             "pipeline".to_owned(),
@@ -1016,13 +1016,19 @@ impl<'a> Lowering<'a> {
             json!({
                 "contract": image_contract(3),
                 "role": "image",
+                "family": {"kind": "materialized"},
                 "value_range": "negative_one_to_one",
                 "stage": "pre_adapter"
             }),
         );
         self.outputs.insert(
             "latent".to_owned(),
-            json!({"contract": latent_contract(), "role": "tensor", "stage": "pre_adapter"}),
+            json!({
+                "contract": latent_contract(),
+                "role": "tensor",
+                "family": {"kind": "materialized"},
+                "stage": "pre_adapter"
+            }),
         );
     }
 

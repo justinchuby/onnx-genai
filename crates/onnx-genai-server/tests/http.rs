@@ -146,8 +146,9 @@ fn sse_data_lines(text: &str) -> Vec<&str> {
 }
 
 fn sse_json_chunks(text: &str) -> Vec<Value> {
-    sse_data_lines(text)
-        .into_iter()
+    text.split("\n\n")
+        .filter(|event| !event.lines().any(|line| line.starts_with("event: ")))
+        .filter_map(|event| event.lines().find_map(|line| line.strip_prefix("data: ")))
         .filter(|data| *data != "[DONE]")
         .map(|data| serde_json::from_str(data).unwrap())
         .collect()

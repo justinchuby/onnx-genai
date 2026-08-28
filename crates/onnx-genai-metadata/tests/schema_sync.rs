@@ -95,6 +95,19 @@ fn generated_schema_preserves_all_root_constraints() {
     assert!(serialized.contains("\"hf_peft\""));
     assert!(serialized.contains("\"segments\""));
     assert!(!serialized.contains("\"adapter_ids\""));
+    let output = &schema["$defs"]["WorkflowOutput"];
+    assert!(
+        output["required"]
+            .as_array()
+            .is_some_and(|required| required.contains(&serde_json::json!("family"))),
+        "every serialized workflow output must declare exactly one publication family"
+    );
+    assert!(serialized.contains("\"retract\""));
+    assert!(serialized.contains("\"finalize\""));
+    assert!(
+        !serialized.contains("streaming_emit"),
+        "the redundant streaming capability must not remain in the schema"
+    );
 }
 
 #[test]

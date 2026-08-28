@@ -455,6 +455,7 @@ pub fn decoder_workflow(
     body.push(WorkflowStep::Emit {
         value: TOKEN_VALUE.to_string(),
         output: TOKENS_OUTPUT.to_string(),
+        stream: None,
         mode: crate::schema::WorkflowEmitMode::Append,
         when: Some(ACTIVE_CELL.to_string()),
         valid_length: None,
@@ -516,7 +517,6 @@ pub fn decoder_workflow(
                 "workflow_ssa".to_string(),
                 "linear_effects".to_string(),
                 "typed_emit".to_string(),
-                "streaming_emit".to_string(),
                 "nested_control_flow".to_string(),
                 "loop_induction_values".to_string(),
                 "serving_service_contract".to_string(),
@@ -528,6 +528,7 @@ pub fn decoder_workflow(
             WorkflowOutput {
                 contract: token_contract(),
                 role: WorkflowOutputRole::Tokens,
+                family: crate::schema::WorkflowOutputFamily::Materialized,
                 value_range: None,
                 stage: crate::schema::OutputStage::PreAdapter,
                 media: None,
@@ -809,6 +810,7 @@ fn rebuild_body(
                 steps.push(WorkflowStep::Emit {
                     value: value.clone(),
                     output: output.clone(),
+                    stream: None,
                     mode: mode.clone(),
                     when: when.clone(),
                     valid_length: Some(accepted.clone()),

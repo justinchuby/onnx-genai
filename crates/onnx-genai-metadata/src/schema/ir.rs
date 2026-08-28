@@ -2,7 +2,7 @@ use super::*;
 use std::collections::BTreeSet;
 
 /// Typed tensor contract used at package and component boundaries.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TensorContract {
     #[schemars(with = "schema_vocabulary::TensorDType")]
@@ -812,11 +812,17 @@ pub enum WorkflowInputSource {
     Artifact { path: String },
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WorkflowOutput {
     pub contract: TensorContract,
     pub role: WorkflowOutputRole,
+    /// The sole publication family for this output boundary.
+    ///
+    /// The default preserves documents authored before output protocols were
+    /// introduced. New schema-versioned documents must state this field; see
+    /// the parser's version gate.
+    pub family: WorkflowOutputFamily,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value_range: Option<PixelValueRange>,
     pub stage: OutputStage,
@@ -828,6 +834,74 @@ pub struct WorkflowOutput {
     /// no model-family identifiers or artifact fingerprints.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media: Option<MediaOutputContract>,
+}
+
+/// Deserialization preserves the pre-output-protocol materialized behavior for
+/// documents whose schema version predates this field. The generated schema
+/// intentionally remains stricter: versioned output-protocol documents must
+/// state their family, which the parser enforces before this compatibility
+/// default is applied.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkflowOutputWire {
+    contract: TensorContract,
+    role: WorkflowOutputRole,
+    #[serde(default)]
+    family: WorkflowOutputFamily,
+    #[serde(default)]
+    value_range: Option<PixelValueRange>,
+    stage: OutputStage,
+    #[serde(default)]
+    media: Option<MediaOutputContract>,
+}
+
+impl<'de> Deserialize<'de> for WorkflowOutput {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = WorkflowOutputWire::deserialize(deserializer)?;
+        Ok(Self {
+            contract: wire.contract,
+            role: wire.role,
+            family: wire.family,
+            value_range: wire.value_range,
+            stage: wire.stage,
+            media: wire.media,
+        })
+    }
+}
+
+/// Publication semantics selected once for a workflow output.
+///
+/// This classification describes workflow semantics only. Adapters render the
+/// resulting publications separately and cannot change an allowed operation.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkflowOutputFamily {
+    /// One value, replaced or grown along a declared axis.
+    #[default]
+    Materialized,
+    /// Ordered, discrete typed occurrences.
+    Events,
+    /// A stream of typed, transaction-addressable revisions.
+    Revisions {
+        /// Exact revision-envelope protocol version.
+        #[schemars(length(min = 1))]
+        version: String,
+    },
+}
+
+impl WorkflowOutputFamily {
+    /// The exact typed-revision protocol version, when this is a revision
+    /// output. Materialized values and discrete events have no revision
+    /// envelope.
+    pub fn revision_version(&self) -> Option<&str> {
+        match self {
+            Self::Revisions { version } => Some(version),
+            Self::Materialized | Self::Events => None,
+        }
+    }
 }
 
 /// Numeric interpretation of pixels emitted by an image or video workflow
@@ -1135,12 +1209,20 @@ pub enum WorkflowStep {
         outputs: BTreeMap<String, WorkflowBranchOutput>,
     },
     Emit {
+        /// SSA value published by a value-carrying operation. `retract` and
+        /// `finalize` carry no value, so this is absent for those operations.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
         value: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         when: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         valid_length: Option<String>,
         output: String,
+        /// Logical stream within the declared output. Omission selects the
+        /// output's default stream; it never selects an adapter.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[schemars(length(min = 1))]
+        stream: Option<String>,
         mode: WorkflowEmitMode,
         /// Axis along which the output grows; defaults to the final axis.
         ///
@@ -1205,6 +1287,7 @@ pub enum WorkflowNode {
         /// on the value's growth axis, globally or per batch row.
         valid_length: Option<String>,
         output: String,
+        stream: Option<String>,
         mode: WorkflowEmitMode,
         /// Axis along which an appended or length-limited output grows.
         ///
@@ -1290,6 +1373,8 @@ pub enum WorkflowEmitMode {
     Replace,
     Append,
     Event,
+    Retract,
+    Finalize,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]

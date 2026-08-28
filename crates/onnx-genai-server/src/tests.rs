@@ -530,6 +530,59 @@ async fn completion_logprobs_match_legacy_openai_shape() {
 }
 
 #[tokio::test]
+async fn buffered_and_sse_routes_deliver_only_committed_workflow_publications() {
+    let request = |stream| {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({
+                    "model": "tiny-llm",
+                    "prompt": "hello",
+                    "max_tokens": 1,
+                    "temperature": 0.0,
+                    "stream": stream
+                })
+                .to_string(),
+            ))
+            .unwrap()
+    };
+
+    let buffered = app(tiny_state()).oneshot(request(false)).await.unwrap();
+    assert_eq!(buffered.status(), StatusCode::OK);
+    let buffered: Value =
+        serde_json::from_slice(&to_bytes(buffered.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let publications = buffered["workflow_outputs"]
+        .as_array()
+        .expect("buffered route exposes committed workflow publications");
+    assert!(!publications.is_empty());
+    assert!(
+        publications
+            .iter()
+            .all(|publication| publication["finality"] == "final"),
+        "{publications:#?}"
+    );
+
+    let streamed = app(tiny_state()).oneshot(request(true)).await.unwrap();
+    assert_eq!(streamed.status(), StatusCode::OK);
+    let body = to_bytes(streamed.into_body(), usize::MAX).await.unwrap();
+    let text = std::str::from_utf8(&body).unwrap();
+    let streamed_publications = text
+        .split("\n\n")
+        .filter(|event| event.lines().any(|line| line == "event: workflow_output"))
+        .map(|event| {
+            let data = event
+                .lines()
+                .find_map(|line| line.strip_prefix("data: "))
+                .expect("workflow output event has data");
+            serde_json::from_str::<Value>(data).expect("workflow output event is JSON")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(streamed_publications.as_slice(), publications.as_slice());
+}
+
+#[tokio::test]
 async fn streaming_chat_and_completion_chunks_include_logprobs() {
     let chat = app(tiny_state())
         .oneshot(

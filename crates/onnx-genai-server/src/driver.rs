@@ -224,6 +224,7 @@ pub(crate) enum DriverCommand {
 #[derive(Debug)]
 pub(crate) enum DriverEvent {
     Token(GenerateToken),
+    WorkflowPublications(Vec<serde_json::Value>),
     Finished(GenerateResult),
     Error(DriverFailure),
 }
@@ -1083,6 +1084,7 @@ impl EngineDriver {
         while let Some(event) = receiver.blocking_recv() {
             match event {
                 DriverEvent::Token(_) => {}
+                DriverEvent::WorkflowPublications(_) => {}
                 DriverEvent::Finished(_) => return Ok(()),
                 DriverEvent::Error(error) => anyhow::bail!(error.message),
             }
@@ -2407,6 +2409,29 @@ fn run_generation(
     match result {
         Ok(result) => {
             metrics.result(result.token_ids.len(), result.prefix_cache_hit_len);
+            let publications = engine.take_committed_workflow_publications();
+            if !publications.is_empty() {
+                let encoded = publications
+                    .iter()
+                    .map(crate::sse::buffered_workflow_publication)
+                    .collect::<anyhow::Result<Vec<_>>>();
+                match encoded {
+                    Ok(encoded) => {
+                        let _ = deliver_event(&events, DriverEvent::WorkflowPublications(encoded));
+                    }
+                    Err(error) => {
+                        let _ = deliver_event(
+                            &events,
+                            DriverEvent::Error(DriverFailure::internal(format!(
+                                "committed workflow output serialization failed after semantic \
+                                 commit: {error:#}; the committed turn remains durable and will \
+                                 not be replayed"
+                            ))),
+                        );
+                        return;
+                    }
+                }
+            }
             let _ = deliver_event(&events, DriverEvent::Finished(result));
         }
         Err(err) => {
@@ -3250,6 +3275,9 @@ mod admission_tests {
                         token.token_id
                     )
                 }
+                DriverEvent::WorkflowPublications(_) => {
+                    panic!("{route} leaked workflow publications from an aborted turn")
+                }
                 DriverEvent::Finished(_) => {
                     panic!("{route} leaked a success completion from an aborted turn")
                 }
@@ -3274,6 +3302,7 @@ mod admission_tests {
             while let Ok(event) = events_rx.try_recv() {
                 match event {
                     DriverEvent::Token(token) => tokens.push(token.token_id),
+                    DriverEvent::WorkflowPublications(_) => {}
                     DriverEvent::Finished(result) => finished = Some(result),
                     DriverEvent::Error(failure) => {
                         panic!("{route} deterministic retry failed: {}", failure.message)
@@ -3643,6 +3672,7 @@ mod driver_delivery_tests {
         while let Some(event) = rx.blocking_recv() {
             match event {
                 DriverEvent::Token(_) => tokens += 1,
+                DriverEvent::WorkflowPublications(_) => {}
                 DriverEvent::Finished(_) => {
                     finished = true;
                     break;
@@ -3767,6 +3797,7 @@ mod driver_delivery_tests {
         while let Some(event) = events_rx.recv().await {
             match event {
                 DriverEvent::Token(token) => tokens.push(token.token_id),
+                DriverEvent::WorkflowPublications(_) => {}
                 DriverEvent::Finished(_) => finished = true,
                 DriverEvent::Error(error) => panic!("unexpected failure: {error:?}"),
             }
@@ -3811,6 +3842,9 @@ mod driver_delivery_tests {
             ),
             Some(DriverEvent::Token(token)) => {
                 panic!("aborted turn leaked DriverEvent::Token({})", token.token_id)
+            }
+            Some(DriverEvent::WorkflowPublications(_)) => {
+                panic!("aborted turn leaked committed workflow publications")
             }
             Some(DriverEvent::Finished(_)) => {
                 panic!("aborted turn leaked a success completion")

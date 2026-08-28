@@ -34,7 +34,7 @@ use crate::{
     sse::{
         StopBoundaryBuffer, completion_chunk, completion_done_chunk, content_chunk, done_chunk,
         reasoning_chunk, role_chunk, send_completion_stream_chunk, send_stream_chunk,
-        tool_call_delta_chunks,
+        send_workflow_publications, tool_call_delta_chunks,
     },
     state::{AppState, DEFAULT_MAX_OUTPUT_TOKENS, ServerConfig},
     types::{

@@ -137,6 +137,7 @@ pipeline:
             kind: request_aligned
             axis: 0
         role: tensor
+        family: { kind: materialized }
         stage: pre_adapter
       latent:
         contract:
@@ -148,6 +149,7 @@ pipeline:
             kind: request_aligned
             axis: 0
         role: tensor
+        family: { kind: materialized }
         stage: pre_adapter
     components:
       model:
