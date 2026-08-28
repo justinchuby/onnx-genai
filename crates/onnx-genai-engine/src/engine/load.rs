@@ -3247,8 +3247,8 @@ mod metadata_admission_tests {
             "the refusal must identify the exact canonical declaration: {message}"
         );
         assert!(
-            message.contains("no candidate-tree package-dispatch capability or executor")
-                && message.contains("Refusing to silently run plain or MTP generation"),
+            message.contains("cannot execute the declared candidate-tree variant")
+                && message.contains("silently running plain, MTP, or DFlash generation"),
             "the refusal must explain why no model/session was loaded: {message}"
         );
         assert!(

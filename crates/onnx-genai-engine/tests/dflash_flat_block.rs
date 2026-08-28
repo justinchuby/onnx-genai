@@ -663,7 +663,7 @@ fn package_with_target(
 fn fixture_root() -> anyhow::Result<PathBuf> {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target-s13/test-fixtures/dflash-flat-block")
+        .join("../../target/test-fixtures/dflash-flat-block")
         .join(NEXT.fetch_add(1, Ordering::Relaxed).to_string());
     fs::create_dir_all(&root)?;
     Ok(root)

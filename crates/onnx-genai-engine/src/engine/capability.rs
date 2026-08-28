@@ -55,16 +55,30 @@ pub enum PackageCapabilityError {
     /// validate but cannot execute transactionally.
     #[error(
         "package declares canonical candidate-tree speculation \
-         (onnx-genai.speculative@{version}), but this runtime has no candidate-tree \
-         package-dispatch capability or executor. Refusing to silently run plain or MTP \
-         generation without the declared proposer, target verification, accepted-prefix \
-         commit, and rollback participants. Upgrade to a runtime that implements \
-         candidate-tree dispatch, or re-export this package with a supported canonical \
-         proposal execution."
+         (onnx-genai.speculative@{version}), but this runtime cannot execute the declared \
+         candidate-tree variant: {reason}. Refusing before component/session/state/output \
+         mutation rather than silently running plain, MTP, or DFlash generation. Re-export the \
+         package with the exact version-1 ORT candidate-tree ABI or select a runtime that \
+         implements this variant."
     )]
     CandidateTreeExecutionUnavailable {
         /// Exact canonical speculation contract version declared by the package.
         version: String,
+        /// Structural or backend feature the candidate-tree driver lacks.
+        reason: String,
+    },
+    /// Raw workflow/component execution would expose a partial proposer/target
+    /// choreography without accepted-path commit authority.
+    #[error(
+        "{operation} cannot execute a canonical candidate-tree package directly: raw \
+         pipeline/component APIs cannot preserve target-verified accepted-path state and output \
+         semantics. Use Engine generation/session generation so the transaction-owned \
+         candidate-tree driver runs proposer, verifier, accepted-path recomputation, atomic \
+         commit, and publication."
+    )]
+    CandidateTreeRawWorkflowApi {
+        /// Public operation that was refused before component execution.
+        operation: String,
     },
     /// The package declares a DFlash ABI/backend pair this runtime has not
     /// implemented. The production driver accepts only the base v1 contract

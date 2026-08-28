@@ -594,7 +594,8 @@ pub(crate) fn package_capability_failure(capability: PackageCapabilityError) -> 
         PackageCapabilityError::CandidateTreeExecutionUnavailable { .. } => {
             ApiError::conflict(capability.to_string())
         }
-        PackageCapabilityError::DFlashRawWorkflowApi { .. } => {
+        PackageCapabilityError::CandidateTreeRawWorkflowApi { .. }
+        | PackageCapabilityError::DFlashRawWorkflowApi { .. } => {
             ApiError::invalid_request(capability.to_string())
         }
         PackageCapabilityError::ConversationOverBound { .. } => {

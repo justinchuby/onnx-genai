@@ -618,13 +618,23 @@ const MATRIX: &[Row] = &[
         true,
         Some("decoder"),
     ),
-    // An intentionally model-less package: loader admission must reject its
-    // unsupported canonical candidate-tree executor before inspecting an ONNX
+    // An intentionally model-less package: exact production candidate-tree
+    // admission rejects its binding-only variant before inspecting an ONNX
     // artifact, while structural workflow recognition remains NoGraph.
     row(
         "crates/onnx-genai-engine/tests/fixtures/unsupported-candidate-tree/inference_metadata.yaml",
         0,
         NoGraph,
+        None,
+        false,
+        None,
+    ),
+    // The DFlash loader spy has two real graph components. Its verifier owns
+    // decoder state, but the package as a whole remains a composite workflow.
+    row(
+        "crates/onnx-genai-engine/tests/fixtures/dflash-admission/inference_metadata.yaml",
+        2,
+        Composite,
         None,
         false,
         None,
@@ -789,7 +799,8 @@ fn collect_workflows(directory: &Path, root: &Path, found: &mut BTreeSet<String>
         let name = entry.file_name().to_string_lossy().into_owned();
         if path.is_dir() {
             let cargo_or_tool_cache = path.join("CACHEDIR.TAG").is_file();
-            if !SKIPPED.contains(&name.as_str()) && !cargo_or_tool_cache {
+            let generated_target = name == "target" || name.starts_with("target-");
+            if !SKIPPED.contains(&name.as_str()) && !generated_target && !cargo_or_tool_cache {
                 collect_workflows(&path, root, found);
             }
             continue;

@@ -982,7 +982,16 @@ impl<'a> WorkflowExecutionPlan<'a> {
         engine: &'a WorkflowRuntime,
         request: PipelineGenerateRequest,
     ) -> anyhow::Result<Self> {
+        engine.reject_candidate_tree_raw_execution("WorkflowExecutionPlan::new")?;
         engine.reject_dflash_raw_execution("WorkflowExecutionPlan::new")?;
+        Self::new_hosted(engine, request, &[])
+    }
+
+    pub(super) fn new_candidate_tree_driver(
+        engine: &'a WorkflowRuntime,
+        request: PipelineGenerateRequest,
+    ) -> anyhow::Result<Self> {
+        engine.require_execution_admitted()?;
         Self::new_hosted(engine, request, &[])
     }
 

@@ -91,6 +91,7 @@ pub enum GenerationBoundary {
     BeforeProposer,
     AfterProposer,
     AfterVerifier,
+    BeforeAcceptedPathCommit,
     BeforeAcceptedPrefixCommit,
     BeforeSemanticCommit,
     BeforeOutputPublication,
@@ -112,6 +113,7 @@ impl std::fmt::Display for GenerationBoundary {
             Self::BeforeProposer => "before proposer execution",
             Self::AfterProposer => "after proposer execution",
             Self::AfterVerifier => "after verifier execution",
+            Self::BeforeAcceptedPathCommit => "before accepted-path commit",
             Self::BeforeAcceptedPrefixCommit => "before accepted-prefix commit",
             Self::BeforeSemanticCommit => "before semantic commit",
             Self::BeforeOutputPublication => "before output publication",
@@ -194,7 +196,7 @@ impl GenerationControl {
             .is_ok()
     }
 
-    fn observe(&self, boundary: GenerationBoundary) -> anyhow::Result<bool> {
+    pub(crate) fn observe(&self, boundary: GenerationBoundary) -> anyhow::Result<bool> {
         match self.state.load(Ordering::Acquire) {
             GENERATION_CANCELLED => return Ok(true),
             GENERATION_COMMITTING | GENERATION_COMMITTED => return Ok(false),
@@ -213,7 +215,7 @@ impl GenerationControl {
         Ok(self.state.load(Ordering::Acquire) == GENERATION_CANCELLED)
     }
 
-    fn begin_commit(&self) -> anyhow::Result<bool> {
+    pub(crate) fn begin_commit(&self) -> anyhow::Result<bool> {
         if self.observe(GenerationBoundary::BeforeSemanticCommit)? {
             return Ok(false);
         }
@@ -231,7 +233,7 @@ impl GenerationControl {
         }
     }
 
-    fn finish_commit(&self) {
+    pub(crate) fn finish_commit(&self) {
         let previous = self
             .state
             .compare_exchange(
@@ -244,7 +246,7 @@ impl GenerationControl {
         debug_assert_eq!(previous, GENERATION_COMMITTING);
     }
 
-    fn abort_commit(&self) {
+    pub(crate) fn abort_commit(&self) {
         let _ = self.state.compare_exchange(
             GENERATION_COMMITTING,
             GENERATION_CANCELLED,
@@ -253,7 +255,10 @@ impl GenerationControl {
         );
     }
 
-    fn observe_after_commit(&self, boundary: GenerationBoundary) -> anyhow::Result<bool> {
+    pub(crate) fn observe_after_commit(
+        &self,
+        boundary: GenerationBoundary,
+    ) -> anyhow::Result<bool> {
         if let Some(checkpoint) = &self.checkpoint {
             checkpoint(boundary)?;
         }
@@ -658,8 +663,11 @@ impl WorkflowRuntime {
         models: PipelineModels,
         speculative: Option<onnx_genai_metadata::SpeculativeContract>,
     ) -> anyhow::Result<Self> {
-        let execution_admission =
-            WorkflowExecutionAdmission::from_speculative(speculative.as_ref(), decode_backend);
+        let execution_admission = WorkflowExecutionAdmission::from_speculative(
+            speculative.as_ref(),
+            Some(&workflow),
+            decode_backend,
+        );
         execution_admission.require_supported()?;
         let compiled_workflow = onnx_genai_metadata::compile_workflow(&workflow)
             .map_err(|error| anyhow::anyhow!("Failed to lower workflow metadata: {error}"))?;
@@ -713,14 +721,16 @@ impl WorkflowRuntime {
     ) -> anyhow::Result<(Self, EngineResourceGovernor)> {
         let decode_backend = validate_pipeline_backend_request(config.decode_backend)?;
         let mut capability_error = None;
+        let mut admitted_execution = None;
         let directory =
             match PipelineModelDirectory::load_with_metadata_preflight(pipeline_dir, |metadata| {
-                WorkflowExecutionAdmission::from_metadata(metadata, decode_backend)
-                    .require_supported()
-                    .map_err(|error| {
-                        capability_error = Some(error.clone());
-                        onnx_genai_ort::OrtError::InvalidArgument(error.to_string())
-                    })
+                let admission = WorkflowExecutionAdmission::from_metadata(metadata, decode_backend);
+                admission.require_supported().map_err(|error| {
+                    capability_error = Some(error.clone());
+                    onnx_genai_ort::OrtError::InvalidArgument(error.to_string())
+                })?;
+                admitted_execution = Some(admission);
+                Ok(())
             }) {
                 Ok(directory) => directory,
                 Err(_) if capability_error.is_some() => {
@@ -732,11 +742,12 @@ impl WorkflowRuntime {
                     ));
                 }
             };
-        let execution_admission = directory
-            .metadata
-            .as_ref()
-            .map(|metadata| WorkflowExecutionAdmission::from_metadata(metadata, decode_backend))
-            .unwrap_or(WorkflowExecutionAdmission::Admitted);
+        let execution_admission = if directory.metadata.is_some() {
+            admitted_execution
+                .expect("metadata preflight stores the typed execution admission before loading")
+        } else {
+            WorkflowExecutionAdmission::Admitted
+        };
         let authority_domain = crate::engine::session_device_domain(&session_options)?;
         crate::engine::validate_shared_authority_limit(
             authority_provider.as_ref(),
@@ -1688,6 +1699,7 @@ impl WorkflowRuntime {
         &mut self,
         request: PipelineGenerateRequest,
     ) -> anyhow::Result<PipelineTensors> {
+        self.reject_candidate_tree_raw_execution("WorkflowRuntime::run_pipeline")?;
         self.reject_dflash_raw_execution("WorkflowRuntime::run_pipeline")?;
         self.run_workflow(request)
     }
@@ -1705,6 +1717,7 @@ impl WorkflowRuntime {
         &mut self,
         request: PipelineGenerateRequest,
     ) -> anyhow::Result<PipelineTensors> {
+        self.reject_candidate_tree_raw_execution("WorkflowRuntime::run_pipeline_retained")?;
         self.reject_dflash_raw_execution("WorkflowRuntime::run_pipeline_retained")?;
         self.run_workflow_retained(request)
     }
@@ -1744,6 +1757,7 @@ impl WorkflowRuntime {
         &mut self,
         request: PipelineGenerateRequest,
     ) -> anyhow::Result<PipelineOutputs> {
+        self.reject_candidate_tree_raw_execution("WorkflowRuntime::run_pipeline_outputs")?;
         self.reject_dflash_raw_execution("WorkflowRuntime::run_pipeline_outputs")?;
         self.run_workflow_outputs(request)
     }
@@ -1831,6 +1845,7 @@ impl WorkflowRuntime {
         &self,
         request: PipelineGenerateRequest,
     ) -> anyhow::Result<WorkflowExecutionPlan<'_>> {
+        self.reject_candidate_tree_raw_execution("WorkflowRuntime::prepare_workflow_execution")?;
         self.reject_dflash_raw_execution("WorkflowRuntime::prepare_workflow_execution")?;
         WorkflowExecutionPlan::new(self, request)
     }
@@ -2540,7 +2555,7 @@ mod speculative_admission_tests {
         assert!(
             message.contains("candidate-tree")
                 && message.contains("onnx-genai.speculative@1")
-                && message.contains("no candidate-tree package-dispatch capability or executor"),
+                && message.contains("cannot execute the declared candidate-tree variant"),
             "{constructor} did not report the exact unsupported contract and capability: {message}"
         );
         assert!(
