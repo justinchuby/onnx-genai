@@ -1161,7 +1161,7 @@ must declare candidate tokens, parent topology or mask, verification outputs,
 accepted path, proposal probabilities required for sampling, and rollback of all
 affected state. Unknown proposal-contract identities or versions fail closed.
 
-The v1.5 wire shape makes those facts independently inspectable:
+The v1.6 wire shape makes those facts independently inspectable:
 
 ```yaml
 speculative:

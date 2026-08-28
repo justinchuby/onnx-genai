@@ -1683,7 +1683,7 @@ fn load_inference_metadata(model_directory: &ModelDirectory) -> anyhow::Result<I
             "package '{}' declares legacy speculative sidecar configuration ({:?}) but no \
              workflow-native `inference_metadata` declaration. Legacy sidecars are importer \
              input only and are never runtime authority. Re-export the package with \
-             `schema_version: v1.5` and `speculative: {{ identity: onnx-genai.speculative, \
+             `schema_version: v1.6` and `speculative: {{ identity: onnx-genai.speculative, \
              version: '1', ... }}`; preserve the legacy descriptor only as migration evidence.",
             model_directory.root.display(),
             legacy.proposal_type,

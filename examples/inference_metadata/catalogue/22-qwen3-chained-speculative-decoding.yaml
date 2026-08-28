@@ -2,7 +2,7 @@
 # consumes the previous token embedding, recycled hidden activation, and draft
 # KV state. Names in the schema remain model-agnostic; artifact paths identify
 # this concrete Qwen3 package.
-schema_version: v1.5
+schema_version: v1.6
 pipeline:
   workflow:
     manifest:

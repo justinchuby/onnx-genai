@@ -39,7 +39,7 @@ impl fmt::Display for SchemaVersion {
 pub const INITIAL_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 0);
 
 /// The newest version this build can read.
-pub const SUPPORTED_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 5);
+pub const SUPPORTED_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 6);
 
 /// The version that first carried encoder batching, padding, ownership levels,
 /// and the video preprocessing program.
@@ -56,7 +56,7 @@ pub const TOKEN_CONTEXT_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 4)
 
 /// The version that made workflow-native, versioned speculative contracts the
 /// only portable speculative authority.
-pub const CANONICAL_SPECULATION_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 5);
+pub const CANONICAL_SPECULATION_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 6);
 
 /// The version that introduced output publication families and typed revision
 /// envelopes.
@@ -156,7 +156,7 @@ mod tests {
 
     #[test]
     fn a_canonical_version_prints_the_way_a_document_should_write_it() {
-        assert_eq!(SUPPORTED_SCHEMA_VERSION.to_string(), "v1.5");
+        assert_eq!(SUPPORTED_SCHEMA_VERSION.to_string(), "v1.6");
         assert_eq!(INITIAL_SCHEMA_VERSION.to_string(), "v1.0");
     }
 
@@ -222,6 +222,10 @@ mod tests {
             gate(Some("1.4")).expect("1.4"),
             TOKEN_CONTEXT_SCHEMA_VERSION
         );
-        assert_eq!(gate(Some("1.5")).expect("1.5"), SUPPORTED_SCHEMA_VERSION);
+        assert_eq!(
+            gate(Some("1.5")).expect("1.5"),
+            OUTPUT_PROTOCOL_SCHEMA_VERSION
+        );
+        assert_eq!(gate(Some("1.6")).expect("1.6"), SUPPORTED_SCHEMA_VERSION);
     }
 }

@@ -4,7 +4,7 @@
 # component ports and roles, and the state_service group that owns the KV
 # cache. A single decoder is not a special package shape — it is a workflow
 # with one ONNX component and one runtime-bound token policy.
-schema_version: v1.5
+schema_version: v1.6
 model:
   max_sequence_length: 16
   vocab_size: 32

@@ -54,7 +54,7 @@
 #   * Rollback: a rejected proposal rewinds every target KV cell; the folded carry
 #     has no state cell and is recomputed from committed tokens, so it is not in
 #     `rollback_state`.
-schema_version: v1.5
+schema_version: v1.6
 pipeline:
   workflow:
     manifest:

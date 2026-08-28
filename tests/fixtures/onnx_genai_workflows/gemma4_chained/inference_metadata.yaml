@@ -9,7 +9,7 @@
 # shared_kv.{full,sliding}_attention.{key,value} -> logits + projected_state
 # (folded carry). No own KV, no present.*. Greedy / logits-emit (external
 # argmax), standard ops only (ORT ∩ native CPU EP). Both graphs are FLOAT (f32).
-schema_version: v1.5
+schema_version: v1.6
 model:
   vocab_size: 32
   max_sequence_length: 16

@@ -334,7 +334,7 @@ fn serving_workflow(
     };
     format!(
         r#"
-schema_version: v1.5
+schema_version: v1.6
 pipeline:
   workflow:
     manifest:

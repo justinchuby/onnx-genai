@@ -35,6 +35,22 @@ fn candidate_tree_fixtures_declare_distinct_greedy_and_sampling_contracts() {
 }
 
 #[test]
+fn canonical_speculation_requires_the_post_output_protocol_schema_version() {
+    let mut metadata = fixture("greedy_tree");
+    metadata.schema_version = Some("v1.5".to_string());
+    let errors =
+        validate_metadata(&metadata).expect_err("v1.5 readers predate canonical speculation");
+    assert!(
+        errors.iter().any(|error| {
+            error.contains("workflow-native canonical speculation")
+                && error.contains("schema version v1.6")
+                && error.contains("declare schema_version 'v1.6'")
+        }),
+        "{errors:#?}"
+    );
+}
+
+#[test]
 fn unknown_canonical_contract_versions_fail_before_execution() {
     let mut metadata = fixture("greedy_tree");
     metadata

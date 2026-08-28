@@ -5,7 +5,7 @@
 # linear accumulator, and causal-convolution history to the same accepted
 # position. No group may commit or roll back independently. The independent
 # proposer is recomputed from committed tokens and owns no persistent state.
-schema_version: v1.5
+schema_version: v1.6
 pipeline:
   workflow:
     manifest:

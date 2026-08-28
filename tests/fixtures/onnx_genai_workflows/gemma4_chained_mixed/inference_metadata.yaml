@@ -7,7 +7,7 @@
 # through. This is the workflow-runtime successor to the direct-`Engine`
 # `tiny-gemma4-assistant-mixed` regression, which proved the same property
 # through the deleted `SharedKvProposerConfig` KV slicer.
-schema_version: v1.5
+schema_version: v1.6
 model:
   vocab_size: 32
   max_sequence_length: 16
