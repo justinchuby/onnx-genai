@@ -2,10 +2,7 @@
 schema_version: v1.1
 pipeline:
   workflow:
-    manifest:
-      capabilities:
-      - workflow_ssa
-      - typed_emit
+    manifest: {}
     inputs:
       request.input_values:
         contract:

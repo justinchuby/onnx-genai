@@ -1201,14 +1201,6 @@ fn test_decoder_runtime_inner(shape: TestSessionShape) -> anyhow::Result<Workflo
         );
     }
     if shape != TestSessionShape::Stateless {
-        // The lease and the capability are one statement, and the validator
-        // says so: a reader that cannot honour leased state must be able to
-        // see that it is being asked to. Both session shapes declare a lease,
-        // so both have to declare this.
-        workflow
-            .manifest
-            .capabilities
-            .insert("session_state_lease".to_string());
         // `validate_generation_workflow` below is the engine's own loop
         // validator, not the document validator, and nothing had ever asked
         // these fixtures whether they are packages a real loader would accept.

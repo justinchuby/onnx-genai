@@ -313,7 +313,6 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: {{}}
-      capabilities: [workflow_ssa, typed_emit]
     inputs:
       logits:
         contract: {{ dtype: float32, shape: [{BATCH}, {VOCAB}] }}

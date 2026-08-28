@@ -73,15 +73,6 @@ pipeline:
     manifest:
       adapter_abis:
         onnx-genai.image-preprocess: '1'
-      capabilities:
-      - workflow_ssa
-      - linear_effects
-      - nested_control_flow
-      - loop_induction_values
-      - typed_emit
-      - emit_valid_length
-      - serving_service_contract
-      - bounded_state_recurrence
     inputs:
       request.prompt_tokens:
         contract:

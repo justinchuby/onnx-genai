@@ -1,9 +1,7 @@
 schema_version: v1
 pipeline:
   workflow:
-    manifest:
-      capabilities:
-        - workflow_ssa
+    manifest: {}
     components:
       identity:
         implementation:

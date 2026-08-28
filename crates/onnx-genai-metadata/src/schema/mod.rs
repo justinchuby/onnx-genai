@@ -88,15 +88,7 @@ pub struct InferenceMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema_version: Option<String>,
 
-    /// Capability identifiers that a runtime MUST support or refuse to load the model.
-    #[serde(default)]
-    #[schemars(
-        extend("examples" = [["kv_cache", "grouped_query_attention"]]),
-        inner(length(min = 1))
-    )]
-    pub required_capabilities: Vec<String>,
-
-    /// Build-time model properties and runtime-configurable capabilities.
+    /// Build-time model properties and runtime-configurable facts.
     #[serde(default)]
     pub model: Option<ModelCapabilities>,
 

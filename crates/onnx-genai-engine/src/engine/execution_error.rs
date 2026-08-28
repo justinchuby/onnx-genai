@@ -12,7 +12,7 @@
 /// failing, so a front end answers all of them with a 4xx it can choose from the
 /// variant rather than from the wording.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum PackageCapabilityError {
+pub enum PackageExecutionError {
     /// The package publishes a token stream but declares no session-scoped
     /// state anything can carry, so a session over it would restart every turn.
     #[error(
@@ -84,8 +84,8 @@ pub enum PackageCapabilityError {
     /// implemented. The production driver accepts only the base v1 contract
     /// through the portable ORT component execution seam.
     #[error(
-        "package declares DFlash flat-block speculation \
-         (onnx-genai.dflash-flat-block@{version}) and requires capability '{capability}', but this \
+        "package declares DFlash flat-block semantic extension \
+         (onnx-genai.dflash-flat-block@{version}), but this \
          runtime implements only the exact v1/base contract through the ORT component backend. \
          Refusing before workflow mutation rather than silently running a different speculative \
          mode. Re-export the package as v1/base for the ORT backend or use a runtime that \
@@ -94,8 +94,6 @@ pub enum PackageCapabilityError {
     DFlashExecutionUnavailable {
         /// Exact DFlash contract version declared by the package.
         version: String,
-        /// Derived capability that requires the unavailable execution driver.
-        capability: String,
     },
     /// DFlash components cannot be executed as an ordinary workflow pass:
     /// doing so would bypass verification and accepted-prefix commit.
@@ -112,7 +110,7 @@ pub enum PackageCapabilityError {
     },
 }
 
-impl PackageCapabilityError {
+impl PackageExecutionError {
     /// Whether this is a transient conflict the same request can succeed at
     /// later, as opposed to a package that will never serve it.
     pub fn is_retryable(&self) -> bool {
@@ -125,10 +123,10 @@ impl PackageCapabilityError {
 /// Reads the whole chain, because the refusal is raised deep in the engine and
 /// reaches a front end wrapped in whatever context the path added. Matching the
 /// type is what keeps a status code from depending on the wording of a message.
-pub fn package_capability_error(error: &anyhow::Error) -> Option<PackageCapabilityError> {
+pub fn package_execution_error(error: &anyhow::Error) -> Option<PackageExecutionError> {
     error
         .chain()
-        .find_map(|cause| cause.downcast_ref::<PackageCapabilityError>().cloned())
+        .find_map(|cause| cause.downcast_ref::<PackageExecutionError>().cloned())
 }
 
 /// What a session already holds in front of the next turn's prompt.

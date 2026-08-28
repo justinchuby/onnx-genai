@@ -358,31 +358,52 @@ fn workflow_adapter_registry()
     > = std::sync::LazyLock::new(|| {
         HashMap::from([
             (
-                ("onnx-genai.image-preprocess", "1"),
+                (
+                    onnx_genai_metadata::extensions::IMAGE_PREPROCESS_V1.identity,
+                    onnx_genai_metadata::extensions::IMAGE_PREPROCESS_V1.version,
+                ),
                 WorkflowRuntime::run_image_preprocess_adapter as WorkflowAdapterExecutor,
             ),
             (
-                ("onnx-genai.video-preprocess", "1"),
+                (
+                    onnx_genai_metadata::extensions::VIDEO_PREPROCESS_V1.identity,
+                    onnx_genai_metadata::extensions::VIDEO_PREPROCESS_V1.version,
+                ),
                 WorkflowRuntime::run_video_preprocess_adapter as WorkflowAdapterExecutor,
             ),
             (
-                ("onnx-genai.audio-preprocess", "1"),
+                (
+                    onnx_genai_metadata::extensions::AUDIO_PREPROCESS_V1.identity,
+                    onnx_genai_metadata::extensions::AUDIO_PREPROCESS_V1.version,
+                ),
                 WorkflowRuntime::run_audio_preprocess_adapter as WorkflowAdapterExecutor,
             ),
             (
-                ("onnx-genai.grammar-guidance", "1"),
+                (
+                    onnx_genai_metadata::extensions::GRAMMAR_GUIDANCE_V1.identity,
+                    onnx_genai_metadata::extensions::GRAMMAR_GUIDANCE_V1.version,
+                ),
                 WorkflowRuntime::run_grammar_guidance_adapter as WorkflowAdapterExecutor,
             ),
             (
-                ("onnx-genai.telemetry", "1"),
+                (
+                    onnx_genai_metadata::extensions::TELEMETRY_V1.identity,
+                    onnx_genai_metadata::extensions::TELEMETRY_V1.version,
+                ),
                 WorkflowRuntime::run_telemetry_adapter as WorkflowAdapterExecutor,
             ),
             (
-                ("onnx-genai.parameter-overlay", "1"),
+                (
+                    onnx_genai_metadata::extensions::PARAMETER_OVERLAY_V1.identity,
+                    onnx_genai_metadata::extensions::PARAMETER_OVERLAY_V1.version,
+                ),
                 WorkflowRuntime::run_parameter_overlay_adapter as WorkflowAdapterExecutor,
             ),
             (
-                ("onnx-genai.text-assembly", "1"),
+                (
+                    onnx_genai_metadata::extensions::TEXT_ASSEMBLY_V1.identity,
+                    onnx_genai_metadata::extensions::TEXT_ASSEMBLY_V1.version,
+                ),
                 WorkflowRuntime::run_text_assembly_adapter as WorkflowAdapterExecutor,
             ),
         ])
@@ -392,6 +413,26 @@ fn workflow_adapter_registry()
 
 pub(super) fn supports_workflow_adapter(abi: &str, version: &str) -> bool {
     workflow_adapter_registry().contains_key(&(abi, version))
+}
+
+#[cfg(test)]
+mod extension_registry_tests {
+    use super::supports_workflow_adapter;
+    use onnx_genai_metadata::extensions::{BUILTIN_EXTENSIONS, ExtensionSurface, SupportStatus};
+
+    #[test]
+    fn every_implemented_component_adapter_has_an_exact_executor() {
+        for descriptor in BUILTIN_EXTENSIONS.iter().filter(|descriptor| {
+            descriptor.surface == ExtensionSurface::ComponentAdapter
+                && descriptor.status == SupportStatus::Implemented
+        }) {
+            assert!(
+                supports_workflow_adapter(descriptor.id.identity, descriptor.id.version),
+                "{} must have its exact registry executor",
+                descriptor.id.wire_name()
+            );
+        }
+    }
 }
 
 fn validate_component_overrides(
@@ -668,7 +709,7 @@ impl<'a> SessionLeaseGuard<'a> {
     ) -> anyhow::Result<Self> {
         if !leases.borrow_mut().insert(session.to_string()) {
             return Err(
-                crate::engine::PackageCapabilityError::ExclusiveLeaseConflict {
+                crate::engine::PackageExecutionError::ExclusiveLeaseConflict {
                     session: session.to_string(),
                 }
                 .into(),
@@ -1148,7 +1189,7 @@ impl<'a> WorkflowExecutionPlan<'a> {
             let requested = conversation.len().saturating_add(budget);
             if requested > bound {
                 return Err(
-                    crate::engine::PackageCapabilityError::ConversationOverBound {
+                    crate::engine::PackageExecutionError::ConversationOverBound {
                         cell: cell.to_string(),
                         requested,
                         bound,
@@ -1624,7 +1665,7 @@ impl<'a> WorkflowExecutionPlan<'a> {
                         let bound = continuation_bound(cell, state, &values)?;
                         if conversation.len() > bound {
                             return Err(
-                                crate::engine::PackageCapabilityError::ConversationOverBound {
+                                crate::engine::PackageExecutionError::ConversationOverBound {
                                     cell: cell.to_string(),
                                     requested: conversation.len(),
                                     bound,

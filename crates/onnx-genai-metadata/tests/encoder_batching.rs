@@ -38,8 +38,7 @@ const PADDED_VISION_ENCODER: &str = r#"
 schema_version: v1.1
 pipeline:
   workflow:
-    manifest:
-      capabilities: [workflow_ssa, linear_effects, typed_emit]
+    manifest: {}
     inputs:
       pixel_values:
         contract:
@@ -110,8 +109,7 @@ const PACKED_VISION_ENCODER: &str = r#"
 schema_version: v1.1
 pipeline:
   workflow:
-    manifest:
-      capabilities: [workflow_ssa, linear_effects, typed_emit]
+    manifest: {}
     inputs:
       image_pixels:
         contract:
@@ -1055,7 +1053,6 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: { onnx-genai.image-preprocess: "1" }
-      capabilities: [workflow_ssa, typed_emit]
     inputs:
       request.image:
         contract: { dtype: uint8, shape: [encoded_bytes] }
@@ -1178,7 +1175,6 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: { onnx-genai.video-preprocess: "1" }
-      capabilities: [workflow_ssa, typed_emit]
     inputs:
       request.video:
         contract: { dtype: uint8, shape: [encoded_bytes] }
@@ -1394,8 +1390,7 @@ const NESTED_VIDEO_ENCODER: &str = r#"
 schema_version: v1.1
 pipeline:
   workflow:
-    manifest:
-      capabilities: [workflow_ssa, typed_emit]
+    manifest: {}
     inputs:
       pixel_values:
         contract:
@@ -1537,8 +1532,7 @@ const FIXED_FRAME_VIDEO_ENCODER: &str = r#"
 schema_version: v1.1
 pipeline:
   workflow:
-    manifest:
-      capabilities: [workflow_ssa, typed_emit]
+    manifest: {}
     inputs:
       pixel_values:
         contract:
@@ -1877,8 +1871,7 @@ const PACKED_EMIT_WORKFLOW: &str = r#"
 schema_version: v1.1
 pipeline:
   workflow:
-    manifest:
-      capabilities: [workflow_ssa, typed_emit, serving_service_contract]
+    manifest: {}
     serving:
       active: active
       done: done
@@ -2094,8 +2087,7 @@ const LEGACY_TRAJECTORY_APPEND: &str = r#"
 schema_version: v1
 pipeline:
   workflow:
-    manifest:
-      capabilities: [workflow_ssa, typed_emit]
+    manifest: {}
     inputs:
       latent:
         contract: { dtype: float32, shape: [batch, channels, height, width], batch_layout: { kind: request_aligned, axis: 0 } }
@@ -2181,8 +2173,7 @@ const PADDED_EMIT_WORKFLOW: &str = r#"
 schema_version: v1.1
 pipeline:
   workflow:
-    manifest:
-      capabilities: [workflow_ssa, typed_emit, serving_service_contract]
+    manifest: {}
     serving:
       active: active
       done: done
@@ -2528,8 +2519,7 @@ const FLAT_TOKEN_PACKED: &str = r#"
 schema_version: v1
 pipeline:
   workflow:
-    manifest:
-      capabilities: [workflow_ssa, linear_effects, typed_emit]
+    manifest: {}
     inputs:
       image_pixels:
         contract:
@@ -2734,19 +2724,6 @@ pipeline:
             "the refusal must explain why no capability replaces it: {message}"
         );
     }
-
-    let metadata = parse("required_capabilities: [continuous_batching]\n");
-    assert_reports(
-        "required_capabilities: [continuous_batching]\n",
-        "retired capability 'continuous_batching'",
-    );
-    assert!(
-        metadata
-            .required_capabilities
-            .iter()
-            .any(|capability| capability == "continuous_batching"),
-        "the semantic validator test must exercise the typed in-memory path"
-    );
 }
 
 #[test]

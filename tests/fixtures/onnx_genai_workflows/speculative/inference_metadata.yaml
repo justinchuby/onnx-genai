@@ -2,19 +2,6 @@ schema_version: v1.6
 pipeline:
   workflow:
     manifest:
-      capabilities:
-      - workflow_ssa
-      - linear_effects
-      - nested_control_flow
-      - loop_induction_values
-      - typed_emit
-      - emit_valid_length
-      - bounded_state_recurrence
-      - serving_service_contract
-      - grammar_guidance_adapter
-      - adaptive_proposal_budget
-      - advisory_state
-      - canonical_speculation
       adapter_abis:
         onnx-genai.grammar-guidance: '1'
     inputs:

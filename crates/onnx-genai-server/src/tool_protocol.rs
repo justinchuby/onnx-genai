@@ -7,7 +7,10 @@
 use std::{collections::BTreeSet, fmt, path::Path, sync::Arc};
 
 use onnx_genai_engine::GenerateConstraint;
-use onnx_genai_metadata::ToolProtocolDeclaration;
+use onnx_genai_metadata::{
+    ToolProtocolDeclaration,
+    extensions::{ATEM_XML_V1, TAGGED_JSON_V1},
+};
 
 use crate::types::{
     ChatCompletionRequest, ChatMessageToolCall, ChatMessageToolCallFunction, ChatTool, ToolChoice,
@@ -251,10 +254,12 @@ pub(crate) fn resolve(
         )),
         0 => Err(ToolProtocolError(format!(
             "{} declares package.tool_protocol identity {:?} version {:?}, but this server implements no such protocol. \
-             Use one of tagged-json@v1 or atem-xml@v1, or install a runtime adapter for the declared protocol.",
+             Use one of {} or {}, or install a runtime adapter for the declared protocol.",
             metadata_path.display(),
             declaration.identity,
             declaration.version,
+            TAGGED_JSON_V1.wire_name(),
+            ATEM_XML_V1.wire_name(),
         ))),
         count => Err(ToolProtocolError(format!(
             "{} declares package.tool_protocol identity {:?} version {:?}, but {count} runtime adapters claim it. \
@@ -413,7 +418,7 @@ struct TaggedJsonV1;
 
 impl ToolProtocolAdapter for TaggedJsonV1 {
     fn declaration(&self) -> (&'static str, &'static str) {
-        ("tagged-json", "v1")
+        (TAGGED_JSON_V1.identity, TAGGED_JSON_V1.version)
     }
 
     fn render(
@@ -454,7 +459,7 @@ struct AtemXmlV1;
 
 impl ToolProtocolAdapter for AtemXmlV1 {
     fn declaration(&self) -> (&'static str, &'static str) {
-        ("atem-xml", "v1")
+        (ATEM_XML_V1.identity, ATEM_XML_V1.version)
     }
 
     fn render(
@@ -812,6 +817,31 @@ mod tests {
             Path::new("fixtures/inference_metadata.yaml"),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn every_implemented_registry_tool_protocol_resolves_exactly_once() {
+        use onnx_genai_metadata::extensions::{
+            BUILTIN_EXTENSIONS, ExtensionSurface, SupportStatus,
+        };
+
+        for descriptor in BUILTIN_EXTENSIONS.iter().filter(|descriptor| {
+            descriptor.surface == ExtensionSurface::ToolProtocol
+                && descriptor.status == SupportStatus::Implemented
+        }) {
+            let protocol = resolve(
+                &ToolProtocolDeclaration {
+                    identity: descriptor.id.identity.to_string(),
+                    version: descriptor.id.version.to_string(),
+                },
+                Path::new("fixtures/inference_metadata.yaml"),
+            )
+            .expect("every registered server protocol has exactly one adapter");
+            assert_eq!(
+                protocol.declaration(),
+                (descriptor.id.identity, descriptor.id.version)
+            );
+        }
     }
 
     #[test]

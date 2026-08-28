@@ -1761,75 +1761,43 @@ fn load_inference_metadata(model_directory: &ModelDirectory) -> anyhow::Result<I
 
 /// Admit metadata for the bare-decoder decode path.
 ///
-/// Structural defects mean the document does not describe a runnable model, so
-/// they stay fatal.
-///
-/// Declared capabilities split on one question: **does the capability describe
-/// the document, or does it prescribe computation this path must perform?**
-///
-/// *Descriptive* capabilities are derived from the workflow manifest —
-/// `workflow_ssa`, `serving_service_contract`, `bounded_state_recurrence`,
-/// `typed_emit`, `emit_valid_length`, `linear_effects`,
-/// `loop_induction_values`, `nested_control_flow`. The canonical package
-/// describes a workflow; this path derives its IO from the graph and never
-/// interprets that manifest, so refusing to load over one rejects packages that
-/// decode correctly. Measured: a package declaring all eight loads, decodes,
-/// and produces a coherent token stream whose first token matches the same
-/// model exported without a workflow manifest. Report and continue.
-///
-/// *Prescriptive* capabilities are derived from `metadata.adapters` — a
-/// concrete weight overlay, not a description. This path never reads
-/// `metadata.adapters`, so decoding anyway would silently emit **base-model
-/// output** rather than the adapted output the package asks for. That is wrong
-/// output, not degraded output, and the caller has no way to notice. These stay
-/// fatal.
+/// Schema-version conformance is validated directly. A bare decoder may not
+/// silently skip a separately declared adapter component or adapter service:
+/// either would produce base-model output rather than the package semantics.
+/// The extension identity/version comes from the owning typed declaration, not
+/// from a second capability list.
 fn admit_inference_metadata(metadata: &InferenceMetadata) -> anyhow::Result<()> {
-    use onnx_genai_metadata::capabilities as capability;
+    onnx_genai_metadata::validate_metadata(metadata)
+        .map_err(|errors| anyhow::anyhow!("Invalid inference metadata: {errors:?}"))?;
 
-    let runtime_caps = onnx_genai_metadata::RuntimeCapabilities::default();
-    let report = onnx_genai_metadata::validate_structure_and_capabilities(metadata, &runtime_caps);
-    if !report.structural.is_empty() {
-        anyhow::bail!("Invalid inference metadata: {:?}", report.structural);
-    }
+    let extension = metadata
+        .adapters
+        .as_ref()
+        .map(|service| {
+            service.application_capability.split_once('@').map_or_else(
+                || service.application_capability.clone(),
+                |(identity, version)| format!("{identity}@{version}"),
+            )
+        })
+        .or_else(|| {
+            metadata.pipeline.as_ref().and_then(|pipeline| {
+                pipeline.workflow.components.values().find_map(|component| {
+                    let onnx_genai_metadata::ComponentImplementation::Adapter {
+                        abi, version, ..
+                    } = &component.implementation
+                    else {
+                        return None;
+                    };
+                    Some(format!("{abi}@{version}"))
+                })
+            })
+        });
 
-    // Capabilities that prescribe computation this path cannot perform. Keyed
-    // on the derived capability name rather than on `metadata.adapters`,
-    // because these are also derived from the workflow spec: a component whose
-    // adapter ABI or contract id is `onnx-genai.parameter-overlay`, or an input
-    // carrying an adapter-segment/count/scale role, yields them with
-    // `metadata.adapters` unset. Checking the service would miss exactly those
-    // workflow-declared overlays, which carry the identical wrong-output risk.
-    const PRESCRIPTIVE: &[&str] = &[
-        capability::PARAMETER_ADAPTERS,
-        capability::HETEROGENEOUS_ADAPTER_BATCHING,
-    ];
-
-    let (prescriptive, descriptive): (Vec<_>, Vec<_>) = report
-        .unsupported_capabilities
-        .iter()
-        .partition(|capability| PRESCRIPTIVE.contains(&capability.as_str()));
-
-    if !prescriptive.is_empty() {
+    if let Some(extension) = extension {
         anyhow::bail!(
-            "inference metadata requires capabilities this decode path cannot perform: {}; \
-             decoding anyway would silently emit base-model output instead of the output the \
-             package describes",
-            prescriptive
-                .iter()
-                .map(|capability| capability.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-    }
-    if !descriptive.is_empty() {
-        tracing::warn!(
-            "inference metadata declares capabilities this runtime does not implement: {}; \
-             continuing because the decode path does not interpret the workflow manifest",
-            descriptive
-                .iter()
-                .map(|capability| capability.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
+            "the bare decoder cannot execute required semantic extension {extension}; \
+             decoding would silently emit base-model output instead of the package semantics. \
+             Use the workflow runtime that admits this exact extension."
         );
     }
     Ok(())
@@ -1840,9 +1808,8 @@ fn resolve_metadata_and_decode_path(
     shared_kv: crate::decode::SharedKvOffer,
     capture_requested: bool,
 ) -> anyhow::Result<MetadataResolution> {
-    // Canonical metadata is the sole execution contract. Structural defects are
-    // fatal; declared workflow capabilities are reported and do not block the
-    // bare-decoder path (see `admit_inference_metadata`).
+    // Canonical metadata is the sole execution contract. Core conformance and
+    // required semantic extensions are admitted before decode-path selection.
     admit_inference_metadata(&metadata)?;
 
     let sliding_window = crate::decode::sliding_window_from_metadata(&metadata)?;
@@ -3259,52 +3226,13 @@ mod metadata_admission_tests {
     }
 
     #[test]
-    fn unsupported_declared_capability_is_reported_but_does_not_block_decode() {
-        let metadata: InferenceMetadata =
-            serde_yaml::from_str("schema_version: v1\nrequired_capabilities: [vendor.future]\n")
-                .expect("metadata parses");
-
-        admit_inference_metadata(&metadata).expect(
-            "an unimplemented declared capability must not block a package that decodes correctly",
-        );
-    }
-
-    #[test]
-    fn workflow_manifest_capabilities_do_not_block_the_bare_decoder() {
-        let metadata: InferenceMetadata = serde_yaml::from_str(
-            r#"
-schema_version: v1
-pipeline:
-  workflow:
-    manifest:
-      capabilities: [workflow_ssa]
-    components:
-      decoder:
-        implementation: { kind: binding }
-        ports: {}
-    steps:
-      - kind: invoke
-        component: decoder
-"#,
-        )
-        .expect("metadata parses");
-
-        // The canonical package describes a workflow; the decode path derives
-        // its IO from the graph and never interprets the manifest, so a
-        // capability the runtime has not implemented is not a reason to refuse.
-        admit_inference_metadata(&metadata)
-            .expect("a workflow manifest must not block the bare decode path");
-    }
-
-    #[test]
     fn structural_defect_still_fails_closed() {
         let metadata: InferenceMetadata = serde_yaml::from_str(
             r#"
 schema_version: v1
 pipeline:
   workflow:
-    manifest:
-      capabilities: [workflow_ssa]
+    manifest: {}
     components:
       decoder:
         implementation: { kind: binding }
@@ -3328,9 +3256,8 @@ pipeline:
 
     #[test]
     fn declared_adapters_fail_closed_because_this_path_cannot_apply_them() {
-        // An adapter overlay is prescriptive, not descriptive: this path never
-        // reads `metadata.adapters`, so loading anyway would silently emit
-        // base-model output instead of the adapted output the package asks for.
+        // The adapter service is a required semantic extension. This path
+        // cannot execute it, so decoding as the base model is forbidden.
         let metadata: InferenceMetadata = serde_yaml::from_str(
             r#"
 schema_version: v1
@@ -3388,27 +3315,23 @@ adapters:
              {error}"
         );
         assert!(
-            error.contains("cannot perform") && error.contains("base-model output"),
+            error.contains("required semantic extension onnx-genai.adapters@1")
+                && error.contains("base-model output"),
             "{error}"
         );
     }
 
     #[test]
     fn workflow_declared_parameter_overlay_also_fails_closed_without_an_adapter_service() {
-        // The prescriptive capabilities are ALSO derived from the workflow spec
-        // (`workflow_required_capabilities`: a component whose adapter ABI or
-        // contract id is `onnx-genai.parameter-overlay` yields
-        // `parameter_adapters`), with `metadata.adapters` unset. This is the
-        // case that makes the explicit capability list correct and a
-        // `metadata.adapters.is_some()` check wrong -- keying off the service
-        // would let a workflow-declared overlay through with only a warning.
+        // A component adapter carries its own exact ABI/version. It remains a
+        // required semantic extension even when no top-level adapter service is
+        // present, so this bare path cannot pass it through as base-model work.
         let metadata: InferenceMetadata = serde_yaml::from_str(
             r#"
 schema_version: v1
 pipeline:
   workflow:
     manifest:
-      capabilities: [workflow_ssa, parameter_adapters]
       adapter_abis:
         onnx-genai.parameter-overlay: "1"
     components:
@@ -3439,7 +3362,8 @@ pipeline:
              {error}"
         );
         assert!(
-            error.contains("parameter_adapters") && error.contains("base-model output"),
+            error.contains("required semantic extension onnx-genai.parameter-overlay@1")
+                && error.contains("base-model output"),
             "{error}"
         );
     }

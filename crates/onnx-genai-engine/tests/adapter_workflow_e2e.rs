@@ -140,7 +140,6 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: { onnx-genai.parameter-overlay: "1" }
-      capabilities: [workflow_ssa, typed_emit, parameter_adapters, heterogeneous_adapter_batching]
     inputs:
       request.adapter_segments:
         contract: { dtype: int64, shape: [batch, 2], batch_layout: { kind: request_aligned, axis: 0 } }
