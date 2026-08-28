@@ -5,10 +5,10 @@ use onnx_genai_engine::{
 use onnx_genai_ort::SessionOptions;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Once;
 
-fn shared_buffer_fixture() -> anyhow::Result<PathBuf> {
+fn shared_buffer_fixture() -> anyhow::Result<tempfile::TempDir> {
     static ENABLE_SHARED_PRESENT: Once = Once::new();
     ENABLE_SHARED_PRESENT.call_once(|| {
         // This isolated test binary sets the CPU fixed-present opt-in before
@@ -18,23 +18,25 @@ fn shared_buffer_fixture() -> anyhow::Result<PathBuf> {
     let source = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/tiny-llm-sharedbuffer")
         .canonicalize()?;
-    let root =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/test-fixtures/live-row-shared");
-    fs::create_dir_all(&root)?;
+    let fixture_parent = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/test-fixtures");
+    fs::create_dir_all(&fixture_parent)?;
+    let root = tempfile::Builder::new()
+        .prefix("live-row-shared-")
+        .tempdir_in(fixture_parent)?;
     for entry in fs::read_dir(&source)? {
         let entry = entry?;
         if entry.file_name() != "model.onnx" && entry.file_name() != "inference_metadata.yaml" {
-            fs::copy(entry.path(), root.join(entry.file_name()))?;
+            fs::copy(entry.path(), root.path().join(entry.file_name()))?;
         }
     }
     let metadata = fs::read_to_string(source.join("inference_metadata.yaml"))?;
     fs::write(
-        root.join("inference_metadata.yaml"),
+        root.path().join("inference_metadata.yaml"),
         metadata.replacen("aliasing: forbidden", "aliasing: permitted", 1),
     )?;
     let textproto = fs::read_to_string(source.join("model.onnx.textproto"))?;
     fs::write(
-        root.join("model.onnx"),
+        root.path().join("model.onnx"),
         onnx_std::textproto::to_binary(&textproto)?,
     )?;
     Ok(root)
@@ -117,8 +119,8 @@ fn assert_live_row_ownership(diagnostic: &ContinuousBatchDiagnostic) {
 fn static_shared_batch_matches_isolated_ragged_rows() -> anyhow::Result<()> {
     let fixture = shared_buffer_fixture()?;
     let requests = ragged_requests();
-    let expected = isolated_results(&fixture, &requests)?;
-    let mut engine = cpu_engine(&fixture)?;
+    let expected = isolated_results(fixture.path(), &requests)?;
+    let mut engine = cpu_engine(fixture.path())?;
     assert!(
         engine.batching_capability().supports_batching(),
         "fixture must exercise the production shared-forward path"
@@ -137,8 +139,8 @@ fn static_shared_batch_matches_isolated_ragged_rows() -> anyhow::Result<()> {
 fn scheduled_shared_batch_matches_isolated_through_backfill_and_row_reuse() -> anyhow::Result<()> {
     let fixture = shared_buffer_fixture()?;
     let requests = ragged_requests();
-    let expected = isolated_results(&fixture, &requests)?;
-    let mut engine = cpu_engine(&fixture)?;
+    let expected = isolated_results(fixture.path(), &requests)?;
+    let mut engine = cpu_engine(fixture.path())?;
     assert!(
         engine.batching_capability().supports_batching(),
         "fixture must exercise the production shared-forward path"
@@ -161,8 +163,8 @@ fn scheduled_shared_batch_matches_isolated_through_backfill_and_row_reuse() -> a
 fn live_row_residency_journal_and_completion_ownership_survive_backfill() -> anyhow::Result<()> {
     let fixture = shared_buffer_fixture()?;
     let requests = ragged_requests();
-    let expected = isolated_results(&fixture, &requests)?;
-    let mut engine = cpu_engine(&fixture)?;
+    let expected = isolated_results(fixture.path(), &requests)?;
+    let mut engine = cpu_engine(fixture.path())?;
     let mut manager = engine.continuous_batch_manager(2)?;
     let handles = requests
         .into_iter()
