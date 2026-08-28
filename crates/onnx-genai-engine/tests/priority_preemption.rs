@@ -1,6 +1,6 @@
 use onnx_genai_engine::{
     Engine, EngineConfig, FinishReason, GeneratePrompt, GenerateRequest,
-    PrioritizedGenerateRequest, ScheduledGenerateArrival,
+    PrioritizedGenerateRequest, ScheduledGenerateArrival, SpeculativeMode,
 };
 use onnx_genai_scheduler::{PreemptionPolicy, Priority, PriorityPolicy, SchedulerConfig};
 use std::path::{Path, PathBuf};
@@ -60,6 +60,91 @@ fn cursor_ineligible_topology_dispatches_through_generic_generation() -> anyhow:
     assert_eq!(results[0].result.token_ids, expected.token_ids);
     assert_eq!(results[0].result.text, expected.text);
     assert_eq!(results[0].result.finish_reason, expected.finish_reason);
+    engine.close_session(session)?;
+    Ok(())
+}
+
+#[test]
+fn valid_speculative_request_dispatches_through_generic_generation_and_preserves_session()
+-> anyhow::Result<()> {
+    let fixture = tiny_fixture()?;
+    let prompt = vec![3, 26, 11, 9, 29, 3, 26, 11, 9, 29];
+    let mut speculative = token_request(prompt, 4);
+    speculative.options.speculative_mode = Some(SpeculativeMode::PromptLookup {
+        ngram: 1,
+        max_tokens: 4,
+    });
+
+    let mut direct = Engine::from_dir(&fixture, priority_config())?;
+    let direct_session = direct.create_session()?;
+    let expected = direct.generate_in_session(direct_session, speculative.clone())?;
+    assert!(
+        direct.last_speculative_stats().proposed_tokens > 0,
+        "the direct generic path must execute speculative proposal/verification"
+    );
+
+    let mut prioritized = Engine::from_dir(&fixture, priority_config())?;
+    let prioritized_session = prioritized.create_session()?;
+    let results = prioritized.drive_prioritized_requests(vec![PrioritizedGenerateRequest {
+        session_id: prioritized_session,
+        request: speculative,
+        priority: Priority::High,
+    }])?;
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].result.token_ids, expected.token_ids);
+    assert_eq!(results[0].result.text, expected.text);
+    assert_eq!(results[0].result.finish_reason, expected.finish_reason);
+    assert!(
+        prioritized.last_speculative_stats().proposed_tokens > 0,
+        "typed cursor ineligibility must dispatch through the generic speculative path"
+    );
+
+    let continuation = token_request(vec![7], 2);
+    let expected_continuation = direct.generate_in_session(direct_session, continuation.clone())?;
+    let actual_continuation = prioritized.generate_in_session(prioritized_session, continuation)?;
+    assert_eq!(
+        actual_continuation.token_ids, expected_continuation.token_ids,
+        "cursor preflight must not mutate session state before generic fallback"
+    );
+    assert_eq!(actual_continuation.text, expected_continuation.text);
+    assert_eq!(
+        actual_continuation.finish_reason,
+        expected_continuation.finish_reason
+    );
+
+    direct.close_session(direct_session)?;
+    prioritized.close_session(prioritized_session)?;
+    Ok(())
+}
+
+#[test]
+fn invalid_speculative_request_does_not_enter_cursor_fallback() -> anyhow::Result<()> {
+    let mut engine = Engine::from_dir(&tiny_fixture()?, priority_config())?;
+    let session = engine.create_session()?;
+    let mut request = token_request(vec![2, 4, 3], 2);
+    request.options.speculative_mode = Some(SpeculativeMode::PromptLookup {
+        ngram: 0,
+        max_tokens: 4,
+    });
+
+    let error = match engine.drive_prioritized_requests(vec![PrioritizedGenerateRequest {
+        session_id: session,
+        request,
+        priority: Priority::High,
+    }]) {
+        Ok(_) => panic!("an invalid speculative contract must fail closed"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("prompt-lookup ngram must be greater than zero"),
+        "{error:#}"
+    );
+
+    let recovered = engine.generate_in_session(session, token_request(vec![2, 4, 3], 1))?;
+    assert_eq!(recovered.finish_reason, FinishReason::MaxTokens);
     engine.close_session(session)?;
     Ok(())
 }

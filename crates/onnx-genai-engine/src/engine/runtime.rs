@@ -2238,9 +2238,11 @@ impl Engine {
             anyhow::bail!("session {} not found", request.session_id);
         }
         if self.should_use_speculative(&options) {
-            anyhow::bail!(
-                "prioritized drive API currently supports the single-sequence non-speculative path; batched/speculative drive is future work"
-            );
+            return Err(crate::pipeline::PerTokenCursorIneligible::new(
+                "this valid request selects speculative proposal and verification, which cannot \
+                 suspend at the prioritized cursor's one-target-token boundary",
+            )
+            .into());
         }
 
         let max_context = self.max_context_for_request(&options);

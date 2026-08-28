@@ -7884,7 +7884,7 @@ pub(crate) struct PerTokenCursorIneligible {
 }
 
 impl PerTokenCursorIneligible {
-    fn new(reason: &'static str) -> Self {
+    pub(crate) fn new(reason: &'static str) -> Self {
         Self { reason }
     }
 }
