@@ -12,7 +12,11 @@ use onnx_genai_ort::Value;
 
 use crate::decode::clone_value;
 
-use super::{OutputPublicationBaseline, TurnTransactionId, turn_transaction::CommittedOutputState};
+use super::{
+    OutputPublicationBaseline, OutputStreamBaseline, TurnAbortReason, TurnBaselineId,
+    TurnPublicationMode, TurnTransactionId, TurnTransactionOutcome,
+    turn_transaction::CommittedOutputState,
+};
 
 /// The sole typed-revision envelope protocol this runtime implements.
 pub const TYPED_REVISION_PROTOCOL_VERSION: &str = "1";
@@ -110,6 +114,20 @@ pub enum WorkflowOutputPublication {
         finality: OutputFinality,
     },
     Revision(TypedRevisionEnvelope),
+    /// The admitted turn committed atomically. In provisional mode this is the
+    /// typed finality authority for every earlier provisional envelope.
+    TransactionCommitted {
+        transaction: TurnTransactionId,
+        baseline: TurnBaselineId,
+    },
+    /// The admitted turn did not commit. Receivers restore exactly these
+    /// admission cursors and must not infer inverse revisions from payloads.
+    AbortToBaseline {
+        transaction: TurnTransactionId,
+        baseline: TurnBaselineId,
+        reason: TurnAbortReason,
+        streams: Vec<OutputStreamBaseline>,
+    },
 }
 
 impl std::fmt::Debug for WorkflowOutputPublication {
@@ -142,7 +160,114 @@ impl std::fmt::Debug for WorkflowOutputPublication {
                 .field("finality", finality)
                 .finish(),
             Self::Revision(envelope) => envelope.fmt(formatter),
+            Self::TransactionCommitted {
+                transaction,
+                baseline,
+            } => formatter
+                .debug_struct("TransactionCommitted")
+                .field("transaction", transaction)
+                .field("baseline", baseline)
+                .finish(),
+            Self::AbortToBaseline {
+                transaction,
+                baseline,
+                reason,
+                streams,
+            } => formatter
+                .debug_struct("AbortToBaseline")
+                .field("transaction", transaction)
+                .field("baseline", baseline)
+                .field("reason", reason)
+                .field("streams", streams)
+                .finish(),
         }
+    }
+}
+
+impl WorkflowOutputPublication {
+    /// Preserve a transaction outcome as a protocol record without inventing
+    /// output-level inverse operations.
+    pub fn from_transaction_outcome(outcome: &TurnTransactionOutcome) -> Self {
+        match outcome {
+            TurnTransactionOutcome::Committed {
+                transaction,
+                baseline,
+            } => Self::TransactionCommitted {
+                transaction: *transaction,
+                baseline: *baseline,
+            },
+            TurnTransactionOutcome::AbortToBaseline {
+                transaction,
+                baseline,
+                reason,
+                streams,
+            } => Self::AbortToBaseline {
+                transaction: *transaction,
+                baseline: *baseline,
+                reason: *reason,
+                streams: streams.clone(),
+            },
+        }
+    }
+
+    fn try_clone(&self) -> Result<Self> {
+        Ok(match self {
+            Self::Materialized {
+                output,
+                operation,
+                payload,
+                finality,
+            } => Self::Materialized {
+                output: output.clone(),
+                operation: *operation,
+                payload: clone_value(payload)?,
+                finality: *finality,
+            },
+            Self::Event {
+                output,
+                stream,
+                sequence,
+                payload,
+                finality,
+            } => Self::Event {
+                output: output.clone(),
+                stream: stream.clone(),
+                sequence: *sequence,
+                payload: clone_value(payload)?,
+                finality: *finality,
+            },
+            Self::Revision(envelope) => Self::Revision(TypedRevisionEnvelope {
+                version: envelope.version.clone(),
+                transaction: envelope.transaction,
+                output: envelope.output.clone(),
+                stream: envelope.stream.clone(),
+                sequence: envelope.sequence,
+                revision: envelope.revision,
+                lineage: envelope.lineage,
+                base: envelope.base,
+                operation: envelope.operation,
+                payload: envelope.payload.as_ref().map(clone_value).transpose()?,
+                finality: envelope.finality,
+            }),
+            Self::TransactionCommitted {
+                transaction,
+                baseline,
+            } => Self::TransactionCommitted {
+                transaction: *transaction,
+                baseline: *baseline,
+            },
+            Self::AbortToBaseline {
+                transaction,
+                baseline,
+                reason,
+                streams,
+            } => Self::AbortToBaseline {
+                transaction: *transaction,
+                baseline: *baseline,
+                reason: *reason,
+                streams: streams.clone(),
+            },
+        })
     }
 }
 
@@ -203,6 +328,14 @@ pub enum RevisionEnvelopeValidationError {
         output: String,
         stream: String,
         operation: TypedRevisionOperation,
+    },
+    #[error(
+        "typed revision envelope for output '{output}' stream '{stream}' has finality {actual:?} before its transaction commits; revision envelopes must remain provisional until a typed commit outcome"
+    )]
+    Finality {
+        output: String,
+        stream: String,
+        actual: OutputFinality,
     },
     #[error(
         "typed revision envelope for output '{output}' stream '{stream}' operation {operation:?} has lineage {lineage}, expected {expected}"
@@ -283,6 +416,13 @@ impl RevisionEnvelopeValidator {
         if envelope.stream.0.is_empty() {
             return Err(RevisionEnvelopeValidationError::EmptyStream {
                 output: envelope.output.clone(),
+            });
+        }
+        if envelope.finality != OutputFinality::Provisional {
+            return Err(RevisionEnvelopeValidationError::Finality {
+                output,
+                stream,
+                actual: envelope.finality,
             });
         }
         let state = self
@@ -391,20 +531,60 @@ enum OutputProtocolFamily {
 
 pub(crate) struct OutputPublicationJournal {
     transaction: TurnTransactionId,
+    publication_mode: TurnPublicationMode,
     outputs: BTreeMap<String, OutputProtocolFamily>,
     revisions: RevisionEnvelopeValidator,
     revision_payloads: BTreeMap<(String, OutputStreamId), Option<Value>>,
     event_sequences: BTreeMap<(String, OutputStreamId), u64>,
     materialized: BTreeMap<(String, OutputStreamId), CommittedOutputState>,
     publications: Vec<WorkflowOutputPublication>,
+    provisional_delivery_cursor: usize,
 }
 
 impl OutputPublicationJournal {
+    #[cfg(test)]
     pub(crate) fn new(
         transaction: TurnTransactionId,
         workflow: &WorkflowSpec,
         baselines: BTreeMap<(String, OutputStreamId), OutputPublicationBaseline>,
     ) -> Result<Self> {
+        Self::new_with_publication_mode(
+            transaction,
+            workflow,
+            baselines,
+            TurnPublicationMode::from(workflow.publication_mode),
+        )
+    }
+
+    pub(crate) fn new_with_publication_mode(
+        transaction: TurnTransactionId,
+        workflow: &WorkflowSpec,
+        baselines: BTreeMap<(String, OutputStreamId), OutputPublicationBaseline>,
+        publication_mode: TurnPublicationMode,
+    ) -> Result<Self> {
+        ensure!(
+            publication_mode == TurnPublicationMode::from(workflow.publication_mode),
+            "transaction publication mode {:?} diverges from pipeline.workflow.publication_mode \
+             {:?}; reject before output mutation rather than creating two authorities",
+            publication_mode,
+            workflow.publication_mode,
+        );
+        if publication_mode == TurnPublicationMode::ProvisionalRevisions {
+            for (output, declaration) in &workflow.outputs {
+                ensure!(
+                    matches!(
+                        declaration.family,
+                        WorkflowOutputFamily::Revisions { ref version }
+                            if version == TYPED_REVISION_PROTOCOL_VERSION
+                    ),
+                    "cannot admit provisional publication mode: output '{output}' has family {:?}; \
+                     provisional_revisions requires typed revision family version '{}' for every \
+                     output so abort_to_baseline can reconcile the complete turn",
+                    declaration.family,
+                    TYPED_REVISION_PROTOCOL_VERSION,
+                );
+            }
+        }
         for (output, declaration) in &workflow.outputs {
             if declaration.family_authored
                 && let WorkflowOutputFamily::Revisions { version } = &declaration.family
@@ -454,6 +634,31 @@ impl OutputPublicationJournal {
                         || baseline.closed
                         || baseline.payload.is_some() =>
                 {
+                    ensure!(
+                        baseline.head == baseline.cursor,
+                        "output '{output}' stream '{}' has invalid revision admission baseline: \
+                         head {} differs from sequence {}; reject before mutation rather than \
+                         publishing an unreconcilable lineage",
+                        stream.0,
+                        baseline.head,
+                        baseline.cursor,
+                    );
+                    ensure!(
+                        baseline.lineage <= baseline.head,
+                        "output '{output}' stream '{}' has invalid revision admission baseline: \
+                         lineage {} exceeds head {}; reject before mutation rather than \
+                         publishing an unreconcilable lineage",
+                        stream.0,
+                        baseline.lineage,
+                        baseline.head,
+                    );
+                    ensure!(
+                        (baseline.lineage == 0) == baseline.payload.is_none(),
+                        "output '{output}' stream '{}' has invalid revision admission baseline: \
+                         lineage {} and payload presence disagree; reject before mutation",
+                        stream.0,
+                        baseline.lineage,
+                    );
                     revisions.streams.insert(
                         (output.clone(), stream.clone()),
                         RevisionStreamState {
@@ -500,12 +705,14 @@ impl OutputPublicationJournal {
         }
         Ok(Self {
             transaction,
+            publication_mode,
             revisions,
             outputs,
             revision_payloads,
             event_sequences,
             materialized,
             publications: Vec::new(),
+            provisional_delivery_cursor: 0,
         })
     }
 
@@ -752,18 +959,64 @@ impl OutputPublicationJournal {
         for (output, stream) in open {
             self.publish_revision(&output, stream, TypedRevisionOperation::Finalize, None)?;
         }
-        for publication in &mut self.publications {
-            match publication {
-                WorkflowOutputPublication::Materialized { finality, .. }
-                | WorkflowOutputPublication::Event { finality, .. } => {
-                    *finality = OutputFinality::Final
-                }
-                WorkflowOutputPublication::Revision(envelope) => {
-                    envelope.finality = OutputFinality::Final;
+        if self.publication_mode == TurnPublicationMode::CommitOnly {
+            for publication in &mut self.publications {
+                match publication {
+                    WorkflowOutputPublication::Materialized { finality, .. }
+                    | WorkflowOutputPublication::Event { finality, .. } => {
+                        *finality = OutputFinality::Final
+                    }
+                    WorkflowOutputPublication::Revision(envelope) => {
+                        envelope.finality = OutputFinality::Final;
+                    }
+                    WorkflowOutputPublication::TransactionCommitted { .. }
+                    | WorkflowOutputPublication::AbortToBaseline { .. } => {}
                 }
             }
         }
         Ok(())
+    }
+
+    /// Record the committed transaction after its state/effect/output writes
+    /// succeed. This record is the finality authority for provisional output.
+    pub(crate) fn record_commit(&mut self, outcome: &TurnTransactionOutcome) {
+        if self.publication_mode == TurnPublicationMode::ProvisionalRevisions {
+            self.publications
+                .push(WorkflowOutputPublication::from_transaction_outcome(outcome));
+        }
+    }
+
+    /// Take the not-yet-delivered provisional publications in authored order.
+    /// A commit-only journal never exposes this pre-commit view.
+    pub(crate) fn take_pending_provisionals(&mut self) -> Result<Vec<WorkflowOutputPublication>> {
+        if self.publication_mode != TurnPublicationMode::ProvisionalRevisions {
+            return Ok(Vec::new());
+        }
+        let pending = self.publications[self.provisional_delivery_cursor..]
+            .iter()
+            .map(WorkflowOutputPublication::try_clone)
+            .collect::<Result<Vec<_>>>()?;
+        self.provisional_delivery_cursor = self.publications.len();
+        Ok(pending)
+    }
+
+    /// Construct the sole exact abort record from the journal's complete
+    /// touched-stream set. The transaction remains the authority for baseline
+    /// cursors, while the journal knows dynamically named streams.
+    pub(crate) fn abort_outcome(
+        &self,
+        turn: &super::TurnTransaction,
+        reason: TurnAbortReason,
+    ) -> TurnTransactionOutcome {
+        let streams = self
+            .revision_payloads
+            .keys()
+            .chain(self.revisions.streams.keys())
+            .chain(self.event_sequences.keys())
+            .chain(self.materialized.keys())
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        turn.abort_for_streams(reason, streams)
     }
 
     pub(crate) fn committed_states(
@@ -825,9 +1078,48 @@ impl OutputPublicationJournal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pipeline::TurnTransaction;
+    use proptest::prelude::*;
 
     fn value(value: i64) -> Value {
         Value::from_slice_i64(&[value], &[1]).expect("test value")
+    }
+
+    fn revision_workflow(
+        publication_mode: onnx_genai_metadata::WorkflowPublicationMode,
+    ) -> WorkflowSpec {
+        WorkflowSpec {
+            manifest: onnx_genai_metadata::WorkflowManifest {
+                adapter_abis: Default::default(),
+            },
+            publication_mode,
+            inputs: Default::default(),
+            outputs: ["answer", "tool"]
+                .into_iter()
+                .map(|name| {
+                    (
+                        name.to_string(),
+                        onnx_genai_metadata::WorkflowOutput {
+                            contract: serde_yaml::from_str("{ dtype: int64, shape: [sequence] }")
+                                .expect("output contract"),
+                            role: onnx_genai_metadata::WorkflowOutputRole::Tensor,
+                            family: WorkflowOutputFamily::Revisions {
+                                version: TYPED_REVISION_PROTOCOL_VERSION.to_string(),
+                            },
+                            family_authored: true,
+                            value_range: None,
+                            stage: onnx_genai_metadata::OutputStage::PreAdapter,
+                            media: None,
+                        },
+                    )
+                })
+                .collect(),
+            components: Default::default(),
+            state: Default::default(),
+            effects: Default::default(),
+            serving: None,
+            steps: Default::default(),
+        }
     }
 
     fn revisions() -> RevisionEnvelopeValidator {
@@ -837,6 +1129,29 @@ mod tests {
                 version: TYPED_REVISION_PROTOCOL_VERSION.to_string(),
             },
         )])
+    }
+
+    type CommittedStateFingerprint = (String, String, u64, u64, u64, bool, Option<Vec<u8>>);
+
+    fn committed_state_fingerprint(
+        states: BTreeMap<(String, OutputStreamId), CommittedOutputState>,
+    ) -> Vec<CommittedStateFingerprint> {
+        states
+            .into_iter()
+            .map(|((output, stream), state)| {
+                (
+                    output,
+                    stream.0,
+                    state.head,
+                    state.cursor,
+                    state.lineage,
+                    state.closed,
+                    state
+                        .payload
+                        .map(|payload| payload.to_raw_bytes().expect("payload bytes")),
+                )
+            })
+            .collect()
     }
 
     fn envelope(
@@ -990,11 +1305,63 @@ mod tests {
     }
 
     #[test]
+    fn success_shaped_finality_cannot_precede_the_transaction_commit() {
+        let mut validator = revisions();
+        let mut final_envelope =
+            envelope(1, 1, 1, 0, TypedRevisionOperation::Append, Some(value(1)));
+        final_envelope.finality = OutputFinality::Final;
+        assert!(matches!(
+            validator.validate_and_apply(&final_envelope),
+            Err(RevisionEnvelopeValidationError::Finality { .. })
+        ));
+        validator
+            .validate_and_apply(&envelope(
+                1,
+                1,
+                1,
+                0,
+                TypedRevisionOperation::Append,
+                Some(value(1)),
+            ))
+            .expect("rejected finality cannot advance the stream");
+    }
+
+    #[test]
+    fn invalid_revision_baseline_is_refused_before_a_journal_can_publish() -> Result<()> {
+        let workflow =
+            revision_workflow(onnx_genai_metadata::WorkflowPublicationMode::ProvisionalRevisions);
+        let error = match OutputPublicationJournal::new(
+            TurnTransactionId(44),
+            &workflow,
+            BTreeMap::from([(
+                ("answer".to_string(), OutputStreamId("main".to_string())),
+                OutputPublicationBaseline {
+                    head: 1,
+                    cursor: 2,
+                    lineage: 1,
+                    closed: false,
+                    payload: Some(value(1)),
+                },
+            )]),
+        ) {
+            Ok(_) => panic!("a malformed admitted baseline must be unreconcilable"),
+            Err(error) => error,
+        };
+        assert!(
+            format!("{error:#}").contains("output 'answer' stream 'main'")
+                && format!("{error:#}").contains("head 1 differs from sequence 2"),
+            "{error:#}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn committed_closed_baseline_rejects_post_close_revision_before_publication() -> Result<()> {
         let workflow = WorkflowSpec {
             manifest: onnx_genai_metadata::WorkflowManifest {
                 adapter_abis: Default::default(),
             },
+            publication_mode: Default::default(),
             inputs: Default::default(),
             outputs: BTreeMap::from([(
                 "answer".to_string(),
@@ -1042,6 +1409,7 @@ mod tests {
             manifest: onnx_genai_metadata::WorkflowManifest {
                 adapter_abis: Default::default(),
             },
+            publication_mode: Default::default(),
             inputs: Default::default(),
             outputs: BTreeMap::from([(
                 "answer".to_string(),
@@ -1115,6 +1483,7 @@ mod tests {
             manifest: onnx_genai_metadata::WorkflowManifest {
                 adapter_abis: Default::default(),
             },
+            publication_mode: Default::default(),
             inputs: Default::default(),
             outputs: BTreeMap::from([(
                 "answer".to_string(),
@@ -1286,6 +1655,7 @@ mod tests {
             manifest: onnx_genai_metadata::WorkflowManifest {
                 adapter_abis: Default::default(),
             },
+            publication_mode: Default::default(),
             inputs: Default::default(),
             // Deliberately insert in a different order from publication. The
             // journal follows authored emits, not map traversal.
@@ -1381,6 +1751,7 @@ mod tests {
             manifest: onnx_genai_metadata::WorkflowManifest {
                 adapter_abis: Default::default(),
             },
+            publication_mode: Default::default(),
             inputs: Default::default(),
             outputs: BTreeMap::from([
                 ("legacy_event".to_string(), output()),
@@ -1426,5 +1797,193 @@ mod tests {
             } if output == "legacy_value"
         ));
         Ok(())
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 128,
+            .. ProptestConfig::default()
+        })]
+
+        /// Random interleavings exercise the one authority that owns stream
+        /// cursor, lineage, closure, finality, and the terminal outcome.
+        #[test]
+        fn revision_transactions_preserve_stream_isolation_and_baselines(
+            actions in prop::collection::vec((0u8..2, 0u8..2, 0u8..4, any::<i64>()), 1..48),
+        ) {
+            for publication_mode in [
+                onnx_genai_metadata::WorkflowPublicationMode::CommitOnly,
+                onnx_genai_metadata::WorkflowPublicationMode::ProvisionalRevisions,
+            ] {
+                let workflow = revision_workflow(publication_mode);
+                let turn = TurnTransaction::admit(
+                    TurnTransactionId(41),
+                    None,
+                    &onnx_genai_metadata::ResolvedStatePlan::default(),
+                    std::iter::empty::<String>(),
+                    ["answer".to_string(), "tool".to_string()],
+                    &std::collections::HashMap::new(),
+                    &std::collections::HashMap::new(),
+                    &std::collections::HashMap::new(),
+                    match publication_mode {
+                        onnx_genai_metadata::WorkflowPublicationMode::CommitOnly => TurnPublicationMode::CommitOnly,
+                        onnx_genai_metadata::WorkflowPublicationMode::ProvisionalRevisions => TurnPublicationMode::ProvisionalRevisions,
+                    },
+                ).expect("revision-only provisional workflow admits");
+                let mut journal = OutputPublicationJournal::new(
+                    turn.id(),
+                    &workflow,
+                    turn.output_baselines().expect("snapshot baselines"),
+                ).expect("revision protocol is admissible");
+                let mut model = std::collections::BTreeMap::new();
+
+                for (output_index, stream_index, operation, payload) in actions.iter().copied() {
+                    let output = if output_index == 0 { "answer" } else { "tool" };
+                    let stream = if stream_index == 0 { "left" } else { "right" };
+                    let state = model
+                        .entry((output, stream))
+                        .or_insert((0u64, 0u64, 0u64, false));
+                    if state.3 {
+                        let before = committed_state_fingerprint(
+                            journal.committed_states().expect("state snapshots"),
+                        );
+                        prop_assert!(journal.publish(
+                            output,
+                            Some(stream),
+                            &WorkflowEmitMode::Append,
+                            Some(value(payload)),
+                        ).is_err());
+                        prop_assert_eq!(
+                            committed_state_fingerprint(
+                                journal.committed_states()
+                                    .expect("rejected operation is atomic"),
+                            ),
+                            before,
+                        );
+                        continue;
+                    }
+                    let mode = match operation {
+                        0 => WorkflowEmitMode::Append,
+                        1 => WorkflowEmitMode::Replace,
+                        2 if state.2 != 0 => WorkflowEmitMode::Retract,
+                        _ => WorkflowEmitMode::Finalize,
+                    };
+                    let carries_payload = matches!(mode, WorkflowEmitMode::Append | WorkflowEmitMode::Replace);
+                    journal.publish(
+                        output,
+                        Some(stream),
+                        &mode,
+                        carries_payload.then(|| value(payload)),
+                    ).expect("the generated legal operation publishes");
+                    state.0 += 1;
+                    state.1 += 1;
+                    match mode {
+                        WorkflowEmitMode::Append | WorkflowEmitMode::Replace => state.2 = state.0,
+                        WorkflowEmitMode::Retract => state.2 = 0,
+                        WorkflowEmitMode::Finalize => state.3 = true,
+                        WorkflowEmitMode::Event => unreachable!("revision strategy omits events"),
+                    }
+                }
+
+                let provisional = journal.take_pending_provisionals().expect("copy envelopes");
+                match publication_mode {
+                    onnx_genai_metadata::WorkflowPublicationMode::CommitOnly => {
+                        prop_assert!(provisional.is_empty());
+                    }
+                    onnx_genai_metadata::WorkflowPublicationMode::ProvisionalRevisions => {
+                        for publication in provisional {
+                            let WorkflowOutputPublication::Revision(envelope) = publication else {
+                                prop_assert!(false, "only revisions publish before commit");
+                                continue;
+                            };
+                            prop_assert_eq!(envelope.finality, OutputFinality::Provisional);
+                        }
+                    }
+                }
+
+                let abort = journal.abort_outcome(
+                    &turn,
+                    TurnAbortReason::Cancellation,
+                );
+                let TurnTransactionOutcome::AbortToBaseline { streams, .. } = abort else {
+                    prop_assert!(false, "an aborted turn must name its baseline");
+                    continue;
+                };
+                for baseline in streams {
+                    prop_assert_eq!(baseline.head, 0);
+                    prop_assert_eq!(baseline.sequence, 0);
+                    prop_assert_eq!(baseline.lineage, 0);
+                    prop_assert!(!baseline.closed);
+                }
+
+                journal.finalize_on_commit().expect("commit default closes streams");
+                journal.record_commit(&turn.committed());
+                let publications = journal.take();
+                for publication in &publications {
+                    match (publication_mode, publication) {
+                        (_, WorkflowOutputPublication::TransactionCommitted { .. }) => {}
+                        (onnx_genai_metadata::WorkflowPublicationMode::CommitOnly,
+                         WorkflowOutputPublication::Materialized { finality, .. }
+                         | WorkflowOutputPublication::Event { finality, .. }) => {
+                            prop_assert_eq!(*finality, OutputFinality::Final);
+                        }
+                        (onnx_genai_metadata::WorkflowPublicationMode::CommitOnly,
+                         WorkflowOutputPublication::Revision(envelope)) => {
+                            prop_assert_eq!(envelope.finality, OutputFinality::Final);
+                        }
+                        (onnx_genai_metadata::WorkflowPublicationMode::ProvisionalRevisions,
+                         WorkflowOutputPublication::Revision(envelope)) => {
+                            prop_assert_eq!(envelope.finality, OutputFinality::Provisional);
+                        }
+                        (_, WorkflowOutputPublication::AbortToBaseline { .. }) => {
+                            prop_assert!(false, "successful commit never emits an abort");
+                        }
+                        (onnx_genai_metadata::WorkflowPublicationMode::ProvisionalRevisions, _) => {
+                            prop_assert!(false, "provisional mode accepts only revision outputs");
+                        }
+                    }
+                }
+                if publication_mode == onnx_genai_metadata::WorkflowPublicationMode::ProvisionalRevisions {
+                    let last_is_commit = matches!(
+                        publications.last(),
+                        Some(WorkflowOutputPublication::TransactionCommitted { .. })
+                    );
+                    prop_assert!(last_is_commit);
+                }
+            }
+        }
+
+        #[test]
+        fn duplicate_or_out_of_order_revisions_fail_without_advancing(
+            payload in any::<i64>(),
+            bad_sequence in 0u64..2,
+        ) {
+            let mut validator = revisions();
+            validator.validate_and_apply(&envelope(
+                1,
+                1,
+                1,
+                0,
+                TypedRevisionOperation::Append,
+                Some(value(payload)),
+            )).expect("first revision");
+            let duplicate = envelope(
+                bad_sequence,
+                2,
+                2,
+                1,
+                TypedRevisionOperation::Replace,
+                Some(value(payload.saturating_add(1))),
+            );
+            prop_assert!(validator.validate_and_apply(&duplicate).is_err());
+            validator.validate_and_apply(&envelope(
+                2,
+                2,
+                2,
+                1,
+                TypedRevisionOperation::Replace,
+                Some(value(payload.saturating_add(1))),
+            )).expect("illegal input cannot mutate the next valid cursor");
+        }
     }
 }

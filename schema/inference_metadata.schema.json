@@ -5810,6 +5810,21 @@
         }
       ]
     },
+    "WorkflowPublicationMode": {
+      "description": "Publication visibility selected for every output in a workflow turn.\n\n`provisional_revisions` is deliberately not a generic streaming switch.\nIt is valid only when every declared output uses the versioned revision\nfamily, allowing a consumer to reconcile one transaction atomically.",
+      "oneOf": [
+        {
+          "const": "commit_only",
+          "description": "Outputs become externally observable only after the turn commits.",
+          "type": "string"
+        },
+        {
+          "const": "provisional_revisions",
+          "description": "Revision envelopes may be published before commit and are reconciled by\nthe transaction's commit or abort-to-baseline outcome.",
+          "type": "string"
+        }
+      ]
+    },
     "WorkflowSpec": {
       "additionalProperties": false,
       "description": "Sound, component-centric workflow IR. Tensor math lives in invoked components.",
@@ -5844,6 +5859,10 @@
           },
           "default": {},
           "type": "object"
+        },
+        "publication_mode": {
+          "$ref": "#/$defs/WorkflowPublicationMode",
+          "description": "Visibility of output publications while an admitted turn is still open.\n\nThis is one workflow-wide transaction decision, rather than a property\nof an individual emit: one turn has one commit or abort outcome that\nreconciles every output stream together."
         },
         "serving": {
           "anyOf": [

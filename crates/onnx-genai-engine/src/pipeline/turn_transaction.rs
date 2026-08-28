@@ -53,6 +53,22 @@ pub struct OutputPublicationBaseline {
     pub payload: Option<Value>,
 }
 
+/// The transport-safe portion of an output stream's admission baseline.
+///
+/// Payload bytes deliberately do not select rollback: a receiver restores its
+/// own prior content by this stream identity and these immutable cursors. This
+/// keeps map traversal, payload shape, and output ordering out of the
+/// transaction reconciliation contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputStreamBaseline {
+    pub output: String,
+    pub stream: OutputStreamId,
+    pub head: u64,
+    pub sequence: u64,
+    pub lineage: u64,
+    pub closed: bool,
+}
+
 impl std::fmt::Debug for OutputPublicationBaseline {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -89,7 +105,7 @@ pub enum TurnAbortReason {
 /// This is intentionally not an output revision operation.  Its identity
 /// points at the transaction and complete baseline that own every provisional
 /// state/effect/output advance.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TurnTransactionOutcome {
     Committed {
         transaction: TurnTransactionId,
@@ -99,6 +115,9 @@ pub enum TurnTransactionOutcome {
         transaction: TurnTransactionId,
         baseline: TurnBaselineId,
         reason: TurnAbortReason,
+        /// Every stream that can have been affected by this admitted turn,
+        /// including dynamically named streams with the empty baseline.
+        streams: Vec<OutputStreamBaseline>,
     },
 }
 
@@ -108,9 +127,20 @@ pub enum TurnPublicationMode {
     /// Outputs remain in the transaction's working set until commit.
     #[default]
     CommitOnly,
-    /// Reserved for the typed revision protocol.  It must be rejected before
-    /// mutation if its sink cannot retract by transaction identity.
+    /// Output publication uses the typed revision protocol and a terminal
+    /// transaction outcome for deterministic reconciliation.
     ProvisionalRevisions,
+}
+
+impl From<onnx_genai_metadata::WorkflowPublicationMode> for TurnPublicationMode {
+    fn from(value: onnx_genai_metadata::WorkflowPublicationMode) -> Self {
+        match value {
+            onnx_genai_metadata::WorkflowPublicationMode::CommitOnly => Self::CommitOnly,
+            onnx_genai_metadata::WorkflowPublicationMode::ProvisionalRevisions => {
+                Self::ProvisionalRevisions
+            }
+        }
+    }
 }
 
 /// Typed admission failure, distinct from an exclusive-lease rejection.
@@ -121,11 +151,6 @@ pub enum TurnTransactionAdmissionError {
          writer in the canonical state plan; join its writers before executing"
     )]
     MissingFinalWriter { state: String },
-    #[error(
-        "cannot admit provisional output mode: output '{output}' has no transaction-addressable \
-         retraction sink; use commit_only or install a typed revision sink before executing"
-    )]
-    UnretractableProvisionalOutput { output: String },
     #[error(
         "cannot admit an atomic turn: failed to snapshot semantic session state '{state}': \
          {message}"
@@ -251,15 +276,6 @@ impl TurnTransaction {
         let outputs = outputs
             .into_iter()
             .collect::<std::collections::BTreeSet<_>>();
-        for output in &outputs {
-            if publication_mode == TurnPublicationMode::ProvisionalRevisions {
-                return Err(
-                    TurnTransactionAdmissionError::UnretractableProvisionalOutput {
-                        output: output.clone(),
-                    },
-                );
-            }
-        }
         if let Some(session) = session {
             for ((owner, output, stream), committed) in session_outputs {
                 if owner != session || !outputs.contains(output) {
@@ -325,6 +341,10 @@ impl TurnTransaction {
 
     pub(crate) fn id(&self) -> TurnTransactionId {
         self.baseline.transaction
+    }
+
+    pub(crate) fn publication_mode(&self) -> TurnPublicationMode {
+        self.publication_mode
     }
 
     pub(crate) fn output_baselines(
@@ -438,11 +458,41 @@ impl TurnTransaction {
     }
 
     pub(crate) fn abort(&self, reason: TurnAbortReason) -> TurnTransactionOutcome {
-        let _ = self.publication_mode;
+        self.abort_for_streams(reason, self.baseline.outputs.keys().cloned())
+    }
+
+    /// Build the one abort outcome for the streams the publication authority
+    /// actually touched. A stream first introduced by this turn had no durable
+    /// entry at admission, so its exact baseline is the empty cursor state.
+    pub(crate) fn abort_for_streams(
+        &self,
+        reason: TurnAbortReason,
+        streams: impl IntoIterator<Item = (String, OutputStreamId)>,
+    ) -> TurnTransactionOutcome {
+        let mut streams = streams
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .map(|(output, stream)| {
+                let baseline = self.baseline.outputs.get(&(output.clone(), stream.clone()));
+                OutputStreamBaseline {
+                    output,
+                    stream,
+                    head: baseline.map_or(0, |value| value.head),
+                    sequence: baseline.map_or(0, |value| value.cursor),
+                    lineage: baseline.map_or(0, |value| value.lineage),
+                    closed: baseline.is_some_and(|value| value.closed),
+                }
+            })
+            .collect::<Vec<_>>();
+        streams.sort_by(|left, right| {
+            (&left.output, &left.stream).cmp(&(&right.output, &right.stream))
+        });
         TurnTransactionOutcome::AbortToBaseline {
             transaction: self.baseline.transaction,
             baseline: self.baseline.id,
             reason,
+            streams,
         }
     }
 }
@@ -598,14 +648,15 @@ mod tests {
                 transaction: TurnTransactionId(11),
                 baseline: TurnBaselineId(11),
                 reason: TurnAbortReason::Cancellation,
+                streams: Vec::new(),
             }
         );
         Ok(())
     }
 
     #[test]
-    fn provisional_mode_is_refused_before_any_mutation() {
-        let error = TurnTransaction::admit(
+    fn provisional_mode_preserves_the_admission_baseline() -> anyhow::Result<()> {
+        let turn = TurnTransaction::admit(
             TurnTransactionId(1),
             Some("session"),
             &ResolvedStatePlan::default(),
@@ -615,13 +666,25 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             TurnPublicationMode::ProvisionalRevisions,
-        )
-        .expect_err("an unretractable provisional output must fail admission");
-        assert!(matches!(
-            error,
-            TurnTransactionAdmissionError::UnretractableProvisionalOutput { output }
-            if output == "tokens"
-        ));
+        )?;
+        let TurnTransactionOutcome::AbortToBaseline { streams, .. } = turn.abort_for_streams(
+            TurnAbortReason::Cancellation,
+            [("tokens".to_string(), OutputStreamId("named".to_string()))],
+        ) else {
+            unreachable!("abort always has a baseline");
+        };
+        assert_eq!(
+            streams,
+            vec![OutputStreamBaseline {
+                output: "tokens".to_string(),
+                stream: OutputStreamId("named".to_string()),
+                head: 0,
+                sequence: 0,
+                lineage: 0,
+                closed: false,
+            }]
+        );
+        Ok(())
     }
 
     #[test]
@@ -659,13 +722,44 @@ mod tests {
                 output_state_with_payload(1, 2, 1, true, 10)?,
             ),
         ]));
+        let TurnTransactionOutcome::AbortToBaseline {
+            transaction,
+            baseline,
+            reason,
+            streams,
+        } = aborted.abort_for_streams(
+            TurnAbortReason::Cancellation,
+            [
+                ("answer".to_string(), OutputStreamId("analysis".to_string())),
+                ("answer".to_string(), OutputStreamId("retry".to_string())),
+            ],
+        )
+        else {
+            unreachable!("an aborted turn has a typed baseline");
+        };
+        assert_eq!(transaction, TurnTransactionId(31));
+        assert_eq!(baseline, TurnBaselineId(31));
+        assert_eq!(reason, TurnAbortReason::Cancellation);
         assert_eq!(
-            aborted.abort(TurnAbortReason::Cancellation),
-            TurnTransactionOutcome::AbortToBaseline {
-                transaction: TurnTransactionId(31),
-                baseline: TurnBaselineId(31),
-                reason: TurnAbortReason::Cancellation,
-            }
+            streams,
+            vec![
+                OutputStreamBaseline {
+                    output: "answer".to_string(),
+                    stream: OutputStreamId("analysis".to_string()),
+                    head: 2,
+                    sequence: 3,
+                    lineage: 2,
+                    closed: false,
+                },
+                OutputStreamBaseline {
+                    output: "answer".to_string(),
+                    stream: OutputStreamId("retry".to_string()),
+                    head: 0,
+                    sequence: 0,
+                    lineage: 0,
+                    closed: false,
+                },
+            ]
         );
         assert_eq!(
             (

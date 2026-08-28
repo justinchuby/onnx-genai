@@ -1900,6 +1900,26 @@ fn validate_output_protocols(
     version: crate::version::SchemaVersion,
     errors: &mut Vec<String>,
 ) {
+    if matches!(
+        workflow.publication_mode,
+        crate::schema::WorkflowPublicationMode::ProvisionalRevisions
+    ) {
+        for (name, output) in &workflow.outputs {
+            if !matches!(
+                output.family,
+                crate::schema::WorkflowOutputFamily::Revisions { version: ref revision_version }
+                    if revision_version == "1"
+            ) {
+                errors.push(format!(
+                    "pipeline.workflow.publication_mode is provisional_revisions, but output \
+                     '{name}' has family {:?}; provisional publication requires every affected \
+                     output to declare `family: {{ kind: revisions, version: \"1\" }}` so its \
+                     transaction can be reconciled without inventing inverse operations",
+                    output.family
+                ));
+            }
+        }
+    }
     for (name, output) in &workflow.outputs {
         if output.family_authored
             && let crate::schema::WorkflowOutputFamily::Revisions {

@@ -432,10 +432,23 @@ payload where applicable. Unknown versions or operations, illegal bases,
 duplicate `finalize`, post-finalize updates, and family/operation mismatches
 **MUST** fail closed.
 
+Schema v1.7 adds the required workflow-level
+`publication_mode: commit_only | provisional_revisions`. It applies to the
+entire admitted turn, not to an individual output: `provisional_revisions`
+**MUST** declare the typed revision family at every affected output, and its
+transport **MUST** preserve each envelope followed by exactly one typed
+`commit` or `abort_to_baseline` transaction outcome. The abort outcome names
+the transaction and the exact admission `(output, stream, head, sequence,
+lineage, closed)` baseline for every affected stream. A buffering or
+specialized transport that cannot preserve those records **MUST** refuse this
+mode before mutation; it must not manufacture inverse revisions.
+
 `abort_to_baseline` is a typed turn/transaction outcome, not a
 revision-envelope operation. It identifies the aborted transaction and its
 recorded committed baseline, and invalidates every provisional publication
-owned by that transaction.
+owned by that transaction. `commit` is the corresponding transaction outcome:
+it makes earlier provisional records durable without rewriting their ordering
+or payload.
 
 `finalize` closes one revision stream early. It is optional and remains
 provisional until the enclosing turn commits. Successful turn commit finalizes
@@ -1056,7 +1069,7 @@ Commit atomically advances every participating state, effect, and output head.
 Abort, cancellation, execution failure, or commit failure restores/retracts the
 whole turn to its recorded baseline. `commit_only` exposes nothing before commit;
 `provisional_revisions` may expose typed provisional publications and the typed
-`abort_to_baseline` turn/transaction outcome defined in
+`commit`/`abort_to_baseline` turn/transaction outcomes defined in
 [§6.4](#64-workflow-output-publication-and-revisions). A participant unable to
 join the transaction causes admission to fail before mutation. An exclusive
 lease is a concurrency primitive, not the transaction itself.

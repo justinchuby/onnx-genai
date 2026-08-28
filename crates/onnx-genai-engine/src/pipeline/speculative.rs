@@ -592,6 +592,7 @@ impl CandidateTreeWorkflowHost<'_> {
             transaction,
             baseline,
             reason,
+            streams: Vec::new(),
         }
     }
 
