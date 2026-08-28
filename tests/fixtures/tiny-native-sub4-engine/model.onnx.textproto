@@ -69,6 +69,7 @@ graph {
   node {
     input: "quant_activation"
     input: "packed_weight"
+    input: ""
     input: "logit_bias"
     output: "logits"
     name: "sub4_logits"

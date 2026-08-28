@@ -4099,7 +4099,8 @@ impl Kernel for WeightDeliveryKernel {
         inputs: &[TensorMetadata<'_>],
     ) -> onnx_runtime_ep_api::Result<WorkspaceRequirement> {
         let rows = inputs
-            .first()
+            .iter()
+            .find(|input| input.dtype != DataType::Undefined)
             .and_then(|input| input.shape.first())
             .copied()
             .unwrap_or(1) as u64;
@@ -4124,9 +4125,12 @@ impl Kernel for WeightDeliveryKernel {
         outputs: &mut [TensorMut],
     ) -> onnx_runtime_ep_api::Result<()> {
         self.deliveries.lock().unwrap().push("resident");
-        let bytes = unsafe {
-            std::slice::from_raw_parts(inputs[0].data_ptr::<u8>(), inputs[0].byte_size())
-        };
+        let input = inputs
+            .iter()
+            .find(|input| input.dtype != DataType::Undefined)
+            .ok_or_else(|| EpError::KernelFailed("test kernel received no input".into()))?;
+        let bytes =
+            unsafe { std::slice::from_raw_parts(input.data_ptr::<u8>(), input.byte_size()) };
         Self::copy_bytes(bytes, &mut outputs[0])
     }
 
@@ -4135,7 +4139,14 @@ impl Kernel for WeightDeliveryKernel {
         inputs: &[KernelInput<'_>],
         outputs: &mut [TensorMut],
     ) -> onnx_runtime_ep_api::Result<()> {
-        match &inputs[0] {
+        let input = inputs
+            .iter()
+            .find(|input| match input {
+                KernelInput::Tensor(view) => view.dtype != DataType::Undefined,
+                KernelInput::Weight(_) => true,
+            })
+            .ok_or_else(|| EpError::KernelFailed("test kernel received no input".into()))?;
+        match input {
             KernelInput::Tensor(view) => self.execute(std::slice::from_ref(view), outputs),
             KernelInput::Weight(handle) => {
                 self.deliveries.lock().unwrap().push("lazy");
@@ -4573,12 +4584,9 @@ fn weight_delivery_fixture() -> (Graph, Arc<WeightStore>, std::path::PathBuf) {
         },
     );
     let output = graph.create_named_value("output", DataType::Uint8, static_shape([4]));
-    let mut node = Node::new(
-        NodeId(0),
-        "BlockQuantizedMoE",
-        vec![Some(weight)],
-        vec![output],
-    );
+    let mut inputs = vec![None; 12];
+    inputs[2] = Some(weight);
+    let mut node = Node::new(NodeId(0), "BlockQuantizedMoE", inputs, vec![output]);
     node.domain = "pkg.nxrt".into();
     graph.insert_node(node);
     graph.add_output(output);

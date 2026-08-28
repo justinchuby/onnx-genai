@@ -36,6 +36,7 @@ pub mod factory;
 pub mod graph_reader;
 pub mod host_pool;
 pub mod kernel_ctx;
+pub mod nxrt_schema;
 pub mod pin;
 mod shared_shapes;
 pub mod status;

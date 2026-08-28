@@ -2691,7 +2691,8 @@ impl ExecutionProvider for CudaExecutionProvider {
         }
         if op.op_type == "BlockQuantizedMatMul"
             && op.domain == "pkg.nxrt"
-            && let Some(reason) = crate::kernels::block_quantized_matmul::unsupported_reason(op)
+            && let Some(reason) =
+                crate::kernels::block_quantized_matmul::unsupported_reason(op, shapes, input_dtypes)
         {
             return KernelMatch::unsupported(reason);
         }

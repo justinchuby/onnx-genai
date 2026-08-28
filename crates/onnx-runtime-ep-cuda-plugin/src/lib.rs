@@ -37,166 +37,12 @@
 
 #[cfg(feature = "cuda")]
 mod cuda_impl {
-    use std::ffi::c_void;
-    use std::ptr;
-
     use onnx_runtime_ep_cuda::CudaExecutionProvider;
     use onnx_runtime_ep_plugin::device::DeviceSupport;
     use onnx_runtime_ep_plugin::ep::KernelRegistryEntry;
-    use onnx_runtime_ep_plugin::onnx_genai_ort_sys as ort;
 
     /// NVIDIA vendor ID (PCI).
     const NVIDIA_VENDOR_ID: u32 = 0x10DE;
-
-    unsafe extern "C" fn dsa_create_schema_kernel(
-        _op: *const ort::OrtCustomOp,
-        _api: *const ort::OrtApi,
-        _info: *const ort::OrtKernelInfo,
-        kernel: *mut *mut c_void,
-    ) -> *mut ort::OrtStatus {
-        if !kernel.is_null() {
-            unsafe { *kernel = std::ptr::dangling_mut::<c_void>() };
-        }
-        std::ptr::null_mut()
-    }
-
-    unsafe extern "C" fn dsa_schema_fallback_must_not_execute(
-        _kernel: *mut c_void,
-        _context: *mut ort::OrtKernelContext,
-    ) -> *mut ort::OrtStatus {
-        onnx_runtime_ep_plugin::status::fail_status(
-            "pkg.nxrt::DsaIndexSelect schema fallback executed; cuda_ep must compile this node",
-        )
-    }
-
-    unsafe extern "C" fn dsa_schema_kernel_destroy(_kernel: *mut c_void) {}
-
-    unsafe extern "C" fn dsa_name(_op: *const ort::OrtCustomOp) -> *const std::ffi::c_char {
-        c"DsaIndexSelect".as_ptr()
-    }
-
-    unsafe extern "C" fn dsa_provider(_op: *const ort::OrtCustomOp) -> *const std::ffi::c_char {
-        c"nxrt_schema_only".as_ptr()
-    }
-
-    unsafe extern "C" fn dsa_input_count(_op: *const ort::OrtCustomOp) -> usize {
-        4
-    }
-
-    unsafe extern "C" fn dsa_input_type(
-        _op: *const ort::OrtCustomOp,
-        index: usize,
-    ) -> ort::ONNXTensorElementDataType {
-        match index {
-            3 => ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
-            _ => ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED,
-        }
-    }
-
-    unsafe extern "C" fn dsa_output_count(_op: *const ort::OrtCustomOp) -> usize {
-        1
-    }
-
-    unsafe extern "C" fn dsa_output_type(
-        _op: *const ort::OrtCustomOp,
-        _index: usize,
-    ) -> ort::ONNXTensorElementDataType {
-        ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64
-    }
-
-    unsafe extern "C" fn dsa_start_version(_op: *const ort::OrtCustomOp) -> i32 {
-        1
-    }
-
-    unsafe extern "C" fn dsa_end_version(_op: *const ort::OrtCustomOp) -> i32 {
-        i32::MAX
-    }
-
-    unsafe extern "C" fn dsa_required_input(
-        _op: *const ort::OrtCustomOp,
-        _index: usize,
-    ) -> ort::OrtCustomOpInputOutputCharacteristic {
-        ort::INPUT_OUTPUT_REQUIRED
-    }
-
-    unsafe extern "C" fn dsa_input_memory(
-        _op: *const ort::OrtCustomOp,
-        _index: usize,
-    ) -> ort::OrtMemType {
-        ort::OrtMemTypeDefault
-    }
-
-    unsafe extern "C" fn dsa_zero_arity(_op: *const ort::OrtCustomOp) -> i32 {
-        0
-    }
-
-    unsafe extern "C" fn dsa_homogeneous(_op: *const ort::OrtCustomOp) -> i32 {
-        1
-    }
-
-    static DSA_CUSTOM_OP: ort::OrtCustomOp = ort::OrtCustomOp {
-        version: ort::ORT_API_VERSION,
-        CreateKernel: None,
-        GetName: Some(dsa_name),
-        GetExecutionProviderType: Some(dsa_provider),
-        GetInputType: Some(dsa_input_type),
-        GetInputTypeCount: Some(dsa_input_count),
-        GetOutputType: Some(dsa_output_type),
-        GetOutputTypeCount: Some(dsa_output_count),
-        KernelCompute: None,
-        KernelDestroy: Some(dsa_schema_kernel_destroy),
-        GetInputCharacteristic: Some(dsa_required_input),
-        GetOutputCharacteristic: Some(dsa_required_input),
-        GetInputMemoryType: Some(dsa_input_memory),
-        GetVariadicInputMinArity: Some(dsa_zero_arity),
-        GetVariadicInputHomogeneity: Some(dsa_homogeneous),
-        GetVariadicOutputMinArity: Some(dsa_zero_arity),
-        GetVariadicOutputHomogeneity: Some(dsa_homogeneous),
-        CreateKernelV2: Some(dsa_create_schema_kernel),
-        KernelComputeV2: Some(dsa_schema_fallback_must_not_execute),
-        InferOutputShapeFn: None,
-        GetStartVersion: Some(dsa_start_version),
-        GetEndVersion: Some(dsa_end_version),
-        GetMayInplace: None,
-        ReleaseMayInplace: None,
-        GetAliasMap: None,
-        ReleaseAliasMap: None,
-    };
-
-    pub(crate) unsafe fn attach_dsa_custom_domain(
-        factory: *mut ort::OrtEpFactory,
-        api: *const ort::OrtApi,
-    ) -> *mut ort::OrtStatus {
-        if api.is_null() {
-            return onnx_runtime_ep_plugin::status::fail_status(
-                "CUDA plugin custom-op registration has no ORT host API",
-            );
-        }
-        let Some(create_domain) = (unsafe { (*api).CreateCustomOpDomain }) else {
-            return onnx_runtime_ep_plugin::status::fail_status(
-                "ORT host lacks CreateCustomOpDomain",
-            );
-        };
-        let Some(add) = (unsafe { (*api).CustomOpDomain_Add }) else {
-            return onnx_runtime_ep_plugin::status::fail_status(
-                "ORT host lacks CustomOpDomain_Add",
-            );
-        };
-        let mut domain = ptr::null_mut();
-        let status = unsafe { create_domain(c"pkg.nxrt".as_ptr(), &mut domain) };
-        if !status.is_null() {
-            return status;
-        }
-        let status = unsafe { add(domain, &DSA_CUSTOM_OP) };
-        if !status.is_null() {
-            if let Some(release) = unsafe { (*api).ReleaseCustomOpDomain } {
-                unsafe { release(domain) };
-            }
-            return status;
-        }
-        unsafe { onnx_runtime_ep_plugin::factory::attach_custom_op_domain(factory, domain) };
-        ptr::null_mut()
-    }
 
     /// Build kernel registry entries from the CUDA EP's **real** registry.
     ///
@@ -233,8 +79,8 @@ mod cuda_impl {
                     .expect("registered CUDA opset must fit ORT's i32 version ABI"),
                 end_version: schema_end_version(&descriptors, index),
                 supported_dtypes: d.supported_dtypes,
-                input_dtype_constraints: &[],
-                output_dtype_constraints: &[],
+                input_dtype_constraints: d.input_dtype_constraints,
+                output_dtype_constraints: d.output_dtype_constraints,
             })
             .collect()
     }
@@ -301,6 +147,8 @@ mod cuda_impl {
                 domain: domain.into(),
                 since_version,
                 supported_dtypes: &[],
+                input_dtype_constraints: &[],
+                output_dtype_constraints: &[],
             }
         }
 
@@ -421,7 +269,9 @@ pub unsafe extern "C" fn CreateEpFactories(
                         })
                         .unwrap_or(std::ptr::null())
                 };
-                let domain_status = unsafe { cuda_impl::attach_dsa_custom_domain(factory, api) };
+                let domain_status = unsafe {
+                    onnx_runtime_ep_plugin::nxrt_schema::attach_nxrt_custom_domain(factory, api)
+                };
                 if !domain_status.is_null() {
                     let _ = unsafe { onnx_runtime_ep_plugin::factory::release_ep_factory(factory) };
                     unsafe {

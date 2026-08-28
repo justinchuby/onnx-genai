@@ -595,9 +595,9 @@ Everything in this list is about the PR #830 delta or was never in #832's scope:
 - which real model shapes drive `MatMul`/`Gemm`/`FusedEpilogue`/`MatMulNBits`
   into cuBLASLt's `bytes > 0` branch, where declining is a hard error rather
   than a no-op (§4.1(b)). This is a property of the heuristic and can only be
-  measured on device. `BlockQuantizedMoE` and `IndexShare` are known *not* to
-  run on the plugin path either here or on `main` — that is a stated gap, not
-  an open question;
+  measured on device. `BlockQuantizedMoE` now has canonical v1 schema and typed
+  registry surfaces on the plugin path; a live ORT CUDA-plugin end-to-end run
+  remains required before claiming that path production-validated;
 - whether the per-node `operand_mem_info` derivation agrees with the
   subgraph-level derivation on real fused CUDA subgraphs (they are expected to,
   since every node in a fused subgraph is placed on the same EP; the

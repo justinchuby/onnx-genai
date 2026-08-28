@@ -23,7 +23,7 @@ def _model() -> bytes:
     node = ir.Node(
         DOMAIN,
         "BlockQuantizedMatMul",
-        [activation, packed_weight, bias],
+        [activation, packed_weight, None, bias],
         [
             ir.AttrInt64("K", 32),
             ir.AttrInt64("N", 1),
