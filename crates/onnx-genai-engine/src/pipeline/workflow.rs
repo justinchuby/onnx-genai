@@ -1300,7 +1300,7 @@ impl<'a> WorkflowExecutionPlan<'a> {
         // no lease to read, so each cell starts from the initializer it
         // declares; refusing here would make declaring a conversation cost a
         // package the ability to answer one question.
-        let state_plan = onnx_genai_metadata::resolve_state_plan(workflow);
+        let state_plan = &engine.plan.compiled_workflow.state_plan;
         let session_state = onnx_genai_metadata::classify_session_state(workflow);
         // Taken before the lease is read and released when the pass ends,
         // whichever way it ends. Declared session contracts validate as
@@ -1465,6 +1465,14 @@ impl<'a> WorkflowExecutionPlan<'a> {
                         }
                         onnx_genai_metadata::StateFinalWriter::Continuation { .. } => None,
                     });
+                if state.class == onnx_genai_metadata::WorkflowStateClass::Semantic
+                    && final_binding.is_none()
+                {
+                    anyhow::bail!(
+                        "session-scoped workflow state '{cell}' has no resolved unique final \
+                         writer; join competing paths through one branch output or loop carry"
+                    );
+                }
                 let value_ref = final_binding.unwrap_or_else(|| {
                     final_state_refs
                         .get(cell)
@@ -6375,6 +6383,46 @@ steps:
         seen: usize,
     }
 
+    struct StateAdvanceHost;
+
+    impl WorkflowNodeHost for StateAdvanceHost {
+        fn hosted_contracts(&self) -> &'static [&'static str] {
+            &["test.state.advance"]
+        }
+
+        fn execute_contract_node(
+            &mut self,
+            request: WorkflowNodeRequest<'_>,
+        ) -> anyhow::Result<bool> {
+            if request.contract != "test.state.advance" {
+                return Ok(false);
+            }
+            let input = request
+                .inputs
+                .get("state")
+                .context("state advance input is bound")?;
+            let current = request
+                .values
+                .get(input)
+                .context("state advance input is available")?
+                .to_vec_i64()?[0];
+            let increment = match request.component {
+                "prefill" => 1,
+                "decode" => 10,
+                component => anyhow::bail!("unexpected state advance component '{component}'"),
+            };
+            let output = request
+                .outputs
+                .get("state")
+                .context("state advance output is bound")?;
+            request.values.insert(
+                output.clone(),
+                Value::from_slice_i64(&[current + increment], &[1])?,
+            );
+            Ok(true)
+        }
+    }
+
     impl WorkflowNodeHost for WrongCardinalityHost {
         fn hosted_contracts(&self) -> &'static [&'static str] {
             super::super::generation::DECODE_CORE_CONTRACTS
@@ -6645,6 +6693,153 @@ steps:
         assert!(!plan.values.contains_key("branch.packed_offsets"));
         assert!(!plan.values.contains_key("branch.packed_owner"));
     }
+
+    #[test]
+    fn sequential_state_loops_commit_the_terminal_update() -> anyhow::Result<()> {
+        let workflow: WorkflowSpec = serde_yaml::from_str(
+            r#"
+manifest: {}
+inputs:
+  seed:
+    contract: { dtype: int64, rank: 1, shape: [1] }
+    role: { kind: opaque }
+    source: { kind: application, name: seed }
+  keep_running:
+    contract: { dtype: bool, rank: 0, shape: [] }
+    role: { kind: opaque }
+    source: { kind: literal }
+    required: false
+    default: true
+  one_iteration:
+    contract: { dtype: int64, rank: 0, shape: [] }
+    role: { kind: opaque }
+    source: { kind: literal }
+    required: false
+    default: 1
+outputs: {}
+components:
+  prefill:
+    implementation: { kind: binding }
+    contract: { id: test.state.advance, version: "1" }
+    ports:
+      inputs:
+        state: { dtype: int64, rank: 1, shape: [1] }
+      outputs:
+        state: { dtype: int64, rank: 1, shape: [1] }
+  decode:
+    implementation: { kind: binding }
+    contract: { id: test.state.advance, version: "1" }
+    ports:
+      inputs:
+        state: { dtype: int64, rank: 1, shape: [1] }
+      outputs:
+        state: { dtype: int64, rank: 1, shape: [1] }
+state:
+  accumulator:
+    contract: { dtype: int64, rank: 1, shape: [1] }
+    scope: session
+    initializer: seed
+    recurrence: { kind: invariant }
+    management: runtime
+    release_boundary: session
+steps:
+  - kind: loop
+    steps:
+      - kind: invoke
+        component: prefill
+        inputs: { state: accumulator }
+        outputs: { state: prefill.next }
+    continue_when: keep_running
+    max_iterations: one_iteration
+    carried:
+      - { cell: accumulator, next: prefill.next }
+  - kind: loop
+    steps:
+      - kind: invoke
+        component: decode
+        inputs: { state: accumulator }
+        outputs: { state: decode.next }
+    continue_when: keep_running
+    max_iterations: one_iteration
+    carried:
+      - { cell: accumulator, next: decode.next }
+"#,
+        )?;
+        let runtime = test_runtime(workflow);
+        let WorkflowNode::Sequence { nodes } = &runtime.plan.compiled_workflow.graph else {
+            panic!("workflow lowers to a sequence");
+        };
+        let WorkflowNode::Loop {
+            carried: prefill, ..
+        } = &nodes[0]
+        else {
+            panic!("first phase lowers to a loop");
+        };
+        let WorkflowNode::Loop {
+            carried: decode, ..
+        } = &nodes[1]
+        else {
+            panic!("second phase lowers to a loop");
+        };
+        assert_eq!(prefill[0].current, "seed");
+        assert_eq!(
+            prefill[0].current_source,
+            onnx_genai_metadata::WorkflowLoopCarrySource::Initializer
+        );
+        assert_eq!(decode[0].current, "accumulator");
+        assert_eq!(
+            decode[0].current_source,
+            onnx_genai_metadata::WorkflowLoopCarrySource::PriorState
+        );
+
+        let request = PipelineGenerateRequest::new(GenerateRequest::new(GeneratePrompt::TokenIds(
+            Vec::new(),
+        )))
+        .with_input(
+            "seed",
+            Value::from_slice_i64(&[0], &[1]).expect("external seed"),
+        )
+        .with_session_id("two-phase");
+        let mut plan =
+            WorkflowExecutionPlan::new_hosted(&runtime, request, &["test.state.advance"])?;
+        let mut host = StateAdvanceHost;
+        let mut hosted: Option<&mut dyn WorkflowNodeHost> = Some(&mut host);
+        plan.execute_retained_with_host(&mut hosted)?;
+
+        let state = runtime.worker.session_state.borrow();
+        let committed = state
+            .get(&("two-phase".to_string(), "accumulator".to_string()))
+            .context("session state was committed")?;
+        assert_eq!(
+            committed.to_vec_i64()?,
+            vec![11],
+            "the decode loop advances the prefill result and owns the committed final value"
+        );
+        drop(state);
+
+        let request = PipelineGenerateRequest::new(GenerateRequest::new(GeneratePrompt::TokenIds(
+            Vec::new(),
+        )))
+        .with_input(
+            "seed",
+            Value::from_slice_i64(&[100], &[1]).expect("new external seed"),
+        )
+        .with_session_id("two-phase");
+        let mut plan =
+            WorkflowExecutionPlan::new_hosted(&runtime, request, &["test.state.advance"])?;
+        let mut hosted: Option<&mut dyn WorkflowNodeHost> = Some(&mut host);
+        plan.execute_retained_with_host(&mut hosted)?;
+        let state = runtime.worker.session_state.borrow();
+        let committed = state
+            .get(&("two-phase".to_string(), "accumulator".to_string()))
+            .context("continued session state was committed")?;
+        assert_eq!(
+            committed.to_vec_i64()?,
+            vec![22],
+            "the next turn restores once, then each sequential loop carries the preceding update"
+        );
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -6909,15 +7104,22 @@ impl WorkflowRuntime {
             let state = workflow.state.get(&carry.cell).with_context(|| {
                 format!("workflow loop carries undeclared state '{}'", carry.cell)
             })?;
-            let seeded = values
-                .get(&session_state_value_name(&carry.cell))
-                .or_else(|| values.get(&carry.current));
+            let restored = values.get(&session_state_value_name(&carry.cell));
+            let current = values.get(&carry.current);
+            let seeded = match carry.current_source {
+                onnx_genai_metadata::WorkflowLoopCarrySource::PriorState => current,
+                onnx_genai_metadata::WorkflowLoopCarrySource::Initializer
+                | onnx_genai_metadata::WorkflowLoopCarrySource::Explicit => restored.or(current),
+            };
             // A state whose resolved readers include a component port is
             // supplied by the service at that port when it has no materialized
             // source.  Storage policy is irrelevant: the binding plan is the
             // only authority for this decision.
             if seeded.is_none()
-                && onnx_genai_metadata::resolve_state_plan(workflow)
+                && self
+                    .plan
+                    .compiled_workflow
+                    .state_plan
                     .cell(&carry.cell)
                     .is_some_and(|cell| {
                         cell.readers.iter().any(|reader| {

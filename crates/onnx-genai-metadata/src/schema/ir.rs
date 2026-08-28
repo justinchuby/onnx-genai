@@ -1231,11 +1231,19 @@ pub struct WorkflowBranchEffectMerge {
 pub struct WorkflowLoopCarry {
     pub cell: String,
     pub current: String,
+    pub current_source: WorkflowLoopCarrySource,
     pub body_input: String,
     pub body_output: String,
     pub next: String,
     pub read_effect: EffectTransition,
     pub write_effect: EffectTransition,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkflowLoopCarrySource {
+    Initializer,
+    Explicit,
+    PriorState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

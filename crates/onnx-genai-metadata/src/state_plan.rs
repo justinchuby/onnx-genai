@@ -8,8 +8,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::schema::{
-    StateReleaseBoundary, StateUpdate, WorkflowSpec, WorkflowStateClass, WorkflowStateScope,
-    WorkflowStep,
+    StateReleaseBoundary, StateUpdate, WorkflowCarry, WorkflowSpec, WorkflowStateClass,
+    WorkflowStateScope, WorkflowStep,
 };
 
 /// Stable semantic identity of one mutable workflow location.
@@ -20,6 +20,21 @@ pub struct StateIdentity(pub String);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StateSource {
     pub binding: String,
+}
+
+/// Why a loop carry reads a particular binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StateCarrySourceKind {
+    Initializer,
+    Explicit,
+    PriorState,
+}
+
+/// The resolved input to one loop-carried state edge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateCarrySource {
+    pub source: StateSource,
+    pub kind: StateCarrySourceKind,
 }
 
 /// A component port or loop edge that observes a state cell.
@@ -100,6 +115,9 @@ pub struct ResolvedStateCell {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ResolvedStatePlan {
     cells: BTreeMap<String, ResolvedStateCell>,
+    carry_sources: BTreeMap<(String, String), StateCarrySource>,
+    terminal_candidates: BTreeMap<String, BTreeSet<TerminalCandidate>>,
+    flow_errors: Vec<String>,
 }
 
 impl ResolvedStatePlan {
@@ -117,13 +135,32 @@ impl ResolvedStatePlan {
         self.cells()
             .filter(|(_, cell)| cell.lifecycle.scope == WorkflowStateScope::Session)
     }
+
+    pub fn carry_source(&self, carry: &WorkflowCarry) -> Option<&StateCarrySource> {
+        self.carry_sources
+            .get(&(carry.cell.clone(), carry.next.clone()))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct TerminalCandidate {
+    binding: String,
+    writer: Option<StateWriter>,
+}
+
+#[derive(Debug, Default)]
+struct StateFlowAnalysis {
+    carries: Vec<(String, String, StateCarrySource)>,
+    carry_sources: BTreeMap<(String, String), StateCarrySource>,
+    terminal_candidates: BTreeMap<String, BTreeSet<TerminalCandidate>>,
+    errors: Vec<String>,
 }
 
 /// Resolve state source, readers, writers, and final writers from explicit
 /// workflow bindings.  This function deliberately does not read
 /// `StateManagement`: allocation policy cannot change dataflow.
 pub fn resolve_state_plan(workflow: &WorkflowSpec) -> ResolvedStatePlan {
-    let loop_carries = loop_carries(&workflow.steps);
+    let flow = analyze_state_flow(workflow);
     let groups = workflow
         .serving
         .as_ref()
@@ -133,15 +170,15 @@ pub fn resolve_state_plan(workflow: &WorkflowSpec) -> ResolvedStatePlan {
     for (name, state) in &workflow.state {
         let mut readers = Vec::new();
         let mut writers = Vec::new();
-        for carry in loop_carries.get(name).into_iter().flatten() {
+        for (cell, next, source) in flow.carries.iter().filter(|(cell, _, _)| cell == name) {
             readers.push(StateReader::LoopCarry {
-                binding: carry.initial.clone(),
+                binding: source.source.binding.clone(),
             });
             writers.push(StateWriter {
-                id: format!("loop:{}", carry.next),
+                id: format!("loop:{next}"),
                 component: None,
                 port: None,
-                binding: carry.next.clone(),
+                binding: cell.clone(),
             });
         }
 
@@ -187,6 +224,17 @@ pub fn resolve_state_plan(workflow: &WorkflowSpec) -> ResolvedStatePlan {
             }
         }
 
+        let terminal_writer = flow
+            .terminal_candidates
+            .get(name)
+            .filter(|candidates| candidates.len() == 1)
+            .and_then(|candidates| candidates.iter().next())
+            .and_then(|candidate| candidate.writer.clone());
+        if let Some(writer) = &terminal_writer
+            && !writers.iter().any(|candidate| candidate.id == writer.id)
+        {
+            writers.push(writer.clone());
+        }
         let final_writer = state
             .session
             .as_ref()
@@ -198,21 +246,7 @@ pub fn resolve_state_plan(workflow: &WorkflowSpec) -> ResolvedStatePlan {
                     }
                 }
             })
-            .or_else(|| {
-                writers
-                    .iter()
-                    .find(|writer| writer.component.is_none())
-                    .cloned()
-                    .map(StateFinalWriter::Writer)
-            })
-            .or_else(|| {
-                let component_writers = writers
-                    .iter()
-                    .filter(|writer| writer.component.is_some())
-                    .collect::<Vec<_>>();
-                (component_writers.len() == 1)
-                    .then(|| StateFinalWriter::Writer(component_writers[0].clone()))
-            });
+            .or_else(|| terminal_writer.map(StateFinalWriter::Writer));
 
         cells.insert(
             name.clone(),
@@ -236,13 +270,18 @@ pub fn resolve_state_plan(workflow: &WorkflowSpec) -> ResolvedStatePlan {
             },
         );
     }
-    ResolvedStatePlan { cells }
+    ResolvedStatePlan {
+        cells,
+        carry_sources: flow.carry_sources,
+        terminal_candidates: flow.terminal_candidates,
+        flow_errors: flow.errors,
+    }
 }
 
 /// Validate the canonical plan.  Diagnostics name the affected state and
 /// binding, and describe the missing declaration needed to repair it.
 pub fn validate_state_plan(workflow: &WorkflowSpec, plan: &ResolvedStatePlan) -> Vec<String> {
-    let mut errors = Vec::new();
+    let mut errors = plan.flow_errors.clone();
     let mut source_edges = BTreeMap::new();
 
     for (name, cell) in plan.cells() {
@@ -280,16 +319,22 @@ pub fn validate_state_plan(workflow: &WorkflowSpec, plan: &ResolvedStatePlan) ->
                  or declare a continuation output"
             ));
         }
-        let component_writers = cell
-            .writers
-            .iter()
-            .filter(|writer| writer.component.is_some())
-            .count();
-        if cell.final_writer.is_none() && component_writers > 1 {
+        if cell.lifecycle.scope == WorkflowStateScope::Session
+            && cell.transaction.required
+            && cell.final_writer.is_none()
+            && let Some(candidates) = plan
+                .terminal_candidates
+                .get(name)
+                .filter(|candidates| candidates.len() > 1)
+        {
+            let candidates = candidates
+                .iter()
+                .map(describe_terminal_candidate)
+                .collect::<Vec<_>>()
+                .join(", ");
             errors.push(format!(
-                "pipeline.workflow.state.{name} has {component_writers} component writers and \
-                 no final-writer join; route the selected successor through one loop carry or \
-                 one explicit join binding before commit"
+                "pipeline.workflow.state.{name} has ambiguous terminal writers [{candidates}]; \
+                 route every path through one explicit branch output or loop carry before commit"
             ));
         }
 
@@ -368,53 +413,282 @@ pub fn validate_state_plan(workflow: &WorkflowSpec, plan: &ResolvedStatePlan) ->
     errors
 }
 
-#[derive(Debug, Clone)]
-struct LoopCarryBinding {
-    initial: String,
-    next: String,
-}
+fn analyze_state_flow(workflow: &WorkflowSpec) -> StateFlowAnalysis {
+    type Flow = BTreeMap<String, BTreeSet<TerminalCandidate>>;
 
-fn loop_carries(steps: &[WorkflowStep]) -> BTreeMap<String, Vec<LoopCarryBinding>> {
-    fn walk(steps: &[WorkflowStep], carries: &mut BTreeMap<String, Vec<LoopCarryBinding>>) {
+    fn singleton(binding: String, writer: Option<StateWriter>) -> BTreeSet<TerminalCandidate> {
+        BTreeSet::from([TerminalCandidate { binding, writer }])
+    }
+
+    fn invoke_writers(
+        workflow: &WorkflowSpec,
+        component: &str,
+        outputs: &BTreeMap<String, String>,
+    ) -> Vec<(String, StateWriter)> {
+        let groups = workflow
+            .serving
+            .as_ref()
+            .map(|serving| &serving.state_service.groups);
+        let mut writers = Vec::new();
+        for (cell, state) in &workflow.state {
+            let Some(aliases) = state
+                .service_group
+                .as_deref()
+                .and_then(|group| groups.and_then(|groups| groups.get(group)))
+                .and_then(|group| group.ports.get(component))
+                .and_then(|aliases| aliases.get(cell))
+            else {
+                continue;
+            };
+            let Some(port) = aliases.output.as_deref() else {
+                continue;
+            };
+            let Some(binding) = outputs.get(port) else {
+                continue;
+            };
+            writers.push((
+                cell.clone(),
+                StateWriter {
+                    id: format!("{component}:{port}:{binding}"),
+                    component: Some(component.to_string()),
+                    port: Some(port.to_string()),
+                    binding: binding.clone(),
+                },
+            ));
+        }
+        writers
+    }
+
+    fn walk_sequence(
+        workflow: &WorkflowSpec,
+        steps: &[WorkflowStep],
+        mut flow: Flow,
+        analysis: &mut StateFlowAnalysis,
+    ) -> Flow {
         for step in steps {
-            match step {
-                WorkflowStep::Sequence { steps } => walk(steps, carries),
-                WorkflowStep::Loop {
-                    setup,
-                    steps,
-                    carried,
-                    ..
-                } => {
-                    for carry in carried {
-                        carries
-                            .entry(carry.cell.clone())
-                            .or_default()
-                            .push(LoopCarryBinding {
-                                initial: carry
-                                    .initial
-                                    .clone()
-                                    .unwrap_or_else(|| carry.cell.clone()),
-                                next: carry.next.clone(),
-                            });
-                    }
-                    walk(setup, carries);
-                    walk(steps, carries);
+            flow = walk_step(workflow, step, flow, analysis);
+        }
+        flow
+    }
+
+    fn walk_step(
+        workflow: &WorkflowSpec,
+        step: &WorkflowStep,
+        mut flow: Flow,
+        analysis: &mut StateFlowAnalysis,
+    ) -> Flow {
+        match step {
+            WorkflowStep::Sequence { steps } => walk_sequence(workflow, steps, flow, analysis),
+            WorkflowStep::Invoke {
+                component, outputs, ..
+            } => {
+                for (cell, writer) in invoke_writers(workflow, component, outputs) {
+                    flow.insert(cell, singleton(writer.binding.clone(), Some(writer)));
                 }
-                WorkflowStep::Branch { cases, default, .. } => {
-                    for case in cases.values() {
-                        walk(std::slice::from_ref(case), carries);
-                    }
-                    if let Some(default) = default {
-                        walk(std::slice::from_ref(default.as_ref()), carries);
-                    }
-                }
-                WorkflowStep::Invoke { .. } | WorkflowStep::Emit { .. } => {}
+                flow
             }
+            WorkflowStep::Loop {
+                setup,
+                steps,
+                carried,
+                ..
+            } => {
+                let setup_flow = walk_sequence(workflow, setup, flow, analysis);
+                let mut body_flow = setup_flow.clone();
+                let mut carried_cells = BTreeSet::new();
+                for carry in carried {
+                    if !carried_cells.insert(carry.cell.clone()) {
+                        analysis.errors.push(format!(
+                            "pipeline.workflow.state.{} is carried more than once by one loop; \
+                             keep one carry edge for the state cell",
+                            carry.cell
+                        ));
+                    }
+                    let Some(state) = workflow.state.get(&carry.cell) else {
+                        analysis.errors.push(format!(
+                            "pipeline.workflow loop carries unknown state cell '{}'",
+                            carry.cell
+                        ));
+                        continue;
+                    };
+                    let source = if let Some(initial) = &carry.initial {
+                        StateCarrySource {
+                            source: StateSource {
+                                binding: initial.clone(),
+                            },
+                            kind: StateCarrySourceKind::Explicit,
+                        }
+                    } else {
+                        let candidates = setup_flow.get(&carry.cell);
+                        let candidate = candidates
+                            .filter(|candidates| candidates.len() == 1)
+                            .and_then(|candidates| candidates.iter().next());
+                        match candidate {
+                            Some(candidate) => StateCarrySource {
+                                source: StateSource {
+                                    binding: candidate.binding.clone(),
+                                },
+                                kind: if candidate.writer.is_none()
+                                    && candidate.binding == state.initializer
+                                {
+                                    StateCarrySourceKind::Initializer
+                                } else {
+                                    StateCarrySourceKind::PriorState
+                                },
+                            },
+                            None => {
+                                let candidates = candidates
+                                    .map(|candidates| {
+                                        candidates
+                                            .iter()
+                                            .map(describe_terminal_candidate)
+                                            .collect::<Vec<_>>()
+                                            .join(", ")
+                                    })
+                                    .unwrap_or_else(|| "none".to_string());
+                                analysis.errors.push(format!(
+                                    "pipeline.workflow.state.{} has ambiguous carry-in sources \
+                                     [{candidates}] before loop writer 'loop:{}'; set 'initial' \
+                                     explicitly or join the paths into one binding",
+                                    carry.cell, carry.next
+                                ));
+                                StateCarrySource {
+                                    source: StateSource {
+                                        binding: state.initializer.clone(),
+                                    },
+                                    kind: StateCarrySourceKind::Initializer,
+                                }
+                            }
+                        }
+                    };
+                    let key = (carry.cell.clone(), carry.next.clone());
+                    if analysis.carry_sources.insert(key, source.clone()).is_some() {
+                        analysis.errors.push(format!(
+                            "pipeline.workflow.state.{} reuses loop writer 'loop:{}'; each carry \
+                             edge must have a unique next binding",
+                            carry.cell, carry.next
+                        ));
+                    }
+                    analysis
+                        .carries
+                        .push((carry.cell.clone(), carry.next.clone(), source));
+                    body_flow.insert(carry.cell.clone(), singleton(carry.cell.clone(), None));
+                }
+                let body_flow = walk_sequence(workflow, steps, body_flow, analysis);
+                let mut exit_flow = setup_flow;
+                for (cell, candidates) in body_flow {
+                    if !carried_cells.contains(&cell) {
+                        exit_flow.entry(cell).or_default().extend(candidates);
+                    }
+                }
+                for carry in carried {
+                    let writer = StateWriter {
+                        id: format!("loop:{}", carry.next),
+                        component: None,
+                        port: None,
+                        binding: carry.cell.clone(),
+                    };
+                    exit_flow.insert(
+                        carry.cell.clone(),
+                        singleton(carry.cell.clone(), Some(writer)),
+                    );
+                }
+                exit_flow
+            }
+            WorkflowStep::Branch {
+                cases,
+                default,
+                outputs,
+                ..
+            } => {
+                let case_flows = cases
+                    .iter()
+                    .map(|(case, step)| {
+                        (
+                            case.as_str(),
+                            walk_step(workflow, step, flow.clone(), analysis),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let default_flow = default
+                    .as_deref()
+                    .map(|step| walk_step(workflow, step, flow.clone(), analysis));
+                let mut joined = flow.clone();
+                for cell in workflow.state.keys() {
+                    let mut candidates = BTreeSet::new();
+                    for (_, case_flow) in &case_flows {
+                        candidates.extend(case_flow.get(cell).cloned().unwrap_or_default());
+                    }
+                    if let Some(default_flow) = &default_flow {
+                        candidates.extend(default_flow.get(cell).cloned().unwrap_or_default());
+                    }
+                    if candidates.len() <= 1 {
+                        joined.insert(cell.clone(), candidates);
+                        continue;
+                    }
+                    let joins = outputs
+                        .iter()
+                        .filter(|(_, phi)| {
+                            case_flows.iter().all(|(case, case_flow)| {
+                                let Some(source) = phi.cases.get(*case) else {
+                                    return false;
+                                };
+                                case_flow.get(cell).is_some_and(|candidates| {
+                                    candidates.len() == 1
+                                        && candidates
+                                            .iter()
+                                            .next()
+                                            .is_some_and(|candidate| candidate.binding == *source)
+                                })
+                            }) && match (&default_flow, &phi.default) {
+                                (Some(default_flow), Some(source)) => {
+                                    default_flow.get(cell).is_some_and(|candidates| {
+                                        candidates.len() == 1
+                                            && candidates.iter().next().is_some_and(|candidate| {
+                                                candidate.binding == *source
+                                            })
+                                    })
+                                }
+                                (None, _) => true,
+                                _ => false,
+                            }
+                        })
+                        .map(|(output, _)| output)
+                        .collect::<Vec<_>>();
+                    if joins.len() == 1 {
+                        let output = joins[0];
+                        let writer = StateWriter {
+                            id: format!("branch:{output}"),
+                            component: None,
+                            port: None,
+                            binding: output.clone(),
+                        };
+                        joined.insert(cell.clone(), singleton(output.clone(), Some(writer)));
+                    } else {
+                        joined.insert(cell.clone(), candidates);
+                    }
+                }
+                joined
+            }
+            WorkflowStep::Emit { .. } => flow,
         }
     }
-    let mut carries = BTreeMap::new();
-    walk(steps, &mut carries);
-    carries
+
+    let initial = workflow
+        .state
+        .iter()
+        .map(|(cell, state)| (cell.clone(), singleton(state.initializer.clone(), None)))
+        .collect();
+    let mut analysis = StateFlowAnalysis::default();
+    analysis.terminal_candidates = walk_sequence(workflow, &workflow.steps, initial, &mut analysis);
+    analysis
+}
+
+fn describe_terminal_candidate(candidate: &TerminalCandidate) -> String {
+    candidate.writer.as_ref().map_or_else(
+        || format!("initializer '{}'", candidate.binding),
+        |writer| format!("'{}' at '{}'", writer.id, writer.binding),
+    )
 }
 
 fn component_port_bindings(steps: &[WorkflowStep], component: &str, port: &str) -> Vec<String> {
@@ -599,6 +873,68 @@ mod tests {
     }
 
     #[test]
+    fn sequential_loops_resolve_the_later_carry_as_the_final_writer() {
+        let mut workflow = workflow(include_str!(
+            "../../../examples/inference_metadata/catalogue/14-weathernext-rollout.yaml"
+        ));
+        let mut decode = workflow.steps[0].clone();
+        let WorkflowStep::Loop { carried, .. } = &mut decode else {
+            panic!("fixture starts with its rollout loop");
+        };
+        let atmosphere = carried
+            .iter_mut()
+            .find(|carry| carry.cell == "atmosphere")
+            .expect("fixture carries atmosphere");
+        atmosphere.next = "decode.atmosphere".to_string();
+        workflow.steps.push(decode);
+        let decode_index = workflow.steps.len() - 1;
+
+        let plan = resolve_state_plan(&workflow);
+        let state = plan.cell("atmosphere").expect("state is planned");
+        assert_eq!(
+            state.final_writer,
+            Some(StateFinalWriter::Writer(StateWriter {
+                id: "loop:decode.atmosphere".to_string(),
+                component: None,
+                port: None,
+                binding: "atmosphere".to_string(),
+            }))
+        );
+        let first = match &workflow.steps[0] {
+            WorkflowStep::Loop { carried, .. } => carried
+                .iter()
+                .find(|carry| carry.cell == "atmosphere")
+                .expect("first loop carries atmosphere"),
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            plan.carry_source(first),
+            Some(&StateCarrySource {
+                source: StateSource {
+                    binding: "request.atmosphere".to_string(),
+                },
+                kind: StateCarrySourceKind::Initializer,
+            })
+        );
+        let second = match &workflow.steps[decode_index] {
+            WorkflowStep::Loop { carried, .. } => carried
+                .iter()
+                .find(|carry| carry.cell == "atmosphere")
+                .expect("second loop carries atmosphere"),
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            plan.carry_source(second),
+            Some(&StateCarrySource {
+                source: StateSource {
+                    binding: "atmosphere".to_string(),
+                },
+                kind: StateCarrySourceKind::PriorState,
+            })
+        );
+    }
+
+    #[test]
     fn competing_final_writers_are_rejected_before_execution() {
         let mut workflow = workflow(include_str!(
             "../../../examples/inference_metadata/catalogue/18-static-cache-indexed-scatter.yaml"
@@ -608,20 +944,77 @@ mod tests {
             .get_mut("cache")
             .expect("fixture declares cache state");
         state.scope = WorkflowStateScope::Session;
-        workflow.steps.push(WorkflowStep::Invoke {
-            component: "decoder".to_string(),
-            inputs: BTreeMap::new(),
-            outputs: BTreeMap::from([("present_cache".to_string(), "other.cache".to_string())]),
+        workflow.steps.push(WorkflowStep::Branch {
+            predicate: "request.position".to_string(),
+            cases: BTreeMap::from([
+                (
+                    "0".to_string(),
+                    WorkflowStep::Invoke {
+                        component: "decoder".to_string(),
+                        inputs: BTreeMap::new(),
+                        outputs: BTreeMap::from([(
+                            "present_cache".to_string(),
+                            "prefill.cache".to_string(),
+                        )]),
+                    },
+                ),
+                (
+                    "1".to_string(),
+                    WorkflowStep::Invoke {
+                        component: "decoder".to_string(),
+                        inputs: BTreeMap::new(),
+                        outputs: BTreeMap::from([(
+                            "present_cache".to_string(),
+                            "decode.cache".to_string(),
+                        )]),
+                    },
+                ),
+            ]),
+            default: None,
+            outputs: BTreeMap::new(),
         });
 
         let errors = validate_state_plan(&workflow, &resolve_state_plan(&workflow));
         assert!(
             errors.iter().any(|error| {
                 error.contains("cache")
-                    && error.contains("component writers")
-                    && error.contains("final-writer join")
+                    && error.contains("decoder:present_cache:prefill.cache")
+                    && error.contains("decoder:present_cache:decode.cache")
+                    && error.contains("explicit branch output")
             }),
             "{errors:?}"
+        );
+
+        let WorkflowStep::Branch { outputs, .. } =
+            workflow.steps.last_mut().expect("test appended a branch")
+        else {
+            unreachable!()
+        };
+        outputs.insert(
+            "joined.cache".to_string(),
+            crate::schema::WorkflowBranchOutput {
+                cases: BTreeMap::from([
+                    ("0".to_string(), "prefill.cache".to_string()),
+                    ("1".to_string(), "decode.cache".to_string()),
+                ]),
+                default: None,
+            },
+        );
+        let plan = resolve_state_plan(&workflow);
+        assert_eq!(
+            plan.cell("cache")
+                .and_then(|state| state.final_writer.clone()),
+            Some(StateFinalWriter::Writer(StateWriter {
+                id: "branch:joined.cache".to_string(),
+                component: None,
+                port: None,
+                binding: "joined.cache".to_string(),
+            }))
+        );
+        assert!(
+            validate_state_plan(&workflow, &plan)
+                .iter()
+                .all(|error| !error.contains("ambiguous terminal writers"))
         );
     }
 }

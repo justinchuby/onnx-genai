@@ -136,9 +136,10 @@ pub use session_state::{
     SessionStateCarrier, SessionStateFacts, classify_session_state, session_group_aliases,
 };
 pub use state_plan::{
-    ResolvedStateCell, ResolvedStatePlan, StateFinalWriter, StateIdentity, StateLifecycle,
-    StateReader, StateSnapshotParticipation, StateSource, StateTransactionParticipation,
-    StateUpdateRelation, StateWriter, resolve_state_plan, validate_state_plan,
+    ResolvedStateCell, ResolvedStatePlan, StateCarrySource, StateCarrySourceKind, StateFinalWriter,
+    StateIdentity, StateLifecycle, StateReader, StateSnapshotParticipation, StateSource,
+    StateTransactionParticipation, StateUpdateRelation, StateWriter, resolve_state_plan,
+    validate_state_plan,
 };
 pub use validation::{
     CapabilityReport, PipelineValidationError, RuntimeCapabilities, derived_capabilities, validate,
