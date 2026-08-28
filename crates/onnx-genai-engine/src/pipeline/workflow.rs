@@ -1210,7 +1210,10 @@ impl<'a> WorkflowExecutionPlan<'a> {
 
     /// Execute the already-bound workflow and retain its input slots for replay.
     pub fn execute(&mut self) -> anyhow::Result<PipelineTensors> {
-        self.execute_outputs().map(PipelineOutputs::into_tensors)
+        let outputs = self.execute_outputs()?;
+        let (tensors, publications) = outputs.into_tensors_and_publications();
+        *self.engine.worker.last_output_publications.borrow_mut() = publications;
+        Ok(tensors)
     }
 
     pub fn execute_outputs(&mut self) -> anyhow::Result<PipelineOutputs> {
@@ -1420,11 +1423,7 @@ impl<'a> WorkflowExecutionPlan<'a> {
             )
         };
         let mut transaction = transaction?;
-        let output_baselines = workflow
-            .outputs
-            .keys()
-            .map(|output| (output.clone(), transaction.output_baseline(output)))
-            .collect();
+        let output_baselines = transaction.output_baselines()?;
         let mut publication_journal = Some(OutputPublicationJournal::new(
             transaction.id(),
             workflow,
@@ -1640,18 +1639,7 @@ impl<'a> WorkflowExecutionPlan<'a> {
             transaction.stage_effects();
             if let Some(journal) = publication_journal.as_mut() {
                 journal.finalize_on_commit()?;
-                for (output, publications) in journal.publication_counts() {
-                    transaction.stage_output(&output, publications);
-                }
-                for output in workflow.outputs.iter().filter_map(|(name, declaration)| {
-                    matches!(
-                        declaration.family,
-                        onnx_genai_metadata::WorkflowOutputFamily::Revisions { .. }
-                    )
-                    .then_some(name)
-                }) {
-                    transaction.stage_output_closed(output);
-                }
+                transaction.stage_outputs(journal.committed_states()?);
             }
             let mut session_state = engine.worker.session_state.borrow_mut();
             let mut session_effects = engine.worker.session_effects.borrow_mut();
@@ -2329,6 +2317,13 @@ impl WorkflowRuntime {
                         })?;
                 }
                 if matches!(mode, WorkflowEmitMode::Retract | WorkflowEmitMode::Finalize) {
+                    anyhow::ensure!(
+                        value.is_empty(),
+                        "workflow emit {mode:?} at output '{output}' stream '{}' names value \
+                         '{value}', but this operation is payloadless; remove the value before \
+                         execution",
+                        stream.as_deref().unwrap_or(output)
+                    );
                     if let Some(journal) = publication_journal.as_mut() {
                         journal
                             .publish(output, stream.as_deref(), mode, None)

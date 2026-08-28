@@ -272,7 +272,8 @@ pub(crate) struct WorkerRuntimeState {
     pub(crate) session_effects: RefCell<HashMap<(String, String), u64>>,
     /// Durable output heads, cursors, lineage and closure facts. Output values
     /// stay pass-local until the enclosing transaction commits.
-    pub(crate) session_outputs: RefCell<HashMap<(String, String), CommittedOutputState>>,
+    pub(crate) session_outputs:
+        RefCell<HashMap<(String, String, super::OutputStreamId), CommittedOutputState>>,
     /// Ordered transport-neutral publications from the last committed pass.
     /// This worker is thread-bound, so the execution plan can take the journal
     /// immediately without a second synchronization protocol.

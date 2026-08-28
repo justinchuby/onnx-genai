@@ -163,9 +163,10 @@ async fn run_completion(
     enforce_context_cap(prompt_tokens, request.max_tokens, handle.model_max_context)?;
     let session = open_session_after_admission(&state, &handle, conversational, lease).await?;
     let generation = submit_completion(&handle, prepared.generation, session).await?;
-    let result = collect_generation_result(generation.events)
+    let collected = collect_generation_with_publications(generation.events)
         .await
         .map_err(generation_failure)?;
+    let result = collected.result;
     crate::metrics::add_prompt_tokens(carried_tokens.reprefilled + prepared.prompt_tokens);
     let completion_tokens = result.token_ids.len();
     let logprobs = completion_logprobs(&result, &tokenizer, requested_logprobs)
@@ -187,6 +188,7 @@ async fn run_completion(
             completion_tokens,
             total_tokens: prompt_tokens + completion_tokens,
         },
+        workflow_outputs: collected.publications,
     })
 }
 
@@ -244,6 +246,9 @@ async fn stream_completion(
                     if matches!(finish_reason, Some(FinishReason::StopSequence { .. })) {
                         stop_buffer.pending.clear();
                     }
+                }
+                Some(DriverEvent::WorkflowPublications(publications)) => {
+                    send_workflow_publications(&tx, &publications).await?;
                 }
                 Some(DriverEvent::Finished(result)) => break Ok(result),
                 Some(DriverEvent::Error(error)) => break Err(error),
@@ -454,7 +459,7 @@ async fn run_chat_completion(
         .submit_generation(session_lookup, generation_request, pipeline_input)
         .await
         .map_err(map_generate_submit_error)?;
-    let result = collect_generation_result(generation.events)
+    let result = collect_generation_with_publications(generation.events)
         .await
         .map_err(generation_failure);
     crate::metrics::add_prompt_tokens(carried_tokens.reprefilled + prepared.prompt_tokens);
@@ -471,9 +476,12 @@ async fn run_chat_completion(
         None
     };
 
+    let mut workflow_outputs = Vec::new();
     let (content, tool_calls, completion_tokens, finish_reason, logprobs, reasoning) = match result
     {
-        Ok(result) => {
+        Ok(collected) => {
+            workflow_outputs = collected.publications;
+            let result = collected.result;
             let default_finish_reason = finish_reason_label(&result.finish_reason);
             let logprobs = chat_logprobs(&result, &tokenizer, requested_top_logprobs)
                 .map_err(|err| ApiError::internal(format!("logprobs conversion failed: {err}")))?;
@@ -541,6 +549,7 @@ async fn run_chat_completion(
         }),
         session_id: client_session_id,
         session_token_count,
+        workflow_outputs,
     })
 }
 
@@ -693,6 +702,11 @@ async fn stream_chat_completion(
                         stop_buffer.pending.clear();
                     }
                 }
+                Some(DriverEvent::WorkflowPublications(publications)) => {
+                    if let Err(error) = send_workflow_publications(&tx, &publications).await {
+                        break Err(StreamOutputFailure::Delivery(error));
+                    }
+                }
                 Some(DriverEvent::Finished(result)) => break Ok(result),
                 Some(DriverEvent::Error(error)) => break Err(StreamOutputFailure::Driver(error)),
                 None => {
@@ -801,6 +815,7 @@ async fn stream_chat_completion(
             Err(StreamOutputFailure::Protocol(error)) => {
                 send_tool_protocol_stream_error(&tx, error).await?;
             }
+            Err(StreamOutputFailure::Delivery(error)) => return Err(error),
         }
 
         tx.send(Ok(Event::default().data("[DONE]")))
@@ -853,6 +868,11 @@ async fn stream_declared_tool_chat_completion(
                 }
                 if matches!(finish_reason, Some(FinishReason::StopSequence { .. })) {
                     stop_buffer.pending.clear();
+                }
+            }
+            Some(DriverEvent::WorkflowPublications(publications)) => {
+                if let Err(error) = send_workflow_publications(tx, &publications).await {
+                    break Err(StreamOutputFailure::Delivery(error));
                 }
             }
             Some(DriverEvent::Finished(result)) => break Ok(result),
@@ -951,6 +971,7 @@ async fn stream_declared_tool_chat_completion(
         Err(StreamOutputFailure::Protocol(error)) => {
             send_tool_protocol_stream_error(tx, error).await?;
         }
+        Err(StreamOutputFailure::Delivery(error)) => return Err(error),
     }
 
     tx.send(Ok(Event::default().data("[DONE]")))
@@ -1265,12 +1286,32 @@ mod stream_admission_tests {
 }
 
 pub(crate) async fn collect_generation_result(
-    mut rx: mpsc::Receiver<DriverEvent>,
+    rx: mpsc::Receiver<DriverEvent>,
 ) -> Result<GenerateResult, DriverFailure> {
+    collect_generation_with_publications(rx)
+        .await
+        .map(|collected| collected.result)
+}
+
+struct CollectedGeneration {
+    result: GenerateResult,
+    publications: Vec<serde_json::Value>,
+}
+
+async fn collect_generation_with_publications(
+    mut rx: mpsc::Receiver<DriverEvent>,
+) -> Result<CollectedGeneration, DriverFailure> {
+    let mut publications = Vec::new();
     while let Some(event) = rx.recv().await {
         match event {
             DriverEvent::Token(_) => {}
-            DriverEvent::Finished(result) => return Ok(result),
+            DriverEvent::WorkflowPublications(committed) => publications.extend(committed),
+            DriverEvent::Finished(result) => {
+                return Ok(CollectedGeneration {
+                    result,
+                    publications,
+                });
+            }
             DriverEvent::Error(error) => return Err(error),
         }
     }
@@ -1986,6 +2027,7 @@ struct PromptContext<'a> {
 enum StreamOutputFailure {
     Driver(DriverFailure),
     Protocol(tool_protocol::ToolProtocolError),
+    Delivery(anyhow::Error),
 }
 
 fn prepare_generate_request(

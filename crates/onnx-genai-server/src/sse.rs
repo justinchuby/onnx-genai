@@ -165,7 +165,6 @@ pub(crate) async fn send_completion_stream_chunk(
 /// lineage, and finality are already decided by the workflow runtime. Tensor
 /// bytes retain their dtype and shape instead of being interpreted as server
 /// text or a server-specific semantic event.
-#[allow(dead_code)]
 pub(crate) fn buffered_workflow_publication(
     publication: &WorkflowOutputPublication,
 ) -> anyhow::Result<serde_json::Value> {
@@ -235,20 +234,36 @@ pub(crate) fn buffered_workflow_publication(
 
 /// Render the same semantic record for an SSE data field. Delivery failure from
 /// the caller of this function cannot change the already committed envelope.
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn sse_workflow_publication_data(
     publication: &WorkflowOutputPublication,
 ) -> anyhow::Result<String> {
     serde_json::to_string(&buffered_workflow_publication(publication)?).map_err(Into::into)
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn workflow_publication_event(
     publication: &WorkflowOutputPublication,
 ) -> anyhow::Result<Event> {
     Ok(Event::default()
         .event("workflow_output")
         .data(sse_workflow_publication_data(publication)?))
+}
+
+pub(crate) async fn send_workflow_publications(
+    tx: &mpsc::Sender<Result<Event, Infallible>>,
+    publications: &[serde_json::Value],
+) -> anyhow::Result<()> {
+    for publication in publications {
+        tx.send(Ok(Event::default()
+            .event("workflow_output")
+            .data(serde_json::to_string(publication)?)))
+            .await
+            .context(
+                "workflow output delivery failed after semantic commit; the committed turn remains durable and will not be replayed",
+            )?;
+    }
+    Ok(())
 }
 
 pub(crate) fn completion_chunk(
@@ -456,7 +471,7 @@ pub(crate) fn done_chunk(
 #[cfg(test)]
 mod reasoning_wire_tests {
     use super::{
-        buffered_workflow_publication, content_chunk, reasoning_chunk,
+        buffered_workflow_publication, content_chunk, reasoning_chunk, send_workflow_publications,
         sse_workflow_publication_data, workflow_publication_event,
     };
     use onnx_genai_engine::pipeline::{
@@ -492,33 +507,52 @@ mod reasoning_wire_tests {
 
     #[test]
     fn buffered_and_sse_adapters_preserve_revision_envelope_order_and_finality() {
+        let publication = |stream: &str, sequence, revision, lineage, base, operation, payload| {
+            WorkflowOutputPublication::Revision(TypedRevisionEnvelope {
+                version: "1".to_string(),
+                transaction: TurnTransactionId(9),
+                output: "answer".to_string(),
+                stream: OutputStreamId(stream.to_string()),
+                sequence: OutputSequence(sequence),
+                revision: OutputRevision(revision),
+                lineage: OutputLineage(lineage),
+                base: OutputLineage(base),
+                operation,
+                payload,
+                finality: OutputFinality::Final,
+            })
+        };
+        let payload =
+            |value| Some(onnx_genai_ort::Value::from_slice_i64(&[value], &[1]).expect("payload"));
         let publications = [
-            WorkflowOutputPublication::Revision(TypedRevisionEnvelope {
-                version: "1".to_string(),
-                transaction: TurnTransactionId(9),
-                output: "answer".to_string(),
-                stream: OutputStreamId("main".to_string()),
-                sequence: OutputSequence(1),
-                revision: OutputRevision(1),
-                lineage: OutputLineage(1),
-                base: OutputLineage(0),
-                operation: TypedRevisionOperation::Append,
-                payload: None,
-                finality: OutputFinality::Final,
-            }),
-            WorkflowOutputPublication::Revision(TypedRevisionEnvelope {
-                version: "1".to_string(),
-                transaction: TurnTransactionId(9),
-                output: "answer".to_string(),
-                stream: OutputStreamId("main".to_string()),
-                sequence: OutputSequence(2),
-                revision: OutputRevision(2),
-                lineage: OutputLineage(1),
-                base: OutputLineage(1),
-                operation: TypedRevisionOperation::Finalize,
-                payload: None,
-                finality: OutputFinality::Final,
-            }),
+            publication(
+                "analysis",
+                1,
+                1,
+                1,
+                0,
+                TypedRevisionOperation::Append,
+                payload(1),
+            ),
+            publication(
+                "final",
+                1,
+                1,
+                1,
+                0,
+                TypedRevisionOperation::Replace,
+                payload(2),
+            ),
+            publication("final", 2, 2, 1, 1, TypedRevisionOperation::Finalize, None),
+            publication(
+                "analysis",
+                2,
+                2,
+                1,
+                1,
+                TypedRevisionOperation::Finalize,
+                None,
+            ),
         ];
         let buffered = publications
             .iter()
@@ -534,10 +568,70 @@ mod reasoning_wire_tests {
             .collect::<anyhow::Result<Vec<serde_json::Value>>>()
             .expect("SSE encoding");
         assert_eq!(sse, buffered);
-        assert_eq!(buffered[0]["sequence"], 1);
-        assert_eq!(buffered[1]["operation"], "finalize");
-        assert_eq!(buffered[1]["finality"], "final");
+        assert_eq!(buffered[0]["stream"], "analysis");
+        assert_eq!(buffered[1]["stream"], "final");
+        assert_eq!(buffered[2]["operation"], "finalize");
+        assert_eq!(buffered[3]["finality"], "final");
         let _ = workflow_publication_event(&publications[0])
             .expect("SSE event accepts the same envelope");
+    }
+
+    #[tokio::test]
+    async fn post_commit_sse_disconnect_reports_delivery_without_replay() {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx);
+        let publications = vec![serde_json::json!({
+            "transaction": 9,
+            "output": "answer",
+            "stream": "analysis",
+            "sequence": 1,
+            "revision": 1,
+            "lineage": 1,
+            "operation": "append",
+            "finality": "final"
+        })];
+        let error = send_workflow_publications(&tx, &publications)
+            .await
+            .expect_err("a disconnected client must report delivery failure");
+        let message = format!("{error:#}");
+        assert!(message.contains("after semantic commit"), "{message}");
+        assert!(message.contains("will not be replayed"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn post_commit_sse_backpressure_preserves_one_ordered_delivery() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        tx.send(Ok(axum::response::sse::Event::default().data("earlier")))
+            .await
+            .expect("prime bounded transport");
+        let publications = vec![serde_json::json!({
+            "transaction": 9,
+            "output": "answer",
+            "stream": "final",
+            "sequence": 2,
+            "revision": 2,
+            "lineage": 1,
+            "operation": "finalize",
+            "finality": "final"
+        })];
+        let sender =
+            tokio::spawn(async move { send_workflow_publications(&tx, &publications).await });
+        tokio::task::yield_now().await;
+        assert!(
+            !sender.is_finished(),
+            "bounded transport must apply backpressure"
+        );
+        let _earlier = rx
+            .recv()
+            .await
+            .expect("earlier event remains first")
+            .expect("earlier event is valid");
+        sender
+            .await
+            .expect("delivery task joins")
+            .expect("publication delivery resumes");
+        let delivered = rx.recv().await.expect("publication delivered once");
+        assert!(delivered.is_ok());
+        assert!(rx.try_recv().is_err(), "publication must not be replayed");
     }
 }

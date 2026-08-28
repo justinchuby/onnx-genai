@@ -98,6 +98,12 @@ impl PipelineOutputs {
         self.tensors
     }
 
+    pub(crate) fn into_tensors_and_publications(
+        self,
+    ) -> (PipelineTensors, Vec<WorkflowOutputPublication>) {
+        (self.tensors, self.publications)
+    }
+
     pub fn aggregate(&self, output: &str) -> Option<&Value> {
         self.tensors.get(output)
     }
@@ -211,6 +217,12 @@ pub(crate) struct WorkflowRuntime {
     /// their plugin/provider teardown outlive every component and execution-island
     /// session that may still call back into them.
     _ort_environment: Option<Arc<onnx_genai_ort::Environment>>,
+}
+
+impl WorkflowRuntime {
+    pub(crate) fn take_committed_output_publications(&mut self) -> Vec<WorkflowOutputPublication> {
+        std::mem::take(&mut *self.worker.last_output_publications.borrow_mut())
+    }
 }
 
 /// Immutable construction plan for another hosted single-decoder worker.
@@ -1036,7 +1048,7 @@ impl WorkflowRuntime {
         self.worker
             .session_outputs
             .borrow_mut()
-            .retain(|(session, _), _| session != session_id);
+            .retain(|(session, _, _), _| session != session_id);
         self.worker
             .session_turn_versions
             .borrow_mut()

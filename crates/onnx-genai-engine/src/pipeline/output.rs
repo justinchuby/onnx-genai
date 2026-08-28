@@ -10,7 +10,9 @@ use anyhow::{Context as _, Result, bail, ensure};
 use onnx_genai_metadata::{WorkflowEmitMode, WorkflowOutputFamily, WorkflowSpec};
 use onnx_genai_ort::Value;
 
-use super::{OutputPublicationBaseline, TurnTransactionId};
+use crate::decode::clone_value;
+
+use super::{OutputPublicationBaseline, TurnTransactionId, turn_transaction::CommittedOutputState};
 
 /// The sole typed-revision envelope protocol this runtime implements.
 pub const TYPED_REVISION_PROTOCOL_VERSION: &str = "1";
@@ -383,7 +385,9 @@ pub(crate) struct OutputPublicationJournal {
     transaction: TurnTransactionId,
     outputs: BTreeMap<String, WorkflowOutputFamily>,
     revisions: RevisionEnvelopeValidator,
+    revision_payloads: BTreeMap<(String, OutputStreamId), Option<Value>>,
     event_sequences: BTreeMap<(String, OutputStreamId), u64>,
+    materialized: BTreeMap<(String, OutputStreamId), CommittedOutputState>,
     publications: Vec<WorkflowOutputPublication>,
 }
 
@@ -391,7 +395,7 @@ impl OutputPublicationJournal {
     pub(crate) fn new(
         transaction: TurnTransactionId,
         workflow: &WorkflowSpec,
-        baselines: BTreeMap<String, OutputPublicationBaseline>,
+        baselines: BTreeMap<(String, OutputStreamId), OutputPublicationBaseline>,
     ) -> Result<Self> {
         for (output, declaration) in &workflow.outputs {
             if let WorkflowOutputFamily::Revisions { version } = &declaration.family {
@@ -408,35 +412,57 @@ impl OutputPublicationJournal {
             .map(|(name, declaration)| (name.clone(), declaration.family.clone()))
             .collect::<BTreeMap<_, _>>();
         let mut revisions = RevisionEnvelopeValidator::new(outputs.clone());
+        let mut revision_payloads = BTreeMap::new();
         let mut event_sequences = BTreeMap::new();
-        for (output, family) in &outputs {
-            let baseline = baselines.get(output).copied().unwrap_or_default();
-            let stream = OutputStreamId(output.clone());
-            if matches!(family, WorkflowOutputFamily::Revisions { .. })
-                && (baseline.head != 0
-                    || baseline.cursor != 0
-                    || baseline.lineage != 0
-                    || baseline.closed)
-            {
-                revisions.streams.insert(
-                    (output.clone(), stream.clone()),
-                    RevisionStreamState {
-                        sequence: baseline.cursor,
-                        revision: baseline.head,
-                        lineage: baseline.lineage,
-                        closed: baseline.closed,
-                    },
-                );
-            }
-            if matches!(family, WorkflowOutputFamily::Events) {
-                event_sequences.insert((output.clone(), stream), baseline.cursor);
+        let mut materialized = BTreeMap::new();
+        for ((output, stream), baseline) in baselines {
+            let Some(family) = outputs.get(&output) else {
+                continue;
+            };
+            match family {
+                WorkflowOutputFamily::Revisions { .. }
+                    if baseline.head != 0
+                        || baseline.cursor != 0
+                        || baseline.lineage != 0
+                        || baseline.closed
+                        || baseline.payload.is_some() =>
+                {
+                    revisions.streams.insert(
+                        (output.clone(), stream.clone()),
+                        RevisionStreamState {
+                            sequence: baseline.cursor,
+                            revision: baseline.head,
+                            lineage: baseline.lineage,
+                            closed: baseline.closed,
+                        },
+                    );
+                    revision_payloads.insert((output, stream), baseline.payload);
+                }
+                WorkflowOutputFamily::Events => {
+                    event_sequences.insert((output, stream), baseline.cursor);
+                }
+                WorkflowOutputFamily::Materialized => {
+                    materialized.insert(
+                        (output, stream),
+                        CommittedOutputState {
+                            head: baseline.head,
+                            cursor: baseline.cursor,
+                            lineage: baseline.lineage,
+                            closed: baseline.closed,
+                            payload: baseline.payload,
+                        },
+                    );
+                }
+                WorkflowOutputFamily::Revisions { .. } => {}
             }
         }
         Ok(Self {
             transaction,
             revisions,
             outputs,
+            revision_payloads,
             event_sequences,
+            materialized,
             publications: Vec::new(),
         })
     }
@@ -528,6 +554,18 @@ impl OutputPublicationJournal {
                         "workflow emit {mode:?} for materialized output '{output}' has no payload"
                     )
                 })?;
+                let state = self
+                    .materialized
+                    .entry((output.to_string(), stream.clone()))
+                    .or_default();
+                state.head = state.head.checked_add(1).with_context(|| {
+                    format!("materialized output '{output}' exhausted its head cursor")
+                })?;
+                state.cursor = state.cursor.checked_add(1).with_context(|| {
+                    format!("materialized output '{output}' exhausted its sequence cursor")
+                })?;
+                state.lineage = state.head;
+                state.payload = Some(clone_value(&payload)?);
                 self.publications
                     .push(WorkflowOutputPublication::Materialized {
                         output: output.to_string(),
@@ -630,6 +668,19 @@ impl OutputPublicationJournal {
         self.revisions
             .validate_and_apply(&envelope)
             .map_err(anyhow::Error::from)?;
+        match envelope.operation {
+            TypedRevisionOperation::Append | TypedRevisionOperation::Replace => {
+                self.revision_payloads.insert(
+                    (output.to_string(), envelope.stream.clone()),
+                    envelope.payload.as_ref().map(clone_value).transpose()?,
+                );
+            }
+            TypedRevisionOperation::Retract => {
+                self.revision_payloads
+                    .insert((output.to_string(), envelope.stream.clone()), None);
+            }
+            TypedRevisionOperation::Finalize => {}
+        }
         self.publications
             .push(WorkflowOutputPublication::Revision(envelope));
         Ok(())
@@ -663,17 +714,55 @@ impl OutputPublicationJournal {
         Ok(())
     }
 
-    pub(crate) fn publication_counts(&self) -> BTreeMap<String, u64> {
-        let mut counts = BTreeMap::new();
-        for publication in &self.publications {
-            let output = match publication {
-                WorkflowOutputPublication::Materialized { output, .. }
-                | WorkflowOutputPublication::Event { output, .. } => output,
-                WorkflowOutputPublication::Revision(envelope) => &envelope.output,
-            };
-            *counts.entry(output.clone()).or_default() += 1;
+    pub(crate) fn committed_states(
+        &self,
+    ) -> Result<BTreeMap<(String, OutputStreamId), CommittedOutputState>> {
+        let mut states = self
+            .materialized
+            .iter()
+            .map(|(identity, state)| {
+                Ok((
+                    identity.clone(),
+                    CommittedOutputState {
+                        head: state.head,
+                        cursor: state.cursor,
+                        lineage: state.lineage,
+                        closed: state.closed,
+                        payload: state.payload.as_ref().map(clone_value).transpose()?,
+                    },
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        for (identity, sequence) in &self.event_sequences {
+            states.insert(
+                identity.clone(),
+                CommittedOutputState {
+                    head: *sequence,
+                    cursor: *sequence,
+                    lineage: *sequence,
+                    closed: false,
+                    payload: None,
+                },
+            );
         }
-        counts
+        for (identity, stream) in &self.revisions.streams {
+            states.insert(
+                identity.clone(),
+                CommittedOutputState {
+                    head: stream.revision,
+                    cursor: stream.sequence,
+                    lineage: stream.lineage,
+                    closed: stream.closed,
+                    payload: self
+                        .revision_payloads
+                        .get(identity)
+                        .and_then(Option::as_ref)
+                        .map(clone_value)
+                        .transpose()?,
+                },
+            );
+        }
+        Ok(states)
     }
 
     pub(crate) fn take(self) -> Vec<WorkflowOutputPublication> {
@@ -879,7 +968,7 @@ mod tests {
             TurnTransactionId(8),
             &workflow,
             BTreeMap::from([(
-                "answer".to_string(),
+                ("answer".to_string(), OutputStreamId("answer".to_string())),
                 OutputPublicationBaseline {
                     closed: true,
                     ..Default::default()
@@ -964,6 +1053,167 @@ mod tests {
                 ("left", 3, OutputFinality::Final),
                 ("right", 2, OutputFinality::Final),
             ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn committed_named_streams_restore_exact_heads_payloads_and_closure() -> Result<()> {
+        let workflow = WorkflowSpec {
+            manifest: onnx_genai_metadata::WorkflowManifest {
+                adapter_abis: Default::default(),
+                capabilities: Default::default(),
+            },
+            inputs: Default::default(),
+            outputs: BTreeMap::from([(
+                "answer".to_string(),
+                onnx_genai_metadata::WorkflowOutput {
+                    contract: serde_yaml::from_str("{ dtype: int64, shape: [sequence] }")?,
+                    role: onnx_genai_metadata::WorkflowOutputRole::Tensor,
+                    family: WorkflowOutputFamily::Revisions {
+                        version: TYPED_REVISION_PROTOCOL_VERSION.to_string(),
+                    },
+                    value_range: None,
+                    stage: onnx_genai_metadata::OutputStage::PreAdapter,
+                    media: None,
+                },
+            )]),
+            components: Default::default(),
+            state: Default::default(),
+            effects: Default::default(),
+            serving: None,
+            steps: Default::default(),
+        };
+        let mut first =
+            OutputPublicationJournal::new(TurnTransactionId(10), &workflow, BTreeMap::new())?;
+        first.publish(
+            "answer",
+            Some("analysis"),
+            &WorkflowEmitMode::Append,
+            Some(value(1)),
+        )?;
+        first.publish(
+            "answer",
+            Some("final"),
+            &WorkflowEmitMode::Replace,
+            Some(value(2)),
+        )?;
+        first.publish("answer", Some("analysis"), &WorkflowEmitMode::Retract, None)?;
+        first.publish(
+            "answer",
+            Some("analysis"),
+            &WorkflowEmitMode::Append,
+            Some(value(3)),
+        )?;
+        first.publish("answer", Some("final"), &WorkflowEmitMode::Finalize, None)?;
+        first.finalize_on_commit()?;
+        let committed = first.committed_states()?;
+        let analysis = &committed[&("answer".to_string(), OutputStreamId("analysis".to_string()))];
+        let final_stream = &committed[&("answer".to_string(), OutputStreamId("final".to_string()))];
+        assert_eq!(
+            (
+                analysis.head,
+                analysis.cursor,
+                analysis.lineage,
+                analysis.closed,
+                analysis
+                    .payload
+                    .as_ref()
+                    .expect("analysis payload")
+                    .to_vec_i64()?,
+            ),
+            (4, 4, 3, true, vec![3])
+        );
+        assert_eq!(
+            (
+                final_stream.head,
+                final_stream.cursor,
+                final_stream.lineage,
+                final_stream.closed,
+                final_stream
+                    .payload
+                    .as_ref()
+                    .expect("final payload")
+                    .to_vec_i64()?,
+            ),
+            (2, 2, 1, true, vec![2])
+        );
+
+        let baselines = committed
+            .iter()
+            .map(|(identity, state)| {
+                Ok((
+                    identity.clone(),
+                    OutputPublicationBaseline {
+                        head: state.head,
+                        cursor: state.cursor,
+                        lineage: state.lineage,
+                        closed: state.closed,
+                        payload: state.payload.as_ref().map(clone_value).transpose()?,
+                    },
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        let mut second =
+            OutputPublicationJournal::new(TurnTransactionId(11), &workflow, baselines)?;
+        let error = second
+            .publish(
+                "answer",
+                Some("analysis"),
+                &WorkflowEmitMode::Append,
+                Some(value(9)),
+            )
+            .expect_err("a committed closed stream must remain closed next turn");
+        assert!(format!("{error:#}").contains("finalized output 'answer' stream 'analysis'"));
+
+        second.publish(
+            "answer",
+            Some("retry"),
+            &WorkflowEmitMode::Replace,
+            Some(value(7)),
+        )?;
+        let aborted = second.committed_states()?;
+        assert!(aborted.contains_key(&("answer".to_string(), OutputStreamId("retry".to_string()))));
+
+        let retry_baselines = committed
+            .iter()
+            .map(|(identity, state)| {
+                Ok((
+                    identity.clone(),
+                    OutputPublicationBaseline {
+                        head: state.head,
+                        cursor: state.cursor,
+                        lineage: state.lineage,
+                        closed: state.closed,
+                        payload: state.payload.as_ref().map(clone_value).transpose()?,
+                    },
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        let mut retry =
+            OutputPublicationJournal::new(TurnTransactionId(12), &workflow, retry_baselines)?;
+        retry.publish(
+            "answer",
+            Some("retry"),
+            &WorkflowEmitMode::Replace,
+            Some(value(7)),
+        )?;
+        retry.finalize_on_commit()?;
+        let retried = retry.committed_states()?;
+        let retry = &retried[&("answer".to_string(), OutputStreamId("retry".to_string()))];
+        assert_eq!(
+            (
+                retry.head,
+                retry.cursor,
+                retry.lineage,
+                retry.closed,
+                retry
+                    .payload
+                    .as_ref()
+                    .expect("retry payload")
+                    .to_vec_i64()?,
+            ),
+            (2, 2, 1, true, vec![7])
         );
         Ok(())
     }

@@ -2149,6 +2149,14 @@ fn validate_output_protocols(workflow: &WorkflowSpec, errors: &mut Vec<String>) 
                             "{site}.value is required for {mode:?} publication to output '{output}'"
                         ));
                     }
+                    if !carries_payload && !value.is_empty() {
+                        errors.push(format!(
+                            "{site}.value names '{value}' for payloadless {mode:?} publication to \
+                             output '{output}' stream '{}'; remove the value because this operation \
+                             cannot carry or discard a payload",
+                            stream.as_deref().unwrap_or(output)
+                        ));
+                    }
                     if !carries_payload
                         && (when.is_some() || valid_length.is_some() || axis.is_some())
                     {
