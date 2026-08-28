@@ -9,8 +9,8 @@
 //! first field it did not recognize: `unknown field 'batch_capacity'`, which
 //! sends a reader looking for a typo in a document that is perfectly correct and
 //! merely newer. Reading the version *before* handing the bytes to `serde` turns
-//! that into the true statement — this document is v1.3 and this runtime reads
-//! up to v1.2 — which is the difference between an upgrade and a bug hunt.
+//! that into the true statement — this document is newer than this runtime —
+//! which is the difference between an upgrade and a bug hunt.
 
 use std::fmt;
 
@@ -39,7 +39,7 @@ impl fmt::Display for SchemaVersion {
 pub const INITIAL_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 0);
 
 /// The newest version this build can read.
-pub const SUPPORTED_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 3);
+pub const SUPPORTED_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 4);
 
 /// The version that first carried encoder batching, padding, ownership levels,
 /// and the video preprocessing program.
@@ -50,6 +50,9 @@ pub const TOKEN_AUTHORITY_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 
 
 /// The version that introduced the exact package tool-call protocol declaration.
 pub const TOOL_PROTOCOL_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 3);
+
+/// The version that introduced the graph-internal token-context contract.
+pub const TOKEN_CONTEXT_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 4);
 
 /// Normalize a declared `schema_version` spelling.
 ///
@@ -145,7 +148,7 @@ mod tests {
 
     #[test]
     fn a_canonical_version_prints_the_way_a_document_should_write_it() {
-        assert_eq!(SUPPORTED_SCHEMA_VERSION.to_string(), "v1.3");
+        assert_eq!(SUPPORTED_SCHEMA_VERSION.to_string(), "v1.4");
         assert_eq!(INITIAL_SCHEMA_VERSION.to_string(), "v1.0");
     }
 
@@ -153,7 +156,7 @@ mod tests {
     fn surrounding_space_is_not_a_different_version() {
         assert_eq!(
             normalize(Some(" 1.3 ")).expect("space normalizes away"),
-            SUPPORTED_SCHEMA_VERSION
+            TOOL_PROTOCOL_SCHEMA_VERSION
         );
     }
 
@@ -161,7 +164,7 @@ mod tests {
     fn a_spelling_no_one_can_compare_says_how_to_write_one() {
         let error = normalize(Some("latest")).expect_err("'latest' is not a version");
         assert!(
-            error.contains("'v<major>.<minor>'") && error.contains("v1.3"),
+            error.contains("'v<major>.<minor>'") && error.contains("v1.4"),
             "{error}"
         );
         assert!(normalize(Some("v1.2.3")).is_err());
@@ -183,12 +186,12 @@ mod tests {
 
     #[test]
     fn a_newer_minor_is_refused_by_number_rather_than_by_field_name() {
-        let error = gate(Some("1.4")).expect_err("1.4 is newer than this build");
+        let error = gate(Some("1.5")).expect_err("1.5 is newer than this build");
         assert!(
-            error.contains("declares inference-metadata schema version v1.4"),
+            error.contains("declares inference-metadata schema version v1.5"),
             "{error}"
         );
-        assert!(error.contains("reads up to v1.3"), "{error}");
+        assert!(error.contains("reads up to v1.4"), "{error}");
         assert!(error.contains("refuses fields it does not know"), "{error}");
     }
 
@@ -203,6 +206,10 @@ mod tests {
         assert_eq!(gate(None).expect("absent"), INITIAL_SCHEMA_VERSION);
         assert_eq!(gate(Some("v1")).expect("v1"), INITIAL_SCHEMA_VERSION);
         assert_eq!(gate(Some("1.1")).expect("1.1"), BATCHING_SCHEMA_VERSION);
-        assert_eq!(gate(Some("1.3")).expect("1.3"), SUPPORTED_SCHEMA_VERSION);
+        assert_eq!(
+            gate(Some("1.3")).expect("1.3"),
+            TOOL_PROTOCOL_SCHEMA_VERSION
+        );
+        assert_eq!(gate(Some("1.4")).expect("1.4"), SUPPORTED_SCHEMA_VERSION);
     }
 }

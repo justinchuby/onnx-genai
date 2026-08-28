@@ -101,6 +101,8 @@ pub mod capabilities {
         INPUT_PRESENCE = "input_presence";
         /// Planner-internal explicit transfer nodes.
         EXPLICIT_TRANSFER = "explicit_transfer";
+        /// Graph-internal stateful token-context feature injection.
+        TOKEN_CONTEXT = "token_context";
     }
 }
 

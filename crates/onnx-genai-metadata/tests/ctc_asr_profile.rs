@@ -99,7 +99,7 @@ pipeline:
         contract:
           dtype: int64
           shape: [batch]
-          batch_layout: { kind: shared }
+          batch_layout: { kind: request_aligned, axis: 0 }
         role: tensor
         stage: pre_adapter
     components:
@@ -550,8 +550,8 @@ fn padded_ctc_length_companion_must_be_int64_at_the_time_prefix_rank() {
     );
 
     let wrong_rank = CTC_ASR_DOCUMENT.replace(
-        "          shape: [batch]\n          batch_layout: { kind: shared }",
-        "          shape: [batch, extra]\n          batch_layout: { kind: shared }",
+        "          shape: [batch]\n          batch_layout: { kind: request_aligned, axis: 0 }",
+        "          shape: [batch, extra]\n          batch_layout: { kind: request_aligned, axis: 0 }",
     );
     let reported = errors(&wrong_rank);
     assert!(
@@ -583,8 +583,8 @@ fn padding_a_non_time_dimension_does_not_require_ctc_lengths() {
         )
         .replace("frame_lengths", "vocab_lengths")
         .replace(
-            "          shape: [batch]\n          batch_layout: { kind: shared }",
-            "          shape: [batch, frames]\n          batch_layout: { kind: shared }",
+            "          shape: [batch]\n          batch_layout: { kind: request_aligned, axis: 0 }",
+            "          shape: [batch, frames]\n          batch_layout: { kind: request_aligned, axis: 0 }",
         )
         .replace("      lengths: vocab_lengths\n", "");
     validate_metadata(&parse(&document))

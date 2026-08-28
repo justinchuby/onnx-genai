@@ -76,6 +76,11 @@ pub struct InferenceMetadata {
     /// understand; it is not a compatibility guarantee spanning a reshape, and
     /// nothing here silently reads an old spelling as a new one. See
     /// `reject_flat_token_packed`.
+    ///
+    /// A component using `onnx-genai.token-context@1` declares at least
+    /// `v1.4`: the component-contract fields predate that version, so only the
+    /// version gate prevents a v1.3 reader from accepting the document while
+    /// silently ignoring the token-identity semantics.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema_version: Option<String>,
 

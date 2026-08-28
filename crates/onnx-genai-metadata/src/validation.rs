@@ -93,6 +93,7 @@ impl Default for RuntimeCapabilities {
                 capability::LOOP_INDUCTION_VALUES.to_string(),
                 capability::TYPED_EMIT.to_string(),
                 capability::STREAMING_EMIT.to_string(),
+                capability::TOKEN_CONTEXT.to_string(),
             ],
         }
     }
@@ -244,6 +245,9 @@ fn workflow_required_capabilities(
                 }
                 "onnx-genai.parameter-overlay" => {
                     capabilities.insert(capability::PARAMETER_ADAPTERS.to_string());
+                }
+                "onnx-genai.token-context" => {
+                    capabilities.insert(capability::TOKEN_CONTEXT.to_string());
                 }
                 _ => {}
             }
@@ -473,6 +477,25 @@ fn validate_schema_version(metadata: &InferenceMetadata, errors: &mut Vec<String
              older reader refuses the package as a newer contract rather than guessing a tool protocol",
             crate::version::TOOL_PROTOCOL_SCHEMA_VERSION,
             crate::version::TOOL_PROTOCOL_SCHEMA_VERSION,
+        ));
+    }
+    let has_token_context = metadata.pipeline.as_ref().is_some_and(|pipeline| {
+        pipeline.workflow.components.values().any(|component| {
+            component
+                .contract
+                .as_ref()
+                .is_some_and(|contract| contract.id == "onnx-genai.token-context")
+        })
+    });
+    if has_token_context && declared < crate::version::TOKEN_CONTEXT_SCHEMA_VERSION {
+        let spelled = metadata.schema_version.as_deref().unwrap_or("<absent>");
+        errors.push(format!(
+            "this package declares the onnx-genai.token-context component contract, which schema \
+             version {} introduced, but declares schema_version '{spelled}' ({declared}); declare \
+             schema_version '{}' so an older reader refuses the package instead of silently \
+             ignoring the token-identity contract",
+            crate::version::TOKEN_CONTEXT_SCHEMA_VERSION,
+            crate::version::TOKEN_CONTEXT_SCHEMA_VERSION,
         ));
     }
     let Some(feature) = batching_schema_feature(metadata) else {
@@ -2327,6 +2350,7 @@ fn validate_workflow(
                     }
                 }
             }
+            validate_token_context_component(name, component, contract, errors);
             if let crate::schema::ComponentImplementation::Adapter { abi, version, .. } =
                 &component.implementation
             {
@@ -2337,6 +2361,7 @@ fn validate_workflow(
                         contract.id, contract.version
                     ));
                 }
+
                 let action = match contract.parameters.get("action") {
                     Some(crate::schema::ScalarValue::String(action)) => Some(action.as_str()),
                     _ => None,
@@ -2663,6 +2688,7 @@ fn validate_workflow(
         "pipeline.workflow.steps",
         errors,
     );
+    validate_token_identity_provenance(&compiled.graph, workflow, errors);
     validate_emit_batch_layout_consistency(
         &compiled.graph,
         &value_contracts,
@@ -3658,12 +3684,23 @@ fn validate_padding(
                 companion.dtype
             ));
         }
-        if !companion.batch_layout.is_shared() {
+        let companion_keeps_request_axis = contract
+            .batch_layout
+            .request_axis()
+            .is_some_and(|request_axis| request_axis < axis);
+        let expected_layout = if companion_keeps_request_axis {
+            &contract.batch_layout
+        } else {
+            &crate::schema::BatchLayout::Shared
+        };
+        if &companion.batch_layout != expected_layout {
             errors.push(format!(
-                "{path} valid_lengths '{valid_lengths}' declares {} but must declare shared; it \
-                 has one entry per position of the axes outer to '{dimension}', which is not a \
-                 request row count",
-                companion.batch_layout.kind_name()
+                "{path} valid_lengths '{valid_lengths}' declares {} but must declare {}; it has \
+                 one entry per position of the axes outer to '{dimension}' and must preserve the \
+                 owning value's request-row layout exactly when that request axis is outer to the \
+                 padded dimension",
+                companion.batch_layout.kind_name(),
+                expected_layout.kind_name(),
             ));
         }
         validate_valid_lengths_shape(
@@ -7069,6 +7106,427 @@ pub enum MetadataError {
 
 // Re-export at crate level
 pub use MetadataError as Error;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SemanticValueOrigin {
+    token_ids: bool,
+    description: String,
+}
+
+impl SemanticValueOrigin {
+    fn token_ids(description: impl Into<String>) -> Self {
+        Self {
+            token_ids: true,
+            description: description.into(),
+        }
+    }
+
+    fn other(description: impl Into<String>) -> Self {
+        Self {
+            token_ids: false,
+            description: description.into(),
+        }
+    }
+}
+
+fn join_semantic_origins<'a>(
+    origins: impl IntoIterator<Item = &'a SemanticValueOrigin>,
+    fallback: impl FnOnce() -> String,
+) -> SemanticValueOrigin {
+    let origins = origins.into_iter().collect::<Vec<_>>();
+    if origins.is_empty() {
+        return SemanticValueOrigin::other(fallback());
+    }
+    let token_ids = origins.iter().all(|origin| origin.token_ids);
+    let description = origins
+        .iter()
+        .map(|origin| origin.description.as_str())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join(" or ");
+    SemanticValueOrigin {
+        token_ids,
+        description,
+    }
+}
+
+fn port_role_name(role: crate::schema::PortRole) -> &'static str {
+    match role {
+        crate::schema::PortRole::TokenIds => "token_ids",
+        crate::schema::PortRole::InputsEmbeds => "inputs_embeds",
+        crate::schema::PortRole::AttentionMask => "attention_mask",
+        crate::schema::PortRole::PositionIds => "position_ids",
+        crate::schema::PortRole::Logits => "logits",
+        crate::schema::PortRole::HiddenStates => "hidden_states",
+        crate::schema::PortRole::EncoderHiddenStates => "encoder_hidden_states",
+        crate::schema::PortRole::AudioFeatures => "audio_features",
+    }
+}
+
+/// Prove semantic value identity through authored workflow dataflow.
+///
+/// Tensor contracts intentionally do not encode semantic identity: token IDs
+/// and position IDs are commonly shape-compatible integer tensors. Runtime
+/// prompt roles and component port roles are the authorities; control-flow
+/// aliases preserve a role only when every incoming path agrees.
+fn validate_token_identity_provenance(
+    graph: &WorkflowNode,
+    workflow: &WorkflowSpec,
+    errors: &mut Vec<String>,
+) {
+    let mut origins = workflow
+        .inputs
+        .iter()
+        .map(|(name, input)| {
+            let origin = match &input.role {
+                crate::schema::SemanticInputRole::Runtime {
+                    role: crate::schema::RuntimeInputRole::PromptTokens,
+                    ..
+                } => SemanticValueOrigin::token_ids(format!(
+                    "workflow input '{name}' with runtime role prompt_tokens"
+                )),
+                crate::schema::SemanticInputRole::Runtime { role, .. } => {
+                    SemanticValueOrigin::other(format!(
+                        "workflow input '{name}' with runtime role {role:?}"
+                    ))
+                }
+                crate::schema::SemanticInputRole::Opaque => SemanticValueOrigin::other(format!(
+                    "workflow input '{name}' with opaque semantic role"
+                )),
+            };
+            (name.clone(), origin)
+        })
+        .collect::<BTreeMap<_, _>>();
+    walk_token_identity_provenance(
+        graph,
+        workflow,
+        &mut origins,
+        "pipeline.workflow.steps",
+        errors,
+    );
+}
+
+fn walk_token_identity_provenance(
+    node: &WorkflowNode,
+    workflow: &WorkflowSpec,
+    origins: &mut BTreeMap<String, SemanticValueOrigin>,
+    path: &str,
+    errors: &mut Vec<String>,
+) {
+    match node {
+        WorkflowNode::Sequence { nodes } => {
+            for (index, node) in nodes.iter().enumerate() {
+                walk_token_identity_provenance(
+                    node,
+                    workflow,
+                    origins,
+                    &format!("{path}.nodes[{index}]"),
+                    errors,
+                );
+            }
+        }
+        WorkflowNode::Invoke {
+            component,
+            inputs,
+            outputs,
+            ..
+        } => {
+            let Some(declaration) = workflow.components.get(component) else {
+                return;
+            };
+            let token_ports = declaration
+                .ports
+                .inputs
+                .keys()
+                .filter(|port| {
+                    declaration.ports.roles.get(*port) == Some(&crate::schema::PortRole::TokenIds)
+                })
+                .collect::<Vec<_>>();
+            let is_token_context = declaration.contract.as_ref().is_some_and(|contract| {
+                contract.id == "onnx-genai.token-context" && contract.version == "1"
+            });
+            if is_token_context
+                && token_ports.len() == 1
+                && let Some(binding) = inputs.get(token_ports[0])
+            {
+                let origin = origins.get(binding);
+                if !origin.is_some_and(|origin| origin.token_ids) {
+                    let observed = origin.map_or_else(
+                        || format!("SSA value '{binding}' with no proved semantic source"),
+                        |origin| origin.description.clone(),
+                    );
+                    errors.push(format!(
+                        "{path} binds token-context component '{component}' token_ids port '{}' to \
+                         SSA value '{binding}', whose semantic provenance is {observed}. Bind a \
+                         value originating from runtime prompt_tokens or a component output \
+                         declared token_ids; dtype, rank, and shape cannot distinguish token \
+                         identity from position IDs",
+                        token_ports[0]
+                    ));
+                }
+            }
+            for (port, value) in outputs {
+                let origin = match declaration.ports.roles.get(port) {
+                    Some(crate::schema::PortRole::TokenIds) => SemanticValueOrigin::token_ids(
+                        format!("component '{component}' output port '{port}' declared token_ids"),
+                    ),
+                    Some(role) => SemanticValueOrigin::other(format!(
+                        "component '{component}' output port '{port}' declared {}",
+                        port_role_name(*role)
+                    )),
+                    None => SemanticValueOrigin::other(format!(
+                        "component '{component}' output port '{port}' with no semantic role"
+                    )),
+                };
+                origins.insert(value.clone(), origin);
+            }
+        }
+        WorkflowNode::Loop {
+            setup,
+            body,
+            iteration,
+            carried,
+            ..
+        } => {
+            walk_token_identity_provenance(
+                setup,
+                workflow,
+                origins,
+                &format!("{path}.setup"),
+                errors,
+            );
+            let mut body_origins = origins.clone();
+            if let Some(iteration) = iteration {
+                body_origins.insert(
+                    iteration.value.clone(),
+                    SemanticValueOrigin::other(format!(
+                        "loop induction value '{}'",
+                        iteration.value
+                    )),
+                );
+            }
+            for carry in carried {
+                let current = origins.get(&carry.current).cloned().unwrap_or_else(|| {
+                    SemanticValueOrigin::other(format!(
+                        "state cell '{}' from its typed initializer or prior session state",
+                        carry.cell
+                    ))
+                });
+                body_origins.insert(carry.body_input.clone(), current);
+            }
+            walk_token_identity_provenance(
+                body,
+                workflow,
+                &mut body_origins,
+                &format!("{path}.body"),
+                errors,
+            );
+            for carry in carried {
+                let current = origins.get(&carry.current);
+                let body_output = body_origins.get(&carry.body_output);
+                let joined = join_semantic_origins(current.into_iter().chain(body_output), || {
+                    format!("loop-carried state cell '{}'", carry.cell)
+                });
+                origins.insert(carry.next.clone(), joined);
+            }
+        }
+        WorkflowNode::Branch {
+            cases,
+            default,
+            outputs,
+            ..
+        } => {
+            let mut case_origins = BTreeMap::new();
+            for (case, node) in cases {
+                let mut branch = origins.clone();
+                walk_token_identity_provenance(
+                    node,
+                    workflow,
+                    &mut branch,
+                    &format!("{path}.cases[{case}]"),
+                    errors,
+                );
+                case_origins.insert(case.as_str(), branch);
+            }
+            let mut default_origins = origins.clone();
+            if let Some(default) = default {
+                walk_token_identity_provenance(
+                    default,
+                    workflow,
+                    &mut default_origins,
+                    &format!("{path}.default"),
+                    errors,
+                );
+            }
+            for (output, merge) in outputs {
+                let incoming = merge.cases.iter().filter_map(|(case, value)| {
+                    case_origins
+                        .get(case.as_str())
+                        .and_then(|branch| branch.get(value))
+                });
+                let default_origin = merge
+                    .default
+                    .as_ref()
+                    .and_then(|value| default_origins.get(value));
+                origins.insert(
+                    output.clone(),
+                    join_semantic_origins(incoming.chain(default_origin), || {
+                        format!("branch output '{output}' with unresolved semantic sources")
+                    }),
+                );
+            }
+        }
+        WorkflowNode::Transfer { input, output, .. } => {
+            let origin = origins.get(input).cloned().unwrap_or_else(|| {
+                SemanticValueOrigin::other(format!(
+                    "transferred SSA value '{input}' with no proved semantic source"
+                ))
+            });
+            origins.insert(output.clone(), origin);
+        }
+        WorkflowNode::Emit { .. } | WorkflowNode::ExecutionIsland { .. } => {}
+    }
+}
+
+/// Validate the portable contract used by graph-internal token-context
+/// components.
+///
+/// The contract deliberately describes only the boundary that graph structure
+/// cannot recover: an embedded sequence has lost the discrete identities needed
+/// to update a token-history state. Hashing, lookup tables, projections, gates,
+/// convolution, and residual placement remain ordinary ONNX/component
+/// semantics. This is consequently neither a model family nor an operator
+/// registry.
+fn validate_token_context_component(
+    component_name: &str,
+    component: &crate::schema::WorkflowComponent,
+    contract: &crate::schema::ComponentContract,
+    errors: &mut Vec<String>,
+) {
+    const TOKEN_CONTEXT_CONTRACT: &str = "onnx-genai.token-context";
+    const TOKEN_CONTEXT_VERSION: &str = "1";
+    if contract.id != TOKEN_CONTEXT_CONTRACT {
+        return;
+    }
+
+    if contract.version != TOKEN_CONTEXT_VERSION {
+        errors.push(format!(
+            "workflow token-context component '{component_name}' declares unsupported contract \
+             {}@{}; supported graph ABI is {TOKEN_CONTEXT_CONTRACT}@{TOKEN_CONTEXT_VERSION}",
+            contract.id, contract.version
+        ));
+    }
+    if !matches!(
+        component.implementation,
+        crate::schema::ComponentImplementation::Onnx { .. }
+    ) {
+        errors.push(format!(
+            "workflow token-context component '{component_name}' must be an ONNX component; \
+             its learned lookup and history update must be declared by ordinary graph ports and \
+             state groups, not recovered from an opaque implementation"
+        ));
+    }
+
+    let embeds = component
+        .ports
+        .roles
+        .iter()
+        .filter(|(port, role)| {
+            **role == crate::schema::PortRole::InputsEmbeds
+                && component.ports.inputs.contains_key(*port)
+        })
+        .map(|(port, _)| port.as_str())
+        .collect::<Vec<_>>();
+    let tokens = component
+        .ports
+        .roles
+        .iter()
+        .filter(|(port, role)| {
+            **role == crate::schema::PortRole::TokenIds
+                && component.ports.inputs.contains_key(*port)
+        })
+        .map(|(port, _)| port.as_str())
+        .collect::<Vec<_>>();
+    if embeds.len() != 1 {
+        errors.push(format!(
+            "workflow token-context component '{component_name}' must declare exactly one \
+             inputs_embeds input role; found {}. The embedded sequence is the feature-injection \
+             path and cannot be guessed from a port name",
+            embeds.len()
+        ));
+        return;
+    }
+    if tokens.len() != 1 {
+        errors.push(format!(
+            "workflow token-context component '{component_name}' consumes inputs_embeds but \
+             declares {} token_ids companion roles; declare exactly one typed token_ids input \
+             carrying the original ids. Reverse embedding lookup is forbidden",
+            tokens.len()
+        ));
+        return;
+    }
+
+    let (Some(embeds), Some(tokens)) = (
+        component.ports.inputs.get(embeds[0]),
+        component.ports.inputs.get(tokens[0]),
+    ) else {
+        errors.push(format!(
+            "workflow token-context component '{component_name}' must declare typed input \
+             contracts for its inputs_embeds and token_ids companion ports; an inferred ONNX \
+             port list cannot prove token-history geometry before execution"
+        ));
+        return;
+    };
+    if !matches!(
+        tokens.dtype.as_str(),
+        "int32" | "int64" | "uint32" | "uint64"
+    ) {
+        errors.push(format!(
+            "workflow token-context component '{component_name}' token_ids companion has dtype \
+             '{}'; token ids must use an integer dtype",
+            tokens.dtype
+        ));
+    }
+    if tokens.rank().checked_add(1) != Some(embeds.rank()) {
+        errors.push(format!(
+            "workflow token-context component '{component_name}' token_ids companion has rank \
+             {}, but inputs_embeds has rank {}; token ids must match every embedding axis except \
+             the trailing feature axis",
+            tokens.rank(),
+            embeds.rank()
+        ));
+    }
+    if tokens.shape.len() + 1 != embeds.shape.len()
+        || !tokens
+            .shape
+            .iter()
+            .zip(&embeds.shape)
+            .all(|(token, embed)| token == embed)
+    {
+        errors.push(format!(
+            "workflow token-context component '{component_name}' token_ids companion geometry \
+             does not match the inputs_embeds prefix; bind the original token rows and sequence \
+             positions, not a reconstructed or differently packed token tensor"
+        ));
+    }
+    if tokens.batch_layout != embeds.batch_layout {
+        errors.push(format!(
+            "workflow token-context component '{component_name}' token_ids companion uses {} \
+             batching while inputs_embeds uses {}; both must follow the same row compaction and \
+             release mapping",
+            tokens.batch_layout.kind_name(),
+            embeds.batch_layout.kind_name()
+        ));
+    }
+    if tokens.padding != embeds.padding {
+        errors.push(format!(
+            "workflow token-context component '{component_name}' token_ids companion padding \
+             does not match inputs_embeds; both must use the same valid-length companions so \
+             token history never absorbs padded positions"
+        ));
+    }
+}
 
 /// A component that owns attention state must say which port carries the
 /// sequence.
