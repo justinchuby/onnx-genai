@@ -10,13 +10,17 @@ versioned contract and typed ports, never the model or component name.
   [`QwenLM/Qwen3.8-Flash-Next@69885871`](https://github.com/QwenLM/Qwen3.8-Flash-Next/tree/69885871a64393807d988b27b1b5e380e8f28526)
 - Official checkpoint configuration:
   [`Qwen/Qwen3.8-Flash-Next@de4b8e4d`](https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/de4b8e4d43b917e7706784d8bb445c9af86a3540/config.json)
+- Pinned Transformers configuration-class defaults:
+  [`Qwen4ExpTextConfig@fc5c5bde`](https://github.com/huggingface/transformers/blob/fc5c5bde8e656dad91cbf34e61940d984b1c7b91/src/transformers/models/qwen4_exp/configuration_qwen4_exp.py#L147-L157)
 - Public Qwen4-Exp equations used by the checkpoint:
   [`huggingface/transformers@fc5c5bde`](https://github.com/huggingface/transformers/blob/fc5c5bde8e656dad91cbf34e61940d984b1c7b91/src/transformers/models/qwen4_exp/modeling_qwen4_exp.py#L1048-L1260)
 
 The pinned configuration declares vocabulary `248320`, n-gram size `3`, eight
 heads per n-gram order, four gated-residual streams, PLE at one-indexed layer
 `2`, PLE width `2560`, kernel size `4`, dilation equal to n-gram size (`3`),
-base table size `20000000`, seed `1234`, and 48 text layers.
+base table size `20000000`, and 48 text layers. Together with the pinned
+Transformers configuration-class default, the checkpoint configuration
+resolves the seed to `1234`.
 
 ## Evidence boundary
 
