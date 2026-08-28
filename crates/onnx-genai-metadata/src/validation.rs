@@ -2656,6 +2656,7 @@ fn validate_workflow(
     validate_batch_capacity(workflow, errors);
     validate_state_lifetimes(workflow, errors);
     validate_session_continuity(workflow, errors);
+    errors.extend(crate::validate_state_plan(workflow, &compiled.state_plan));
     if let Some(serving) = &workflow.serving {
         if serving.state_service.groups.is_empty() {
             errors.push(

@@ -1020,6 +1020,16 @@ value **MUST** join to one final writer before commit. Author-defined map keys,
 component order, filenames, modality names, and model-family names have no
 semantic authority. Storage management does not redefine dataflow.
 
+Readers MUST resolve those declarations to one typed state plan before
+execution. The plan carries the state identity, lifecycle and release boundary,
+source binding, reader and writer edges, update relation, final writer,
+snapshot/fork eligibility, and transaction participation. Validation and every
+executor consume that same plan; no allocator, storage placement, or
+storage-management field may select a source or final writer independently.
+Consequently, a caller-provided seed and a value carried from an earlier
+invocation differ only in which declared binding supplies the plan's source,
+not in their validation or execution mechanism.
+
 At turn admission, before mutation or publication, the runtime records one typed
 committed baseline for the complete state/effect write set and each workflow
 output's committed head, cursor, lineage, and closure state. The baseline and
