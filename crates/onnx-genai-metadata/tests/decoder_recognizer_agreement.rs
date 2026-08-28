@@ -438,6 +438,22 @@ const MATRIX: &[Row] = &[
     // pin is still covered, by `onnx_genai_workflows/decoder` below, so nothing
     // was lost by following the fixtures here.
     row(
+        "crates/onnx-genai-engine/tests/fixtures/tiny-deepseek-v4-csa/inference_metadata.yaml",
+        1,
+        SingleGraph,
+        Some("decoder"),
+        true,
+        Some("decoder"),
+    ),
+    row(
+        "crates/onnx-genai-engine/tests/fixtures/tiny-deepseek-v4-csa-schedule/inference_metadata.yaml",
+        1,
+        SingleGraph,
+        Some("decoder"),
+        true,
+        Some("decoder"),
+    ),
+    row(
         "tests/fixtures/tiny-deepseek-v4-qmoe/inference_metadata.yaml",
         1,
         SingleGraph,

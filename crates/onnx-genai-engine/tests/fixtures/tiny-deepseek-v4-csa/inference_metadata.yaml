@@ -1,0 +1,924 @@
+model:
+  max_sequence_length: 512
+pipeline:
+  workflow:
+    manifest:
+      adapter_abis: {}
+      capabilities:
+      - bounded_state_recurrence
+      - linear_effects
+      - loop_induction_values
+      - nested_control_flow
+      - serving_service_contract
+      - typed_emit
+      - workflow_ssa
+    inputs:
+      application.attention_mask:
+        contract:
+          dtype: int64
+          shape: [Any, Any]
+          optional: false
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: attention_mask
+        required: true
+        externally_suppliable: true
+      application.position_ids:
+        contract:
+          dtype: int64
+          shape: [Any, Any]
+          optional: false
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: position_ids
+        required: true
+        externally_suppliable: true
+      package.accepted_len:
+        contract:
+          dtype: int64
+          shape:
+          - batch
+          optional: false
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: 0
+      package.active:
+        contract:
+          dtype: bool
+          shape:
+          - batch
+          optional: false
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: true
+      package.done:
+        contract:
+          dtype: bool
+          shape:
+          - batch
+          optional: false
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: false
+      package.sequence_capacity:
+        contract:
+          dtype: int64
+          shape:
+          - 1
+          optional: false
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: 512
+      request.input_ids:
+        contract:
+          dtype: int64
+          shape:
+          - batch
+          - sequence
+          optional: false
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: runtime
+          version: '1.0'
+          role: prompt_tokens
+        source:
+          kind: request
+        required: true
+      request.max_iterations:
+        contract:
+          dtype: int64
+          shape:
+          - 1
+          optional: false
+        role:
+          kind: runtime
+          version: '1.0'
+          role: max_iterations
+        source:
+          kind: request
+        required: false
+        default: 512
+      package.record_capacity:
+        contract:
+          dtype: int64
+          shape:
+          - 1
+          optional: false
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: 128
+      package.state_seed_f32_rank4:
+        contract:
+          dtype: float32
+          shape: [Any, Any, Any, Any]
+          optional: false
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: 0.0
+      package.state_seed_f32_rank3:
+        contract:
+          dtype: float32
+          shape: [Any, Any, Any]
+          optional: false
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: 0.0
+      package.state_seed_u8_rank3:
+        contract:
+          dtype: uint8
+          shape: [Any, Any, Any]
+          optional: false
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: 0
+    outputs:
+      tokens:
+        contract:
+          dtype: int64
+          shape:
+          - batch
+          - sequence
+          optional: false
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role: tokens
+        family: { kind: materialized }
+        stage: pre_adapter
+    components:
+      decoder:
+        implementation:
+          kind: onnx
+          artifact: model.onnx.textproto
+        ports:
+          inputs:
+            attention_mask:
+              dtype: int64
+              shape: [Any, Any]
+              optional: false
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            position_ids:
+              dtype: int64
+              shape: [Any, Any]
+              optional: false
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            input_ids:
+              dtype: int64
+              shape: [Any, Any]
+              optional: false
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            past_key_values.0.key:
+              dtype: float32
+              shape: [Any, Any, Any, Any]
+              optional: false
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            past_key_values.0.value:
+              dtype: float32
+              shape: [Any, Any, Any, Any]
+              optional: false
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            past_key_values.1.key:
+              dtype: float32
+              shape: [Any, Any, Any, Any]
+              optional: false
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            past_key_values.1.value:
+              dtype: float32
+              shape: [Any, Any, Any, Any]
+              optional: false
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            past_compressed_kv.0:
+              dtype: uint8
+              shape: [Any, Any, Any]
+              optional: false
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            past_compression_carry.0:
+              dtype: float32
+              shape: [Any, Any, Any, Any]
+              optional: false
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            past_index_key.0:
+              dtype: uint8
+              shape: [Any, Any, Any]
+              optional: false
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            past_index_carry.0:
+              dtype: float32
+              shape: [Any, Any, Any, Any]
+              optional: false
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            past_compressed_kv.1:
+              dtype: float32
+              shape: [Any, Any, Any]
+              optional: false
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            past_compression_carry.1:
+              dtype: float32
+              shape: [Any, Any, Any, Any]
+              optional: false
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            logits:
+              dtype: float32
+              shape: [Any, Any, Any]
+              optional: false
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            present.0.key:
+              dtype: float32
+              shape: [Any, Any, Any, Any]
+              optional: false
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            present.0.value:
+              dtype: float32
+              shape: [Any, Any, Any, Any]
+              optional: false
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            present.1.key:
+              dtype: float32
+              shape: [Any, Any, Any, Any]
+              optional: false
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            present.1.value:
+              dtype: float32
+              shape: [Any, Any, Any, Any]
+              optional: false
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            present_compressed_kv.0:
+              dtype: uint8
+              shape: [Any, Any, Any]
+              optional: false
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            present_compression_carry.0:
+              dtype: float32
+              shape: [Any, Any, Any, Any]
+              optional: false
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            present_index_key.0:
+              dtype: uint8
+              shape: [Any, Any, Any]
+              optional: false
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            present_index_carry.0:
+              dtype: float32
+              shape: [Any, Any, Any, Any]
+              optional: false
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            present_compressed_kv.1:
+              dtype: float32
+              shape: [Any, Any, Any]
+              optional: false
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            present_compression_carry.1:
+              dtype: float32
+              shape: [Any, Any, Any, Any]
+              optional: false
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          roles:
+            input_ids: token_ids
+            attention_mask: attention_mask
+            position_ids: position_ids
+            logits: logits
+        contract:
+          id: onnx-genai.autoregressive-decode
+          version: '1.0'
+          equivalence: semantic
+          bindings: {}
+          parameters: {}
+        application_overridable: false
+        effects: []
+      token_policy:
+        implementation:
+          kind: binding
+        ports:
+          inputs:
+            logits:
+              dtype: float32
+              shape: [Any, Any, Any]
+              optional: false
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            accepted_len:
+              dtype: int64
+              shape:
+              - batch
+              optional: false
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            active:
+              dtype: bool
+              shape:
+              - batch
+              optional: false
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            done:
+              dtype: bool
+              shape:
+              - batch
+              optional: false
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            token:
+              dtype: int64
+              shape:
+              - batch
+              - sequence
+              optional: false
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+        contract:
+          id: onnx-genai.token-policy
+          version: '1.0'
+          equivalence: semantic
+          bindings: {}
+          parameters: {}
+        application_overridable: false
+        effects: []
+    state:
+      accepted_len:
+        contract:
+          dtype: int64
+          shape:
+          - batch
+          optional: false
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        class: semantic
+        scope: invocation
+        initializer: package.accepted_len
+        recurrence:
+          kind: invariant
+        management: workflow
+      active:
+        contract:
+          dtype: bool
+          shape:
+          - batch
+          optional: false
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        class: semantic
+        scope: invocation
+        initializer: package.active
+        recurrence:
+          kind: invariant
+        management: workflow
+      done:
+        contract:
+          dtype: bool
+          shape:
+          - batch
+          optional: false
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        class: semantic
+        scope: invocation
+        initializer: package.done
+        recurrence:
+          kind: invariant
+        management: workflow
+      sequence:
+        contract:
+          dtype: int64
+          shape:
+          - batch
+          - sequence
+          optional: false
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        class: semantic
+        scope: invocation
+        initializer: request.input_ids
+        recurrence:
+          kind: bounded
+          axis: 1
+          max: package.sequence_capacity
+        management: workflow
+      decoder_kv.0.key:
+        contract:
+          dtype: float32
+          shape: [Any, Any, Any, Any]
+          optional: false
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        class: semantic
+        scope: invocation
+        initializer: package.state_seed_f32_rank4
+        recurrence:
+          kind: invariant
+        management: runtime
+        release_boundary: invocation
+        service_group: decoder_kv
+      decoder_kv.0.value:
+        contract:
+          dtype: float32
+          shape: [Any, Any, Any, Any]
+          optional: false
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        class: semantic
+        scope: invocation
+        initializer: package.state_seed_f32_rank4
+        recurrence:
+          kind: invariant
+        management: runtime
+        release_boundary: invocation
+        service_group: decoder_kv
+      decoder_kv.1.key:
+        contract:
+          dtype: float32
+          shape: [Any, Any, Any, Any]
+          optional: false
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        class: semantic
+        scope: invocation
+        initializer: package.state_seed_f32_rank4
+        recurrence:
+          kind: invariant
+        management: runtime
+        release_boundary: invocation
+        service_group: decoder_kv
+      decoder_kv.1.value:
+        contract:
+          dtype: float32
+          shape: [Any, Any, Any, Any]
+          optional: false
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        class: semantic
+        scope: invocation
+        initializer: package.state_seed_f32_rank4
+        recurrence:
+          kind: invariant
+        management: runtime
+        release_boundary: invocation
+        service_group: decoder_kv
+      compressed_records.0.kv:
+        contract:
+          dtype: uint8
+          shape: [Any, Any, Any]
+          optional: false
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        class: semantic
+        scope: invocation
+        initializer: package.state_seed_u8_rank3
+        recurrence:
+          kind: bounded
+          axis: 1
+          max: package.record_capacity
+        management: runtime
+        release_boundary: invocation
+        service_group: compressed_records.0
+      compressed_carries.0.kv:
+        contract:
+          dtype: float32
+          shape: [Any, Any, Any, Any]
+          optional: false
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        class: semantic
+        scope: invocation
+        initializer: package.state_seed_f32_rank4
+        recurrence:
+          kind: invariant
+        management: runtime
+        release_boundary: invocation
+        service_group: compressed_carries.0
+      compressed_records.0.index:
+        contract:
+          dtype: uint8
+          shape: [Any, Any, Any]
+          optional: false
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        class: semantic
+        scope: invocation
+        initializer: package.state_seed_u8_rank3
+        recurrence:
+          kind: bounded
+          axis: 1
+          max: package.record_capacity
+        management: runtime
+        release_boundary: invocation
+        service_group: compressed_records.0
+      compressed_carries.0.index:
+        contract:
+          dtype: float32
+          shape: [Any, Any, Any, Any]
+          optional: false
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        class: semantic
+        scope: invocation
+        initializer: package.state_seed_f32_rank4
+        recurrence:
+          kind: invariant
+        management: runtime
+        release_boundary: invocation
+        service_group: compressed_carries.0
+      compressed_records.1.kv:
+        contract:
+          dtype: float32
+          shape: [Any, Any, Any]
+          optional: false
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        class: semantic
+        scope: invocation
+        initializer: package.state_seed_f32_rank3
+        recurrence:
+          kind: bounded
+          axis: 1
+          max: package.record_capacity
+        management: runtime
+        release_boundary: invocation
+        service_group: compressed_records.1
+      compressed_carries.1.kv:
+        contract:
+          dtype: float32
+          shape: [Any, Any, Any, Any]
+          optional: false
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        class: semantic
+        scope: invocation
+        initializer: package.state_seed_f32_rank4
+        recurrence:
+          kind: invariant
+        management: runtime
+        release_boundary: invocation
+        service_group: compressed_carries.1
+    effects: {}
+    serving:
+      active: active
+      done: done
+      accepted_len: accepted_len
+      state_service:
+        groups:
+          decoder_kv:
+            kind: full_attention
+            sequence_axis: 2
+            layout: head_major_bnsh
+            aliasing: forbidden
+            reuse:
+              prefix_reusable: true
+              evictable_prefix: true
+            capabilities:
+              snapshot: true
+              fork: true
+            ports:
+              decoder:
+                decoder_kv.0.key:
+                  input: past_key_values.0.key
+                  output: present.0.key
+                  role: key
+                  layer: 0
+                decoder_kv.0.value:
+                  input: past_key_values.0.value
+                  output: present.0.value
+                  role: value
+                  layer: 0
+                decoder_kv.1.key:
+                  input: past_key_values.1.key
+                  output: present.1.key
+                  role: key
+                  layer: 1
+                decoder_kv.1.value:
+                  input: past_key_values.1.value
+                  output: present.1.value
+                  role: value
+                  layer: 1
+          compressed_records.0:
+            kind: compressed_attention
+            properties:
+              kind: compressed_attention
+              ratio: ratio4
+              record_format: fp8_e4m3_block64
+              recurrence: standard
+            layout: batch_record_feature
+            aliasing: forbidden
+            update:
+              kind: append
+            reuse:
+              prefix_reusable: false
+              evictable_prefix: false
+            capabilities:
+              snapshot: false
+              fork: false
+              cascade:
+              - compressed_carries.0
+            ports:
+              decoder:
+                compressed_records.0.kv:
+                  input: past_compressed_kv.0
+                  output: present_compressed_kv.0
+                  role: compressed_kv
+                  layer: 0
+                compressed_records.0.index:
+                  input: past_index_key.0
+                  output: present_index_key.0
+                  role: index_key
+                  layer: 0
+            sequence_axis: 1
+          compressed_carries.0:
+            kind: compressed_attention
+            properties:
+              kind: compressed_attention
+              ratio: ratio4
+              record_format: fp8_e4m3_block64
+              recurrence: standard
+            layout: batch_carry_slot_stream_feature
+            aliasing: forbidden
+            update:
+              kind: replace
+            reuse:
+              prefix_reusable: false
+              evictable_prefix: false
+            capabilities:
+              snapshot: false
+              fork: false
+              cascade:
+              - compressed_records.0
+            ports:
+              decoder:
+                compressed_carries.0.kv:
+                  input: past_compression_carry.0
+                  output: present_compression_carry.0
+                  role: compression_carry
+                  layer: 0
+                compressed_carries.0.index:
+                  input: past_index_carry.0
+                  output: present_index_carry.0
+                  role: index_carry
+                  layer: 0
+          compressed_records.1:
+            kind: compressed_attention
+            properties:
+              kind: compressed_attention
+              ratio: ratio128
+              record_format: f32
+              recurrence: standard
+            layout: batch_record_feature
+            aliasing: forbidden
+            update:
+              kind: append
+            reuse:
+              prefix_reusable: false
+              evictable_prefix: false
+            capabilities:
+              snapshot: false
+              fork: false
+              cascade:
+              - compressed_carries.1
+            ports:
+              decoder:
+                compressed_records.1.kv:
+                  input: past_compressed_kv.1
+                  output: present_compressed_kv.1
+                  role: compressed_kv
+                  layer: 1
+            sequence_axis: 1
+          compressed_carries.1:
+            kind: compressed_attention
+            properties:
+              kind: compressed_attention
+              ratio: ratio128
+              record_format: f32
+              recurrence: standard
+            layout: batch_carry_slot_stream_feature
+            aliasing: forbidden
+            update:
+              kind: replace
+            reuse:
+              prefix_reusable: false
+              evictable_prefix: false
+            capabilities:
+              snapshot: false
+              fork: false
+              cascade:
+              - compressed_records.1
+            ports:
+              decoder:
+                compressed_carries.1.kv:
+                  input: past_compression_carry.1
+                  output: present_compression_carry.1
+                  role: compression_carry
+                  layer: 1
+    steps:
+    - kind: loop
+      setup: []
+      steps:
+      - kind: invoke
+        component: decoder
+        inputs:
+          attention_mask: application.attention_mask
+          input_ids: request.input_ids
+          position_ids: application.position_ids
+          past_key_values.0.key: decoder_kv.0.key
+          past_key_values.0.value: decoder_kv.0.value
+          past_key_values.1.key: decoder_kv.1.key
+          past_key_values.1.value: decoder_kv.1.value
+          past_compressed_kv.0: compressed_records.0.kv
+          past_index_key.0: compressed_records.0.index
+          past_compression_carry.0: compressed_carries.0.kv
+          past_index_carry.0: compressed_carries.0.index
+          past_compressed_kv.1: compressed_records.1.kv
+          past_compression_carry.1: compressed_carries.1.kv
+        outputs:
+          logits: step.logits
+          present.0.key: body.decoder_kv.0.key
+          present.0.value: body.decoder_kv.0.value
+          present.1.key: body.decoder_kv.1.key
+          present.1.value: body.decoder_kv.1.value
+          present_compressed_kv.0: body.compressed_records.0.kv
+          present_index_key.0: body.compressed_records.0.index
+          present_compression_carry.0: body.compressed_carries.0.kv
+          present_index_carry.0: body.compressed_carries.0.index
+          present_compressed_kv.1: body.compressed_records.1.kv
+          present_compression_carry.1: body.compressed_carries.1.kv
+      - kind: invoke
+        component: token_policy
+        inputs:
+          logits: step.logits
+        outputs:
+          accepted_len: body.accepted_len
+          active: body.active
+          done: body.done
+          token: step.token
+      - kind: emit
+        value: step.token
+        when: active
+        output: tokens
+        mode: append
+      continue_when: active
+      max_iterations: request.max_iterations
+      termination: generation_eos
+      iteration:
+        value: loop.iteration
+        contract:
+          dtype: int64
+          shape:
+          - 1
+          optional: false
+      carried:
+      - cell: decoder_kv.0.key
+        next: body.decoder_kv.0.key
+      - cell: decoder_kv.0.value
+        next: body.decoder_kv.0.value
+      - cell: decoder_kv.1.key
+        next: body.decoder_kv.1.key
+      - cell: decoder_kv.1.value
+        next: body.decoder_kv.1.value
+      - cell: compressed_records.0.kv
+        next: body.compressed_records.0.kv
+      - cell: compressed_carries.0.kv
+        next: body.compressed_carries.0.kv
+      - cell: compressed_records.0.index
+        next: body.compressed_records.0.index
+      - cell: compressed_carries.0.index
+        next: body.compressed_carries.0.index
+      - cell: compressed_records.1.kv
+        next: body.compressed_records.1.kv
+      - cell: compressed_carries.1.kv
+        next: body.compressed_carries.1.kv
+      - cell: active
+        next: body.active
+      - cell: done
+        next: body.done
+      - cell: accepted_len
+        next: body.accepted_len
+      - cell: sequence
+        next: step.token
+schema_version: v1.2
+package:
+  tokenizer:
+    algorithm: bpe
+    vocab_size: 100
+    byte_level: true
+    special_tokens:
+      eos_token_id:
+      - 99

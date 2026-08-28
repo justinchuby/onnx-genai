@@ -23,12 +23,14 @@ use std::sync::Arc;
 
 mod backend;
 mod cpu;
+mod csa;
 mod cuda;
 mod io;
 mod kv_commit;
 mod load;
 mod paged_gqa;
 mod tensor;
+pub use csa::{CompressedStateTensorPhase, CompressedStateTransitionRefusal};
 #[cfg(feature = "native-cuda")]
 pub(crate) use tensor::recurrent_state_bytes_from_graph;
 #[cfg(test)]
@@ -112,6 +114,23 @@ pub struct NativeDecodeSession {
     hidden_output: Option<String>,
     kv_inputs: Vec<String>,
     present_to_past: HashMap<String, String>,
+    /// Resolved CSA/HCA record transitions whose growth axis is a
+    /// backend-owned compressed-record cursor, not the token count.
+    ///
+    /// A growable KV cache present output has its sequence axis equal to the
+    /// running token length (`past_len + tokens`), which the CPU decode path
+    /// asserts to catch a mis-bound cache. A CompressedSparseAttention record
+    /// buffer (`compressed_kv`, `index_key`) instead grows by roughly
+    /// `tokens / compression_ratio` records — a cursor the op owns and the ABI
+    /// declares is not inferable from the token count. These sets are classified
+    /// from the canonical [`onnx_genai_metadata::StatePortRole`] and
+    /// [`onnx_genai_metadata::StateGroupProperties`] at load time (never from
+    /// tensor shape).
+    ///
+    /// The plan owns one descriptor per property-typed input→output transition
+    /// plus name indexes. Runtime validation, accounting, state reporting, and
+    /// operation refusals all consume this same authority.
+    compressed_state: csa::CompressedStatePlan,
     past: HashMap<String, Tensor>,
     cuda: Option<DecodeCudaState>,
     cpu_kv: Option<DecodeCpuKvState>,
@@ -155,6 +174,62 @@ pub struct NativeDecodeSession {
     /// axis internally, so its rows cannot be mapped back to input positions and
     /// padding would silently answer with a padded row.
     prefill_query_padding: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeStateOperation {
+    Snapshot,
+    Restore,
+    Rollback,
+    Rewind,
+    Fork,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeStateOperationRefusal {
+    pub operation: NativeStateOperation,
+    pub target_len: Option<usize>,
+    pub state_inputs: Vec<String>,
+}
+
+impl std::fmt::Display for NativeStateOperationRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let operation = match self.operation {
+            NativeStateOperation::Snapshot => "snapshot",
+            NativeStateOperation::Restore => "restore",
+            NativeStateOperation::Rollback => "rollback",
+            NativeStateOperation::Rewind => "rewind",
+            NativeStateOperation::Fork => "fork",
+        };
+        write!(
+            formatter,
+            "native compressed-attention state does not support {operation}"
+        )?;
+        if let Some(target) = self.target_len {
+            write!(formatter, " to token length {target}")?;
+        }
+        write!(
+            formatter,
+            ": record cursors and partial compressor carries cannot be reconstructed at an \
+             arbitrary token boundary; reset to zero is supported. State inputs: {:?}",
+            self.state_inputs
+        )
+    }
+}
+
+impl std::error::Error for NativeStateOperationRefusal {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompressedRecordStateInfo {
+    pub group: String,
+    pub layer: usize,
+    pub role: onnx_genai_metadata::StatePortRole,
+    pub input: String,
+    pub ratio: onnx_genai_metadata::CompressionRatio,
+    pub dtype: DataType,
+    pub batch: usize,
+    pub records: usize,
+    pub record_width_bytes: usize,
 }
 
 /// Deep-copy of the native loop-carried tensors at a semantic prefix boundary.
@@ -277,8 +352,50 @@ impl NativeDecodeSession {
         self.current_len
     }
 
+    /// Actual graph-visible compressed-record extents currently carried by the
+    /// CPU session. Empty before the first step or for a decoder without
+    /// compressed-attention state.
+    pub fn compressed_record_state(&self) -> anyhow::Result<Vec<CompressedRecordStateInfo>> {
+        let mut state = Vec::with_capacity(self.compressed_state.len());
+        for spec in self.compressed_state.records() {
+            let Some(tensor) = self.past.get(&spec.input) else {
+                continue;
+            };
+            let records = *tensor.shape.get(spec.sequence_axis).with_context(|| {
+                format!(
+                    "compressed state '{}' record axis {} is outside shape {:?}",
+                    spec.input, spec.sequence_axis, tensor.shape
+                )
+            })?;
+            state.push(CompressedRecordStateInfo {
+                group: spec.group.clone(),
+                layer: spec.layer,
+                role: spec.role,
+                input: spec.input.clone(),
+                ratio: spec.ratio,
+                dtype: tensor.dtype,
+                batch: tensor.shape[0],
+                records,
+                record_width_bytes: spec.record_width_bytes,
+            });
+        }
+        state.sort_by(|left, right| left.input.cmp(&right.input));
+        Ok(state)
+    }
+
     pub fn kv_layer_count(&self) -> usize {
-        self.kv_inputs.len() / 2
+        self.kv_inputs
+            .iter()
+            .filter(|name| !self.compressed_state.contains_past(name))
+            .filter(|name| {
+                self.session
+                    .inputs()
+                    .iter()
+                    .find(|meta| &meta.name == *name)
+                    .is_some_and(|meta| !is_recurrent_state_shape(&meta.shape))
+            })
+            .count()
+            / 2
     }
 
     /// Stage 2a (#750): run **one fused forward** over `token_ids.len()`
@@ -393,7 +510,12 @@ impl NativeDecodeSession {
         // Length-`past_len` batched past for every KV / recurrent-state input,
         // batch axis = N.
         for name in &self.kv_inputs {
-            let tensor = make_past_input_tensor_batched(&self.session, name, batch, past_len)?;
+            let logical_len = self
+                .compressed_state
+                .record_for_past(name)
+                .map(|spec| past_len / spec.ratio.tokens_per_record())
+                .unwrap_or(past_len);
+            let tensor = make_past_input_tensor_batched(&self.session, name, batch, logical_len)?;
             owned.push((name.clone(), tensor));
         }
 
@@ -424,7 +546,10 @@ impl NativeDecodeSession {
     }
 
     pub(crate) fn supports_past_snapshots(&self) -> bool {
-        self.cuda.is_none() && self.cpu_kv.is_none() && self.has_recurrent_state()
+        self.cuda.is_none()
+            && self.cpu_kv.is_none()
+            && self.has_recurrent_state()
+            && self.compressed_state.is_empty()
     }
 
     fn recurrent_past_names(&self) -> HashSet<String> {
@@ -442,11 +567,67 @@ impl NativeDecodeSession {
             .collect()
     }
 
+    /// Past-input names of the CSA/HCA compressed-record buffers
+    /// (`past_compressed_kv.*`, `past_index_key.*`).
+    ///
+    /// Classified from typed canonical state roles and properties at load time,
+    /// not from tensor
+    /// shape: their growth axis is the backend-owned compressed-record cursor
+    /// (~tokens/ratio), so they are append-only but cannot be token-prefix-sliced
+    /// like a dense KV cache.
+    /// The fixed-size carries are excluded (they thread as recurrent
+    /// wholesale-swap state via [`Self::recurrent_past_names`]). Empty for a
+    /// graph with no CSA record state.
+    fn csa_record_past_names(&self) -> HashSet<String> {
+        self.compressed_state.past_names().cloned().collect()
+    }
+
+    fn compressed_state_refusal(
+        &self,
+        operation: NativeStateOperation,
+        target_len: Option<usize>,
+    ) -> Option<anyhow::Error> {
+        if self.compressed_state.is_empty() {
+            return None;
+        }
+        let mut state_inputs = self
+            .compressed_state
+            .past_names()
+            .cloned()
+            .collect::<Vec<_>>();
+        state_inputs.sort();
+        Some(anyhow::Error::new(NativeStateOperationRefusal {
+            operation,
+            target_len,
+            state_inputs,
+        }))
+    }
+
+    /// Check whether a state operation is supported by every declared state
+    /// group before attempting it. Unsupported compressed-record operations
+    /// return [`NativeStateOperationRefusal`], which callers may downcast.
+    pub fn ensure_state_operation_supported(
+        &self,
+        operation: NativeStateOperation,
+        target_len: Option<usize>,
+    ) -> anyhow::Result<()> {
+        if operation == NativeStateOperation::Rewind && target_len == Some(0) {
+            return Ok(());
+        }
+        if let Some(error) = self.compressed_state_refusal(operation, target_len) {
+            return Err(error);
+        }
+        Ok(())
+    }
+
     pub(crate) fn has_recurrent_state(&self) -> bool {
         !self.recurrent_past_names().is_empty()
     }
 
     pub(crate) fn snapshot_past(&self) -> anyhow::Result<NativePastSnapshot> {
+        if let Some(error) = self.compressed_state_refusal(NativeStateOperation::Snapshot, None) {
+            return Err(error);
+        }
         if !self.supports_past_snapshots() {
             bail!("native past snapshots require host past tensors and recurrent state");
         }
@@ -475,6 +656,11 @@ impl NativeDecodeSession {
         &mut self,
         snapshot: &NativePastSnapshot,
     ) -> anyhow::Result<()> {
+        if let Some(error) =
+            self.compressed_state_refusal(NativeStateOperation::Restore, Some(snapshot.len))
+        {
+            return Err(error);
+        }
         if !self.supports_past_snapshots() {
             bail!("native past snapshots require host past tensors and recurrent state");
         }
@@ -504,6 +690,9 @@ impl NativeDecodeSession {
     /// it is a prefix-sliceable append-only cache the ordinary rewind already
     /// handles.
     pub(crate) fn snapshot_recurrent_state(&mut self) -> anyhow::Result<RecurrentStateSnapshot> {
+        if let Some(error) = self.compressed_state_refusal(NativeStateOperation::Snapshot, None) {
+            return Err(error);
+        }
         if !self.has_recurrent_state() {
             bail!("snapshot_recurrent_state requires a decoder that carries recurrent state");
         }
@@ -522,13 +711,11 @@ impl NativeDecodeSession {
                  recurrent decoders keep their loop-carried state in the host past map"
             );
         }
-        let recurrent = self.recurrent_past_names();
-        let mut host = HashMap::with_capacity(recurrent.len());
-        for name in &recurrent {
+        let snapshot_names = self.recurrent_past_names();
+        let mut host = HashMap::with_capacity(snapshot_names.len());
+        for name in &snapshot_names {
             let tensor = self.past.get(name).with_context(|| {
-                format!(
-                    "recurrent state '{name}' is not materialized yet; snapshot it after a step"
-                )
+                format!("state '{name}' is not materialized yet; snapshot it after a step")
             })?;
             host.insert(
                 name.clone(),
@@ -587,6 +774,11 @@ impl NativeDecodeSession {
         base_len: usize,
         accepted_tokens: &[TokenId],
     ) -> anyhow::Result<()> {
+        if let Some(error) =
+            self.compressed_state_refusal(NativeStateOperation::Rollback, Some(base_len))
+        {
+            return Err(error);
+        }
         if snapshot.len != base_len {
             bail!(
                 "recurrent snapshot length {} does not match commit base length {base_len}",
@@ -984,6 +1176,7 @@ impl NativeDecodeSession {
         let bytes = crate::native_decode::tensor::kv_cache_bytes_per_sequence(
             &self.session,
             &self.present_to_past,
+            &self.compressed_state,
             max_context,
         )?;
         // Same reasoning as `recurrent_state_reservation`: where these live is a
@@ -1093,6 +1286,19 @@ impl NativeDecodeSession {
         snapshot: &NativeRecurrentSnapshot,
     ) -> anyhow::Result<()> {
         self.restore_recurrent_state(&snapshot.0)
+    }
+
+    /// Speculative rollback for a recurrent decoder: rewind dense KV to
+    /// `base_len`, restore snapshotted conv/SSM carries, then deterministically
+    /// re-advance by `accepted_tokens`. Compressed-record groups that do not
+    /// declare rollback support return [`NativeStateOperationRefusal`].
+    pub fn rollback_recurrent_to_accepted(
+        &mut self,
+        snapshot: &NativeRecurrentSnapshot,
+        base_len: usize,
+        accepted_tokens: &[TokenId],
+    ) -> anyhow::Result<()> {
+        self.commit_recurrent_state_to_accepted(&snapshot.0, base_len, accepted_tokens)
     }
 
     /// Batch-N greedy decode step (stage 2b-impl-4, #750). Steps the pinned
@@ -1382,7 +1588,21 @@ impl NativeDecodeSession {
     }
 
     /// Rewind by prefix-slicing every carried host KV tensor.
+    ///
+    /// A CSA/HCA compressed-record cache cannot be prefix-sliced to an
+    /// arbitrary non-zero token boundary (its cursor advances at the per-layer
+    /// compression rate and its compressor carry is not reconstructible mid
+    /// block), so a bare rewind to a non-zero length with CSA state present is
+    /// a typed refusal rather than a silent corruption. `rewind(0)` (a full
+    /// teardown via [`Self::reset`]) always clears it. Snapshot and rollback
+    /// likewise refuse unless the declared group capabilities can support them.
     pub fn rewind(&mut self, target_len: usize) -> anyhow::Result<()> {
+        if target_len > 0
+            && let Some(error) =
+                self.compressed_state_refusal(NativeStateOperation::Rewind, Some(target_len))
+        {
+            return Err(error);
+        }
         self.rewind_inner(target_len)
     }
 

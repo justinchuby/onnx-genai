@@ -189,6 +189,35 @@ pub struct DecoderAbi {
     /// than having its integer control ports guessed by name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub static_cache: Option<StaticCacheIoSpec>,
+
+    /// Runtime view of the canonical workflow state groups bound to this
+    /// decoder. This is derived together with the rest of the ABI and is never
+    /// serialized, so `pipeline.workflow.serving.state_service.groups` remains
+    /// the sole authority.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub state_groups: Vec<DecoderStateGroup>,
+}
+
+/// One canonical state-service group resolved for a decoder component.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecoderStateGroup {
+    pub name: String,
+    pub kind: StateKind,
+    pub properties: Option<StateGroupProperties>,
+    pub sequence_axis: Option<usize>,
+    pub update: Option<StateUpdate>,
+    pub capabilities: StateGroupCapabilities,
+    pub ports: Vec<DecoderStatePort>,
+}
+
+/// One read-write state port resolved from a canonical group.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecoderStatePort {
+    pub role: Option<StatePortRole>,
+    pub layer: Option<usize>,
+    pub input: String,
+    pub output: String,
 }
 
 /// Explicit port ABI for a fixed-buffer TensorScatter static KV cache.

@@ -1099,6 +1099,39 @@
       ],
       "type": "object"
     },
+    "CompressedRecordFormat": {
+      "description": "Graph-visible storage format of compressed attention KV records.",
+      "oneOf": [
+        {
+          "enum": [
+            "f32",
+            "fp8_e4m3_block64"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "fp4_e2m1_block32",
+          "description": "The learned-index representation. It is expressible so a runtime can\nissue a typed refusal when incorrectly declared for KV records.",
+          "type": "string"
+        }
+      ]
+    },
+    "CompressionRatio": {
+      "description": "Supported token-to-record cadences for compressed attention.",
+      "enum": [
+        "ratio4",
+        "ratio128"
+      ],
+      "type": "string"
+    },
+    "CompressionRecurrence": {
+      "description": "Recurrence discipline of a compressed-attention state group.",
+      "enum": [
+        "standard",
+        "multi_token_prediction"
+      ],
+      "type": "string"
+    },
     "ConstraintLanguageFacts": {
       "additionalProperties": false,
       "description": "A constraint language the package's parser accepts.\n\nThe parser implementation may be native; only the dialect and version are\nportable facts. A request carries the grammar or JSON Schema itself.",
@@ -3427,6 +3460,17 @@
           "default": {},
           "type": "object"
         },
+        "properties": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StateGroupProperties"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Typed algorithmic properties carried by this state group.\n\nMost state kinds need no additional properties. Compressed-attention\nstate must declare its compression cadence and record representation\nbecause neither is recoverable from tensor names or shapes."
+        },
         "reuse": {
           "$ref": "#/$defs/StateReuse",
           "default": {
@@ -3469,6 +3513,40 @@
       ],
       "type": "object"
     },
+    "StateGroupProperties": {
+      "description": "Algorithmic properties of a semantic state group.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "Properties shared by the record and carry groups of one compressed-\nattention layer.",
+          "properties": {
+            "kind": {
+              "const": "compressed_attention",
+              "type": "string"
+            },
+            "ratio": {
+              "$ref": "#/$defs/CompressionRatio",
+              "description": "Number of source tokens accumulated per emitted record."
+            },
+            "record_format": {
+              "$ref": "#/$defs/CompressedRecordFormat",
+              "description": "Storage representation of the compressed-KV record stream."
+            },
+            "recurrence": {
+              "$ref": "#/$defs/CompressionRecurrence",
+              "default": "standard",
+              "description": "Recurrence discipline used by the compressor."
+            }
+          },
+          "required": [
+            "kind",
+            "ratio",
+            "record_format"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "StateKind": {
       "description": "Semantic kind of a model state group.",
       "oneOf": [
@@ -3485,6 +3563,11 @@
         {
           "const": "multi_latent_attention",
           "description": "Compressed latent attention state (MLA).",
+          "type": "string"
+        },
+        {
+          "const": "compressed_attention",
+          "description": "Block-compressed causal attention records and their fixed compressor\ncarries.",
           "type": "string"
         },
         {
@@ -3598,6 +3681,26 @@
         {
           "const": "combined",
           "description": "A single buffer holding keys and values together.",
+          "type": "string"
+        },
+        {
+          "const": "compressed_kv",
+          "description": "Compressed KV records emitted at the declared compression cadence.",
+          "type": "string"
+        },
+        {
+          "const": "compression_carry",
+          "description": "Fixed-size compressor carry replaced after every step.",
+          "type": "string"
+        },
+        {
+          "const": "index_key",
+          "description": "Learned index-key records used by query-selective compressed attention.",
+          "type": "string"
+        },
+        {
+          "const": "index_carry",
+          "description": "Fixed-size learned-index compressor carry.",
           "type": "string"
         }
       ]

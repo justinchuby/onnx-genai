@@ -88,6 +88,13 @@ impl NativeDecodeSession {
         device: NativeDecodeDevice,
         options: NativeDecodeLoadOptions<'_>,
     ) -> anyhow::Result<Self> {
+        csa::refuse_compressed_records_on_cuda(
+            options
+                .io
+                .map(|io| io.state_groups.as_slice())
+                .unwrap_or_default(),
+            matches!(&device, NativeDecodeDevice::Cuda { .. }),
+        )?;
         let preference = match device {
             NativeDecodeDevice::Cpu => DevicePreference::Cpu,
             NativeDecodeDevice::Cuda { index } => DevicePreference::Gpu { index },
@@ -319,6 +326,10 @@ impl NativeDecodeSession {
         >,
         #[cfg(not(feature = "native-cuda"))] _cuda_offload_policy: Option<()>,
     ) -> anyhow::Result<Self> {
+        csa::refuse_compressed_records_on_cuda(
+            io.map(|io| io.state_groups.as_slice()).unwrap_or_default(),
+            matches!(&device, NativeDecodeDevice::Cuda { .. }),
+        )?;
         if options.metadata_max_len.is_none() {
             options.metadata_max_len = native_metadata_max_len_from_model_path(path.as_ref());
         }
@@ -614,6 +625,9 @@ impl NativeDecodeSession {
             },
             None => (Vec::new(), Vec::new()),
         };
+        // Every append-updated group, including compressed record groups, is
+        // already lowered positionally by the canonical workflow recognizer.
+        let append_state_count = kv_inputs.len();
 
         // Fixed loop-carried recurrent states (hybrid linear-attention
         // `conv_state` / `recurrent_state`) are declared through `io.state_pairs`
@@ -622,12 +636,8 @@ impl NativeDecodeSession {
         // past input (recurrent states are seeded at their full static extent by
         // `make_empty_input_tensor`) and copies the present output back each step
         // (`replace` semantics fall out naturally from the wholesale tensor swap).
-        // So fold the declared state pairs into the same positionally-paired
-        // lists. This is what lets hybrid SSM/attention decoders (qwen3.5) decode:
-        // their linear-attention layers carry state only through these pairs.
-        // Appending to both lists in the same order keeps the positional zip below
-        // correct; `present_to_past` also records each pair explicitly, so the
-        // recurrent tail never depends on the zip.
+        // So fold the declared state pairs into the same lists and record each
+        // pair by name in `present_to_past` below.
         let mut state_pairs: Vec<(String, String)> = Vec::new();
         if let Some(pairs) = io.and_then(|io| io.state_pairs.as_ref()) {
             for pair in pairs {
@@ -636,6 +646,23 @@ impl NativeDecodeSession {
                 state_pairs.push((pair.output.clone(), pair.input.clone()));
             }
         }
+        // Validate the canonical compressed-attention groups against the graph's
+        // typed IO and retain only the record-axis properties the executor needs.
+        // Carries have already lowered into `state_pairs`; append-updated records
+        // have already lowered into `kv_inputs`/`present_outputs`.
+        let compressed_state = csa::resolve_compressed_state(
+            session.inputs(),
+            session.outputs(),
+            io.map(|io| io.state_groups.as_slice()).unwrap_or_default(),
+        )?;
+        csa::refuse_compressed_records_on_cuda(
+            io.map(|io| io.state_groups.as_slice()).unwrap_or_default(),
+            session.device_id().device_type == DeviceType::Cuda,
+        )?;
+        // Only the fixed carries and hybrid recurrent states are wholesale-swap
+        // "fixed" state; the growable CSA record buffers are explicitly excluded
+        // so the CUDA/accounting/growth paths treat them as growable, matching
+        // the CPU present->past handoff.
         let fixed_state_inputs = state_pairs
             .iter()
             .map(|(_, input)| input.clone())
@@ -648,14 +675,14 @@ impl NativeDecodeSession {
         }
 
         let mut present_to_past = HashMap::new();
-        // KV lists pair positionally; state pairs carry explicit names.
-        let kv_pair_count = kv_inputs.len() - state_pairs.len();
+        // Append-updated pairs are positional; replacement groups carry
+        // explicit names.
         present_to_past.extend(
             present_outputs
                 .iter()
-                .take(kv_pair_count)
+                .take(append_state_count)
                 .cloned()
-                .zip(kv_inputs.iter().take(kv_pair_count).cloned()),
+                .zip(kv_inputs.iter().take(append_state_count).cloned()),
         );
         present_to_past.extend(state_pairs.iter().cloned());
         if present_to_past.len() != kv_inputs.len() {
@@ -663,6 +690,7 @@ impl NativeDecodeSession {
                 "native decoder has incomplete past/present pairs; past inputs: {kv_inputs:?}, present outputs: {present_outputs:?}"
             );
         }
+        compressed_state.verify_pairing(&present_to_past)?;
 
         let mut declared_sources = HashMap::new();
         for (name, source) in [
@@ -911,6 +939,7 @@ impl NativeDecodeSession {
             hidden_output,
             kv_inputs,
             present_to_past,
+            compressed_state,
             past: HashMap::new(),
             cuda,
             cpu_kv,

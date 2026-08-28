@@ -1,0 +1,3 @@
+# `model.onnx` and `model.onnx.data` are committed so the E2E cannot skip-pass.
+# The generator's transient report is compared with `io_report.json`, not kept.
+model.onnx_io.json

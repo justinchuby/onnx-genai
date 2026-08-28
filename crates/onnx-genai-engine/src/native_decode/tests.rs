@@ -1529,6 +1529,7 @@ fn target_io(sequence_source: SequenceInputKind) -> DecoderAbi {
         state_pairs: None,
         optional_inputs: BTreeMap::new(),
         static_cache: None,
+        state_groups: Vec::new(),
         aliasing: None,
     }
 }
@@ -1556,6 +1557,7 @@ fn tiny_decoder_io() -> DecoderAbi {
         state_pairs: None,
         optional_inputs: BTreeMap::new(),
         static_cache: None,
+        state_groups: Vec::new(),
         aliasing: None,
     }
 }
@@ -3920,8 +3922,13 @@ fn kv_is_sized_at_full_context_per_sequence() {
             "past_key_values.1.value".to_string(),
         ),
     ]);
-    let bytes = crate::native_decode::tensor::kv_cache_bytes_per_sequence(&session, &declared, 128)
-        .expect("the fixture pins every axis but the growable one");
+    let bytes = crate::native_decode::tensor::kv_cache_bytes_per_sequence(
+        &session,
+        &declared,
+        &super::csa::CompressedStatePlan::default(),
+        128,
+    )
+    .expect("the fixture pins every axis but the growable one");
     assert_eq!(bytes, 1024, "2 tensors x 128 f32 elements is 1024 bytes");
 }
 
@@ -3955,8 +3962,13 @@ fn recurrent_state_is_not_charged_as_kv() {
             "past_key_values.1.value".to_string(),
         ),
     ]);
-    let bytes = crate::native_decode::tensor::kv_cache_bytes_per_sequence(&session, &all, 128)
-        .expect("the fixture is sizeable");
+    let bytes = crate::native_decode::tensor::kv_cache_bytes_per_sequence(
+        &session,
+        &all,
+        &super::csa::CompressedStatePlan::default(),
+        128,
+    )
+    .expect("the fixture is sizeable");
     assert_eq!(
         bytes, 1024,
         "only layer 1's KV counts; layer 0's state is charged at its own fixed size"
@@ -3971,8 +3983,13 @@ fn recurrent_state_is_not_charged_as_kv() {
 fn a_decoder_declaring_no_pairs_needs_no_kv_reservation() {
     let session = tiny_hybrid_decoder();
     let none = std::collections::HashMap::new();
-    let bytes = crate::native_decode::tensor::kv_cache_bytes_per_sequence(&session, &none, 4096)
-        .expect("an empty declaration is sizeable");
+    let bytes = crate::native_decode::tensor::kv_cache_bytes_per_sequence(
+        &session,
+        &none,
+        &super::csa::CompressedStatePlan::default(),
+        4096,
+    )
+    .expect("an empty declaration is sizeable");
     assert_eq!(bytes, 0);
 }
 

@@ -445,6 +445,7 @@ fn recurrent_state_tensor_bytes(name: &str, dtype: DataType, shape: &[Dim]) -> a
 pub(crate) fn kv_cache_bytes_per_sequence(
     session: &InferenceSession,
     present_to_past: &std::collections::HashMap<String, String>,
+    compressed_records: &super::csa::CompressedStatePlan,
     max_context: usize,
 ) -> anyhow::Result<u64> {
     let declared: std::collections::HashSet<&str> =
@@ -454,7 +455,10 @@ pub(crate) fn kv_cache_bytes_per_sequence(
         // Recurrent state is loop-carried too, and is charged separately at its
         // own fixed size. Sizing it by context would be wrong by orders of
         // magnitude -- its whole point is that it does not grow.
-        if !declared.contains(meta.name.as_str()) || is_recurrent_state_shape(&meta.shape) {
+        if !declared.contains(meta.name.as_str())
+            || is_recurrent_state_shape(&meta.shape)
+            || compressed_records.contains_past(&meta.name)
+        {
             continue;
         }
         tensors.push(crate::kv_sizing::KvTensorSpec {
@@ -482,7 +486,55 @@ pub(crate) fn kv_cache_bytes_per_sequence(
                 .collect(),
         });
     }
-    crate::kv_sizing::kv_cache_bytes_for_tensors(&tensors, u64::try_from(max_context).unwrap_or(0))
+    let dense = crate::kv_sizing::kv_cache_bytes_for_tensors(
+        &tensors,
+        u64::try_from(max_context).unwrap_or(0),
+    )?;
+    let mut compressed = 0_u64;
+    for spec in compressed_records.records() {
+        let name = &spec.input;
+        let meta = session
+            .inputs()
+            .iter()
+            .find(|meta| meta.name == *name)
+            .with_context(|| format!("missing compressed state input metadata for '{name}'"))?;
+        if spec.sequence_axis >= meta.shape.len() {
+            bail!(
+                "compressed state input '{name}' sequence axis {} is outside rank {}",
+                spec.sequence_axis,
+                meta.shape.len()
+            );
+        }
+        let records = max_context / spec.ratio.tokens_per_record();
+        let mut elements = 1_usize;
+        for (axis, dim) in meta.shape.iter().copied().enumerate() {
+            let extent = if axis == 0 {
+                1
+            } else if axis == spec.sequence_axis {
+                records
+            } else if let Dim::Static(value) = dim {
+                value
+            } else {
+                bail!(
+                    "cannot size compressed state '{name}': dimension {axis} of {:?} is symbolic \
+                     and is neither batch nor the declared record axis",
+                    meta.shape
+                );
+            };
+            elements = elements.saturating_mul(extent);
+        }
+        let bytes = meta
+            .dtype
+            .checked_storage_bytes(elements)
+            .with_context(|| {
+                format!(
+                    "unsupported compressed-state dtype {:?} for '{name}'",
+                    meta.dtype
+                )
+            })?;
+        compressed = compressed.saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
+    }
+    Ok(dense.saturating_add(compressed))
 }
 
 pub(crate) fn make_empty_input_tensor(

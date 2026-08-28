@@ -4,8 +4,8 @@
 //! The registered operator exposes the complete frozen stateful v1 boundary.
 //! Ratio-128 and ratio-4 own their persistent compressed records and incremental
 //! carries. Ratio-4 additionally builds the shared FP4 index-key stream and
-//! learned top-k selection. Unfrozen top-k ties and the MTP sidecar remain
-//! explicit Unsupported paths.
+//! learned top-k selection. Equal scores use the same lower-index-first rule as
+//! ONNX TopK; the MTP sidecar remains an explicit Unsupported path.
 
 use std::borrow::Cow;
 
@@ -1949,17 +1949,12 @@ fn select_ratio4_topk(
                 }
                 scores.push((record, score));
             }
-            for left in 0..scores.len() {
-                for right in left + 1..scores.len() {
-                    if scores[left].1 == scores[right].1 {
-                        return Err(unsupported(format!(
-                            "portable top-k tie ordering is unfrozen: equal score {} at [batch={b}, query={s}] for compressed records {} and {}",
-                            scores[left].1, scores[left].0, scores[right].0
-                        )));
-                    }
-                }
-            }
-            scores.sort_unstable_by(|left, right| right.1.total_cmp(&left.1));
+            scores.sort_unstable_by(|left, right| {
+                right
+                    .1
+                    .total_cmp(&left.1)
+                    .then_with(|| left.0.cmp(&right.0))
+            });
             let row = b
                 .checked_mul(sequence)
                 .and_then(|value| value.checked_add(s))
@@ -5168,8 +5163,8 @@ mod tests {
     }
 
     #[test]
-    fn ratio4_topk_ties_remain_explicitly_unsupported() {
-        let message = select_ratio4_topk(
+    fn ratio4_topk_ties_prefer_lower_record_index() {
+        let selected = select_ratio4_topk(
             &[0.0; 128],
             &[1.0],
             &[0.25; 256],
@@ -5179,10 +5174,8 @@ mod tests {
             2,
             64,
         )
-        .unwrap_err()
-        .to_string();
-        assert!(message.contains("Unsupported"));
-        assert!(message.contains("top-k tie ordering is unfrozen"));
+        .unwrap();
+        assert_eq!(selected, vec![0, 1]);
     }
 
     #[test]

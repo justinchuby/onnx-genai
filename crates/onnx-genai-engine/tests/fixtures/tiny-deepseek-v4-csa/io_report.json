@@ -1,0 +1,331 @@
+{
+  "csa_node_count": 2,
+  "csa_nodes": [
+    {
+      "name": "model/layers.0/self_attn/CompressedSparseAttention_node_114",
+      "domain": "pkg.nxrt",
+      "inputs": [
+        "v_model.layers.0.self_attn.Reshape_94",
+        "v_model.layers.0.self_attn.Reshape_99",
+        "v_model.layers.0.self_attn.compressor.wkv.MatMul_101",
+        "v_model.layers.0.self_attn.compressor.wgate.MatMul_103",
+        "model.layers.0.self_attn.compressor.ape",
+        "model.layers.0.self_attn.compressor.norm.weight",
+        "past_compressed_kv.0",
+        "past_compression_carry.0",
+        "v_model.Cast_24",
+        "v_model.layers.0.self_attn.Cast_104",
+        "model.layers.0.self_attn.attn_sink",
+        "v_model.layers.0.self_attn.indexer.Reshape_107",
+        "v_model.layers.0.self_attn.indexer.weights_proj.MatMul_109",
+        "v_model.layers.0.self_attn.indexer.compressor.wkv.MatMul_111",
+        "v_model.layers.0.self_attn.indexer.compressor.wgate.MatMul_113",
+        "model.layers.0.self_attn.indexer.compressor.ape",
+        "model.layers.0.self_attn.indexer.compressor.norm.weight",
+        "past_index_key.0",
+        "past_index_carry.0"
+      ],
+      "outputs": [
+        "v_model.layers.0.self_attn.CompressedSparseAttention_114_0",
+        "present_compressed_kv.0",
+        "present_compression_carry.0",
+        "present_index_key.0",
+        "present_index_carry.0",
+        "selected_indices.0"
+      ],
+      "attributes": {
+        "num_heads": 2,
+        "head_dim": 512,
+        "qk_rope_head_dim": 64,
+        "compression_ratio": 4,
+        "index_num_heads": 2,
+        "index_head_dim": 128,
+        "index_topk": 4,
+        "causal": 1,
+        "cache_layout_version": 1,
+        "index_layout_version": 1,
+        "sink_mode": "logit_only",
+        "cache_format": "fp8_e4m3_block64",
+        "scale": 0.0
+      }
+    },
+    {
+      "name": "model/layers.1/self_attn/CompressedSparseAttention_node_346",
+      "domain": "pkg.nxrt",
+      "inputs": [
+        "v_model.layers.1.self_attn.Reshape_335",
+        "v_model.layers.1.self_attn.Reshape_340",
+        "v_model.layers.1.self_attn.compressor.wkv.MatMul_342",
+        "v_model.layers.1.self_attn.compressor.wgate.MatMul_344",
+        "model.layers.1.self_attn.compressor.ape",
+        "model.layers.1.self_attn.compressor.norm.weight",
+        "past_compressed_kv.1",
+        "past_compression_carry.1",
+        "v_model.Cast_24",
+        "v_model.layers.0.self_attn.Cast_104",
+        "model.layers.1.self_attn.attn_sink"
+      ],
+      "outputs": [
+        "v_model.layers.1.self_attn.CompressedSparseAttention_346_0",
+        "present_compressed_kv.1",
+        "present_compression_carry.1"
+      ],
+      "attributes": {
+        "num_heads": 2,
+        "head_dim": 512,
+        "qk_rope_head_dim": 64,
+        "compression_ratio": 128,
+        "index_num_heads": 0,
+        "index_head_dim": 0,
+        "index_topk": 0,
+        "causal": 1,
+        "cache_layout_version": 1,
+        "index_layout_version": 1,
+        "sink_mode": "logit_only",
+        "cache_format": "f32",
+        "scale": 0.0
+      }
+    }
+  ],
+  "graph_inputs": [
+    {
+      "name": "attention_mask",
+      "dtype": "INT64",
+      "shape": [
+        "batch",
+        "past_sequence_length + sequence_length"
+      ]
+    },
+    {
+      "name": "position_ids",
+      "dtype": "INT64",
+      "shape": [
+        "batch",
+        "sequence_length"
+      ]
+    },
+    {
+      "name": "past_key_values.0.key",
+      "dtype": "FLOAT",
+      "shape": [
+        "batch",
+        1,
+        "past_sequence_length",
+        512
+      ]
+    },
+    {
+      "name": "past_key_values.0.value",
+      "dtype": "FLOAT",
+      "shape": [
+        "batch",
+        1,
+        "past_sequence_length",
+        512
+      ]
+    },
+    {
+      "name": "past_key_values.1.key",
+      "dtype": "FLOAT",
+      "shape": [
+        "batch",
+        1,
+        "past_sequence_length",
+        512
+      ]
+    },
+    {
+      "name": "past_key_values.1.value",
+      "dtype": "FLOAT",
+      "shape": [
+        "batch",
+        1,
+        "past_sequence_length",
+        512
+      ]
+    },
+    {
+      "name": "input_ids",
+      "dtype": "INT64",
+      "shape": [
+        "batch",
+        "sequence_length"
+      ]
+    },
+    {
+      "name": "past_compressed_kv.0",
+      "dtype": "UINT8",
+      "shape": [
+        "batch",
+        "past_compressed_records.0",
+        583
+      ]
+    },
+    {
+      "name": "past_compression_carry.0",
+      "dtype": "FLOAT",
+      "shape": [
+        "batch",
+        8,
+        2,
+        1024
+      ]
+    },
+    {
+      "name": "past_index_key.0",
+      "dtype": "UINT8",
+      "shape": [
+        "batch",
+        "past_compressed_records.0",
+        68
+      ]
+    },
+    {
+      "name": "past_index_carry.0",
+      "dtype": "FLOAT",
+      "shape": [
+        "batch",
+        8,
+        2,
+        256
+      ]
+    },
+    {
+      "name": "past_compressed_kv.1",
+      "dtype": "FLOAT",
+      "shape": [
+        "batch",
+        "past_compressed_records.1",
+        512
+      ]
+    },
+    {
+      "name": "past_compression_carry.1",
+      "dtype": "FLOAT",
+      "shape": [
+        "batch",
+        128,
+        2,
+        512
+      ]
+    }
+  ],
+  "graph_outputs": [
+    {
+      "name": "logits",
+      "dtype": "FLOAT",
+      "shape": [
+        "batch",
+        "sequence_length",
+        100
+      ]
+    },
+    {
+      "name": "present.0.key",
+      "dtype": "FLOAT",
+      "shape": [
+        "batch",
+        1,
+        "past_sequence_length + sequence_length",
+        512
+      ]
+    },
+    {
+      "name": "present.0.value",
+      "dtype": "FLOAT",
+      "shape": [
+        "batch",
+        1,
+        "past_sequence_length + sequence_length",
+        512
+      ]
+    },
+    {
+      "name": "present.1.key",
+      "dtype": "FLOAT",
+      "shape": [
+        "batch",
+        1,
+        "past_sequence_length + sequence_length",
+        512
+      ]
+    },
+    {
+      "name": "present.1.value",
+      "dtype": "FLOAT",
+      "shape": [
+        "batch",
+        1,
+        "past_sequence_length + sequence_length",
+        512
+      ]
+    },
+    {
+      "name": "present_compressed_kv.0",
+      "dtype": "UINT8",
+      "shape": [
+        "batch",
+        "present_compressed_records.0",
+        583
+      ]
+    },
+    {
+      "name": "present_compression_carry.0",
+      "dtype": "FLOAT",
+      "shape": [
+        "batch",
+        8,
+        2,
+        1024
+      ]
+    },
+    {
+      "name": "present_index_key.0",
+      "dtype": "UINT8",
+      "shape": [
+        "batch",
+        "present_compressed_records.0",
+        68
+      ]
+    },
+    {
+      "name": "present_index_carry.0",
+      "dtype": "FLOAT",
+      "shape": [
+        "batch",
+        8,
+        2,
+        256
+      ]
+    },
+    {
+      "name": "selected_indices.0",
+      "dtype": "INT32",
+      "shape": [
+        "batch",
+        2,
+        "sequence_length",
+        "selected_records.0"
+      ]
+    },
+    {
+      "name": "present_compressed_kv.1",
+      "dtype": "FLOAT",
+      "shape": [
+        "batch",
+        "present_compressed_records.1",
+        512
+      ]
+    },
+    {
+      "name": "present_compression_carry.1",
+      "dtype": "FLOAT",
+      "shape": [
+        "batch",
+        128,
+        2,
+        512
+      ]
+    }
+  ]
+}

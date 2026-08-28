@@ -1105,6 +1105,7 @@ impl Builder {
             group.to_string(),
             StateGroupContract {
                 kind,
+                properties: None,
                 sequence_axis: (kind != StateKind::Recurrent).then_some(2),
                 layout: layout_name(abi),
                 logical_lengths,

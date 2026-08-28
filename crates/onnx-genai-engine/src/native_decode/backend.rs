@@ -210,13 +210,19 @@ impl NativeDecodeSession {
             self.last_hidden = None;
             return Ok(());
         }
-        let recurrent_names: HashSet<String> = self
+        let mut skip_names: HashSet<String> = self
             .session
             .inputs()
             .iter()
             .filter(|meta| is_recurrent_state_shape(&meta.shape))
             .map(|meta| meta.name.clone())
             .collect();
+        // CSA/HCA compressed-record buffers advance on the compression cursor,
+        // not the token count, so they cannot be token-prefix-sliced. Like the
+        // conv/SSM carries they are restored wholesale from a snapshot by the
+        // speculative-rollback commit path; a bare non-zero rewind of them is
+        // refused earlier in the public `rewind`.
+        skip_names.extend(self.csa_record_past_names());
         for (name, tensor) in &mut self.past {
             // Recurrent states are destructive rolling caches with no per-step
             // history to slice; leave them intact here. Greedy decode never
@@ -224,7 +230,7 @@ impl NativeDecodeSession {
             // `snapshot_recurrent_state` + `commit_recurrent_state_to_accepted`
             // (snapshot the pre-draft state, then re-advance by the accepted
             // tokens) rather than prefix-slicing them.
-            if recurrent_names.contains(name) {
+            if skip_names.contains(name) {
                 continue;
             }
             let axis = tensor
