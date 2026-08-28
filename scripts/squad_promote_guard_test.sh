@@ -16,6 +16,7 @@ set -uo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 GUARD="$HERE/squad_promote_guard.sh"
+REAL_GIT=$(command -v git)
 # Scratch lives outside the repo on a runner. A hard kill skips the EXIT trap,
 # and a leaked directory at the repo root would not be caught by the guard this
 # file tests: the forbidden set is directory-prefixed, so `.squad-…` is allowed
@@ -48,6 +49,19 @@ check_output() { # description needle haystack present|absent
   case "$mode" in
     present) if printf '%s' "$hay" | grep -qF -- "$needle"; then ok; else bad "$what: expected to see '$needle'"; fi ;;
     absent)  if printf '%s' "$hay" | grep -qF -- "$needle"; then bad "$what: did NOT expect '$needle'"; else ok; fi ;;
+  esac
+}
+
+check_ignore() { # description path ignored|not-ignored
+  local what="$1" path="$2" want="$3" rc
+  # --no-index makes this a test of the shipped pattern rather than of whether
+  # this checkout happens to retain a path in its index.
+  "$REAL_GIT" -C "$HERE/.." check-ignore --no-index -q -- "$path"
+  rc=$?
+  case "$want" in
+    ignored)     check "$what" 0 "$rc" ;;
+    not-ignored) check "$what" 1 "$rc" ;;
+    *) bad "$what: unknown ignore expectation '$want'" ;;
   esac
 }
 
@@ -278,6 +292,31 @@ else
   out=$(lint_workflow "$mutant")
   check_output "lint catches a missing staging step" "never stages it" "$out" present
 fi
+
+# --- 10. local Squad state must be ignored without hiding static policy ----
+check_ignore "inbox records are local state" \
+  ".squad/decisions/inbox/roy-local-record.md" ignored
+check_ignore "orchestration records are local state" \
+  ".squad/orchestration-log/2026-08-28T16-40-59Z-run.md" ignored
+check_ignore "session logs are local state" \
+  ".squad/log/2026-08-28T16-40-59Z-run.md" ignored
+check_ignore "session files are local state" \
+  ".squad/sessions/session.json" ignored
+check_ignore "current identity is local state" ".squad/identity/now.md" ignored
+check_ignore "memory indexes are local state" ".squad/memory/index.json" ignored
+check_ignore "agent histories are local state" ".squad/agents/roy/history.md" ignored
+check_ignore "agent history archives are local state" \
+  ".squad/agents/roy/history-archive.md" ignored
+check_ignore "inbox placeholder remains tracked" \
+  ".squad/decisions/inbox/README.md" not-ignored
+check_ignore "team roster remains tracked" ".squad/team.md" not-ignored
+check_ignore "Squad configuration remains tracked" ".squad/config.json" not-ignored
+check_ignore "agent charter remains tracked" \
+  ".squad/agents/roy/charter.md" not-ignored
+check_ignore "static template remains tracked" \
+  ".squad/templates/history.md" not-ignored
+check_ignore "durable identity wisdom remains tracked" \
+  ".squad/identity/wisdom.md" not-ignored
 
 echo
 echo "passed: $pass   failed: $fail"
