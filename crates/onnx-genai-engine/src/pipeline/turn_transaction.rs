@@ -263,6 +263,18 @@ impl TurnTransaction {
             .find_map(|(identity, value)| (identity.0 == state).then_some(value))
     }
 
+    pub(crate) fn id(&self) -> TurnTransactionId {
+        self.baseline.transaction
+    }
+
+    pub(crate) fn output_baseline(&self, output: &str) -> OutputPublicationBaseline {
+        self.baseline
+            .outputs
+            .get(output)
+            .copied()
+            .unwrap_or_default()
+    }
+
     pub(crate) fn stage_state(&mut self, state: StateIdentity, value: Value) {
         self.staged_states
             .insert(state, TurnStateBaseline::Present(value));
@@ -278,6 +290,17 @@ impl TurnTransaction {
         state.head = state.head.saturating_add(publications);
         state.cursor = state.cursor.saturating_add(publications);
         state.lineage = state.lineage.saturating_add(publications);
+    }
+
+    /// Closure is staged with the output head and becomes durable only with the
+    /// enclosing turn commit. An abort therefore restores an early finalization
+    /// to the admission baseline just like every other output fact.
+    pub(crate) fn stage_output_closed(&mut self, output: &str) {
+        let state = self
+            .staged_outputs
+            .get_mut(output)
+            .expect("output was admitted into this transaction");
+        state.closed = true;
     }
 
     pub(crate) fn stage_effects(&mut self) {
@@ -476,5 +499,53 @@ mod tests {
             TurnTransactionAdmissionError::UnretractableProvisionalOutput { output }
             if output == "tokens"
         ));
+    }
+
+    #[test]
+    fn early_output_close_is_staged_until_commit_and_abort_keeps_the_baseline() -> anyhow::Result<()>
+    {
+        let mut states = HashMap::new();
+        let mut effects = HashMap::new();
+        let mut outputs = HashMap::from([(
+            ("session".to_string(), "answer".to_string()),
+            CommittedOutputState::default(),
+        )]);
+        let mut aborted = TurnTransaction::admit(
+            TurnTransactionId(31),
+            Some("session"),
+            &ResolvedStatePlan::default(),
+            std::iter::empty::<String>(),
+            ["answer".to_string()],
+            &states,
+            &effects,
+            &outputs,
+            TurnPublicationMode::CommitOnly,
+        )?;
+        aborted.stage_output_closed("answer");
+        assert_eq!(
+            aborted.abort(TurnAbortReason::Cancellation),
+            TurnTransactionOutcome::AbortToBaseline {
+                transaction: TurnTransactionId(31),
+                baseline: TurnBaselineId(31),
+                reason: TurnAbortReason::Cancellation,
+            }
+        );
+        assert!(!outputs[&("session".to_string(), "answer".to_string())].closed);
+
+        let mut committed = TurnTransaction::admit(
+            TurnTransactionId(32),
+            Some("session"),
+            &ResolvedStatePlan::default(),
+            std::iter::empty::<String>(),
+            ["answer".to_string()],
+            &states,
+            &effects,
+            &outputs,
+            TurnPublicationMode::CommitOnly,
+        )?;
+        committed.stage_output_closed("answer");
+        committed.commit(&mut states, &mut effects, &mut outputs)?;
+        assert!(outputs[&("session".to_string(), "answer".to_string())].closed);
+        Ok(())
     }
 }

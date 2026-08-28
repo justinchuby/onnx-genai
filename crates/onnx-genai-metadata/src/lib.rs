@@ -93,8 +93,6 @@ pub mod capabilities {
         LOOP_INDUCTION_VALUES = "loop_induction_values";
         /// Typed workflow emission.
         TYPED_EMIT = "typed_emit";
-        /// Incremental event emission.
-        STREAMING_EMIT = "streaming_emit";
         /// Ragged valid-prefix emission.
         EMIT_VALID_LENGTH = "emit_valid_length";
         /// Observable presence for an optional input.
@@ -148,8 +146,9 @@ pub use validation::{
     validate_metadata, validate_pipeline_spec, validate_structure_and_capabilities,
 };
 pub use version::{
-    BATCHING_SCHEMA_VERSION, INITIAL_SCHEMA_VERSION, SUPPORTED_SCHEMA_VERSION, SchemaVersion,
-    TOKEN_AUTHORITY_SCHEMA_VERSION, TOOL_PROTOCOL_SCHEMA_VERSION,
+    BATCHING_SCHEMA_VERSION, INITIAL_SCHEMA_VERSION, OUTPUT_PROTOCOL_SCHEMA_VERSION,
+    SUPPORTED_SCHEMA_VERSION, SchemaVersion, TOKEN_AUTHORITY_SCHEMA_VERSION,
+    TOOL_PROTOCOL_SCHEMA_VERSION,
 };
 
 /// Generates the inference-metadata JSON Schema with deterministic object-key ordering.

@@ -202,7 +202,6 @@
     ["nested_control_flow","syntax/IR","Loops or branches nested inside structural workflow nodes."],
     ["loop_induction_values","syntax/IR","A typed zero-based iteration value visible to policy components."],
     ["typed_emit","syntax/IR","Publication of a typed SSA value to a declared workflow output."],
-    ["streaming_emit","syntax/IR","Incremental event publication during execution."],
     ["emit_valid_length","syntax/IR","Ragged valid-prefix publication from a fixed-capacity tensor."],
     ["input_presence","syntax/IR","An observable boolean indicating whether an optional caller or application tensor was supplied."],
     ["explicit_transfer","syntax/IR","A device-transfer node in the planner's lowered internal IR."]
@@ -225,8 +224,8 @@ pipeline:
       request.image: {contract: {dtype: uint8, shape: [encoded_bytes]}, role: {kind: runtime, role: encoded_image}, required: true}
       request.max_iterations: {contract: {dtype: int64, shape: [1]}, required: false, default: 4}
     outputs:
-      tokens: {contract: {dtype: int64, shape: [batch, generated]}, role: tokens}
-      image: {contract: {dtype: float32, shape: [batch, 3, height, width], value_range: [-1, 1]}, role: image}
+      tokens: {contract: {dtype: int64, shape: [batch, generated]}, role: tokens, family: {kind: materialized}}
+      image: {contract: {dtype: float32, shape: [batch, 3, height, width], value_range: [-1, 1]}, role: image, family: {kind: materialized}}
     components:
       decoder:
         implementation: {kind: onnx, artifact: model.onnx}
@@ -407,7 +406,7 @@ future_extension: {enabled: false, zero: 0, nothing: null, empty_text: "", empty
     const emitModes=[
       {term:"replace",description:"Replaces the output with the emitted value."},
       {term:"append",description:"Concatenates chunks along axis, defaulting to the final axis; rank-four or deeper values must declare axis."},
-      {term:"event",description:"Publishes an incremental ordered event and requires streaming_emit."}
+      {term:"event",description:"Publishes an incremental ordered event for an output in the events family."}
     ];
     const executionRules=[
       {term:"root steps",description:"Execute once per workflow invocation, in order."},

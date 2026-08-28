@@ -103,6 +103,7 @@ pipeline:
       logits:
         contract: {dtype: float32, shape: [batch, sequence, vocab], batch_layout: {kind: request_aligned, axis: 0}}
         role: tensor
+        family: { kind: materialized }
         stage: pre_adapter
     state:
       past_key_values.0.key:

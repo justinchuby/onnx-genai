@@ -2,6 +2,10 @@ use std::convert::Infallible;
 
 use anyhow::Context;
 use axum::response::sse::Event;
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use onnx_genai_engine::pipeline::{
+    OutputFinality, TypedRevisionOperation, WorkflowOutputPublication,
+};
 use serde::Serialize;
 use tokio::sync::mpsc;
 
@@ -153,6 +157,98 @@ pub(crate) async fn send_completion_stream_chunk(
     tx.send(Ok(Event::default().data(serde_json::to_string(&chunk)?)))
         .await
         .context("stream receiver closed")
+}
+
+/// Render a transport-neutral publication into a buffered JSON representation.
+///
+/// This is intentionally a mechanical encoding: identity, ordering, revision
+/// lineage, and finality are already decided by the workflow runtime. Tensor
+/// bytes retain their dtype and shape instead of being interpreted as server
+/// text or a server-specific semantic event.
+#[allow(dead_code)]
+pub(crate) fn buffered_workflow_publication(
+    publication: &WorkflowOutputPublication,
+) -> anyhow::Result<serde_json::Value> {
+    fn finality(finality: OutputFinality) -> &'static str {
+        match finality {
+            OutputFinality::Provisional => "provisional",
+            OutputFinality::Final => "final",
+        }
+    }
+    fn operation(operation: TypedRevisionOperation) -> &'static str {
+        match operation {
+            TypedRevisionOperation::Append => "append",
+            TypedRevisionOperation::Replace => "replace",
+            TypedRevisionOperation::Retract => "retract",
+            TypedRevisionOperation::Finalize => "finalize",
+        }
+    }
+    fn payload(value: &onnx_genai_ort::Value) -> anyhow::Result<serde_json::Value> {
+        Ok(serde_json::json!({
+            "dtype": format!("{:?}", value.dtype()),
+            "shape": value.shape(),
+            "bytes": STANDARD.encode(value.to_raw_bytes()?),
+        }))
+    }
+
+    match publication {
+        WorkflowOutputPublication::Materialized {
+            output,
+            operation: publication_operation,
+            payload: publication_payload,
+            finality: publication_finality,
+        } => Ok(serde_json::json!({
+            "output": output,
+            "operation": operation(*publication_operation),
+            "payload": payload(publication_payload)?,
+            "finality": finality(*publication_finality),
+        })),
+        WorkflowOutputPublication::Event {
+            output,
+            stream,
+            sequence,
+            payload: publication_payload,
+            finality: publication_finality,
+        } => Ok(serde_json::json!({
+            "output": output,
+            "stream": stream.0,
+            "sequence": sequence.0,
+            "operation": "event",
+            "payload": payload(publication_payload)?,
+            "finality": finality(*publication_finality),
+        })),
+        WorkflowOutputPublication::Revision(envelope) => Ok(serde_json::json!({
+            "version": envelope.version,
+            "transaction": envelope.transaction.0,
+            "output": envelope.output,
+            "stream": envelope.stream.0,
+            "sequence": envelope.sequence.0,
+            "revision": envelope.revision.0,
+            "lineage": envelope.lineage.0,
+            "base": envelope.base.0,
+            "operation": operation(envelope.operation),
+            "payload": envelope.payload.as_ref().map(payload).transpose()?,
+            "finality": finality(envelope.finality),
+        })),
+    }
+}
+
+/// Render the same semantic record for an SSE data field. Delivery failure from
+/// the caller of this function cannot change the already committed envelope.
+#[allow(dead_code)]
+pub(crate) fn sse_workflow_publication_data(
+    publication: &WorkflowOutputPublication,
+) -> anyhow::Result<String> {
+    serde_json::to_string(&buffered_workflow_publication(publication)?).map_err(Into::into)
+}
+
+#[allow(dead_code)]
+pub(crate) fn workflow_publication_event(
+    publication: &WorkflowOutputPublication,
+) -> anyhow::Result<Event> {
+    Ok(Event::default()
+        .event("workflow_output")
+        .data(sse_workflow_publication_data(publication)?))
 }
 
 pub(crate) fn completion_chunk(
@@ -359,7 +455,15 @@ pub(crate) fn done_chunk(
 
 #[cfg(test)]
 mod reasoning_wire_tests {
-    use super::{content_chunk, reasoning_chunk};
+    use super::{
+        buffered_workflow_publication, content_chunk, reasoning_chunk,
+        sse_workflow_publication_data, workflow_publication_event,
+    };
+    use onnx_genai_engine::pipeline::{
+        OutputFinality, OutputLineage, OutputRevision, OutputSequence, OutputStreamId,
+        TurnTransactionId, TypedRevisionEnvelope, TypedRevisionOperation,
+        WorkflowOutputPublication,
+    };
 
     // Reasoning rides on its own `reasoning_content` key and never touches
     // `content`, so an OpenAI-compatible client that ignores the extra field
@@ -384,5 +488,56 @@ mod reasoning_wire_tests {
         let json = serde_json::to_string(&chunk).expect("serialize");
         assert!(json.contains("\"content\":\"Hi\""), "{json}");
         assert!(!json.contains("reasoning_content"), "{json}");
+    }
+
+    #[test]
+    fn buffered_and_sse_adapters_preserve_revision_envelope_order_and_finality() {
+        let publications = [
+            WorkflowOutputPublication::Revision(TypedRevisionEnvelope {
+                version: "1".to_string(),
+                transaction: TurnTransactionId(9),
+                output: "answer".to_string(),
+                stream: OutputStreamId("main".to_string()),
+                sequence: OutputSequence(1),
+                revision: OutputRevision(1),
+                lineage: OutputLineage(1),
+                base: OutputLineage(0),
+                operation: TypedRevisionOperation::Append,
+                payload: None,
+                finality: OutputFinality::Final,
+            }),
+            WorkflowOutputPublication::Revision(TypedRevisionEnvelope {
+                version: "1".to_string(),
+                transaction: TurnTransactionId(9),
+                output: "answer".to_string(),
+                stream: OutputStreamId("main".to_string()),
+                sequence: OutputSequence(2),
+                revision: OutputRevision(2),
+                lineage: OutputLineage(1),
+                base: OutputLineage(1),
+                operation: TypedRevisionOperation::Finalize,
+                payload: None,
+                finality: OutputFinality::Final,
+            }),
+        ];
+        let buffered = publications
+            .iter()
+            .map(buffered_workflow_publication)
+            .collect::<anyhow::Result<Vec<_>>>()
+            .expect("buffered encoding");
+        let sse = publications
+            .iter()
+            .map(sse_workflow_publication_data)
+            .map(|encoded| {
+                encoded.and_then(|encoded| serde_json::from_str(&encoded).map_err(Into::into))
+            })
+            .collect::<anyhow::Result<Vec<serde_json::Value>>>()
+            .expect("SSE encoding");
+        assert_eq!(sse, buffered);
+        assert_eq!(buffered[0]["sequence"], 1);
+        assert_eq!(buffered[1]["operation"], "finalize");
+        assert_eq!(buffered[1]["finality"], "final");
+        let _ = workflow_publication_event(&publications[0])
+            .expect("SSE event accepts the same envelope");
     }
 }

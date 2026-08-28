@@ -16,7 +16,6 @@ pipeline:
       - loop_induction_values
       - nested_control_flow
       - serving_service_contract
-      - streaming_emit
       - typed_emit
       - workflow_ssa
     inputs:
@@ -161,6 +160,7 @@ pipeline:
             kind: request_aligned
             axis: 0
         role: tokens
+        family: { kind: materialized }
         stage: pre_adapter
     components:
       decoder:

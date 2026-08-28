@@ -53,6 +53,7 @@ pipeline:
           - dimension: frames
             valid_lengths: frame_lengths
         role: tensor
+        family: { kind: materialized }
         stage: pre_adapter
       frame_lengths:
         contract:
@@ -63,6 +64,7 @@ pipeline:
             kind: request_aligned
             axis: 0
         role: tensor
+        family: { kind: materialized }
         stage: pre_adapter
     components:
       encoder:
