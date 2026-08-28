@@ -1458,6 +1458,13 @@ impl<'a> WorkflowExecutionPlan<'a> {
             workflow,
             output_baselines,
         )?);
+        if let Some(host) = host.as_deref_mut()
+            && let Err(error) = host.begin_turn(&transaction)
+        {
+            let outcome = transaction.abort(TurnAbortReason::ExecutionFailure);
+            host.turn_aborted(outcome);
+            return Err(error);
+        }
         if let Some(session_id) = self.session_id.as_ref() {
             for (cell, carrier) in session_state.carried() {
                 let resolved = state_plan.cell(cell).with_context(|| {
@@ -1548,7 +1555,10 @@ impl<'a> WorkflowExecutionPlan<'a> {
             host,
         );
         if let Err(error) = result {
-            let _ = transaction.abort(TurnAbortReason::ExecutionFailure);
+            let outcome = transaction.abort(TurnAbortReason::ExecutionFailure);
+            if let Some(host) = host.as_deref_mut() {
+                host.turn_aborted(outcome);
+            }
             return Err(error);
         }
         let staged_commit = (|| -> anyhow::Result<()> {
@@ -1597,6 +1607,9 @@ impl<'a> WorkflowExecutionPlan<'a> {
                 &pass.telemetry.row_outputs,
                 pass.telemetry.loop_ended_by_predicate,
             )?;
+            if let Some(host) = host.as_deref_mut() {
+                host.before_turn_commit(&transaction)?;
+            }
             // Every semantic session cell in the canonical plan is staged when
             // this pass names a session, including one whose current turn did
             // not change its value. A stateless tensor pass owns no conversation
@@ -1723,7 +1736,10 @@ impl<'a> WorkflowExecutionPlan<'a> {
             Ok(())
         })();
         if let Err(error) = staged_commit {
-            let _ = transaction.abort(TurnAbortReason::CommitFailure);
+            let outcome = transaction.abort(TurnAbortReason::CommitFailure);
+            if let Some(host) = host.as_deref_mut() {
+                host.turn_aborted(outcome);
+            }
             return Err(error);
         }
         if has_semantic_session_state && let Some(session) = self.session_id.as_deref() {
@@ -1735,6 +1751,9 @@ impl<'a> WorkflowExecutionPlan<'a> {
         *engine.worker.last_output_publications.borrow_mut() = publication_journal
             .map(OutputPublicationJournal::take)
             .unwrap_or_default();
+        if let Some(host) = host.as_deref_mut() {
+            host.turn_committed(transaction.committed());
+        }
         engine.publish_workflow_telemetry(pass.telemetry);
         Ok((values, row_outputs))
     }
@@ -1817,6 +1836,39 @@ pub(crate) trait WorkflowNodeHost {
     /// package inputs are the host's business.
     fn hosted_contracts(&self) -> &'static [&'static str];
 
+    /// Select one exact authored invocation independently of a component
+    /// contract. Typed workflow constructs use this only after construction
+    /// proved the invocation's identity, bindings, and control-flow location.
+    fn hosts_invocation(
+        &self,
+        _component: &str,
+        _inputs: &BTreeMap<String, String>,
+        _outputs: &BTreeMap<String, String>,
+    ) -> bool {
+        false
+    }
+
+    /// Observe the admitted generic workflow transaction before execution.
+    fn begin_turn(&mut self, _turn: &TurnTransaction) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Observe an authored control boundary while the generic transaction is
+    /// still provisional.
+    fn observe_boundary(&mut self, _boundary: GenerationBoundary) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Final fallible hook before the generic state/effect/output write set is
+    /// staged and committed.
+    fn before_turn_commit(&mut self, _turn: &TurnTransaction) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn turn_committed(&mut self, _outcome: TurnTransactionOutcome) {}
+
+    fn turn_aborted(&mut self, _outcome: TurnTransactionOutcome) {}
+
     /// Execute one node bound to `contract`.
     ///
     /// Returns `Ok(false)` when this host does not implement the contract, so
@@ -1844,6 +1896,8 @@ pub(crate) struct WorkflowNodeRequest<'a> {
     pub(crate) outputs: &'a BTreeMap<String, String>,
     /// The invocation's value environment.
     pub(crate) values: &'a mut PipelineTensors,
+    /// The ordinary S4 journal owned by the enclosing generic turn.
+    pub(crate) publication_journal: &'a mut Option<OutputPublicationJournal>,
 }
 
 impl WorkflowRuntime {
@@ -1909,13 +1963,21 @@ impl WorkflowRuntime {
                         // The hosted executor is selected before generic ONNX
                         // resolution, but admission still validates every
                         // invocation-bound input before the executor can run.
-                        if let Some(contract) = declaration
+                        let contract = declaration
                             .contract
                             .as_ref()
-                            .map(|contract| contract.id.as_str())
-                            && let Some(host) = host.as_deref_mut()
-                            && host.hosted_contracts().contains(&contract)
-                        {
+                            .map(|contract| contract.id.as_str());
+                        let hosted_by_invocation = host
+                            .as_deref()
+                            .is_some_and(|host| host.hosts_invocation(component, inputs, outputs));
+                        let hosted_by_contract = contract.is_some_and(|contract| {
+                            host.as_deref()
+                                .is_some_and(|host| host.hosted_contracts().contains(&contract))
+                        });
+                        if hosted_by_invocation || hosted_by_contract {
+                            let host = host
+                                .as_deref_mut()
+                                .expect("a hosted invocation has a workflow host");
                             let prepared = prepare_hosted_component_batch_inputs(
                                 component,
                                 declaration,
@@ -1927,11 +1989,12 @@ impl WorkflowRuntime {
                             let request_count = prepared.request_count;
                             drop(prepared.resolved);
                             let handled = match host.execute_contract_node(WorkflowNodeRequest {
-                                contract,
+                                contract: contract.unwrap_or(""),
                                 component,
                                 inputs,
                                 outputs,
                                 values,
+                                publication_journal,
                             }) {
                                 Ok(handled) => handled,
                                 Err(error) => {
@@ -1941,6 +2004,7 @@ impl WorkflowRuntime {
                             };
                             if !handled {
                                 clear_bound_component_outputs(outputs, values);
+                                let contract = contract.unwrap_or("<typed invocation>");
                                 anyhow::bail!(
                                     "workflow component '{component}' declares contract \
                                      '{contract}', which the running host lists as implemented but \
@@ -1960,7 +2024,9 @@ impl WorkflowRuntime {
                                 &std::collections::HashSet::new(),
                                 request_count,
                             )?;
-                            self.record_contract_execution(contract);
+                            if let Some(contract) = contract {
+                                self.record_contract_execution(contract);
+                            }
                             telemetry.record_stage(
                                 component.clone(),
                                 stage_started.elapsed().as_nanos(),
@@ -2073,6 +2139,7 @@ impl WorkflowRuntime {
                                         inputs,
                                         outputs,
                                         values,
+                                        publication_journal,
                                     }) {
                                         Ok(handled) => handled,
                                         Err(error) => {
@@ -2241,6 +2308,9 @@ impl WorkflowRuntime {
                     telemetry,
                     host,
                 )?;
+                if let Some(host) = host.as_deref_mut() {
+                    host.observe_boundary(GenerationBoundary::AfterLoopSetup)?;
+                }
                 for index in 0..limit {
                     if !self.advance_workflow_loop(
                         &plan,
@@ -2363,6 +2433,9 @@ impl WorkflowRuntime {
                             final_state_refs.insert(cell.clone(), output.clone());
                         }
                     }
+                }
+                if let Some(host) = host.as_deref_mut() {
+                    host.observe_boundary(GenerationBoundary::AfterBranch)?;
                 }
             }
             WorkflowNode::Emit {
@@ -7048,12 +7121,14 @@ steps:
             contract: "vendor.something-else".to_string(),
             seen: Vec::new(),
         };
+        let mut publication_journal = None;
         let request = WorkflowNodeRequest {
             contract: "onnx-genai.token-policy",
             component: "token_policy",
             inputs: &BTreeMap::new(),
             outputs: &BTreeMap::new(),
             values: &mut PipelineTensors::default(),
+            publication_journal: &mut publication_journal,
         };
         assert!(
             !host.execute_contract_node(request).expect("no error"),
@@ -7076,6 +7151,7 @@ steps:
             contract: "onnx-genai.token-policy".to_string(),
             seen: Vec::new(),
         };
+        let mut publication_journal = None;
 
         let handled = host
             .execute_contract_node(WorkflowNodeRequest {
@@ -7084,6 +7160,7 @@ steps:
                 inputs: &inputs,
                 outputs: &outputs,
                 values: &mut values,
+                publication_journal: &mut publication_journal,
             })
             .expect("the host runs");
 
@@ -8086,10 +8163,13 @@ impl WorkflowRuntime {
             })?;
             let restored = values.get(&session_state_value_name(&carry.cell));
             let current = values.get(&carry.current);
+            let setup_value = values.get(&carry.body_input);
             let seeded = match carry.current_source {
-                onnx_genai_metadata::WorkflowLoopCarrySource::PriorState => current,
+                onnx_genai_metadata::WorkflowLoopCarrySource::PriorState => current.or(setup_value),
                 onnx_genai_metadata::WorkflowLoopCarrySource::Initializer
-                | onnx_genai_metadata::WorkflowLoopCarrySource::Explicit => restored.or(current),
+                | onnx_genai_metadata::WorkflowLoopCarrySource::Explicit => {
+                    restored.or(current).or(setup_value)
+                }
             };
             // A state whose resolved readers include a component port is
             // supplied by the service at that port when it has no materialized

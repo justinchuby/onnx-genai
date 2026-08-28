@@ -95,6 +95,7 @@ pipeline:
           outputs:
             candidate_tokens: {dtype: int64, shape: [batch, 6], batch_layout: {kind: request_aligned, axis: 0}}
             candidate_parents: {dtype: int64, shape: [batch, 6], batch_layout: {kind: request_aligned, axis: 0}}
+            proposal_probabilities: {dtype: float32, shape: [batch, 7, 6], batch_layout: {kind: request_aligned, axis: 0}}
             private_state_out: {dtype: float32, shape: [batch, 2], batch_layout: {kind: request_aligned, axis: 0}}
         row_scope: {axis: 0, stateful: true}
       target:
@@ -110,6 +111,7 @@ pipeline:
             token_context: {dtype: int64, shape: [batch, 4], batch_layout: {kind: request_aligned, axis: 0}}
           outputs:
             target_logits: {dtype: float32, shape: [batch, 7, 6], batch_layout: {kind: request_aligned, axis: 0}}
+            target_probabilities: {dtype: float32, shape: [batch, 7, 6], batch_layout: {kind: request_aligned, axis: 0}}
             target_state_out: {dtype: float32, shape: [batch, 2], batch_layout: {kind: request_aligned, axis: 0}}
             token_context_out: {dtype: int64, shape: [batch, 4], batch_layout: {kind: request_aligned, axis: 0}}
           roles:
@@ -122,6 +124,7 @@ pipeline:
       outputs:
         candidate_tokens: proposed.tokens
         candidate_parents: proposed.parents
+        proposal_probabilities: proposed.probabilities
         private_state_out: proposed.state
     - kind: invoke
       component: target
@@ -135,6 +138,7 @@ pipeline:
         token_context: request.token_context
       outputs:
         target_logits: verified.logits
+        target_probabilities: verified.probabilities
         target_state_out: verified.state
         token_context_out: verified.token_context
     state:
@@ -213,10 +217,13 @@ speculative:
     accepted_tokens: accepted_tokens
   vocabulary: {kind: identical}
   max_proposal_width: 6
-  distribution_preserving: false
+  distribution_preserving: true
   verification:
     target_output: {component: target, output: target_logits}
     accepted_path: {kind: runtime, binding: accepted_prefix}
+    probabilities:
+      proposal: {component: proposer, output: proposal_probabilities}
+      target: {component: target, output: target_probabilities}
   rollback_state: [proposer_private, target_recurrent, token_context]
 "#;
 
@@ -231,6 +238,7 @@ graph {
   node { input: "candidate_base" input: "offset" output: "candidate_shifted" op_type: "Add" }
   node { input: "candidate_shifted" input: "vocabulary" output: "candidate_tokens" op_type: "Mod" }
   node { output: "candidate_parents" op_type: "Constant" attribute { name: "value" t { dims: 1 dims: 6 data_type: 7 {parent_values} } type: TENSOR } }
+  node { output: "proposal_probabilities" op_type: "Constant" attribute { name: "value" t { dims: 1 dims: 7 dims: 6 data_type: 1 float_data: 0.0 float_data: 0.5 float_data: 0.5 float_data: 0.0 float_data: 0.0 float_data: 0.0 float_data: 0.0 float_data: 0.0 float_data: 0.0 float_data: 1.0 float_data: 0.0 float_data: 0.0 float_data: 0.0 float_data: 0.0 float_data: 0.0 float_data: 0.0 float_data: 1.0 float_data: 0.0 float_data: 0.0 float_data: 0.0 float_data: 0.0 float_data: 0.0 float_data: 0.0 float_data: 1.0 float_data: 1.0 float_data: 0.0 float_data: 0.0 float_data: 0.0 float_data: 0.0 float_data: 0.0 float_data: 1.0 float_data: 0.0 float_data: 0.0 float_data: 0.0 float_data: 0.0 float_data: 0.0 float_data: 1.0 float_data: 0.0 float_data: 0.0 float_data: 0.0 float_data: 0.0 float_data: 0.0 } type: TENSOR } }
   node { input: "context_tokens" output: "context_f32" op_type: "Cast" attribute { name: "to" i: 1 type: INT } }
   node { input: "context_f32" output: "context_sum" op_type: "ReduceSum" attribute { name: "keepdims" i: 0 type: INT } }
   node { input: "private_state" input: "context_sum" output: "private_state_out" op_type: "Add" }
@@ -239,6 +247,7 @@ graph {
   input { name: "private_state" type { tensor_type { elem_type: 1 shape { dim { dim_value: 1 } dim { dim_value: 2 } } } } }
   output { name: "candidate_tokens" type { tensor_type { elem_type: 7 shape { dim { dim_value: 1 } dim { dim_value: 6 } } } } }
   output { name: "candidate_parents" type { tensor_type { elem_type: 7 shape { dim { dim_value: 1 } dim { dim_value: 6 } } } } }
+  output { name: "proposal_probabilities" type { tensor_type { elem_type: 1 shape { dim { dim_value: 1 } dim { dim_value: 7 } dim { dim_value: 6 } } } } }
   output { name: "private_state_out" type { tensor_type { elem_type: 1 shape { dim { dim_value: 1 } dim { dim_value: 2 } } } } }
 }
 opset_import { domain: "" version: 18 }
@@ -248,6 +257,7 @@ const PARENT_TARGET: &str = r#"
 ir_version: 8
 graph {
   node { output: "target_logits" op_type: "Constant" attribute { name: "value" t { dims: 1 dims: 7 dims: 6 data_type: 1 {logit_values} } type: TENSOR } }
+  node { input: "target_logits" output: "target_probabilities" op_type: "Softmax" attribute { name: "axis" i: -1 type: INT } }
   node { input: "accepted_tokens" output: "accepted_f32" op_type: "Cast" attribute { name: "to" i: 1 type: INT } }
   node { input: "accepted_f32" output: "accepted_sum_f32" op_type: "ReduceSum" attribute { name: "keepdims" i: 0 type: INT } }
   node { input: "target_state" input: "accepted_sum_f32" output: "target_state_out" op_type: "Add" }
@@ -262,6 +272,7 @@ graph {
   input { name: "target_state" type { tensor_type { elem_type: 1 shape { dim { dim_value: 1 } dim { dim_value: 2 } } } } }
   input { name: "token_context" type { tensor_type { elem_type: 7 shape { dim { dim_value: 1 } dim { dim_value: 4 } } } } }
   output { name: "target_logits" type { tensor_type { elem_type: 1 shape { dim { dim_value: 1 } dim { dim_value: 7 } dim { dim_value: 6 } } } } }
+  output { name: "target_probabilities" type { tensor_type { elem_type: 1 shape { dim { dim_value: 1 } dim { dim_value: 7 } dim { dim_value: 6 } } } } }
   output { name: "target_state_out" type { tensor_type { elem_type: 1 shape { dim { dim_value: 1 } dim { dim_value: 2 } } } } }
   output { name: "token_context_out" type { tensor_type { elem_type: 7 shape { dim { dim_value: 1 } dim { dim_value: 4 } } } } }
 }
@@ -527,6 +538,102 @@ graph {
 opset_import { domain: "" version: 18 }
 "#;
 
+const COMPOSED_SETUP: &str = r#"
+ir_version: 8
+graph {
+  node { input: "context_tokens" output: "prepared_context" op_type: "Identity" }
+  node { input: "proposer_state" output: "proposer_state_out" op_type: "Identity" }
+  node { input: "target_state" output: "target_state_out" op_type: "Identity" }
+  node { input: "token_context" output: "token_context_out" op_type: "Identity" }
+  node { input: "branch_state" output: "branch_state_out" op_type: "Identity" }
+  node { output: "one" op_type: "Constant" attribute { name: "value" t { dims: 1 dims: 1 data_type: 7 int64_data: 1 } type: TENSOR } }
+  node { input: "setup_counter" input: "one" output: "setup_counter_out" op_type: "Add" }
+  node { input: "setup_counter_out" output: "setup_event" op_type: "Identity" }
+  name: "candidate_composed_setup"
+  input { name: "context_tokens" type { tensor_type { elem_type: 7 shape { dim { dim_value: 1 } dim { dim_param: "sequence" } } } } }
+  input { name: "proposer_state" type { tensor_type { elem_type: 1 shape { dim { dim_value: 1 } dim { dim_value: 2 } } } } }
+  input { name: "target_state" type { tensor_type { elem_type: 1 shape { dim { dim_value: 1 } dim { dim_value: 2 } } } } }
+  input { name: "token_context" type { tensor_type { elem_type: 7 shape { dim { dim_value: 1 } dim { dim_value: 4 } } } } }
+  input { name: "branch_state" type { tensor_type { elem_type: 7 shape { dim { dim_value: 1 } dim { dim_value: 1 } } } } }
+  input { name: "setup_counter" type { tensor_type { elem_type: 7 shape { dim { dim_value: 1 } dim { dim_value: 1 } } } } }
+  output { name: "prepared_context" type { tensor_type { elem_type: 7 shape { dim { dim_value: 1 } dim { dim_param: "sequence" } } } } }
+  output { name: "proposer_state_out" type { tensor_type { elem_type: 1 shape { dim { dim_value: 1 } dim { dim_value: 2 } } } } }
+  output { name: "target_state_out" type { tensor_type { elem_type: 1 shape { dim { dim_value: 1 } dim { dim_value: 2 } } } } }
+  output { name: "token_context_out" type { tensor_type { elem_type: 7 shape { dim { dim_value: 1 } dim { dim_value: 4 } } } } }
+  output { name: "branch_state_out" type { tensor_type { elem_type: 7 shape { dim { dim_value: 1 } dim { dim_value: 1 } } } } }
+  output { name: "setup_counter_out" type { tensor_type { elem_type: 7 shape { dim { dim_value: 1 } dim { dim_value: 1 } } } } }
+  output { name: "setup_event" type { tensor_type { elem_type: 7 shape { dim { dim_value: 1 } dim { dim_value: 1 } } } } }
+}
+opset_import { domain: "" version: 18 }
+"#;
+
+const COMPOSED_PRE_TRUE: &str = r#"
+ir_version: 8
+graph {
+  node { input: "context_tokens" output: "prepared_context" op_type: "Identity" }
+  name: "candidate_composed_pre_true"
+  input { name: "context_tokens" type { tensor_type { elem_type: 7 shape { dim { dim_value: 1 } dim { dim_param: "sequence" } } } } }
+  output { name: "prepared_context" type { tensor_type { elem_type: 7 shape { dim { dim_value: 1 } dim { dim_param: "sequence" } } } } }
+}
+opset_import { domain: "" version: 18 }
+"#;
+
+const COMPOSED_PRE_FALSE: &str = r#"
+ir_version: 8
+graph {
+  node { output: "one" op_type: "Constant" attribute { name: "value" t { data_type: 7 int64_data: 1 } type: TENSOR } }
+  node { input: "context_tokens" input: "one" output: "prepared_context" op_type: "Add" }
+  name: "candidate_composed_pre_false"
+  input { name: "context_tokens" type { tensor_type { elem_type: 7 shape { dim { dim_value: 1 } dim { dim_param: "sequence" } } } } }
+  output { name: "prepared_context" type { tensor_type { elem_type: 7 shape { dim { dim_value: 1 } dim { dim_param: "sequence" } } } } }
+}
+opset_import { domain: "" version: 18 }
+"#;
+
+const COMPOSED_POST_TRUE: &str = r#"
+ir_version: 8
+graph {
+  node { input: "accepted_tokens" output: "accepted_sum" op_type: "ReduceSum" attribute { name: "keepdims" i: 1 type: INT } }
+  node { input: "branch_state" input: "accepted_sum" output: "branch_state_out" op_type: "Add" }
+  node { input: "branch_state_out" output: "post_value" op_type: "Identity" }
+  name: "candidate_composed_post_true"
+  input { name: "accepted_tokens" type { tensor_type { elem_type: 7 shape { dim { dim_value: 1 } dim { dim_param: "accepted" } } } } }
+  input { name: "branch_state" type { tensor_type { elem_type: 7 shape { dim { dim_value: 1 } dim { dim_value: 1 } } } } }
+  output { name: "post_value" type { tensor_type { elem_type: 7 shape { dim { dim_value: 1 } dim { dim_value: 1 } } } } }
+  output { name: "branch_state_out" type { tensor_type { elem_type: 7 shape { dim { dim_value: 1 } dim { dim_value: 1 } } } } }
+}
+opset_import { domain: "" version: 18 }
+"#;
+
+const COMPOSED_POST_FALSE: &str = r#"
+ir_version: 8
+graph {
+  node { output: "post_value" op_type: "Constant" attribute { name: "value" t { dims: 1 dims: 1 data_type: 7 int64_data: -1 } type: TENSOR } }
+  node { input: "branch_state" output: "branch_state_out" op_type: "Identity" }
+  name: "candidate_composed_post_false"
+  input { name: "accepted_tokens" type { tensor_type { elem_type: 7 shape { dim { dim_value: 1 } dim { dim_param: "accepted" } } } } }
+  input { name: "branch_state" type { tensor_type { elem_type: 7 shape { dim { dim_value: 1 } dim { dim_value: 1 } } } } }
+  output { name: "post_value" type { tensor_type { elem_type: 7 shape { dim { dim_value: 1 } dim { dim_value: 1 } } } } }
+  output { name: "branch_state_out" type { tensor_type { elem_type: 7 shape { dim { dim_value: 1 } dim { dim_value: 1 } } } } }
+}
+opset_import { domain: "" version: 18 }
+"#;
+
+const COMPOSED_ROOT_POST: &str = r#"
+ir_version: 8
+graph {
+  node { input: "accepted_tokens" output: "accepted_sum" op_type: "ReduceSum" attribute { name: "keepdims" i: 1 type: INT } }
+  node { input: "root_state" input: "accepted_sum" output: "root_state_out" op_type: "Add" }
+  node { input: "root_state_out" output: "post_value" op_type: "Identity" }
+  name: "candidate_composed_root_post"
+  input { name: "accepted_tokens" type { tensor_type { elem_type: 7 shape { dim { dim_value: 1 } dim { dim_param: "accepted" } } } } }
+  input { name: "root_state" type { tensor_type { elem_type: 7 shape { dim { dim_value: 1 } dim { dim_value: 1 } } } } }
+  output { name: "post_value" type { tensor_type { elem_type: 7 shape { dim { dim_value: 1 } dim { dim_value: 1 } } } } }
+  output { name: "root_state_out" type { tensor_type { elem_type: 7 shape { dim { dim_value: 1 } dim { dim_value: 1 } } } } }
+}
+opset_import { domain: "" version: 18 }
+"#;
+
 fn fixture_root(name: &str) -> anyhow::Result<PathBuf> {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -560,6 +667,438 @@ fn parent_package(parents: &[i64; 6], decisions: &[usize; 7]) -> anyhow::Result<
         root.join("target.onnx.textproto"),
         PARENT_TARGET.replace("{logit_values}", &logits),
     )?;
+    Ok(root)
+}
+
+fn composed_parent_metadata(continue_loop: bool, reorder_components: bool) -> String {
+    let controls = format!(
+        r#"      accepted_prefix:
+        contract: {{dtype: int64, shape: [batch, Any], batch_layout: {{kind: request_aligned, axis: 0}}}}
+        role: {{kind: opaque}}
+        source: {{kind: literal}}
+        required: false
+        default: 0
+      control.continue:
+        contract: {{dtype: bool, shape: [1]}}
+        role: {{kind: opaque}}
+        source: {{kind: literal}}
+        required: false
+        default: {continue_loop}
+      control.max:
+        contract: {{dtype: int64, shape: [1]}}
+        role: {{kind: opaque}}
+        source: {{kind: literal}}
+        required: false
+        default: 1
+      control.branch:
+        contract: {{dtype: bool, shape: [1]}}
+        role: {{kind: opaque}}
+        source: {{kind: literal}}
+        required: false
+        default: true
+      setup.counter.seed:
+        contract: {{dtype: int64, shape: [batch, 1], batch_layout: {{kind: request_aligned, axis: 0}}}}
+        role: {{kind: opaque}}
+        source: {{kind: literal}}
+        required: false
+        default: 0
+      branch.state.seed:
+        contract: {{dtype: int64, shape: [batch, 1], batch_layout: {{kind: request_aligned, axis: 0}}}}
+        role: {{kind: opaque}}
+        source: {{kind: literal}}
+        required: false
+        default: 0
+      root.state.seed:
+        contract: {{dtype: int64, shape: [batch, 1], batch_layout: {{kind: request_aligned, axis: 0}}}}
+        role: {{kind: opaque}}
+        source: {{kind: literal}}
+        required: false
+        default: 0
+"#
+    );
+    let outputs = r#"    outputs:
+      tokens:
+        contract: {dtype: int64, shape: [batch, Any], batch_layout: {kind: request_aligned, axis: 0}}
+        role: tokens
+        family: {kind: events}
+        stage: pre_adapter
+      setup_events:
+        contract: {dtype: int64, shape: [batch, 1], batch_layout: {kind: request_aligned, axis: 0}}
+        role: tensor
+        family: {kind: events}
+        stage: pre_adapter
+      setup_revision:
+        contract: {dtype: int64, shape: [batch, 1], batch_layout: {kind: request_aligned, axis: 0}}
+        role: tensor
+        family: {kind: revisions, version: "1"}
+        stage: pre_adapter
+      root_events:
+        contract: {dtype: int64, shape: [batch, 1], batch_layout: {kind: request_aligned, axis: 0}}
+        role: tensor
+        family: {kind: events}
+        stage: pre_adapter
+      post_value:
+        contract: {dtype: int64, shape: [batch, 1], batch_layout: {kind: request_aligned, axis: 0}}
+        role: tensor
+        family: {kind: materialized}
+        stage: pre_adapter
+"#;
+    let components = r#"      root_pre:
+        implementation: {kind: onnx, artifact: pre-true.onnx.textproto}
+        ports:
+          inputs:
+            context_tokens: {dtype: int64, shape: [batch, sequence], batch_layout: {kind: request_aligned, axis: 0}}
+          outputs:
+            prepared_context: {dtype: int64, shape: [batch, sequence], batch_layout: {kind: request_aligned, axis: 0}}
+        row_scope: {axis: 0, stateful: false}
+      root_post:
+        implementation: {kind: onnx, artifact: root-post.onnx.textproto}
+        ports:
+          inputs:
+            accepted_tokens: {dtype: int64, shape: [batch, accepted], batch_layout: {kind: request_aligned, axis: 0}}
+            root_state: {dtype: int64, shape: [batch, 1], batch_layout: {kind: request_aligned, axis: 0}}
+          outputs:
+            post_value: {dtype: int64, shape: [batch, 1], batch_layout: {kind: request_aligned, axis: 0}}
+            root_state_out: {dtype: int64, shape: [batch, 1], batch_layout: {kind: request_aligned, axis: 0}}
+        row_scope: {axis: 0, stateful: true}
+      setup:
+        implementation: {kind: onnx, artifact: setup.onnx.textproto}
+        effects: [audit]
+        ports:
+          inputs:
+            context_tokens: {dtype: int64, shape: [batch, sequence], batch_layout: {kind: request_aligned, axis: 0}}
+            proposer_state: {dtype: float32, shape: [batch, 2], batch_layout: {kind: request_aligned, axis: 0}}
+            target_state: {dtype: float32, shape: [batch, 2], batch_layout: {kind: request_aligned, axis: 0}}
+            token_context: {dtype: int64, shape: [batch, 4], batch_layout: {kind: request_aligned, axis: 0}}
+            branch_state: {dtype: int64, shape: [batch, 1], batch_layout: {kind: request_aligned, axis: 0}}
+            setup_counter: {dtype: int64, shape: [batch, 1], batch_layout: {kind: request_aligned, axis: 0}}
+          outputs:
+            prepared_context: {dtype: int64, shape: [batch, sequence], batch_layout: {kind: request_aligned, axis: 0}}
+            proposer_state_out: {dtype: float32, shape: [batch, 2], batch_layout: {kind: request_aligned, axis: 0}}
+            target_state_out: {dtype: float32, shape: [batch, 2], batch_layout: {kind: request_aligned, axis: 0}}
+            token_context_out: {dtype: int64, shape: [batch, 4], batch_layout: {kind: request_aligned, axis: 0}}
+            branch_state_out: {dtype: int64, shape: [batch, 1], batch_layout: {kind: request_aligned, axis: 0}}
+            setup_counter_out: {dtype: int64, shape: [batch, 1], batch_layout: {kind: request_aligned, axis: 0}}
+            setup_event: {dtype: int64, shape: [batch, 1], batch_layout: {kind: request_aligned, axis: 0}}
+        row_scope: {axis: 0, stateful: true}
+      pre_true:
+        implementation: {kind: onnx, artifact: pre-true.onnx.textproto}
+        ports:
+          inputs:
+            context_tokens: {dtype: int64, shape: [batch, sequence], batch_layout: {kind: request_aligned, axis: 0}}
+          outputs:
+            prepared_context: {dtype: int64, shape: [batch, sequence], batch_layout: {kind: request_aligned, axis: 0}}
+        row_scope: {axis: 0, stateful: false}
+      pre_false:
+        implementation: {kind: onnx, artifact: pre-false.onnx.textproto}
+        ports:
+          inputs:
+            context_tokens: {dtype: int64, shape: [batch, sequence], batch_layout: {kind: request_aligned, axis: 0}}
+          outputs:
+            prepared_context: {dtype: int64, shape: [batch, sequence], batch_layout: {kind: request_aligned, axis: 0}}
+        row_scope: {axis: 0, stateful: false}
+      post_true:
+        implementation: {kind: onnx, artifact: post-true.onnx.textproto}
+        ports:
+          inputs:
+            accepted_tokens: {dtype: int64, shape: [batch, accepted], batch_layout: {kind: request_aligned, axis: 0}}
+            branch_state: {dtype: int64, shape: [batch, 1], batch_layout: {kind: request_aligned, axis: 0}}
+          outputs:
+            post_value: {dtype: int64, shape: [batch, 1], batch_layout: {kind: request_aligned, axis: 0}}
+            branch_state_out: {dtype: int64, shape: [batch, 1], batch_layout: {kind: request_aligned, axis: 0}}
+        row_scope: {axis: 0, stateful: true}
+      post_false:
+        implementation: {kind: onnx, artifact: post-false.onnx.textproto}
+        ports:
+          inputs:
+            accepted_tokens: {dtype: int64, shape: [batch, accepted], batch_layout: {kind: request_aligned, axis: 0}}
+            branch_state: {dtype: int64, shape: [batch, 1], batch_layout: {kind: request_aligned, axis: 0}}
+          outputs:
+            post_value: {dtype: int64, shape: [batch, 1], batch_layout: {kind: request_aligned, axis: 0}}
+            branch_state_out: {dtype: int64, shape: [batch, 1], batch_layout: {kind: request_aligned, axis: 0}}
+        row_scope: {axis: 0, stateful: true}
+"#;
+    let steps = r#"    steps:
+    - kind: invoke
+      component: root_pre
+      inputs: {context_tokens: request.tokens}
+      outputs: {prepared_context: root.context}
+    - kind: loop
+      setup:
+      - kind: invoke
+        component: setup
+        inputs:
+          context_tokens: root.context
+          proposer_state: request.proposer_state
+          target_state: request.target_state
+          token_context: request.token_context
+          branch_state: branch.state.seed
+          setup_counter: setup.counter.seed
+        outputs:
+          prepared_context: setup.context
+          proposer_state_out: setup.proposer_state
+          target_state_out: setup.target_state
+          token_context_out: setup.token_context
+          branch_state_out: setup.branch_state
+          setup_counter_out: setup.counter.next
+          setup_event: setup.event
+      - {kind: emit, value: setup.event, output: setup_events, mode: event}
+      - {kind: emit, value: setup.counter.next, output: setup_revision, mode: append}
+      steps:
+      - kind: branch
+        predicate: control.branch
+        cases:
+          "true":
+            kind: invoke
+            component: pre_true
+            inputs: {context_tokens: setup.context}
+            outputs: {prepared_context: branch.true.context}
+        default:
+          kind: invoke
+          component: pre_false
+          inputs: {context_tokens: setup.context}
+          outputs: {prepared_context: branch.false.context}
+        outputs:
+          branch.context:
+            cases: {"true": branch.true.context}
+            default: branch.false.context
+      - kind: invoke
+        component: proposer
+        inputs: {context_tokens: branch.context, private_state: proposer_private}
+        outputs:
+          candidate_tokens: proposed.tokens
+          candidate_parents: proposed.parents
+          proposal_probabilities: proposed.probabilities
+          private_state_out: proposed.state
+      - kind: invoke
+        component: target
+        inputs:
+          context_tokens: branch.context
+          candidate_tokens: proposed.tokens
+          ancestor_mask: runtime.ancestor_mask
+          position_ids: runtime.position_ids
+          accepted_tokens: runtime.accepted_tokens
+          target_state: target_recurrent
+          token_context: token_context
+        outputs:
+          target_logits: verified.logits
+          target_probabilities: verified.probabilities
+          target_state_out: verified.state
+          token_context_out: verified.token_context
+      - kind: branch
+        predicate: control.branch
+        cases:
+          "true":
+            kind: invoke
+            component: post_true
+            inputs: {accepted_tokens: accepted_prefix, branch_state: branch_counter}
+            outputs: {post_value: branch.true.post, branch_state_out: branch.true.state}
+        default:
+          kind: invoke
+          component: post_false
+          inputs: {accepted_tokens: accepted_prefix, branch_state: branch_counter}
+          outputs: {post_value: branch.false.post, branch_state_out: branch.false.state}
+        outputs:
+          branch.post:
+            cases: {"true": branch.true.post}
+            default: branch.false.post
+          branch.state:
+            cases: {"true": branch.true.state}
+            default: branch.false.state
+      - {kind: emit, value: accepted_prefix, output: tokens, mode: event}
+      - {kind: emit, value: branch.post, output: post_value, mode: replace}
+      continue_when: control.continue
+      max_iterations: control.max
+      carried:
+      - {cell: proposer_private, initial: setup.proposer_state, next: proposed.state}
+      - {cell: target_recurrent, initial: setup.target_state, next: verified.state}
+      - {cell: token_context, initial: setup.token_context, next: verified.token_context}
+      - {cell: branch_counter, initial: setup.branch_state, next: branch.state}
+    - kind: invoke
+      component: root_post
+      inputs: {accepted_tokens: setup.event, root_state: root.state.seed}
+      outputs: {post_value: root.post, root_state_out: root.state.next}
+    - {kind: emit, value: root.post, output: root_events, mode: event}
+"#;
+    let setup_state = r#"      setup_counter:
+        contract: {dtype: int64, shape: [batch, 1], batch_layout: {kind: request_aligned, axis: 0}}
+        class: semantic
+        scope: session
+        initializer: setup.counter.seed
+        recurrence: {kind: invariant}
+        management: runtime
+        release_boundary: session
+        service_group: setup_counter
+      branch_counter:
+        contract: {dtype: int64, shape: [batch, 1], batch_layout: {kind: request_aligned, axis: 0}}
+        class: semantic
+        scope: session
+        initializer: branch.state.seed
+        recurrence: {kind: invariant}
+        management: runtime
+        release_boundary: session
+        service_group: branch_counter
+      root_counter:
+        contract: {dtype: int64, shape: [batch, 1], batch_layout: {kind: request_aligned, axis: 0}}
+        class: semantic
+        scope: session
+        initializer: root.state.seed
+        recurrence: {kind: invariant}
+        management: runtime
+        release_boundary: session
+        service_group: root_counter
+"#;
+    let setup_service = r#"          setup_counter:
+            kind: recurrent
+            layout: bf
+            update: {kind: replace}
+            capabilities: {rollback_positions: 1, snapshot: true, fork: false}
+            ports:
+              setup:
+                setup_counter: {input: setup_counter, output: setup_counter_out}
+          branch_counter:
+            kind: recurrent
+            layout: bf
+            update: {kind: replace}
+            capabilities: {rollback_positions: 6, snapshot: true, fork: false}
+            ports:
+              setup:
+                branch_counter: {input: branch_state, output: branch_state_out}
+              post_true:
+                branch_counter: {input: branch_state, output: branch_state_out}
+              post_false:
+                branch_counter: {input: branch_state, output: branch_state_out}
+          root_counter:
+            kind: recurrent
+            layout: bf
+            update: {kind: replace}
+            capabilities: {rollback_positions: 1, snapshot: true, fork: false}
+            ports:
+              root_post:
+                root_counter: {input: root_state, output: root_state_out}
+"#;
+
+    let original_outputs = r#"    outputs:
+      tokens:
+        contract: {dtype: int64, shape: [1]}
+        role: tokens
+        family: {kind: events}
+        stage: pre_adapter
+    components:
+"#;
+    let mut metadata = PARENT_METADATA
+        .replacen(
+            "capabilities: [workflow_ssa, serving_service_contract, canonical_speculation, session_state_lease]",
+            "capabilities: [workflow_ssa, nested_control_flow, linear_effects, typed_emit, serving_service_contract, canonical_speculation, session_state_lease]",
+            1,
+        )
+        .replacen(
+            original_outputs,
+            &(controls + outputs + "    components:\n"),
+            1,
+        );
+    let component_marker = if reorder_components {
+        "    steps:\n"
+    } else {
+        "      proposer:\n"
+    };
+    metadata = metadata.replacen(
+        component_marker,
+        &(components.to_string() + component_marker),
+        1,
+    );
+    let start = metadata.find("    steps:\n").expect("workflow steps");
+    let end = metadata[start..]
+        .find("    state:\n")
+        .map(|offset| start + offset)
+        .expect("workflow state");
+    metadata.replace_range(start..end, steps);
+    metadata = metadata
+        .replacen("    state:\n", &("    state:\n".to_string() + setup_state), 1)
+        .replacen(
+            "    serving:\n",
+            "    effects:\n      audit:\n        retry: transactional\n        speculation_safety: {kind: clonable}\n    serving:\n",
+            1,
+        )
+        .replacen(
+            "        groups:\n",
+            &("        groups:\n".to_string() + setup_service),
+            1,
+        )
+        .replacen(
+            "          proposer_private:\n            kind: recurrent\n            layout: bf\n            update: {kind: replace}\n            capabilities: {rollback_positions: 6, snapshot: true, fork: false}\n            ports:\n              proposer:\n",
+            "          proposer_private:\n            kind: recurrent\n            layout: bf\n            update: {kind: replace}\n            capabilities: {rollback_positions: 6, snapshot: true, fork: false}\n            ports:\n              setup:\n                proposer_private: {input: proposer_state, output: proposer_state_out}\n              proposer:\n",
+            1,
+        )
+        .replacen(
+            "          target_recurrent:\n            kind: recurrent\n            layout: bf\n            update: {kind: replace}\n            capabilities: {rollback_positions: 6, snapshot: true, fork: false, cascade: [token_context]}\n            ports:\n              target:\n",
+            "          target_recurrent:\n            kind: recurrent\n            layout: bf\n            update: {kind: replace}\n            capabilities: {rollback_positions: 6, snapshot: true, fork: false, cascade: [token_context]}\n            ports:\n              setup:\n                target_recurrent: {input: target_state, output: target_state_out}\n              target:\n",
+            1,
+        )
+        .replacen(
+            "          token_context:\n            kind: recurrent\n            layout: bf\n            update: {kind: replace}\n            capabilities: {rollback_positions: 6, snapshot: true, fork: false, cascade: [target_recurrent]}\n            ports:\n              target:\n",
+            "          token_context:\n            kind: recurrent\n            layout: bf\n            update: {kind: replace}\n            capabilities: {rollback_positions: 6, snapshot: true, fork: false, cascade: [target_recurrent]}\n            ports:\n              setup:\n                token_context: {input: token_context, output: token_context_out}\n              target:\n",
+            1,
+        )
+        .replacen(
+            "  rollback_state: [proposer_private, target_recurrent, token_context]",
+            "  rollback_state: [proposer_private, target_recurrent, token_context, branch_counter]",
+            1,
+        );
+    metadata
+}
+
+fn composed_parent_package(
+    continue_loop: bool,
+    reorder_components: bool,
+) -> anyhow::Result<PathBuf> {
+    let root = parent_package(&[-1, -1, 0, 1, 2, 4], &[2, 0, 4, 0, 0, 0, 0])?;
+    fs::write(
+        root.join("inference_metadata.yaml"),
+        composed_parent_metadata(continue_loop, reorder_components),
+    )?;
+    for (name, model) in [
+        ("setup.onnx.textproto", COMPOSED_SETUP),
+        ("pre-true.onnx.textproto", COMPOSED_PRE_TRUE),
+        ("pre-false.onnx.textproto", COMPOSED_PRE_FALSE),
+        ("post-true.onnx.textproto", COMPOSED_POST_TRUE),
+        ("post-false.onnx.textproto", COMPOSED_POST_FALSE),
+        ("root-post.onnx.textproto", COMPOSED_ROOT_POST),
+    ] {
+        fs::write(root.join(name), model)?;
+    }
+    Ok(root)
+}
+
+fn retryable_composed_parent_package() -> anyhow::Result<PathBuf> {
+    let root = composed_parent_package(true, false)?;
+    replace_metadata(&root, |metadata| {
+        metadata
+            .replacen(
+                "      setup_revision:\n        contract: {dtype: int64, shape: [batch, 1], batch_layout: {kind: request_aligned, axis: 0}}\n        role: tensor\n        family: {kind: revisions, version: \"1\"}",
+                "      setup_revision:\n        contract: {dtype: int64, shape: [batch, 1], batch_layout: {kind: request_aligned, axis: 0}}\n        role: tensor\n        family: {kind: events}",
+                1,
+            )
+            .replacen(
+                "{kind: emit, value: setup.counter.next, output: setup_revision, mode: append}",
+                "{kind: emit, value: setup.counter.next, output: setup_revision, mode: event}",
+                1,
+            )
+    })?;
+    Ok(root)
+}
+
+fn repeated_composed_parent_package(iterations: usize) -> anyhow::Result<PathBuf> {
+    let root = retryable_composed_parent_package()?;
+    replace_metadata(&root, |metadata| {
+        metadata.replacen(
+            "      control.max:\n        contract: {dtype: int64, shape: [1]}\n        role: {kind: opaque}\n        source: {kind: literal}\n        required: false\n        default: 1",
+            &format!(
+                "      control.max:\n        contract: {{dtype: int64, shape: [1]}}\n        role: {{kind: opaque}}\n        source: {{kind: literal}}\n        required: false\n        default: {iterations}"
+            ),
+            1,
+        )
+    })?;
     Ok(root)
 }
 
@@ -619,39 +1158,79 @@ fn with_control_flow_support(metadata: String) -> String {
         )
 }
 
-type MetadataUpdate = Box<dyn FnOnce(String) -> String>;
-type RefusalCase = (&'static str, MetadataUpdate, Vec<&'static str>);
-
 #[test]
-fn candidate_tree_emit_site_is_refused_before_the_specialized_driver_can_skip_it()
--> anyhow::Result<()> {
-    let root = parent_package(&[-1, -1, 0, 1, 2, 4], &[1, 4, 0, 0, 0, 0, 0])?;
-    replace_metadata(&root, |metadata| {
-        metadata
-            .replacen(
-                "capabilities: [workflow_ssa, serving_service_contract, canonical_speculation, session_state_lease]",
-                "capabilities: [workflow_ssa, typed_emit, serving_service_contract, canonical_speculation, session_state_lease]",
-                1,
-            )
-            .replacen(
-                "    components:\n",
-                "      side:\n        contract: {dtype: int64, shape: [batch, 6], batch_layout: {kind: request_aligned, axis: 0}}\n        role: tensor\n        family: {kind: events}\n        stage: pre_adapter\n    components:\n",
-                1,
-            )
-            .replacen(
-                "    state:\n",
-                "    - kind: emit\n      value: proposed.tokens\n      output: side\n      mode: event\n    state:\n",
-                1,
-            )
-    })?;
-    assert_preload_candidate_refusal(
-        &root,
-        &[
-            "pipeline.workflow.steps[2]",
-            "cannot publish emit",
-            "S4 family/site",
-        ],
-    )?;
+fn composed_candidate_tree_runs_setup_branches_effects_and_all_outputs() -> anyhow::Result<()> {
+    let root = composed_parent_package(true, false)?;
+    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+    let session = engine.create_session()?;
+    let result = engine.generate_in_session(session, greedy_request(3))?;
+    assert_eq!(result.token_ids, vec![2, 4, 0]);
+    assert_eq!(
+        engine.workflow_session_effect_cursor(&session.to_string(), "audit"),
+        Some(1),
+        "setup effect must commit exactly once through the generic turn"
+    );
+    let invocations = engine.component_invocations();
+    for (component, expected) in [
+        ("root_pre", 1),
+        ("setup", 1),
+        ("pre_true", 1),
+        ("proposer", 2),
+        ("target", 2),
+        ("post_true", 1),
+        ("root_post", 1),
+    ] {
+        assert_eq!(
+            invocations.get(component).copied(),
+            Some(expected),
+            "{component} must execute in authored order without duplication"
+        );
+    }
+    assert!(!invocations.contains_key("pre_false"));
+    assert!(!invocations.contains_key("post_false"));
+
+    let publications = engine.take_committed_workflow_publications();
+    let names = publications
+        .iter()
+        .map(|publication| match publication {
+            WorkflowOutputPublication::Materialized { output, .. }
+            | WorkflowOutputPublication::Event { output, .. } => output.as_str(),
+            WorkflowOutputPublication::Revision(envelope) => envelope.output.as_str(),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        [
+            "setup_events",
+            "setup_revision",
+            "tokens",
+            "post_value",
+            "root_events",
+            "setup_revision",
+        ]
+    );
+    let WorkflowOutputPublication::Event { payload, .. } = &publications[0] else {
+        panic!("setup output must be an event")
+    };
+    assert_eq!(payload.to_vec_i64()?, vec![1]);
+    let WorkflowOutputPublication::Event { payload, .. } = &publications[2] else {
+        panic!("candidate accepted path must flow through the authored token emit")
+    };
+    assert_eq!(payload.to_vec_i64()?, vec![2, 4, 0]);
+    let WorkflowOutputPublication::Materialized { payload, .. } = &publications[3] else {
+        panic!("post-branch phi must publish a materialized value")
+    };
+    assert_eq!(payload.to_vec_i64()?, vec![6]);
+    let error = engine
+        .prepare_session_fork(session, SessionPosition::new(0))
+        .expect_err("composed candidate fork must decline before child allocation");
+    assert!(matches!(
+        error,
+        SessionForkError::UnsupportedParticipant { participant, reason, .. }
+            if participant == "candidate_tree.accepted_path"
+                && reason.contains("before child allocation")
+    ));
+
     Ok(())
 }
 
@@ -781,108 +1360,113 @@ fn ambiguous_phi_candidate_binding_refuses_before_loading() -> anyhow::Result<()
 }
 
 #[test]
-fn unsupported_candidate_compositions_all_refuse_before_component_loading() -> anyhow::Result<()> {
-    let parents = [-1, -1, 0, 1, 2, 4];
-    let decisions = [1, 4, 0, 0, 0, 0, 0];
-    let cases: Vec<RefusalCase> = vec![
-        (
-            "empty-loop",
-            Box::new(|metadata| {
-                with_control_flow_support(metadata).replacen(
-                    "    - kind: invoke\n      component: proposer\n",
-                    "    - kind: loop\n      setup: []\n      steps:\n      - {kind: invoke, component: observer}\n      continue_when: control.continue\n      max_iterations: control.max\n    - kind: invoke\n      component: proposer\n",
-                    1,
-                )
-            }),
-            vec![
-                "pipeline.workflow.steps[0]",
-                "loop",
-                "condition/body ordering",
-            ],
-        ),
-        (
-            "setup-loop",
-            Box::new(|metadata| {
-                with_control_flow_support(metadata).replacen(
-                    "    - kind: invoke\n      component: proposer\n",
-                    "    - kind: loop\n      setup:\n      - {kind: invoke, component: observer}\n      steps:\n      - {kind: invoke, component: observer}\n      continue_when: control.continue\n      max_iterations: control.max\n    - kind: invoke\n      component: proposer\n",
-                    1,
-                )
-            }),
-            vec!["pipeline.workflow.steps[0]", "loop", "non-empty setup"],
-        ),
-        (
-            "branch",
-            Box::new(|metadata| {
-                with_control_flow_support(metadata).replacen(
-                    "    - kind: invoke\n      component: proposer\n",
-                    "    - kind: branch\n      predicate: control.continue\n      cases:\n        \"true\": {kind: invoke, component: observer}\n      default: {kind: invoke, component: observer}\n    - kind: invoke\n      component: proposer\n",
-                    1,
-                )
-            }),
-            vec!["pipeline.workflow.steps[0]", "branch", "predicate/join"],
-        ),
-        (
-            "unrelated",
-            Box::new(|metadata| {
-                metadata
-                    .replacen(
-                        "      proposer:\n",
-                        "      observer:\n        implementation: {kind: onnx, artifact: observer.onnx.textproto}\n        ports: {inputs: {}, outputs: {}}\n        row_scope: {axis: 0, stateful: false}\n      proposer:\n",
-                        1,
-                    )
-                    .replacen(
-                        "    - kind: invoke\n      component: proposer\n",
-                        "    - kind: invoke\n      component: observer\n    - kind: invoke\n      component: proposer\n",
-                        1,
-                    )
-            }),
-            vec![
-                "pipeline.workflow.steps[0]",
-                "unrelated component 'observer'",
-            ],
-        ),
-        (
-            "effect",
-            Box::new(|metadata| {
-                metadata
-                    .replacen(
-                        "capabilities: [workflow_ssa, serving_service_contract, canonical_speculation, session_state_lease]",
-                        "capabilities: [workflow_ssa, linear_effects, serving_service_contract, canonical_speculation, session_state_lease]",
-                        1,
-                    )
-                    .replacen(
-                        "    serving:\n",
-                        "    effects:\n      audit: {retry: pure}\n    serving:\n",
-                        1,
-                    )
-            }),
-            vec![
-                "effectful candidate-tree regions",
-                "accepted-path transaction",
-            ],
-        ),
-        (
-            "extra-output",
-            Box::new(|metadata| {
-                metadata.replacen(
-                    "    components:\n",
-                    "      side:\n        contract: {dtype: int64, shape: [batch, 6], batch_layout: {kind: request_aligned, axis: 0}}\n        role: tensor\n        family: {kind: events}\n        stage: pre_adapter\n    components:\n",
-                    1,
-                )
-            }),
-            vec![
-                "declared output 'side'",
-                "no candidate-tree output-publication participant",
-            ],
-        ),
-    ];
-    for (name, update, expected) in cases {
-        let root = parent_package(&parents, &decisions)?;
-        replace_metadata(&root, update)?;
-        assert_preload_candidate_refusal(&root, &expected)
-            .map_err(|error| anyhow::anyhow!("{name}: {error:#}"))?;
-    }
+fn intervening_work_at_the_exact_verification_seam_refuses_before_loading() -> anyhow::Result<()> {
+    let root = parent_package(&[-1, -1, 0, 1, 2, 4], &[1, 4, 0, 0, 0, 0, 0])?;
+    replace_metadata(&root, |metadata| {
+        with_control_flow_support(metadata).replacen(
+            "    - kind: invoke\n      component: target\n",
+            "    - kind: invoke\n      component: observer\n    - kind: invoke\n      component: target\n",
+            1,
+        )
+    })?;
+    assert_preload_candidate_refusal(
+        &root,
+        &[
+            "proposer",
+            "not immediately followed",
+            "observer",
+            "Move unrelated work before or after",
+        ],
+    )?;
+    Ok(())
+}
+
+#[test]
+fn zero_trip_setup_and_component_map_reorder_preserve_semantics() -> anyhow::Result<()> {
+    let zero_trip = composed_parent_package(false, false)?;
+    let mut engine = Engine::from_dir(&zero_trip, EngineConfig::default())?;
+    let result = engine.generate(greedy_request(3))?;
+    assert!(result.token_ids.is_empty());
+    let invocations = engine.component_invocations();
+    assert_eq!(invocations.get("setup").copied(), Some(1));
+    assert_eq!(invocations.get("root_pre").copied(), Some(1));
+    assert_eq!(invocations.get("root_post").copied(), Some(1));
+    assert!(!invocations.contains_key("proposer"));
+    assert!(!invocations.contains_key("target"));
+    let publications = engine.take_committed_workflow_publications();
+    assert_eq!(publications.len(), 4);
+    assert!(matches!(
+        &publications[0],
+        WorkflowOutputPublication::Event { output, payload, .. }
+            if output == "setup_events" && payload.to_vec_i64()? == vec![1]
+    ));
+
+    let ordered = composed_parent_package(true, false)?;
+    let reordered = composed_parent_package(true, true)?;
+    let ordered_result =
+        Engine::from_dir(&ordered, EngineConfig::default())?.generate(greedy_request(3))?;
+    let reordered_result =
+        Engine::from_dir(&reordered, EngineConfig::default())?.generate(greedy_request(3))?;
+    assert_eq!(ordered_result.token_ids, reordered_result.token_ids);
+    Ok(())
+}
+
+#[test]
+fn sampling_candidate_path_executes_inside_the_composed_workflow() -> anyhow::Result<()> {
+    let root = composed_parent_package(true, false)?;
+    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+    let result = engine.generate(sampling_request(23, 2))?;
+    assert!(!result.token_ids.is_empty());
+    let invocations = engine.component_invocations();
+    assert_eq!(invocations.get("setup").copied(), Some(1));
+    assert_eq!(invocations.get("root_pre").copied(), Some(1));
+    assert_eq!(invocations.get("root_post").copied(), Some(1));
+    assert_eq!(invocations.get("pre_true").copied(), Some(1));
+    assert_eq!(invocations.get("post_true").copied(), Some(1));
+    assert_eq!(
+        engine.take_candidate_tree_block_traces().len(),
+        1,
+        "the authored loop owns one candidate-tree seam entry"
+    );
+    Ok(())
+}
+
+#[test]
+fn token_output_identity_is_selected_by_role_not_by_name() -> anyhow::Result<()> {
+    let root = parent_package(&[-1, -1, 0, 1, 2, 4], &[2, 0, 4, 0, 0, 0, 0])?;
+    replace_metadata(&root, |metadata| {
+        metadata.replacen("      tokens:\n", "      generated_ids:\n", 1)
+    })?;
+    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+    let result = engine.generate(greedy_request(3))?;
+    assert_eq!(result.token_ids, vec![2, 4, 0]);
+    assert!(engine.take_committed_workflow_publications().iter().all(
+        |publication| match publication {
+            WorkflowOutputPublication::Materialized { output, .. }
+            | WorkflowOutputPublication::Event { output, .. } => output == "generated_ids",
+            WorkflowOutputPublication::Revision(envelope) => {
+                envelope.output == "generated_ids"
+            }
+        }
+    ));
+    Ok(())
+}
+
+#[test]
+fn authored_loop_repeats_only_its_body_and_never_duplicates_setup() -> anyhow::Result<()> {
+    let root = repeated_composed_parent_package(2)?;
+    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+    let result = engine.generate(greedy_request(6))?;
+    assert!(!result.token_ids.is_empty());
+    let invocations = engine.component_invocations();
+    assert_eq!(engine.take_candidate_tree_block_traces().len(), 2);
+    assert_eq!(invocations.get("setup").copied(), Some(1));
+    assert_eq!(invocations.get("root_pre").copied(), Some(1));
+    assert_eq!(invocations.get("root_post").copied(), Some(1));
+    assert_eq!(invocations.get("pre_true").copied(), Some(2));
+    assert_eq!(invocations.get("post_true").copied(), Some(2));
+    assert_eq!(invocations.get("proposer").copied(), Some(4));
+    assert_eq!(invocations.get("target").copied(), Some(4));
     Ok(())
 }
 
@@ -1097,6 +1681,12 @@ fn dispatched_sampling_matches_independent_reference_and_distribution_support() 
 #[test]
 fn sampling_without_both_declared_distributions_refuses_before_mutation() -> anyhow::Result<()> {
     let root = parent_package(&[-1, -1, 0, 1, 2, 4], &[1, 4, 0, 0, 0, 0, 0])?;
+    replace_metadata(&root, |metadata| {
+        metadata.replace(
+            "    probabilities:\n      proposal: {component: proposer, output: proposal_probabilities}\n      target: {component: target, output: target_probabilities}\n",
+            "",
+        )
+    })?;
     let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
     let error = engine
         .generate(GenerateRequest {
@@ -1213,6 +1803,157 @@ fn fault_at(boundary: GenerationBoundary) -> GenerationControl {
     })
 }
 
+fn composed_control_at(
+    boundary: GenerationBoundary,
+    occurrence: usize,
+    cancellation: bool,
+) -> GenerationControl {
+    let seen = AtomicUsize::new(0);
+    let control = GenerationControl::new();
+    let cancellation_control = control.clone();
+    control.with_checkpoint(move |observed| {
+        if observed == boundary && seen.fetch_add(1, Ordering::AcqRel) + 1 == occurrence {
+            if cancellation {
+                cancellation_control.cancel();
+            } else {
+                anyhow::bail!("injected composed {boundary} failure");
+            }
+        }
+        Ok(())
+    })
+}
+
+struct ComposedSecondTurn {
+    tokens: Vec<u32>,
+    candidates: Vec<u32>,
+    setup_state: Vec<i64>,
+    branch_state: Vec<i64>,
+    root_state: Vec<i64>,
+}
+
+fn clean_composed_second_turn(root: &Path) -> anyhow::Result<ComposedSecondTurn> {
+    let mut engine = Engine::from_dir(root, EngineConfig::default())?;
+    let session = engine.create_session()?;
+    engine.generate_in_session(session, greedy_request(1))?;
+    engine.take_candidate_tree_block_traces();
+    engine.take_committed_workflow_publications();
+    let result = engine.generate_in_session(session, greedy_request(1))?;
+    let candidates = engine.take_candidate_tree_block_traces()[0]
+        .candidates
+        .clone();
+    let publications = engine.take_committed_workflow_publications();
+    let WorkflowOutputPublication::Event { payload, .. } = &publications[0] else {
+        panic!("composed setup must publish its state event first")
+    };
+    let setup_state = payload.to_vec_i64()?;
+    let WorkflowOutputPublication::Materialized { payload, .. } = &publications[3] else {
+        panic!("composed branch state must publish through post_value")
+    };
+    let branch_state = payload.to_vec_i64()?;
+    let WorkflowOutputPublication::Event { payload, .. } = &publications[4] else {
+        panic!("composed unrelated root state must publish through root_events")
+    };
+    Ok(ComposedSecondTurn {
+        tokens: result.token_ids,
+        candidates,
+        setup_state,
+        branch_state,
+        root_state: payload.to_vec_i64()?,
+    })
+}
+
+fn assert_composed_controlled_retry(
+    boundary: GenerationBoundary,
+    occurrence: usize,
+    cancellation: bool,
+) -> anyhow::Result<()> {
+    let root = retryable_composed_parent_package()?;
+    let expected = clean_composed_second_turn(&root)?;
+    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+    let session = engine.create_session()?;
+    engine.generate_in_session(session, greedy_request(1))?;
+    engine.take_candidate_tree_block_traces();
+    engine.take_committed_workflow_publications();
+    let baseline = engine.session_token_count(session)?;
+    let effect_baseline = engine
+        .workflow_session_effect_cursor(&session.to_string(), "audit")
+        .expect("first composed turn commits its audit effect");
+    let control = composed_control_at(boundary, occurrence, cancellation);
+    let mut delivered = Vec::new();
+    let mut callback = |token: onnx_genai_engine::GenerateToken| -> anyhow::Result<()> {
+        delivered.push(token.token_id);
+        Ok(())
+    };
+    let error = engine
+        .generate_in_session_with_control_callbacks(
+            session,
+            greedy_request(1),
+            control,
+            None,
+            Some(&mut callback),
+        )
+        .expect_err("composed candidate-tree turn must abort");
+    if cancellation {
+        let cancelled = error
+            .downcast_ref::<CandidateTreeGenerationCancelled>()
+            .expect("typed composed candidate-tree cancellation");
+        assert_eq!(cancelled.boundary, boundary);
+    } else {
+        assert!(
+            format!("{error:#}").contains("injected composed"),
+            "{error:#}"
+        );
+    }
+    assert!(delivered.is_empty());
+    assert_eq!(engine.session_token_count(session)?, baseline);
+    assert_eq!(
+        engine.workflow_session_effect_cursor(&session.to_string(), "audit"),
+        Some(effect_baseline),
+        "aborted setup effect must restore its committed cursor"
+    );
+    assert!(engine.take_candidate_tree_block_traces().is_empty());
+    assert!(
+        engine.take_committed_workflow_publications().is_empty(),
+        "setup/candidate/branch publications must all remain provisional on abort"
+    );
+
+    let retry = engine.generate_in_session(session, greedy_request(1))?;
+    let trace = engine.take_candidate_tree_block_traces();
+    let publications = engine.take_committed_workflow_publications();
+    let WorkflowOutputPublication::Event { payload, .. } = &publications[0] else {
+        panic!("retry setup must publish its state event first")
+    };
+    assert_eq!(retry.token_ids, expected.tokens);
+    assert_eq!(trace[0].candidates, expected.candidates);
+    assert_eq!(
+        payload.to_vec_i64()?,
+        expected.setup_state,
+        "aborted setup state must not advance before deterministic retry"
+    );
+    let WorkflowOutputPublication::Materialized { payload, .. } = &publications[3] else {
+        panic!("retry branch state must publish through post_value")
+    };
+    assert_eq!(
+        payload.to_vec_i64()?,
+        expected.branch_state,
+        "aborted branch-local state must not advance before deterministic retry"
+    );
+    let WorkflowOutputPublication::Event { payload, .. } = &publications[4] else {
+        panic!("retry unrelated root state must publish through root_events")
+    };
+    assert_eq!(
+        payload.to_vec_i64()?,
+        expected.root_state,
+        "aborted unrelated root state must not advance before deterministic retry"
+    );
+    assert_eq!(
+        engine.workflow_session_effect_cursor(&session.to_string(), "audit"),
+        Some(effect_baseline + 1),
+        "retry must commit the setup effect once"
+    );
+    Ok(())
+}
+
 fn clean_second_turn(root: &Path) -> anyhow::Result<(Vec<u32>, Vec<u32>)> {
     let mut engine = Engine::from_dir(root, EngineConfig::default())?;
     let session = engine.create_session()?;
@@ -1280,6 +2021,21 @@ fn fault_and_cancellation_restore_state_rng_and_staged_output_for_retry() -> any
     ] {
         assert_controlled_retry(boundary, false)?;
         assert_controlled_retry(boundary, true)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn composed_faults_and_cancellation_restore_setup_branch_state_effects_and_outputs()
+-> anyhow::Result<()> {
+    for (boundary, occurrence) in [
+        (GenerationBoundary::AfterLoopSetup, 1),
+        (GenerationBoundary::AfterVerifier, 1),
+        (GenerationBoundary::AfterBranch, 2),
+        (GenerationBoundary::BeforeSemanticCommit, 1),
+    ] {
+        assert_composed_controlled_retry(boundary, occurrence, false)?;
+        assert_composed_controlled_retry(boundary, occurrence, true)?;
     }
     Ok(())
 }
