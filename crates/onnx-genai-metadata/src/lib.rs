@@ -147,7 +147,7 @@ pub use validation::{
 };
 pub use version::{
     BATCHING_SCHEMA_VERSION, INITIAL_SCHEMA_VERSION, SUPPORTED_SCHEMA_VERSION, SchemaVersion,
-    TOKEN_AUTHORITY_SCHEMA_VERSION,
+    TOKEN_AUTHORITY_SCHEMA_VERSION, TOOL_PROTOCOL_SCHEMA_VERSION,
 };
 
 /// Generates the inference-metadata JSON Schema with deterministic object-key ordering.

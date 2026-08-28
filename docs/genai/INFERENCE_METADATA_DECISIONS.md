@@ -1376,6 +1376,46 @@ ambiguous identities and versions fail closed; parser trial order, model-family
 matching, and a boolean such as `supports_tools` are forbidden. Whether the
 implementation is native or portable is not part of the package contract.
 
+The declaration is an exact pair under `package`, not an implementation
+registry entry:
+
+```yaml
+schema_version: v1.3
+package:
+  tool_protocol:
+    identity: tagged-json
+    version: v1
+```
+
+`identity` and `version` are opaque protocol-owned strings. They select the
+request/template renderer and output-envelope parser together; a package that
+does not support tools omits `tool_protocol` entirely.
+
+Forced `tool_choice` output requirements are adapter-owned too:
+`tagged-json@v1` supplies its tagged JSON grammar, while `atem-xml@v1`
+explicitly supplies no engine JSON grammar because its envelope is XML. A
+runtime must not apply one protocol's grammar to another protocol.
+
+This server currently supplies these exact v1 adapters:
+
+| Declaration | Request/template rendering | Output envelopes |
+| --- | --- | --- |
+| `tagged-json@v1` | Supplies the offered OpenAI `tools` JSON value to a chat template; without a template, prefixes it with `<\|tools\|>\n`. It emits the caller's `tool_choice` after `<\|tool_choice\|>\n`. | One or more adjacent `<tool_call>{...}</tool_call>` envelopes, separated only by whitespace. Every object has `name`, optionally `id`, and `arguments` or `parameters`. |
+| `atem-xml@v1` | Supplies the same `tools` JSON template value; without a template, prefixes it with `<atem:tools>\n`. It uses the same explicit `tool_choice` placement. | One or more adjacent `<atem:invoke name="...">...</atem:invoke>` envelopes. Each argument is `<atem:parameter name="...">JSON-or-text</atem:parameter>`; `&quot;`, `&apos;`, `&lt;`, `&gt;`, and `&amp;` are unescaped exactly once. |
+
+For both adapters, explicit IDs are preserved and absent IDs become stable
+`call_<index>` values in envelope order. Duplicate IDs, empty/oversized names
+or IDs, excess calls, non-whitespace envelope interstitials, invalid JSON, and
+text outside XML parameters are malformed. Before an opening envelope parsing
+is `NoCall`; after an unclosed opening envelope it is `Incomplete`; a complete,
+valid sequence is `Complete`. Feeding the same UTF-8 output in arbitrary chunks
+MUST produce the same typed result as feeding it at once. This server caps each
+rendered or parsed protocol payload at 64 KiB and each collection at 32 calls.
+At the buffered-generation and SSE-streaming boundaries, `Incomplete` and
+`Malformed` are typed protocol failures that name the declared identity/version
+and boundary; they are never returned as assistant content. `NoCall` remains
+ordinary assistant content.
+
 All caller-provided tool data, template values, and model-produced envelopes are
 untrusted structured input and **MUST** be bounded and validated. Metadata grants
 no authority to execute or select tools.
@@ -1443,6 +1483,7 @@ Packages written against the previous contract migrate as follows:
 | top-level `model.io` | declare port roles in `components.<c>.ports.roles` and cache ports in the owning `state_service` group |
 | `model.io.static_cache` | `state_service.groups.<g>.update` (`indexed_scatter`, `write_indices_ports`, `kv_length_ports`) plus `role`/`layer` on the group's port pairs |
 | `pipeline.models.<c>.io` | deleted with the composite IR; use `components.<c>.ports` |
+| inferred tool format / `supports_tools` | declare exact `package.tool_protocol.identity` and `.version`, or omit the section when tools are unsupported |
 
 Every removed field is rejected by name, so migration failures are precise rather
 than mysterious.

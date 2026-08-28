@@ -2226,6 +2226,17 @@
             }
           ],
           "description": "Exact tokenizer and vocabulary facts."
+        },
+        "tool_protocol": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ToolProtocolDeclaration"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Exact, versioned tool-call protocol used to render caller-owned tools\nand parse model-produced envelopes.  Absence means this package does\nnot support tool calls; it is intentionally not a boolean capability."
         }
       },
       "type": "object"
@@ -4109,6 +4120,27 @@
           ]
         }
       },
+      "type": "object"
+    },
+    "ToolProtocolDeclaration": {
+      "additionalProperties": false,
+      "description": "A portable tool-call protocol identity.  Implementations select only this\nexact pair and never infer a protocol from a model name or emitted text.",
+      "properties": {
+        "identity": {
+          "description": "Stable protocol identity, independent of model family or runtime.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "version": {
+          "description": "Exact protocol version, including its envelope and streaming semantics.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "identity",
+        "version"
+      ],
       "type": "object"
     },
     "VisionOutputBinding": {

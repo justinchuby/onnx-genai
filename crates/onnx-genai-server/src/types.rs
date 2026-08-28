@@ -495,7 +495,7 @@ pub struct AudioTranscriptionResponse {
     pub text: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct ChatMessageToolCall {
     pub id: String,
     #[serde(rename = "type")]
@@ -503,7 +503,7 @@ pub struct ChatMessageToolCall {
     pub function: ChatMessageToolCallFunction,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct ChatMessageToolCallFunction {
     pub name: String,
     pub arguments: String,

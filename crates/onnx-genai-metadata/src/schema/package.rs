@@ -19,6 +19,25 @@ pub struct PackageFacts {
     /// Constraint/grammar dialects this package's parser can interpret.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub constraint_languages: Vec<ConstraintLanguageFacts>,
+
+    /// Exact, versioned tool-call protocol used to render caller-owned tools
+    /// and parse model-produced envelopes.  Absence means this package does
+    /// not support tool calls; it is intentionally not a boolean capability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_protocol: Option<ToolProtocolDeclaration>,
+}
+
+/// A portable tool-call protocol identity.  Implementations select only this
+/// exact pair and never infer a protocol from a model name or emitted text.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ToolProtocolDeclaration {
+    /// Stable protocol identity, independent of model family or runtime.
+    #[schemars(length(min = 1))]
+    pub identity: String,
+    /// Exact protocol version, including its envelope and streaming semantics.
+    #[schemars(length(min = 1))]
+    pub version: String,
 }
 
 /// Tokenizer facts and package-relative artifacts.
