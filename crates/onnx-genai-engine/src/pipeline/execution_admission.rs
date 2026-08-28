@@ -4,10 +4,10 @@ use onnx_genai_metadata::{
     CandidateTreeTopology, ComponentImplementation, DFlashStructure, InferenceMetadata,
     RuntimeInputRole, SemanticInputRole, SpeculativeAcceptedPath, SpeculativeContract,
     SpeculativeProposalExecution, StateFinalWriter, StatePortAccess, WorkflowSpec, WorkflowStep,
-    capabilities, derived_capabilities,
+    extensions::{DFLASH_FLAT_BLOCK_V1, find},
 };
 
-use crate::engine::{EngineDecodeBackend, PackageCapabilityError};
+use crate::engine::{EngineDecodeBackend, PackageExecutionError};
 
 type InvocationBindings<'a> = (
     &'a std::collections::BTreeMap<String, String>,
@@ -65,14 +65,8 @@ pub(crate) struct CandidateTreeExecutionPlan {
 pub(crate) enum WorkflowExecutionAdmission {
     Admitted,
     CandidateTree(Box<CandidateTreeExecutionPlan>),
-    CandidateTreeUnavailable {
-        version: String,
-        reason: String,
-    },
-    DFlashUnavailable {
-        version: String,
-        capability: &'static str,
-    },
+    CandidateTreeUnavailable { version: String, reason: String },
+    DFlashUnavailable { version: String },
 }
 
 impl WorkflowExecutionAdmission {
@@ -80,21 +74,14 @@ impl WorkflowExecutionAdmission {
         metadata: &InferenceMetadata,
         backend: EngineDecodeBackend,
     ) -> Self {
-        let admission = Self::from_speculative(
+        Self::from_speculative(
             metadata.speculative.as_ref(),
             metadata
                 .pipeline
                 .as_ref()
                 .map(|pipeline| &pipeline.workflow),
             backend,
-        );
-        if matches!(admission, Self::DFlashUnavailable { .. }) {
-            debug_assert!(
-                derived_capabilities(metadata).contains(capabilities::DFLASH_FLAT_BLOCK),
-                "a validated DFlash declaration must derive its execution capability"
-            );
-        }
-        admission
+        )
     }
 
     pub(crate) fn from_speculative(
@@ -128,7 +115,7 @@ impl WorkflowExecutionAdmission {
             }
             SpeculativeProposalExecution::DflashFlatBlock {
                 version, structure, ..
-            } if version == "1"
+            } if version == DFLASH_FLAT_BLOCK_V1.version
                 && matches!(structure.as_ref(), DFlashStructure::Base)
                 && matches!(
                     backend,
@@ -138,31 +125,32 @@ impl WorkflowExecutionAdmission {
                 Self::Admitted
             }
             SpeculativeProposalExecution::DflashFlatBlock { version, .. } => {
+                debug_assert!(
+                    find(DFLASH_FLAT_BLOCK_V1.identity, version).is_some(),
+                    "metadata validation must reject an unregistered DFlash extension version"
+                );
                 Self::DFlashUnavailable {
                     version: version.clone(),
-                    capability: capabilities::DFLASH_FLAT_BLOCK,
                 }
             }
             _ => Self::Admitted,
         }
     }
 
-    pub(crate) fn require_supported(&self) -> Result<(), PackageCapabilityError> {
+    pub(crate) fn require_supported(&self) -> Result<(), PackageExecutionError> {
         match self {
             Self::Admitted | Self::CandidateTree(_) => Ok(()),
             Self::CandidateTreeUnavailable { version, reason } => {
-                Err(PackageCapabilityError::CandidateTreeExecutionUnavailable {
+                Err(PackageExecutionError::CandidateTreeExecutionUnavailable {
                     version: version.clone(),
                     reason: reason.clone(),
                 })
             }
-            Self::DFlashUnavailable {
-                version,
-                capability,
-            } => Err(PackageCapabilityError::DFlashExecutionUnavailable {
-                version: version.clone(),
-                capability: (*capability).to_string(),
-            }),
+            Self::DFlashUnavailable { version } => {
+                Err(PackageExecutionError::DFlashExecutionUnavailable {
+                    version: version.clone(),
+                })
+            }
         }
     }
 
@@ -1107,7 +1095,6 @@ mod tests {
             WorkflowExecutionAdmission::from_metadata(&dflash, EngineDecodeBackend::Native),
             WorkflowExecutionAdmission::DFlashUnavailable {
                 version: "1".to_string(),
-                capability: capabilities::DFLASH_FLAT_BLOCK,
             }
         );
 
@@ -1127,7 +1114,6 @@ mod tests {
             WorkflowExecutionAdmission::from_metadata(&versioned, EngineDecodeBackend::Ort),
             WorkflowExecutionAdmission::DFlashUnavailable {
                 version: "2".to_string(),
-                capability: capabilities::DFLASH_FLAT_BLOCK,
             }
         );
     }

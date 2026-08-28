@@ -46,8 +46,6 @@ fi
 # Stripped, target-only metadata: no speculative block, no share-buffer hints ->
 # plain contiguous past->present decode (head_dim agnostic).
 cat > "$TARGET_DIR/inference_metadata.yaml" <<'YAML'
-required_capabilities:
-  - grouped_query_attention
 model:
   attention:
     type: group_query_attention

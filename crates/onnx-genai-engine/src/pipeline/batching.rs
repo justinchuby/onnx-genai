@@ -1934,7 +1934,7 @@ ports:
     fn workflow_inputs_must_share_one_logical_request_cardinality() {
         let workflow: WorkflowSpec = serde_yaml::from_str(
             r#"
-manifest: { capabilities: [] }
+manifest: {}
 inputs:
   packed:
     contract:

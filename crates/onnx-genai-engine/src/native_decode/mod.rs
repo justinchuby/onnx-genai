@@ -4,7 +4,7 @@ use crate::config::{GenerateOptions, GenerateResult, GenerateTokenCallback};
 use crate::decode::DecodeBackend;
 use crate::decode_loop::{DecodeLoopBackend, DecodeLoopState};
 use crate::logits::{ProcessorChain, TokenId};
-use crate::pipeline::generation::{GenerationRequest, generate_with_decode_core};
+use crate::pipeline::generation::GenerationRequest;
 use crate::sampling::sample_greedy;
 use anyhow::{Context, bail};
 use onnx_genai_metadata::{DecoderAbi, KvOwnership, SequenceInputKind};
@@ -1632,6 +1632,28 @@ impl NativeDecodeSession {
         runtime: &crate::pipeline::WorkflowRuntime,
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
+        self.generate_with_callback_and_staged_observer(
+            prompt_tokens,
+            options,
+            chain,
+            tokenizer,
+            runtime,
+            None,
+            callback,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn generate_with_callback_and_staged_observer(
+        &mut self,
+        prompt_tokens: &[TokenId],
+        options: &GenerateOptions,
+        chain: &ProcessorChain,
+        tokenizer: &Tokenizer,
+        runtime: &crate::pipeline::WorkflowRuntime,
+        staged_output_observer: Option<&mut crate::pipeline::ToolCallStagedOutputObserver>,
+        callback: Option<&mut GenerateTokenCallback<'_>>,
+    ) -> anyhow::Result<GenerateResult> {
         if prompt_tokens.is_empty() {
             bail!("native generation requires at least one prompt token");
         }
@@ -1645,7 +1667,7 @@ impl NativeDecodeSession {
             lookahead: std::collections::VecDeque::new(),
         };
         let mut state = DecodeLoopState::new(0, options.seed, options.top_logprobs);
-        generate_with_decode_core(
+        crate::pipeline::generation::generate_with_decode_core_and_staged_observer(
             runtime,
             &mut backend,
             &mut state,
@@ -1656,6 +1678,7 @@ impl NativeDecodeSession {
                 tokenizer,
                 max_context: options.max_context,
             },
+            staged_output_observer,
             callback,
         )
     }
@@ -1725,7 +1748,7 @@ impl NativeDecodeSession {
     /// If `resume_from > current_len`, behaves like full generation from 0.
     /// If `resume_from < current_len`, rewinds the KV cache to `resume_from`.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn generate_incremental_with_callback(
+    pub(crate) fn generate_incremental_with_callback_and_staged_observer(
         &mut self,
         prompt_tokens: &[TokenId],
         resume_from: usize,
@@ -1733,6 +1756,7 @@ impl NativeDecodeSession {
         chain: &ProcessorChain,
         tokenizer: &Tokenizer,
         runtime: &crate::pipeline::WorkflowRuntime,
+        staged_output_observer: Option<&mut crate::pipeline::ToolCallStagedOutputObserver>,
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
         if prompt_tokens.is_empty() {
@@ -1741,12 +1765,13 @@ impl NativeDecodeSession {
         let resume_from = resume_from.min(prompt_tokens.len());
         if resume_from == 0 || resume_from > self.current_len {
             // Full reset path — no valid KV prefix to reuse.
-            return self.generate_with_callback(
+            return self.generate_with_callback_and_staged_observer(
                 prompt_tokens,
                 options,
                 chain,
                 tokenizer,
                 runtime,
+                staged_output_observer,
                 callback,
             );
         }
@@ -1771,7 +1796,7 @@ impl NativeDecodeSession {
             lookahead: std::collections::VecDeque::new(),
         };
         let mut state = DecodeLoopState::new(resume_from, options.seed, options.top_logprobs);
-        generate_with_decode_core(
+        crate::pipeline::generation::generate_with_decode_core_and_staged_observer(
             runtime,
             &mut backend,
             &mut state,
@@ -1782,6 +1807,7 @@ impl NativeDecodeSession {
                 tokenizer,
                 max_context: options.max_context,
             },
+            staged_output_observer,
             callback,
         )
     }

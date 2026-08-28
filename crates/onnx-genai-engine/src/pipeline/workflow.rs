@@ -358,31 +358,52 @@ fn workflow_adapter_registry()
     > = std::sync::LazyLock::new(|| {
         HashMap::from([
             (
-                ("onnx-genai.image-preprocess", "1"),
+                (
+                    onnx_genai_metadata::extensions::IMAGE_PREPROCESS_V1.identity,
+                    onnx_genai_metadata::extensions::IMAGE_PREPROCESS_V1.version,
+                ),
                 WorkflowRuntime::run_image_preprocess_adapter as WorkflowAdapterExecutor,
             ),
             (
-                ("onnx-genai.video-preprocess", "1"),
+                (
+                    onnx_genai_metadata::extensions::VIDEO_PREPROCESS_V1.identity,
+                    onnx_genai_metadata::extensions::VIDEO_PREPROCESS_V1.version,
+                ),
                 WorkflowRuntime::run_video_preprocess_adapter as WorkflowAdapterExecutor,
             ),
             (
-                ("onnx-genai.audio-preprocess", "1"),
+                (
+                    onnx_genai_metadata::extensions::AUDIO_PREPROCESS_V1.identity,
+                    onnx_genai_metadata::extensions::AUDIO_PREPROCESS_V1.version,
+                ),
                 WorkflowRuntime::run_audio_preprocess_adapter as WorkflowAdapterExecutor,
             ),
             (
-                ("onnx-genai.grammar-guidance", "1"),
+                (
+                    onnx_genai_metadata::extensions::GRAMMAR_GUIDANCE_V1.identity,
+                    onnx_genai_metadata::extensions::GRAMMAR_GUIDANCE_V1.version,
+                ),
                 WorkflowRuntime::run_grammar_guidance_adapter as WorkflowAdapterExecutor,
             ),
             (
-                ("onnx-genai.telemetry", "1"),
+                (
+                    onnx_genai_metadata::extensions::TELEMETRY_V1.identity,
+                    onnx_genai_metadata::extensions::TELEMETRY_V1.version,
+                ),
                 WorkflowRuntime::run_telemetry_adapter as WorkflowAdapterExecutor,
             ),
             (
-                ("onnx-genai.parameter-overlay", "1"),
+                (
+                    onnx_genai_metadata::extensions::PARAMETER_OVERLAY_V1.identity,
+                    onnx_genai_metadata::extensions::PARAMETER_OVERLAY_V1.version,
+                ),
                 WorkflowRuntime::run_parameter_overlay_adapter as WorkflowAdapterExecutor,
             ),
             (
-                ("onnx-genai.text-assembly", "1"),
+                (
+                    onnx_genai_metadata::extensions::TEXT_ASSEMBLY_V1.identity,
+                    onnx_genai_metadata::extensions::TEXT_ASSEMBLY_V1.version,
+                ),
                 WorkflowRuntime::run_text_assembly_adapter as WorkflowAdapterExecutor,
             ),
         ])
@@ -392,6 +413,26 @@ fn workflow_adapter_registry()
 
 pub(super) fn supports_workflow_adapter(abi: &str, version: &str) -> bool {
     workflow_adapter_registry().contains_key(&(abi, version))
+}
+
+#[cfg(test)]
+mod extension_registry_tests {
+    use super::supports_workflow_adapter;
+    use onnx_genai_metadata::extensions::{BUILTIN_EXTENSIONS, ExtensionSurface, SupportStatus};
+
+    #[test]
+    fn every_implemented_component_adapter_has_an_exact_executor() {
+        for descriptor in BUILTIN_EXTENSIONS.iter().filter(|descriptor| {
+            descriptor.surface == ExtensionSurface::ComponentAdapter
+                && descriptor.status == SupportStatus::Implemented
+        }) {
+            assert!(
+                supports_workflow_adapter(descriptor.id.identity, descriptor.id.version),
+                "{} must have its exact registry executor",
+                descriptor.id.wire_name()
+            );
+        }
+    }
 }
 
 fn validate_component_overrides(
@@ -668,7 +709,7 @@ impl<'a> SessionLeaseGuard<'a> {
     ) -> anyhow::Result<Self> {
         if !leases.borrow_mut().insert(session.to_string()) {
             return Err(
-                crate::engine::PackageCapabilityError::ExclusiveLeaseConflict {
+                crate::engine::PackageExecutionError::ExclusiveLeaseConflict {
                     session: session.to_string(),
                 }
                 .into(),
@@ -1032,6 +1073,7 @@ impl<'a> WorkflowExecutionPlan<'a> {
             session_id,
             component_overrides,
             generation_control: _,
+            tool_call_policy: _,
         } = request;
         let workflow = &engine.plan.workflow;
         let session_turn_version = session_id.as_ref().map(|session| {
@@ -1148,7 +1190,7 @@ impl<'a> WorkflowExecutionPlan<'a> {
             let requested = conversation.len().saturating_add(budget);
             if requested > bound {
                 return Err(
-                    crate::engine::PackageCapabilityError::ConversationOverBound {
+                    crate::engine::PackageExecutionError::ConversationOverBound {
                         cell: cell.to_string(),
                         requested,
                         bound,
@@ -1458,6 +1500,13 @@ impl<'a> WorkflowExecutionPlan<'a> {
             workflow,
             output_baselines,
         )?);
+        if let Some(host) = host.as_deref_mut()
+            && let Err(error) = host.begin_turn(&transaction)
+        {
+            let outcome = transaction.abort(TurnAbortReason::ExecutionFailure);
+            host.turn_aborted(outcome);
+            return Err(error);
+        }
         if let Some(session_id) = self.session_id.as_ref() {
             for (cell, carrier) in session_state.carried() {
                 let resolved = state_plan.cell(cell).with_context(|| {
@@ -1548,7 +1597,10 @@ impl<'a> WorkflowExecutionPlan<'a> {
             host,
         );
         if let Err(error) = result {
-            let _ = transaction.abort(TurnAbortReason::ExecutionFailure);
+            let outcome = transaction.abort(TurnAbortReason::ExecutionFailure);
+            if let Some(host) = host.as_deref_mut() {
+                host.turn_aborted(outcome);
+            }
             return Err(error);
         }
         let staged_commit = (|| -> anyhow::Result<()> {
@@ -1597,6 +1649,9 @@ impl<'a> WorkflowExecutionPlan<'a> {
                 &pass.telemetry.row_outputs,
                 pass.telemetry.loop_ended_by_predicate,
             )?;
+            if let Some(host) = host.as_deref_mut() {
+                host.before_turn_commit(&transaction)?;
+            }
             // Every semantic session cell in the canonical plan is staged when
             // this pass names a session, including one whose current turn did
             // not change its value. A stateless tensor pass owns no conversation
@@ -1624,7 +1679,7 @@ impl<'a> WorkflowExecutionPlan<'a> {
                         let bound = continuation_bound(cell, state, &values)?;
                         if conversation.len() > bound {
                             return Err(
-                                crate::engine::PackageCapabilityError::ConversationOverBound {
+                                crate::engine::PackageExecutionError::ConversationOverBound {
                                     cell: cell.to_string(),
                                     requested: conversation.len(),
                                     bound,
@@ -1723,7 +1778,10 @@ impl<'a> WorkflowExecutionPlan<'a> {
             Ok(())
         })();
         if let Err(error) = staged_commit {
-            let _ = transaction.abort(TurnAbortReason::CommitFailure);
+            let outcome = transaction.abort(TurnAbortReason::CommitFailure);
+            if let Some(host) = host.as_deref_mut() {
+                host.turn_aborted(outcome);
+            }
             return Err(error);
         }
         if has_semantic_session_state && let Some(session) = self.session_id.as_deref() {
@@ -1735,6 +1793,9 @@ impl<'a> WorkflowExecutionPlan<'a> {
         *engine.worker.last_output_publications.borrow_mut() = publication_journal
             .map(OutputPublicationJournal::take)
             .unwrap_or_default();
+        if let Some(host) = host.as_deref_mut() {
+            host.turn_committed(transaction.committed());
+        }
         engine.publish_workflow_telemetry(pass.telemetry);
         Ok((values, row_outputs))
     }
@@ -1792,6 +1853,18 @@ pub(crate) fn runtime_contract_registry() -> &'static std::collections::HashSet<
     &REGISTRY
 }
 
+/// The host's contribution to the generic loop's next-iteration decision.
+///
+/// A host may stop only after it staged the current body normally. The
+/// interpreter consumes this before it begins a later body, preserving the
+/// authored loop as the sole control-flow authority.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) enum WorkflowLoopHostOutcome {
+    #[default]
+    Continue,
+    Stop(super::GenerationStopReason),
+}
+
 /// A runtime-supplied executor for a workflow node the package does not ship a
 /// graph for.
 ///
@@ -1816,6 +1889,35 @@ pub(crate) trait WorkflowNodeHost {
     /// first. It is also what the execution plan reads to decide which declared
     /// package inputs are the host's business.
     fn hosted_contracts(&self) -> &'static [&'static str];
+
+    /// Capture host-owned provisional state at admission.
+    fn begin_turn(&mut self, _turn: &TurnTransaction) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Run host-owned pre-commit validation after all canonical output is
+    /// staged but before semantic state and publications are committed.
+    fn before_turn_commit(&mut self, _turn: &TurnTransaction) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Commit or restore host-owned provisional state with the transaction.
+    fn turn_committed(&mut self, _outcome: TurnTransactionOutcome) {}
+
+    fn turn_aborted(&mut self, _outcome: TurnTransactionOutcome) {}
+
+    /// Request that the interpreter not begin another authored loop body.
+    fn loop_host_outcome(&self) -> WorkflowLoopHostOutcome {
+        WorkflowLoopHostOutcome::Continue
+    }
+
+    /// Observe newly staged generated token output without publishing it.
+    fn observe_staged_generation_tokens(
+        &mut self,
+        _tokens: &[crate::TokenId],
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
 
     /// Execute one node bound to `contract`.
     ///
@@ -2467,7 +2569,7 @@ impl WorkflowRuntime {
                         .request_axis()
                         .is_some()
                 {
-                    emit_workflow_rows_with_publications(
+                    let staged_generation_tokens = emit_workflow_rows_with_publications(
                         values,
                         &tensor,
                         value,
@@ -2483,7 +2585,13 @@ impl WorkflowRuntime {
                         telemetry,
                         symbols,
                         dynamic_symbols,
+                        output_contract.role == onnx_genai_metadata::WorkflowOutputRole::Tokens,
                     )?;
+                    if let Some(host) = host.as_deref_mut() {
+                        for tokens in staged_generation_tokens {
+                            host.observe_staged_generation_tokens(&tokens)?;
+                        }
+                    }
                     telemetry.record_stage("emit", emit_started.elapsed().as_nanos());
                     return Ok(());
                 }
@@ -2542,6 +2650,19 @@ impl WorkflowRuntime {
                             )
                         })?;
                 }
+                let staged_generation_tokens = (output_contract.role
+                    == onnx_genai_metadata::WorkflowOutputRole::Tokens)
+                    .then(|| {
+                        emitted
+                            .to_vec_i64()?
+                            .into_iter()
+                            .map(|token| {
+                                u32::try_from(token)
+                                    .context("the workflow emitted a token outside uint32")
+                            })
+                            .collect::<anyhow::Result<Vec<_>>>()
+                    })
+                    .transpose()?;
                 match mode {
                     WorkflowEmitMode::Replace => {
                         values.insert(output.clone(), emitted);
@@ -2563,6 +2684,11 @@ impl WorkflowRuntime {
                     WorkflowEmitMode::Retract | WorkflowEmitMode::Finalize => {
                         unreachable!("control publication returned before reading a payload")
                     }
+                }
+                if let Some(tokens) = staged_generation_tokens
+                    && let Some(host) = host.as_deref_mut()
+                {
+                    host.observe_staged_generation_tokens(&tokens)?;
                 }
                 telemetry.record_stage("emit", emit_started.elapsed().as_nanos());
             }
@@ -5428,7 +5554,9 @@ fn emit_workflow_rows(
         telemetry,
         symbols,
         dynamic_symbols,
+        false,
     )
+    .map(|_| ())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5448,7 +5576,8 @@ fn emit_workflow_rows_with_publications(
     telemetry: &mut WorkflowRunTelemetry,
     symbols: &HashMap<String, i64>,
     dynamic_symbols: &std::collections::HashSet<String>,
-) -> anyhow::Result<()> {
+    observe_generation_tokens: bool,
+) -> anyhow::Result<Vec<Vec<crate::TokenId>>> {
     let rows = tensor
         .shape()
         .first()
@@ -5465,6 +5594,7 @@ fn emit_workflow_rows_with_publications(
         );
     }
     let mut row_names = vec![String::new(); rows];
+    let mut staged_generation_tokens = Vec::new();
     for row in 0..rows {
         let active = guards.is_none_or(|values| values[if values.len() == 1 { 0 } else { row }]);
         if !active {
@@ -5488,6 +5618,17 @@ fn emit_workflow_rows_with_publications(
             &mut row_symbols,
             dynamic_symbols,
         )?;
+        if observe_generation_tokens {
+            staged_generation_tokens.push(
+                emitted
+                    .to_vec_i64()?
+                    .into_iter()
+                    .map(|token| {
+                        u32::try_from(token).context("the workflow emitted a token outside uint32")
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()?,
+            );
+        }
         if let Some(journal) = publication_journal.as_mut() {
             journal
                 .publish(output, stream, mode, Some(clone_value(&emitted)?))
@@ -5545,7 +5686,7 @@ fn emit_workflow_rows_with_publications(
             entry[row] = name;
         }
     }
-    Ok(())
+    Ok(staged_generation_tokens)
 }
 
 fn slice_workflow_row(
@@ -8174,6 +8315,11 @@ impl WorkflowRuntime {
         } = plan;
         let carried = *carried;
         let emits_generation_tokens = loop_emits_generation_tokens(body, workflow);
+        if host.as_deref_mut().is_some_and(|host| {
+            !matches!(host.loop_host_outcome(), WorkflowLoopHostOutcome::Continue)
+        }) {
+            return Ok(false);
+        }
         // Skipping the liveness read is an optimization for a predicate the
         // caller said it does not care about: with `stop_on_eos` off, an
         // in-graph EOS predicate cannot end the loop, so reading it every step

@@ -1,6 +1,6 @@
 use onnx_genai_metadata::{
-    RuntimeCapabilities, derived_capabilities, parse_metadata, validate_metadata,
-    validate_structure_and_capabilities,
+    extensions::{DFLASH_FLAT_BLOCK_V1, find},
+    parse_metadata, validate_metadata,
 };
 
 fn document(version: &str, contract_version: &str, probabilities: bool) -> String {
@@ -32,9 +32,7 @@ package:
       eos_token_id: [12]
 pipeline:
   workflow:
-    manifest:
-      capabilities:
-        [workflow_ssa, typed_emit, serving_service_contract, dflash_flat_block]
+    manifest: {{}}
     inputs:
       request.active:
         contract: {{ dtype: bool, shape: [batch], batch_layout: {{ kind: request_aligned, axis: 0 }} }}
@@ -298,15 +296,15 @@ speculative:
 }
 
 #[test]
-fn dflash_uses_exact_version_schema_and_capability_admission() {
+fn dflash_uses_exact_version_schema_and_extension_registry() {
     let metadata = parse_metadata(&document("v1.6", "1", true), Some("yaml")).expect("parses");
     validate_metadata(&metadata).expect("valid DFlash contract");
     assert!(
-        derived_capabilities(&metadata).contains("dflash_flat_block"),
-        "DFlash capability is structural"
+        find(DFLASH_FLAT_BLOCK_V1.identity, DFLASH_FLAT_BLOCK_V1.version).is_some(),
+        "DFlash v1 must be an exact registered semantic extension"
     );
 
-    let mut old_reader_contract =
+    let old_reader_contract =
         parse_metadata(&document("v1.5", "1", true), Some("yaml")).expect("parses");
     let errors = validate_metadata(&old_reader_contract).expect_err("v1.5 cannot claim DFlash");
     assert!(
@@ -314,17 +312,6 @@ fn dflash_uses_exact_version_schema_and_capability_admission() {
             .iter()
             .any(|error| error.contains("schema version v1.6")),
         "{errors:#?}"
-    );
-
-    old_reader_contract.schema_version = Some("v1.6".to_string());
-    let mut runtime = RuntimeCapabilities::default();
-    runtime
-        .supported
-        .retain(|capability| capability != "dflash_flat_block");
-    let report = validate_structure_and_capabilities(&old_reader_contract, &runtime);
-    assert_eq!(
-        report.unsupported_capabilities,
-        vec!["dflash_flat_block".to_string()]
     );
 }
 

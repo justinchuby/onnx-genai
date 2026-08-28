@@ -538,6 +538,7 @@ fn native_session_generate(
         text: String::new(),
         token_ids,
         finish_reason: FinishReason::MaxTokens,
+        tool_calls: Vec::new(),
         prefix_cache_hit_len: 0,
         logprobs,
         budget_cap: None,

@@ -727,8 +727,6 @@ impl Default for AdapterPlanningContract {
 pub struct WorkflowManifest {
     #[serde(default)]
     pub adapter_abis: BTreeMap<String, String>,
-    #[serde(default)]
-    pub capabilities: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]

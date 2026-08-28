@@ -994,7 +994,6 @@ mod tests {
         let workflow = WorkflowSpec {
             manifest: onnx_genai_metadata::WorkflowManifest {
                 adapter_abis: Default::default(),
-                capabilities: Default::default(),
             },
             inputs: Default::default(),
             outputs: BTreeMap::from([(
@@ -1042,7 +1041,6 @@ mod tests {
         let workflow = WorkflowSpec {
             manifest: onnx_genai_metadata::WorkflowManifest {
                 adapter_abis: Default::default(),
-                capabilities: Default::default(),
             },
             inputs: Default::default(),
             outputs: BTreeMap::from([(
@@ -1116,7 +1114,6 @@ mod tests {
         let workflow = WorkflowSpec {
             manifest: onnx_genai_metadata::WorkflowManifest {
                 adapter_abis: Default::default(),
-                capabilities: Default::default(),
             },
             inputs: Default::default(),
             outputs: BTreeMap::from([(
@@ -1288,7 +1285,6 @@ mod tests {
         let workflow = WorkflowSpec {
             manifest: onnx_genai_metadata::WorkflowManifest {
                 adapter_abis: Default::default(),
-                capabilities: Default::default(),
             },
             inputs: Default::default(),
             // Deliberately insert in a different order from publication. The
@@ -1384,7 +1380,6 @@ mod tests {
         let workflow = WorkflowSpec {
             manifest: onnx_genai_metadata::WorkflowManifest {
                 adapter_abis: Default::default(),
-                capabilities: Default::default(),
             },
             inputs: Default::default(),
             outputs: BTreeMap::from([

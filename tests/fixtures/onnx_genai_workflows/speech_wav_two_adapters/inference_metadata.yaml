@@ -4,10 +4,6 @@ pipeline:
     manifest:
       adapter_abis:
         onnx-genai.text-assembly: '1'
-      capabilities:
-      - workflow_ssa
-      - linear_effects
-      - typed_emit
     inputs:
       request.prompt_tokens:
         contract:

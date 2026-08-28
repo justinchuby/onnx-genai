@@ -8,8 +8,8 @@ use onnx_genai_engine::pipeline::{
 };
 use onnx_genai_engine::{
     Engine, EngineConfig, FinishReason, GenerateOptions, GeneratePrompt, GenerateRequest,
-    GenerationBoundary, GenerationControl, PackageCapabilityError, PipelineGenerateRequest,
-    SessionForkError, SessionPosition, package_capability_error,
+    GenerationBoundary, GenerationControl, PackageExecutionError, PipelineGenerateRequest,
+    SessionForkError, SessionPosition, ToolCallPolicy, package_execution_error,
 };
 use rand::rngs::StdRng;
 use rand::{Rng as _, SeedableRng as _};
@@ -18,8 +18,7 @@ const PARENT_METADATA: &str = r#"
 schema_version: v1.6
 pipeline:
   workflow:
-    manifest:
-      capabilities: [workflow_ssa, serving_service_contract, canonical_speculation, session_state_lease]
+    manifest: {}
     inputs:
       request.tokens:
         contract: {dtype: int64, shape: [batch, sequence], batch_layout: {kind: request_aligned, axis: 0}}
@@ -272,8 +271,7 @@ const ANCESTOR_METADATA: &str = r#"
 schema_version: v1.6
 pipeline:
   workflow:
-    manifest:
-      capabilities: [workflow_ssa, serving_service_contract, canonical_speculation, session_state_lease]
+    manifest: {}
     inputs:
       prompt:
         contract: {dtype: int64, shape: [batch, sequence], batch_layout: {kind: request_aligned, axis: 0}}
@@ -570,6 +568,41 @@ fn replace_metadata(root: &Path, update: impl FnOnce(String) -> String) -> anyho
     Ok(())
 }
 
+fn install_tool_protocol_tokenizer(root: &Path, token_texts: &[(u64, &str)]) -> anyhow::Result<()> {
+    replace_metadata(root, |metadata| {
+        metadata.replacen(
+            "schema_version: v1.6\npipeline:",
+            "schema_version: v1.6\npackage:\n  tool_protocol: {identity: tagged-json, version: v1}\npipeline:",
+            1,
+        )
+    })?;
+    let vocab = serde_json::Map::from_iter(
+        (0..6).map(|token| (format!("token_{token}"), serde_json::Value::from(token))),
+    );
+    let mut vocab = vocab;
+    vocab.insert("<unk>".to_string(), serde_json::Value::from(1));
+    for (token, text) in token_texts {
+        vocab.retain(|_, value| value.as_u64() != Some(*token));
+        vocab.insert((*text).to_string(), serde_json::Value::from(*token));
+    }
+    let tokenizer = serde_json::json!({
+        "version": "1.0",
+        "truncation": null,
+        "padding": null,
+        "added_tokens": [],
+        "normalizer": null,
+        "pre_tokenizer": null,
+        "post_processor": null,
+        "decoder": null,
+        "model": {"type": "WordLevel", "vocab": vocab, "unk_token": "<unk>"}
+    });
+    fs::write(
+        root.join("tokenizer.json"),
+        serde_json::to_vec_pretty(&tokenizer)?,
+    )?;
+    Ok(())
+}
+
 fn assert_preload_candidate_refusal(
     root: &Path,
     expected: &[&str],
@@ -587,8 +620,8 @@ fn assert_preload_candidate_refusal(
         Engine::from_dir(root, EngineConfig::default()),
         "candidate-tree composition must fail before component loading",
     );
-    let reason = match package_capability_error(&error) {
-        Some(PackageCapabilityError::CandidateTreeExecutionUnavailable { reason, .. }) => reason,
+    let reason = match package_execution_error(&error) {
+        Some(PackageExecutionError::CandidateTreeExecutionUnavailable { reason, .. }) => reason,
         other => panic!("expected typed pre-load candidate-tree refusal, got {other:?}: {error:#}"),
     };
     for fragment in expected {
@@ -943,6 +976,41 @@ fn parent_tree_engine_dispatches_nonzero_root_and_deep_paths() -> anyhow::Result
         assert_eq!(trace.len(), 1);
         assert_eq!(trace[0].committed_tokens, expected);
     }
+
+    Ok(())
+}
+
+#[test]
+fn candidate_tree_waits_for_budget_boundary_across_complete_call_blocks() -> anyhow::Result<()> {
+    let root = parent_package(&[-1, -1, 0, 1, 2, 4], &[2, 0, 4, 0, 0, 0, 0])?;
+    install_tool_protocol_tokenizer(
+        &root,
+        &[
+            (
+                0,
+                r#"<tool_call>{"name":"zero","arguments":{}}</tool_call>"#,
+            ),
+            (2, r#"<tool_call>{"name":"two","arguments":{}}</tool_call>"#),
+            (
+                4,
+                r#"<tool_call>{"name":"four","arguments":{}}</tool_call>"#,
+            ),
+        ],
+    )?;
+    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+    let result = engine.generate_with_pipeline_request(
+        PipelineGenerateRequest::new(greedy_request(5)).with_tool_call_policy(ToolCallPolicy::Auto),
+    )?;
+    assert_eq!(result.token_ids, vec![2, 4, 0, 2, 4]);
+    assert_eq!(result.finish_reason, FinishReason::ToolCalls);
+    assert_eq!(
+        result
+            .tool_calls
+            .iter()
+            .map(|call| call.name.as_str())
+            .collect::<Vec<_>>(),
+        ["two", "four", "zero", "two", "four"]
+    );
     Ok(())
 }
 
@@ -1182,8 +1250,8 @@ fn raw_pipeline_apis_typed_refuse_before_candidate_components_run() -> anyhow::R
         ),
     ] {
         assert!(matches!(
-            package_capability_error(&error),
-            Some(PackageCapabilityError::CandidateTreeRawWorkflowApi {
+            package_execution_error(&error),
+            Some(PackageExecutionError::CandidateTreeRawWorkflowApi {
                 operation: actual
             }) if actual == operation
         ));

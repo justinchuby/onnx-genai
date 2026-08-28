@@ -1,8 +1,7 @@
 schema_version: v1.6
 pipeline:
   workflow:
-    manifest:
-      capabilities: [workflow_ssa, serving_service_contract, canonical_speculation]
+    manifest: {}
     inputs:
       active:
         contract: {dtype: bool, shape: [batch], batch_layout: {kind: request_aligned, axis: 0}}
