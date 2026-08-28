@@ -770,6 +770,8 @@ mod tests {
     /// `token_embedding` names the verifier component and the given table.
     fn chained_speculative_with_table(table: &str) -> onnx_genai_metadata::SpeculativeContract {
         let yaml = [
+            "identity: onnx-genai.speculative".to_string(),
+            "version: '1'".to_string(),
             "proposer: proposer".to_string(),
             "target: verifier".to_string(),
             "proposal_execution:".to_string(),
@@ -782,6 +784,9 @@ mod tests {
             "vocabulary:".to_string(),
             "  kind: identical".to_string(),
             "max_proposal_width: 4".to_string(),
+            "verification:".to_string(),
+            "  target_output: {component: verifier, output: logits}".to_string(),
+            "  accepted_path: {kind: runtime, binding: accepted_prefix}".to_string(),
         ]
         .join("\n");
         serde_yaml::from_str(&yaml).expect("speculative contract YAML should parse")
@@ -842,6 +847,8 @@ mod tests {
     fn a_block_proposer_without_a_folded_carry_is_ignored() {
         let signatures = verifier_signatures();
         let yaml = [
+            "identity: onnx-genai.speculative",
+            "version: '1'",
             "proposer: proposer",
             "target: verifier",
             "proposal_execution:",
@@ -849,6 +856,9 @@ mod tests {
             "vocabulary:",
             "  kind: identical",
             "max_proposal_width: 4",
+            "verification:",
+            "  target_output: {component: verifier, output: logits}",
+            "  accepted_path: {kind: runtime, binding: accepted_prefix}",
         ]
         .join("\n");
         let speculative: onnx_genai_metadata::SpeculativeContract =

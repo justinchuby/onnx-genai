@@ -321,10 +321,26 @@ impl Engine {
         // needs a resolvable model directory, something a composite workflow
         // package (components in subdirectories) deliberately does not present.
         let metadata = if onnx_genai_metadata::find_metadata_path(model_dir).is_some() {
-            Some(
-                onnx_genai_metadata::load_metadata_package(model_dir)
-                    .map_err(|error| anyhow::anyhow!("{error}"))?,
-            )
+            let mut capability_error = None;
+            let directory =
+                match onnx_genai_ort::PipelineModelDirectory::load_with_metadata_preflight(
+                    model_dir,
+                    |metadata| {
+                        crate::pipeline::WorkflowExecutionAdmission::from_metadata(metadata)
+                            .require_supported()
+                            .map_err(|error| {
+                                capability_error = Some(error.clone());
+                                onnx_genai_ort::OrtError::InvalidArgument(error.to_string())
+                            })
+                    },
+                ) {
+                    Ok(directory) => directory,
+                    Err(_) if capability_error.is_some() => {
+                        return Err(capability_error.expect("guarded by is_some").into());
+                    }
+                    Err(error) => return Err(anyhow::anyhow!("{error}")),
+                };
+            return Ok(directory.spec.workflow);
         } else {
             onnx_genai_ort::ModelDirectory::load(model_dir)
                 .ok()
@@ -700,9 +716,53 @@ impl Engine {
         // Stage: runtime KV-cache allocation, granted by the governor built above.
         let kv_cache = allocate_kv_cache(&config, kv_model.as_ref(), &governor)?;
 
-        // Stage: speculative-assistant loading (mode resolution then per-mode heads).
+        // Stage: speculative-assistant loading. The configuration selects
+        // whether an MTP optimization is wanted; every MTP graph/state/weight
+        // fact comes from the package's canonical contract.
+        let canonical_mtp = metadata.speculative.as_ref().is_some_and(|contract| {
+            matches!(
+                contract.proposal_execution,
+                onnx_genai_metadata::SpeculativeProposalExecution::Mtp { .. }
+            )
+        });
+        let mtp_requested = matches!(&config.speculative_mode, SpeculativeMode::Mtp(_));
+        let mtp_auto_enabled = matches!(&config.speculative_mode, SpeculativeMode::None)
+            && metadata
+                .speculative
+                .as_ref()
+                .is_some_and(|contract| contract.distribution_preserving);
+        if mtp_requested && !canonical_mtp {
+            anyhow::bail!(
+                "MTP was requested through runtime configuration, but this package declares no \
+                 canonical MTP proposal contract. Runtime configuration controls enablement and \
+                 width only; re-export `inference_metadata` with \
+                 speculative.proposal_execution.kind: mtp."
+            );
+        }
         let (speculative_mode, resolved_mtp_config) =
-            resolve_speculative_mode(config.speculative_mode.clone(), draft.is_some())?;
+            if canonical_mtp && (mtp_requested || mtp_auto_enabled) {
+                let vocab_size = metadata
+                    .model
+                    .as_ref()
+                    .and_then(|model| model.vocab_size)
+                    .filter(|&value| value > 0)
+                    .context(
+                        "canonical MTP speculation requires model.vocab_size; declare the target \
+                     vocabulary in package metadata",
+                    )?;
+                let resolved = ResolvedMtpConfig::from_canonical_metadata(
+                    &metadata,
+                    &model_directory.root,
+                    vocab_size,
+                    config.num_speculative_tokens,
+                )?;
+                (
+                    SpeculativeMode::Mtp(resolved.public_config.clone()),
+                    Some(resolved),
+                )
+            } else {
+                resolve_speculative_mode(config.speculative_mode.clone(), draft.is_some())?
+            };
         let mtp = load_mtp_model(
             resolved_mtp_config,
             &session,
@@ -840,7 +900,7 @@ impl Engine {
         // serialized representation and gains no second writable statement of
         // its own ports. An ABI that already names a hidden output wins, and a
         // directory that declares no MTP sidecar is left exactly as it was.
-        if let Some(seeded) = mtp_seeded_decoder_io(&metadata, &model_directory.root) {
+        if let Some(seeded) = mtp_seeded_decoder_io(&metadata) {
             metadata.set_derived_decoder_io(seeded);
         }
         let tokenizer = {
@@ -1410,7 +1470,22 @@ impl Engine {
             Environment::new("onnx-genai-engine")
                 .map_err(|e| anyhow::anyhow!("Failed to create ORT environment: {e}"))?
         });
-        // Sidecar-declared MTP self-speculation: the pure-attention MTP head
+        if matches!(&config.speculative_mode, SpeculativeMode::Mtp(_))
+            && !metadata.speculative.as_ref().is_some_and(|contract| {
+                matches!(
+                    contract.proposal_execution,
+                    onnx_genai_metadata::SpeculativeProposalExecution::Mtp { .. }
+                )
+            })
+        {
+            anyhow::bail!(
+                "MTP was requested through runtime configuration, but this package declares no \
+                 canonical MTP proposal contract. Runtime configuration controls enablement and \
+                 width only; re-export `inference_metadata` with \
+                 speculative.proposal_execution.kind: mtp."
+            );
+        }
+        // Workflow-native MTP self-speculation: the pure-attention MTP head
         // loads on the ORT `environment` (ORT CUDA EP), seeded from the native
         // hybrid target's declared hidden output. Yields `None` for every
         // non-MTP model, preserving the plain native load path exactly.
@@ -1420,6 +1495,13 @@ impl Engine {
             &environment,
             session_options,
             native_device,
+            config.num_speculative_tokens,
+            matches!(&config.speculative_mode, SpeculativeMode::Mtp(_))
+                || (matches!(&config.speculative_mode, SpeculativeMode::None)
+                    && metadata
+                        .speculative
+                        .as_ref()
+                        .is_some_and(|contract| contract.distribution_preserving)),
         )?;
         // A model runs at most one proposer kind; shared-KV drafting and MTP are
         // mutually exclusive, so at most one of these may be anything but
@@ -1546,16 +1628,15 @@ fn maybe_fill_hybrid_io_from_graph(
 /// the model directory declares an MTP sidecar that names one, so every other
 /// model keeps exactly the ABI it resolved.
 #[cfg(feature = "native-backend")]
-fn mtp_seeded_decoder_io(
-    metadata: &InferenceMetadata,
-    model_root: &Path,
-) -> Option<onnx_genai_metadata::DecoderAbi> {
+fn mtp_seeded_decoder_io(metadata: &InferenceMetadata) -> Option<onnx_genai_metadata::DecoderAbi> {
     let io = metadata.decoder_io()?;
-    let descriptor = onnx_genai_metadata::detect_speculator(model_root)?;
-    let onnx_genai_metadata::SpeculatorProposerStatus::Mtp(spec) = descriptor.proposer else {
+    let speculative = metadata.speculative.as_ref()?;
+    let onnx_genai_metadata::SpeculativeProposalExecution::Mtp { target_hidden, .. } =
+        &speculative.proposal_execution
+    else {
         return None;
     };
-    decoder_io_seeded_with(io, &spec.target_hidden_output)
+    decoder_io_seeded_with(io, &target_hidden.output)
 }
 
 /// Name `target_hidden_output` as the ABI's hidden output, or decline.
@@ -1612,6 +1693,20 @@ fn load_inference_metadata(model_directory: &ModelDirectory) -> anyhow::Result<I
     if let Some(metadata_path) = &model_directory.metadata_path {
         return onnx_genai_metadata::load_metadata(metadata_path)
             .map_err(|e| anyhow::anyhow!("Failed to load metadata: {e}"));
+    }
+    if let Some(legacy) =
+        onnx_genai_metadata::inspect_legacy_speculator_for_migration(&model_directory.root)
+            .map_err(|error| anyhow::anyhow!("Failed to inspect legacy speculation: {error}"))?
+    {
+        anyhow::bail!(
+            "package '{}' declares legacy speculative sidecar configuration ({:?}) but no \
+             workflow-native `inference_metadata` declaration. Legacy sidecars are importer \
+             input only and are never runtime authority. Re-export the package with \
+             `schema_version: v1.6` and `speculative: {{ identity: onnx-genai.speculative, \
+             version: '1', ... }}`; preserve the legacy descriptor only as migration evidence.",
+            model_directory.root.display(),
+            legacy.proposal_type,
+        );
     }
     if let Some(compat) = genai_config_compat_metadata_from_model_path(
         model_directory.genai_config_path.as_deref(),
@@ -2806,14 +2901,14 @@ fn build_mtp_model_from_resolved(
     })
 }
 
-/// Resolve and build a native-backend MTP proposer from a model directory's
-/// inference metadata, mirroring [`load_native_shared_kv_proposer`].
+/// Resolve and build a native-backend MTP proposer from the package's
+/// workflow-native declaration.
 ///
 /// Returns the loaded [`MtpModel`] (the pure-attention MTP head runs on the ORT
 /// `environment`; only the hybrid GDN target needs the native EP) together with
 /// the [`SpeculativeMode::Mtp`] the engine should adopt. Yields `None` /
-/// [`SpeculativeMode::None`] when the metadata advertises no MTP speculator, so
-/// non-speculative models keep their exact existing load path.
+/// [`SpeculativeMode::None`] when the declaration selects another proposal
+/// form, so non-MTP models keep their exact existing load path.
 #[cfg(feature = "native-backend")]
 fn load_native_mtp_proposer(
     metadata: &InferenceMetadata,
@@ -2821,23 +2916,20 @@ fn load_native_mtp_proposer(
     environment: &Environment,
     session_options: &SessionOptions,
     native_device: crate::native_decode::NativeDecodeDevice,
+    requested_drafts: usize,
+    enabled: bool,
 ) -> anyhow::Result<(Option<MtpModel>, SpeculativeMode)> {
-    // The package's workflow describes the *target* graph; the draft head is a
-    // separate artifact the model directory declares for itself in `config.json`.
-    // Discovery is therefore the signal here, and a directory that declares no
-    // speculator simply loads unspeculated.
-    let Some(descriptor) = onnx_genai_metadata::detect_speculator(&model_directory.root) else {
+    if !enabled {
+        return Ok((None, SpeculativeMode::None));
+    }
+    let Some(speculative) = metadata.speculative.as_ref() else {
         return Ok((None, SpeculativeMode::None));
     };
-    let spec = match descriptor.proposer {
-        onnx_genai_metadata::SpeculatorProposerStatus::Mtp(spec) => spec,
-        // A declaration that cannot be read is an authoring error worth
-        // surfacing. Any other proposer kind is simply not this loader's
-        // business and leaves the native path unspeculated.
-        onnx_genai_metadata::SpeculatorProposerStatus::Unknown(reason) => {
-            anyhow::bail!("Invalid native MTP sidecar metadata: {reason}")
-        }
-        _ => return Ok((None, SpeculativeMode::None)),
+    if !matches!(
+        speculative.proposal_execution,
+        onnx_genai_metadata::SpeculativeProposalExecution::Mtp { .. }
+    ) {
+        return Ok((None, SpeculativeMode::None));
     };
     // The native target exposes no ORT `Session` to interrogate for the target
     // vocabulary (that is the point of the native EP). The head borrows the
@@ -2853,7 +2945,12 @@ fn load_native_mtp_proposer(
             "native MTP speculation requires the target vocabulary size; declare \
              `model.vocab_size` in the package metadata",
         )?;
-    let resolved = ResolvedMtpConfig::from_sidecar_descriptor(&spec, vocab_size);
+    let resolved = ResolvedMtpConfig::from_canonical_metadata(
+        metadata,
+        &model_directory.root,
+        vocab_size,
+        requested_drafts,
+    )?;
     validate_resolved_mtp_config(&resolved)?;
     validate_native_mtp_hidden_output(&model_directory.model_path, &resolved)?;
     // The pure-attention MTP head runs as an ORT session; when the native target
@@ -3097,6 +3194,31 @@ fn load_eagle3_model(
 #[cfg(test)]
 mod metadata_admission_tests {
     use super::*;
+
+    #[test]
+    fn candidate_tree_contract_is_refused_before_model_or_session_loading() {
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/unsupported-candidate-tree");
+
+        let Err(error) = Engine::from_dir(&fixture, EngineConfig::default()) else {
+            panic!("a declared candidate tree must never fall through to plain generation");
+        };
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("candidate-tree") && message.contains("onnx-genai.speculative@1"),
+            "the refusal must identify the exact canonical declaration: {message}"
+        );
+        assert!(
+            message.contains("no candidate-tree package-dispatch capability or executor")
+                && message.contains("Refusing to silently run plain or MTP generation"),
+            "the refusal must explain why no model/session was loaded: {message}"
+        );
+        assert!(
+            !message.contains("model.onnx"),
+            "the candidate-tree admission guard must run before this fixture's intentionally \
+             absent model artifact is inspected: {message}"
+        );
+    }
 
     #[test]
     fn unsupported_declared_capability_is_reported_but_does_not_block_decode() {

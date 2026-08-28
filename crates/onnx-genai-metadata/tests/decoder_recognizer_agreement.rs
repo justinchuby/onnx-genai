@@ -485,6 +485,14 @@ const MATRIX: &[Row] = &[
         true,
         Some("decoder"),
     ),
+    row(
+        "tests/fixtures/tiny-llm-cursor-fallback/inference_metadata.yaml",
+        1,
+        SingleGraph,
+        Some("decoder"),
+        true,
+        Some("decoder"),
+    ),
     // Its sibling's graph exactly; the one declaration that differs
     // (`aliasing: permitted`) is a state-service property, not a structural
     // one, so it must classify identically. A row that drifted from
@@ -552,11 +560,11 @@ const MATRIX: &[Row] = &[
     ),
     row(
         "tests/fixtures/tiny-mtp-full/inference_metadata.yaml",
-        1,
-        SingleGraph,
+        2,
+        Composite,
         Some("decoder"),
-        true,
-        Some("decoder"),
+        false,
+        None,
     ),
     row(
         "tests/fixtures/tiny-native-engine/inference_metadata.yaml",
@@ -600,10 +608,37 @@ const MATRIX: &[Row] = &[
         true,
         Some("decoder"),
     ),
+    // An intentionally model-less package: loader admission must reject its
+    // unsupported canonical candidate-tree executor before inspecting an ONNX
+    // artifact, while structural workflow recognition remains NoGraph.
+    row(
+        "crates/onnx-genai-engine/tests/fixtures/unsupported-candidate-tree/inference_metadata.yaml",
+        0,
+        NoGraph,
+        None,
+        false,
+        None,
+    ),
     // The smallest document that declares a workflow at all: its one component
     // is a `binding`, so the workflow names no graph.
     row(
         "crates/onnx-genai-metadata/tests/fixtures/north_star_minimal.yaml",
+        0,
+        NoGraph,
+        None,
+        false,
+        None,
+    ),
+    row(
+        "crates/onnx-genai-metadata/tests/fixtures/canonical_speculation/greedy_tree.yaml",
+        0,
+        NoGraph,
+        None,
+        false,
+        None,
+    ),
+    row(
+        "crates/onnx-genai-metadata/tests/fixtures/canonical_speculation/sampling_tree.yaml",
         0,
         NoGraph,
         None,

@@ -1,4 +1,4 @@
-schema_version: v1
+schema_version: v1.6
 pipeline:
   workflow:
     manifest:
@@ -14,6 +14,7 @@ pipeline:
       - grammar_guidance_adapter
       - adaptive_proposal_budget
       - advisory_state
+      - canonical_speculation
       adapter_abis:
         onnx-genai.grammar-guidance: '1'
     inputs:
@@ -1294,6 +1295,8 @@ generation:
     max_output_tokens:
       input: request.max_iterations
 speculative:
+  identity: onnx-genai.speculative
+  version: '1'
   proposer: proposer
   target: verifier
   vocabulary:
@@ -1304,6 +1307,9 @@ speculative:
   - cache_1
   shared_weights: []
   distribution_preserving: true
+  verification:
+    target_output: {component: verifier, output: accepted_tokens}
+    accepted_path: {kind: component, value: {component: verifier, output: accepted_tokens}}
   rollback_state:
   - cache_0
   - cache_1

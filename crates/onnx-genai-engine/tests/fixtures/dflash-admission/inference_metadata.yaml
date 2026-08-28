@@ -1,5 +1,5 @@
 
-schema_version: v1.5
+schema_version: v1.6
 package:
   tokenizer:
     special_tokens:
@@ -244,6 +244,8 @@ pipeline:
               verifier:
                 recurrent: { input: recurrent, output: next_recurrent }
 speculative:
+  identity: onnx-genai.speculative
+  version: '1'
   proposer: parallel_adapter
   target: verifier
   proposal_execution:
@@ -282,8 +284,13 @@ speculative:
       token_history: { kind: sequence, source: { component: verifier, output: present_tokens } }
       recurrent: { kind: prefix_snapshots, source: { component: verifier, output: recurrent_prefixes }, axis: 1 }
     structure: { kind: base }
-  shared_weights: [token_embedding, missing_lm_head]
+  shared_weights:
+    - { component: verifier, initializer: token_embedding }
+    - { component: verifier, initializer: missing_lm_head }
   vocabulary: { kind: identical }
   max_proposal_width: 3
   distribution_preserving: true
+  verification:
+    target_output: { component: verifier, output: logits }
+    accepted_path: { kind: runtime, binding: accepted_prefix }
   rollback_state: [target_cache, draft_cache, token_history, recurrent]

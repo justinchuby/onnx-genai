@@ -51,6 +51,21 @@ pub enum PackageCapabilityError {
         /// The session whose exclusive lease is already held.
         session: String,
     },
+    /// The package declares a canonical candidate tree this runtime can
+    /// validate but cannot execute transactionally.
+    #[error(
+        "package declares canonical candidate-tree speculation \
+         (onnx-genai.speculative@{version}), but this runtime has no candidate-tree \
+         package-dispatch capability or executor. Refusing to silently run plain or MTP \
+         generation without the declared proposer, target verification, accepted-prefix \
+         commit, and rollback participants. Upgrade to a runtime that implements \
+         candidate-tree dispatch, or re-export this package with a supported canonical \
+         proposal execution."
+    )]
+    CandidateTreeExecutionUnavailable {
+        /// Exact canonical speculation contract version declared by the package.
+        version: String,
+    },
     /// The package declares an exact DFlash ABI this runtime can validate but
     /// does not yet have a transaction-owned execution driver for.
     #[error(

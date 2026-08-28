@@ -555,10 +555,31 @@ impl WorkflowRuntime {
         session_options: SessionOptions,
         authority_provider: Option<SharedMemoryAuthorityProvider>,
     ) -> anyhow::Result<(Self, EngineResourceGovernor)> {
-        let metadata = onnx_genai_metadata::load_metadata_package(pipeline_dir)
-            .map_err(|error| anyhow::anyhow!("Failed to resolve workflow package: {error}"))?;
-        let execution_admission = WorkflowExecutionAdmission::from_metadata(&metadata);
-        execution_admission.require_supported()?;
+        let mut capability_error = None;
+        let directory =
+            match PipelineModelDirectory::load_with_metadata_preflight(pipeline_dir, |metadata| {
+                WorkflowExecutionAdmission::from_metadata(metadata)
+                    .require_supported()
+                    .map_err(|error| {
+                        capability_error = Some(error.clone());
+                        onnx_genai_ort::OrtError::InvalidArgument(error.to_string())
+                    })
+            }) {
+                Ok(directory) => directory,
+                Err(_) if capability_error.is_some() => {
+                    return Err(capability_error.expect("guarded by is_some").into());
+                }
+                Err(error) => {
+                    return Err(anyhow::anyhow!(
+                        "Failed to resolve workflow package: {error}"
+                    ));
+                }
+            };
+        let execution_admission = directory
+            .metadata
+            .as_ref()
+            .map(WorkflowExecutionAdmission::from_metadata)
+            .unwrap_or(WorkflowExecutionAdmission::Admitted);
         let decode_backend = validate_pipeline_backend_request(config.decode_backend)?;
         let authority_domain = crate::engine::session_device_domain(&session_options)?;
         crate::engine::validate_shared_authority_limit(
@@ -566,8 +587,6 @@ impl WorkflowRuntime {
             &authority_domain,
             config.limits.vram_limit,
         )?;
-        let directory = PipelineModelDirectory::load(pipeline_dir)
-            .map_err(|error| anyhow::anyhow!("Failed to resolve workflow package: {error}"))?;
         for (component, declaration) in &directory.spec.workflow.components {
             if let ComponentImplementation::Adapter { abi, version, .. } =
                 &declaration.implementation
@@ -721,14 +740,14 @@ impl WorkflowRuntime {
             None
         };
         let models = if decode_backend == EngineDecodeBackend::Native {
-            PipelineModels::load_with_ort_session_filter(
-                pipeline_dir,
+            PipelineModels::load_resolved_with_ort_session_filter(
+                directory.clone(),
                 component_session_options,
                 |_| false,
             )
         } else {
-            PipelineModels::load_with_component_options(
-                pipeline_dir,
+            PipelineModels::load_resolved_with_component_options(
+                directory.clone(),
                 component_session_options,
                 session_options,
             )
@@ -2240,6 +2259,149 @@ pipeline:
                 "PMM and engine snapshots must report the same canonical device charge"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod speculative_admission_tests {
+    use super::*;
+    use crate::{
+        DeviceCompatibilityDomain, DeviceMemoryAuthority, ProcessMemoryManager, ResourceLimit,
+    };
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    struct NeverCalledAuthorityProvider;
+
+    impl MemoryAuthorityProvider for NeverCalledAuthorityProvider {
+        fn process_memory_manager(&self) -> ProcessMemoryManager {
+            panic!("candidate-tree admission must precede memory-authority construction")
+        }
+
+        fn validate_limit(
+            &self,
+            _domain: &DeviceCompatibilityDomain,
+            _requested: ResourceLimit,
+        ) -> anyhow::Result<()> {
+            panic!("candidate-tree admission must precede memory-authority validation")
+        }
+
+        fn authority(
+            &self,
+            _domain: &DeviceCompatibilityDomain,
+            _resolved_limit_bytes: u64,
+        ) -> anyhow::Result<DeviceMemoryAuthority> {
+            panic!("candidate-tree admission must precede memory-authority construction")
+        }
+    }
+
+    fn fixture() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/unsupported-candidate-tree")
+    }
+
+    fn staged_missing_component_fixture(name: &str) -> PathBuf {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/candidate-tree-admission")
+            .join(name);
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create candidate-tree fixture");
+        let source = fs::read_to_string(fixture().join("inference_metadata.yaml"))
+            .expect("read candidate-tree fixture");
+        let from = "implementation: {kind: binding}";
+        assert!(source.contains(from), "fixture no longer contains {from:?}");
+        fs::write(
+            root.join("inference_metadata.yaml"),
+            source.replace(
+                from,
+                "implementation: {kind: onnx, artifact: must-not-load.onnx}",
+            ),
+        )
+        .expect("write candidate-tree fixture");
+        root
+    }
+
+    fn assert_candidate_tree_refusal<T>(result: anyhow::Result<T>, constructor: &str) {
+        let Err(error) = result else {
+            panic!("candidate-tree package must fail closed in {constructor}");
+        };
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("candidate-tree")
+                && message.contains("onnx-genai.speculative@1")
+                && message.contains("no candidate-tree package-dispatch capability or executor"),
+            "{constructor} did not report the exact unsupported contract and capability: {message}"
+        );
+        assert!(
+            !message.contains("must-not-load.onnx"),
+            "{constructor} resolved or inspected a component artifact before runtime admission: \
+             {message}"
+        );
+    }
+
+    #[test]
+    fn workflow_runtime_constructor_fails_before_component_loading() {
+        let fixture = staged_missing_component_fixture("workflow-runtime");
+        assert_candidate_tree_refusal(
+            WorkflowRuntime::from_dir_with_session_options(
+                &fixture,
+                EngineConfig::default(),
+                SessionOptions::default(),
+            ),
+            "WorkflowRuntime::from_dir_with_session_options",
+        );
+    }
+
+    #[test]
+    fn workflow_runtime_memory_authority_constructor_fails_before_mutation() {
+        let fixture = staged_missing_component_fixture("workflow-runtime-memory-authority");
+        assert_candidate_tree_refusal(
+            WorkflowRuntime::from_dir_with_session_options_and_memory_authority_provider(
+                &fixture,
+                EngineConfig::default(),
+                SessionOptions::default(),
+                Arc::new(NeverCalledAuthorityProvider),
+            ),
+            "WorkflowRuntime::from_dir_with_session_options_and_memory_authority_provider",
+        );
+    }
+
+    #[test]
+    fn hosted_runtime_constructor_consumes_the_same_admission() {
+        let metadata = onnx_genai_metadata::parser::load_metadata_from_dir(&fixture())
+            .expect("candidate-tree fixture parses")
+            .expect("candidate-tree fixture has metadata");
+        let workflow = metadata
+            .pipeline
+            .as_ref()
+            .expect("candidate-tree fixture has a workflow")
+            .workflow
+            .clone();
+        let directory = PipelineModelDirectory {
+            root: fixture(),
+            metadata_path: None,
+            spec: onnx_genai_metadata::PipelineSpec {
+                workflow: workflow.clone(),
+            },
+            adapters: None,
+            metadata: Some(metadata.clone()),
+            preprocessing: None,
+            model_paths: BTreeMap::new(),
+            tokenizer_paths: onnx_genai_ort::PipelineTokenizerPaths {
+                shared: None,
+                per_component: BTreeMap::new(),
+            },
+        };
+        assert_candidate_tree_refusal(
+            WorkflowRuntime::hosted(
+                fixture(),
+                workflow,
+                EngineDecodeBackend::Ort,
+                MemoryStrategyPlan::unknown(0, None, "candidate-tree admission test"),
+                PipelineModels::hosted(directory, SessionOptions::default(), None),
+                metadata.speculative,
+            ),
+            "WorkflowRuntime::hosted",
+        );
     }
 }
 

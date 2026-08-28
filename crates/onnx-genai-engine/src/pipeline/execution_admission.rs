@@ -11,6 +11,9 @@ use crate::engine::PackageCapabilityError;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum WorkflowExecutionAdmission {
     Admitted,
+    CandidateTreeUnavailable {
+        version: String,
+    },
     DFlashUnavailable {
         version: String,
         capability: &'static str,
@@ -30,20 +33,31 @@ impl WorkflowExecutionAdmission {
     }
 
     pub(crate) fn from_speculative(speculative: Option<&SpeculativeContract>) -> Self {
-        let Some(SpeculativeProposalExecution::DflashFlatBlock { version, .. }) =
-            speculative.map(|contract| &contract.proposal_execution)
-        else {
+        let Some(contract) = speculative else {
             return Self::Admitted;
         };
-        Self::DFlashUnavailable {
-            version: version.clone(),
-            capability: capabilities::DFLASH_FLAT_BLOCK,
+        match &contract.proposal_execution {
+            SpeculativeProposalExecution::CandidateTree { .. } => Self::CandidateTreeUnavailable {
+                version: contract.version.clone(),
+            },
+            SpeculativeProposalExecution::DflashFlatBlock { version, .. } => {
+                Self::DFlashUnavailable {
+                    version: version.clone(),
+                    capability: capabilities::DFLASH_FLAT_BLOCK,
+                }
+            }
+            _ => Self::Admitted,
         }
     }
 
     pub(crate) fn require_supported(&self) -> Result<(), PackageCapabilityError> {
         match self {
             Self::Admitted => Ok(()),
+            Self::CandidateTreeUnavailable { version } => {
+                Err(PackageCapabilityError::CandidateTreeExecutionUnavailable {
+                    version: version.clone(),
+                })
+            }
             Self::DFlashUnavailable {
                 version,
                 capability,

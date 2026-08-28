@@ -2933,15 +2933,28 @@ steps:
 
     fn contract(execution: SpeculativeProposalExecution) -> SpeculativeContract {
         SpeculativeContract {
+            identity: "onnx-genai.speculative".to_string(),
+            version: "1".to_string(),
             proposer: "assistant".to_string(),
             target: "target".to_string(),
             proposal_execution: execution,
             port_bindings: Default::default(),
+            target_port_bindings: Default::default(),
             shared_state: Default::default(),
             shared_weights: Default::default(),
             vocabulary: onnx_genai_metadata::SpeculativeVocabulary::Identical,
             max_proposal_width: 4,
             distribution_preserving: true,
+            verification: onnx_genai_metadata::SpeculativeVerification {
+                target_output: onnx_genai_metadata::SpeculativeValueRef {
+                    component: "target".to_string(),
+                    output: "logits".to_string(),
+                },
+                accepted_path: onnx_genai_metadata::SpeculativeAcceptedPath::Runtime {
+                    binding: "accepted_prefix".to_string(),
+                },
+                probabilities: None,
+            },
             rollback_state: Default::default(),
         }
     }

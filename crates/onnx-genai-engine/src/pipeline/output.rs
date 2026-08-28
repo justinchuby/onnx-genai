@@ -381,9 +381,17 @@ impl RevisionEnvelopeValidator {
 
 /// Pass-local journal that produces all three output families in authored
 /// execution order. It is intentionally not a network stream.
+#[derive(Debug, Clone)]
+enum OutputProtocolFamily {
+    /// Pre-v1.5 per-site semantics: replace, append, and event were selected by
+    /// the emit itself because no output-level family existed yet.
+    Legacy,
+    Declared(WorkflowOutputFamily),
+}
+
 pub(crate) struct OutputPublicationJournal {
     transaction: TurnTransactionId,
-    outputs: BTreeMap<String, WorkflowOutputFamily>,
+    outputs: BTreeMap<String, OutputProtocolFamily>,
     revisions: RevisionEnvelopeValidator,
     revision_payloads: BTreeMap<(String, OutputStreamId), Option<Value>>,
     event_sequences: BTreeMap<(String, OutputStreamId), u64>,
@@ -398,7 +406,9 @@ impl OutputPublicationJournal {
         baselines: BTreeMap<(String, OutputStreamId), OutputPublicationBaseline>,
     ) -> Result<Self> {
         for (output, declaration) in &workflow.outputs {
-            if let WorkflowOutputFamily::Revisions { version } = &declaration.family {
+            if declaration.family_authored
+                && let WorkflowOutputFamily::Revisions { version } = &declaration.family
+            {
                 ensure!(
                     version == TYPED_REVISION_PROTOCOL_VERSION,
                     "output '{output}' declares typed revision protocol version '{version}', but \
@@ -409,9 +419,26 @@ impl OutputPublicationJournal {
         let outputs = workflow
             .outputs
             .iter()
-            .map(|(name, declaration)| (name.clone(), declaration.family.clone()))
+            .map(|(name, declaration)| {
+                (
+                    name.clone(),
+                    if declaration.family_authored {
+                        OutputProtocolFamily::Declared(declaration.family.clone())
+                    } else {
+                        OutputProtocolFamily::Legacy
+                    },
+                )
+            })
             .collect::<BTreeMap<_, _>>();
-        let mut revisions = RevisionEnvelopeValidator::new(outputs.clone());
+        let mut revisions = RevisionEnvelopeValidator::new(outputs.iter().map(|(name, family)| {
+            (
+                name.clone(),
+                match family {
+                    OutputProtocolFamily::Declared(family) => family.clone(),
+                    OutputProtocolFamily::Legacy => WorkflowOutputFamily::Materialized,
+                },
+            )
+        }));
         let mut revision_payloads = BTreeMap::new();
         let mut event_sequences = BTreeMap::new();
         let mut materialized = BTreeMap::new();
@@ -420,7 +447,7 @@ impl OutputPublicationJournal {
                 continue;
             };
             match family {
-                WorkflowOutputFamily::Revisions { .. }
+                OutputProtocolFamily::Declared(WorkflowOutputFamily::Revisions { .. })
                     if baseline.head != 0
                         || baseline.cursor != 0
                         || baseline.lineage != 0
@@ -438,10 +465,10 @@ impl OutputPublicationJournal {
                     );
                     revision_payloads.insert((output, stream), baseline.payload);
                 }
-                WorkflowOutputFamily::Events => {
+                OutputProtocolFamily::Declared(WorkflowOutputFamily::Events) => {
                     event_sequences.insert((output, stream), baseline.cursor);
                 }
-                WorkflowOutputFamily::Materialized => {
+                OutputProtocolFamily::Declared(WorkflowOutputFamily::Materialized) => {
                     materialized.insert(
                         (output, stream),
                         CommittedOutputState {
@@ -453,7 +480,22 @@ impl OutputPublicationJournal {
                         },
                     );
                 }
-                WorkflowOutputFamily::Revisions { .. } => {}
+                OutputProtocolFamily::Legacy if baseline.payload.is_some() => {
+                    materialized.insert(
+                        (output, stream),
+                        CommittedOutputState {
+                            head: baseline.head,
+                            cursor: baseline.cursor,
+                            lineage: baseline.lineage,
+                            closed: baseline.closed,
+                            payload: baseline.payload,
+                        },
+                    );
+                }
+                OutputProtocolFamily::Legacy => {
+                    event_sequences.insert((output, stream), baseline.cursor);
+                }
+                OutputProtocolFamily::Declared(WorkflowOutputFamily::Revisions { .. }) => {}
             }
         }
         Ok(Self {
@@ -488,16 +530,21 @@ impl OutputPublicationJournal {
         );
         match (family, mode) {
             (
-                WorkflowOutputFamily::Materialized,
+                OutputProtocolFamily::Legacy
+                | OutputProtocolFamily::Declared(WorkflowOutputFamily::Materialized),
                 WorkflowEmitMode::Replace | WorkflowEmitMode::Append,
             ) => ensure!(
                 stream.0 == output,
                 "materialized output '{output}' cannot publish a named stream '{}'",
                 stream.0
             ),
-            (WorkflowOutputFamily::Events, WorkflowEmitMode::Event) => {}
             (
-                WorkflowOutputFamily::Revisions { .. },
+                OutputProtocolFamily::Legacy
+                | OutputProtocolFamily::Declared(WorkflowOutputFamily::Events),
+                WorkflowEmitMode::Event,
+            ) => {}
+            (
+                OutputProtocolFamily::Declared(WorkflowOutputFamily::Revisions { .. }),
                 WorkflowEmitMode::Append
                 | WorkflowEmitMode::Replace
                 | WorkflowEmitMode::Retract
@@ -541,7 +588,8 @@ impl OutputPublicationJournal {
         let stream = OutputStreamId(stream.unwrap_or(output).to_string());
         match (family, mode) {
             (
-                WorkflowOutputFamily::Materialized,
+                OutputProtocolFamily::Legacy
+                | OutputProtocolFamily::Declared(WorkflowOutputFamily::Materialized),
                 WorkflowEmitMode::Replace | WorkflowEmitMode::Append,
             ) => {
                 ensure!(
@@ -578,7 +626,11 @@ impl OutputPublicationJournal {
                         finality: OutputFinality::Provisional,
                     });
             }
-            (WorkflowOutputFamily::Events, WorkflowEmitMode::Event) => {
+            (
+                OutputProtocolFamily::Legacy
+                | OutputProtocolFamily::Declared(WorkflowOutputFamily::Events),
+                WorkflowEmitMode::Event,
+            ) => {
                 let sequence = match self
                     .event_sequences
                     .get(&(output.to_string(), stream.clone()))
@@ -606,7 +658,7 @@ impl OutputPublicationJournal {
                 });
             }
             (
-                WorkflowOutputFamily::Revisions { .. },
+                OutputProtocolFamily::Declared(WorkflowOutputFamily::Revisions { .. }),
                 WorkflowEmitMode::Append
                 | WorkflowEmitMode::Replace
                 | WorkflowEmitMode::Retract
@@ -953,6 +1005,7 @@ mod tests {
                     family: WorkflowOutputFamily::Revisions {
                         version: TYPED_REVISION_PROTOCOL_VERSION.to_string(),
                     },
+                    family_authored: true,
                     value_range: None,
                     stage: onnx_genai_metadata::OutputStage::PreAdapter,
                     media: None,
@@ -1000,6 +1053,7 @@ mod tests {
                     family: WorkflowOutputFamily::Revisions {
                         version: TYPED_REVISION_PROTOCOL_VERSION.to_string(),
                     },
+                    family_authored: true,
                     value_range: None,
                     stage: onnx_genai_metadata::OutputStage::PreAdapter,
                     media: None,
@@ -1073,6 +1127,7 @@ mod tests {
                     family: WorkflowOutputFamily::Revisions {
                         version: TYPED_REVISION_PROTOCOL_VERSION.to_string(),
                     },
+                    family_authored: true,
                     value_range: None,
                     stage: onnx_genai_metadata::OutputStage::PreAdapter,
                     media: None,
@@ -1225,6 +1280,7 @@ mod tests {
                 .expect("output contract"),
             role: onnx_genai_metadata::WorkflowOutputRole::Tensor,
             family,
+            family_authored: true,
             value_range: None,
             stage: onnx_genai_metadata::OutputStage::PreAdapter,
             media: None,
@@ -1309,6 +1365,70 @@ mod tests {
                 finality: OutputFinality::Final,
                 ..
             })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_implicit_outputs_preserve_per_site_event_and_materialized_execution() -> Result<()> {
+        let output = || onnx_genai_metadata::WorkflowOutput {
+            contract: serde_yaml::from_str("{ dtype: int64, shape: [sequence] }")
+                .expect("output contract"),
+            role: onnx_genai_metadata::WorkflowOutputRole::Tensor,
+            family: WorkflowOutputFamily::Materialized,
+            family_authored: false,
+            value_range: None,
+            stage: onnx_genai_metadata::OutputStage::PreAdapter,
+            media: None,
+        };
+        let workflow = WorkflowSpec {
+            manifest: onnx_genai_metadata::WorkflowManifest {
+                adapter_abis: Default::default(),
+                capabilities: Default::default(),
+            },
+            inputs: Default::default(),
+            outputs: BTreeMap::from([
+                ("legacy_event".to_string(), output()),
+                ("legacy_value".to_string(), output()),
+            ]),
+            components: Default::default(),
+            state: Default::default(),
+            effects: Default::default(),
+            serving: None,
+            steps: Default::default(),
+        };
+        let mut journal =
+            OutputPublicationJournal::new(TurnTransactionId(19), &workflow, BTreeMap::new())?;
+        journal.publish(
+            "legacy_event",
+            None,
+            &WorkflowEmitMode::Event,
+            Some(value(3)),
+        )?;
+        journal.publish(
+            "legacy_value",
+            None,
+            &WorkflowEmitMode::Replace,
+            Some(value(7)),
+        )?;
+        journal.finalize_on_commit()?;
+
+        let publications = journal.take();
+        assert!(matches!(
+            &publications[0],
+            WorkflowOutputPublication::Event {
+                output,
+                finality: OutputFinality::Final,
+                ..
+            } if output == "legacy_event"
+        ));
+        assert!(matches!(
+            &publications[1],
+            WorkflowOutputPublication::Materialized {
+                output,
+                finality: OutputFinality::Final,
+                ..
+            } if output == "legacy_value"
         ));
         Ok(())
     }

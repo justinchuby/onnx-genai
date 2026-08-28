@@ -247,6 +247,8 @@ pipeline:
               arbitrary_drafter_name:
                 draft_cache: {{ input: past_draft, output: present_draft }}
 speculative:
+  identity: onnx-genai.speculative
+  version: "1"
   proposer: arbitrary_drafter_name
   target: arbitrary_target_name
   proposal_execution:
@@ -281,10 +283,15 @@ speculative:
       target_cache: {{ kind: sequence, source: {{ component: arbitrary_target_name, output: present_target }} }}
       draft_cache: {{ kind: sequence, source: {{ component: arbitrary_drafter_name, output: present_draft }} }}
     structure: {{ kind: base }}
-  shared_weights: [token_embedding, lm_head]
+  shared_weights:
+    - {{ component: arbitrary_target_name, initializer: token_embedding }}
+    - {{ component: arbitrary_target_name, initializer: lm_head }}
   vocabulary: {{ kind: identical }}
   max_proposal_width: 8
   distribution_preserving: true
+  verification:
+    target_output: {{ component: arbitrary_target_name, output: exact_scores }}
+    accepted_path: {{ kind: runtime, binding: accepted_prefix }}
   rollback_state: [target_cache, draft_cache]
 "#
     )
@@ -292,7 +299,7 @@ speculative:
 
 #[test]
 fn dflash_uses_exact_version_schema_and_capability_admission() {
-    let metadata = parse_metadata(&document("v1.5", "1", true), Some("yaml")).expect("parses");
+    let metadata = parse_metadata(&document("v1.6", "1", true), Some("yaml")).expect("parses");
     validate_metadata(&metadata).expect("valid DFlash contract");
     assert!(
         derived_capabilities(&metadata).contains("dflash_flat_block"),
@@ -300,16 +307,16 @@ fn dflash_uses_exact_version_schema_and_capability_admission() {
     );
 
     let mut old_reader_contract =
-        parse_metadata(&document("v1.4", "1", true), Some("yaml")).expect("parses");
-    let errors = validate_metadata(&old_reader_contract).expect_err("v1.4 cannot claim DFlash");
+        parse_metadata(&document("v1.5", "1", true), Some("yaml")).expect("parses");
+    let errors = validate_metadata(&old_reader_contract).expect_err("v1.5 cannot claim DFlash");
     assert!(
         errors
             .iter()
-            .any(|error| error.contains("schema version v1.5")),
+            .any(|error| error.contains("schema version v1.6")),
         "{errors:#?}"
     );
 
-    old_reader_contract.schema_version = Some("v1.5".to_string());
+    old_reader_contract.schema_version = Some("v1.6".to_string());
     let mut runtime = RuntimeCapabilities::default();
     runtime
         .supported
@@ -323,7 +330,7 @@ fn dflash_uses_exact_version_schema_and_capability_admission() {
 
 #[test]
 fn unknown_or_implicit_structural_versions_fail_closed() {
-    let unknown = parse_metadata(&document("v1.5", "17", true), Some("yaml")).expect("parses");
+    let unknown = parse_metadata(&document("v1.6", "17", true), Some("yaml")).expect("parses");
     let errors = validate_metadata(&unknown).expect_err("unknown DFlash version");
     assert!(
         errors
@@ -332,7 +339,7 @@ fn unknown_or_implicit_structural_versions_fail_closed() {
         "{errors:#?}"
     );
 
-    let implicit = document("v1.5", "1", true).replace(
+    let implicit = document("v1.6", "1", true).replace(
         "structure: { kind: base }",
         "structure:\n      kind: selector_convolution_v1\n      selector:\n        selected_tokens_output: selected_ids\n        candidate_ids_output: selected_ids\n        top_k: 1\n        rank: 2\n      convolution:\n        kernel_size: 2\n        group_size: 1\n        first_position_reads_anchor: true",
     );
@@ -348,7 +355,7 @@ fn unknown_or_implicit_structural_versions_fail_closed() {
 
 #[test]
 fn selector_and_convolution_semantics_require_and_admit_exact_version_two() {
-    let document = document("v1.5", "2", false)
+    let document = document("v1.6", "2", false)
         .replace(
             "            selected_ids:\n              dtype: int64\n              shape: [batch, proposal]\n              batch_layout: { kind: request_aligned, axis: 0 }",
             "            selected_ids:\n              dtype: int64\n              shape: [batch, proposal]\n              batch_layout: { kind: request_aligned, axis: 0 }\n            selector_candidates:\n              dtype: int64\n              shape: [batch, proposal, 3]\n              batch_layout: { kind: request_aligned, axis: 0 }\n            selector_probabilities:\n              dtype: float32\n              shape: [batch, proposal, 3]\n              batch_layout: { kind: request_aligned, axis: 0 }",
@@ -367,7 +374,7 @@ fn selector_and_convolution_semantics_require_and_admit_exact_version_two() {
 
 #[test]
 fn conditioning_and_state_provenance_are_not_inferred_from_names() {
-    let forged = document("v1.5", "1", true).replace(
+    let forged = document("v1.6", "1", true).replace(
         "layer_alpha: hidden_states",
         "layer_alpha: encoder_hidden_states",
     );
@@ -380,7 +387,7 @@ fn conditioning_and_state_provenance_are_not_inferred_from_names() {
         "{errors:#?}"
     );
 
-    let omitted = document("v1.5", "1", true).replace(
+    let omitted = document("v1.6", "1", true).replace(
         "rollback_state: [target_cache, draft_cache]",
         "rollback_state: [target_cache]",
     );
