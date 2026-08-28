@@ -1820,6 +1820,8 @@ pub enum FinishReason {
     StopSequence { index: usize },
     /// The model context window was reached before another decode step could run.
     Length,
+    /// Staged generated output completed a declared tool-call protocol.
+    ToolCalls,
 }
 
 /// Scheduler admission reduced the requested generation ceiling to preserve the

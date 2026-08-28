@@ -860,7 +860,7 @@ async fn stream_declared_tool_chat_completion(
                 }
                 buffered_text.push_str(&stop_buffer.push(&revealed.content));
                 let parser_chunk = spelled.as_deref().unwrap_or(&token.text);
-                let outcome = tool_stream.push(protocol, parser_chunk);
+                let outcome = tool_stream.push(protocol.parser(), parser_chunk);
                 if let Some(error) =
                     protocol.incremental_output_error(&outcome, "SSE chunk ingestion")
                 {
@@ -890,7 +890,7 @@ async fn stream_declared_tool_chat_completion(
             if !matches!(result.finish_reason, FinishReason::StopSequence { .. }) {
                 let trailing = stop_buffer.flush();
                 buffered_text.push_str(&trailing);
-                let outcome = tool_stream.push(protocol, &trailing);
+                let outcome = tool_stream.push(protocol.parser(), &trailing);
                 if let Some(error) =
                     protocol.incremental_output_error(&outcome, "SSE chunk ingestion")
                 {
@@ -901,7 +901,7 @@ async fn stream_declared_tool_chat_completion(
                     return Ok(());
                 }
             }
-            let outcome = tool_stream.finish(protocol);
+            let outcome = tool_stream.finish(protocol.parser());
             if let Err(error) =
                 protocol.validate_output(request, &outcome, "SSE streaming boundary")
             {
@@ -2440,8 +2440,8 @@ pub fn parse_assistant_output(
     let mut stream = tool_protocol::ToolCallStream::default();
     let outcome = match protocol {
         Some(protocol) => {
-            stream.push(protocol, &output);
-            stream.finish(protocol)
+            stream.push(protocol.parser(), &output);
+            stream.finish(protocol.parser())
         }
         None => ToolParseOutcome::NoCall,
     };
@@ -2475,7 +2475,19 @@ fn parsed_tool_output_with_content(
     if let ToolParseOutcome::Complete(tool_calls) = &outcome {
         ParsedAssistantOutput {
             content: None,
-            tool_calls: Some(tool_calls.clone()),
+            tool_calls: Some(
+                tool_calls
+                    .iter()
+                    .map(|call| ChatMessageToolCall {
+                        id: call.id.clone(),
+                        kind: "function".to_string(),
+                        function: crate::types::ChatMessageToolCallFunction {
+                            name: call.name.clone(),
+                            arguments: call.arguments.clone(),
+                        },
+                    })
+                    .collect(),
+            ),
             finish_reason: "tool_calls",
             tool_parse: outcome,
         }
@@ -2935,6 +2947,17 @@ fn finish_reason_label(reason: &FinishReason) -> &'static str {
     match reason {
         FinishReason::MaxTokens | FinishReason::Length => "length",
         FinishReason::EosToken | FinishReason::StopSequence { .. } => "stop",
+        FinishReason::ToolCalls => "tool_calls",
+    }
+}
+
+#[cfg(test)]
+mod finish_reason_tests {
+    use super::*;
+
+    #[test]
+    fn tool_call_stop_maps_only_to_the_openai_tool_calls_label() {
+        assert_eq!(finish_reason_label(&FinishReason::ToolCalls), "tool_calls");
     }
 }
 
@@ -3077,12 +3100,12 @@ mod prompt_rendering_tests {
 
         assert_eq!(prepared.request.options.constraint, None);
         let ToolParseOutcome::Complete(calls) = tool_protocol::ToolCallStream::default().push(
-            &protocol,
+            protocol.parser(),
             "<atem:invoke name=\"weather\"><atem:parameter name=\"city\">\"Paris\"</atem:parameter></atem:invoke>",
         ) else {
             panic!("ATEM generated envelope must parse through the declared adapter");
         };
-        assert_eq!(calls[0].function.name, "weather");
+        assert_eq!(calls[0].name, "weather");
     }
 
     #[test]

@@ -4,68 +4,17 @@
 //! runtime's implementation of that declaration; a package never names an
 //! adapter, parser library, or model family.
 
-use std::{collections::BTreeSet, fmt, path::Path, sync::Arc};
+use std::{collections::BTreeSet, path::Path};
 
 use onnx_genai_engine::GenerateConstraint;
-use onnx_genai_metadata::ToolProtocolDeclaration;
-
-use crate::types::{
-    ChatCompletionRequest, ChatMessageToolCall, ChatMessageToolCallFunction, ChatTool, ToolChoice,
-    ToolChoiceMode,
+use onnx_genai_metadata::{
+    MAX_TOOL_CALL_ID_BYTES, MAX_TOOL_CALLS, MAX_TOOL_NAME_BYTES, MAX_TOOL_PAYLOAD_BYTES,
+    ToolProtocol as ParsedToolProtocol, ToolProtocolDeclaration, resolve_tool_protocol,
 };
 
-const MAX_TOOL_PAYLOAD_BYTES: usize = 64 * 1024;
-const MAX_TOOL_CALLS: usize = 32;
-const MAX_TOOL_NAME_BYTES: usize = 256;
-const MAX_TOOL_CALL_ID_BYTES: usize = 256;
+pub use onnx_genai_metadata::{ToolCallStream, ToolParseOutcome, ToolProtocolError};
 
-/// A result while consuming model output one arbitrary chunk at a time.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ToolParseOutcome {
-    /// This protocol's opening envelope has not appeared.
-    NoCall,
-    /// An opening envelope appeared but cannot yet be decided.
-    Incomplete,
-    /// The complete envelope is valid and contains these calls.
-    Complete(Vec<ChatMessageToolCall>),
-    /// The envelope is complete enough to reject, with an actionable reason.
-    Malformed(String),
-}
-
-/// Incremental parsing state.  Chunk boundaries have no semantic effect.
-#[derive(Debug, Default)]
-pub struct ToolCallStream {
-    input: String,
-    terminal_error: Option<String>,
-}
-
-impl ToolCallStream {
-    pub fn push(&mut self, protocol: &ToolProtocol, chunk: &str) -> ToolParseOutcome {
-        if let Some(error) = &self.terminal_error {
-            return ToolParseOutcome::Malformed(error.clone());
-        }
-        if self.input.len().saturating_add(chunk.len()) > MAX_TOOL_PAYLOAD_BYTES {
-            let error = format!(
-                "tool output exceeds the {MAX_TOOL_PAYLOAD_BYTES}-byte protocol limit; reduce the model envelope"
-            );
-            self.terminal_error = Some(error.clone());
-            return ToolParseOutcome::Malformed(error);
-        }
-        self.input.push_str(chunk);
-        let outcome = protocol.parse(&self.input);
-        if let ToolParseOutcome::Malformed(error) = &outcome {
-            self.terminal_error = Some(error.clone());
-        }
-        outcome
-    }
-
-    pub fn finish(self, protocol: &ToolProtocol) -> ToolParseOutcome {
-        if let Some(error) = self.terminal_error {
-            return ToolParseOutcome::Malformed(error);
-        }
-        protocol.parse(&self.input)
-    }
-}
+use crate::types::{ChatCompletionRequest, ChatTool, ToolChoice, ToolChoiceMode};
 
 /// How a protocol's forced tool choice changes normal response-format
 /// constraints. This is adapter-owned because the tool-call envelope is part
@@ -84,35 +33,13 @@ pub(crate) struct RenderedToolRequest {
     pub(crate) fallback_prefix: String,
 }
 
-trait ToolProtocolAdapter: Send + Sync {
-    fn declaration(&self) -> (&'static str, &'static str);
-    fn render(
-        &self,
-        request: &ChatCompletionRequest,
-    ) -> Result<RenderedToolRequest, ToolProtocolError>;
-    fn output_constraint(
-        &self,
-        request: &ChatCompletionRequest,
-    ) -> Result<ToolOutputConstraint, ToolProtocolError>;
-    fn parse(&self, input: &str) -> ToolParseOutcome;
-}
-
-/// A resolved declaration.  The dynamic adapter is deliberately private: it is
-/// a runtime implementation detail, while the public metadata declaration is
-/// portable.
-#[derive(Clone)]
-pub struct ToolProtocol(Arc<dyn ToolProtocolAdapter>);
-
-impl fmt::Debug for ToolProtocol {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let (identity, version) = self.declaration();
-        formatter
-            .debug_struct("ToolProtocol")
-            .field("identity", &identity)
-            .field("version", &version)
-            .finish()
-    }
-}
+/// Server request-rendering policy for one shared exact parser.
+///
+/// The inner parser is transport-neutral and authoritative for all generated
+/// output. This wrapper retains only OpenAI request rendering and post-parse
+/// tool-choice validation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolProtocol(ParsedToolProtocol);
 
 impl ToolProtocol {
     pub fn declaration(&self) -> (&'static str, &'static str) {
@@ -123,14 +50,43 @@ impl ToolProtocol {
         &self,
         request: &ChatCompletionRequest,
     ) -> Result<RenderedToolRequest, ToolProtocolError> {
-        self.0.render(request)
+        match self.0 {
+            ParsedToolProtocol::TaggedJsonV1 => render_tagged_json_request(request),
+            ParsedToolProtocol::AtemXmlV1 => render_atem_xml_request(request),
+        }
     }
 
     pub(crate) fn output_constraint(
         &self,
         request: &ChatCompletionRequest,
     ) -> Result<ToolOutputConstraint, ToolProtocolError> {
-        self.0.output_constraint(request)
+        match self.0 {
+            ParsedToolProtocol::TaggedJsonV1 => {
+                let Some(schemas) = forced_tool_choice_schemas(request) else {
+                    return Ok(ToolOutputConstraint::Unchanged);
+                };
+                let schema = if schemas.len() == 1 {
+                    schemas.into_iter().next().expect("one schema")
+                } else {
+                    serde_json::json!({ "anyOf": schemas })
+                };
+                let schema = serde_json::to_string(&schema).map_err(|error| {
+                    ToolProtocolError(format!(
+                        "tagged-json@v1 cannot encode forced tool-choice schema: {error}"
+                    ))
+                })?;
+                Ok(ToolOutputConstraint::Set(Some(GenerateConstraint::Lark(
+                    format!(
+                        "start: \"<tool_call>\\n\" tool \"\\n</tool_call>\"\ntool: %json {schema}\n"
+                    ),
+                ))))
+            }
+            ParsedToolProtocol::AtemXmlV1 => Ok(if forced_tool_choice_schemas(request).is_some() {
+                ToolOutputConstraint::Set(None)
+            } else {
+                ToolOutputConstraint::Unchanged
+            }),
+        }
     }
 
     /// Convert a terminal parser outcome into a protocol-specific error at the
@@ -140,16 +96,7 @@ impl ToolProtocol {
         outcome: &ToolParseOutcome,
         boundary: &str,
     ) -> Option<ToolProtocolError> {
-        let (identity, version) = self.declaration();
-        match outcome {
-            ToolParseOutcome::NoCall | ToolParseOutcome::Complete(_) => None,
-            ToolParseOutcome::Incomplete => Some(ToolProtocolError(format!(
-                "declared tool protocol {identity}@{version} produced an incomplete envelope at the {boundary}; the opening envelope reached end of output"
-            ))),
-            ToolParseOutcome::Malformed(reason) => Some(ToolProtocolError(format!(
-                "declared tool protocol {identity}@{version} produced a malformed envelope at the {boundary}: {reason}"
-            ))),
-        }
+        self.0.output_error(outcome, boundary)
     }
 
     /// Reject only failures that are terminal while more chunks may arrive.
@@ -158,9 +105,7 @@ impl ToolProtocol {
         outcome: &ToolParseOutcome,
         boundary: &str,
     ) -> Option<ToolProtocolError> {
-        matches!(outcome, ToolParseOutcome::Malformed(_))
-            .then(|| self.output_error(outcome, boundary))
-            .flatten()
+        self.0.incremental_output_error(outcome, boundary)
     }
 
     /// Enforce the request's tool-choice policy after parsing has reached its
@@ -192,7 +137,7 @@ impl ToolProtocol {
             (Some(ToolChoice::Specific(choice)), ToolParseOutcome::Complete(calls)) => {
                 let observed = calls
                     .iter()
-                    .map(|call| call.function.name.as_str())
+                    .map(|call| call.name.as_str())
                     .collect::<BTreeSet<_>>();
                 if observed.len() == 1 && observed.contains(choice.function.name.as_str()) {
                     Ok(())
@@ -209,11 +154,6 @@ impl ToolProtocol {
     }
 
     pub fn parse(&self, input: &str) -> ToolParseOutcome {
-        if input.len() > MAX_TOOL_PAYLOAD_BYTES {
-            return ToolParseOutcome::Malformed(format!(
-                "tool output exceeds the {MAX_TOOL_PAYLOAD_BYTES}-byte protocol limit; reduce the model envelope"
-            ));
-        }
         self.0.parse(input)
     }
 
@@ -228,6 +168,11 @@ impl ToolProtocol {
             Path::new("the supplied tool protocol declaration"),
         )
     }
+
+    /// The shared, transport-neutral parser selected by this declaration.
+    pub fn parser(&self) -> ParsedToolProtocol {
+        self.0
+    }
 }
 
 /// Resolve the exact declaration supplied by metadata, without fallback or
@@ -237,33 +182,7 @@ pub(crate) fn resolve(
     declaration: &ToolProtocolDeclaration,
     metadata_path: &Path,
 ) -> Result<ToolProtocol, ToolProtocolError> {
-    let adapters: [Arc<dyn ToolProtocolAdapter>; 2] = [Arc::new(TaggedJsonV1), Arc::new(AtemXmlV1)];
-    let matches = adapters
-        .into_iter()
-        .filter(|adapter| {
-            let (identity, version) = adapter.declaration();
-            identity == declaration.identity && version == declaration.version
-        })
-        .collect::<Vec<_>>();
-    match matches.len() {
-        1 => Ok(ToolProtocol(
-            matches.into_iter().next().expect("one adapter"),
-        )),
-        0 => Err(ToolProtocolError(format!(
-            "{} declares package.tool_protocol identity {:?} version {:?}, but this server implements no such protocol. \
-             Use one of tagged-json@v1 or atem-xml@v1, or install a runtime adapter for the declared protocol.",
-            metadata_path.display(),
-            declaration.identity,
-            declaration.version,
-        ))),
-        count => Err(ToolProtocolError(format!(
-            "{} declares package.tool_protocol identity {:?} version {:?}, but {count} runtime adapters claim it. \
-             The declaration is ambiguous; install exactly one adapter for that identity and version.",
-            metadata_path.display(),
-            declaration.identity,
-            declaration.version,
-        ))),
-    }
+    resolve_tool_protocol(declaration, metadata_path).map(ToolProtocol)
 }
 
 pub(crate) fn validate_request(
@@ -398,91 +317,6 @@ fn validate_tool(
     Ok(())
 }
 
-#[derive(Debug)]
-pub struct ToolProtocolError(String);
-
-impl fmt::Display for ToolProtocolError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for ToolProtocolError {}
-
-struct TaggedJsonV1;
-
-impl ToolProtocolAdapter for TaggedJsonV1 {
-    fn declaration(&self) -> (&'static str, &'static str) {
-        ("tagged-json", "v1")
-    }
-
-    fn render(
-        &self,
-        request: &ChatCompletionRequest,
-    ) -> Result<RenderedToolRequest, ToolProtocolError> {
-        render_tagged_json_request(request)
-    }
-
-    fn output_constraint(
-        &self,
-        request: &ChatCompletionRequest,
-    ) -> Result<ToolOutputConstraint, ToolProtocolError> {
-        let Some(schemas) = forced_tool_choice_schemas(request) else {
-            return Ok(ToolOutputConstraint::Unchanged);
-        };
-        let schema = if schemas.len() == 1 {
-            schemas.into_iter().next().expect("one schema")
-        } else {
-            serde_json::json!({ "anyOf": schemas })
-        };
-        let schema = serde_json::to_string(&schema).map_err(|error| {
-            ToolProtocolError(format!(
-                "tagged-json@v1 cannot encode forced tool-choice schema: {error}"
-            ))
-        })?;
-        Ok(ToolOutputConstraint::Set(Some(GenerateConstraint::Lark(
-            format!("start: \"<tool_call>\\n\" tool \"\\n</tool_call>\"\ntool: %json {schema}\n"),
-        ))))
-    }
-
-    fn parse(&self, input: &str) -> ToolParseOutcome {
-        parse_tagged_json(input)
-    }
-}
-
-struct AtemXmlV1;
-
-impl ToolProtocolAdapter for AtemXmlV1 {
-    fn declaration(&self) -> (&'static str, &'static str) {
-        ("atem-xml", "v1")
-    }
-
-    fn render(
-        &self,
-        request: &ChatCompletionRequest,
-    ) -> Result<RenderedToolRequest, ToolProtocolError> {
-        render_atem_xml_request(request)
-    }
-
-    fn output_constraint(
-        &self,
-        request: &ChatCompletionRequest,
-    ) -> Result<ToolOutputConstraint, ToolProtocolError> {
-        Ok(if forced_tool_choice_schemas(request).is_some() {
-            // ATEM is XML, and the engine's JSON grammar cannot describe its
-            // quoted attributes and escaped parameter bodies. Explicitly clear
-            // a response-format constraint rather than emitting tagged JSON.
-            ToolOutputConstraint::Set(None)
-        } else {
-            ToolOutputConstraint::Unchanged
-        })
-    }
-
-    fn parse(&self, input: &str) -> ToolParseOutcome {
-        parse_atem_xml(input)
-    }
-}
-
 fn render_tagged_json_request(
     request: &ChatCompletionRequest,
 ) -> Result<RenderedToolRequest, ToolProtocolError> {
@@ -588,217 +422,6 @@ fn tool_choice_prompt(choice: &ToolChoice) -> String {
     }
 }
 
-fn parse_tagged_json(input: &str) -> ToolParseOutcome {
-    const OPEN: &str = "<tool_call>";
-    const CLOSE: &str = "</tool_call>";
-    let Some(mut rest) = input.split_once(OPEN).map(|(_, rest)| rest) else {
-        return ToolParseOutcome::NoCall;
-    };
-    let mut values = Vec::new();
-    loop {
-        let Some((body, after)) = rest.split_once(CLOSE) else {
-            return ToolParseOutcome::Incomplete;
-        };
-        match serde_json::from_str::<serde_json::Value>(body.trim()) {
-            Ok(value) => values.push(value),
-            Err(error) => {
-                return ToolParseOutcome::Malformed(format!(
-                    "tagged-json@v1 tool_call envelope contains invalid JSON: {error}"
-                ));
-            }
-        }
-        match after.split_once(OPEN) {
-            Some((between, next)) if between.trim().is_empty() => rest = next,
-            Some((between, _)) => {
-                return ToolParseOutcome::Malformed(format!(
-                    "tagged-json@v1 has non-whitespace text between tool_call envelopes: {between:?}"
-                ));
-            }
-            None => {
-                if !after.trim().is_empty() {
-                    return ToolParseOutcome::Malformed(
-                        "tagged-json@v1 has trailing text after a tool_call envelope".to_string(),
-                    );
-                }
-                return values_to_calls("tagged-json@v1", values);
-            }
-        }
-    }
-}
-
-fn parse_atem_xml(input: &str) -> ToolParseOutcome {
-    const OPEN: &str = "<atem:invoke";
-    const CLOSE: &str = "</atem:invoke>";
-    let first = input.trim_start();
-    if first.is_empty() {
-        return ToolParseOutcome::NoCall;
-    }
-    let mut rest = if let Some(rest) = first.strip_prefix(OPEN) {
-        rest
-    } else if OPEN.starts_with(first) {
-        return ToolParseOutcome::Incomplete;
-    } else if let Some((prefix, _)) = input.split_once(OPEN) {
-        return ToolParseOutcome::Malformed(format!(
-            "atem-xml@v1 has non-whitespace text before the first invoke envelope: {prefix:?}"
-        ));
-    } else {
-        return ToolParseOutcome::NoCall;
-    };
-    let mut values = Vec::new();
-    loop {
-        let Some((open_tag, body)) = rest.split_once('>') else {
-            return ToolParseOutcome::Incomplete;
-        };
-        let Some(name) = xml_attribute(open_tag, "name") else {
-            return ToolParseOutcome::Malformed(
-                "atem-xml@v1 invoke envelope is missing its quoted name attribute".to_string(),
-            );
-        };
-        let Some((body, after)) = body.split_once(CLOSE) else {
-            return ToolParseOutcome::Incomplete;
-        };
-        let mut arguments = serde_json::Map::new();
-        let mut parameters = body;
-        while !parameters.trim().is_empty() {
-            parameters = parameters.trim_start();
-            let Some(after_open) = parameters.strip_prefix("<atem:parameter") else {
-                return ToolParseOutcome::Malformed(
-                    "atem-xml@v1 invoke envelope contains text outside parameter envelopes"
-                        .to_string(),
-                );
-            };
-            let Some((parameter_tag, after_tag)) = after_open.split_once('>') else {
-                return ToolParseOutcome::Incomplete;
-            };
-            let Some(key) = xml_attribute(parameter_tag, "name") else {
-                return ToolParseOutcome::Malformed(
-                    "atem-xml@v1 parameter envelope is missing its quoted name attribute"
-                        .to_string(),
-                );
-            };
-            let Some((raw, after_parameter)) = after_tag.split_once("</atem:parameter>") else {
-                return ToolParseOutcome::Incomplete;
-            };
-            if raw.contains("<atem:parameter") {
-                return ToolParseOutcome::Malformed(
-                    "atem-xml@v1 does not permit nested parameter envelopes".to_string(),
-                );
-            }
-            let raw = xml_unescape(raw);
-            let value =
-                serde_json::from_str(raw.trim()).unwrap_or_else(|_| serde_json::Value::String(raw));
-            if arguments.insert(key, value).is_some() {
-                return ToolParseOutcome::Malformed(
-                    "atem-xml@v1 invoke envelope has duplicate parameter names".to_string(),
-                );
-            }
-            parameters = after_parameter;
-        }
-        values.push(serde_json::json!({ "name": name, "arguments": arguments }));
-        match after.split_once(OPEN) {
-            Some((between, next)) if between.trim().is_empty() => rest = next,
-            Some((between, _)) => {
-                return ToolParseOutcome::Malformed(format!(
-                    "atem-xml@v1 has non-whitespace text between invoke envelopes: {between:?}"
-                ));
-            }
-            None => {
-                let trailing = after.trim_start();
-                if trailing.is_empty() {
-                    return values_to_calls("atem-xml@v1", values);
-                }
-                if OPEN.starts_with(trailing) {
-                    return ToolParseOutcome::Incomplete;
-                }
-                return ToolParseOutcome::Malformed(format!(
-                    "atem-xml@v1 has non-whitespace trailing text after an invoke envelope: {trailing:?}"
-                ));
-            }
-        }
-    }
-}
-
-fn xml_attribute(tag: &str, attribute: &str) -> Option<String> {
-    let marker = format!("{attribute}=\"");
-    let value = tag.split_once(&marker)?.1;
-    let value = value.split_once('"')?.0;
-    let value = xml_unescape(value);
-    (!value.is_empty() && value.len() <= MAX_TOOL_NAME_BYTES).then_some(value)
-}
-
-fn xml_unescape(value: &str) -> String {
-    value
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&amp;", "&")
-}
-
-fn values_to_calls(protocol: &str, values: Vec<serde_json::Value>) -> ToolParseOutcome {
-    if values.is_empty() || values.len() > MAX_TOOL_CALLS {
-        return ToolParseOutcome::Malformed(format!(
-            "{protocol} must contain from 1 to {MAX_TOOL_CALLS} calls"
-        ));
-    }
-    let mut ids = BTreeSet::new();
-    let mut calls = Vec::with_capacity(values.len());
-    for (index, value) in values.into_iter().enumerate() {
-        let Some(name) = value.get("name").and_then(serde_json::Value::as_str) else {
-            return ToolParseOutcome::Malformed(format!(
-                "{protocol} call {index} is missing a string name"
-            ));
-        };
-        if name.is_empty() || name.len() > MAX_TOOL_NAME_BYTES {
-            return ToolParseOutcome::Malformed(format!(
-                "{protocol} call {index} name must contain 1 to {MAX_TOOL_NAME_BYTES} bytes"
-            ));
-        }
-        let id = value
-            .get("id")
-            .and_then(serde_json::Value::as_str)
-            .map(ToString::to_string)
-            .unwrap_or_else(|| format!("call_{index}"));
-        if id.is_empty() || id.len() > MAX_TOOL_CALL_ID_BYTES || !ids.insert(id.clone()) {
-            return ToolParseOutcome::Malformed(format!(
-                "{protocol} call {index} has an empty, oversized, or duplicate id"
-            ));
-        }
-        let Some(arguments) = value.get("arguments").or_else(|| value.get("parameters")) else {
-            return ToolParseOutcome::Malformed(format!(
-                "{protocol} call {index} is missing required arguments or parameters"
-            ));
-        };
-        if !arguments.is_object() {
-            return ToolParseOutcome::Malformed(format!(
-                "{protocol} call {index} arguments or parameters must be a JSON object"
-            ));
-        }
-        let arguments = match serde_json::to_string(&arguments) {
-            Ok(arguments) if arguments.len() <= MAX_TOOL_PAYLOAD_BYTES => arguments,
-            Ok(_) => {
-                return ToolParseOutcome::Malformed(format!(
-                    "{protocol} call {index} arguments exceed the {MAX_TOOL_PAYLOAD_BYTES}-byte limit"
-                ));
-            }
-            Err(error) => {
-                return ToolParseOutcome::Malformed(format!(
-                    "{protocol} call {index} arguments cannot be encoded: {error}"
-                ));
-            }
-        };
-        calls.push(ChatMessageToolCall {
-            id,
-            kind: "function".to_string(),
-            function: ChatMessageToolCallFunction {
-                name: name.to_string(),
-                arguments,
-            },
-        });
-    }
-    ToolParseOutcome::Complete(calls)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -833,8 +456,8 @@ mod tests {
                     continue;
                 }
                 let mut stream = ToolCallStream::default();
-                stream.push(&resolved, &input[..split]);
-                let actual = stream.push(&resolved, &input[split..]);
+                stream.push(resolved.parser(), &input[..split]);
+                let actual = stream.push(resolved.parser(), &input[split..]);
                 assert_eq!(actual, expected, "{identity} split at {split}");
             }
         }
@@ -854,7 +477,7 @@ mod tests {
         ] {
             let resolved = protocol(identity);
             let mut stream = ToolCallStream::default();
-            let outcome = stream.push(&resolved, input);
+            let outcome = stream.push(resolved.parser(), input);
             let ToolParseOutcome::Complete(calls) = outcome else {
                 panic!("expected complete {identity} call");
             };
@@ -904,8 +527,8 @@ mod tests {
             panic!("surrounding whitespace and adjacent calls must be accepted");
         };
         assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].function.name, "read");
-        assert_eq!(calls[1].function.name, "write");
+        assert_eq!(calls[0].name, "read");
+        assert_eq!(calls[1].name, "write");
     }
 
     #[test]
@@ -927,14 +550,14 @@ mod tests {
 
         let mut stream = ToolCallStream::default();
         assert_eq!(
-            stream.push(&resolved, &format!("{call}junk")),
+            stream.push(resolved.parser(), &format!("{call}junk")),
             ToolParseOutcome::Malformed(
                 "atem-xml@v1 has non-whitespace trailing text after an invoke envelope: \"junk\""
                     .to_string()
             )
         );
         assert!(matches!(
-            stream.push(&resolved, "<atem:invoke name=\"ignored\">"),
+            stream.push(resolved.parser(), "<atem:invoke name=\"ignored\">"),
             ToolParseOutcome::Malformed(message) if message.contains("trailing text")
         ));
     }
@@ -970,7 +593,7 @@ mod tests {
         let resolved = protocol("tagged-json");
         let mut stream = ToolCallStream::default();
         let partial = stream.push(
-            &resolved,
+            resolved.parser(),
             r#"<tool_call>{"name":"read","arguments":{"path":"src/"#,
         );
         assert_eq!(partial, ToolParseOutcome::Incomplete);
@@ -979,14 +602,14 @@ mod tests {
                 .incremental_output_error(&partial, "SSE chunk ingestion")
                 .is_none()
         );
-        let complete = stream.push(&resolved, r#"lib.rs"}}</tool_call>"#);
+        let complete = stream.push(resolved.parser(), r#"lib.rs"}}</tool_call>"#);
         assert!(matches!(complete, ToolParseOutcome::Complete(_)));
         assert!(
             resolved
                 .incremental_output_error(&complete, "SSE chunk ingestion")
                 .is_none()
         );
-        assert_eq!(stream.finish(&resolved), complete);
+        assert_eq!(stream.finish(resolved.parser()), complete);
     }
 
     #[test]
@@ -1005,11 +628,11 @@ mod tests {
             let mut stream = ToolCallStream::default();
             for chunk in chunks {
                 assert!(matches!(
-                    stream.push(&resolved, chunk),
+                    stream.push(resolved.parser(), chunk),
                     ToolParseOutcome::Incomplete
                 ));
             }
-            let outcome = stream.finish(&resolved);
+            let outcome = stream.finish(resolved.parser());
             let error = resolved
                 .output_error(&outcome, "SSE streaming boundary")
                 .expect("an incomplete stream must fail closed")
@@ -1143,7 +766,7 @@ mod tests {
             ));
 
             let mut stream = ToolCallStream::default();
-            let outcome = stream.push(&resolved, &oversized);
+            let outcome = stream.push(resolved.parser(), &oversized);
             assert!(matches!(
                 outcome,
                 ToolParseOutcome::Malformed(ref message) if message.contains("byte protocol limit")
@@ -1155,7 +778,7 @@ mod tests {
             assert!(error.contains(&format!("{identity}@v1")), "{error}");
             assert!(error.contains("SSE streaming boundary"), "{error}");
             assert!(matches!(
-                stream.push(&resolved, "<tool_call>{}</tool_call>"),
+                stream.push(resolved.parser(), "<tool_call>{}</tool_call>"),
                 ToolParseOutcome::Malformed(message) if message.contains("byte protocol limit")
             ));
         }

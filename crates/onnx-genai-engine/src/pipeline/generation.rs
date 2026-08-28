@@ -51,7 +51,10 @@ use crate::logits::ProcessorChain;
 use crate::processors::ensure_constrained_finish;
 
 use super::workflow::{WorkflowExecutionPlan, WorkflowNodeHost, WorkflowNodeRequest};
-use super::{PipelineGenerateRequest, WorkflowRuntime};
+use super::{
+    GenerationStopReason, PipelineGenerateRequest, StagedOutputObservation,
+    ToolCallStagedOutputObserver, WorkflowRuntime,
+};
 
 /// The contracts a decode core implements for the interpreter.
 ///
@@ -410,10 +413,12 @@ pub(crate) struct GenerationNodeHost<'a, 'c, B: DecodeLoopBackend + ?Sized> {
     tokenizer: &'a Tokenizer,
     max_context: Option<usize>,
     callback: Option<&'a mut GenerateTokenCallback<'c>>,
+    staged_output_observer: Option<&'a mut ToolCallStagedOutputObserver>,
     /// Logits from this iteration's decode node, awaiting its policy node.
     pending_forward: Option<ForwardOutcome>,
     /// The stop the policy node reached, if any.
     finish: Option<FinishReason>,
+    loop_stop: Option<GenerationStopReason>,
     /// Nodes this host executed, by contract. Proves — to a test, and to a
     /// reader — that the interpreter selected these executors from what the
     /// workflow declared rather than the drive calling them directly.
@@ -427,6 +432,16 @@ impl<'a, 'c, B: DecodeLoopBackend + ?Sized> GenerationNodeHost<'a, 'c, B> {
         request: &GenerationRequest<'a>,
         callback: Option<&'a mut GenerateTokenCallback<'c>>,
     ) -> Self {
+        Self::new_with_staged_output_observer(backend, state, request, callback, None)
+    }
+
+    pub(crate) fn new_with_staged_output_observer(
+        backend: &'a mut B,
+        state: &'a mut DecodeLoopState,
+        request: &GenerationRequest<'a>,
+        callback: Option<&'a mut GenerateTokenCallback<'c>>,
+        staged_output_observer: Option<&'a mut ToolCallStagedOutputObserver>,
+    ) -> Self {
         Self {
             backend,
             state,
@@ -435,8 +450,10 @@ impl<'a, 'c, B: DecodeLoopBackend + ?Sized> GenerationNodeHost<'a, 'c, B> {
             tokenizer: request.tokenizer,
             max_context: request.max_context,
             callback,
+            staged_output_observer,
             pending_forward: None,
             finish: None,
+            loop_stop: None,
             executed: BTreeMap::new(),
         }
     }
@@ -479,7 +496,7 @@ impl<'a, 'c, B: DecodeLoopBackend + ?Sized> GenerationNodeHost<'a, 'c, B> {
             self.chain,
             self.tokenizer,
             forward,
-            self.callback.as_deref_mut(),
+            None,
         )?;
         // The context bound is a stop like any other, decided by the policy that
         // just committed a token: the next iteration is the one that could not
@@ -489,6 +506,17 @@ impl<'a, 'c, B: DecodeLoopBackend + ?Sized> GenerationNodeHost<'a, 'c, B> {
             reason = Some(FinishReason::Length);
         }
         self.finish = reason.clone();
+        if let Some(callback) = self.callback.as_deref_mut() {
+            let text = self
+                .tokenizer
+                .decode(&[token])
+                .map_err(|error| anyhow::anyhow!("failed to detokenize token {token}: {error}"))?;
+            callback(crate::config::GenerateToken {
+                token_id: token,
+                text,
+                finish_reason: reason.clone(),
+            })?;
+        }
         self.publish_policy_outputs(request, token, reason.is_some())
     }
 
@@ -538,6 +566,58 @@ impl<B: DecodeLoopBackend + ?Sized> WorkflowNodeHost for GenerationNodeHost<'_, 
         DECODE_CORE_CONTRACTS
     }
 
+    fn begin_turn(&mut self, _turn: &super::TurnTransaction) -> anyhow::Result<()> {
+        if let Some(observer) = self.staged_output_observer.as_deref_mut() {
+            observer.begin_turn();
+        }
+        Ok(())
+    }
+
+    fn before_turn_commit(&mut self, _turn: &super::TurnTransaction) -> anyhow::Result<()> {
+        if let Some(observer) = self.staged_output_observer.as_deref() {
+            observer
+                .finish("semantic commit")
+                .context("validate staged generated tool protocol before semantic commit")?;
+        }
+        Ok(())
+    }
+
+    fn turn_committed(&mut self, _outcome: super::TurnTransactionOutcome) {
+        if let Some(observer) = self.staged_output_observer.as_deref_mut() {
+            observer.commit_turn();
+        }
+    }
+
+    fn turn_aborted(&mut self, _outcome: super::TurnTransactionOutcome) {
+        if let Some(observer) = self.staged_output_observer.as_deref_mut() {
+            observer.abort_turn();
+        }
+    }
+
+    fn loop_host_outcome(&self) -> super::workflow::WorkflowLoopHostOutcome {
+        self.loop_stop.clone().map_or(
+            super::workflow::WorkflowLoopHostOutcome::Continue,
+            super::workflow::WorkflowLoopHostOutcome::Stop,
+        )
+    }
+
+    fn observe_staged_generation_tokens(
+        &mut self,
+        tokens: &[crate::TokenId],
+    ) -> anyhow::Result<()> {
+        let Some(observer) = self.staged_output_observer.as_deref_mut() else {
+            return Ok(());
+        };
+        if let StagedOutputObservation::ToolCallsReady(calls) = observer
+            .observe_tokens(self.tokenizer, tokens)
+            .context("observe staged generated output before output publication")?
+        {
+            self.loop_stop = Some(GenerationStopReason::ToolCallsReady(calls));
+            self.finish = Some(FinishReason::ToolCalls);
+        }
+        Ok(())
+    }
+
     fn execute_contract_node(
         &mut self,
         mut request: WorkflowNodeRequest<'_>,
@@ -579,7 +659,7 @@ impl<B: DecodeLoopBackend + ?Sized> GenerationCore for GenerationNodeHost<'_, '_
     }
 
     fn streams_tokens(&self) -> bool {
-        true
+        self.callback.is_some()
     }
 }
 
@@ -779,6 +859,31 @@ pub(crate) fn generate_with_decode_core<B: DecodeLoopBackend + ?Sized>(
     request: GenerationRequest<'_>,
     callback: Option<&mut GenerateTokenCallback<'_>>,
 ) -> anyhow::Result<GenerateResult> {
+    generate_with_decode_core_and_staged_observer(
+        runtime,
+        backend,
+        state,
+        prompt_tokens,
+        request,
+        None,
+        callback,
+    )
+}
+
+/// Generate through a decode core while a host observes staged token output.
+///
+/// Tool-aware callers receive their ordinary callback events only after the
+/// enclosing transaction commits. The observer itself receives only provisional
+/// output and never invokes that callback.
+pub(crate) fn generate_with_decode_core_and_staged_observer<B: DecodeLoopBackend + ?Sized>(
+    runtime: &WorkflowRuntime,
+    backend: &mut B,
+    state: &mut DecodeLoopState,
+    prompt_tokens: &[crate::TokenId],
+    request: GenerationRequest<'_>,
+    staged_output_observer: Option<&mut ToolCallStagedOutputObserver>,
+    callback: Option<&mut GenerateTokenCallback<'_>>,
+) -> anyhow::Result<GenerateResult> {
     // A prompt that already fills the context cannot take a step. Refusing
     // before the plan binds anything keeps the refusal free of partial state.
     if reached_context_limit(backend.context_len(), request.max_context) {
@@ -811,15 +916,36 @@ pub(crate) fn generate_with_decode_core<B: DecodeLoopBackend + ?Sized>(
         prompt: crate::GeneratePrompt::TokenIds(prompt_tokens.to_vec()),
         options: options.clone(),
     });
-    let mut host = GenerationNodeHost::new(backend, state, &request, callback);
-    run_declared_generation(
-        runtime,
-        &options,
-        Some(tokenizer),
-        pipeline_request,
-        Some(&mut host),
-        None,
-    )
+    match staged_output_observer {
+        Some(observer) => {
+            let mut host = GenerationNodeHost::new_with_staged_output_observer(
+                backend,
+                state,
+                &request,
+                None,
+                Some(observer),
+            );
+            run_declared_generation(
+                runtime,
+                &options,
+                Some(tokenizer),
+                pipeline_request,
+                Some(&mut host),
+                callback,
+            )
+        }
+        None => {
+            let mut host = GenerationNodeHost::new(backend, state, &request, callback);
+            run_declared_generation(
+                runtime,
+                &options,
+                Some(tokenizer),
+                pipeline_request,
+                Some(&mut host),
+                None,
+            )
+        }
+    }
 }
 
 /// The declared token stream and the generated one must be the same stream.

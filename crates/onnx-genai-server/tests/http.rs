@@ -1395,7 +1395,7 @@ fn declared_atem_xml_protocol_converts_escaped_values_to_openai() {
     let protocol = declared_protocol("atem-xml");
     let mut stream = ToolCallStream::default();
     let outcome = stream.push(
-        &protocol,
+        protocol.parser(),
         r#"<atem:invoke name="bash">
 <atem:parameter name="command">{"cmd":"printf ok"}</atem:parameter>
 <atem:parameter name="description">"run a &lt; safe command"</atem:parameter>
@@ -1405,8 +1405,8 @@ fn declared_atem_xml_protocol_converts_escaped_values_to_openai() {
         panic!("expected a complete declared ATEM envelope");
     };
     assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].function.name, "bash");
-    let arguments: Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+    assert_eq!(calls[0].name, "bash");
+    let arguments: Value = serde_json::from_str(&calls[0].arguments).unwrap();
     assert_eq!(arguments["command"]["cmd"], "printf ok");
     assert_eq!(arguments["description"], "run a < safe command");
 }
@@ -1490,12 +1490,12 @@ fn declared_protocol_reports_incomplete_and_malformed_envelopes() {
     let protocol = declared_protocol("tagged-json");
     let mut stream = ToolCallStream::default();
     assert!(matches!(
-        stream.push(&protocol, "<tool_call>{\"name\":\"read\"}"),
+        stream.push(protocol.parser(), "<tool_call>{\"name\":\"read\"}"),
         ToolParseOutcome::Incomplete
     ));
     let mut stream = ToolCallStream::default();
     assert!(matches!(
-        stream.push(&protocol, "<tool_call>{\"name\":}</tool_call>"),
+        stream.push(protocol.parser(), "<tool_call>{\"name\":}</tool_call>"),
         ToolParseOutcome::Malformed(_)
     ));
 }

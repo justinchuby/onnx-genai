@@ -1458,6 +1458,13 @@ impl<'a> WorkflowExecutionPlan<'a> {
             workflow,
             output_baselines,
         )?);
+        if let Some(host) = host.as_deref_mut()
+            && let Err(error) = host.begin_turn(&transaction)
+        {
+            let outcome = transaction.abort(TurnAbortReason::ExecutionFailure);
+            host.turn_aborted(outcome);
+            return Err(error);
+        }
         if let Some(session_id) = self.session_id.as_ref() {
             for (cell, carrier) in session_state.carried() {
                 let resolved = state_plan.cell(cell).with_context(|| {
@@ -1548,7 +1555,10 @@ impl<'a> WorkflowExecutionPlan<'a> {
             host,
         );
         if let Err(error) = result {
-            let _ = transaction.abort(TurnAbortReason::ExecutionFailure);
+            let outcome = transaction.abort(TurnAbortReason::ExecutionFailure);
+            if let Some(host) = host.as_deref_mut() {
+                host.turn_aborted(outcome);
+            }
             return Err(error);
         }
         let staged_commit = (|| -> anyhow::Result<()> {
@@ -1597,6 +1607,9 @@ impl<'a> WorkflowExecutionPlan<'a> {
                 &pass.telemetry.row_outputs,
                 pass.telemetry.loop_ended_by_predicate,
             )?;
+            if let Some(host) = host.as_deref_mut() {
+                host.before_turn_commit(&transaction)?;
+            }
             // Every semantic session cell in the canonical plan is staged when
             // this pass names a session, including one whose current turn did
             // not change its value. A stateless tensor pass owns no conversation
@@ -1723,7 +1736,10 @@ impl<'a> WorkflowExecutionPlan<'a> {
             Ok(())
         })();
         if let Err(error) = staged_commit {
-            let _ = transaction.abort(TurnAbortReason::CommitFailure);
+            let outcome = transaction.abort(TurnAbortReason::CommitFailure);
+            if let Some(host) = host.as_deref_mut() {
+                host.turn_aborted(outcome);
+            }
             return Err(error);
         }
         if has_semantic_session_state && let Some(session) = self.session_id.as_deref() {
@@ -1735,6 +1751,9 @@ impl<'a> WorkflowExecutionPlan<'a> {
         *engine.worker.last_output_publications.borrow_mut() = publication_journal
             .map(OutputPublicationJournal::take)
             .unwrap_or_default();
+        if let Some(host) = host.as_deref_mut() {
+            host.turn_committed(transaction.committed());
+        }
         engine.publish_workflow_telemetry(pass.telemetry);
         Ok((values, row_outputs))
     }
@@ -1792,6 +1811,18 @@ pub(crate) fn runtime_contract_registry() -> &'static std::collections::HashSet<
     &REGISTRY
 }
 
+/// The host's contribution to the generic loop's next-iteration decision.
+///
+/// A host may stop only after it staged the current body normally. The
+/// interpreter consumes this before it begins a later body, preserving the
+/// authored loop as the sole control-flow authority.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) enum WorkflowLoopHostOutcome {
+    #[default]
+    Continue,
+    Stop(super::GenerationStopReason),
+}
+
 /// A runtime-supplied executor for a workflow node the package does not ship a
 /// graph for.
 ///
@@ -1816,6 +1847,35 @@ pub(crate) trait WorkflowNodeHost {
     /// first. It is also what the execution plan reads to decide which declared
     /// package inputs are the host's business.
     fn hosted_contracts(&self) -> &'static [&'static str];
+
+    /// Capture host-owned provisional state at admission.
+    fn begin_turn(&mut self, _turn: &TurnTransaction) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Run host-owned pre-commit validation after all canonical output is
+    /// staged but before semantic state and publications are committed.
+    fn before_turn_commit(&mut self, _turn: &TurnTransaction) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Commit or restore host-owned provisional state with the transaction.
+    fn turn_committed(&mut self, _outcome: TurnTransactionOutcome) {}
+
+    fn turn_aborted(&mut self, _outcome: TurnTransactionOutcome) {}
+
+    /// Request that the interpreter not begin another authored loop body.
+    fn loop_host_outcome(&self) -> WorkflowLoopHostOutcome {
+        WorkflowLoopHostOutcome::Continue
+    }
+
+    /// Observe newly staged generated token output without publishing it.
+    fn observe_staged_generation_tokens(
+        &mut self,
+        _tokens: &[crate::TokenId],
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
 
     /// Execute one node bound to `contract`.
     ///
@@ -2542,6 +2602,19 @@ impl WorkflowRuntime {
                             )
                         })?;
                 }
+                let staged_generation_tokens = (output_contract.role
+                    == onnx_genai_metadata::WorkflowOutputRole::Tokens)
+                    .then(|| {
+                        emitted
+                            .to_vec_i64()?
+                            .into_iter()
+                            .map(|token| {
+                                u32::try_from(token)
+                                    .context("the workflow emitted a token outside uint32")
+                            })
+                            .collect::<anyhow::Result<Vec<_>>>()
+                    })
+                    .transpose()?;
                 match mode {
                     WorkflowEmitMode::Replace => {
                         values.insert(output.clone(), emitted);
@@ -2563,6 +2636,11 @@ impl WorkflowRuntime {
                     WorkflowEmitMode::Retract | WorkflowEmitMode::Finalize => {
                         unreachable!("control publication returned before reading a payload")
                     }
+                }
+                if let Some(tokens) = staged_generation_tokens
+                    && let Some(host) = host.as_deref_mut()
+                {
+                    host.observe_staged_generation_tokens(&tokens)?;
                 }
                 telemetry.record_stage("emit", emit_started.elapsed().as_nanos());
             }
@@ -8174,6 +8252,11 @@ impl WorkflowRuntime {
         } = plan;
         let carried = *carried;
         let emits_generation_tokens = loop_emits_generation_tokens(body, workflow);
+        if host.as_deref_mut().is_some_and(|host| {
+            !matches!(host.loop_host_outcome(), WorkflowLoopHostOutcome::Continue)
+        }) {
+            return Ok(false);
+        }
         // Skipping the liveness read is an optimization for a predicate the
         // caller said it does not care about: with `stop_on_eos` off, an
         // in-graph EOS predicate cannot end the loop, so reading it every step

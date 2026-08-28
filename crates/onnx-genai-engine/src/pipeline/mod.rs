@@ -39,6 +39,7 @@ mod output;
 mod row_state;
 mod runtime_state;
 pub mod speculative;
+mod tool_protocol;
 mod turn_transaction;
 mod workflow;
 
@@ -59,6 +60,10 @@ pub use output::{
     TypedRevisionEnvelope, TypedRevisionOperation, WorkflowOutputPublication,
 };
 pub use row_state::{RowPlan, RowScopedState, RowTable, check_selection, gather_rows};
+pub use tool_protocol::{
+    GenerationStopReason, StagedOutputCheckpoint, StagedOutputObservation,
+    StagedOutputObservationError, ToolCallStagedOutputObserver,
+};
 pub(crate) use turn_transaction::TurnTransaction;
 pub use turn_transaction::{
     OutputPublicationBaseline, TurnAbortReason, TurnBaselineId, TurnCommittedBaseline,

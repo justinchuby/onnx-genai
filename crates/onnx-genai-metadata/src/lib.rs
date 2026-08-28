@@ -118,6 +118,7 @@ pub mod parser;
 pub mod schema;
 pub mod session_state;
 mod state_plan;
+pub mod tool_protocol;
 pub mod validation;
 pub mod version;
 
@@ -144,6 +145,11 @@ pub use state_plan::{
     StateIdentity, StateLifecycle, StateReader, StateSemanticRole, StateServiceParticipation,
     StateSnapshotParticipation, StateSource, StateTransactionParticipation, StateUpdateRelation,
     StateWriter, resolve_state_plan, validate_state_plan,
+};
+pub use tool_protocol::{
+    MAX_TOOL_CALL_ID_BYTES, MAX_TOOL_CALLS, MAX_TOOL_NAME_BYTES, MAX_TOOL_PAYLOAD_BYTES, ToolCall,
+    ToolCallStream, ToolParseOutcome, ToolProtocol, ToolProtocolError,
+    resolve as resolve_tool_protocol,
 };
 pub use validation::{
     CapabilityReport, PipelineValidationError, RuntimeCapabilities, derived_capabilities, validate,
