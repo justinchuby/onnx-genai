@@ -121,24 +121,24 @@ pipeline:
       capabilities: [workflow_ssa, typed_emit, parameter_adapters, heterogeneous_adapter_batching]
     inputs:
       request.adapter_segments:
-        contract: { dtype: int64, rank: 2, shape: [batch, 2], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: int64, shape: [batch, 2], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: runtime, version: "1.0", role: adapter_segments }
         source: { kind: request }
       request.adapter_counts:
-        contract: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: int64, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: runtime, version: "1.0", role: adapter_counts }
         source: { kind: request }
       request.adapter_scales:
-        contract: { dtype: float32, rank: 2, shape: [batch, 2], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: float32, shape: [batch, 2], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: runtime, version: "1.0", role: adapter_scales }
         source: { kind: request }
       activations:
-        contract: { dtype: float32, rank: 2, shape: [batch, 2], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: float32, shape: [batch, 2], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: opaque }
         source: { kind: application, name: activations }
     outputs:
       result:
-        contract: { dtype: float32, rank: 2, shape: [batch, 2], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: float32, shape: [batch, 2], batch_layout: { kind: request_aligned, axis: 0 } }
         role: tensor
         stage: pre_adapter
     components:
@@ -155,9 +155,9 @@ pipeline:
         row_scope: { axis: 0, stateful: false }
         ports:
           inputs:
-            input: { dtype: float32, rank: 2, shape: [batch, 2], batch_layout: { kind: request_aligned, axis: 0 } }
+            input: { dtype: float32, shape: [batch, 2], batch_layout: { kind: request_aligned, axis: 0 } }
           outputs:
-            output: { dtype: float32, rank: 2, shape: [batch, 2], batch_layout: { kind: request_aligned, axis: 0 } }
+            output: { dtype: float32, shape: [batch, 2], batch_layout: { kind: request_aligned, axis: 0 } }
         contract:
           id: onnx-genai.parameter-overlay
           version: "1"

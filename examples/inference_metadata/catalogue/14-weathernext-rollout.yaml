@@ -14,7 +14,6 @@ pipeline:
       request.active:
         contract:
           dtype: bool
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -29,7 +28,6 @@ pipeline:
       request.done:
         contract:
           dtype: bool
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -44,7 +42,6 @@ pipeline:
       request.accepted_len:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -59,7 +56,6 @@ pipeline:
       request.forcing:
         contract:
           dtype: float32
-          rank: 4
           shape:
           - batch
           - forcing_variables
@@ -77,7 +73,6 @@ pipeline:
       request.atmosphere:
         contract:
           dtype: float32
-          rank: 5
           shape:
           - batch
           - variables
@@ -96,7 +91,6 @@ pipeline:
       request.max_iterations:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - 1
         role:
@@ -110,7 +104,6 @@ pipeline:
       package.continue:
         contract:
           dtype: bool
-          rank: 1
           shape:
           - 1
         role:
@@ -123,7 +116,6 @@ pipeline:
       forecast:
         contract:
           dtype: float32
-          rank: 5
           shape:
           - batch
           - variables
@@ -144,7 +136,6 @@ pipeline:
           inputs:
             atmosphere:
               dtype: float32
-              rank: 5
               shape:
               - batch
               - variables
@@ -156,7 +147,6 @@ pipeline:
                 axis: 0
             forcing:
               dtype: float32
-              rank: 4
               shape:
               - batch
               - forcing_variables
@@ -168,7 +158,6 @@ pipeline:
           outputs:
             next_atmosphere:
               dtype: float32
-              rank: 5
               shape:
               - batch
               - variables
@@ -180,7 +169,6 @@ pipeline:
                 axis: 0
             forecast:
               dtype: float32
-              rank: 5
               shape:
               - batch
               - variables
@@ -194,7 +182,6 @@ pipeline:
       atmosphere:
         contract:
           dtype: float32
-          rank: 5
           shape:
           - batch
           - variables
@@ -214,7 +201,6 @@ pipeline:
       forecast:
         contract:
           dtype: float32
-          rank: 5
           shape:
           - batch
           - variables

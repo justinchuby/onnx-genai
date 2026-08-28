@@ -84,17 +84,17 @@ pipeline:
       capabilities: [workflow_ssa, parameter_adapters, heterogeneous_adapter_batching]
     inputs:
       request.lora_segments:
-        contract: { dtype: int64, rank: 2, shape: [batch, 2],
+        contract: { dtype: int64, shape: [batch, 2],
                      batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: runtime, version: "1.0", role: adapter_segments }
         source: { kind: request }
       request.lora_counts:
-        contract: { dtype: int64, rank: 1, shape: [batch],
+        contract: { dtype: int64, shape: [batch],
                      batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: runtime, version: "1.0", role: adapter_counts }
         source: { kind: request }
       request.lora_scales:
-        contract: { dtype: float32, rank: 2, shape: [batch, 2],
+        contract: { dtype: float32, shape: [batch, 2],
                      batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: runtime, version: "1.0", role: adapter_scales }
         source: { kind: request }

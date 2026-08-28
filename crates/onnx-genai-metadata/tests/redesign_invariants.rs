@@ -134,46 +134,45 @@ pipeline:
       capabilities: [workflow_ssa, linear_effects, typed_emit, parameter_adapters, heterogeneous_adapter_batching]
     inputs:
       request.adapter_segments:
-        contract: { dtype: int64, rank: 2, shape: [batch, 2], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: int64, shape: [batch, 2], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: runtime, version: "1.0", role: adapter_segments }
         source: { kind: request }
       request.adapter_counts:
-        contract: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: int64, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: runtime, version: "1.0", role: adapter_counts }
         source: { kind: request }
       request.adapter_scales:
-        contract: { dtype: float32, rank: 2, shape: [batch, 2], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: float32, shape: [batch, 2], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: runtime, version: "1.0", role: adapter_scales }
         source: { kind: request }
       vision.embeddings:
-        contract: { dtype: float32, rank: 3, shape: [batch, tiles, hidden], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: float32, shape: [batch, tiles, hidden], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: opaque }
         source: { kind: application, name: vision.embeddings }
         externally_suppliable: true
       image_features:
         contract:
           dtype: float32
-          rank: 2
           shape: [items, hidden]
           batch_layout: { kind: token_packed, axis: 0, levels: [{ offsets: image_offsets, owner: image_owner }] }
         role: { kind: opaque }
         source: { kind: application, name: image_features }
         externally_suppliable: true
       image_offsets:
-        contract: { dtype: int64, rank: 1, shape: [rows_plus_one], batch_layout: { kind: shared } }
+        contract: { dtype: int64, shape: [rows_plus_one], batch_layout: { kind: shared } }
         role: { kind: opaque }
         source: { kind: application, name: image_offsets }
       image_owner:
-        contract: { dtype: int64, rank: 1, shape: [items], batch_layout: { kind: shared } }
+        contract: { dtype: int64, shape: [items], batch_layout: { kind: shared } }
         role: { kind: opaque }
         source: { kind: application, name: image_owner }
       prompt:
-        contract: { dtype: int64, rank: 2, shape: [batch, sequence], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: int64, shape: [batch, sequence], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: opaque }
         source: { kind: application, name: prompt }
     outputs:
       tokens:
-        contract: { dtype: int64, rank: 2, shape: [batch, generated], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: int64, shape: [batch, generated], batch_layout: { kind: request_aligned, axis: 0 } }
         role: tokens
         stage: pre_adapter
     effects:
@@ -185,17 +184,17 @@ pipeline:
         implementation: { kind: onnx, artifact: splice.onnx }
         ports:
           inputs:
-            prompt: { dtype: int64, rank: 2, shape: [batch, sequence], batch_layout: { kind: request_aligned, axis: 0 } }
-            embeddings: { dtype: float32, rank: 3, shape: [batch, tiles, hidden], batch_layout: { kind: request_aligned, axis: 0 } }
+            prompt: { dtype: int64, shape: [batch, sequence], batch_layout: { kind: request_aligned, axis: 0 } }
+            embeddings: { dtype: float32, shape: [batch, tiles, hidden], batch_layout: { kind: request_aligned, axis: 0 } }
           outputs:
-            spliced: { dtype: float32, rank: 3, shape: [batch, sequence, hidden], batch_layout: { kind: request_aligned, axis: 0 } }
+            spliced: { dtype: float32, shape: [batch, sequence, hidden], batch_layout: { kind: request_aligned, axis: 0 } }
       decoder:
         implementation: { kind: onnx, artifact: decoder.onnx }
         ports:
           inputs:
-            hidden: { dtype: float32, rank: 3, shape: [batch, sequence, hidden], batch_layout: { kind: request_aligned, axis: 0 } }
+            hidden: { dtype: float32, shape: [batch, sequence, hidden], batch_layout: { kind: request_aligned, axis: 0 } }
           outputs:
-            token: { dtype: int64, rank: 2, shape: [batch, generated], batch_layout: { kind: request_aligned, axis: 0 } }
+            token: { dtype: int64, shape: [batch, generated], batch_layout: { kind: request_aligned, axis: 0 } }
       grammar:
         implementation: { kind: binding }
         row_scope: { axis: 0, stateful: true }
@@ -203,9 +202,9 @@ pipeline:
         cache_affects_state: [grammar.parser_table]
         ports:
           inputs:
-            token: { dtype: int64, rank: 2, shape: [batch, generated], batch_layout: { kind: request_aligned, axis: 0 } }
+            token: { dtype: int64, shape: [batch, generated], batch_layout: { kind: request_aligned, axis: 0 } }
           outputs:
-            guided: { dtype: int64, rank: 2, shape: [batch, generated], batch_layout: { kind: request_aligned, axis: 0 } }
+            guided: { dtype: int64, shape: [batch, generated], batch_layout: { kind: request_aligned, axis: 0 } }
     steps:
       - kind: invoke
         component: splice
@@ -341,19 +340,19 @@ pipeline:
       capabilities: [workflow_ssa, serving_service_contract{linear_effects}]
     inputs:
       active:
-        contract: {{ dtype: bool, rank: 1, shape: [batch], batch_layout: {{ kind: request_aligned, axis: 0 }} }}
+        contract: {{ dtype: bool, shape: [batch], batch_layout: {{ kind: request_aligned, axis: 0 }} }}
         role: {{ kind: opaque }}
         source: {{ kind: application, name: active }}
       done:
-        contract: {{ dtype: bool, rank: 1, shape: [batch], batch_layout: {{ kind: request_aligned, axis: 0 }} }}
+        contract: {{ dtype: bool, shape: [batch], batch_layout: {{ kind: request_aligned, axis: 0 }} }}
         role: {{ kind: opaque }}
         source: {{ kind: application, name: done }}
       accepted_len:
-        contract: {{ dtype: int64, rank: 1, shape: [batch], batch_layout: {{ kind: request_aligned, axis: 0 }} }}
+        contract: {{ dtype: int64, shape: [batch], batch_layout: {{ kind: request_aligned, axis: 0 }} }}
         role: {{ kind: opaque }}
         source: {{ kind: application, name: accepted_len }}
       empty_cache:
-        contract: {{ dtype: float16, rank: 4, shape: [batch, heads, sequence, head_dim], batch_layout: {{ kind: request_aligned, axis: 0 }} }}
+        contract: {{ dtype: float16, shape: [batch, heads, sequence, head_dim], batch_layout: {{ kind: request_aligned, axis: 0 }} }}
         role: {{ kind: opaque }}
         source: {{ kind: application, name: empty_cache }}
     components:
@@ -366,7 +365,7 @@ pipeline:
         ports: {{}}
     state:
       cache:
-        contract: {{ dtype: float16, rank: 4, shape: [batch, heads, sequence, head_dim], batch_layout: {{ kind: request_aligned, axis: 0 }} }}
+        contract: {{ dtype: float16, shape: [batch, heads, sequence, head_dim], batch_layout: {{ kind: request_aligned, axis: 0 }} }}
         class: semantic
         scope: invocation
         initializer: empty_cache
@@ -524,11 +523,11 @@ speculative:
         "        ports: {}",
         r#"        ports:
           inputs:
-            inputs_embeds: { dtype: float16, rank: 4, shape: [batch, heads, sequence, head_dim] }
-            past_state: { dtype: float16, rank: 4, shape: [batch, heads, sequence, head_dim] }
+            inputs_embeds: { dtype: float16, shape: [batch, heads, sequence, head_dim] }
+            past_state: { dtype: float16, shape: [batch, heads, sequence, head_dim] }
           outputs:
-            draft_logits: { dtype: float16, rank: 4, shape: [batch, heads, sequence, head_dim] }
-            next_state: { dtype: float16, rank: 4, shape: [batch, heads, sequence, head_dim] }"#,
+            draft_logits: { dtype: float16, shape: [batch, heads, sequence, head_dim] }
+            next_state: { dtype: float16, shape: [batch, heads, sequence, head_dim] }"#,
         1,
     )
     .replacen(
@@ -725,7 +724,7 @@ pipeline:
       capabilities: [workflow_ssa]
     inputs:
       request.temperature:
-        contract: { dtype: float32, rank: 1, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: float32, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: runtime, version: "1.0", role: sampling_temperature }
         source: { kind: request }
     components:
@@ -1029,24 +1028,24 @@ pipeline:
       capabilities: [workflow_ssa, session_state, session_state_lease, serving_service_contract]
     inputs:
       seed_state:
-        contract: { dtype: float32, rank: 2, shape: [batch, hidden], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: float32, shape: [batch, hidden], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: opaque }
         source: { kind: application, name: seed_state }
       active:
-        contract: { dtype: bool, rank: 1, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: bool, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: opaque }
         source: { kind: application, name: active }
       done:
-        contract: { dtype: bool, rank: 1, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: bool, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: opaque }
         source: { kind: application, name: done }
       accepted_len:
-        contract: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: int64, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: opaque }
         source: { kind: application, name: accepted_len }
     state:
       conversation:
-        contract: { dtype: float32, rank: 2, shape: [batch, hidden], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: float32, shape: [batch, hidden], batch_layout: { kind: request_aligned, axis: 0 } }
         class: semantic
         scope: session
         initializer: seed_state
@@ -1059,9 +1058,9 @@ pipeline:
         implementation: { kind: onnx, artifact: decoder.onnx }
         ports:
           inputs:
-            past_state: { dtype: float32, rank: 2, shape: [batch, hidden], batch_layout: { kind: request_aligned, axis: 0 } }
+            past_state: { dtype: float32, shape: [batch, hidden], batch_layout: { kind: request_aligned, axis: 0 } }
           outputs:
-            next_state: { dtype: float32, rank: 2, shape: [batch, hidden], batch_layout: { kind: request_aligned, axis: 0 } }
+            next_state: { dtype: float32, shape: [batch, hidden], batch_layout: { kind: request_aligned, axis: 0 } }
     serving:
       active: active
       done: done
@@ -1307,7 +1306,7 @@ fn portable_checkpoints_are_distinct_from_private_state_transfer() {
     // is a declared property, not an emergent one.
     let exported = private.replace(
         "    state:\n      cache:",
-        "    outputs:\n      cache:\n        contract: { dtype: float16, rank: 4, shape: [batch, \
+        "    outputs:\n      cache:\n        contract: { dtype: float16, shape: [batch, \
          heads, sequence, head_dim], batch_layout: { kind: request_aligned, axis: 0 } }\n        \
          role: tensor\n        stage: pre_adapter\n    state:\n      cache:",
     );
@@ -1375,11 +1374,11 @@ fn the_speculative_region_covers_every_component_in_the_loop_body() {
         .replace(
             "      empty_cache:",
             r#"      more:
-        contract: { dtype: bool, rank: 0, shape: [] }
+        contract: { dtype: bool, shape: [] }
         role: { kind: opaque }
         source: { kind: application, name: more }
       budget:
-        contract: { dtype: int64, rank: 0, shape: [] }
+        contract: { dtype: int64, shape: [] }
         role: { kind: opaque }
         source: { kind: application, name: budget }
       empty_cache:"#,
@@ -1422,11 +1421,11 @@ fn runtime_owned_state_cannot_be_exported_under_an_alias() {
         .replace(
             "      empty_cache:",
             r#"      more:
-        contract: { dtype: bool, rank: 0, shape: [] }
+        contract: { dtype: bool, shape: [] }
         role: { kind: opaque }
         source: { kind: application, name: more }
       budget:
-        contract: { dtype: int64, rank: 0, shape: [] }
+        contract: { dtype: int64, shape: [] }
         role: { kind: opaque }
         source: { kind: application, name: budget }
       empty_cache:"#,
@@ -1439,15 +1438,15 @@ fn runtime_owned_state_cannot_be_exported_under_an_alias() {
         implementation: { kind: onnx, artifact: verifier.onnx }
         ports:
           inputs:
-            past_key_values: { dtype: float16, rank: 4, shape: [batch, heads, sequence, head_dim], batch_layout: { kind: request_aligned, axis: 0 } }
+            past_key_values: { dtype: float16, shape: [batch, heads, sequence, head_dim], batch_layout: { kind: request_aligned, axis: 0 } }
           outputs:
-            present_key_values: { dtype: float16, rank: 4, shape: [batch, heads, sequence, head_dim], batch_layout: { kind: request_aligned, axis: 0 } }"#,
+            present_key_values: { dtype: float16, shape: [batch, heads, sequence, head_dim], batch_layout: { kind: request_aligned, axis: 0 } }"#,
         )
         .replace(
             "    state:\n      cache:",
             r#"    outputs:
       cache_dump:
-        contract: { dtype: float16, rank: 4, shape: [batch, heads, sequence, head_dim], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: float16, shape: [batch, heads, sequence, head_dim], batch_layout: { kind: request_aligned, axis: 0 } }
         role: tensor
         stage: pre_adapter
     state:
@@ -1562,7 +1561,6 @@ preprocessing:
         dtype: float32
         contract:
           dtype: float32
-          rank: 3
           shape: [batch, 80, audio_seq_len]
           batch_layout: { kind: request_aligned, axis: 0 }
 pipeline:
@@ -1572,12 +1570,12 @@ pipeline:
       capabilities: [workflow_ssa, typed_emit, audio_preprocessing_program]
     inputs:
       request.audio:
-        contract: { dtype: uint8, rank: 1, shape: [encoded_bytes] }
+        contract: { dtype: uint8, shape: [encoded_bytes] }
         role: { kind: opaque }
         source: { kind: application, name: audio }
     outputs:
       encoder_states:
-        contract: { dtype: float32, rank: 3, shape: [batch, 1500, 384], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: float32, shape: [batch, 1500, 384], batch_layout: { kind: request_aligned, axis: 0 } }
         role: tensor
         stage: pre_adapter
     components:
@@ -1585,16 +1583,16 @@ pipeline:
         implementation: { kind: adapter, abi: onnx-genai.audio-preprocess, version: "1" }
         ports:
           inputs:
-            encoded: { dtype: uint8, rank: 1, shape: [encoded_bytes] }
+            encoded: { dtype: uint8, shape: [encoded_bytes] }
           outputs:
-            input_features: { dtype: float32, rank: 3, shape: [batch, 80, audio_seq_len], batch_layout: { kind: request_aligned, axis: 0 } }
+            input_features: { dtype: float32, shape: [batch, 80, audio_seq_len], batch_layout: { kind: request_aligned, axis: 0 } }
       encoder:
         implementation: { kind: onnx, artifact: encoder.onnx }
         ports:
           inputs:
-            input_features: { dtype: float32, rank: 3, shape: [batch, 80, audio_seq_len], batch_layout: { kind: request_aligned, axis: 0 } }
+            input_features: { dtype: float32, shape: [batch, 80, audio_seq_len], batch_layout: { kind: request_aligned, axis: 0 } }
           outputs:
-            encoder_hidden_states: { dtype: float32, rank: 3, shape: [batch, 1500, 384], batch_layout: { kind: request_aligned, axis: 0 } }
+            encoder_hidden_states: { dtype: float32, shape: [batch, 1500, 384], batch_layout: { kind: request_aligned, axis: 0 } }
     steps:
       - kind: invoke
         component: audio_preprocess
@@ -1637,7 +1635,7 @@ fn an_audio_adapter_without_a_program_is_rejected() {
 #[test]
 fn an_audio_output_without_a_contract_is_rejected() {
     let document = AUDIO_PREPROCESSING_WORKFLOW.replace(
-        "        contract:\n          dtype: float32\n          rank: 3\n          shape: \
+        "        contract:\n          dtype: float32\n          shape: \
          [batch, 80, audio_seq_len]\n          batch_layout: { kind: request_aligned, axis: 0 }\n",
         "",
     );

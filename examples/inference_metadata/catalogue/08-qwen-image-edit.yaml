@@ -13,7 +13,6 @@ pipeline:
       request.latent:
         contract:
           dtype: float32
-          rank: 4
           shape:
           - batch
           - 4
@@ -31,7 +30,6 @@ pipeline:
       request.max_iterations:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - 1
         role:
@@ -45,7 +43,6 @@ pipeline:
       package.continue:
         contract:
           dtype: bool
-          rank: 1
           shape:
           - 1
         role:
@@ -57,7 +54,6 @@ pipeline:
       request.input_ids:
         contract:
           dtype: int64
-          rank: 2
           shape:
           - batch
           - prompt_sequence
@@ -74,7 +70,6 @@ pipeline:
       request.source_image:
         contract:
           dtype: float32
-          rank: 4
           shape:
           - batch
           - 3
@@ -94,7 +89,6 @@ pipeline:
       image:
         contract:
           dtype: float32
-          rank: 4
           shape:
           - batch
           - 3
@@ -115,7 +109,6 @@ pipeline:
           inputs:
             sample:
               dtype: float32
-              rank: 4
               shape:
               - batch
               - 4
@@ -126,12 +119,10 @@ pipeline:
                 axis: 0
             step:
               dtype: int64
-              rank: 1
               shape:
               - 1
             encoder_hidden_states:
               dtype: float16
-              rank: 3
               shape:
               - batch
               - prompt_sequence
@@ -141,7 +132,6 @@ pipeline:
                 axis: 0
             source_image_latent:
               dtype: float32
-              rank: 4
               shape:
               - batch
               - 4
@@ -153,7 +143,6 @@ pipeline:
           outputs:
             next_sample:
               dtype: float32
-              rank: 4
               shape:
               - batch
               - 4
@@ -170,7 +159,6 @@ pipeline:
           inputs:
             latent:
               dtype: float32
-              rank: 4
               shape:
               - batch
               - 4
@@ -182,7 +170,6 @@ pipeline:
           outputs:
             image:
               dtype: float32
-              rank: 4
               shape:
               - batch
               - 3
@@ -199,7 +186,6 @@ pipeline:
           inputs:
             input_ids:
               dtype: int64
-              rank: 2
               shape:
               - batch
               - prompt_sequence
@@ -209,7 +195,6 @@ pipeline:
           outputs:
             encoder_hidden_states:
               dtype: float16
-              rank: 3
               shape:
               - batch
               - prompt_sequence
@@ -225,7 +210,6 @@ pipeline:
           inputs:
             image:
               dtype: float32
-              rank: 4
               shape:
               - batch
               - 3
@@ -237,7 +221,6 @@ pipeline:
           outputs:
             image_latent:
               dtype: float32
-              rank: 4
               shape:
               - batch
               - 4
@@ -250,7 +233,6 @@ pipeline:
       latent:
         contract:
           dtype: float32
-          rank: 4
           shape:
           - batch
           - 4
@@ -284,7 +266,6 @@ pipeline:
         value: loop.iteration
         contract:
           dtype: int64
-          rank: 1
           shape:
           - 1
       setup:

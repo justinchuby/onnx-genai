@@ -10,7 +10,6 @@ pipeline:
       request.query:
         contract:
           dtype: float16
-          rank: 4
           shape:
           - batch
           - heads
@@ -28,7 +27,6 @@ pipeline:
       request.key:
         contract:
           dtype: float16
-          rank: 4
           shape:
           - batch
           - heads
@@ -46,7 +44,6 @@ pipeline:
       request.value:
         contract:
           dtype: float16
-          rank: 4
           shape:
           - batch
           - heads
@@ -64,7 +61,6 @@ pipeline:
       request.indices:
         contract:
           dtype: int32
-          rank: 2
           shape:
           - batch
           - sequence
@@ -80,7 +76,6 @@ pipeline:
       request.block_table:
         contract:
           dtype: int32
-          rank: 2
           shape:
           - batch
           - blocks
@@ -97,7 +92,6 @@ pipeline:
       output:
         contract:
           dtype: float16
-          rank: 4
           shape:
           - batch
           - heads
@@ -117,7 +111,6 @@ pipeline:
           inputs:
             data:
               dtype: float16
-              rank: 4
               shape:
               - batch
               - heads
@@ -128,7 +121,6 @@ pipeline:
                 axis: 0
             indices:
               dtype: int32
-              rank: 2
               shape:
               - batch
               - sequence
@@ -138,7 +130,6 @@ pipeline:
           outputs:
             output:
               dtype: float16
-              rank: 4
               shape:
               - batch
               - heads
@@ -155,7 +146,6 @@ pipeline:
           inputs:
             query:
               dtype: float16
-              rank: 4
               shape:
               - batch
               - heads
@@ -166,7 +156,6 @@ pipeline:
                 axis: 0
             key:
               dtype: float16
-              rank: 4
               shape:
               - batch
               - heads
@@ -177,7 +166,6 @@ pipeline:
                 axis: 0
             value:
               dtype: float16
-              rank: 4
               shape:
               - batch
               - heads
@@ -189,7 +177,6 @@ pipeline:
           outputs:
             output:
               dtype: float16
-              rank: 4
               shape:
               - batch
               - heads
@@ -206,7 +193,6 @@ pipeline:
           inputs:
             query:
               dtype: float16
-              rank: 4
               shape:
               - batch
               - heads
@@ -217,7 +203,6 @@ pipeline:
                 axis: 0
             key:
               dtype: float16
-              rank: 4
               shape:
               - batch
               - heads
@@ -228,7 +213,6 @@ pipeline:
                 axis: 0
             value:
               dtype: float16
-              rank: 4
               shape:
               - batch
               - heads
@@ -240,7 +224,6 @@ pipeline:
           outputs:
             output:
               dtype: float16
-              rank: 4
               shape:
               - batch
               - heads
@@ -257,7 +240,6 @@ pipeline:
           inputs:
             query:
               dtype: float16
-              rank: 4
               shape:
               - batch
               - heads
@@ -268,7 +250,6 @@ pipeline:
                 axis: 0
             key_pages:
               dtype: float16
-              rank: 4
               shape:
               - batch
               - heads
@@ -279,7 +260,6 @@ pipeline:
                 axis: 0
             value_pages:
               dtype: float16
-              rank: 4
               shape:
               - batch
               - heads
@@ -290,7 +270,6 @@ pipeline:
                 axis: 0
             block_table:
               dtype: int32
-              rank: 2
               shape:
               - batch
               - blocks
@@ -299,7 +278,6 @@ pipeline:
                 axis: 0
             slot_mapping:
               dtype: int32
-              rank: 2
               shape:
               - batch
               - sequence
@@ -309,7 +287,6 @@ pipeline:
           outputs:
             output:
               dtype: float16
-              rank: 4
               shape:
               - batch
               - heads
@@ -334,7 +311,6 @@ pipeline:
           inputs:
             query:
               dtype: float16
-              rank: 4
               shape:
               - batch
               - heads
@@ -345,7 +321,6 @@ pipeline:
                 axis: 0
             key:
               dtype: float16
-              rank: 4
               shape:
               - batch
               - heads
@@ -356,7 +331,6 @@ pipeline:
                 axis: 0
             value:
               dtype: float16
-              rank: 4
               shape:
               - batch
               - heads
@@ -368,7 +342,6 @@ pipeline:
           outputs:
             output:
               dtype: float16
-              rank: 4
               shape:
               - batch
               - heads

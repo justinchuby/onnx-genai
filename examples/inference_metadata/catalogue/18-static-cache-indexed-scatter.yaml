@@ -11,7 +11,6 @@ pipeline:
       request.active:
         contract:
           dtype: bool
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -26,7 +25,6 @@ pipeline:
       request.done:
         contract:
           dtype: bool
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -41,7 +39,6 @@ pipeline:
       request.accepted_len:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -56,7 +53,6 @@ pipeline:
       request.input_ids:
         contract:
           dtype: int64
-          rank: 2
           shape:
           - batch
           - 1
@@ -73,7 +69,6 @@ pipeline:
       request.cache:
         contract:
           dtype: float16
-          rank: 4
           shape:
           - batch
           - heads
@@ -91,7 +86,6 @@ pipeline:
       request.write_indices:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -106,7 +100,6 @@ pipeline:
       request.cache_lengths:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -121,7 +114,6 @@ pipeline:
       package.capacity:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - 1
         role:
@@ -134,7 +126,6 @@ pipeline:
       logits:
         contract:
           dtype: float16
-          rank: 3
           shape:
           - batch
           - sequence
@@ -153,7 +144,6 @@ pipeline:
           inputs:
             input_ids:
               dtype: int64
-              rank: 2
               shape:
               - batch
               - 1
@@ -162,7 +152,6 @@ pipeline:
                 axis: 0
             past_cache:
               dtype: float16
-              rank: 4
               shape:
               - batch
               - heads
@@ -173,7 +162,6 @@ pipeline:
                 axis: 0
             write_indices:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -181,7 +169,6 @@ pipeline:
                 axis: 0
             cache_lengths:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -190,7 +177,6 @@ pipeline:
           outputs:
             logits:
               dtype: float16
-              rank: 3
               shape:
               - batch
               - sequence
@@ -200,7 +186,6 @@ pipeline:
                 axis: 0
             present_cache:
               dtype: float16
-              rank: 4
               shape:
               - batch
               - heads
@@ -216,7 +201,6 @@ pipeline:
       cache:
         contract:
           dtype: float16
-          rank: 4
           shape:
           - batch
           - heads
@@ -235,7 +219,6 @@ pipeline:
       write_indices:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -248,7 +231,6 @@ pipeline:
       cache_lengths:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - batch
           batch_layout:

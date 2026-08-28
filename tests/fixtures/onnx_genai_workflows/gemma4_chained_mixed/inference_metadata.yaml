@@ -17,94 +17,94 @@ pipeline:
       capabilities: [workflow_ssa, typed_emit, serving_service_contract, bounded_state_recurrence]
     inputs:
       request.active:
-        contract: {dtype: bool, rank: 1, shape: [batch], batch_layout: {kind: request_aligned, axis: 0}}
+        contract: {dtype: bool, shape: [batch], batch_layout: {kind: request_aligned, axis: 0}}
         role: {kind: opaque}
         source: {kind: application, name: active}
         required: true
       request.done:
-        contract: {dtype: bool, rank: 1, shape: [batch], batch_layout: {kind: request_aligned, axis: 0}}
+        contract: {dtype: bool, shape: [batch], batch_layout: {kind: request_aligned, axis: 0}}
         role: {kind: opaque}
         source: {kind: application, name: done}
         required: true
       request.accepted_len:
-        contract: {dtype: int64, rank: 1, shape: [batch], batch_layout: {kind: request_aligned, axis: 0}}
+        contract: {dtype: int64, shape: [batch], batch_layout: {kind: request_aligned, axis: 0}}
         role: {kind: opaque}
         source: {kind: application, name: accepted_len}
         required: true
       request.input_ids:
-        contract: {dtype: int64, rank: 2, shape: [batch, sequence], batch_layout: {kind: request_aligned, axis: 0}}
+        contract: {dtype: int64, shape: [batch, sequence], batch_layout: {kind: request_aligned, axis: 0}}
         role: {kind: runtime, version: '1.0', role: prompt_tokens}
         source: {kind: request}
         required: true
       request.attention_mask:
-        contract: {dtype: int64, rank: 2, shape: [batch, sequence], batch_layout: {kind: request_aligned, axis: 0}}
+        contract: {dtype: int64, shape: [batch, sequence], batch_layout: {kind: request_aligned, axis: 0}}
         role: {kind: opaque}
         source: {kind: application, name: attention_mask}
         required: true
       request.position_ids:
-        contract: {dtype: int64, rank: 2, shape: [batch, sequence], batch_layout: {kind: request_aligned, axis: 0}}
+        contract: {dtype: int64, shape: [batch, sequence], batch_layout: {kind: request_aligned, axis: 0}}
         role: {kind: opaque}
         source: {kind: application, name: position_ids}
         required: true
       request.inputs_embeds:
-        contract: {dtype: float32, rank: 3, shape: [batch, sequence, fused_hidden], batch_layout: {kind: request_aligned, axis: 0}}
+        contract: {dtype: float32, shape: [batch, sequence, fused_hidden], batch_layout: {kind: request_aligned, axis: 0}}
         role: {kind: opaque}
         source: {kind: application, name: inputs_embeds}
         required: true
       request.past_key_values.0.key:
-        contract: {dtype: float32, rank: 4, shape: [batch, kv_heads, past_sequence, sliding_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+        contract: {dtype: float32, shape: [batch, kv_heads, past_sequence, sliding_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
         role: {kind: opaque}
         source: {kind: application, name: past_key_values.0.key}
         required: true
       request.past_key_values.0.value:
-        contract: {dtype: float32, rank: 4, shape: [batch, kv_heads, past_sequence, sliding_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+        contract: {dtype: float32, shape: [batch, kv_heads, past_sequence, sliding_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
         role: {kind: opaque}
         source: {kind: application, name: past_key_values.0.value}
         required: true
       request.past_key_values.1.key:
-        contract: {dtype: float32, rank: 4, shape: [batch, kv_heads, past_sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+        contract: {dtype: float32, shape: [batch, kv_heads, past_sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
         role: {kind: opaque}
         source: {kind: application, name: past_key_values.1.key}
         required: true
       request.past_key_values.1.value:
-        contract: {dtype: float32, rank: 4, shape: [batch, kv_heads, past_sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+        contract: {dtype: float32, shape: [batch, kv_heads, past_sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
         role: {kind: opaque}
         source: {kind: application, name: past_key_values.1.value}
         required: true
       request.shared_kv.full_attention.key:
-        contract: {dtype: float32, rank: 4, shape: [batch, kv_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+        contract: {dtype: float32, shape: [batch, kv_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
         role: {kind: opaque}
         source: {kind: application, name: shared_kv.full_attention.key}
         required: true
       request.shared_kv.full_attention.value:
-        contract: {dtype: float32, rank: 4, shape: [batch, kv_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+        contract: {dtype: float32, shape: [batch, kv_heads, sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
         role: {kind: opaque}
         source: {kind: application, name: shared_kv.full_attention.value}
         required: true
       request.shared_kv.sliding_attention.key:
-        contract: {dtype: float32, rank: 4, shape: [batch, kv_heads, sequence, sliding_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+        contract: {dtype: float32, shape: [batch, kv_heads, sequence, sliding_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
         role: {kind: opaque}
         source: {kind: application, name: shared_kv.sliding_attention.key}
         required: true
       request.shared_kv.sliding_attention.value:
-        contract: {dtype: float32, rank: 4, shape: [batch, kv_heads, sequence, sliding_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+        contract: {dtype: float32, shape: [batch, kv_heads, sequence, sliding_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
         role: {kind: opaque}
         source: {kind: application, name: shared_kv.sliding_attention.value}
         required: true
       package.max_context:
-        contract: {dtype: int64, rank: 1, shape: [1]}
+        contract: {dtype: int64, shape: [1]}
         role: {kind: opaque}
         source: {kind: literal}
         required: false
         default: 16
     outputs:
       logits:
-        contract: {dtype: float32, rank: 3, shape: [batch, sequence, vocab], batch_layout: {kind: request_aligned, axis: 0}}
+        contract: {dtype: float32, shape: [batch, sequence, vocab], batch_layout: {kind: request_aligned, axis: 0}}
         role: tensor
         stage: pre_adapter
     state:
       past_key_values.0.key:
-        contract: {dtype: float32, rank: 4, shape: [batch, kv_heads, past_sequence, sliding_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+        contract: {dtype: float32, shape: [batch, kv_heads, past_sequence, sliding_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
         class: semantic
         scope: invocation
         initializer: request.past_key_values.0.key
@@ -113,7 +113,7 @@ pipeline:
         management: runtime
         release_boundary: invocation
       past_key_values.0.value:
-        contract: {dtype: float32, rank: 4, shape: [batch, kv_heads, past_sequence, sliding_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+        contract: {dtype: float32, shape: [batch, kv_heads, past_sequence, sliding_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
         class: semantic
         scope: invocation
         initializer: request.past_key_values.0.value
@@ -122,7 +122,7 @@ pipeline:
         management: runtime
         release_boundary: invocation
       past_key_values.1.key:
-        contract: {dtype: float32, rank: 4, shape: [batch, kv_heads, past_sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+        contract: {dtype: float32, shape: [batch, kv_heads, past_sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
         class: semantic
         scope: invocation
         initializer: request.past_key_values.1.key
@@ -131,7 +131,7 @@ pipeline:
         management: runtime
         release_boundary: invocation
       past_key_values.1.value:
-        contract: {dtype: float32, rank: 4, shape: [batch, kv_heads, past_sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
+        contract: {dtype: float32, shape: [batch, kv_heads, past_sequence, full_head_dim], batch_layout: {kind: request_aligned, axis: 0}}
         class: semantic
         scope: invocation
         initializer: request.past_key_values.1.value
@@ -146,48 +146,39 @@ pipeline:
           inputs:
             inputs_embeds:
               dtype: float32
-              rank: 3
               shape: [batch, sequence, fused_hidden]
               batch_layout: {kind: request_aligned, axis: 0}
             position_ids:
               dtype: int64
-              rank: 2
               shape: [batch, sequence]
               batch_layout: {kind: request_aligned, axis: 0}
             attention_mask:
               dtype: int64
-              rank: 2
               shape: [batch, kv_sequence]
               batch_layout: {kind: request_aligned, axis: 0}
             shared_kv.full_attention.key:
               dtype: float32
-              rank: 4
               shape: [batch, kv_heads, kv_sequence, full_head_dim]
               batch_layout: {kind: request_aligned, axis: 0}
             shared_kv.full_attention.value:
               dtype: float32
-              rank: 4
               shape: [batch, kv_heads, kv_sequence, full_head_dim]
               batch_layout: {kind: request_aligned, axis: 0}
             shared_kv.sliding_attention.key:
               dtype: float32
-              rank: 4
               shape: [batch, kv_heads, kv_sequence, sliding_head_dim]
               batch_layout: {kind: request_aligned, axis: 0}
             shared_kv.sliding_attention.value:
               dtype: float32
-              rank: 4
               shape: [batch, kv_heads, kv_sequence, sliding_head_dim]
               batch_layout: {kind: request_aligned, axis: 0}
           outputs:
             logits:
               dtype: float32
-              rank: 3
               shape: [batch, sequence, vocab]
               batch_layout: {kind: request_aligned, axis: 0}
             projected_state:
               dtype: float32
-              rank: 3
               shape: [batch, sequence, hidden]
               batch_layout: {kind: request_aligned, axis: 0}
       target:
@@ -196,68 +187,55 @@ pipeline:
           inputs:
             input_ids:
               dtype: int64
-              rank: 2
               shape: [batch, sequence]
               batch_layout: {kind: request_aligned, axis: 0}
             attention_mask:
               dtype: int64
-              rank: 2
               shape: [batch, kv_sequence]
               batch_layout: {kind: request_aligned, axis: 0}
             position_ids:
               dtype: int64
-              rank: 2
               shape: [batch, sequence]
               batch_layout: {kind: request_aligned, axis: 0}
             past_key_values.0.key:
               dtype: float32
-              rank: 4
               shape: [batch, kv_heads, past_sequence, sliding_head_dim]
               batch_layout: {kind: request_aligned, axis: 0}
             past_key_values.0.value:
               dtype: float32
-              rank: 4
               shape: [batch, kv_heads, past_sequence, sliding_head_dim]
               batch_layout: {kind: request_aligned, axis: 0}
             past_key_values.1.key:
               dtype: float32
-              rank: 4
               shape: [batch, kv_heads, past_sequence, full_head_dim]
               batch_layout: {kind: request_aligned, axis: 0}
             past_key_values.1.value:
               dtype: float32
-              rank: 4
               shape: [batch, kv_heads, past_sequence, full_head_dim]
               batch_layout: {kind: request_aligned, axis: 0}
           outputs:
             logits:
               dtype: float32
-              rank: 3
               shape: [batch, sequence, vocab]
               batch_layout: {kind: request_aligned, axis: 0}
             present.0.key:
               dtype: float32
-              rank: 4
               shape: [batch, kv_heads, kv_sequence, sliding_head_dim]
               batch_layout: {kind: request_aligned, axis: 0}
             present.0.value:
               dtype: float32
-              rank: 4
               shape: [batch, kv_heads, kv_sequence, sliding_head_dim]
               batch_layout: {kind: request_aligned, axis: 0}
             present.1.key:
               dtype: float32
-              rank: 4
               shape: [batch, kv_heads, kv_sequence, full_head_dim]
               batch_layout: {kind: request_aligned, axis: 0}
             present.1.value:
               dtype: float32
-              rank: 4
               shape: [batch, kv_heads, kv_sequence, full_head_dim]
               batch_layout: {kind: request_aligned, axis: 0}
             hidden_states.0:
               dtype: float32
-              rank: 3
               shape: [batch, sequence, hidden]
               batch_layout: {kind: request_aligned, axis: 0}
     steps:

@@ -190,11 +190,9 @@ pub fn plan_encoder_groups(
 }
 
 fn validate_item_dimensions(item: &EncoderWorkItem<'_>) -> Result<(), EncoderBatchingError> {
-    if let Some(shape) = &item.contract.shape {
-        for dimension in shape {
-            if let TensorDimension::Symbol(symbol) = dimension {
-                require_dimension(item, symbol, "the tensor contract shape")?;
-            }
+    for dimension in &item.contract.shape {
+        if let TensorDimension::Symbol(symbol) = dimension {
+            require_dimension(item, symbol, "the tensor contract shape")?;
         }
     }
     let Some(capacity) = item.capacity else {
@@ -240,9 +238,7 @@ fn dimensions_compatible(
     left: &EncoderWorkItem<'_>,
     right: &EncoderWorkItem<'_>,
 ) -> Result<bool, EncoderBatchingError> {
-    let Some(shape) = &left.contract.shape else {
-        return Ok(true);
-    };
+    let shape = &left.contract.shape;
     let capacity = left
         .capacity
         .expect("batched compatibility is called only for declared capacity");
@@ -653,12 +649,12 @@ mod tests {
     #[test]
     fn grouping_is_stable_across_component_contract_uniformity_and_budgets() {
         let primary_contract = contract(
-            "dtype: float32\nrank: 3\nshape: [items, patches, features]\n\
+            "dtype: float32\nshape: [items, patches, features]\n\
              batch_layout: { kind: token_packed, axis: 0, levels: [{ offsets: offsets, owner: owner }] }\n\
              padding: [{ dimension: patches, valid_lengths: lengths }]\n",
         );
         let other_contract = contract(
-            "dtype: float16\nrank: 3\nshape: [items, patches, features]\n\
+            "dtype: float16\nshape: [items, patches, features]\n\
              batch_layout: { kind: token_packed, axis: 0, levels: [{ offsets: offsets, owner: owner }] }\n\
              padding: [{ dimension: patches, valid_lengths: lengths }]\n",
         );
@@ -768,7 +764,7 @@ mod tests {
     #[test]
     fn padded_budget_charges_the_materialized_rectangle() {
         let contract = contract(
-            "dtype: float32\nrank: 3\nshape: [items, patches, features]\n\
+            "dtype: float32\nshape: [items, patches, features]\n\
              batch_layout: { kind: token_packed, axis: 0, levels: [{ offsets: offsets, owner: owner }] }\n\
              padding: [{ dimension: patches, valid_lengths: lengths }]\n",
         );
@@ -803,7 +799,7 @@ mod tests {
 
     #[test]
     fn missing_authored_extent_is_an_actionable_error() {
-        let contract = contract("dtype: float32\nrank: 2\nshape: [items, features]\n");
+        let contract = contract("dtype: float32\nshape: [items, features]\n");
         let capacity = capacity("uniform_dimensions: [features]\n");
         let dimensions = dimensions(&[("items", 1)]);
         let error = plan_encoder_groups(&[EncoderWorkItem {

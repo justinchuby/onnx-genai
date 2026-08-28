@@ -54,7 +54,6 @@ preprocessing:
         dtype: float32
         contract:
           dtype: float32
-          rank: 3
           shape: [items, max_patches, 3]
           batch_layout:
             kind: token_packed
@@ -63,11 +62,11 @@ preprocessing:
               - { offsets: media.offsets, owner: media.owner, extent: produced }
           padding: [{ dimension: max_patches, valid_lengths: media.lengths }]
       - { source: runtime.offsets, name: media.offsets, content: pack_offsets, dtype: int64,
-          contract: { dtype: int64, rank: 1, shape: [rows_plus_one], batch_layout: { kind: shared } } }
+          contract: { dtype: int64, shape: [rows_plus_one], batch_layout: { kind: shared } } }
       - { source: runtime.owner, name: media.owner, content: pack_owner, dtype: int64,
-          contract: { dtype: int64, rank: 1, shape: [items], batch_layout: { kind: shared } } }
+          contract: { dtype: int64, shape: [items], batch_layout: { kind: shared } } }
       - { source: runtime.lengths, name: media.lengths, content: valid_lengths, dtype: int64,
-          contract: { dtype: int64, rank: 1, shape: [items], batch_layout: { kind: shared } } }
+          contract: { dtype: int64, shape: [items], batch_layout: { kind: shared } } }
 "#;
 
 const VIDEO_PROGRAM: &str = r#"
@@ -88,7 +87,6 @@ preprocessing:
         dtype: float32
         contract:
           dtype: float32
-          rank: 3
           shape: [frames, max_patches, 3]
           batch_layout:
             kind: token_packed
@@ -98,19 +96,19 @@ preprocessing:
               - { offsets: video.clip_offsets, owner: video.clip_owner, extent: produced }
           padding: [{ dimension: max_patches, valid_lengths: video.lengths }]
       - { source: runtime.frame_offsets, name: video.frame_offsets, content: pack_offsets,
-          dtype: int64, contract: { dtype: int64, rank: 1, shape: [clips_plus_one],
+          dtype: int64, contract: { dtype: int64, shape: [clips_plus_one],
           batch_layout: { kind: shared } } }
       - { source: runtime.frame_owner, name: video.frame_owner, content: pack_owner,
-          dtype: int64, contract: { dtype: int64, rank: 1, shape: [frames],
+          dtype: int64, contract: { dtype: int64, shape: [frames],
           batch_layout: { kind: shared } } }
       - { source: runtime.clip_offsets, name: video.clip_offsets, content: pack_offsets,
-          dtype: int64, contract: { dtype: int64, rank: 1, shape: [rows_plus_one],
+          dtype: int64, contract: { dtype: int64, shape: [rows_plus_one],
           batch_layout: { kind: shared } } }
       - { source: runtime.clip_owner, name: video.clip_owner, content: pack_owner,
-          dtype: int64, contract: { dtype: int64, rank: 1, shape: [clips],
+          dtype: int64, contract: { dtype: int64, shape: [clips],
           batch_layout: { kind: shared } } }
       - { source: runtime.lengths, name: video.lengths, content: valid_lengths, dtype: int64,
-          contract: { dtype: int64, rank: 1, shape: [frames], batch_layout: { kind: shared } } }
+          contract: { dtype: int64, shape: [frames], batch_layout: { kind: shared } } }
 "#;
 
 const MIXED_LAYOUT_PROGRAM: &str = r#"
@@ -132,7 +130,6 @@ preprocessing:
         dtype: float32
         contract:
           dtype: float32
-          rank: 3
           shape: [items, max_patches, 3]
           batch_layout:
             kind: token_packed
@@ -146,15 +143,14 @@ preprocessing:
         dtype: int64
         contract:
           dtype: int64
-          rank: 2
           shape: [request_rows, 3]
           batch_layout: GRID_LAYOUT
       - { source: runtime.offsets, name: media.offsets, content: pack_offsets, dtype: int64,
-          contract: { dtype: int64, rank: 1, shape: [rows_plus_one], batch_layout: { kind: shared } } }
+          contract: { dtype: int64, shape: [rows_plus_one], batch_layout: { kind: shared } } }
       - { source: runtime.owner, name: media.owner, content: pack_owner, dtype: int64,
-          contract: { dtype: int64, rank: 1, shape: [items], batch_layout: { kind: shared } } }
+          contract: { dtype: int64, shape: [items], batch_layout: { kind: shared } } }
       - { source: runtime.lengths, name: media.lengths, content: valid_lengths, dtype: int64,
-          contract: { dtype: int64, rank: 1, shape: [items], batch_layout: { kind: shared } } }
+          contract: { dtype: int64, shape: [items], batch_layout: { kind: shared } } }
 "#;
 
 fn mixed_layout_program(layout: &str) -> VisionPreprocessingProgram {
@@ -377,7 +373,7 @@ fn unreferenced_length_role_lookalike_is_not_intercepted() {
         dtype: "int64".to_owned(),
         contract: Some(
             serde_yaml::from_str::<TensorContract>(
-                "dtype: int64\nrank: 1\nshape: [items]\nbatch_layout: { kind: shared }\n",
+                "dtype: int64\nshape: [items]\nbatch_layout: { kind: shared }\n",
             )
             .unwrap(),
         ),
@@ -481,11 +477,11 @@ fn empty_media_rejects_unresolved_symbolic_feature_width() {
         .iter_mut()
         .find(|output| output.name == "video.pixels")
         .unwrap();
-    pixels.contract.as_mut().unwrap().shape = Some(vec![
+    pixels.contract.as_mut().unwrap().shape = vec![
         TensorDimension::Symbol("frames".to_owned()),
         TensorDimension::Symbol("max_patches".to_owned()),
         TensorDimension::Symbol("features".to_owned()),
-    ]);
+    ];
     let processor = GroupedVisionPreprocessor::from_input_and_program(
         "video_preprocess",
         &[-1, -1, -1],

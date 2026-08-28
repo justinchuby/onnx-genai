@@ -377,7 +377,7 @@ branch before reading the optional input and merge a real alternative value:
 ```yaml
 inputs:
   request.image:
-    contract: { dtype: uint8, rank: 1, shape: [encoded_bytes] }
+    contract: { dtype: uint8, shape: [encoded_bytes] }
     role: { kind: runtime, version: "1.0", role: media }
     source: { kind: request }
     required: false
@@ -790,14 +790,14 @@ Logical cache cells bind explicitly to named KV service groups:
 ```yaml
 state:
   cache:
-    contract: { dtype: float16, rank: 4, shape: [batch, heads, sequence, head_dim] }
+    contract: { dtype: float16, shape: [batch, heads, sequence, head_dim] }
     class: semantic
     scope: invocation
     initializer: empty_cache
     recurrence: { kind: growing, axis: 2, increment: accepted_len, max: max_context }
     service_group: decoder_cache
   cache_lengths:
-    contract: { dtype: int64, rank: 1, shape: [batch] }
+    contract: { dtype: int64, shape: [batch] }
     class: semantic
     scope: invocation
     initializer: initial_cache_lengths
@@ -897,7 +897,7 @@ steps:
     max_iterations: num_steps
     iteration:
       value: diffusion_step
-      contract: { dtype: int64, rank: 0, shape: [] }
+      contract: { dtype: int64, shape: [] }
     carried: [{ cell: latent, initial: latent.initial, next: latent.next }]
   - kind: invoke                 # once after loop
     component: decoder

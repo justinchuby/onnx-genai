@@ -58,15 +58,15 @@ pipeline:
       capabilities: [workflow_ssa, parameter_adapters, heterogeneous_adapter_batching]
     inputs:
       request.adapter_segments:
-        contract: { dtype: int64, rank: 2, shape: [batch, 2], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: int64, shape: [batch, 2], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: runtime, version: "1.0", role: adapter_segments }
         source: { kind: request }
       request.adapter_counts:
-        contract: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: int64, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: runtime, version: "1.0", role: adapter_counts }
         source: { kind: request }
       request.adapter_scales:
-        contract: { dtype: float32, rank: 2, shape: [batch, 2], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: float32, shape: [batch, 2], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: runtime, version: "1.0", role: adapter_scales }
         source: { kind: request }
     components:
@@ -80,9 +80,9 @@ pipeline:
           version: "1"
         ports:
           inputs:
-            input: { dtype: float32, rank: 2, shape: [batch, 2] }
+            input: { dtype: float32, shape: [batch, 2] }
           outputs:
-            output: { dtype: float32, rank: 2, shape: [batch, 2] }
+            output: { dtype: float32, shape: [batch, 2] }
         contract:
           id: onnx-genai.parameter-overlay
           version: "1"
@@ -272,8 +272,8 @@ fn adapter_wire_contract_rejects_ambiguous_selection_and_indices() {
         .replace("max_adapters: 2", "max_adapters: 0")
         .replace("index: 0", "index: 2")
         .replace(
-            "contract: { dtype: int64, rank: 2, shape: [batch, 2] }\n        role: { kind: runtime, version: \"1.0\", role: adapter_segments }",
-            "contract: { dtype: float32, rank: 2, shape: [batch, 2] }\n        role: { kind: runtime, version: \"1.0\", role: adapter_segments }",
+            "contract: { dtype: int64, shape: [batch, 2] }\n        role: { kind: runtime, version: \"1.0\", role: adapter_segments }",
+            "contract: { dtype: float32, shape: [batch, 2] }\n        role: { kind: runtime, version: \"1.0\", role: adapter_segments }",
         );
     let metadata: InferenceMetadata =
         serde_yaml::from_str(&invalid).expect("invalid adapter wire contract parses");
@@ -383,7 +383,7 @@ pipeline:
       capabilities: [workflow_ssa, nested_control_flow, input_presence]
     inputs:
       request.image:
-        contract: { dtype: uint8, rank: 1, shape: [encoded_bytes] }
+        contract: { dtype: uint8, shape: [encoded_bytes] }
         role: { kind: runtime, version: "1.0", role: media }
         source: { kind: request }
         required: false
@@ -415,7 +415,7 @@ pipeline:
       capabilities: [workflow_ssa]
     inputs:
       request.image:
-        contract: { dtype: uint8, rank: 1, shape: [encoded_bytes] }
+        contract: { dtype: uint8, shape: [encoded_bytes] }
         role: { kind: runtime, version: "1.0", role: media }
         source: { kind: request }
         required: false
@@ -443,7 +443,7 @@ pipeline:
       capabilities: [workflow_ssa, input_presence]
     inputs:
       request.image:
-        contract: { dtype: uint8, rank: 1, shape: [encoded_bytes] }
+        contract: { dtype: uint8, shape: [encoded_bytes] }
         role: { kind: runtime, version: "1.0", role: media }
         source: { kind: request }
         required: false
@@ -453,7 +453,7 @@ pipeline:
         implementation: { kind: binding }
         ports:
           inputs:
-            image: { dtype: uint8, rank: 1, shape: [encoded_bytes] }
+            image: { dtype: uint8, shape: [encoded_bytes] }
     steps:
       - kind: invoke
         component: consume
@@ -480,7 +480,7 @@ pipeline:
       capabilities: [workflow_ssa, input_presence]
     inputs:
       request.temperature:
-        contract: { dtype: float32, rank: 1, shape: [1] }
+        contract: { dtype: float32, shape: [1] }
         role: { kind: runtime, version: "1.0", role: sampling_temperature }
         source: { kind: request }
         required: false
@@ -582,7 +582,7 @@ pipeline:
 
 #[test]
 fn emit_valid_length_requires_integer_scalar_or_vector() {
-    fn errors(dtype: &str, rank: usize, shape: &str) -> Vec<String> {
+    fn errors(dtype: &str, shape: &str) -> Vec<String> {
         let metadata: InferenceMetadata = serde_yaml::from_str(&format!(
             r#"
 pipeline:
@@ -591,18 +591,18 @@ pipeline:
       capabilities: [workflow_ssa, typed_emit, emit_valid_length]
     inputs:
       value:
-        contract: {{ dtype: int64, rank: 1, shape: [sequence] }}
+        contract: {{ dtype: int64, shape: [sequence] }}
         role: {{ kind: opaque }}
         source: {{ kind: application, name: value }}
         required: true
       length:
-        contract: {{ dtype: {dtype}, rank: {rank}, shape: {shape} }}
+        contract: {{ dtype: {dtype}, shape: {shape} }}
         role: {{ kind: opaque }}
         source: {{ kind: application, name: length }}
         required: true
     outputs:
       result:
-        contract: {{ dtype: int64, rank: 1, shape: [valid] }}
+        contract: {{ dtype: int64, shape: [valid] }}
         role: tokens
         stage: pre_adapter
     components: {{}}
@@ -619,12 +619,12 @@ pipeline:
     }
 
     assert!(
-        errors("float32", 0, "[]")
+        errors("float32", "[]")
             .iter()
             .any(|error| error.contains("must have an integer dtype"))
     );
     assert!(
-        errors("int64", 2, "[batch, one]")
+        errors("int64", "[batch, one]")
             .iter()
             .any(|error| error.contains("must be a scalar or rank-one tensor"))
     );
@@ -643,14 +643,13 @@ pipeline:
       value:
         contract:
           dtype: int64
-          rank: 2
           shape: [batch, sequence]
           {batch_layout}
         role: {{ kind: opaque }}
         source: {{ kind: application, name: value }}
         required: true
       length:
-        contract: {{ dtype: int64, rank: 1, shape: [batch] }}
+        contract: {{ dtype: int64, shape: [batch] }}
         role: {{ kind: opaque }}
         source: {{ kind: application, name: length }}
         required: true
@@ -658,7 +657,6 @@ pipeline:
       result:
         contract:
           dtype: int64
-          rank: 2
           shape: [batch, generated]
           {batch_layout}
         role: tokens
@@ -723,13 +721,13 @@ pipeline:
       capabilities: [workflow_ssa]
     inputs:
       value:
-        contract: {{ dtype: int64, rank: 2, shape: [batch, sequence] }}
+        contract: {{ dtype: int64, shape: [batch, sequence] }}
         role: {{ kind: opaque }}
         source: {{ kind: application, name: value }}
         required: true
     outputs:
       result:
-        contract: {{ dtype: int64, rank: 2, shape: [batch, generated] }}
+        contract: {{ dtype: int64, shape: [batch, generated] }}
         role: tokens
         stage: pre_adapter
     components: {{}}
@@ -787,7 +785,6 @@ pipeline:
       value:
         contract:
           dtype: int64
-          rank: 2
           shape: [batch, sequence]
           batch_layout: { kind: request_aligned, axis: 0 }
         role: { kind: opaque }
@@ -796,7 +793,6 @@ pipeline:
       valid_length:
         contract:
           dtype: int64
-          rank: 1
           shape: [batch]
           batch_layout: { kind: request_aligned, axis: 0 }
         role: { kind: opaque }
@@ -805,7 +801,6 @@ pipeline:
       active.initial:
         contract:
           dtype: bool
-          rank: 1
           shape: [batch]
           batch_layout: { kind: request_aligned, axis: 0 }
         role: { kind: opaque }
@@ -814,7 +809,6 @@ pipeline:
       done.initial:
         contract:
           dtype: bool
-          rank: 1
           shape: [batch]
           batch_layout: { kind: request_aligned, axis: 0 }
         role: { kind: opaque }
@@ -823,14 +817,13 @@ pipeline:
       cache.initial:
         contract:
           dtype: float32
-          rank: 2
           shape: [batch, capacity]
           batch_layout: { kind: request_aligned, axis: 0 }
         role: { kind: opaque }
         source: { kind: application, name: cache }
         required: true
       max_iterations:
-        contract: { dtype: int64, rank: 0, shape: [] }
+        contract: { dtype: int64, shape: [] }
         role: { kind: opaque }
         source: { kind: application, name: max_iterations }
         required: true
@@ -838,7 +831,6 @@ pipeline:
       result:
         contract:
           dtype: int64
-          rank: 2
           shape: [batch, generated]
           batch_layout: { kind: request_aligned, axis: 0 }
         role: tokens
@@ -848,7 +840,6 @@ pipeline:
       active:
         contract:
           dtype: bool
-          rank: 1
           shape: [batch]
           batch_layout: { kind: request_aligned, axis: 0 }
         scope: invocation
@@ -857,7 +848,6 @@ pipeline:
       done:
         contract:
           dtype: bool
-          rank: 1
           shape: [batch]
           batch_layout: { kind: request_aligned, axis: 0 }
         scope: invocation
@@ -866,7 +856,6 @@ pipeline:
       accepted_len:
         contract:
           dtype: int64
-          rank: 1
           shape: [batch]
           batch_layout: { kind: request_aligned, axis: 0 }
         scope: invocation
@@ -875,7 +864,6 @@ pipeline:
       cache:
         contract:
           dtype: float32
-          rank: 2
           shape: [batch, capacity]
           batch_layout: { kind: request_aligned, axis: 0 }
         scope: invocation
@@ -957,7 +945,7 @@ pipeline:
       capabilities: [workflow_ssa, advisory_state, session_state_lease]
     inputs:
       estimate:
-        contract: { dtype: float32, rank: 1, shape: [batch] }
+        contract: { dtype: float32, shape: [batch] }
         role: { kind: opaque }
         source: { kind: application, name: estimate }
         required: true
@@ -968,7 +956,7 @@ pipeline:
         ports: {}
     state:
       estimate:
-        contract: { dtype: float32, rank: 1, shape: [batch] }
+        contract: { dtype: float32, shape: [batch] }
         class: advisory
         scope: session
         initializer: estimate
@@ -992,23 +980,23 @@ pipeline:
       capabilities: [workflow_ssa, serving_service_contract]
     inputs:
       active:
-        contract: { dtype: bool, rank: 1, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: bool, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: opaque }
         source: { kind: application, name: active }
       done:
-        contract: { dtype: bool, rank: 1, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: bool, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: opaque }
         source: { kind: application, name: done }
       accepted_len:
-        contract: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: int64, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: opaque }
         source: { kind: application, name: accepted_len }
       cache_lengths:
-        contract: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: int64, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: opaque }
         source: { kind: application, name: cache_lengths }
       empty_cache:
-        contract: { dtype: float16, rank: 4, shape: [batch, heads, sequence, head_dim], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: float16, shape: [batch, heads, sequence, head_dim], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: opaque }
         source: { kind: application, name: empty_cache }
     components:
@@ -1017,7 +1005,7 @@ pipeline:
         ports: { roles: { input_ids: token_ids } }
     state:
       cache:
-        contract: { dtype: float16, rank: 4, shape: [batch, heads, sequence, head_dim], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: float16, shape: [batch, heads, sequence, head_dim], batch_layout: { kind: request_aligned, axis: 0 } }
         class: semantic
         scope: invocation
         initializer: empty_cache
@@ -1026,7 +1014,7 @@ pipeline:
         management: runtime
         release_boundary: invocation
       cache_lengths:
-        contract: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: int64, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
         class: semantic
         scope: invocation
         initializer: cache_lengths

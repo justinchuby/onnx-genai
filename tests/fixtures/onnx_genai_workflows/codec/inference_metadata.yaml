@@ -10,7 +10,6 @@ pipeline:
       request.waveform:
         contract:
           dtype: float32
-          rank: 3
           shape:
           - batch
           - 1
@@ -29,7 +28,6 @@ pipeline:
       waveform:
         contract:
           dtype: float32
-          rank: 3
           shape:
           - batch
           - 1

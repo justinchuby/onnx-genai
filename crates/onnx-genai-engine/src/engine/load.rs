@@ -822,7 +822,7 @@ impl Engine {
         // `derive_fallback_io`: a declared `io` block always wins, and pure-dense
         // decoders (no recurrent state pairs) yield no derived spec and keep their
         // existing load path unchanged. See #384 and the qwen3.5-27B enablement.
-        maybe_fill_hybrid_io_from_graph(&mut metadata, &model_directory.model_path);
+        maybe_fill_hybrid_io_from_graph(&mut metadata, &model_directory.model_path)?;
         admit_inference_metadata(&metadata)?;
         // Native MTP self-speculation seeds its draft head from a target hidden
         // output. The native decode session only records that hidden state when
@@ -1512,19 +1512,23 @@ impl Engine {
 /// path. The result is installed as a *derived* ABI rather than written into
 /// the deprecated serialized block, so it stays one representation.
 #[cfg(feature = "native-backend")]
-fn maybe_fill_hybrid_io_from_graph(metadata: &mut InferenceMetadata, model_path: &Path) {
+fn maybe_fill_hybrid_io_from_graph(
+    metadata: &mut InferenceMetadata,
+    model_path: &Path,
+) -> anyhow::Result<()> {
     // A workflow-recognized or legacy-declared ABI is always authoritative.
     if metadata.decoder_io().is_some() {
-        return;
+        return Ok(());
     }
-    let Some(graph_info) = crate::engine::decoder_graph_info_from_model_path(model_path) else {
-        return;
+    let Some(graph_info) = crate::engine::decoder_graph_info_from_model_path(model_path)? else {
+        return Ok(());
     };
     let Some(io) = onnx_genai_genai_config::GenAiConfig::derive_decoder_abi_from_graph(&graph_info)
     else {
-        return;
+        return Ok(());
     };
     metadata.set_derived_decoder_io(io);
+    Ok(())
 }
 
 /// The resolved decode ABI with an MTP sidecar's target hidden output filled in.

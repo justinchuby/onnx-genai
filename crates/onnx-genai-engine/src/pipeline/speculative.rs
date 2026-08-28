@@ -1333,13 +1333,14 @@ fn position_symbol(
     declaration: &onnx_genai_metadata::WorkflowComponent,
     port: &str,
 ) -> Option<String> {
-    let shape = declaration.ports.inputs.get(port)?.shape.as_ref()?;
+    let shape = &declaration.ports.inputs.get(port)?.shape;
     if shape.len() < 3 {
         return None;
     }
     match &shape[shape.len() - 2] {
         onnx_genai_metadata::TensorDimension::Symbol(symbol) => Some(symbol.clone()),
-        onnx_genai_metadata::TensorDimension::Fixed(_) => None,
+        onnx_genai_metadata::TensorDimension::Fixed(_)
+        | onnx_genai_metadata::TensorDimension::Any => None,
     }
 }
 
@@ -1369,11 +1370,11 @@ fn proposer_output_symbols(
         .ports
         .inputs
         .values()
-        .filter_map(|contract| contract.shape.as_ref())
-        .flatten()
+        .flat_map(|contract| &contract.shape)
         .filter_map(|dimension| match dimension {
             onnx_genai_metadata::TensorDimension::Symbol(symbol) => Some(symbol.as_str()),
-            onnx_genai_metadata::TensorDimension::Fixed(_) => None,
+            onnx_genai_metadata::TensorDimension::Fixed(_)
+            | onnx_genai_metadata::TensorDimension::Any => None,
         })
         .collect::<std::collections::HashSet<_>>();
 
@@ -1383,9 +1384,7 @@ fn proposer_output_symbols(
         let Some(contract) = declaration.ports.outputs.get(port) else {
             continue;
         };
-        let Some(shape) = contract.shape.as_ref() else {
-            continue;
-        };
+        let shape = &contract.shape;
         let Some(produced) = run.get(value_name) else {
             continue;
         };
@@ -1421,7 +1420,7 @@ fn symbol_axis(
     port: &str,
     symbol: &str,
 ) -> Option<usize> {
-    let shape = declaration.ports.inputs.get(port)?.shape.as_ref()?;
+    let shape = &declaration.ports.inputs.get(port)?.shape;
     shape.iter().position(|dimension| {
         matches!(dimension, onnx_genai_metadata::TensorDimension::Symbol(name) if name == symbol)
     })
@@ -1517,15 +1516,15 @@ components:
     ports:
       inputs: {}
       outputs:
-        logits: {dtype: float32, rank: 3, shape: [batch, sequence, vocab]}
-        hidden_states.0: {dtype: float32, rank: 3, shape: [batch, sequence, hidden]}
+        logits: {dtype: float32, shape: [batch, sequence, vocab]}
+        hidden_states.0: {dtype: float32, shape: [batch, sequence, hidden]}
   assistant:
     implementation: {kind: onnx, artifact: assistant/model.onnx}
     ports:
       inputs:
-        inputs_embeds: {dtype: float32, rank: 3, shape: [batch, sequence, fused]}
+        inputs_embeds: {dtype: float32, shape: [batch, sequence, fused]}
       outputs:
-        logits: {dtype: float32, rank: 3, shape: [batch, sequence, vocab]}
+        logits: {dtype: float32, shape: [batch, sequence, vocab]}
 steps:
 - kind: invoke
   component: assistant

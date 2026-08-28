@@ -10,7 +10,6 @@ pipeline:
       request.pixel_values:
         contract:
           dtype: float32
-          rank: 4
           shape:
           - batch
           - 3
@@ -29,7 +28,6 @@ pipeline:
       request.input_ids:
         contract:
           dtype: int64
-          rank: 2
           shape:
           - batch
           - sequence
@@ -47,7 +45,6 @@ pipeline:
       logits:
         contract:
           dtype: float16
-          rank: 3
           shape:
           - batch
           - sequence
@@ -66,7 +63,6 @@ pipeline:
           inputs:
             pixel_values:
               dtype: float32
-              rank: 4
               shape:
               - batch
               - 3
@@ -78,7 +74,6 @@ pipeline:
           outputs:
             image_features:
               dtype: float16
-              rank: 3
               shape:
               - batch
               - patches
@@ -94,7 +89,6 @@ pipeline:
           inputs:
             input_ids:
               dtype: int64
-              rank: 2
               shape:
               - batch
               - sequence
@@ -103,7 +97,6 @@ pipeline:
                 axis: 0
             image_features:
               dtype: float16
-              rank: 3
               shape:
               - batch
               - patches
@@ -114,7 +107,6 @@ pipeline:
           outputs:
             inputs_embeds:
               dtype: float16
-              rank: 3
               shape:
               - batch
               - sequence
@@ -130,7 +122,6 @@ pipeline:
           inputs:
             inputs_embeds:
               dtype: float16
-              rank: 3
               shape:
               - batch
               - sequence
@@ -141,7 +132,6 @@ pipeline:
           outputs:
             logits:
               dtype: float16
-              rank: 3
               shape:
               - batch
               - sequence
