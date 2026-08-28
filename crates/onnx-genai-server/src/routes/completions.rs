@@ -480,11 +480,16 @@ async fn run_chat_completion(
             let output = assistant_output_text(&result, &tokenizer);
             let reasoning = atem_reasoning_content(&output).filter(|thought| !thought.is_empty());
             let parsed = if request.has_tool_context() {
-                parse_assistant_output(handle.tool_protocol.as_ref(), output, default_finish_reason)
-                    .map_err(|error| {
-                        ApiError::internal(format!("tool protocol output rejected: {error}"))
-                    })?
-                    .aligned_to(&request)
+                parse_assistant_output(
+                    handle.tool_protocol.as_ref(),
+                    Some(&request),
+                    output,
+                    default_finish_reason,
+                )
+                .map_err(|error| {
+                    ApiError::internal(format!("tool protocol output rejected: {error}"))
+                })?
+                .aligned_to(&request)
             } else {
                 ParsedAssistantOutput {
                     content: Some(result.text),
@@ -635,12 +640,28 @@ async fn stream_chat_completion(
     tokio::spawn(async move {
         send_stream_chunk(&tx, role_chunk(&id, created, &model)).await?;
 
+        if request.has_tool_context() {
+            let protocol = handle
+                .tool_protocol
+                .clone()
+                .expect("tool requests are rejected unless the package declares a protocol");
+            return stream_declared_tool_chat_completion(
+                &tx,
+                (&id, created, &model),
+                &request,
+                &protocol,
+                &tokenizer,
+                handle.private_channels,
+                requested_top_logprobs,
+                &user_stop_sequences,
+                wants_constrained_json,
+                &mut driver_rx,
+            )
+            .await;
+        }
+
         let mut stop_buffer = StopBoundaryBuffer::new(user_stop_sequences.clone());
         let mut channel_gate = PrivateChannelGate::new(handle.private_channels);
-        let mut buffered_text = String::new();
-        let buffer_for_tool_detection = request.has_tool_context();
-        let mut tool_stream =
-            buffer_for_tool_detection.then(tool_protocol::ToolCallStream::default);
         let result = loop {
             match driver_rx.recv().await {
                 Some(DriverEvent::Token(token)) => {
@@ -661,22 +682,7 @@ async fn stream_chat_completion(
                         .await?;
                     }
                     let content = stop_buffer.push(&revealed.content);
-                    if let (Some(protocol), Some(stream)) =
-                        (handle.tool_protocol.as_ref(), tool_stream.as_mut())
-                    {
-                        let parser_chunk = spelled.as_deref().unwrap_or(&token.text);
-                        let outcome = stream.push(protocol, parser_chunk);
-                        if let Some(error) =
-                            protocol.output_error(&outcome, "SSE streaming boundary")
-                        {
-                            break Err(StreamOutputFailure::Protocol(error));
-                        }
-                    }
-                    if buffer_for_tool_detection {
-                        buffered_text.push_str(&content);
-                    }
-                    if !buffer_for_tool_detection
-                        && requested_top_logprobs.is_none()
+                    if requested_top_logprobs.is_none()
                         && !wants_constrained_json
                         && !content.is_empty()
                     {
@@ -699,99 +705,27 @@ async fn stream_chat_completion(
 
         match result {
             Ok(result) => {
-                if buffer_for_tool_detection
-                    && !matches!(result.finish_reason, FinishReason::StopSequence { .. })
-                {
-                    let trailing = stop_buffer.flush();
-                    buffered_text.push_str(&trailing);
-                    if let (Some(protocol), Some(stream)) =
-                        (handle.tool_protocol.as_ref(), tool_stream.as_mut())
-                    {
-                        let outcome = stream.push(protocol, &trailing);
-                        if let Some(error) =
-                            protocol.output_error(&outcome, "SSE streaming boundary")
-                        {
-                            send_tool_protocol_stream_error(&tx, error).await?;
-                            tx.send(Ok(Event::default().data("[DONE]")))
-                                .await
-                                .context("stream receiver closed")?;
-                            return Ok(());
-                        }
-                    }
-                }
-                let parsed = if let (Some(protocol), Some(stream)) =
-                    (handle.tool_protocol.as_ref(), tool_stream)
-                {
-                    let outcome = stream.finish(protocol);
-                    if let Some(error) = protocol.output_error(&outcome, "SSE streaming boundary") {
-                        Err(error)
-                    } else {
-                        Ok(parsed_tool_output(
-                            outcome,
-                            finish_reason_label(&result.finish_reason),
-                        ))
-                    }
-                } else {
-                    Ok(ParsedAssistantOutput {
-                        content: None,
-                        tool_calls: None,
-                        finish_reason: finish_reason_label(&result.finish_reason),
-                        tool_parse: ToolParseOutcome::NoCall,
-                    })
-                };
-                let parsed = match parsed {
-                    Ok(parsed) => parsed.aligned_to(&request),
-                    Err(error) => {
-                        send_tool_protocol_stream_error(&tx, error).await?;
-                        tx.send(Ok(Event::default().data("[DONE]")))
-                            .await
-                            .context("stream receiver closed")?;
-                        return Ok(());
-                    }
-                };
                 if let Some(requested_top_logprobs) = requested_top_logprobs {
-                    if let Some(tool_calls) = parsed.tool_calls {
-                        send_tool_call_deltas(&tx, (&id, created, &model), tool_calls).await?;
-                    } else {
-                        send_chat_logprob_chunks(
-                            &tx,
-                            (&id, created, &model),
-                            &result,
-                            &tokenizer,
-                            requested_top_logprobs,
-                            &user_stop_sequences,
-                            handle.private_channels,
-                        )
-                        .await?;
-                        send_stream_chunk(
-                            &tx,
-                            done_chunk(
-                                &id,
-                                created,
-                                &model,
-                                finish_reason_label(&result.finish_reason),
-                            ),
-                        )
-                        .await?;
-                    }
-                } else if buffer_for_tool_detection {
-                    if let Some(tool_calls) = parsed.tool_calls {
-                        send_tool_call_deltas(&tx, (&id, created, &model), tool_calls).await?;
-                    } else {
-                        let content = buffered_text;
-                        if !content.is_empty() {
-                            send_stream_chunk(
-                                &tx,
-                                content_chunk(&id, created, &model, content, None),
-                            )
-                            .await?;
-                        }
-                        send_stream_chunk(
-                            &tx,
-                            done_chunk(&id, created, &model, parsed.finish_reason),
-                        )
-                        .await?;
-                    }
+                    send_chat_logprob_chunks(
+                        &tx,
+                        (&id, created, &model),
+                        &result,
+                        &tokenizer,
+                        requested_top_logprobs,
+                        &user_stop_sequences,
+                        handle.private_channels,
+                    )
+                    .await?;
+                    send_stream_chunk(
+                        &tx,
+                        done_chunk(
+                            &id,
+                            created,
+                            &model,
+                            finish_reason_label(&result.finish_reason),
+                        ),
+                    )
+                    .await?;
                 } else if wants_constrained_json {
                     let content = visible_assistant_text(&result, &tokenizer);
                     if !content.is_empty() {
@@ -876,6 +810,287 @@ async fn stream_chat_completion(
     });
 
     Ok(Sse::new(ReceiverStream::new(rx)))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn stream_declared_tool_chat_completion(
+    tx: &mpsc::Sender<Result<Event, Infallible>>,
+    response: (&str, u64, &str),
+    request: &ChatCompletionRequest,
+    protocol: &ToolProtocol,
+    tokenizer: &Tokenizer,
+    private_channels: bool,
+    requested_top_logprobs: Option<usize>,
+    user_stop_sequences: &[String],
+    wants_constrained_json: bool,
+    driver_rx: &mut mpsc::Receiver<DriverEvent>,
+) -> anyhow::Result<()> {
+    let (id, created, model) = response;
+    let mut stop_buffer = StopBoundaryBuffer::new(user_stop_sequences.to_vec());
+    let mut channel_gate = PrivateChannelGate::new(private_channels);
+    let mut buffered_text = String::new();
+    let mut tool_stream = tool_protocol::ToolCallStream::default();
+    let result = loop {
+        match driver_rx.recv().await {
+            Some(DriverEvent::Token(token)) => {
+                let finish_reason = token.finish_reason.clone();
+                let spelled = channel_gate
+                    .armed()
+                    .then(|| tokenizer.decode_with_special_tokens(&[token.token_id]).ok())
+                    .flatten();
+                let revealed = channel_gate.push(spelled.as_deref(), &token.text);
+                if !revealed.reasoning.is_empty() {
+                    send_stream_chunk(tx, reasoning_chunk(id, created, model, revealed.reasoning))
+                        .await?;
+                }
+                buffered_text.push_str(&stop_buffer.push(&revealed.content));
+                let parser_chunk = spelled.as_deref().unwrap_or(&token.text);
+                let outcome = tool_stream.push(protocol, parser_chunk);
+                if let Some(error) =
+                    protocol.incremental_output_error(&outcome, "SSE chunk ingestion")
+                {
+                    break Err(StreamOutputFailure::Protocol(error));
+                }
+                if matches!(finish_reason, Some(FinishReason::StopSequence { .. })) {
+                    stop_buffer.pending.clear();
+                }
+            }
+            Some(DriverEvent::Finished(result)) => break Ok(result),
+            Some(DriverEvent::Error(error)) => break Err(StreamOutputFailure::Driver(error)),
+            None => {
+                break Err(StreamOutputFailure::Driver(DriverFailure::internal(
+                    "generation stream ended before result",
+                )));
+            }
+        }
+    };
+
+    match result {
+        Ok(result) => {
+            if !matches!(result.finish_reason, FinishReason::StopSequence { .. }) {
+                let trailing = stop_buffer.flush();
+                buffered_text.push_str(&trailing);
+                let outcome = tool_stream.push(protocol, &trailing);
+                if let Some(error) =
+                    protocol.incremental_output_error(&outcome, "SSE chunk ingestion")
+                {
+                    send_tool_protocol_stream_error(tx, error).await?;
+                    tx.send(Ok(Event::default().data("[DONE]")))
+                        .await
+                        .context("stream receiver closed")?;
+                    return Ok(());
+                }
+            }
+            let outcome = tool_stream.finish(protocol);
+            if let Err(error) =
+                protocol.validate_output(request, &outcome, "SSE streaming boundary")
+            {
+                send_tool_protocol_stream_error(tx, error).await?;
+                tx.send(Ok(Event::default().data("[DONE]")))
+                    .await
+                    .context("stream receiver closed")?;
+                return Ok(());
+            }
+            let parsed = parsed_tool_output(outcome, finish_reason_label(&result.finish_reason))
+                .aligned_to(request);
+            if let Some(tool_calls) = parsed.tool_calls {
+                send_tool_call_deltas(tx, response, tool_calls).await?;
+            } else if let Some(requested_top_logprobs) = requested_top_logprobs {
+                send_chat_logprob_chunks(
+                    tx,
+                    response,
+                    &result,
+                    tokenizer,
+                    requested_top_logprobs,
+                    user_stop_sequences,
+                    private_channels,
+                )
+                .await?;
+                send_stream_chunk(
+                    tx,
+                    done_chunk(
+                        id,
+                        created,
+                        model,
+                        finish_reason_label(&result.finish_reason),
+                    ),
+                )
+                .await?;
+            } else {
+                if !buffered_text.is_empty() {
+                    send_stream_chunk(tx, content_chunk(id, created, model, buffered_text, None))
+                        .await?;
+                }
+                send_stream_chunk(tx, done_chunk(id, created, model, parsed.finish_reason)).await?;
+            }
+        }
+        Err(StreamOutputFailure::Driver(err))
+            if wants_constrained_json
+                && json_constraint_stopped_incomplete_message(&err.message) =>
+        {
+            send_stream_chunk(
+                tx,
+                content_chunk(id, created, model, "{}".to_string(), None),
+            )
+            .await?;
+            send_stream_chunk(tx, done_chunk(id, created, model, "stop")).await?;
+        }
+        Err(StreamOutputFailure::Driver(err)) => {
+            let error = generation_failure(err);
+            tx.send(Ok(Event::default().event("error").data(
+                serde_json::to_string(&ErrorResponse {
+                    error: ErrorBody {
+                        message: error.message,
+                        kind: error.kind,
+                    },
+                })?,
+            )))
+            .await
+            .context("stream receiver closed")?;
+        }
+        Err(StreamOutputFailure::Protocol(error)) => {
+            send_tool_protocol_stream_error(tx, error).await?;
+        }
+    }
+
+    tx.send(Ok(Event::default().data("[DONE]")))
+        .await
+        .context("stream receiver closed")?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod declared_tool_stream_tests {
+    use super::*;
+    use axum::body::to_bytes;
+    use onnx_genai::GenerateToken;
+    use onnx_genai_metadata::ToolProtocolDeclaration;
+    use std::path::PathBuf;
+
+    fn protocol() -> ToolProtocol {
+        ToolProtocol::from_declaration(&ToolProtocolDeclaration {
+            identity: "tagged-json".to_string(),
+            version: "v1".to_string(),
+        })
+        .unwrap()
+    }
+
+    async fn injected_body(request: &ChatCompletionRequest, chunks: &[&str]) -> String {
+        let protocol = protocol();
+        let tokenizer_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-llm/tokenizer.json");
+        let tokenizer = Tokenizer::from_file(&tokenizer_path).expect("fixture tokenizer");
+        let (driver_tx, mut driver_rx) = mpsc::channel(chunks.len() + 1);
+        for (token_id, text) in chunks.iter().enumerate() {
+            driver_tx
+                .send(DriverEvent::Token(GenerateToken {
+                    token_id: token_id as u32,
+                    text: (*text).to_string(),
+                    finish_reason: None,
+                }))
+                .await
+                .unwrap();
+        }
+        driver_tx
+            .send(DriverEvent::Finished(GenerateResult {
+                text: chunks.concat(),
+                token_ids: (0..chunks.len() as u32).collect(),
+                finish_reason: FinishReason::EosToken,
+                prefix_cache_hit_len: 0,
+                logprobs: None,
+                budget_cap: None,
+            }))
+            .await
+            .unwrap();
+        drop(driver_tx);
+
+        let (tx, rx) = mpsc::channel(16);
+        send_stream_chunk(&tx, role_chunk("chatcmpl-test", 1, "fixture"))
+            .await
+            .unwrap();
+        stream_declared_tool_chat_completion(
+            &tx,
+            ("chatcmpl-test", 1, "fixture"),
+            request,
+            &protocol,
+            &tokenizer,
+            false,
+            None,
+            &[],
+            false,
+            &mut driver_rx,
+        )
+        .await
+        .unwrap();
+        drop(tx);
+
+        let response = Sse::new(ReceiverStream::new(rx)).into_response();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        String::from_utf8(body.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn injected_sse_route_accepts_a_tool_envelope_split_across_tokens() {
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "fixture",
+            "messages": [{"role": "user", "content": "weather?"}],
+            "tools": [{"type": "function", "function": {"name": "weather"}}],
+            "tool_choice": "required",
+            "stream": true
+        }))
+        .unwrap();
+        let body = injected_body(
+            &request,
+            &[
+                r#"<tool_call>{"name":"weather","arguments":{"city":"Par"#,
+                r#"is"}}</tool_call>"#,
+            ],
+        )
+        .await;
+        assert!(body.contains("\"tool_calls\""), "{body}");
+        assert!(body.contains("\"weather\""), "{body}");
+        assert!(body.contains("\\\"city\\\":\\\"Paris\\\""), "{body}");
+        assert!(body.contains("data: [DONE]"), "{body}");
+        assert!(!body.contains("event: error"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn injected_sse_route_enforces_required_and_specific_tool_choice() {
+        let required: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "fixture",
+            "messages": [{"role": "user", "content": "weather?"}],
+            "tools": [{"type": "function", "function": {"name": "weather"}}],
+            "tool_choice": "required",
+            "stream": true
+        }))
+        .unwrap();
+        let body = injected_body(&required, &["ordinary assistant text"]).await;
+        assert!(body.contains("event: error"), "{body}");
+        assert!(body.contains("tagged-json@v1"), "{body}");
+        assert!(body.contains("tool_choice required"), "{body}");
+        assert!(body.contains("no tool call"), "{body}");
+
+        let specific: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "fixture",
+            "messages": [{"role": "user", "content": "weather?"}],
+            "tools": [
+                {"type": "function", "function": {"name": "weather"}},
+                {"type": "function", "function": {"name": "calendar"}}
+            ],
+            "tool_choice": {"type": "function", "function": {"name": "weather"}},
+            "stream": true
+        }))
+        .unwrap();
+        let body = injected_body(
+            &specific,
+            &[r#"<tool_call>{"name":"calendar","arguments":{}}</tool_call>"#],
+        )
+        .await;
+        assert!(body.contains("event: error"), "{body}");
+        assert!(body.contains("tagged-json@v1"), "{body}");
+        assert!(body.contains("weather"), "{body}");
+        assert!(body.contains("calendar"), "{body}");
+    }
 }
 
 async fn await_driver_admission(
@@ -2106,6 +2321,7 @@ fn align_tool_calls(calls: &mut [ChatMessageToolCall], request: &ChatCompletionR
 
 pub fn parse_assistant_output(
     protocol: Option<&ToolProtocol>,
+    request: Option<&ChatCompletionRequest>,
     output: String,
     default_finish_reason: &'static str,
 ) -> Result<ParsedAssistantOutput, tool_protocol::ToolProtocolError> {
@@ -2120,10 +2336,13 @@ pub fn parse_assistant_output(
         }
         None => ToolParseOutcome::NoCall,
     };
-    if let Some(protocol) = protocol
-        && let Some(error) = protocol.output_error(&outcome, "buffered generation boundary")
-    {
-        return Err(error);
+    if let Some(protocol) = protocol {
+        if let Some(request) = request {
+            protocol.validate_output(request, &outcome, "buffered generation boundary")?;
+        } else if let Some(error) = protocol.output_error(&outcome, "buffered generation boundary")
+        {
+            return Err(error);
+        }
     }
     Ok(parsed_tool_output_with_content(
         outcome,
@@ -3228,7 +3447,7 @@ mod tool_name_alignment_tests {
                 version: "v1".to_string(),
             })
             .unwrap();
-        let parsed = parse_assistant_output(Some(&protocol), output, "stop")
+        let parsed = parse_assistant_output(Some(&protocol), None, output, "stop")
             .expect("declared ATEM envelope parses")
             .aligned_to(&request_offering(&["glob", "read"]));
         let calls = parsed.tool_calls.expect("an ATEM invoke is a tool call");
@@ -3470,7 +3689,7 @@ mod buffered_reasoning_tests {
                 .to_string();
         assert_eq!(atem_reasoning_content(&output).as_deref(), Some("weigh it"));
         assert_eq!(
-            parse_assistant_output(None, output, "stop")
+            parse_assistant_output(None, None, output, "stop")
                 .expect("ordinary output parses")
                 .content
                 .as_deref(),
@@ -3488,7 +3707,7 @@ mod buffered_reasoning_tests {
             Some("still going")
         );
         assert_eq!(
-            parse_assistant_output(None, output, "stop")
+            parse_assistant_output(None, None, output, "stop")
                 .expect("ordinary output parses")
                 .content
                 .as_deref(),

@@ -1162,6 +1162,7 @@ fn declared_tagged_json_protocol_converts_multiple_calls_to_openai() {
     let protocol = declared_protocol("tagged-json");
     let parsed = parse_assistant_output(
         Some(&protocol),
+        None,
         r#"<tool_call>
 {"name":"read_file","arguments":{"path":"src/lib.rs"}}
 </tool_call>
@@ -1240,6 +1241,7 @@ fn declared_atem_xml_request_uses_its_adapter_across_generation_and_parse() {
 
     let parsed = parse_assistant_output(
         Some(&protocol),
+        Some(&request),
         "<atem:invoke name=\"weather\"><atem:parameter name=\"city\">\"Paris\"</atem:parameter></atem:invoke>"
             .to_string(),
         "stop",
@@ -1252,6 +1254,7 @@ fn declared_atem_xml_request_uses_its_adapter_across_generation_and_parse() {
 #[test]
 fn parser_returns_only_atem_user_channel_content() {
     let parsed = parse_assistant_output(
+        None,
         None,
         "<|start|>assistant to=self<|message|>private reasoning<|eom|>\
          <|start|>assistant to=user<|message|>final answer<|eot|>"
@@ -1269,6 +1272,7 @@ fn parser_returns_only_atem_user_channel_content() {
 #[test]
 fn parser_withholds_atem_reasoning_without_a_user_channel() {
     let parsed = parse_assistant_output(
+        None,
         None,
         "<|start|>assistant to=self<|message|>private reasoning that ran long".to_string(),
         "length",
@@ -1321,6 +1325,7 @@ fn declared_protocol_envelope_failures_are_not_assistant_content() {
     ] {
         let error = parse_assistant_output(
             Some(&declared_protocol(identity)),
+            None,
             output.to_string(),
             "stop",
         )
@@ -1336,18 +1341,104 @@ fn declared_protocol_envelope_failures_are_not_assistant_content() {
 fn declared_protocol_preserves_ordinary_no_call_assistant_text() {
     for identity in ["tagged-json", "atem-xml"] {
         let output = "ordinary assistant text".to_string();
-        let parsed =
-            parse_assistant_output(Some(&declared_protocol(identity)), output.clone(), "stop")
-                .expect("a non-envelope is ordinary assistant text");
+        let parsed = parse_assistant_output(
+            Some(&declared_protocol(identity)),
+            None,
+            output.clone(),
+            "stop",
+        )
+        .expect("a non-envelope is ordinary assistant text");
         assert_eq!(parsed.content, Some(output));
         assert!(matches!(parsed.tool_parse, ToolParseOutcome::NoCall));
     }
 }
 
 #[test]
+fn buffered_declared_protocol_enforces_required_and_specific_tool_choice() {
+    for identity in ["tagged-json", "atem-xml"] {
+        let protocol = declared_protocol(identity);
+        let required = chat_request(json!({
+            "model": "fixture",
+            "messages": [{"role": "user", "content": "weather?"}],
+            "tools": [{"type": "function", "function": {"name": "weather"}}],
+            "tool_choice": "required"
+        }));
+        let error = parse_assistant_output(
+            Some(&protocol),
+            Some(&required),
+            "ordinary assistant text".to_string(),
+            "stop",
+        )
+        .expect_err("required tool choice must reject a terminal no-call")
+        .to_string();
+        assert!(error.contains(&format!("{identity}@v1")), "{error}");
+        assert!(error.contains("tool_choice required"), "{error}");
+        assert!(error.contains("no tool call"), "{error}");
+
+        let specific = chat_request(json!({
+            "model": "fixture",
+            "messages": [{"role": "user", "content": "weather?"}],
+            "tools": [
+                {"type": "function", "function": {"name": "weather"}},
+                {"type": "function", "function": {"name": "calendar"}}
+            ],
+            "tool_choice": {"type": "function", "function": {"name": "weather"}}
+        }));
+        let error = parse_assistant_output(
+            Some(&protocol),
+            Some(&specific),
+            "ordinary assistant text".to_string(),
+            "stop",
+        )
+        .expect_err("specific tool choice must reject a terminal no-call")
+        .to_string();
+        assert!(error.contains(&format!("{identity}@v1")), "{error}");
+        assert!(error.contains("weather"), "{error}");
+        assert!(error.contains("no tool call"), "{error}");
+
+        let mismatched = match identity {
+            "tagged-json" => {
+                r#"<tool_call>{"name":"calendar","arguments":{}}</tool_call>"#.to_string()
+            }
+            "atem-xml" => r#"<atem:invoke name="calendar"></atem:invoke>"#.to_string(),
+            _ => unreachable!(),
+        };
+        let error = parse_assistant_output(Some(&protocol), Some(&specific), mismatched, "stop")
+            .expect_err("specific tool choice must reject a different parsed function")
+            .to_string();
+        assert!(error.contains(&format!("{identity}@v1")), "{error}");
+        assert!(error.contains("weather"), "{error}");
+        assert!(error.contains("calendar"), "{error}");
+    }
+}
+
+#[test]
+fn buffered_declared_protocol_preserves_auto_and_none_no_call_behavior() {
+    for identity in ["tagged-json", "atem-xml"] {
+        for mode in ["auto", "none"] {
+            let protocol = declared_protocol(identity);
+            let request = chat_request(json!({
+                "model": "fixture",
+                "messages": [{"role": "user", "content": "weather?"}],
+                "tools": [{"type": "function", "function": {"name": "weather"}}],
+                "tool_choice": mode
+            }));
+            let parsed = parse_assistant_output(
+                Some(&protocol),
+                Some(&request),
+                "ordinary assistant text".to_string(),
+                "stop",
+            )
+            .expect("auto and none permit ordinary assistant content");
+            assert!(matches!(parsed.tool_parse, ToolParseOutcome::NoCall));
+        }
+    }
+}
+
+#[test]
 fn plain_assistant_output_preserves_content() {
     let output = "ordinary assistant text".to_string();
-    let parsed = parse_assistant_output(None, output.clone(), "stop");
+    let parsed = parse_assistant_output(None, None, output.clone(), "stop");
     let parsed = parsed.expect("ordinary assistant content");
 
     assert_eq!(parsed.content, Some(output));

@@ -148,6 +148,62 @@ impl ToolProtocol {
         }
     }
 
+    /// Reject only failures that are terminal while more chunks may arrive.
+    pub fn incremental_output_error(
+        &self,
+        outcome: &ToolParseOutcome,
+        boundary: &str,
+    ) -> Option<ToolProtocolError> {
+        matches!(outcome, ToolParseOutcome::Malformed(_))
+            .then(|| self.output_error(outcome, boundary))
+            .flatten()
+    }
+
+    /// Enforce the request's tool-choice policy after parsing has reached its
+    /// terminal boundary.
+    pub fn validate_output(
+        &self,
+        request: &ChatCompletionRequest,
+        outcome: &ToolParseOutcome,
+        boundary: &str,
+    ) -> Result<(), ToolProtocolError> {
+        if let Some(error) = self.output_error(outcome, boundary) {
+            return Err(error);
+        }
+        let (identity, version) = self.declaration();
+        match (&request.tool_choice, outcome) {
+            (Some(ToolChoice::Mode(ToolChoiceMode::Required)), ToolParseOutcome::NoCall) => {
+                Err(ToolProtocolError(format!(
+                    "declared tool protocol {identity}@{version} violated tool_choice required at the \
+                 {boundary}: the model produced no tool call"
+                )))
+            }
+            (Some(ToolChoice::Specific(choice)), ToolParseOutcome::NoCall) => {
+                Err(ToolProtocolError(format!(
+                    "declared tool protocol {identity}@{version} violated specific tool_choice \
+                     {:?} at the {boundary}: the model produced no tool call",
+                    choice.function.name
+                )))
+            }
+            (Some(ToolChoice::Specific(choice)), ToolParseOutcome::Complete(calls)) => {
+                let observed = calls
+                    .iter()
+                    .map(|call| call.function.name.as_str())
+                    .collect::<BTreeSet<_>>();
+                if observed.len() == 1 && observed.contains(choice.function.name.as_str()) {
+                    Ok(())
+                } else {
+                    Err(ToolProtocolError(format!(
+                        "declared tool protocol {identity}@{version} violated specific tool_choice \
+                         {:?} at the {boundary}: parsed function name(s) were {:?}",
+                        choice.function.name, observed
+                    )))
+                }
+            }
+            _ => Ok(()),
+        }
+    }
+
     pub fn parse(&self, input: &str) -> ToolParseOutcome {
         if input.len() > MAX_TOOL_PAYLOAD_BYTES {
             return ToolParseOutcome::Malformed(format!(
@@ -681,11 +737,16 @@ fn values_to_calls(protocol: &str, values: Vec<serde_json::Value>) -> ToolParseO
                 "{protocol} call {index} has an empty, oversized, or duplicate id"
             ));
         }
-        let arguments = value
-            .get("arguments")
-            .or_else(|| value.get("parameters"))
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!({}));
+        let Some(arguments) = value.get("arguments").or_else(|| value.get("parameters")) else {
+            return ToolParseOutcome::Malformed(format!(
+                "{protocol} call {index} is missing required arguments or parameters"
+            ));
+        };
+        if !arguments.is_object() {
+            return ToolParseOutcome::Malformed(format!(
+                "{protocol} call {index} arguments or parameters must be a JSON object"
+            ));
+        }
         let arguments = match serde_json::to_string(&arguments) {
             Ok(arguments) if arguments.len() <= MAX_TOOL_PAYLOAD_BYTES => arguments,
             Ok(_) => {
@@ -792,6 +853,56 @@ mod tests {
             ),
             ToolParseOutcome::Malformed(_)
         ));
+    }
+
+    #[test]
+    fn tagged_json_requires_an_explicit_object_argument_field() {
+        let resolved = protocol("tagged-json");
+        for input in [
+            r#"<tool_call>{"name":"read"}</tool_call>"#,
+            r#"<tool_call>{"name":"read","arguments":null}</tool_call>"#,
+            r#"<tool_call>{"name":"read","arguments":[]}</tool_call>"#,
+            r#"<tool_call>{"name":"read","parameters":"path"}</tool_call>"#,
+        ] {
+            assert!(
+                matches!(resolved.parse(input), ToolParseOutcome::Malformed(_)),
+                "{input}"
+            );
+        }
+        for input in [
+            r#"<tool_call>{"name":"read","arguments":{}}</tool_call>"#,
+            r#"<tool_call>{"name":"read","arguments":{"path":"src/lib.rs"}}</tool_call>"#,
+            r#"<tool_call>{"name":"read","parameters":{}}</tool_call>"#,
+        ] {
+            assert!(
+                matches!(resolved.parse(input), ToolParseOutcome::Complete(_)),
+                "{input}"
+            );
+        }
+    }
+
+    #[test]
+    fn incomplete_chunks_are_nonterminal_until_stream_finish() {
+        let resolved = protocol("tagged-json");
+        let mut stream = ToolCallStream::default();
+        let partial = stream.push(
+            &resolved,
+            r#"<tool_call>{"name":"read","arguments":{"path":"src/"#,
+        );
+        assert_eq!(partial, ToolParseOutcome::Incomplete);
+        assert!(
+            resolved
+                .incremental_output_error(&partial, "SSE chunk ingestion")
+                .is_none()
+        );
+        let complete = stream.push(&resolved, r#"lib.rs"}}</tool_call>"#);
+        assert!(matches!(complete, ToolParseOutcome::Complete(_)));
+        assert!(
+            resolved
+                .incremental_output_error(&complete, "SSE chunk ingestion")
+                .is_none()
+        );
+        assert_eq!(stream.finish(&resolved), complete);
     }
 
     #[test]
