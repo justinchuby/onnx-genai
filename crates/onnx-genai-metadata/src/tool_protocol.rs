@@ -178,13 +178,22 @@ pub fn resolve(
 fn parse_tagged_json(input: &str) -> ToolParseOutcome {
     const OPEN: &str = "<tool_call>";
     const CLOSE: &str = "</tool_call>";
-    let Some(mut rest) = input.split_once(OPEN).map(|(_, rest)| rest) else {
+    if input.trim().is_empty() {
+        return ToolParseOutcome::NoCall;
+    }
+    let Some((prefix, mut rest)) = input.split_once(OPEN) else {
         return if OPEN.starts_with(input.trim_start()) {
             ToolParseOutcome::Incomplete
         } else {
             ToolParseOutcome::NoCall
         };
     };
+    if !prefix.trim().is_empty() {
+        return ToolParseOutcome::Malformed(format!(
+            "tagged-json@v1 has non-whitespace text before the first tool_call envelope: \
+             {prefix:?}"
+        ));
+    }
     let mut values = Vec::new();
     loop {
         let Some((body, after)) = rest.split_once(CLOSE) else {
@@ -495,6 +504,18 @@ mod tests {
             malformed.push(protocol, "<tool_call>{}</tool_call>"),
             ToolParseOutcome::Malformed(_)
         ));
+    }
+
+    #[test]
+    fn empty_output_is_a_terminal_no_call_for_every_protocol() {
+        for identity in ["tagged-json", "atem-xml"] {
+            let protocol = protocol(identity);
+            assert_eq!(protocol.parse(" \n\t"), ToolParseOutcome::NoCall);
+            assert_eq!(
+                ToolCallStream::default().finish(protocol),
+                ToolParseOutcome::NoCall
+            );
+        }
     }
 
     #[test]

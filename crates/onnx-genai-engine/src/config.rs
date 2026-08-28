@@ -1787,6 +1787,30 @@ impl GenerateRequest {
     }
 }
 
+/// Transport-neutral policy for interpreting generated tool-call envelopes.
+///
+/// The serving layer translates its request vocabulary into this type. The
+/// engine then owns parsing, policy enforcement, transaction commit, and the
+/// resulting stop reason.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ToolCallPolicy {
+    /// Do not interpret tool-like generated text.
+    #[default]
+    Disabled,
+    /// Tool calls are allowed, but ordinary assistant text is also valid.
+    Auto,
+    /// At least one valid tool call is required.
+    Required,
+    /// Every generated call must name this exact function.
+    Specific { function: String },
+}
+
+impl ToolCallPolicy {
+    pub fn observes_output(&self) -> bool {
+        !matches!(self, Self::Disabled)
+    }
+}
+
 /// A generation request with an explicit scheduler priority.
 #[derive(Debug, Clone)]
 pub struct PrioritizedGenerateRequest {
@@ -1844,6 +1868,10 @@ pub struct GenerateResult {
     pub token_ids: Vec<TokenId>,
     /// Termination reason.
     pub finish_reason: FinishReason,
+    /// Tool calls parsed and committed by the generation transaction.
+    ///
+    /// Empty unless `finish_reason` is [`FinishReason::ToolCalls`].
+    pub tool_calls: Vec<onnx_genai_metadata::ToolCall>,
     /// Number of prompt/context tokens whose KV state was reused from the prefix cache.
     pub prefix_cache_hit_len: usize,
     /// Per-generated-token log probabilities, or `None` when not requested.

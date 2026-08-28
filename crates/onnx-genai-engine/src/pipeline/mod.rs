@@ -386,6 +386,8 @@ pub(crate) struct WorkflowSessionForkSnapshot {
 /// A request for the universal workflow interpreter.
 pub struct PipelineGenerateRequest {
     pub request: GenerateRequest,
+    /// Transport-neutral policy for interpreting generated tool-call output.
+    pub tool_call_policy: crate::ToolCallPolicy,
     /// Application tensors keyed by a declared package input or application source name.
     pub inputs: PipelineTensors,
     /// Identity used by session-scoped workflow state cells.
@@ -401,6 +403,7 @@ impl PipelineGenerateRequest {
     pub fn new(request: GenerateRequest) -> Self {
         Self {
             request,
+            tool_call_policy: crate::ToolCallPolicy::Disabled,
             inputs: HashMap::new(),
             session_id: None,
             component_overrides: HashMap::new(),
@@ -430,6 +433,11 @@ impl PipelineGenerateRequest {
 
     pub fn with_generation_control(mut self, control: GenerationControl) -> Self {
         self.generation_control = Some(control);
+        self
+    }
+
+    pub fn with_tool_call_policy(mut self, policy: crate::ToolCallPolicy) -> Self {
+        self.tool_call_policy = policy;
         self
     }
 }

@@ -4,15 +4,15 @@
 //! runtime's implementation of that declaration; a package never names an
 //! adapter, parser library, or model family.
 
-use std::{collections::BTreeSet, path::Path};
+use std::path::Path;
 
-use onnx_genai_engine::GenerateConstraint;
+use onnx_genai_engine::{GenerateConstraint, ToolCallPolicy};
 use onnx_genai_metadata::{
     MAX_TOOL_CALL_ID_BYTES, MAX_TOOL_CALLS, MAX_TOOL_NAME_BYTES, MAX_TOOL_PAYLOAD_BYTES,
     ToolProtocol as ParsedToolProtocol, ToolProtocolDeclaration, resolve_tool_protocol,
 };
 
-pub use onnx_genai_metadata::{ToolCallStream, ToolParseOutcome, ToolProtocolError};
+pub use onnx_genai_metadata::ToolProtocolError;
 
 use crate::types::{ChatCompletionRequest, ChatTool, ToolChoice, ToolChoiceMode};
 
@@ -33,11 +33,10 @@ pub(crate) struct RenderedToolRequest {
     pub(crate) fallback_prefix: String,
 }
 
-/// Server request-rendering policy for one shared exact parser.
+/// Server request-rendering policy for one declared protocol.
 ///
-/// The inner parser is transport-neutral and authoritative for all generated
-/// output. This wrapper retains only OpenAI request rendering and post-parse
-/// tool-choice validation.
+/// Generated output is parsed and policy-checked inside the engine transaction;
+/// this wrapper owns only OpenAI request rendering and constraint selection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolProtocol(ParsedToolProtocol);
 
@@ -89,77 +88,9 @@ impl ToolProtocol {
         }
     }
 
-    /// Convert a terminal parser outcome into a protocol-specific error at the
-    /// boundary where the complete model output is known.
-    pub fn output_error(
-        &self,
-        outcome: &ToolParseOutcome,
-        boundary: &str,
-    ) -> Option<ToolProtocolError> {
-        self.0.output_error(outcome, boundary)
-    }
-
-    /// Reject only failures that are terminal while more chunks may arrive.
-    pub fn incremental_output_error(
-        &self,
-        outcome: &ToolParseOutcome,
-        boundary: &str,
-    ) -> Option<ToolProtocolError> {
-        self.0.incremental_output_error(outcome, boundary)
-    }
-
-    /// Enforce the request's tool-choice policy after parsing has reached its
-    /// terminal boundary.
-    pub fn validate_output(
-        &self,
-        request: &ChatCompletionRequest,
-        outcome: &ToolParseOutcome,
-        boundary: &str,
-    ) -> Result<(), ToolProtocolError> {
-        if let Some(error) = self.output_error(outcome, boundary) {
-            return Err(error);
-        }
-        let (identity, version) = self.declaration();
-        match (&request.tool_choice, outcome) {
-            (Some(ToolChoice::Mode(ToolChoiceMode::Required)), ToolParseOutcome::NoCall) => {
-                Err(ToolProtocolError(format!(
-                    "declared tool protocol {identity}@{version} violated tool_choice required at the \
-                 {boundary}: the model produced no tool call"
-                )))
-            }
-            (Some(ToolChoice::Specific(choice)), ToolParseOutcome::NoCall) => {
-                Err(ToolProtocolError(format!(
-                    "declared tool protocol {identity}@{version} violated specific tool_choice \
-                     {:?} at the {boundary}: the model produced no tool call",
-                    choice.function.name
-                )))
-            }
-            (Some(ToolChoice::Specific(choice)), ToolParseOutcome::Complete(calls)) => {
-                let observed = calls
-                    .iter()
-                    .map(|call| call.name.as_str())
-                    .collect::<BTreeSet<_>>();
-                if observed.len() == 1 && observed.contains(choice.function.name.as_str()) {
-                    Ok(())
-                } else {
-                    Err(ToolProtocolError(format!(
-                        "declared tool protocol {identity}@{version} violated specific tool_choice \
-                         {:?} at the {boundary}: parsed function name(s) were {:?}",
-                        choice.function.name, observed
-                    )))
-                }
-            }
-            _ => Ok(()),
-        }
-    }
-
-    pub fn parse(&self, input: &str) -> ToolParseOutcome {
-        self.0.parse(input)
-    }
-
-    /// Resolve a declaration for callers that parse declared model output
-    /// outside a loaded server.  Model admission uses [`resolve`] so its error
-    /// includes the actual metadata path.
+    /// Resolve a declaration for request rendering outside a loaded server.
+    /// Model admission uses [`resolve`] so its error includes the actual
+    /// metadata path.
     pub fn from_declaration(
         declaration: &ToolProtocolDeclaration,
     ) -> Result<Self, ToolProtocolError> {
@@ -167,11 +98,6 @@ impl ToolProtocol {
             declaration,
             Path::new("the supplied tool protocol declaration"),
         )
-    }
-
-    /// The shared, transport-neutral parser selected by this declaration.
-    pub fn parser(&self) -> ParsedToolProtocol {
-        self.0
     }
 }
 
@@ -193,6 +119,7 @@ pub(crate) fn validate_request(
     if !request.has_tool_context() {
         return Ok(());
     }
+
     let Some(protocol) = protocol else {
         let path = declaration_path
             .map(|path| path.display().to_string())
@@ -214,6 +141,31 @@ pub(crate) fn validate_request(
         )));
     }
     validate_untrusted_request_values(request, identity, version)
+}
+
+/// Translate OpenAI request vocabulary into the engine's transport-neutral
+/// observation policy for this turn.
+pub(crate) fn request_policy(request: &ChatCompletionRequest) -> ToolCallPolicy {
+    let has_tools = request
+        .tools
+        .as_ref()
+        .is_some_and(|tools| !tools.is_empty());
+    if !has_tools
+        || matches!(
+            request.tool_choice,
+            Some(ToolChoice::Mode(ToolChoiceMode::None))
+        )
+    {
+        return ToolCallPolicy::Disabled;
+    }
+    match &request.tool_choice {
+        Some(ToolChoice::Mode(ToolChoiceMode::Required)) => ToolCallPolicy::Required,
+        Some(ToolChoice::Specific(choice)) => ToolCallPolicy::Specific {
+            function: choice.function.name.clone(),
+        },
+        Some(ToolChoice::Mode(ToolChoiceMode::Auto)) | None => ToolCallPolicy::Auto,
+        Some(ToolChoice::Mode(ToolChoiceMode::None)) => ToolCallPolicy::Disabled,
+    }
 }
 
 fn validate_untrusted_request_values(
@@ -438,212 +390,6 @@ mod tests {
     }
 
     #[test]
-    fn chunk_boundaries_do_not_change_declared_protocol_outcomes() {
-        for (identity, input) in [
-            (
-                "tagged-json",
-                "<tool_call>{\"id\":\"weather-1\",\"name\":\"weather\",\"arguments\":{\"city\":\"A\\\\\\\"B\"}}</tool_call>",
-            ),
-            (
-                "atem-xml",
-                "<atem:invoke name=\"weather\"><atem:parameter name=\"city\">\"Paris\"</atem:parameter></atem:invoke>",
-            ),
-        ] {
-            let resolved = protocol(identity);
-            let expected = resolved.parse(input);
-            for split in 0..=input.len() {
-                if !input.is_char_boundary(split) {
-                    continue;
-                }
-                let mut stream = ToolCallStream::default();
-                stream.push(resolved.parser(), &input[..split]);
-                let actual = stream.push(resolved.parser(), &input[split..]);
-                assert_eq!(actual, expected, "{identity} split at {split}");
-            }
-        }
-    }
-
-    #[test]
-    fn two_declared_protocols_share_the_same_stream_dispatch() {
-        for (identity, input) in [
-            (
-                "tagged-json",
-                "<tool_call>{\"id\":\"one\",\"name\":\"first\",\"arguments\":{}}</tool_call>\n<tool_call>{\"name\":\"second\",\"parameters\":{\"n\":2}}</tool_call>",
-            ),
-            (
-                "atem-xml",
-                "<atem:invoke name=\"first\"><atem:parameter name=\"text\">\"a &lt; b\"</atem:parameter></atem:invoke>",
-            ),
-        ] {
-            let resolved = protocol(identity);
-            let mut stream = ToolCallStream::default();
-            let outcome = stream.push(resolved.parser(), input);
-            let ToolParseOutcome::Complete(calls) = outcome else {
-                panic!("expected complete {identity} call");
-            };
-            assert!(!calls.is_empty());
-        }
-    }
-
-    #[test]
-    fn incomplete_and_malformed_envelopes_are_distinct() {
-        let resolved = protocol("tagged-json");
-        assert_eq!(
-            resolved.parse("<tool_call>{\"name\":\"missing-close\"}"),
-            ToolParseOutcome::Incomplete
-        );
-        assert!(matches!(
-            resolved.parse("<tool_call>{\"name\":}</tool_call>"),
-            ToolParseOutcome::Malformed(_)
-        ));
-        let atem = protocol("atem-xml");
-        assert!(matches!(
-            atem.parse(
-                "<atem:invoke name=\"tool\">unexpected<atem:parameter name=\"x\">1</atem:parameter></atem:invoke>"
-            ),
-            ToolParseOutcome::Malformed(_)
-        ));
-    }
-
-    #[test]
-    fn atem_xml_requires_the_complete_output_to_be_an_envelope_sequence() {
-        let resolved = protocol("atem-xml");
-        let call = r#"<atem:invoke name="read"></atem:invoke>"#;
-        for input in [
-            format!("junk{call}"),
-            format!("{call}junk"),
-            format!("junk{call}junk"),
-        ] {
-            assert!(
-                matches!(resolved.parse(&input), ToolParseOutcome::Malformed(_)),
-                "{input}"
-            );
-        }
-
-        let valid = format!(
-            " \n{call}\t<atem:invoke name=\"write\"><atem:parameter name=\"path\">\"src/lib.rs\"</atem:parameter></atem:invoke>\r\n"
-        );
-        let ToolParseOutcome::Complete(calls) = resolved.parse(&valid) else {
-            panic!("surrounding whitespace and adjacent calls must be accepted");
-        };
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].name, "read");
-        assert_eq!(calls[1].name, "write");
-    }
-
-    #[test]
-    fn atem_xml_partial_openers_remain_incomplete_but_surrounding_text_is_terminal() {
-        let resolved = protocol("atem-xml");
-        let call = r#"<atem:invoke name="read"></atem:invoke>"#;
-        let inputs = [
-            "<atem:inv".to_string(),
-            " \n<atem:inv".to_string(),
-            format!("{call}\n<atem:inv"),
-        ];
-        for input in inputs {
-            assert_eq!(
-                resolved.parse(&input),
-                ToolParseOutcome::Incomplete,
-                "{input}"
-            );
-        }
-
-        let mut stream = ToolCallStream::default();
-        assert_eq!(
-            stream.push(resolved.parser(), &format!("{call}junk")),
-            ToolParseOutcome::Malformed(
-                "atem-xml@v1 has non-whitespace trailing text after an invoke envelope: \"junk\""
-                    .to_string()
-            )
-        );
-        assert!(matches!(
-            stream.push(resolved.parser(), "<atem:invoke name=\"ignored\">"),
-            ToolParseOutcome::Malformed(message) if message.contains("trailing text")
-        ));
-    }
-
-    #[test]
-    fn tagged_json_requires_an_explicit_object_argument_field() {
-        let resolved = protocol("tagged-json");
-        for input in [
-            r#"<tool_call>{"name":"read"}</tool_call>"#,
-            r#"<tool_call>{"name":"read","arguments":null}</tool_call>"#,
-            r#"<tool_call>{"name":"read","arguments":[]}</tool_call>"#,
-            r#"<tool_call>{"name":"read","parameters":"path"}</tool_call>"#,
-        ] {
-            assert!(
-                matches!(resolved.parse(input), ToolParseOutcome::Malformed(_)),
-                "{input}"
-            );
-        }
-        for input in [
-            r#"<tool_call>{"name":"read","arguments":{}}</tool_call>"#,
-            r#"<tool_call>{"name":"read","arguments":{"path":"src/lib.rs"}}</tool_call>"#,
-            r#"<tool_call>{"name":"read","parameters":{}}</tool_call>"#,
-        ] {
-            assert!(
-                matches!(resolved.parse(input), ToolParseOutcome::Complete(_)),
-                "{input}"
-            );
-        }
-    }
-
-    #[test]
-    fn incomplete_chunks_are_nonterminal_until_stream_finish() {
-        let resolved = protocol("tagged-json");
-        let mut stream = ToolCallStream::default();
-        let partial = stream.push(
-            resolved.parser(),
-            r#"<tool_call>{"name":"read","arguments":{"path":"src/"#,
-        );
-        assert_eq!(partial, ToolParseOutcome::Incomplete);
-        assert!(
-            resolved
-                .incremental_output_error(&partial, "SSE chunk ingestion")
-                .is_none()
-        );
-        let complete = stream.push(resolved.parser(), r#"lib.rs"}}</tool_call>"#);
-        assert!(matches!(complete, ToolParseOutcome::Complete(_)));
-        assert!(
-            resolved
-                .incremental_output_error(&complete, "SSE chunk ingestion")
-                .is_none()
-        );
-        assert_eq!(stream.finish(resolved.parser()), complete);
-    }
-
-    #[test]
-    fn sse_boundary_turns_incomplete_envelopes_into_typed_protocol_errors() {
-        for (identity, chunks) in [
-            ("tagged-json", ["<tool_call>{\"name\":", "\"read\"}"]),
-            (
-                "atem-xml",
-                [
-                    "<atem:invoke name=\"read\"><atem:parameter",
-                    " name=\"path\">src/lib.rs",
-                ],
-            ),
-        ] {
-            let resolved = protocol(identity);
-            let mut stream = ToolCallStream::default();
-            for chunk in chunks {
-                assert!(matches!(
-                    stream.push(resolved.parser(), chunk),
-                    ToolParseOutcome::Incomplete
-                ));
-            }
-            let outcome = stream.finish(resolved.parser());
-            let error = resolved
-                .output_error(&outcome, "SSE streaming boundary")
-                .expect("an incomplete stream must fail closed")
-                .to_string();
-            assert!(error.contains(&format!("{identity}@v1")), "{error}");
-            assert!(error.contains("incomplete"), "{error}");
-            assert!(error.contains("SSE streaming boundary"), "{error}");
-        }
-    }
-
-    #[test]
     fn unknown_declaration_names_its_metadata_path_and_exact_pair() {
         let error = resolve(
             &ToolProtocolDeclaration {
@@ -683,6 +429,50 @@ mod tests {
             "{error}"
         );
         assert!(error.contains("package.tool_protocol"), "{error}");
+    }
+
+    #[test]
+    fn openai_tool_choice_translates_to_transport_neutral_engine_policy() {
+        let request = |tool_choice: serde_json::Value, with_tools: bool| {
+            serde_json::from_value::<ChatCompletionRequest>(serde_json::json!({
+                "model": "fixture",
+                "messages": [{"role": "user", "content": "weather?"}],
+                "tools": with_tools.then(|| serde_json::json!([
+                    {"type": "function", "function": {"name": "weather"}}
+                ])),
+                "tool_choice": tool_choice
+            }))
+            .unwrap()
+        };
+
+        assert_eq!(
+            request_policy(&request(serde_json::json!("auto"), true)),
+            ToolCallPolicy::Auto
+        );
+        assert_eq!(
+            request_policy(&request(serde_json::json!("required"), true)),
+            ToolCallPolicy::Required
+        );
+        assert_eq!(
+            request_policy(&request(serde_json::json!("none"), true)),
+            ToolCallPolicy::Disabled
+        );
+        assert_eq!(
+            request_policy(&request(serde_json::json!("auto"), false)),
+            ToolCallPolicy::Disabled
+        );
+        assert_eq!(
+            request_policy(&request(
+                serde_json::json!({
+                    "type": "function",
+                    "function": {"name": "weather"}
+                }),
+                true,
+            )),
+            ToolCallPolicy::Specific {
+                function: "weather".to_string()
+            }
+        );
     }
 
     #[test]
@@ -753,34 +543,5 @@ mod tests {
             atem.output_constraint(&request).unwrap(),
             ToolOutputConstraint::Set(None)
         ));
-    }
-
-    #[test]
-    fn model_output_and_incremental_stream_are_bounded() {
-        let oversized = "x".repeat(MAX_TOOL_PAYLOAD_BYTES + 1);
-        for identity in ["tagged-json", "atem-xml"] {
-            let resolved = protocol(identity);
-            assert!(matches!(
-                resolved.parse(&oversized),
-                ToolParseOutcome::Malformed(message) if message.contains("byte protocol limit")
-            ));
-
-            let mut stream = ToolCallStream::default();
-            let outcome = stream.push(resolved.parser(), &oversized);
-            assert!(matches!(
-                outcome,
-                ToolParseOutcome::Malformed(ref message) if message.contains("byte protocol limit")
-            ));
-            let error = resolved
-                .output_error(&outcome, "SSE streaming boundary")
-                .expect("terminal stream failure has typed protocol error")
-                .to_string();
-            assert!(error.contains(&format!("{identity}@v1")), "{error}");
-            assert!(error.contains("SSE streaming boundary"), "{error}");
-            assert!(matches!(
-                stream.push(resolved.parser(), "<tool_call>{}</tool_call>"),
-                ToolParseOutcome::Malformed(message) if message.contains("byte protocol limit")
-            ));
-        }
     }
 }

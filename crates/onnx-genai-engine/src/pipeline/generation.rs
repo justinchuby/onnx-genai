@@ -389,6 +389,8 @@ pub(crate) trait GenerationCore: WorkflowNodeHost {
     fn committed_tokens(&self) -> Vec<crate::TokenId>;
     /// Whether this core already delivered each token to the request callback.
     fn streams_tokens(&self) -> bool;
+    /// A normal host-requested stop, including committed tool calls.
+    fn host_stop_reason(&self) -> Option<GenerationStopReason>;
 }
 
 /// Everything one generation needs beyond its decode executor.
@@ -661,6 +663,65 @@ impl<B: DecodeLoopBackend + ?Sized> GenerationCore for GenerationNodeHost<'_, '_
     fn streams_tokens(&self) -> bool {
         self.callback.is_some()
     }
+
+    fn host_stop_reason(&self) -> Option<GenerationStopReason> {
+        self.loop_stop.clone()
+    }
+}
+
+/// Observer-only host for a workflow whose components execute generically.
+///
+/// It implements no component contracts; it only participates in the same
+/// transaction and loop-stop hooks as a fused decode core.
+struct StagedOutputObserverHost<'a> {
+    tokenizer: &'a Tokenizer,
+    observer: &'a mut ToolCallStagedOutputObserver,
+}
+
+impl WorkflowNodeHost for StagedOutputObserverHost<'_> {
+    fn hosted_contracts(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    fn begin_turn(&mut self, _turn: &super::TurnTransaction) -> anyhow::Result<()> {
+        self.observer.begin_turn();
+        Ok(())
+    }
+
+    fn before_turn_commit(&mut self, _turn: &super::TurnTransaction) -> anyhow::Result<()> {
+        self.observer
+            .finish("semantic commit")
+            .context("validate staged generated tool protocol before semantic commit")
+    }
+
+    fn turn_committed(&mut self, _outcome: super::TurnTransactionOutcome) {
+        self.observer.commit_turn();
+    }
+
+    fn turn_aborted(&mut self, _outcome: super::TurnTransactionOutcome) {
+        self.observer.abort_turn();
+    }
+
+    fn loop_host_outcome(&self) -> super::workflow::WorkflowLoopHostOutcome {
+        self.observer.stop_reason().map_or(
+            super::workflow::WorkflowLoopHostOutcome::Continue,
+            super::workflow::WorkflowLoopHostOutcome::Stop,
+        )
+    }
+
+    fn observe_staged_generation_tokens(
+        &mut self,
+        tokens: &[crate::TokenId],
+    ) -> anyhow::Result<()> {
+        self.observer
+            .observe_tokens(self.tokenizer, tokens)
+            .context("observe staged generated output before output publication")?;
+        Ok(())
+    }
+
+    fn execute_contract_node(&mut self, _request: WorkflowNodeRequest<'_>) -> anyhow::Result<bool> {
+        Ok(false)
+    }
 }
 
 /// Run a package's declared generation loop to completion.
@@ -677,6 +738,7 @@ pub(crate) fn run_declared_generation(
     tokenizer: Option<&Tokenizer>,
     request: PipelineGenerateRequest,
     mut core: Option<&mut dyn GenerationCore>,
+    staged_output_observer: Option<&mut ToolCallStagedOutputObserver>,
     mut callback: Option<&mut GenerateTokenCallback<'_>>,
 ) -> anyhow::Result<GenerateResult> {
     // Commit-only output is delivered to callbacks below, after the workflow
@@ -689,10 +751,28 @@ pub(crate) fn run_declared_generation(
     };
     let mut plan = WorkflowExecutionPlan::new_hosted(runtime, request, hosted)?;
     let generic_execution = core.is_none();
-    let outputs = {
-        let mut host: Option<&mut dyn WorkflowNodeHost> = core
-            .as_deref_mut()
-            .map(|core| core as &mut dyn WorkflowNodeHost);
+    let (outputs, host_stop_reason) = {
+        anyhow::ensure!(
+            core.is_none() || staged_output_observer.is_none(),
+            "a decode core owns staged-output observation; a second observer host would duplicate \
+             parser authority"
+        );
+        let mut observer_host = match (core.is_none(), tokenizer, staged_output_observer) {
+            (true, Some(tokenizer), Some(observer)) => Some(StagedOutputObserverHost {
+                tokenizer,
+                observer,
+            }),
+            (true, None, Some(_)) => anyhow::bail!(
+                "tool-call output observation requires the package tokenizer for canonical decode"
+            ),
+            _ => None,
+        };
+        let mut host: Option<&mut dyn WorkflowNodeHost> = match core.as_deref_mut() {
+            Some(core) => Some(core as &mut dyn WorkflowNodeHost),
+            None => observer_host
+                .as_mut()
+                .map(|host| host as &mut dyn WorkflowNodeHost),
+        };
         let (values, row_outputs) = plan.execute_retained_with_host_before_commit(
             &mut host,
             |values, row_outputs, ended_by_predicate| {
@@ -709,7 +789,14 @@ pub(crate) fn run_declared_generation(
                 Ok(())
             },
         )?;
-        runtime.package_outputs(values, row_outputs, Vec::new())
+        let host_stop_reason = match host.as_deref().map(WorkflowNodeHost::loop_host_outcome) {
+            Some(super::workflow::WorkflowLoopHostOutcome::Stop(reason)) => Some(reason),
+            _ => None,
+        };
+        (
+            runtime.package_outputs(values, row_outputs, Vec::new()),
+            host_stop_reason,
+        )
     };
 
     let output = runtime
@@ -800,10 +887,17 @@ pub(crate) fn run_declared_generation(
     // ended the loop. Reporting `MaxTokens` unconditionally would tell a caller
     // that a workflow which ended at its own EOS ran out of budget, which is
     // the one thing a finish reason exists to distinguish.
-    let finish_reason = match core.as_deref().and_then(GenerationCore::finish) {
-        Some(reason) => reason,
-        None if runtime.last_generation_ended_by_predicate() => FinishReason::EosToken,
-        None => FinishReason::MaxTokens,
+    let stop_reason = core
+        .as_deref()
+        .and_then(GenerationCore::host_stop_reason)
+        .or(host_stop_reason);
+    let finish_reason = match stop_reason.as_ref() {
+        Some(reason) => reason.finish_reason(),
+        None => match core.as_deref().and_then(GenerationCore::finish) {
+            Some(reason) => reason,
+            None if runtime.last_generation_ended_by_predicate() => FinishReason::EosToken,
+            None => FinishReason::MaxTokens,
+        },
     };
 
     let text = tokenizer
@@ -833,6 +927,10 @@ pub(crate) fn run_declared_generation(
         text,
         token_ids,
         finish_reason,
+        tool_calls: match stop_reason {
+            Some(GenerationStopReason::ToolCallsReady(calls)) => calls,
+            _ => Vec::new(),
+        },
         // A package with no decode core has no prefix cache to have hit: the
         // interpreter recomputes every component from the request's own inputs.
         prefix_cache_hit_len: core
@@ -851,6 +949,7 @@ pub(crate) fn run_declared_generation(
 /// The direct replacement for a hand-rolled token loop: the iteration bound,
 /// the stop predicate and the emit come from the workflow, and `backend` is
 /// the executor the interpreter routes the declared decode step to.
+#[cfg(test)]
 pub(crate) fn generate_with_decode_core<B: DecodeLoopBackend + ?Sized>(
     runtime: &WorkflowRuntime,
     backend: &mut B,
@@ -888,13 +987,23 @@ pub(crate) fn generate_with_decode_core_and_staged_observer<B: DecodeLoopBackend
     // before the plan binds anything keeps the refusal free of partial state.
     if reached_context_limit(backend.context_len(), request.max_context) {
         ensure_constrained_finish(request.options, &state.generated_text, FinishReason::Length)?;
-        return finish_result(
+        if let Some(observer) = staged_output_observer.as_deref() {
+            observer
+                .finish("context-limit boundary")
+                .context("validate generated tool protocol before returning")?;
+        }
+        let mut result = finish_result(
             request.tokenizer,
             &state.generated_tokens,
             FinishReason::Length,
             state.prefix_cache_hit_len,
             state.logprobs.as_deref(),
-        );
+        )?;
+        result.tool_calls = staged_output_observer
+            .as_deref()
+            .map(ToolCallStagedOutputObserver::committed_calls)
+            .unwrap_or_default();
+        return Ok(result);
     }
     state.generated_tokens.reserve(
         request
@@ -931,6 +1040,7 @@ pub(crate) fn generate_with_decode_core_and_staged_observer<B: DecodeLoopBackend
                 Some(tokenizer),
                 pipeline_request,
                 Some(&mut host),
+                None,
                 callback,
             )
         }
@@ -942,6 +1052,7 @@ pub(crate) fn generate_with_decode_core_and_staged_observer<B: DecodeLoopBackend
                 Some(tokenizer),
                 pipeline_request,
                 Some(&mut host),
+                None,
                 None,
             )
         }

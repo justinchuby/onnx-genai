@@ -2828,6 +2828,7 @@ async fn stalled_output_route_does_not_block_another_completion() {
             session_id: None,
             lease: None,
             request: Box::new(build_generate_request(&slow_request)),
+            tool_call_policy: onnx_genai_engine::ToolCallPolicy::Disabled,
             admission: slow_admission,
             events: slow_tx,
             permit: crate::driver::WorkerPermit::untracked(slow_permit),
@@ -2835,7 +2836,12 @@ async fn stalled_output_route_does_not_block_another_completion() {
         .await
         .unwrap();
     let fast_rx = driver
-        .generate(None, build_generate_request(&fast_request), None)
+        .generate(
+            None,
+            build_generate_request(&fast_request),
+            onnx_genai_engine::ToolCallPolicy::Disabled,
+            None,
+        )
         .await
         .unwrap();
 
@@ -2887,6 +2893,7 @@ async fn native_driver_sessions_generate_through_server_path() {
                     .expect("a session with no turn in flight is leasable"),
             ),
             request,
+            onnx_genai_engine::ToolCallPolicy::Disabled,
             None,
         )
         .await
