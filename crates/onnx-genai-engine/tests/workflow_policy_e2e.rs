@@ -2888,6 +2888,7 @@ pipeline:
 #[test]
 fn workflow_threads_loop_branch_effects_and_session_state() -> anyhow::Result<()> {
     let metadata = r#"
+schema_version: v1.5
 pipeline:
   workflow:
     manifest:
@@ -2913,7 +2914,8 @@ pipeline:
                           role: { kind: opaque },
                           source: { kind: application, name: initial_continue }, required: true }
     outputs:
-      state: { contract: { dtype: int64, shape: [] }, role: tensor, stage: pre_adapter }
+      state: { contract: { dtype: int64, shape: [] }, role: tensor,
+               family: { kind: materialized }, stage: pre_adapter }
       events: { contract: { dtype: int64, shape: [] }, role: event,
                 family: { kind: events }, stage: pre_adapter }
     effects:
