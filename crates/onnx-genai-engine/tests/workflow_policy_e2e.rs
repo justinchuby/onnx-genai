@@ -676,7 +676,6 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: { onnx-genai.image-preprocess: "1" }
-      capabilities: [workflow_ssa, typed_emit]
     inputs:
       request.batch_anchor:
         contract: { dtype: int64, shape: [batch, sequence] }
@@ -800,7 +799,6 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: { onnx-genai.video-preprocess: "1" }
-      capabilities: [workflow_ssa, typed_emit]
     inputs:
       request.video:
         contract: { dtype: uint8, shape: [encoded_bytes] }
@@ -867,8 +865,7 @@ fn optional_media_presence_selects_real_or_empty_features() -> anyhow::Result<()
     let metadata = r#"
 pipeline:
   workflow:
-    manifest:
-      capabilities: [workflow_ssa, nested_control_flow, typed_emit, input_presence]
+    manifest: {}
     inputs:
       request.image_features:
         contract: { dtype: float32, shape: [num_features, 4] }
@@ -948,7 +945,6 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: {}
-      capabilities: [workflow_ssa, typed_emit]
     inputs:
       logits:
         contract: { dtype: float32, shape: [batch, vocabulary] }
@@ -1117,7 +1113,6 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: {}
-      capabilities: [workflow_ssa, linear_effects, typed_emit, nested_control_flow]
     inputs:
       initial_cache:
         contract: { dtype: float32, shape: [batch, cache] }
@@ -1221,7 +1216,6 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: {}
-      capabilities: [workflow_ssa, typed_emit]
     inputs:
       logits:
         contract: { dtype: float32, shape: [1, 4] }
@@ -1386,7 +1380,6 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: {}
-      capabilities: [workflow_ssa, typed_emit]
     inputs:
       logits:
         contract: { dtype: float32, shape: [batch, 4] }
@@ -1476,7 +1469,6 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: {}
-      capabilities: [workflow_ssa, typed_emit]
     inputs:
       logits.raw:
         contract: { dtype: float32, shape: [1, 4] }
@@ -1546,7 +1538,6 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: {}
-      capabilities: [workflow_ssa, typed_emit]
     inputs:
       eos:
         contract: { dtype: int64, shape: [num_eos] }
@@ -1583,7 +1574,6 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: {}
-      capabilities: [workflow_ssa, typed_emit]
     inputs:
       prompt:
         contract: { dtype: int64, shape: [batch, prompt_sequence] }
@@ -1644,7 +1634,6 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: {}
-      capabilities: [workflow_ssa, typed_emit, bounded_state_growth]
     inputs:
       prompt:
         contract: { dtype: int64, shape: [batch, prompt_sequence] }
@@ -1723,7 +1712,6 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: {}
-      capabilities: [workflow_ssa, linear_effects, typed_emit, nested_control_flow]
     inputs:
       logits: { contract: { dtype: float32, shape: [batch, vocabulary] },
                 role: { kind: opaque }, source: { kind: application, name: logits }, required: true }
@@ -1907,8 +1895,6 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: {}
-      capabilities: [workflow_ssa, linear_effects, typed_emit, nested_control_flow,
-                     loop_induction_values]
     inputs:
       sample: { contract: { dtype: float32, shape: [batch, width] },
                 role: { kind: opaque }, source: { kind: application, name: sample }, required: true }
@@ -2027,8 +2013,6 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: {}
-      capabilities: [workflow_ssa, linear_effects, typed_emit, nested_control_flow,
-                     loop_induction_values]
     inputs:
       outer_count: { contract: { dtype: int64, shape: [] },
                      role: { kind: opaque }, source: { kind: application, name: outer_count },
@@ -2094,7 +2078,6 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: {}
-      capabilities: [workflow_ssa, typed_emit]
     inputs:
       current: { contract: { dtype: int64, shape: [batch, sequence] }, role: { kind: opaque },
                  source: { kind: application, name: current }, required: true }
@@ -2164,7 +2147,6 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: {}
-      capabilities: [workflow_ssa, typed_emit, emit_valid_length]
     inputs:
       target: { contract: { dtype: float32, shape: [batch, draft, vocabulary],
                             batch_layout: { kind: request_aligned, axis: 0 } }, role: { kind: opaque },
@@ -2266,9 +2248,6 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: {}
-      capabilities:
-        [workflow_ssa, linear_effects, typed_emit, nested_control_flow,
-         bounded_state_recurrence]
     inputs:
       tentative: { contract: { dtype: int64, shape: [batch, state] },
                    role: { kind: opaque }, source: { kind: application, name: tentative },
@@ -2397,10 +2376,6 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: { onnx-genai.grammar-guidance: "1" }
-      capabilities:
-        [workflow_ssa, linear_effects, typed_emit, emit_valid_length, emit_row_identity,
-         nested_control_flow, grammar_guidance_adapter, adaptive_proposal_budget,
-         advisory_state]
     inputs:
       proposed: { contract: { dtype: int64, shape: [batch, proposal] },
                   role: { kind: opaque }, source: { kind: application, name: proposed },
@@ -2825,7 +2800,6 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: { onnx-genai.telemetry: "1" }
-      capabilities: [workflow_ssa, linear_effects, typed_emit, telemetry_adapter]
     inputs: {}
     outputs:
       elapsed_ms: { contract: { dtype: float32, shape: [] },
@@ -2893,9 +2867,6 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: {}
-      capabilities:
-        [workflow_ssa, linear_effects, typed_emit,
-         nested_control_flow, session_state_lease]
     inputs:
       initial: { contract: { dtype: int64, shape: [] }, role: { kind: opaque },
                  source: { kind: application, name: initial }, required: true }
@@ -3162,9 +3133,6 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: {}
-      capabilities:
-        [workflow_ssa, linear_effects, typed_emit,
-         nested_control_flow, session_state_lease, advisory_state]
     inputs:
       initial: { contract: { dtype: int64, shape: [] },
                  role: { kind: opaque }, source: { kind: application, name: initial },
@@ -3395,8 +3363,6 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: {}
-      capabilities:
-        [workflow_ssa, linear_effects, typed_emit, nested_control_flow]
     inputs:
       accept:
         contract: { dtype: bool, shape: [] }

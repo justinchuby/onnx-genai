@@ -1,17 +1,7 @@
 schema_version: v1.2
 pipeline:
   workflow:
-    manifest:
-      capabilities:
-      - workflow_ssa
-      - linear_effects
-      - nested_control_flow
-      - typed_emit
-      - emit_valid_length
-      - loop_induction_values
-      - serving_service_contract
-      - bounded_state_recurrence
-      - session_state_lease
+    manifest: {}
     inputs:
       request.input_ids:
         contract:

@@ -30,8 +30,7 @@ const PLAIN: &str = "model:\n  vocab_size: 32000\n";
 const PADDED: &str = r#"
 pipeline:
   workflow:
-    manifest:
-      capabilities: [workflow_ssa, typed_emit]
+    manifest: {}
     inputs:
       pixel_values:
         contract:
@@ -77,7 +76,7 @@ pipeline:
 const OUTPUT_WITHOUT_FAMILY: &str = r#"
 pipeline:
   workflow:
-    manifest: { capabilities: [workflow_ssa, typed_emit] }
+    manifest: {}
     outputs:
       answer:
         contract: { dtype: int64, shape: [sequence] }
@@ -337,7 +336,7 @@ fn output_family_rejects_an_illegal_emit_at_its_authored_site() {
 schema_version: "v1.5"
 pipeline:
   workflow:
-    manifest: { capabilities: [workflow_ssa, typed_emit] }
+    manifest: {}
     outputs:
       answer:
         contract: { dtype: int64, shape: [sequence] }
@@ -365,7 +364,8 @@ fn retired_streaming_emit_is_rejected_with_output_family_migration_guidance() {
     let document = r#"
 pipeline:
   workflow:
-    manifest: { capabilities: [workflow_ssa, typed_emit, streaming_emit] }
+    manifest:
+      capabilities: [streaming_emit]
     components: {}
     steps: []
 "#;

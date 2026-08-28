@@ -42,7 +42,7 @@ use rand::{Rng as _, SeedableRng as _};
 use super::execution_admission::{
     CandidateTreeExecutionMode, CandidateTreeExecutionPlan, CandidateTreeTopologyInput,
 };
-use super::workflow::{WorkflowLoopHostOutcome, WorkflowLoopHostStop};
+use super::workflow::WorkflowLoopHostOutcome;
 use super::{PipelineTensors, WorkflowRuntime};
 use crate::config::{FinishReason, GenerateOptions, GenerateResult, GenerateTokenCallback};
 use crate::speculative::{
@@ -473,7 +473,8 @@ struct CandidateTreeWorkflowHost<'a> {
     text: String,
     token_text: Vec<String>,
     commit_started: bool,
-    loop_stop: Option<WorkflowLoopHostStop>,
+    loop_stop: Option<super::GenerationStopReason>,
+    staged_output_observer: Option<&'a mut super::ToolCallStagedOutputObserver>,
 }
 
 impl CandidateTreeWorkflowHost<'_> {
@@ -804,20 +805,51 @@ impl CandidateTreeWorkflowHost<'_> {
         });
         self.generated.extend_from_slice(&committed);
         self.blocks = self.blocks.saturating_add(1);
-        self.loop_stop = if self.finish_reason == FinishReason::EosToken {
-            Some(WorkflowLoopHostStop::EosCommitted)
+        if let Some(observer) = self.staged_output_observer.as_deref_mut() {
+            let tokenizer = self.tokenizer.context(
+                "candidate-tree tool-call observation requires the package tokenizer before commit",
+            )?;
+            observer
+                .observe_tokens(tokenizer, &committed)
+                .map_err(|error| {
+                    anyhow::Error::new(error).context(
+                        "candidate-tree staged tool-call observation failed before semantic commit",
+                    )
+                })?;
+        }
+        let mut loop_stop = if self.finish_reason == FinishReason::EosToken {
+            Some(super::GenerationStopReason::EosCommitted)
         } else if self.generated.len() >= self.options.max_new_tokens {
-            Some(WorkflowLoopHostStop::BudgetExhausted)
+            Some(super::GenerationStopReason::BudgetExhausted)
         } else if self
             .options
             .max_context
             .is_some_and(|limit| accepted_context.len() >= limit)
         {
             self.finish_reason = FinishReason::Length;
-            Some(WorkflowLoopHostStop::ContextExhausted)
+            Some(super::GenerationStopReason::ContextExhausted)
         } else {
             None
         };
+        if loop_stop.is_some()
+            && let Some(observer) = self.staged_output_observer.as_deref_mut()
+            && matches!(
+                observer
+                    .finish("candidate-tree terminal generation boundary")
+                    .map_err(|error| {
+                        anyhow::Error::new(error)
+                            .context("validate candidate-tree tool protocol before semantic commit")
+                    })?,
+                super::StagedOutputObservation::TerminalComplete(_)
+            )
+        {
+            loop_stop = observer.stop_reason();
+            self.finish_reason = loop_stop
+                .as_ref()
+                .expect("terminal tool observer supplies a stop reason")
+                .finish_reason();
+        }
+        self.loop_stop = loop_stop;
         Ok(accepted_context)
     }
 
@@ -896,6 +928,9 @@ impl super::workflow::WorkflowNodeHost for CandidateTreeWorkflowHost<'_> {
             unreachable!("a newly admitted transaction is represented by its committed identity")
         };
         self.turn_identity = Some((transaction, baseline));
+        if let Some(observer) = self.staged_output_observer.as_deref_mut() {
+            observer.begin_turn();
+        }
         Ok(())
     }
 
@@ -929,6 +964,23 @@ impl super::workflow::WorkflowNodeHost for CandidateTreeWorkflowHost<'_> {
             })
             .collect::<Result<Vec<_>, _>>()
             .context("decode candidate-tree token events before semantic commit")?;
+        if let Some(observer) = self.staged_output_observer.as_deref_mut()
+            && matches!(
+                observer
+                    .finish("candidate-tree semantic commit")
+                    .map_err(|error| {
+                        anyhow::Error::new(error)
+                            .context("validate candidate-tree tool protocol before semantic commit")
+                    })?,
+                super::StagedOutputObservation::TerminalComplete(_)
+            )
+        {
+            let stop = observer
+                .stop_reason()
+                .expect("terminal tool observer supplies a stop reason");
+            self.finish_reason = stop.finish_reason();
+            self.loop_stop = Some(stop);
+        }
         match self.control.begin_commit() {
             Ok(true) => {
                 self.commit_started = true;
@@ -945,19 +997,25 @@ impl super::workflow::WorkflowNodeHost for CandidateTreeWorkflowHost<'_> {
     }
 
     fn loop_host_outcome(&self) -> WorkflowLoopHostOutcome {
-        self.loop_stop.map_or(
+        self.loop_stop.clone().map_or(
             WorkflowLoopHostOutcome::Continue,
             WorkflowLoopHostOutcome::Stop,
         )
     }
 
     fn turn_committed(&mut self, _outcome: super::TurnTransactionOutcome) {
+        if let Some(observer) = self.staged_output_observer.as_deref_mut() {
+            observer.commit_turn();
+        }
         if self.commit_started {
             self.control.finish_commit();
         }
     }
 
     fn turn_aborted(&mut self, _outcome: super::TurnTransactionOutcome) {
+        if let Some(observer) = self.staged_output_observer.as_deref_mut() {
+            observer.abort_turn();
+        }
         self.control.abort_commit();
     }
 
@@ -1466,7 +1524,7 @@ impl WorkflowRuntime {
         self.require_execution_admitted()?;
         if self.is_candidate_tree() {
             return Err(
-                crate::engine::PackageCapabilityError::CandidateTreeRawWorkflowApi {
+                crate::engine::PackageExecutionError::CandidateTreeRawWorkflowApi {
                     operation: operation.to_string(),
                 }
                 .into(),
@@ -1491,6 +1549,7 @@ impl WorkflowRuntime {
         options: &GenerateOptions,
         request: super::PipelineGenerateRequest,
         tokenizer: Option<&onnx_genai_ort::Tokenizer>,
+        staged_output_observer: Option<&mut super::ToolCallStagedOutputObserver>,
         mut callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
         self.require_execution_admitted()?;
@@ -1560,6 +1619,7 @@ impl WorkflowRuntime {
                 text: String::new(),
                 token_ids: Vec::new(),
                 finish_reason: FinishReason::Length,
+                tool_calls: Vec::new(),
                 prefix_cache_hit_len: 0,
                 logprobs: None,
                 budget_cap: None,
@@ -1585,6 +1645,7 @@ impl WorkflowRuntime {
             token_text: Vec::new(),
             commit_started: false,
             loop_stop: None,
+            staged_output_observer,
         };
         {
             let mut hosted: Option<&mut dyn super::workflow::WorkflowNodeHost> = Some(&mut host);
@@ -1601,6 +1662,11 @@ impl WorkflowRuntime {
             );
         }
         *self.worker.last_candidate_tree_block_traces.borrow_mut() = host.traces;
+        let tool_calls = host
+            .staged_output_observer
+            .as_deref()
+            .map(super::ToolCallStagedOutputObserver::committed_calls)
+            .unwrap_or_default();
 
         match control.observe_after_commit(super::GenerationBoundary::BeforeOutputPublication) {
             Ok(true) if callback.is_some() => {
@@ -1636,6 +1702,7 @@ impl WorkflowRuntime {
             text: host.text,
             token_ids: host.generated,
             finish_reason: host.finish_reason,
+            tool_calls,
             prefix_cache_hit_len: 0,
             logprobs: None,
             budget_cap: None,
@@ -2110,6 +2177,7 @@ impl WorkflowRuntime {
         options: &GenerateOptions,
         request: super::PipelineGenerateRequest,
         tokenizer: Option<&onnx_genai_ort::Tokenizer>,
+        _staged_output_observer: Option<&mut super::ToolCallStagedOutputObserver>,
         mut callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
         self.require_execution_admitted()?;
@@ -2200,6 +2268,7 @@ impl WorkflowRuntime {
                 text: String::new(),
                 token_ids: Vec::new(),
                 finish_reason: FinishReason::Length,
+                tool_calls: Vec::new(),
                 prefix_cache_hit_len: 0,
                 logprobs: None,
                 budget_cap: None,
@@ -2496,6 +2565,7 @@ impl WorkflowRuntime {
             text,
             token_ids: generated,
             finish_reason,
+            tool_calls: Vec::new(),
             prefix_cache_hit_len: 0,
             logprobs: None,
             budget_cap: None,

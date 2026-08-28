@@ -56,7 +56,7 @@ pub(crate) async fn fork_session(
     let lease = state
         .sessions
         .acquire(binding.clone(), &source_id)
-        .map_err(package_capability_failure)?;
+        .map_err(package_execution_failure)?;
     let model = binding.model().as_str().to_string();
     let handle = state
         .registry

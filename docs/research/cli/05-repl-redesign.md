@@ -129,7 +129,7 @@ enum CompletionSource {
     DecodeBackends,
     Models,
     SessionNames,
-    RuntimeCapabilities, // populated from 04-runtime-capability-inventory.md implementation work
+    RuntimeExtensions, // populated from the generated metadata extension registry
 }
 ```
 

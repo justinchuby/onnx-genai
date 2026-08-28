@@ -8,14 +8,13 @@
 
 use onnx_genai_metadata::{InferenceMetadata, validate_metadata};
 
-fn document(state: &str, manifest: &str) -> String {
+fn document(state: &str, _manifest: &str) -> String {
     format!(
         r#"
 schema_version: v1
 pipeline:
   workflow:
-    manifest:
-      capabilities: [workflow_ssa, typed_emit, {manifest}]
+    manifest: {{}}
     inputs:
       request.input_ids:
         contract: {{ dtype: int64, shape: [batch, sequence], batch_layout: {{ kind: request_aligned, axis: 0 }} }}

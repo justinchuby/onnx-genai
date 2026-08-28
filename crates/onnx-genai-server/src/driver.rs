@@ -14,7 +14,7 @@ use onnx_genai_engine::{
     ContinuousBatchManager, EmbeddingOptions, EncodedAudio, EngineGovernorError,
     EngineMemoryAccounting, FimConfig, GenerationControl, GovernorSnapshot, KvNotApplicable,
     KvTelemetry, MemoryStrategyPlan, OrtEngineWorkerFactory, PipelineGenerateRequest,
-    ResourceLimit, SchedulerAdmissionError,
+    ResourceLimit, SchedulerAdmissionError, ToolCallPolicy,
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 
@@ -165,6 +165,7 @@ pub(crate) enum DriverCommand {
         /// worker stopped — releases the lease by dropping the guard.
         lease: Option<SessionLeaseGuard>,
         request: Box<GenerateRequest>,
+        tool_call_policy: ToolCallPolicy,
         input: Option<MultimodalInput>,
         admission: oneshot::Sender<Result<(), DriverFailure>>,
         events: mpsc::Sender<DriverEvent>,
@@ -237,7 +238,7 @@ pub(crate) enum DriverFailureKind {
     /// The caller asked the loaded package for something it cannot serve as
     /// asked. Carried as the engine's own type so a status code never depends
     /// on the wording of a message.
-    PackageCapability(onnx_genai_engine::PackageCapabilityError),
+    PackageExecution(onnx_genai_engine::PackageExecutionError),
 }
 
 #[derive(Debug, Clone)]
@@ -284,7 +285,7 @@ impl DriverFailure {
                 )
             )
         });
-        let capability = onnx_genai_engine::package_capability_error(error);
+        let capability = onnx_genai_engine::package_execution_error(error);
         Self {
             // Anyhow's Display shows only the outermost context, which for a
             // decode failure is the generic "forward pass failed" wrapper. The
@@ -298,7 +299,7 @@ impl DriverFailure {
                 None => format!("{error:#}"),
             },
             kind: match (capability, memory_overload) {
-                (Some(capability), _) => DriverFailureKind::PackageCapability(capability),
+                (Some(capability), _) => DriverFailureKind::PackageExecution(capability),
                 (None, true) => DriverFailureKind::MemoryOverload,
                 (None, false) => DriverFailureKind::Internal,
             },
@@ -343,6 +344,7 @@ struct DriverRoute {
 
 struct PendingGeneration {
     request: GenerateRequest,
+    tool_call_policy: ToolCallPolicy,
     lease: Option<SessionLeaseGuard>,
     admission: oneshot::Sender<Result<(), DriverFailure>>,
     events: mpsc::Sender<DriverEvent>,
@@ -981,15 +983,18 @@ impl EngineDriver {
         &self,
         session: Option<SessionLeaseGuard>,
         request: GenerateRequest,
+        tool_call_policy: ToolCallPolicy,
         input: Option<MultimodalInput>,
     ) -> Result<DriverGeneration, GenerateSubmitError> {
-        self.generate(session, request, input).await
+        self.generate(session, request, tool_call_policy, input)
+            .await
     }
 
     pub(crate) async fn generate(
         &self,
         session: Option<SessionLeaseGuard>,
         request: GenerateRequest,
+        tool_call_policy: ToolCallPolicy,
         input: Option<MultimodalInput>,
     ) -> Result<DriverGeneration, GenerateSubmitError> {
         // A session-bound generation goes to the worker holding its KV state;
@@ -1035,6 +1040,7 @@ impl EngineDriver {
                 session_id: placement.map(|placement| placement.engine_session_id),
                 lease: session,
                 request: Box::new(request),
+                tool_call_policy,
                 input,
                 admission,
                 events,
@@ -1071,6 +1077,7 @@ impl EngineDriver {
             session_id: None,
             lease: None,
             request: Box::new(request),
+            tool_call_policy: ToolCallPolicy::Disabled,
             input: None,
             admission,
             events,
@@ -1359,11 +1366,12 @@ fn run_static_engine_driver(
                 session_id: None,
                 lease,
                 request,
+                tool_call_policy,
                 input: None,
                 admission,
                 events,
                 permit,
-            } => {
+            } if !tool_call_policy.observes_output() => {
                 run_static_batch_until_idle(
                     engine,
                     &mut rx,
@@ -1377,6 +1385,7 @@ fn run_static_engine_driver(
                     resource_snapshot,
                     PendingGeneration {
                         request: *request,
+                        tool_call_policy,
                         lease,
                         admission,
                         events,
@@ -1422,13 +1431,15 @@ fn run_static_batch_until_idle(
                     session_id: None,
                     lease,
                     request,
+                    tool_call_policy,
                     input: None,
                     admission,
                     events,
                     permit,
-                }) => {
+                }) if !tool_call_policy.observes_output() => {
                     initial.push(PendingGeneration {
                         request: *request,
+                        tool_call_policy,
                         lease,
                         admission,
                         events,
@@ -1449,13 +1460,15 @@ fn run_static_batch_until_idle(
                     session_id: None,
                     lease,
                     request,
+                    tool_call_policy,
                     input: None,
                     admission,
                     events,
                     permit,
-                }) => {
+                }) if !tool_call_policy.observes_output() => {
                     initial.push(PendingGeneration {
                         request: *request,
+                        tool_call_policy,
                         lease,
                         admission,
                         events,
@@ -1569,17 +1582,19 @@ fn run_static_batch_until_idle(
                     session_id: None,
                     lease,
                     request,
+                    tool_call_policy,
                     input: None,
                     admission,
                     events,
                     permit,
-                }) => {
+                }) if !tool_call_policy.observes_output() => {
                     submit_to_continuous_manager(
                         &mut manager,
                         &mut routes,
                         &mut abandoned,
                         PendingGeneration {
                             request: *request,
+                            tool_call_policy,
                             lease,
                             admission,
                             events,
@@ -1600,18 +1615,31 @@ fn run_static_batch_until_idle(
                     session_id: None,
                     lease,
                     request,
+                    tool_call_policy,
                     input: None,
                     admission,
                     events,
                     permit,
                 } => {
-                    if routes.len() + abandoned.len() < manager.max_batch() {
+                    if tool_call_policy.observes_output() {
+                        deferred.push_back(DriverCommand::Generate {
+                            session_id: None,
+                            lease,
+                            request,
+                            tool_call_policy,
+                            input: None,
+                            admission,
+                            events,
+                            permit,
+                        });
+                    } else if routes.len() + abandoned.len() < manager.max_batch() {
                         submit_to_continuous_manager(
                             &mut manager,
                             &mut routes,
                             &mut abandoned,
                             PendingGeneration {
                                 request: *request,
+                                tool_call_policy,
                                 lease,
                                 admission,
                                 events,
@@ -1623,6 +1651,7 @@ fn run_static_batch_until_idle(
                             session_id: None,
                             lease,
                             request,
+                            tool_call_policy,
                             input: None,
                             admission,
                             events,
@@ -1834,11 +1863,13 @@ fn submit_to_continuous_manager(
 ) {
     let PendingGeneration {
         request,
+        tool_call_policy,
         lease,
         admission,
         events,
         permit,
     } = pending;
+    debug_assert!(!tool_call_policy.observes_output());
     match manager.submit(request) {
         Ok(handle) => {
             routes.insert(
@@ -2083,6 +2114,7 @@ fn handle_driver_command(engine: &mut Engine, command: DriverCommand) {
             session_id,
             lease,
             request,
+            tool_call_policy,
             input,
             admission,
             events,
@@ -2093,6 +2125,7 @@ fn handle_driver_command(engine: &mut Engine, command: DriverCommand) {
             input,
             PendingGeneration {
                 request: *request,
+                tool_call_policy,
                 lease,
                 admission,
                 events,
@@ -2344,6 +2377,7 @@ fn run_generation(
 ) {
     let PendingGeneration {
         request,
+        tool_call_policy,
         lease,
         admission,
         events,
@@ -2351,7 +2385,12 @@ fn run_generation(
     } = pending;
     let mut metrics = GenerationMetrics::start();
     let bound = match input
-        .map(|input| input.bind(PipelineGenerateRequest::new(request.clone())))
+        .map(|input| {
+            input.bind(
+                PipelineGenerateRequest::new(request.clone())
+                    .with_tool_call_policy(tool_call_policy.clone()),
+            )
+        })
         .transpose()
     {
         Ok(bound) => bound,
@@ -2399,30 +2438,32 @@ fn run_generation(
                 Some(&mut admitted),
                 Some(&mut callback),
             ),
-            (None, session) if specialized_speculation => match session {
-                Some(session) => engine.generate_in_session_with_control_callbacks(
-                    session,
-                    request,
-                    generation_control,
+            (None, session) if specialized_speculation => {
+                let request = PipelineGenerateRequest::new(request)
+                    .with_generation_control(generation_control)
+                    .with_tool_call_policy(tool_call_policy);
+                engine.generate_with_pipeline_callbacks(
+                    match session {
+                        Some(session) => request.with_session_id(session.to_string()),
+                        None => request,
+                    },
                     Some(&mut admitted),
                     Some(&mut callback),
-                ),
-                None => engine.generate_with_control_callbacks(
-                    request,
-                    generation_control,
-                    Some(&mut admitted),
-                    Some(&mut callback),
-                ),
-            },
-            (None, Some(session_id)) => engine.generate_in_session_with_callbacks(
+                )
+            }
+            (None, Some(session_id)) => engine.generate_in_session_with_tool_policy_callbacks(
                 session_id,
                 request,
+                tool_call_policy,
                 Some(&mut admitted),
                 Some(&mut callback),
             ),
-            (None, None) => {
-                engine.generate_with_callbacks(request, Some(&mut admitted), Some(&mut callback))
-            }
+            (None, None) => engine.generate_with_tool_policy_callbacks(
+                request,
+                tool_call_policy,
+                Some(&mut admitted),
+                Some(&mut callback),
+            ),
         }
     };
     // The engine has committed whatever this turn wrote to the session, so the
@@ -2775,7 +2816,14 @@ mod admission_tests {
             .acquire(driver.binding(lost), "lost-session")
             .expect("the failed worker cannot strand the routing lease");
         assert!(matches!(
-            driver.generate(Some(lease), warmup_request(), None).await,
+            driver
+                .generate(
+                    Some(lease),
+                    warmup_request(),
+                    ToolCallPolicy::Disabled,
+                    None,
+                )
+                .await,
             Err(GenerateSubmitError::Failed(DriverFailure {
                 kind: DriverFailureKind::WorkerUnavailable,
                 ..
@@ -3203,6 +3251,7 @@ mod admission_tests {
             Some(input),
             PendingGeneration {
                 request,
+                tool_call_policy: ToolCallPolicy::Disabled,
                 lease: None,
                 admission,
                 events,
@@ -3238,6 +3287,7 @@ mod admission_tests {
             (
                 PendingGeneration {
                     request,
+                    tool_call_policy: ToolCallPolicy::Disabled,
                     lease: None,
                     admission,
                     events,
@@ -3409,7 +3459,9 @@ mod admission_tests {
             .expect_err("a stopped driver opens no sessions");
         assert_eq!(error.to_string(), "engine driver stopped");
         assert!(matches!(
-            driver.generate(None, warmup_request(), None).await,
+            driver
+                .generate(None, warmup_request(), ToolCallPolicy::Disabled, None,)
+                .await,
             Err(GenerateSubmitError::DriverStopped)
         ));
         assert!(matches!(
@@ -3530,7 +3582,14 @@ mod admission_tests {
             .expect("an idle session is leasable");
         assert!(leases.is_held(&driver.binding(session)));
         assert!(matches!(
-            driver.generate(Some(lease), warmup_request(), None).await,
+            driver
+                .generate(
+                    Some(lease),
+                    warmup_request(),
+                    ToolCallPolicy::Disabled,
+                    None,
+                )
+                .await,
             Err(GenerateSubmitError::Overloaded)
         ));
         assert!(
@@ -3545,7 +3604,14 @@ mod admission_tests {
             .acquire(driver.binding(session), "sess-stopped")
             .expect("still leasable");
         assert!(matches!(
-            driver.generate(Some(lease), warmup_request(), None).await,
+            driver
+                .generate(
+                    Some(lease),
+                    warmup_request(),
+                    ToolCallPolicy::Disabled,
+                    None,
+                )
+                .await,
             Err(GenerateSubmitError::DriverStopped)
         ));
         assert_eq!(
@@ -3671,6 +3737,7 @@ mod driver_delivery_tests {
             text: "done".to_string(),
             token_ids: (0..tokens as u32).collect(),
             finish_reason: FinishReason::EosToken,
+            tool_calls: Vec::new(),
             prefix_cache_hit_len: 0,
             logprobs: None,
             budget_cap: None,

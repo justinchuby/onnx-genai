@@ -668,7 +668,7 @@ impl<'a> SessionLeaseGuard<'a> {
     ) -> anyhow::Result<Self> {
         if !leases.borrow_mut().insert(session.to_string()) {
             return Err(
-                crate::engine::PackageCapabilityError::ExclusiveLeaseConflict {
+                crate::engine::PackageExecutionError::ExclusiveLeaseConflict {
                     session: session.to_string(),
                 }
                 .into(),
@@ -1031,7 +1031,7 @@ impl<'a> WorkflowExecutionPlan<'a> {
             inputs,
             session_id,
             component_overrides,
-            generation_control: _,
+            ..
         } = request;
         let workflow = &engine.plan.workflow;
         let session_turn_version = session_id.as_ref().map(|session| {
@@ -1148,7 +1148,7 @@ impl<'a> WorkflowExecutionPlan<'a> {
             let requested = conversation.len().saturating_add(budget);
             if requested > bound {
                 return Err(
-                    crate::engine::PackageCapabilityError::ConversationOverBound {
+                    crate::engine::PackageExecutionError::ConversationOverBound {
                         cell: cell.to_string(),
                         requested,
                         bound,
@@ -1637,7 +1637,7 @@ impl<'a> WorkflowExecutionPlan<'a> {
                         let bound = continuation_bound(cell, state, &values)?;
                         if conversation.len() > bound {
                             return Err(
-                                crate::engine::PackageCapabilityError::ConversationOverBound {
+                                crate::engine::PackageExecutionError::ConversationOverBound {
                                     cell: cell.to_string(),
                                     requested: conversation.len(),
                                     bound,
@@ -1811,23 +1811,16 @@ pub(crate) fn runtime_contract_registry() -> &'static std::collections::HashSet<
     &REGISTRY
 }
 
-/// A request-level terminal condition a hosted generation seam committed.
-///
-/// It composes with, rather than overwrites, the authored loop predicate: the
-/// current body completed normally, but no later body may start for this turn.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WorkflowLoopHostStop {
-    BudgetExhausted,
-    EosCommitted,
-    ContextExhausted,
-}
-
 /// The host's contribution to the generic loop's next-iteration decision.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+///
+/// A host may stop only after it staged the current body normally. The
+/// interpreter consumes this before it begins a later body, preserving the
+/// authored loop as the sole control-flow authority.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) enum WorkflowLoopHostOutcome {
     #[default]
     Continue,
-    Stop(WorkflowLoopHostStop),
+    Stop(super::GenerationStopReason),
 }
 
 /// A runtime-supplied executor for a workflow node the package does not ship a
@@ -1892,6 +1885,15 @@ pub(crate) trait WorkflowNodeHost {
     /// interpreter evaluates another authored loop body.
     fn loop_host_outcome(&self) -> WorkflowLoopHostOutcome {
         WorkflowLoopHostOutcome::Continue
+    }
+
+    /// Observe newly staged generated token output without publishing it.
+    #[allow(dead_code)]
+    fn observe_staged_generation_tokens(
+        &mut self,
+        _tokens: &[crate::TokenId],
+    ) -> anyhow::Result<()> {
+        Ok(())
     }
 
     /// Execute one node bound to `contract`.

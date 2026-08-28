@@ -13,8 +13,7 @@ model:
   max_sequence_length: 16
 pipeline:
   workflow:
-    manifest:
-      capabilities: [workflow_ssa, typed_emit, serving_service_contract, bounded_state_recurrence, canonical_speculation]
+    manifest: {}
     inputs:
       request.active:
         contract: {dtype: bool, shape: [batch], batch_layout: {kind: request_aligned, axis: 0}}

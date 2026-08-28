@@ -1,5 +1,5 @@
 use super::*;
-use crate::tool_protocol::{self, ToolOutputConstraint, ToolParseOutcome, ToolProtocol};
+use crate::tool_protocol::{self, ToolOutputConstraint, ToolProtocol};
 
 pub(crate) async fn completions(
     State(state): State<AppState>,
@@ -444,6 +444,7 @@ async fn run_chat_completion(
     let mut generation_request = prepared.request;
     generation_request.options.max_new_tokens = output_budget;
     generation_request.options.max_context = handle.model_max_context;
+    let tool_call_policy = tool_protocol::request_policy(&request);
     let session_lookup =
         open_session_after_admission(&state, &handle, client_session_id.as_deref(), lease).await?;
 
@@ -456,7 +457,12 @@ async fn run_chat_completion(
     // owns, so this route no longer branches on which package shape was loaded.
     let generation = handle
         .engine
-        .submit_generation(session_lookup, generation_request, pipeline_input)
+        .submit_generation(
+            session_lookup,
+            generation_request,
+            tool_call_policy,
+            pipeline_input,
+        )
         .await
         .map_err(map_generate_submit_error)?;
     let result = collect_generation_with_publications(generation.events)
@@ -486,31 +492,22 @@ async fn run_chat_completion(
             let logprobs = chat_logprobs(&result, &tokenizer, requested_top_logprobs)
                 .map_err(|err| ApiError::internal(format!("logprobs conversion failed: {err}")))?;
             let output = assistant_output_text(&result, &tokenizer);
-            let reasoning = atem_reasoning_content(&output).filter(|thought| !thought.is_empty());
-            let parsed = if request.has_tool_context() {
-                parse_assistant_output(
-                    handle.tool_protocol.as_ref(),
-                    Some(&request),
-                    output,
-                    default_finish_reason,
-                )
-                .map_err(|error| {
-                    ApiError::internal(format!("tool protocol output rejected: {error}"))
-                })?
-                .aligned_to(&request)
+            let tool_calls = committed_chat_tool_calls(&result);
+            let content = if tool_calls.is_some() {
+                None
             } else {
-                ParsedAssistantOutput {
-                    content: Some(result.text),
-                    tool_calls: None,
-                    finish_reason: default_finish_reason,
-                    tool_parse: ToolParseOutcome::NoCall,
-                }
+                Some(atem_visible_content(&output).unwrap_or(output.clone()))
             };
+            let reasoning = tool_calls
+                .is_none()
+                .then(|| atem_reasoning_content(&output))
+                .flatten()
+                .filter(|thought| !thought.is_empty());
             (
-                parsed.content,
-                parsed.tool_calls,
+                content,
+                tool_calls,
                 result.token_ids.len(),
-                parsed.finish_reason,
+                default_finish_reason,
                 logprobs,
                 reasoning,
             )
@@ -632,6 +629,7 @@ async fn stream_chat_completion(
     let mut generation_request = prepared.request;
     generation_request.options.max_new_tokens = output_budget;
     generation_request.options.max_context = handle.model_max_context;
+    let tool_call_policy = tool_protocol::request_policy(&request);
     let (tx, rx) = mpsc::channel(16);
     let session_lookup =
         open_session_after_admission(&state, &handle, client_session_id.as_deref(), lease).await?;
@@ -639,7 +637,12 @@ async fn stream_chat_completion(
     // owns, so this route no longer branches on which package shape was loaded.
     let generation = handle
         .engine
-        .submit_generation(session_lookup, generation_request, pipeline_input)
+        .submit_generation(
+            session_lookup,
+            generation_request,
+            tool_call_policy,
+            pipeline_input,
+        )
         .await
         .map_err(map_generate_submit_error)?;
     await_driver_admission(generation.admission).await?;
@@ -650,15 +653,9 @@ async fn stream_chat_completion(
         send_stream_chunk(&tx, role_chunk(&id, created, &model)).await?;
 
         if request.has_tool_context() {
-            let protocol = handle
-                .tool_protocol
-                .clone()
-                .expect("tool requests are rejected unless the package declares a protocol");
             return stream_declared_tool_chat_completion(
                 &tx,
                 (&id, created, &model),
-                &request,
-                &protocol,
                 &tokenizer,
                 handle.private_channels,
                 requested_top_logprobs,
@@ -812,9 +809,6 @@ async fn stream_chat_completion(
                 .await
                 .context("stream receiver closed")?;
             }
-            Err(StreamOutputFailure::Protocol(error)) => {
-                send_tool_protocol_stream_error(&tx, error).await?;
-            }
             Err(StreamOutputFailure::Delivery(error)) => return Err(error),
         }
 
@@ -831,8 +825,6 @@ async fn stream_chat_completion(
 async fn stream_declared_tool_chat_completion(
     tx: &mpsc::Sender<Result<Event, Infallible>>,
     response: (&str, u64, &str),
-    request: &ChatCompletionRequest,
-    protocol: &ToolProtocol,
     tokenizer: &Tokenizer,
     private_channels: bool,
     requested_top_logprobs: Option<usize>,
@@ -844,7 +836,6 @@ async fn stream_declared_tool_chat_completion(
     let mut stop_buffer = StopBoundaryBuffer::new(user_stop_sequences.to_vec());
     let mut channel_gate = PrivateChannelGate::new(private_channels);
     let mut buffered_text = String::new();
-    let mut tool_stream = tool_protocol::ToolCallStream::default();
     let result = loop {
         match driver_rx.recv().await {
             Some(DriverEvent::Token(token)) => {
@@ -859,13 +850,6 @@ async fn stream_declared_tool_chat_completion(
                         .await?;
                 }
                 buffered_text.push_str(&stop_buffer.push(&revealed.content));
-                let parser_chunk = spelled.as_deref().unwrap_or(&token.text);
-                let outcome = tool_stream.push(protocol, parser_chunk);
-                if let Some(error) =
-                    protocol.incremental_output_error(&outcome, "SSE chunk ingestion")
-                {
-                    break Err(StreamOutputFailure::Protocol(error));
-                }
                 if matches!(finish_reason, Some(FinishReason::StopSequence { .. })) {
                     stop_buffer.pending.clear();
                 }
@@ -887,33 +871,17 @@ async fn stream_declared_tool_chat_completion(
 
     match result {
         Ok(result) => {
+            let remaining = channel_gate.flush();
+            if !remaining.reasoning.is_empty() {
+                send_stream_chunk(tx, reasoning_chunk(id, created, model, remaining.reasoning))
+                    .await?;
+            }
+            buffered_text.push_str(&stop_buffer.push(&remaining.content));
             if !matches!(result.finish_reason, FinishReason::StopSequence { .. }) {
                 let trailing = stop_buffer.flush();
                 buffered_text.push_str(&trailing);
-                let outcome = tool_stream.push(protocol, &trailing);
-                if let Some(error) =
-                    protocol.incremental_output_error(&outcome, "SSE chunk ingestion")
-                {
-                    send_tool_protocol_stream_error(tx, error).await?;
-                    tx.send(Ok(Event::default().data("[DONE]")))
-                        .await
-                        .context("stream receiver closed")?;
-                    return Ok(());
-                }
             }
-            let outcome = tool_stream.finish(protocol);
-            if let Err(error) =
-                protocol.validate_output(request, &outcome, "SSE streaming boundary")
-            {
-                send_tool_protocol_stream_error(tx, error).await?;
-                tx.send(Ok(Event::default().data("[DONE]")))
-                    .await
-                    .context("stream receiver closed")?;
-                return Ok(());
-            }
-            let parsed = parsed_tool_output(outcome, finish_reason_label(&result.finish_reason))
-                .aligned_to(request);
-            if let Some(tool_calls) = parsed.tool_calls {
+            if let Some(tool_calls) = committed_chat_tool_calls(&result) {
                 send_tool_call_deltas(tx, response, tool_calls).await?;
             } else if let Some(requested_top_logprobs) = requested_top_logprobs {
                 send_chat_logprob_chunks(
@@ -941,7 +909,16 @@ async fn stream_declared_tool_chat_completion(
                     send_stream_chunk(tx, content_chunk(id, created, model, buffered_text, None))
                         .await?;
                 }
-                send_stream_chunk(tx, done_chunk(id, created, model, parsed.finish_reason)).await?;
+                send_stream_chunk(
+                    tx,
+                    done_chunk(
+                        id,
+                        created,
+                        model,
+                        finish_reason_label(&result.finish_reason),
+                    ),
+                )
+                .await?;
             }
         }
         Err(StreamOutputFailure::Driver(err))
@@ -968,9 +945,6 @@ async fn stream_declared_tool_chat_completion(
             .await
             .context("stream receiver closed")?;
         }
-        Err(StreamOutputFailure::Protocol(error)) => {
-            send_tool_protocol_stream_error(tx, error).await?;
-        }
         Err(StreamOutputFailure::Delivery(error)) => return Err(error),
     }
 
@@ -978,207 +952,6 @@ async fn stream_declared_tool_chat_completion(
         .await
         .context("stream receiver closed")?;
     Ok(())
-}
-
-#[cfg(test)]
-mod declared_tool_stream_tests {
-    use super::*;
-    use axum::body::to_bytes;
-    use onnx_genai::GenerateToken;
-    use onnx_genai_metadata::ToolProtocolDeclaration;
-    use std::path::PathBuf;
-
-    fn protocol(identity: &str) -> ToolProtocol {
-        ToolProtocol::from_declaration(&ToolProtocolDeclaration {
-            identity: identity.to_string(),
-            version: "v1".to_string(),
-        })
-        .unwrap()
-    }
-
-    async fn injected_body(
-        identity: &str,
-        request: &ChatCompletionRequest,
-        chunks: &[&str],
-    ) -> String {
-        let protocol = protocol(identity);
-        let tokenizer_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/fixtures/tiny-llm/tokenizer.json");
-        let tokenizer = Tokenizer::from_file(&tokenizer_path).expect("fixture tokenizer");
-        let (driver_tx, mut driver_rx) = mpsc::channel(chunks.len() + 1);
-        for (token_id, text) in chunks.iter().enumerate() {
-            driver_tx
-                .send(DriverEvent::Token(GenerateToken {
-                    token_id: token_id as u32,
-                    text: (*text).to_string(),
-                    finish_reason: None,
-                }))
-                .await
-                .unwrap();
-        }
-        driver_tx
-            .send(DriverEvent::Finished(GenerateResult {
-                text: chunks.concat(),
-                token_ids: (0..chunks.len() as u32).collect(),
-                finish_reason: FinishReason::EosToken,
-                prefix_cache_hit_len: 0,
-                logprobs: None,
-                budget_cap: None,
-            }))
-            .await
-            .unwrap();
-        drop(driver_tx);
-
-        let (tx, rx) = mpsc::channel(16);
-        send_stream_chunk(&tx, role_chunk("chatcmpl-test", 1, "fixture"))
-            .await
-            .unwrap();
-        stream_declared_tool_chat_completion(
-            &tx,
-            ("chatcmpl-test", 1, "fixture"),
-            request,
-            &protocol,
-            &tokenizer,
-            false,
-            None,
-            &[],
-            false,
-            &mut driver_rx,
-        )
-        .await
-        .unwrap();
-        drop(tx);
-
-        let response = Sse::new(ReceiverStream::new(rx)).into_response();
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        String::from_utf8(body.to_vec()).unwrap()
-    }
-
-    #[tokio::test]
-    async fn injected_sse_route_accepts_a_tool_envelope_split_across_tokens() {
-        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
-            "model": "fixture",
-            "messages": [{"role": "user", "content": "weather?"}],
-            "tools": [{"type": "function", "function": {"name": "weather"}}],
-            "tool_choice": "required",
-            "stream": true
-        }))
-        .unwrap();
-        let body = injected_body(
-            "tagged-json",
-            &request,
-            &[
-                r#"<tool_call>{"name":"weather","arguments":{"city":"Par"#,
-                r#"is"}}</tool_call>"#,
-            ],
-        )
-        .await;
-        assert!(body.contains("\"tool_calls\""), "{body}");
-        assert!(body.contains("\"weather\""), "{body}");
-        assert!(body.contains("\\\"city\\\":\\\"Paris\\\""), "{body}");
-        assert!(body.contains("data: [DONE]"), "{body}");
-        assert!(!body.contains("event: error"), "{body}");
-    }
-
-    #[tokio::test]
-    async fn injected_sse_route_enforces_required_and_specific_tool_choice() {
-        let required: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
-            "model": "fixture",
-            "messages": [{"role": "user", "content": "weather?"}],
-            "tools": [{"type": "function", "function": {"name": "weather"}}],
-            "tool_choice": "required",
-            "stream": true
-        }))
-        .unwrap();
-        let body = injected_body("tagged-json", &required, &["ordinary assistant text"]).await;
-        assert!(body.contains("event: error"), "{body}");
-        assert!(body.contains("tagged-json@v1"), "{body}");
-        assert!(body.contains("tool_choice required"), "{body}");
-        assert!(body.contains("no tool call"), "{body}");
-
-        let specific: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
-            "model": "fixture",
-            "messages": [{"role": "user", "content": "weather?"}],
-            "tools": [
-                {"type": "function", "function": {"name": "weather"}},
-                {"type": "function", "function": {"name": "calendar"}}
-            ],
-            "tool_choice": {"type": "function", "function": {"name": "weather"}},
-            "stream": true
-        }))
-        .unwrap();
-        let body = injected_body(
-            "tagged-json",
-            &specific,
-            &[r#"<tool_call>{"name":"calendar","arguments":{}}</tool_call>"#],
-        )
-        .await;
-        assert!(body.contains("event: error"), "{body}");
-        assert!(body.contains("tagged-json@v1"), "{body}");
-        assert!(body.contains("weather"), "{body}");
-        assert!(body.contains("calendar"), "{body}");
-    }
-
-    #[tokio::test]
-    async fn injected_sse_route_rejects_text_outside_atem_envelopes() {
-        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
-            "model": "fixture",
-            "messages": [{"role": "user", "content": "read"}],
-            "tools": [{"type": "function", "function": {"name": "read"}}],
-            "tool_choice": "required",
-            "stream": true
-        }))
-        .unwrap();
-        let call = r#"<atem:invoke name="read"></atem:invoke>"#;
-        for (chunks, reason) in [
-            (vec!["junk", call], "before the first invoke envelope"),
-            (vec![call, "junk"], "trailing text after an invoke envelope"),
-            (
-                vec!["junk", call, "junk"],
-                "before the first invoke envelope",
-            ),
-        ] {
-            let body = injected_body("atem-xml", &request, &chunks).await;
-            assert!(body.contains("event: error"), "{body}");
-            assert!(body.contains("atem-xml@v1"), "{body}");
-            assert!(body.contains("malformed envelope"), "{body}");
-            assert!(body.contains("SSE chunk ingestion"), "{body}");
-            assert!(body.contains(reason), "{body}");
-            assert!(!body.contains("\"tool_calls\""), "{body}");
-        }
-    }
-
-    #[tokio::test]
-    async fn injected_sse_route_accepts_whitespace_and_multiple_atem_calls() {
-        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
-            "model": "fixture",
-            "messages": [{"role": "user", "content": "read then write"}],
-            "tools": [
-                {"type": "function", "function": {"name": "read"}},
-                {"type": "function", "function": {"name": "write"}}
-            ],
-            "tool_choice": "required",
-            "stream": true
-        }))
-        .unwrap();
-        let body = injected_body(
-            "atem-xml",
-            &request,
-            &[
-                " \n<atem:inv",
-                "oke name=\"read\"></atem:invoke>\t",
-                "<atem:invoke name=\"write\"><atem:parameter name=\"path\">",
-                "\"src/lib.rs\"</atem:parameter></atem:invoke>\r\n",
-            ],
-        )
-        .await;
-        assert!(body.contains("\"tool_calls\""), "{body}");
-        assert!(body.contains("\"read\""), "{body}");
-        assert!(body.contains("\"write\""), "{body}");
-        assert!(body.contains("\\\"path\\\":\\\"src/lib.rs\\\""), "{body}");
-        assert!(body.contains("data: [DONE]"), "{body}");
-        assert!(!body.contains("event: error"), "{body}");
-    }
 }
 
 async fn await_driver_admission(
@@ -1676,7 +1449,7 @@ fn lease_bound_session(
     sessions
         .acquire(binding, client_id)
         .map(Some)
-        .map_err(package_capability_failure)
+        .map_err(package_execution_failure)
 }
 
 /// Refuse a session id that names a conversation inside a *different* model.
@@ -1788,7 +1561,7 @@ async fn get_or_create_session(
         ensure_session_belongs_to_model(handle, &binding, client_id)?;
         return sessions
             .acquire(binding, client_id)
-            .map_err(package_capability_failure);
+            .map_err(package_execution_failure);
     }
 
     let opened = handle
@@ -1802,7 +1575,7 @@ async fn get_or_create_session(
     // from the moment it exists, whichever way the claim below resolves.
     let lease = sessions
         .acquire(binding.clone(), client_id)
-        .map_err(package_capability_failure)?;
+        .map_err(package_execution_failure)?;
     // Claim decides; a caller that lost the race, and a caller the registry
     // refused outright, both close the session they opened rather than leaving
     // it to accumulate a conversation nobody will read.
@@ -1812,7 +1585,7 @@ async fn get_or_create_session(
             ensure_session_belongs_to_model(handle, &existing, client_id)?;
             sessions
                 .acquire(existing, client_id)
-                .map_err(package_capability_failure)
+                .map_err(package_execution_failure)
         }
         Ok(crate::session::SessionClaim::Claimed { evicted }) => {
             close_evicted_session(&state.registry, evicted).await?;
@@ -1906,7 +1679,12 @@ async fn submit_completion(
     match generation {
         CompletionGeneration::Plain(request) => handle
             .engine
-            .generate(session, request, None)
+            .generate(
+                session,
+                request,
+                onnx_genai_engine::ToolCallPolicy::Disabled,
+                None,
+            )
             .await
             .map_err(map_generate_submit_error),
         CompletionGeneration::Fim {
@@ -2026,7 +1804,6 @@ struct PromptContext<'a> {
 
 enum StreamOutputFailure {
     Driver(DriverFailure),
-    Protocol(tool_protocol::ToolProtocolError),
     Delivery(anyhow::Error),
 }
 
@@ -2359,134 +2136,21 @@ fn build_prompt_with_tool_prefix(request: &ChatCompletionRequest, tool_prefix: &
     prompt
 }
 
-#[derive(Debug, Clone)]
-pub struct ParsedAssistantOutput {
-    pub content: Option<String>,
-    pub tool_calls: Option<Vec<ChatMessageToolCall>>,
-    pub finish_reason: &'static str,
-    pub tool_parse: ToolParseOutcome,
-}
-
-impl ParsedAssistantOutput {
-    /// Point every parsed call at a tool the caller actually offered.
-    fn aligned_to(mut self, request: &ChatCompletionRequest) -> Self {
-        if let Some(calls) = self.tool_calls.as_deref_mut() {
-            align_tool_calls(calls, request);
-        }
-        self
-    }
-}
-
-/// Resolve an over-qualified call back to the tool the caller offered.
-///
-/// A model offered a bare name sometimes answers with a dotted one, and it is
-/// led there from both directions. This package's own tool instructions carry a
-/// namespaced example (`example_tool_name.example_function_name`), which invites
-/// a leading namespace — `functions.read`. The same instructions derive the
-/// valid recipients by splitting each offered name on `.`, so a set of bare
-/// names is advertised back as `read.*`, `bash.*`, which invites a *trailing*
-/// segment instead: a model told to address `read.*` obliges by borrowing the
-/// first thing to hand, usually a parameter name — `read.filePath`.
-///
-/// Either way the extra segment is the model's spelling, not the caller's, and
-/// a client can only dispatch a name it offered — it rejects anything else as an
-/// unavailable tool. So a dotted name that is not itself on offer is resolved to
-/// an offered tool when exactly one of its segments names one.
-///
-/// Requiring exactly one *distinct* target keeps the resolution from being a
-/// guess without punishing a model that merely repeats itself: `glob.glob`
-/// names one tool twice and resolves, while a call whose segments name two
-/// different offered tools has no single intended target and is left alone. Anything else is likewise left untouched for the caller to
-/// reject, because inventing a target it never offered would be worse than the
-/// error it already knows how to report.
-fn align_tool_calls(calls: &mut [ChatMessageToolCall], request: &ChatCompletionRequest) {
-    let Some(offered) = request.tools.as_ref().filter(|_| {
-        !matches!(
-            request.tool_choice,
-            Some(ToolChoice::Mode(ToolChoiceMode::None))
-        )
-    }) else {
-        return;
-    };
-    let names_a_tool =
-        |name: &str| -> bool { offered.iter().any(|tool| tool.function.name == name) };
-    for call in calls {
-        if names_a_tool(&call.function.name) {
-            continue;
-        }
-        let targets: std::collections::BTreeSet<&str> = call
-            .function
-            .name
-            .split('.')
-            .filter(|segment| names_a_tool(segment))
-            .collect();
-        let [target] = targets.into_iter().collect::<Vec<_>>()[..] else {
-            continue;
-        };
-        let target = target.to_string();
-        call.function.name = target;
-    }
-}
-
-pub fn parse_assistant_output(
-    protocol: Option<&ToolProtocol>,
-    request: Option<&ChatCompletionRequest>,
-    output: String,
-    default_finish_reason: &'static str,
-) -> Result<ParsedAssistantOutput, tool_protocol::ToolProtocolError> {
-    // OpenAI tool calls end the assistant turn. The batch row finishes normally
-    // with finish_reason=tool_calls; role=tool follow-up messages are submitted
-    // as a new turn rather than pausing and resuming mid-token.
-    let mut stream = tool_protocol::ToolCallStream::default();
-    let outcome = match protocol {
-        Some(protocol) => {
-            stream.push(protocol, &output);
-            stream.finish(protocol)
-        }
-        None => ToolParseOutcome::NoCall,
-    };
-    if let Some(protocol) = protocol {
-        if let Some(request) = request {
-            protocol.validate_output(request, &outcome, "buffered generation boundary")?;
-        } else if let Some(error) = protocol.output_error(&outcome, "buffered generation boundary")
-        {
-            return Err(error);
-        }
-    }
-    Ok(parsed_tool_output_with_content(
-        outcome,
-        atem_visible_content(&output).unwrap_or(output),
-        default_finish_reason,
-    ))
-}
-
-fn parsed_tool_output(
-    outcome: ToolParseOutcome,
-    default_finish_reason: &'static str,
-) -> ParsedAssistantOutput {
-    parsed_tool_output_with_content(outcome, String::new(), default_finish_reason)
-}
-
-fn parsed_tool_output_with_content(
-    outcome: ToolParseOutcome,
-    content: String,
-    default_finish_reason: &'static str,
-) -> ParsedAssistantOutput {
-    if let ToolParseOutcome::Complete(tool_calls) = &outcome {
-        ParsedAssistantOutput {
-            content: None,
-            tool_calls: Some(tool_calls.clone()),
-            finish_reason: "tool_calls",
-            tool_parse: outcome,
-        }
-    } else {
-        ParsedAssistantOutput {
-            content: Some(content),
-            tool_calls: None,
-            finish_reason: default_finish_reason,
-            tool_parse: outcome,
-        }
-    }
+fn committed_chat_tool_calls(result: &GenerateResult) -> Option<Vec<ChatMessageToolCall>> {
+    (!result.tool_calls.is_empty()).then(|| {
+        result
+            .tool_calls
+            .iter()
+            .map(|call| ChatMessageToolCall {
+                id: call.id.clone(),
+                kind: "function".to_string(),
+                function: crate::types::ChatMessageToolCallFunction {
+                    name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                },
+            })
+            .collect()
+    })
 }
 
 /// Opens an ATEM channel, ending the address that names its recipient.
@@ -2935,6 +2599,17 @@ fn finish_reason_label(reason: &FinishReason) -> &'static str {
     match reason {
         FinishReason::MaxTokens | FinishReason::Length => "length",
         FinishReason::EosToken | FinishReason::StopSequence { .. } => "stop",
+        FinishReason::ToolCalls => "tool_calls",
+    }
+}
+
+#[cfg(test)]
+mod finish_reason_tests {
+    use super::*;
+
+    #[test]
+    fn tool_call_stop_maps_only_to_the_openai_tool_calls_label() {
+        assert_eq!(finish_reason_label(&FinishReason::ToolCalls), "tool_calls");
     }
 }
 
@@ -2948,22 +2623,6 @@ async fn send_tool_call_deltas(
         send_stream_chunk(tx, chunk).await?;
     }
     send_stream_chunk(tx, done_chunk(id, created, model, "tool_calls")).await
-}
-
-async fn send_tool_protocol_stream_error(
-    tx: &mpsc::Sender<Result<Event, Infallible>>,
-    error: tool_protocol::ToolProtocolError,
-) -> anyhow::Result<()> {
-    tx.send(Ok(Event::default().event("error").data(
-        serde_json::to_string(&ErrorResponse {
-            error: ErrorBody {
-                message: error.to_string(),
-                kind: "server_error",
-            },
-        })?,
-    )))
-    .await
-    .context("stream receiver closed")
 }
 
 fn completion_id() -> String {
@@ -3076,13 +2735,10 @@ mod prompt_rendering_tests {
         .expect("production preparation");
 
         assert_eq!(prepared.request.options.constraint, None);
-        let ToolParseOutcome::Complete(calls) = tool_protocol::ToolCallStream::default().push(
-            &protocol,
-            "<atem:invoke name=\"weather\"><atem:parameter name=\"city\">\"Paris\"</atem:parameter></atem:invoke>",
-        ) else {
-            panic!("ATEM generated envelope must parse through the declared adapter");
-        };
-        assert_eq!(calls[0].function.name, "weather");
+        assert_eq!(
+            tool_protocol::request_policy(&request),
+            onnx_genai_engine::ToolCallPolicy::Required
+        );
     }
 
     #[test]
@@ -3451,123 +3107,6 @@ mod output_budget_tests {
 }
 
 #[cfg(test)]
-mod tool_name_alignment_tests {
-    use super::*;
-    use serde_json::json;
-
-    fn request_offering(names: &[&str]) -> ChatCompletionRequest {
-        let tools: Vec<_> = names
-            .iter()
-            .map(|name| json!({"type": "function", "function": {"name": name}}))
-            .collect();
-        serde_json::from_value(json!({
-            "model": "m",
-            "messages": [{"role": "user", "content": "hi"}],
-            "tools": tools
-        }))
-        .expect("request")
-    }
-
-    fn call(name: &str) -> ChatMessageToolCall {
-        serde_json::from_value(json!({
-            "id": "call_0",
-            "type": "function",
-            "function": {"name": name, "arguments": "{}"}
-        }))
-        .expect("call")
-    }
-
-    fn aligned(name: &str, offered: &[&str]) -> String {
-        let mut calls = vec![call(name)];
-        align_tool_calls(&mut calls, &request_offering(offered));
-        calls.remove(0).function.name
-    }
-
-    // The package's tool instructions show a namespaced example, so the model
-    // sometimes qualifies a bare name. The client only knows the name it
-    // offered, and rejects anything else as an unavailable tool.
-    #[test]
-    fn a_namespaced_call_resolves_to_the_offered_tool() {
-        assert_eq!(aligned("glob.glob", &["glob", "read"]), "glob");
-        assert_eq!(aligned("functions.read", &["glob", "read"]), "read");
-    }
-
-    // The instructions advertise a bare tool set back as `read.*`, `bash.*`, so
-    // a model told to address `read.*` supplies a second segment from whatever
-    // is to hand -- usually a parameter name. The tool it means is unambiguous.
-    #[test]
-    fn a_call_qualified_with_a_parameter_name_resolves_to_the_offered_tool() {
-        assert_eq!(aligned("read.filePath", &["read", "bash"]), "read");
-        assert_eq!(aligned("bash.command", &["read", "bash"]), "bash");
-        assert_eq!(aligned("write.filePath.content", &["write"]), "write");
-    }
-
-    // Two segments naming two different offered tools have no single intended
-    // target, so the call is left for the caller to reject rather than resolved
-    // to whichever segment happens to be looked at first.
-    #[test]
-    fn a_call_naming_two_offered_tools_is_not_resolved() {
-        assert_eq!(aligned("read.write", &["read", "write"]), "read.write");
-    }
-
-    // A name the caller offered is never rewritten, even when it contains a dot.
-    #[test]
-    fn an_offered_name_is_left_alone() {
-        assert_eq!(aligned("glob", &["glob"]), "glob");
-        assert_eq!(aligned("fs.read", &["fs.read", "read"]), "fs.read");
-    }
-
-    // A suffix that names nothing on offer stays as the model spelled it, so
-    // the caller reports the unavailable tool it already knows how to report
-    // rather than dispatching one it never offered.
-    #[test]
-    fn an_unknown_call_is_left_for_the_caller_to_reject() {
-        assert_eq!(aligned("shell.exec", &["glob", "read"]), "shell.exec");
-        assert_eq!(aligned("wander", &["glob", "read"]), "wander");
-    }
-
-    // Suffix resolution is safe only because it matches a call's final segment
-    // against an offered tool's *whole* name, so the resolved target is always a
-    // single offered name and never a choice between two. When two offered tools
-    // merely share a final segment (`fs.read`, `net.read`) and the model writes a
-    // third namespace (`svc.read`), the bare segment `read` is offered by
-    // neither, so the call is left alone for the caller to reject rather than
-    // being resolved arbitrarily to one of them.
-    #[test]
-    fn a_shared_final_segment_is_not_resolved_arbitrarily() {
-        assert_eq!(aligned("svc.read", &["fs.read", "net.read"]), "svc.read");
-        // An exact offer still wins and is never rewritten to the other.
-        assert_eq!(aligned("net.read", &["fs.read", "net.read"]), "net.read");
-    }
-
-    // The whole path a real turn travels: an ATEM tool call the model spelled
-    // with a namespace it was never offered is parsed and then resolved to the
-    // offered tool, so the client dispatches it instead of rejecting `glob.glob`.
-    #[test]
-    fn a_namespaced_atem_call_dispatches_through_the_full_parse_path() {
-        let output = "<atem:invoke name=\"glob.glob\">\
-             <atem:parameter name=\"pattern\">*.rs</atem:parameter>\
-             </atem:invoke>"
-            .to_string();
-        let protocol =
-            ToolProtocol::from_declaration(&onnx_genai_metadata::ToolProtocolDeclaration {
-                identity: "atem-xml".to_string(),
-                version: "v1".to_string(),
-            })
-            .unwrap();
-        let parsed = parse_assistant_output(Some(&protocol), None, output, "stop")
-            .expect("declared ATEM envelope parses")
-            .aligned_to(&request_offering(&["glob", "read"]));
-        let calls = parsed.tool_calls.expect("an ATEM invoke is a tool call");
-        assert_eq!(calls.len(), 1);
-        assert_eq!(
-            calls[0].function.name, "glob",
-            "the namespaced call is dispatched to the offered flat tool"
-        );
-    }
-}
-
-#[cfg(test)]
 mod channel_gate_tests {
     use super::*;
 
@@ -3779,7 +3318,7 @@ mod channel_gate_tests {
 }
 
 // The buffered (non-streamed) path does not go through the gate: it composes
-// `atem_reasoning_content` for the reasoning and `parse_assistant_output` for
+// `atem_reasoning_content` for the reasoning and `atem_visible_content` for
 // the answer, exactly as `run_chat_completion` does. These assert that a
 // buffered turn reports its thinking on `reasoning_content` while keeping it out
 // of `content`, so the two paths agree instead of the buffered one silently
@@ -3796,13 +3335,7 @@ mod buffered_reasoning_tests {
             " to=self<|message|>weigh it<|eom|><|start|>assistant to=user<|message|>Hi<|eot|>"
                 .to_string();
         assert_eq!(atem_reasoning_content(&output).as_deref(), Some("weigh it"));
-        assert_eq!(
-            parse_assistant_output(None, None, output, "stop")
-                .expect("ordinary output parses")
-                .content
-                .as_deref(),
-            Some("Hi")
-        );
+        assert_eq!(atem_visible_content(&output).as_deref(), Some("Hi"));
     }
 
     // A buffered turn that never reaches the user still reports what it thought,
@@ -3814,12 +3347,6 @@ mod buffered_reasoning_tests {
             atem_reasoning_content(&output).as_deref(),
             Some("still going")
         );
-        assert_eq!(
-            parse_assistant_output(None, None, output, "stop")
-                .expect("ordinary output parses")
-                .content
-                .as_deref(),
-            Some("")
-        );
+        assert_eq!(atem_visible_content(&output).as_deref(), Some(""));
     }
 }

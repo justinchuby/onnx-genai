@@ -211,9 +211,6 @@ def build(output: Path) -> None:
     )
     write_tokenizer(output / "tokenizer.json")
     (output / "inference_metadata.yaml").write_text(
-        "required_capabilities:\n"
-        "- kv_cache\n"
-        "- multi_head_attention\n"
         "model:\n"
         "  attention:\n"
         "    type: multi_head\n"
