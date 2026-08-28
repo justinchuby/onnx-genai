@@ -417,6 +417,11 @@ payload where applicable. Unknown versions or operations, illegal bases,
 duplicate `finalize`, post-finalize updates, and family/operation mismatches
 **MUST** fail closed.
 
+`abort_to_baseline` is a typed turn/transaction outcome, not a
+revision-envelope operation. It identifies the aborted transaction and its
+recorded committed baseline, and invalidates every provisional publication
+owned by that transaction.
+
 `finalize` closes one revision stream early. It is optional and remains
 provisional until the enclosing turn commits. Successful turn commit finalizes
 ordinary outputs and every still-open revision stream by default. Turn abort
@@ -1025,11 +1030,11 @@ emit order, or container order.
 Commit atomically advances every participating state, effect, and output head.
 Abort, cancellation, execution failure, or commit failure restores/retracts the
 whole turn to its recorded baseline. `commit_only` exposes nothing before commit;
-`provisional_revisions` may expose typed provisional publications and a typed
-`abort_to_baseline` outcome that lets consumers invalidate all turn-owned
-revisions without inverse-payload guessing. A participant unable to join the
-transaction causes admission to fail before mutation. An exclusive lease is a
-concurrency primitive, not the transaction itself.
+`provisional_revisions` may expose typed provisional publications and the typed
+`abort_to_baseline` turn/transaction outcome defined in
+[§6.4](#64-workflow-output-publication-and-revisions). A participant unable to
+join the transaction causes admission to fail before mutation. An exclusive
+lease is a concurrency primitive, not the transaction itself.
 
 ### 12.6 Private state and checkpoints
 
