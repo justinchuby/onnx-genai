@@ -297,6 +297,56 @@ fn two_distinct_executable_geometries_use_one_generic_dispatch() -> anyhow::Resu
 }
 
 #[test]
+fn public_generation_refuses_undispatched_dflash_before_admission_or_output() -> anyhow::Result<()>
+{
+    let root = package(ALTERNATE)?;
+    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+    let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![3]));
+    request.options.max_new_tokens = 2;
+    let mut output = Vec::new();
+
+    let error = {
+        let mut callback = |token| -> anyhow::Result<()> {
+            output.push(token);
+            Ok(())
+        };
+        engine
+            .generate_with_callback(request.clone(), Some(&mut callback))
+            .expect_err("DFlash must not fall through to plain generation")
+    };
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("DFlash flat-block")
+            && message.contains("no transaction-owned DFlash generation driver"),
+        "the refusal must identify the unavailable canonical execution path: {message}"
+    );
+    assert!(
+        output.is_empty(),
+        "a DFlash request refused before admission must not publish a token"
+    );
+
+    let session = engine.create_session()?;
+    let error = {
+        let mut callback = |token| -> anyhow::Result<()> {
+            output.push(token);
+            Ok(())
+        };
+        engine
+            .generate_in_session_with_callback(session, request, Some(&mut callback))
+            .expect_err("session generation must share the DFlash admission refusal")
+    };
+    assert!(
+        format!("{error:#}").contains("Refusing to silently execute plain generation"),
+        "session generation must not bypass the canonical DFlash gate: {error:#}"
+    );
+    assert!(
+        output.is_empty(),
+        "the session refusal must not publish a token"
+    );
+    Ok(())
+}
+
+#[test]
 fn greedy_zero_partial_full_acceptance_commits_only_the_prefix() -> anyhow::Result<()> {
     let geometry = QWEN_REDUCED;
     let root = package(geometry)?;

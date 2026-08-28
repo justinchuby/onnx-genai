@@ -23,6 +23,29 @@ use crate::pipeline::{
 };
 
 impl Engine {
+    /// DFlash metadata is precise enough to be executable only through its
+    /// proposer/verifier transaction driver. Until that driver exists, every
+    /// public generation entry rejects the declaration before admission rather
+    /// than silently executing the ordinary decoder loop.
+    pub(crate) fn reject_undispatched_dflash_generation(&self) -> anyhow::Result<()> {
+        let Some(contract) = self.workflow.speculative_contract() else {
+            return Ok(());
+        };
+        let onnx_genai_metadata::SpeculativeProposalExecution::DflashFlatBlock { version, .. } =
+            &contract.proposal_execution
+        else {
+            return Ok(());
+        };
+        anyhow::bail!(
+            "package declares canonical DFlash flat-block speculation \
+             (onnx-genai.dflash-flat-block@{version}), but this runtime has no transaction-owned \
+             DFlash generation driver. Refusing to silently execute plain generation without \
+             declared target conditioning, proposer/verifier execution, accepted-prefix S3 \
+             commit, and rollback participants. Upgrade to a runtime that implements DFlash \
+             dispatch before generating from this package."
+        );
+    }
+
     /// How many device→host materializations this runtime has performed.
     ///
     /// A proposal chain's per-token work is supposed to stay on the device that
@@ -177,6 +200,7 @@ impl Engine {
         mut on_admitted: Option<&mut dyn FnMut()>,
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
+        self.reject_undispatched_dflash_generation()?;
         // A request that binds no tensors is a prompt, and a prompt is served
         // by the ordinary entry point — which admits through the scheduler,
         // reuses a cached prefix, and routes the declared decode step to the
