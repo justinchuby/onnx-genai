@@ -1126,6 +1126,355 @@
       ],
       "type": "object"
     },
+    "DFlashBlockLayout": {
+      "additionalProperties": false,
+      "description": "Flat anchor-plus-mask block presented to one DFlash invocation.",
+      "properties": {
+        "anchor_position": {
+          "description": "Position holding the verifier-produced anchor token.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "attention_mask_input": {
+          "description": "Proposer input receiving validity for target context followed by the\nflat block.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "first_candidate_position": {
+          "description": "First position predicted in parallel. Validation requires this to be\nexactly one past `anchor_position`.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "mask_token_id": {
+          "description": "Token whose shared target embedding initializes masked positions.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "masked_positions_input": {
+          "description": "Proposer input receiving a boolean tensor with `true` exactly at masked\ncandidate positions and `false` at the anchor.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "noise_embeddings_input": {
+          "description": "Proposer input receiving target-embedding rows for the anchor followed\nby the masked candidate positions.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "position_ids_input": {
+          "description": "Proposer input receiving absolute positions for target context followed\nby the flat block.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "noise_embeddings_input",
+        "masked_positions_input",
+        "position_ids_input",
+        "attention_mask_input",
+        "anchor_position",
+        "first_candidate_position",
+        "mask_token_id"
+      ],
+      "type": "object"
+    },
+    "DFlashConditioning": {
+      "additionalProperties": false,
+      "description": "Explicit target-feature conditioning for a DFlash proposer.",
+      "properties": {
+        "combination": {
+          "$ref": "#/$defs/DFlashFeatureCombination",
+          "description": "Structural operation used to combine multiple sources."
+        },
+        "proposer_input": {
+          "description": "Proposer input receiving the fused target features.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "sources": {
+          "description": "Target component outputs, in concatenation order.\n\nA source must be a floating rank-3 `[batch, sequence, hidden]` output\nwith semantic role `hidden_states`. Layer selection is therefore\nproducer-authored provenance, not a runtime model-family lookup.",
+          "items": {
+            "$ref": "#/$defs/SpeculativeValueRef"
+          },
+          "minItems": 1,
+          "type": "array"
+        }
+      },
+      "required": [
+        "sources",
+        "proposer_input",
+        "combination"
+      ],
+      "type": "object"
+    },
+    "DFlashConvolutionContract": {
+      "additionalProperties": false,
+      "description": "DFlash 2 block-local grouped dynamic convolution ABI.",
+      "properties": {
+        "first_position_reads_anchor": {
+          "description": "The first candidate reads the anchor representation as its predecessor.",
+          "type": "boolean"
+        },
+        "group_size": {
+          "format": "uint",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "kernel_size": {
+          "format": "uint",
+          "minimum": 2,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "kernel_size",
+        "group_size",
+        "first_position_reads_anchor"
+      ],
+      "type": "object"
+    },
+    "DFlashFeatureCombination": {
+      "description": "How target hidden features are fused before DFlash consumes them.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "Concatenate sources in declaration order along `axis`.",
+          "properties": {
+            "axis": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "kind": {
+              "const": "concatenate",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "axis"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "DFlashOutputProjection": {
+      "additionalProperties": false,
+      "description": "Target LM-head initializer and the proposer input that borrows it.",
+      "properties": {
+        "component": {
+          "description": "Component owning the immutable initializer.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "initializer": {
+          "description": "Exact initializer name.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "layout": {
+          "$ref": "#/$defs/DFlashProjectionLayout",
+          "description": "Matrix layout required by the proposer graph."
+        },
+        "proposer_input": {
+          "description": "Proposer input receiving the initializer as a read-only tensor.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "component",
+        "initializer",
+        "proposer_input",
+        "layout"
+      ],
+      "type": "object"
+    },
+    "DFlashOutputs": {
+      "additionalProperties": false,
+      "description": "Typed outputs of DFlash proposal and verification.",
+      "properties": {
+        "candidate_tokens": {
+          "description": "Proposer output containing selected candidate token ids\n`[batch, proposal]`.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "proposal_probabilities": {
+          "description": "Full-vocabulary proposal probabilities `[batch, proposal, vocabulary]`.\n\nAbsence is valid for greedy-only execution. A sampling request must be\nrejected before invoking the proposer when this field is absent.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "verifier_logits": {
+          "$ref": "#/$defs/SpeculativeValueRef",
+          "description": "Target output containing exact verification logits\n`[batch, proposal_plus_bonus, vocabulary]`."
+        }
+      },
+      "required": [
+        "candidate_tokens",
+        "verifier_logits"
+      ],
+      "type": "object"
+    },
+    "DFlashProjectionLayout": {
+      "description": "Layout of the shared output projection.",
+      "enum": [
+        "hidden_vocabulary",
+        "vocabulary_hidden"
+      ],
+      "type": "string"
+    },
+    "DFlashSelectorContract": {
+      "additionalProperties": false,
+      "description": "DFlash 2 adjacent-candidate selector ABI.",
+      "properties": {
+        "candidate_ids_output": {
+          "description": "Proposer output containing top-k candidate ids\n`[batch, proposal, candidates]`.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "conditional_probabilities_output": {
+          "description": "Proposer output containing the selected conditional distribution over\n`candidate_ids_output`, required for sampling.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rank": {
+          "format": "uint",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "selected_tokens_output": {
+          "description": "Proposer output containing the selected path `[batch, proposal]`.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "top_k": {
+          "format": "uint",
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "selected_tokens_output",
+        "candidate_ids_output",
+        "top_k",
+        "rank"
+      ],
+      "type": "object"
+    },
+    "DFlashSharedWeights": {
+      "additionalProperties": false,
+      "description": "Immutable target weights DFlash reuses.",
+      "properties": {
+        "input_embedding": {
+          "$ref": "#/$defs/TokenEmbeddingSource",
+          "description": "Target token embedding table used for anchor and mask rows."
+        },
+        "output_projection": {
+          "$ref": "#/$defs/DFlashOutputProjection",
+          "description": "Target output projection passed read-only to the proposer."
+        }
+      },
+      "required": [
+        "input_embedding",
+        "output_projection"
+      ],
+      "type": "object"
+    },
+    "DFlashStateCommit": {
+      "description": "How one speculative state cell is reduced to the accepted prefix.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "The component's ordinary state output grows on its declared sequence\naxis and is truncated to `baseline + accepted`.",
+          "properties": {
+            "kind": {
+              "const": "sequence",
+              "type": "string"
+            },
+            "source": {
+              "$ref": "#/$defs/SpeculativeValueRef"
+            }
+          },
+          "required": [
+            "kind",
+            "source"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The component emits one complete fixed-state snapshot for each possible\naccepted length, including prefix zero.",
+          "properties": {
+            "axis": {
+              "description": "Axis enumerating prefix lengths `0..=proposal`.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "kind": {
+              "const": "prefix_snapshots",
+              "type": "string"
+            },
+            "source": {
+              "$ref": "#/$defs/SpeculativeValueRef"
+            }
+          },
+          "required": [
+            "kind",
+            "source",
+            "axis"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "DFlashStructure": {
+      "description": "Exact DFlash structural family.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "Base DFlash: parallel masked-block prediction with target KV injection.",
+          "properties": {
+            "kind": {
+              "const": "base",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "DFlash 2: base DFlash plus an explicit adjacent-candidate selector and\nblock-local dynamic convolution.",
+          "properties": {
+            "convolution": {
+              "$ref": "#/$defs/DFlashConvolutionContract"
+            },
+            "kind": {
+              "const": "selector_convolution_v1",
+              "type": "string"
+            },
+            "selector": {
+              "$ref": "#/$defs/DFlashSelectorContract"
+            }
+          },
+          "required": [
+            "kind",
+            "selector",
+            "convolution"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "DType": {
       "description": "Scalar dtype vocabulary with common ONNX and runtime aliases.",
       "oneOf": [
@@ -3126,6 +3475,67 @@
           },
           "required": [
             "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "One DFlash invocation predicts every masked position of a flat block in\nparallel from explicitly bound target hidden features.\n\nVersion 1 is the base DFlash architecture. Version 2 adds the DFlash 2\nselector and block-local convolution through [`DFlashStructure`];\nneither version is inferred from optional ports or tensor names.",
+          "properties": {
+            "accepted_prefix_state": {
+              "additionalProperties": {
+                "$ref": "#/$defs/DFlashStateCommit"
+              },
+              "description": "How every rollback participant commits exactly one accepted prefix.\n\nThe keys must equal the enclosing contract's `rollback_state`.\nSequence state is truncated on its declared state-group sequence\naxis. Fixed recurrent state selects an explicitly emitted\nper-prefix snapshot; a runtime never guesses from a port name.",
+              "type": "object"
+            },
+            "block": {
+              "$ref": "#/$defs/DFlashBlockLayout",
+              "description": "Anchor/masked-position layout and the proposer inputs carrying it."
+            },
+            "conditioning": {
+              "$ref": "#/$defs/DFlashConditioning",
+              "description": "Target hidden features and how they become one proposer input."
+            },
+            "draft_private_state": {
+              "description": "Mutable state cells owned only by the drafter.\n\nEvery cell is also present in the enclosing contract's\n`rollback_state`; the separate set distinguishes private draft\nstate from target state without creating another rollback authority.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array",
+              "uniqueItems": true
+            },
+            "kind": {
+              "const": "dflash_flat_block",
+              "type": "string"
+            },
+            "outputs": {
+              "$ref": "#/$defs/DFlashOutputs",
+              "description": "Proposer and verifier outputs consumed by the generic runtime."
+            },
+            "shared_weights": {
+              "$ref": "#/$defs/DFlashSharedWeights",
+              "description": "Immutable target initializers reused by the proposer."
+            },
+            "structure": {
+              "$ref": "#/$defs/DFlashStructure",
+              "description": "Base DFlash or an exact versioned structural extension."
+            },
+            "version": {
+              "description": "Exact structural ABI version implemented by the reader.",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "version",
+            "conditioning",
+            "block",
+            "outputs",
+            "shared_weights",
+            "accepted_prefix_state",
+            "structure"
           ],
           "type": "object"
         },
@@ -5535,7 +5945,7 @@
       "type": "array"
     },
     "schema_version": {
-      "description": "Schema version of this inference-metadata document, e.g. `\"v1.1\"`.\n\nCanonically `\"v<major>.<minor>\"`, matching the `v1` that every writer in\nthis repository already stamps. Absence means the initial `v1.0`\ncontract, as do the spellings `\"v1\"`, `\"1\"`, `\"1.0\"` and `\"v1.0\"` that\npredate a canonical form; readers normalize before comparing, so all of\nthem keep loading and `\"1.1\"` is an accepted synonym for `\"v1.1\"`. A\ndocument that uses nothing new keeps stamping what it already stamped —\nrewriting an existing spelling would change the package's semantic\nidentity to say something no reader distinguishes. Bump the major only\nfor breaking schema changes, and the minor whenever a document may carry\na field an older reader would not know.\n\nAn additive field keeps the same major version, but note what that does\nand does not buy: the v1 surface is closed — every structure here denies\nunknown fields — so a reader built before a field was added rejects a\ndocument that uses it rather than ignoring it. Compatibility with older\nreaders therefore comes from a new field being *absent by default*, not\nfrom tolerance of unknown keys. A producer that emits one is declaring\nthat the package needs a reader which understands it, and a package that\ndoes not emit it keeps loading everywhere it loaded before.\n\nThat is a statement about *additive* fields, and it is not a promise that\nthis schema never reshapes one it already had. It does, while it is\npre-release: `token_packed` moved its `offsets` and `owner` into a\n`levels` chain in v1.1, and a document written against the flat spelling\ndoes not load at any version. A version says which fields a reader must\nunderstand; it is not a compatibility guarantee spanning a reshape, and\nnothing here silently reads an old spelling as a new one. See\n`reject_flat_token_packed`.\n\nA component using `onnx-genai.token-context@1` declares at least\n`v1.4`: the component-contract fields predate that version, so only the\nversion gate prevents a v1.3 reader from accepting the document while\nsilently ignoring the token-identity semantics.",
+      "description": "Schema version of this inference-metadata document, e.g. `\"v1.1\"`.\n\nCanonically `\"v<major>.<minor>\"`, matching the `v1` that every writer in\nthis repository already stamps. Absence means the initial `v1.0`\ncontract, as do the spellings `\"v1\"`, `\"1\"`, `\"1.0\"` and `\"v1.0\"` that\npredate a canonical form; readers normalize before comparing, so all of\nthem keep loading and `\"1.1\"` is an accepted synonym for `\"v1.1\"`. A\ndocument that uses nothing new keeps stamping what it already stamped —\nrewriting an existing spelling would change the package's semantic\nidentity to say something no reader distinguishes. Bump the major only\nfor breaking schema changes, and the minor whenever a document may carry\na field an older reader would not know.\n\nAn additive field keeps the same major version, but note what that does\nand does not buy: the v1 surface is closed — every structure here denies\nunknown fields — so a reader built before a field was added rejects a\ndocument that uses it rather than ignoring it. Compatibility with older\nreaders therefore comes from a new field being *absent by default*, not\nfrom tolerance of unknown keys. A producer that emits one is declaring\nthat the package needs a reader which understands it, and a package that\ndoes not emit it keeps loading everywhere it loaded before.\n\nThat is a statement about *additive* fields, and it is not a promise that\nthis schema never reshapes one it already had. It does, while it is\npre-release: `token_packed` moved its `offsets` and `owner` into a\n`levels` chain in v1.1, and a document written against the flat spelling\ndoes not load at any version. A version says which fields a reader must\nunderstand; it is not a compatibility guarantee spanning a reshape, and\nnothing here silently reads an old spelling as a new one. See\n`reject_flat_token_packed`.\n\nA component using `onnx-genai.token-context@1` declares at least\n`v1.4`: the component-contract fields predate that version, so only the\nversion gate prevents a v1.3 reader from accepting the document while\nsilently ignoring the token-identity semantics.\n\nA DFlash flat-block proposal declares at least `v1.5`, so a v1.4 reader\nrefuses before ignoring its target-hidden provenance, probability, and\naccepted-prefix state fields.",
       "type": [
         "string",
         "null"

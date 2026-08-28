@@ -998,6 +998,7 @@ impl<'a> WorkflowExecutionPlan<'a> {
         request: PipelineGenerateRequest,
         hosted: &[&str],
     ) -> anyhow::Result<Self> {
+        engine.require_execution_admitted()?;
         let PipelineGenerateRequest {
             request,
             inputs,

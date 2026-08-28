@@ -588,6 +588,9 @@ pub(crate) fn session_fork_failure(error: anyhow::Error) -> ApiError {
 pub(crate) fn package_capability_failure(capability: PackageCapabilityError) -> ApiError {
     match capability {
         PackageCapabilityError::NoSessionState => ApiError::conflict(capability.to_string()),
+        PackageCapabilityError::DFlashExecutionUnavailable { .. } => {
+            ApiError::conflict(capability.to_string())
+        }
         PackageCapabilityError::ConversationOverBound { .. } => {
             ApiError::invalid_request(capability.to_string())
         }

@@ -128,6 +128,8 @@ pub(crate) struct WorkflowPlan {
     pub(crate) device_bridge_components: HashSet<String>,
     pub(crate) memory_strategy_plan: MemoryStrategyPlan,
     pub(crate) decode_backend: EngineDecodeBackend,
+    /// Canonical construction-time decision reused by every execution entry.
+    pub(crate) execution_admission: super::WorkflowExecutionAdmission,
     pub(crate) adapter_service: Option<onnx_genai_metadata::AdapterServiceContract>,
     pub(crate) preprocessing: Option<PreprocessingSpec>,
     /// The package's speculative compatibility contract, when it declares one.
@@ -261,6 +263,14 @@ pub(crate) struct WorkerRuntimeState {
     /// declared normalizer joins them for the same reason: it changes what the
     /// cached rows are, not merely where they live.
     pub(crate) embedding_tables: RefCell<HashMap<EmbeddingTableKey, Rc<EmbeddingTable>>>,
+    /// Immutable non-embedding initializers borrowed across components by a
+    /// declared speculative contract.
+    ///
+    /// DFlash passes the target LM head into the proposer as a read-only input.
+    /// Loading that matrix once per proposal would turn a metadata lookup into
+    /// the dominant draft cost, while copying it into the proposer artifact
+    /// would violate the declared shared-weight relationship.
+    pub(crate) shared_initializers: RefCell<HashMap<(String, String), Rc<onnx_genai_ort::Value>>>,
     /// Session-scoped workflow cells, keyed by `(session id, cell)`.
     ///
     /// Per-session state living on the owning worker: §3.2 storage under §3.3
@@ -334,6 +344,7 @@ impl Default for WorkerRuntimeState {
             component_allocators: RefCell::new(HashMap::new()),
             component_outputs: RefCell::new(HashMap::new()),
             embedding_tables: RefCell::new(HashMap::new()),
+            shared_initializers: RefCell::new(HashMap::new()),
             session_state: RefCell::new(HashMap::new()),
             session_effects: RefCell::new(HashMap::new()),
             session_outputs: RefCell::new(HashMap::new()),

@@ -509,6 +509,14 @@ const MATRIX: &[Row] = &[
         Some("decoder"),
     ),
     row(
+        "tests/fixtures/tiny-llm-cursor-fallback/inference_metadata.yaml",
+        1,
+        SingleGraph,
+        Some("decoder"),
+        true,
+        Some("decoder"),
+    ),
+    row(
         "tests/fixtures/tiny-llm-explicit-io/inference_metadata.yaml",
         1,
         SingleGraph,
@@ -735,7 +743,8 @@ fn collect_workflows(directory: &Path, root: &Path, found: &mut BTreeSet<String>
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().into_owned();
         if path.is_dir() {
-            if !SKIPPED.contains(&name.as_str()) {
+            let cargo_or_tool_cache = path.join("CACHEDIR.TAG").is_file();
+            if !SKIPPED.contains(&name.as_str()) && !cargo_or_tool_cache {
                 collect_workflows(&path, root, found);
             }
             continue;

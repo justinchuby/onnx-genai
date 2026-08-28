@@ -54,6 +54,9 @@ pub const TOOL_PROTOCOL_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 3)
 /// The version that introduced the graph-internal token-context contract.
 pub const TOKEN_CONTEXT_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 4);
 
+/// The version that introduced the generalized DFlash flat-block contract.
+pub const DFLASH_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 5);
+
 /// The version that introduced output publication families and typed revision
 /// envelopes.
 pub const OUTPUT_PROTOCOL_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 5);
@@ -213,6 +216,10 @@ mod tests {
         assert_eq!(
             gate(Some("1.3")).expect("1.3"),
             TOOL_PROTOCOL_SCHEMA_VERSION
+        );
+        assert_eq!(
+            gate(Some("1.4")).expect("1.4"),
+            TOKEN_CONTEXT_SCHEMA_VERSION
         );
         assert_eq!(gate(Some("1.5")).expect("1.5"), SUPPORTED_SCHEMA_VERSION);
     }

@@ -320,14 +320,20 @@ impl Engine {
         // that foreign format into this project's one representation — and which
         // needs a resolvable model directory, something a composite workflow
         // package (components in subdirectories) deliberately does not present.
-        let metadata = match onnx_genai_metadata::parser::load_metadata_from_dir(model_dir)
-            .map_err(|error| anyhow::anyhow!("{error}"))?
-        {
-            Some(metadata) => Some(metadata),
-            None => onnx_genai_ort::ModelDirectory::load(model_dir)
+        let metadata = if onnx_genai_metadata::find_metadata_path(model_dir).is_some() {
+            Some(
+                onnx_genai_metadata::load_metadata_package(model_dir)
+                    .map_err(|error| anyhow::anyhow!("{error}"))?,
+            )
+        } else {
+            onnx_genai_ort::ModelDirectory::load(model_dir)
                 .ok()
-                .and_then(|directory| load_inference_metadata(&directory).ok()),
+                .and_then(|directory| load_inference_metadata(&directory).ok())
         };
+        if let Some(metadata) = &metadata {
+            crate::pipeline::WorkflowExecutionAdmission::from_metadata(metadata)
+                .require_supported()?;
+        }
         metadata
             .as_ref()
             .and_then(|metadata| metadata.pipeline.as_ref())

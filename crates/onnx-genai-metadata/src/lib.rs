@@ -101,6 +101,8 @@ pub mod capabilities {
         EXPLICIT_TRANSFER = "explicit_transfer";
         /// Graph-internal stateful token-context feature injection.
         TOKEN_CONTEXT = "token_context";
+        /// Target-hidden-conditioned DFlash flat-block speculative proposal.
+        DFLASH_FLAT_BLOCK = "dflash_flat_block";
     }
 }
 
@@ -146,9 +148,9 @@ pub use validation::{
     validate_metadata, validate_pipeline_spec, validate_structure_and_capabilities,
 };
 pub use version::{
-    BATCHING_SCHEMA_VERSION, INITIAL_SCHEMA_VERSION, OUTPUT_PROTOCOL_SCHEMA_VERSION,
-    SUPPORTED_SCHEMA_VERSION, SchemaVersion, TOKEN_AUTHORITY_SCHEMA_VERSION,
-    TOOL_PROTOCOL_SCHEMA_VERSION,
+    BATCHING_SCHEMA_VERSION, DFLASH_SCHEMA_VERSION, INITIAL_SCHEMA_VERSION,
+    OUTPUT_PROTOCOL_SCHEMA_VERSION, SUPPORTED_SCHEMA_VERSION, SchemaVersion,
+    TOKEN_AUTHORITY_SCHEMA_VERSION, TOOL_PROTOCOL_SCHEMA_VERSION,
 };
 
 /// Generates the inference-metadata JSON Schema with deterministic object-key ordering.

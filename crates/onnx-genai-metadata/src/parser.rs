@@ -82,9 +82,14 @@ impl SpeculatorDescriptor {
                 SpeculatorProposerStatus::NotYetSupported(SpeculatorProposerKind::PEagle)
             }
             ProposalType::Mtp => Self::resolve_mtp(model_dir, &config),
-            ProposalType::DFlash => {
-                SpeculatorProposerStatus::NotYetSupported(SpeculatorProposerKind::DFlash)
-            }
+            ProposalType::DFlash => SpeculatorProposerStatus::Unknown(
+                "legacy `proposal_type: dflash` is not an executable authority. Re-export one \
+                 canonical `speculative.proposal_execution: { kind: dflash_flat_block, version: \
+                 \"1\" | \"2\", ... }` contract with explicit target-hidden provenance, block \
+                 layout, probabilities, shared initializers, verifier outputs, and accepted-prefix \
+                 state participants"
+                    .into(),
+            ),
             // A legacy `shared_kv` speculator no longer selects a runtime path.
             // Borrowed-KV drafting is declared by the package's
             // `speculative.proposal_execution: {kind: chained}` contract and
@@ -995,6 +1000,45 @@ speculative:
         assert!(
             reason.contains("proposal_execution") && reason.contains("chained"),
             "the diagnostic must point at the workflow contract: {reason}"
+        );
+    }
+
+    #[test]
+    fn legacy_dflash_is_migration_input_not_parallel_runtime_authority() {
+        let descriptor = SpeculatorDescriptor::from_config(
+            Path::new("/models/dflash"),
+            SpeculatorConfig {
+                proposal_type: ProposalType::DFlash,
+                num_speculative_tokens: 8,
+                verifier: None,
+                model: None,
+                io: None,
+                backbone_hidden_size: None,
+                vocab_size: None,
+                projected_state_output: None,
+                logits_output: None,
+                input_embedding: None,
+                shared_kv: Vec::new(),
+                target_hidden_output: None,
+                target_hidden_layout: None,
+                target_hidden_size: None,
+                hc_mult: None,
+                mtp_hidden_output: None,
+                mtp_state_output: None,
+                kv_mode: None,
+                embedding: None,
+                lm_head: None,
+            },
+            SpeculatorConfigSource::HuggingFaceConfig,
+        );
+        let SpeculatorProposerStatus::Unknown(reason) = descriptor.proposer else {
+            panic!("legacy DFlash must not resolve beside the canonical workflow contract");
+        };
+        assert!(
+            reason.contains("dflash_flat_block")
+                && reason.contains("target-hidden provenance")
+                && reason.contains("accepted-prefix"),
+            "{reason}"
         );
     }
 

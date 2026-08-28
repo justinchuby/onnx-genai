@@ -29,6 +29,7 @@ mod arg_reduce;
 mod audio;
 mod batching;
 mod device_ops;
+mod execution_admission;
 pub(crate) mod generation;
 mod islands;
 #[cfg(feature = "native-backend")]
@@ -47,6 +48,7 @@ pub use batching::{
     BatchContractError, ComposedOwnership, OwnershipLevelValues, PackedOwnership,
     PackedRequestView, PackedTensor, PackedValueView, RebasedI64Slice, batch_contract_error,
 };
+pub(crate) use execution_admission::WorkflowExecutionAdmission;
 pub(crate) use generation::validate_generation_workflow;
 pub use islands::ExecutionIslandDiagnostic;
 pub use onnx_genai_metadata::WorkflowOutputRole;
@@ -131,6 +133,81 @@ impl std::ops::Deref for PipelineOutputs {
 
     fn deref(&self) -> &Self::Target {
         &self.tensors
+    }
+}
+
+#[cfg(test)]
+mod dflash_constructor_admission_tests {
+    use super::*;
+    use crate::memory_authority::{DeviceCompatibilityDomain, DeviceMemoryAuthority};
+    use onnx_runtime_memory_governor::ProcessMemoryManager;
+    use std::path::PathBuf;
+
+    struct PanicAuthorityProvider;
+
+    impl MemoryAuthorityProvider for PanicAuthorityProvider {
+        fn process_memory_manager(&self) -> ProcessMemoryManager {
+            panic!("DFlash admission must precede authority allocation")
+        }
+
+        fn validate_limit(
+            &self,
+            _domain: &DeviceCompatibilityDomain,
+            _requested: crate::ResourceLimit,
+        ) -> anyhow::Result<()> {
+            panic!("DFlash admission must precede authority validation")
+        }
+
+        fn authority(
+            &self,
+            _domain: &DeviceCompatibilityDomain,
+            _resolved_limit_bytes: u64,
+        ) -> anyhow::Result<DeviceMemoryAuthority> {
+            panic!("DFlash admission must precede device authority allocation")
+        }
+    }
+
+    fn fixture() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dflash-admission")
+    }
+
+    fn assert_dflash_refusal(error: anyhow::Error) {
+        assert!(matches!(
+            crate::engine::package_capability_error(&error),
+            Some(crate::engine::PackageCapabilityError::DFlashExecutionUnavailable {
+                version,
+                capability,
+            }) if version == "1"
+                && capability == onnx_genai_metadata::capabilities::DFLASH_FLAT_BLOCK
+        ));
+    }
+
+    #[test]
+    fn every_direct_workflow_constructor_refuses_before_model_or_authority_allocation() {
+        let root = fixture();
+        assert!(
+            PipelineModelDirectory::load(&root).is_err(),
+            "the empty ONNX files make this a loader spy: reaching component admission must fail"
+        );
+
+        let error = WorkflowRuntime::from_dir_with_session_options(
+            &root,
+            EngineConfig::default(),
+            SessionOptions::default(),
+        )
+        .err()
+        .expect("direct workflow construction must refuse DFlash");
+        assert_dflash_refusal(error);
+
+        let error = WorkflowRuntime::from_dir_with_session_options_and_memory_authority_provider(
+            &root,
+            EngineConfig::default(),
+            SessionOptions::default(),
+            Arc::new(PanicAuthorityProvider),
+        )
+        .err()
+        .expect("provider workflow construction must refuse DFlash");
+        assert_dflash_refusal(error);
     }
 }
 
@@ -425,6 +502,9 @@ impl WorkflowRuntime {
         models: PipelineModels,
         speculative: Option<onnx_genai_metadata::SpeculativeContract>,
     ) -> anyhow::Result<Self> {
+        let execution_admission =
+            WorkflowExecutionAdmission::from_speculative(speculative.as_ref());
+        execution_admission.require_supported()?;
         let compiled_workflow = onnx_genai_metadata::compile_workflow(&workflow)
             .map_err(|error| anyhow::anyhow!("Failed to lower workflow metadata: {error}"))?;
         let row_wise_outputs = workflow::workflow_row_wise_outputs(&compiled_workflow.graph);
@@ -442,6 +522,7 @@ impl WorkflowRuntime {
                 device_bridge_components,
                 memory_strategy_plan,
                 decode_backend,
+                execution_admission,
                 adapter_service: None,
                 preprocessing: None,
                 speculative,
@@ -474,6 +555,10 @@ impl WorkflowRuntime {
         session_options: SessionOptions,
         authority_provider: Option<SharedMemoryAuthorityProvider>,
     ) -> anyhow::Result<(Self, EngineResourceGovernor)> {
+        let metadata = onnx_genai_metadata::load_metadata_package(pipeline_dir)
+            .map_err(|error| anyhow::anyhow!("Failed to resolve workflow package: {error}"))?;
+        let execution_admission = WorkflowExecutionAdmission::from_metadata(&metadata);
+        execution_admission.require_supported()?;
         let decode_backend = validate_pipeline_backend_request(config.decode_backend)?;
         let authority_domain = crate::engine::session_device_domain(&session_options)?;
         crate::engine::validate_shared_authority_limit(
@@ -799,6 +884,7 @@ impl WorkflowRuntime {
                     device_bridge_components,
                     memory_strategy_plan,
                     decode_backend,
+                    execution_admission,
                     adapter_service: directory.adapters,
                     preprocessing: directory.preprocessing,
                     speculative,
@@ -818,6 +904,29 @@ impl WorkflowRuntime {
 
     pub fn decode_backend(&self) -> EngineDecodeBackend {
         self.plan.decode_backend
+    }
+
+    pub(crate) fn require_execution_admitted(&self) -> anyhow::Result<()> {
+        self.plan.execution_admission.require_supported()?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_execution_admission_for_test(
+        &mut self,
+        admission: WorkflowExecutionAdmission,
+    ) {
+        Arc::get_mut(&mut self.plan)
+            .expect("a fresh test runtime has one plan owner")
+            .execution_admission = admission;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn output_publication_state_for_test(&self) -> (usize, usize) {
+        (
+            self.worker.session_outputs.borrow().len(),
+            self.worker.last_output_publications.borrow().len(),
+        )
     }
 
     /// The immutable plan this runtime executes (§3.1).
