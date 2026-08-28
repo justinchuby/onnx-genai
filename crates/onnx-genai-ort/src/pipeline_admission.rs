@@ -836,6 +836,8 @@ mod tests {
     fn a_block_proposer_without_a_folded_carry_is_ignored() {
         let signatures = verifier_signatures();
         let yaml = [
+            "identity: onnx-genai.speculative",
+            "version: '1'",
             "proposer: proposer",
             "target: verifier",
             "proposal_execution:",
@@ -843,6 +845,9 @@ mod tests {
             "vocabulary:",
             "  kind: identical",
             "max_proposal_width: 4",
+            "verification:",
+            "  target_output: {component: verifier, output: logits}",
+            "  accepted_path: {kind: runtime, binding: accepted_prefix}",
         ]
         .join("\n");
         let speculative: onnx_genai_metadata::SpeculativeContract =

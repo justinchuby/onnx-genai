@@ -12,8 +12,8 @@ use anyhow::Context;
 use onnx_genai_metadata::decoder_workflow::IterationPolicy;
 use onnx_genai_metadata::{
     ComponentImplementation, DeviceKind, LiteralValue, RuntimeInputRole, ScalarValue,
-    TensorContract, TensorDimension, WorkflowEmitMode, WorkflowInputSource, WorkflowNode,
-    WorkflowSpec,
+    SpeculativeContract, SpeculativeProposalExecution, TensorContract, TensorDimension,
+    WorkflowEmitMode, WorkflowInputSource, WorkflowNode, WorkflowSpec,
 };
 use onnx_genai_ort::{
     DataType, PipelineModelDirectory, PipelineModels, SessionOptions, Tokenizer, Value,
@@ -63,6 +63,36 @@ pub use workflow::{
 pub(crate) use workflow::{
     PerTokenCursorIneligible, WorkflowGenerationCursor, WorkflowNodeHost, WorkflowNodeRequest,
 };
+
+/// Admit only speculative package contracts for which this runtime has a
+/// package-dispatch executor.
+///
+/// Metadata validation owns protocol identity, exact version, and topology.
+/// This runtime gate owns implementation capability and must run before model,
+/// session, state, or output construction.
+pub(crate) fn admit_speculative_runtime(
+    contract: Option<&SpeculativeContract>,
+) -> anyhow::Result<()> {
+    let Some(contract) = contract else {
+        return Ok(());
+    };
+    if !matches!(
+        contract.proposal_execution,
+        SpeculativeProposalExecution::CandidateTree { .. }
+    ) {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "package declares canonical candidate-tree speculation \
+         (onnx-genai.speculative@{}), but this runtime has no candidate-tree \
+         package-dispatch capability or executor. Refusing to silently run plain or MTP \
+         generation without the declared proposer, target verification, accepted-prefix \
+         commit, and rollback participants. Upgrade to a runtime that implements \
+         candidate-tree dispatch, or re-export this package with a supported canonical \
+         proposal execution.",
+        contract.version
+    );
+}
 
 pub fn has_buffered_pcm16_wav_output(workflow: &WorkflowSpec) -> bool {
     audio::has_buffered_pcm16_wav_output(workflow)
@@ -387,6 +417,7 @@ impl WorkflowRuntime {
         models: PipelineModels,
         speculative: Option<onnx_genai_metadata::SpeculativeContract>,
     ) -> anyhow::Result<Self> {
+        admit_speculative_runtime(speculative.as_ref())?;
         let compiled_workflow = onnx_genai_metadata::compile_workflow(&workflow)
             .map_err(|error| anyhow::anyhow!("Failed to lower workflow metadata: {error}"))?;
         let row_wise_outputs = workflow::workflow_row_wise_outputs(&compiled_workflow.graph);
@@ -436,6 +467,12 @@ impl WorkflowRuntime {
         session_options: SessionOptions,
         authority_provider: Option<SharedMemoryAuthorityProvider>,
     ) -> anyhow::Result<(Self, EngineResourceGovernor)> {
+        let directory =
+            PipelineModelDirectory::load_with_metadata_preflight(pipeline_dir, |metadata| {
+                admit_speculative_runtime(metadata.speculative.as_ref())
+                    .map_err(|error| onnx_genai_ort::OrtError::InvalidArgument(error.to_string()))
+            })
+            .map_err(|error| anyhow::anyhow!("Failed to resolve workflow package: {error}"))?;
         let decode_backend = validate_pipeline_backend_request(config.decode_backend)?;
         let authority_domain = crate::engine::session_device_domain(&session_options)?;
         crate::engine::validate_shared_authority_limit(
@@ -443,8 +480,6 @@ impl WorkflowRuntime {
             &authority_domain,
             config.limits.vram_limit,
         )?;
-        let directory = PipelineModelDirectory::load(pipeline_dir)
-            .map_err(|error| anyhow::anyhow!("Failed to resolve workflow package: {error}"))?;
         for (component, declaration) in &directory.spec.workflow.components {
             if let ComponentImplementation::Adapter { abi, version, .. } =
                 &declaration.implementation
@@ -598,14 +633,14 @@ impl WorkflowRuntime {
             None
         };
         let models = if decode_backend == EngineDecodeBackend::Native {
-            PipelineModels::load_with_ort_session_filter(
-                pipeline_dir,
+            PipelineModels::load_resolved_with_ort_session_filter(
+                directory.clone(),
                 component_session_options,
                 |_| false,
             )
         } else {
-            PipelineModels::load_with_component_options(
-                pipeline_dir,
+            PipelineModels::load_resolved_with_component_options(
+                directory.clone(),
                 component_session_options,
                 session_options,
             )
@@ -1927,6 +1962,149 @@ pipeline:
                 "PMM and engine snapshots must report the same canonical device charge"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod speculative_admission_tests {
+    use super::*;
+    use crate::{
+        DeviceCompatibilityDomain, DeviceMemoryAuthority, ProcessMemoryManager, ResourceLimit,
+    };
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    struct NeverCalledAuthorityProvider;
+
+    impl MemoryAuthorityProvider for NeverCalledAuthorityProvider {
+        fn process_memory_manager(&self) -> ProcessMemoryManager {
+            panic!("candidate-tree admission must precede memory-authority construction")
+        }
+
+        fn validate_limit(
+            &self,
+            _domain: &DeviceCompatibilityDomain,
+            _requested: ResourceLimit,
+        ) -> anyhow::Result<()> {
+            panic!("candidate-tree admission must precede memory-authority validation")
+        }
+
+        fn authority(
+            &self,
+            _domain: &DeviceCompatibilityDomain,
+            _resolved_limit_bytes: u64,
+        ) -> anyhow::Result<DeviceMemoryAuthority> {
+            panic!("candidate-tree admission must precede memory-authority construction")
+        }
+    }
+
+    fn fixture() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/unsupported-candidate-tree")
+    }
+
+    fn staged_missing_component_fixture(name: &str) -> PathBuf {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/candidate-tree-admission")
+            .join(name);
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create candidate-tree fixture");
+        let source = fs::read_to_string(fixture().join("inference_metadata.yaml"))
+            .expect("read candidate-tree fixture");
+        let from = "implementation: {kind: binding}";
+        assert!(source.contains(from), "fixture no longer contains {from:?}");
+        fs::write(
+            root.join("inference_metadata.yaml"),
+            source.replace(
+                from,
+                "implementation: {kind: onnx, artifact: must-not-load.onnx}",
+            ),
+        )
+        .expect("write candidate-tree fixture");
+        root
+    }
+
+    fn assert_candidate_tree_refusal<T>(result: anyhow::Result<T>, constructor: &str) {
+        let Err(error) = result else {
+            panic!("candidate-tree package must fail closed in {constructor}");
+        };
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("candidate-tree")
+                && message.contains("onnx-genai.speculative@1")
+                && message.contains("no candidate-tree package-dispatch capability or executor"),
+            "{constructor} did not report the exact unsupported contract and capability: {message}"
+        );
+        assert!(
+            !message.contains("must-not-load.onnx"),
+            "{constructor} resolved or inspected a component artifact before runtime admission: \
+             {message}"
+        );
+    }
+
+    #[test]
+    fn workflow_runtime_constructor_fails_before_component_loading() {
+        let fixture = staged_missing_component_fixture("workflow-runtime");
+        assert_candidate_tree_refusal(
+            WorkflowRuntime::from_dir_with_session_options(
+                &fixture,
+                EngineConfig::default(),
+                SessionOptions::default(),
+            ),
+            "WorkflowRuntime::from_dir_with_session_options",
+        );
+    }
+
+    #[test]
+    fn workflow_runtime_memory_authority_constructor_fails_before_mutation() {
+        let fixture = staged_missing_component_fixture("workflow-runtime-memory-authority");
+        assert_candidate_tree_refusal(
+            WorkflowRuntime::from_dir_with_session_options_and_memory_authority_provider(
+                &fixture,
+                EngineConfig::default(),
+                SessionOptions::default(),
+                Arc::new(NeverCalledAuthorityProvider),
+            ),
+            "WorkflowRuntime::from_dir_with_session_options_and_memory_authority_provider",
+        );
+    }
+
+    #[test]
+    fn hosted_runtime_constructor_consumes_the_same_admission() {
+        let metadata = onnx_genai_metadata::parser::load_metadata_from_dir(&fixture())
+            .expect("candidate-tree fixture parses")
+            .expect("candidate-tree fixture has metadata");
+        let workflow = metadata
+            .pipeline
+            .as_ref()
+            .expect("candidate-tree fixture has a workflow")
+            .workflow
+            .clone();
+        let directory = PipelineModelDirectory {
+            root: fixture(),
+            metadata_path: None,
+            spec: onnx_genai_metadata::PipelineSpec {
+                workflow: workflow.clone(),
+            },
+            adapters: None,
+            metadata: Some(metadata.clone()),
+            preprocessing: None,
+            model_paths: BTreeMap::new(),
+            tokenizer_paths: onnx_genai_ort::PipelineTokenizerPaths {
+                shared: None,
+                per_component: BTreeMap::new(),
+            },
+        };
+        assert_candidate_tree_refusal(
+            WorkflowRuntime::hosted(
+                fixture(),
+                workflow,
+                EngineDecodeBackend::Ort,
+                MemoryStrategyPlan::unknown(0, None, "candidate-tree admission test"),
+                PipelineModels::hosted(directory, SessionOptions::default(), None),
+                metadata.speculative,
+            ),
+            "WorkflowRuntime::hosted",
+        );
     }
 }
 

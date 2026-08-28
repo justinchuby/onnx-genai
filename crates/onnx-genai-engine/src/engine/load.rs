@@ -328,7 +328,10 @@ impl Engine {
                 .and_then(|directory| load_inference_metadata(&directory).ok()),
         };
         if let Some(metadata) = metadata.as_ref() {
-            Self::reject_undispatched_canonical_speculation(metadata)?;
+            onnx_genai_metadata::validate_metadata(metadata).map_err(|errors| {
+                anyhow::anyhow!("Invalid inference metadata: {}", errors.join("; "))
+            })?;
+            crate::pipeline::admit_speculative_runtime(metadata.speculative.as_ref())?;
         }
         metadata
             .as_ref()
@@ -347,33 +350,6 @@ impl Engine {
                     model_dir.display()
                 )
             })
-    }
-
-    /// Refuse canonical declaration variants for which this runtime has no
-    /// package-dispatch executor. This gate is before model/session loading, so
-    /// unsupported proposal data cannot mutate target, proposer, state, or S3
-    /// output participants and then silently fall through to plain generation.
-    fn reject_undispatched_canonical_speculation(
-        metadata: &InferenceMetadata,
-    ) -> anyhow::Result<()> {
-        let Some(contract) = metadata.speculative.as_ref() else {
-            return Ok(());
-        };
-        if !matches!(
-            contract.proposal_execution,
-            onnx_genai_metadata::SpeculativeProposalExecution::CandidateTree { .. }
-        ) {
-            return Ok(());
-        }
-        anyhow::bail!(
-            "package declares canonical candidate-tree speculation \
-             (onnx-genai.speculative@{}), but this runtime has no candidate-tree \
-             package-dispatch executor. Refusing to silently run plain or MTP generation \
-             without the declared proposer, target verification, accepted-prefix commit, and \
-             rollback participants. Upgrade to a runtime that implements candidate-tree \
-             dispatch, or re-export this package with a supported canonical proposal execution.",
-            contract.version
-        );
     }
 
     /// Adopt the package's declared workflow as the one this runtime executes.
@@ -3214,7 +3190,7 @@ mod metadata_admission_tests {
             "the refusal must identify the exact canonical declaration: {message}"
         );
         assert!(
-            message.contains("no candidate-tree package-dispatch executor")
+            message.contains("no candidate-tree package-dispatch capability or executor")
                 && message.contains("Refusing to silently run plain or MTP generation"),
             "the refusal must explain why no model/session was loaded: {message}"
         );

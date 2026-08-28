@@ -312,6 +312,19 @@ impl PipelineModelDirectory {
 
     /// Resolve the validated pipeline spec and all referenced model/tokenizer files.
     pub fn load(root: impl AsRef<Path>) -> Result<Self> {
+        Self::load_with_metadata_preflight(root, |_| Ok(()))
+    }
+
+    /// Resolve a pipeline after a caller-owned runtime admission check.
+    ///
+    /// The callback receives parsed, semantically validated metadata before any
+    /// component artifact is resolved or inspected. Runtime layers use this to
+    /// reject contracts they cannot dispatch without first touching models,
+    /// sessions, or mutable execution state.
+    pub fn load_with_metadata_preflight(
+        root: impl AsRef<Path>,
+        preflight: impl FnOnce(&InferenceMetadata) -> Result<()>,
+    ) -> Result<Self> {
         let root = root.as_ref();
         if !root.is_dir() {
             return Err(model_dir_missing_err(root));
@@ -331,6 +344,7 @@ impl PipelineModelDirectory {
         })?;
         onnx_genai_metadata::validate_metadata(&metadata)
             .map_err(|errors| OrtError::InvalidArgument(errors.join("; ")))?;
+        preflight(&metadata)?;
         let preprocessing = metadata.preprocessing.clone();
         let adapters = metadata.adapters.clone();
 
@@ -469,6 +483,23 @@ impl PipelineModels {
         Self::load_with_options_and_filter(root, component_options, generated_options, |_| true)
     }
 
+    /// Load all sessions from an already resolved and admitted directory.
+    ///
+    /// Keeping the admitted directory authoritative prevents metadata from
+    /// being re-read between runtime preflight and session construction.
+    pub fn load_resolved_with_component_options(
+        directory: PipelineModelDirectory,
+        component_options: SessionOptions,
+        generated_options: SessionOptions,
+    ) -> Result<Self> {
+        Self::load_resolved_with_options_and_filter(
+            directory,
+            component_options,
+            generated_options,
+            |_| true,
+        )
+    }
+
     /// Resolve and load pipeline assets, building an ORT [`Session`] only for the
     /// components for which `build_ort_session(name)` returns `true`.
     ///
@@ -487,6 +518,20 @@ impl PipelineModels {
         Self::load_with_options_and_filter(root, options.clone(), options, build_ort_session)
     }
 
+    /// Load selected sessions from an already resolved and admitted directory.
+    pub fn load_resolved_with_ort_session_filter(
+        directory: PipelineModelDirectory,
+        options: SessionOptions,
+        build_ort_session: impl Fn(&str) -> bool,
+    ) -> Result<Self> {
+        Self::load_resolved_with_options_and_filter(
+            directory,
+            options.clone(),
+            options,
+            build_ort_session,
+        )
+    }
+
     fn load_with_options_and_filter(
         root: impl AsRef<Path>,
         component_options: SessionOptions,
@@ -494,7 +539,20 @@ impl PipelineModels {
         build_ort_session: impl Fn(&str) -> bool,
     ) -> Result<Self> {
         let directory = PipelineModelDirectory::load(root)?;
+        Self::load_resolved_with_options_and_filter(
+            directory,
+            component_options,
+            generated_options,
+            build_ort_session,
+        )
+    }
 
+    fn load_resolved_with_options_and_filter(
+        directory: PipelineModelDirectory,
+        component_options: SessionOptions,
+        generated_options: SessionOptions,
+        build_ort_session: impl Fn(&str) -> bool,
+    ) -> Result<Self> {
         let mut sessions = BTreeMap::new();
         let mut graph_io_metadata = BTreeMap::new();
         let environment = OnceLock::new();
@@ -1051,6 +1109,49 @@ mod tests {
             directory.tokenizer_paths.shared.as_deref(),
             Some(expected.as_path())
         );
+    }
+
+    #[test]
+    fn pipeline_metadata_preflight_precedes_component_artifact_resolution() {
+        let root = staged_legacy_pipeline("metadata-preflight-before-components");
+        let resolved = PipelineModelDirectory::load(&root).unwrap();
+        assert!(
+            !resolved.model_paths.is_empty(),
+            "fixture must declare ONNX components"
+        );
+        for path in resolved.model_paths.values() {
+            fs::remove_file(path).unwrap();
+        }
+
+        let error = PipelineModelDirectory::load_with_metadata_preflight(&root, |_| {
+            Err(OrtError::InvalidArgument(
+                "runtime admission sentinel".to_string(),
+            ))
+        })
+        .unwrap_err()
+        .to_string();
+        assert_eq!(error, "Invalid argument: runtime admission sentinel");
+    }
+
+    #[test]
+    fn resolved_pipeline_models_do_not_reread_metadata_after_admission() {
+        let root = staged_legacy_pipeline("resolved-directory-is-authoritative");
+        let directory = PipelineModelDirectory::load(&root).unwrap();
+        fs::remove_file(
+            directory
+                .metadata_path
+                .as_ref()
+                .expect("fixture has native metadata"),
+        )
+        .unwrap();
+
+        let models = PipelineModels::load_resolved_with_ort_session_filter(
+            directory,
+            SessionOptions::default(),
+            |_| false,
+        )
+        .expect("resolved directory remains authoritative");
+        assert!(!models.graph_io_metadata.is_empty());
     }
 
     #[test]
