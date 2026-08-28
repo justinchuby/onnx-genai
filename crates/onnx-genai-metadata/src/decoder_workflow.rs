@@ -64,6 +64,8 @@ pub const TOKENS_OUTPUT: &str = "tokens";
 pub enum BuildError {
     /// The ABI names no sequence input, so nothing drives the loop.
     NoSequenceInput,
+    /// A decoder loop needs a graph edge that produces each step's embeddings.
+    InputsEmbedsNeedsEmbeddingProducer,
     /// The ABI names no logits output, so nothing selects a token.
     NoLogitsOutput,
     /// State inputs and outputs disagree in length, so the pairs are ambiguous.
@@ -84,6 +86,13 @@ impl std::fmt::Display for BuildError {
             Self::NoSequenceInput => formatter.write_str(
                 "this decoder names neither a token input nor an inputs_embeds input, so no \
                  workflow could say what drives its generation loop",
+            ),
+            Self::InputsEmbedsNeedsEmbeddingProducer => formatter.write_str(
+                "this decoder drives its graph through inputs_embeds, but a bare decoder ABI \
+                 cannot express the per-step component that produces each embedding from the \
+                 selected token. Author a multi-component workflow that binds the embedding \
+                 producer and, when token-context state is used, its explicit token_ids \
+                 companion; do not lower this graph into a loop with a stale embedding input",
             ),
             Self::NoLogitsOutput => formatter.write_str(
                 "this decoder names no logits output, so no workflow could say what its token \
@@ -160,7 +169,9 @@ pub fn decoder_workflow(
         .to_string();
     let sequence_is_embeds = matches!(abi.sequence_source, Some(SequenceInputKind::InputsEmbeds))
         || (abi.token_input.is_none() && abi.inputs_embeds_input.is_some());
-
+    if sequence_is_embeds {
+        return Err(BuildError::InputsEmbedsNeedsEmbeddingProducer);
+    }
     // A fixed-capacity decoder states its KV through `static_cache` rather than
     // `kv_inputs`: the buffers are the same state, declared per half. Reading
     // both here is what lets one group describe either discipline instead of
@@ -236,15 +247,10 @@ pub fn decoder_workflow(
     // A graph may consume both a raw token stream and a routed pre-embedded
     // one. Declaring both is explicit, so both are carried across; only the one
     // the ABI names as the sequence source drives the loop.
-    let secondary = if sequence_is_embeds {
-        abi.token_input
-            .as_deref()
-            .map(|port| (port, token_contract(), PortRole::TokenIds))
-    } else {
-        abi.inputs_embeds_input
-            .as_deref()
-            .map(|port| (port, hidden_contract(), PortRole::InputsEmbeds))
-    };
+    let secondary = abi
+        .inputs_embeds_input
+        .as_deref()
+        .map(|port| (port, hidden_contract(), PortRole::InputsEmbeds));
     if let Some((port, contract, role)) = secondary
         && port != sequence_port
     {
@@ -1519,7 +1525,7 @@ mod tests {
     }
 
     #[test]
-    fn an_embeds_driven_decoder_roundtrips() {
+    fn an_embeds_driven_decoder_requires_an_embedding_producer() {
         let abi = DecoderAbi {
             sequence_source: Some(SequenceInputKind::InputsEmbeds),
             inputs_embeds_input: Some("inputs_embeds".to_string()),
@@ -1528,11 +1534,9 @@ mod tests {
             kv_outputs: Some(vec!["present.key".to_string()]),
             ..DecoderAbi::default()
         };
-        let read_back = roundtrips(&abi);
-        assert_eq!(read_back.inputs_embeds_input, abi.inputs_embeds_input);
         assert_eq!(
-            read_back.sequence_source,
-            Some(SequenceInputKind::InputsEmbeds)
+            decoder_workflow(&abi, "model.onnx", &DecoderFacts::default()),
+            Err(BuildError::InputsEmbedsNeedsEmbeddingProducer)
         );
     }
 

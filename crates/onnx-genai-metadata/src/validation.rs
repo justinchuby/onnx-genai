@@ -2299,6 +2299,7 @@ fn validate_workflow(
                     }
                 }
             }
+            validate_token_context_component(name, component, contract, errors);
             if let crate::schema::ComponentImplementation::Adapter { abi, version, .. } =
                 &component.implementation
             {
@@ -2309,6 +2310,7 @@ fn validate_workflow(
                         contract.id, contract.version
                     ));
                 }
+
                 let action = match contract.parameters.get("action") {
                     Some(crate::schema::ScalarValue::String(action)) => Some(action.as_str()),
                     _ => None,
@@ -7053,6 +7055,143 @@ pub enum MetadataError {
 
 // Re-export at crate level
 pub use MetadataError as Error;
+
+/// Validate the portable contract used by graph-internal token-context
+/// components.
+///
+/// The contract deliberately describes only the boundary that graph structure
+/// cannot recover: an embedded sequence has lost the discrete identities needed
+/// to update a token-history state. Hashing, lookup tables, projections, gates,
+/// convolution, and residual placement remain ordinary ONNX/component
+/// semantics. This is consequently neither a model family nor an operator
+/// registry.
+fn validate_token_context_component(
+    component_name: &str,
+    component: &crate::schema::WorkflowComponent,
+    contract: &crate::schema::ComponentContract,
+    errors: &mut Vec<String>,
+) {
+    const TOKEN_CONTEXT_CONTRACT: &str = "onnx-genai.token-context";
+    const TOKEN_CONTEXT_VERSION: &str = "1";
+    if contract.id != TOKEN_CONTEXT_CONTRACT {
+        return;
+    }
+
+    if contract.version != TOKEN_CONTEXT_VERSION {
+        errors.push(format!(
+            "workflow token-context component '{component_name}' declares unsupported contract \
+             {}@{}; supported graph ABI is {TOKEN_CONTEXT_CONTRACT}@{TOKEN_CONTEXT_VERSION}",
+            contract.id, contract.version
+        ));
+    }
+    if !matches!(
+        component.implementation,
+        crate::schema::ComponentImplementation::Onnx { .. }
+    ) {
+        errors.push(format!(
+            "workflow token-context component '{component_name}' must be an ONNX component; \
+             its learned lookup and history update must be declared by ordinary graph ports and \
+             state groups, not recovered from an opaque implementation"
+        ));
+    }
+
+    let embeds = component
+        .ports
+        .roles
+        .iter()
+        .filter(|(_, role)| **role == crate::schema::PortRole::InputsEmbeds)
+        .map(|(port, _)| port.as_str())
+        .collect::<Vec<_>>();
+    let tokens = component
+        .ports
+        .roles
+        .iter()
+        .filter(|(_, role)| **role == crate::schema::PortRole::TokenIds)
+        .map(|(port, _)| port.as_str())
+        .collect::<Vec<_>>();
+    if embeds.len() != 1 {
+        errors.push(format!(
+            "workflow token-context component '{component_name}' must declare exactly one \
+             inputs_embeds input role; found {}. The embedded sequence is the feature-injection \
+             path and cannot be guessed from a port name",
+            embeds.len()
+        ));
+        return;
+    }
+    if tokens.len() != 1 {
+        errors.push(format!(
+            "workflow token-context component '{component_name}' consumes inputs_embeds but \
+             declares {} token_ids companion roles; declare exactly one typed token_ids input \
+             carrying the original ids. Reverse embedding lookup is forbidden",
+            tokens.len()
+        ));
+        return;
+    }
+
+    let (Some(embeds), Some(tokens)) = (
+        component.ports.inputs.get(embeds[0]),
+        component.ports.inputs.get(tokens[0]),
+    ) else {
+        errors.push(format!(
+            "workflow token-context component '{component_name}' must declare typed input \
+             contracts for its inputs_embeds and token_ids companion ports; an inferred ONNX \
+             port list cannot prove token-history geometry before execution"
+        ));
+        return;
+    };
+    if !matches!(
+        tokens.dtype.as_str(),
+        "int32" | "int64" | "uint32" | "uint64"
+    ) {
+        errors.push(format!(
+            "workflow token-context component '{component_name}' token_ids companion has dtype \
+             '{}'; token ids must use an integer dtype",
+            tokens.dtype
+        ));
+    }
+    if tokens.rank.checked_add(1) != Some(embeds.rank) {
+        errors.push(format!(
+            "workflow token-context component '{component_name}' token_ids companion has rank \
+             {}, but inputs_embeds has rank {}; token ids must match every embedding axis except \
+             the trailing feature axis",
+            tokens.rank, embeds.rank
+        ));
+    }
+    match (&tokens.shape, &embeds.shape) {
+        (Some(tokens_shape), Some(embeds_shape))
+            if tokens_shape.len() + 1 == embeds_shape.len()
+                && tokens_shape
+                    .iter()
+                    .zip(embeds_shape)
+                    .all(|(token, embed)| token == embed) => {}
+        (Some(_), Some(_)) => errors.push(format!(
+            "workflow token-context component '{component_name}' token_ids companion geometry \
+             does not match the inputs_embeds prefix; bind the original token rows and sequence \
+             positions, not a reconstructed or differently packed token tensor"
+        )),
+        _ => errors.push(format!(
+            "workflow token-context component '{component_name}' must declare shapes for both \
+             token_ids and inputs_embeds so their row and sequence geometry can be checked \
+             before execution"
+        )),
+    }
+    if tokens.batch_layout != embeds.batch_layout {
+        errors.push(format!(
+            "workflow token-context component '{component_name}' token_ids companion uses {} \
+             batching while inputs_embeds uses {}; both must follow the same row compaction and \
+             release mapping",
+            tokens.batch_layout.kind_name(),
+            embeds.batch_layout.kind_name()
+        ));
+    }
+    if tokens.padding != embeds.padding {
+        errors.push(format!(
+            "workflow token-context component '{component_name}' token_ids companion padding \
+             does not match inputs_embeds; both must use the same valid-length companions so \
+             token history never absorbs padded positions"
+        ));
+    }
+}
 
 /// A component that owns attention state must say which port carries the
 /// sequence.
