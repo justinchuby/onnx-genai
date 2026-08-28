@@ -133,6 +133,25 @@ fn candidate_tree_unavailable_reason(
             onnx_genai_metadata::decoder_workflow::TOKENS_OUTPUT
         ));
     }
+    if let Some(reason) = candidate_tree_bypassed_step(
+        &workflow.steps,
+        "pipeline.workflow.steps",
+        &contract.proposer,
+        &contract.target,
+    ) {
+        return Some(reason);
+    }
+    if let Some(output) = workflow
+        .outputs
+        .keys()
+        .find(|output| output.as_str() != onnx_genai_metadata::decoder_workflow::TOKENS_OUTPUT)
+    {
+        return Some(format!(
+            "declared output '{output}' has no candidate-tree output-publication participant; \
+             the current driver stages only the declared token stream, so admitting it would \
+             skip its S4 family/site"
+        ));
+    }
     for component in [&contract.proposer, &contract.target] {
         let Some(declaration) = workflow.components.get(component) else {
             return Some(format!("component '{component}' is undeclared"));
@@ -290,6 +309,68 @@ fn candidate_tree_unavailable_reason(
                  invocation",
                 probabilities.target.output
             ));
+        }
+    }
+    None
+}
+
+/// Find authored steps the specialized tree drive would otherwise skip.
+///
+/// A sequence is only structural grouping, so recursively inspecting it admits
+/// the same two-component template wherever it is grouped. A loop, branch,
+/// unrelated invocation, or emit has ordering/effect/output semantics the
+/// driver does not interpret; accepting one would make the metadata advisory.
+fn candidate_tree_bypassed_step(
+    steps: &[WorkflowStep],
+    path: &str,
+    proposer: &str,
+    target: &str,
+) -> Option<String> {
+    for (index, step) in steps.iter().enumerate() {
+        let step_path = format!("{path}[{index}]");
+        match step {
+            WorkflowStep::Invoke { component, .. }
+                if component == proposer || component == target => {}
+            WorkflowStep::Invoke { component, .. } => {
+                return Some(format!(
+                    "candidate-tree driver cannot execute unrelated component '{component}' at \
+                     {step_path}; it would be skipped between proposer/target invocations"
+                ));
+            }
+            WorkflowStep::Sequence { steps } => {
+                if let Some(reason) = candidate_tree_bypassed_step(
+                    steps,
+                    &format!("{step_path}.steps"),
+                    proposer,
+                    target,
+                ) {
+                    return Some(reason);
+                }
+            }
+            WorkflowStep::Loop { setup, .. } => {
+                let detail = if setup.is_empty() {
+                    "its condition/body ordering"
+                } else {
+                    "its non-empty setup, condition/body ordering"
+                };
+                return Some(format!(
+                    "candidate-tree driver cannot faithfully execute loop at {step_path}: \
+                     {detail} would be skipped; use a flat proposer/target invocation template \
+                     until the generic workflow transaction hosts the candidate-tree seam"
+                ));
+            }
+            WorkflowStep::Branch { .. } => {
+                return Some(format!(
+                    "candidate-tree driver cannot faithfully execute branch at {step_path}; its \
+                     predicate/join would be skipped before accepted-prefix commit"
+                ));
+            }
+            WorkflowStep::Emit { output, .. } => {
+                return Some(format!(
+                    "candidate-tree driver cannot publish emit at {step_path} into output \
+                     '{output}'; its S4 family/site would be skipped"
+                ));
+            }
         }
     }
     None

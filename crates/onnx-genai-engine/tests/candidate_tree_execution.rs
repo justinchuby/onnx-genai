@@ -563,6 +563,47 @@ fn parent_package(parents: &[i64; 6], decisions: &[usize; 7]) -> anyhow::Result<
     Ok(root)
 }
 
+#[test]
+fn candidate_tree_emit_site_is_refused_before_the_specialized_driver_can_skip_it()
+-> anyhow::Result<()> {
+    let root = parent_package(&[-1, -1, 0, 1, 2, 4], &[1, 4, 0, 0, 0, 0, 0])?;
+    let metadata_path = root.join("inference_metadata.yaml");
+    let metadata = fs::read_to_string(&metadata_path)?;
+    let metadata = metadata
+        .replacen(
+            "capabilities: [workflow_ssa, serving_service_contract, canonical_speculation, session_state_lease]",
+            "capabilities: [workflow_ssa, typed_emit, serving_service_contract, canonical_speculation, session_state_lease]",
+            1,
+        )
+        .replacen(
+            "    components:\n",
+            "      side:\n        contract: {dtype: int64, shape: [batch, 6], batch_layout: {kind: request_aligned, axis: 0}}\n        role: tensor\n        family: {kind: events}\n        stage: pre_adapter\n    components:\n",
+            1,
+        )
+        .replacen(
+            "    state:\n",
+            "    - kind: emit\n      value: proposed.tokens\n      output: side\n      mode: event\n    state:\n",
+            1,
+        );
+    fs::write(&metadata_path, metadata)?;
+
+    let error = expect_error(
+        Engine::from_dir(&root, EngineConfig::default()),
+        "an authored emit cannot be skipped by candidate-tree generation",
+    );
+    assert!(
+        matches!(
+            package_capability_error(&error),
+            Some(PackageCapabilityError::CandidateTreeExecutionUnavailable { reason, .. })
+                if reason.contains("pipeline.workflow.steps[2]")
+                    && reason.contains("cannot publish emit")
+                    && reason.contains("S4 family/site")
+        ),
+        "unexpected candidate-tree admission result: {error:#}"
+    );
+    Ok(())
+}
+
 fn ancestor_package() -> anyhow::Result<PathBuf> {
     ancestor_package_with_sources(ANCESTOR_PROPOSER, ANCESTOR_TARGET)
 }
