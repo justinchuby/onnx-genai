@@ -1046,6 +1046,27 @@ whole turn to its recorded baseline. `commit_only` exposes nothing before commit
 join the transaction causes admission to fail before mutation. An exclusive
 lease is a concurrency primitive, not the transaction itself.
 
+When a runtime advances several positional rows through one shared forward,
+each admitted row remains an independent turn participant. Its baseline
+**MUST** cover every mutable row-owned value the turn can touch, including
+semantic state and cache residency, logical cursors and sequence bookkeeping,
+random/constraint state, staged output and completion state, and
+runtime-visible journals or events. Commit publishes that row's complete write
+set; abort restores only that row and discards its staged publications. Rows
+whose turns did not abort retain their committed progress and continue
+independently. A retry is admitted from the restored baseline and **MUST**
+produce the same result under the package's declared determinism contract.
+
+Shared execution does not create a second preparation authority. Canonical
+prepared inputs remain immutable, a positional row-selection plan is a
+transient execution view over them, and replay applies the same plan to the
+same prepared source values. Transaction snapshots and restoration follow the
+selected rows without rewriting prepared inputs, inferring scheduler identity,
+or converting optional shared execution into a package requirement. If any
+selected participant cannot snapshot and restore completely, the runtime
+declines the shared optimization before mutation and executes an equivalent
+isolated path.
+
 ### 12.6 Private state and checkpoints
 
 Internal state is private by default. An internal state cell is **not**

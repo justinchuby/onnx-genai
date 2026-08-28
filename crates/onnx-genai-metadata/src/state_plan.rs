@@ -63,7 +63,10 @@ pub struct StateWriter {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StateFinalWriter {
     Writer(StateWriter),
-    Continuation { output: String },
+    Continuation {
+        prompt_input: String,
+        output: String,
+    },
 }
 
 /// The graph relation used when a writer advances state.
@@ -262,11 +265,13 @@ pub fn resolve_state_plan(workflow: &WorkflowSpec) -> ResolvedStatePlan {
             .as_ref()
             .and_then(|lease| lease.continuation.as_ref())
             .map(|continuation| match continuation {
-                crate::schema::SessionContinuation::PromptPrefix { tokens_output, .. } => {
-                    StateFinalWriter::Continuation {
-                        output: tokens_output.clone(),
-                    }
-                }
+                crate::schema::SessionContinuation::PromptPrefix {
+                    prompt_input,
+                    tokens_output,
+                } => StateFinalWriter::Continuation {
+                    prompt_input: prompt_input.clone(),
+                    output: tokens_output.clone(),
+                },
             })
             .or_else(|| terminal_writer.map(StateFinalWriter::Writer));
 
@@ -366,7 +371,7 @@ pub fn validate_state_plan(workflow: &WorkflowSpec, plan: &ResolvedStatePlan) ->
                 .expect("resolved state cell is declared")
                 .contract;
             let incompatible_terminal = match &cell.final_writer {
-                Some(StateFinalWriter::Continuation { output }) => {
+                Some(StateFinalWriter::Continuation { output, .. }) => {
                     workflow.outputs.get(output).is_some_and(|output| {
                         !output.contract.representation_compatible_with(persisted)
                     })
@@ -407,7 +412,7 @@ pub fn validate_state_plan(workflow: &WorkflowSpec, plan: &ResolvedStatePlan) ->
                         .zip(writer.port.as_deref())
                         .map(|(component, port)| format!("{component}:{port}"))
                         .unwrap_or_else(|| writer.id.clone()),
-                    StateFinalWriter::Continuation { output } => {
+                    StateFinalWriter::Continuation { output, .. } => {
                         format!("continuation output '{output}'")
                     }
                 };

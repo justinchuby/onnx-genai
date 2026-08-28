@@ -23,6 +23,213 @@ fn native_logical_len(engine: &Engine, id: SessionId) -> Option<usize> {
         .map(|state| state.tokens.len())
 }
 
+/// Typed baseline for the runtime-owned half of an admitted decoder turn.
+///
+/// Workflow cells use `TurnTransaction` directly. Decoder sessions cannot be
+/// represented as `Value`s: their KV pages, runner bindings, and optional
+/// draft session are owned by the engine. This participant uses the same
+/// transaction/baseline identities and snapshots every one of those owners
+/// before the first mutation.
+pub(crate) struct DecoderTurnParticipant {
+    turn: crate::pipeline::TurnTransaction,
+    tokens: Vec<TokenId>,
+    kv_token_count: usize,
+    sampled_fastpath_failed: bool,
+    speculative_stats: SpeculativeStats,
+    decode: crate::decode::DecodeTurnBaseline,
+    draft: Option<DraftTurnParticipant>,
+}
+
+struct DraftTurnParticipant {
+    tokens: Vec<TokenId>,
+    kv_token_count: usize,
+    decode: crate::decode::DecodeTurnBaseline,
+}
+
+impl DecoderTurnParticipant {
+    pub(crate) fn admit(
+        transaction: crate::pipeline::TurnTransactionId,
+        state: &mut EngineSession,
+        speculative_stats: SpeculativeStats,
+    ) -> anyhow::Result<Self> {
+        let decode = state
+            .decode_state
+            .snapshot_turn_baseline(state.kv_token_count)
+            .context("cannot admit atomic decoder turn for target state")?;
+        let draft = state
+            .draft
+            .as_mut()
+            .map(|draft| {
+                Ok::<DraftTurnParticipant, anyhow::Error>(DraftTurnParticipant {
+                    tokens: draft.tokens.clone(),
+                    kv_token_count: draft.kv_token_count,
+                    decode: draft
+                        .decode_state
+                        .snapshot_turn_baseline(draft.kv_token_count)
+                        .context("cannot admit atomic decoder turn for draft state")?,
+                })
+            })
+            .transpose()?;
+        Ok(Self {
+            turn: crate::pipeline::TurnTransaction::admit_runtime_participant(transaction),
+            tokens: state.tokens.clone(),
+            kv_token_count: state.kv_token_count,
+            sampled_fastpath_failed: state.sampled_fastpath_failed,
+            speculative_stats,
+            decode,
+            draft,
+        })
+    }
+
+    pub(crate) fn committed(&self) -> crate::pipeline::TurnTransactionOutcome {
+        self.turn.committed()
+    }
+
+    /// Publish commit-only token output after all decoder participants have
+    /// committed. Callback delivery is deliberately outside the turn: a callback
+    /// error reports a failed delivery of an already committed result, never an
+    /// execution failure that would require retracting an irrevocable publication.
+    fn publish_committed_tokens(
+        tokenizer: &onnx_genai_ort::Tokenizer,
+        result: &GenerateResult,
+        callback: Option<&mut GenerateTokenCallback<'_>>,
+    ) -> anyhow::Result<()> {
+        let Some(callback) = callback else {
+            return Ok(());
+        };
+        for (index, token_id) in result.token_ids.iter().copied().enumerate() {
+            callback(crate::config::GenerateToken {
+                token_id,
+                text: tokenizer.decode(&[token_id])?,
+                finish_reason: (index + 1 == result.token_ids.len())
+                    .then(|| result.finish_reason.clone()),
+            })?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn abort(
+        self,
+        engine: &mut Engine,
+        session_id: SessionId,
+        state: &mut EngineSession,
+        reason: crate::pipeline::TurnAbortReason,
+    ) -> anyhow::Result<crate::pipeline::TurnTransactionOutcome> {
+        let session = engine.session.as_deref().context(MISSING_ORT_SESSION)?;
+        crate::kv_bridge::restore_decode_turn_baseline(crate::kv_bridge::DecodeTurnRestore {
+            session,
+            kv_model: engine.kv_model.as_ref(),
+            kv_cache: &mut engine.kv_cache,
+            seq: session_id,
+            tokens: &mut state.tokens,
+            decode_state: &mut state.decode_state,
+            kv_token_count: &mut state.kv_token_count,
+            baseline_tokens: &self.tokens,
+            baseline_kv_token_count: self.kv_token_count,
+            baseline: &self.decode,
+        })
+        .context("failed to restore target decoder participant to atomic-turn baseline")?;
+        state.sampled_fastpath_failed = self.sampled_fastpath_failed;
+        engine.last_speculative_stats = self.speculative_stats;
+        match (engine.draft.as_mut(), state.draft.as_mut(), self.draft) {
+            (Some(model), Some(state), Some(baseline)) => {
+                crate::kv_bridge::restore_decode_turn_baseline(
+                    crate::kv_bridge::DecodeTurnRestore {
+                        session: &model.session,
+                        kv_model: model.kv_model.as_ref(),
+                        kv_cache: &mut model.kv_cache,
+                        seq: state.seq,
+                        tokens: &mut state.tokens,
+                        decode_state: &mut state.decode_state,
+                        kv_token_count: &mut state.kv_token_count,
+                        baseline_tokens: &baseline.tokens,
+                        baseline_kv_token_count: baseline.kv_token_count,
+                        baseline: &baseline.decode,
+                    },
+                )
+                .context("failed to restore draft decoder participant to atomic-turn baseline")?;
+            }
+            (None, None, None) => {}
+            _ => anyhow::bail!(
+                "cannot abort atomic decoder turn: draft participant topology changed during \
+                 execution; retain the admitted draft session until the turn resolves"
+            ),
+        }
+        Ok(self.turn.abort(reason))
+    }
+}
+
+#[cfg(feature = "native-backend")]
+struct NativeDecoderTurnParticipant {
+    turn: crate::pipeline::TurnTransaction,
+    session_id: SessionId,
+    active_before: Option<SessionId>,
+    materialized_len: Option<usize>,
+    recurrent: Option<crate::native_decode::RecurrentStateSnapshot>,
+}
+
+#[cfg(feature = "native-backend")]
+impl NativeDecoderTurnParticipant {
+    fn admit(engine: &mut Engine, session_id: SessionId) -> anyhow::Result<Self> {
+        let active_before = engine.native_active_session;
+        let native = engine.native_session.as_mut().context(
+            "cannot admit atomic native decoder turn: native decoder session is unavailable",
+        )?;
+        let materialized_len = (active_before == Some(session_id)).then(|| native.current_len());
+        let recurrent = materialized_len
+            .filter(|length| *length > 0 && native.has_recurrent_state())
+            .map(|_| {
+                native.snapshot_recurrent_state().with_context(|| {
+                    "cannot admit atomic native decoder turn: recurrent state has no \
+                     snapshot/restore support; implement that participant before mutation"
+                })
+            })
+            .transpose()?;
+        Ok(Self {
+            turn: crate::pipeline::TurnTransaction::admit_runtime_participant(
+                engine.workflow.next_turn_transaction_id(),
+            ),
+            session_id,
+            active_before,
+            materialized_len,
+            recurrent,
+        })
+    }
+
+    fn committed(&self) -> crate::pipeline::TurnTransactionOutcome {
+        self.turn.committed()
+    }
+
+    fn abort(
+        self,
+        engine: &mut Engine,
+        reason: crate::pipeline::TurnAbortReason,
+    ) -> anyhow::Result<crate::pipeline::TurnTransactionOutcome> {
+        let native = engine.native_session.as_mut().context(
+            "cannot abort atomic native decoder turn: native decoder session is unavailable",
+        )?;
+        match self.materialized_len {
+            Some(length) => {
+                native.rewind(length)?;
+                if let Some(snapshot) = &self.recurrent {
+                    native.restore_recurrent_state(snapshot)?;
+                }
+                engine.native_active_session = Some(self.session_id);
+            }
+            None => {
+                // This turn had to evict another session's materialized native
+                // cache. Its logical history remains in `native_sessions`; make
+                // the cache explicitly cold rather than leaving a provisional
+                // target prefix observable as an active session.
+                native.reset()?;
+                engine.native_active_session = None;
+            }
+        }
+        let _ = self.active_before;
+        Ok(self.turn.abort(reason))
+    }
+}
+
 /// The ORT backend as a [`SessionStore`]: a session in `Engine::sessions`, its
 /// paged KV sequence, its scheduler entry, and any aligned draft state.
 struct OrtSessions<'a>(&'a mut Engine);
@@ -78,7 +285,7 @@ impl SessionStore for OrtSessions<'_> {
             .sessions
             .remove(&id)
             .with_context(|| format!("session {id} not found"))?;
-        let result = (|| {
+        let result = (|| -> anyhow::Result<()> {
             let session = engine.session.as_deref().context(MISSING_ORT_SESSION)?;
             rewind_target_state_to_len(
                 session,
@@ -1209,7 +1416,7 @@ impl Engine {
         priority: Priority,
         mut custom_sampler: Option<Box<dyn Sampler>>,
         mut admission_callback: Option<&mut dyn FnMut()>,
-        mut callback: Option<&mut GenerateTokenCallback<'_>>,
+        callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
         // A package with no decode core keeps its conversation in the
         // session-scoped cells its workflow declares. Routing here rather than
@@ -1244,7 +1451,6 @@ impl Engine {
                 callback,
             );
         }
-        self.last_speculative_stats = SpeculativeStats::default();
         request.options.validate()?;
         let mut options = request.options.clone();
         self.apply_eos_defaults(&mut options)?;
@@ -1279,6 +1485,19 @@ impl Engine {
             self.scheduler.complete(session_id);
             anyhow::bail!("session {session_id} not found");
         };
+        let turn = match DecoderTurnParticipant::admit(
+            self.workflow.next_turn_transaction_id(),
+            &mut state,
+            self.last_speculative_stats,
+        ) {
+            Ok(turn) => turn,
+            Err(error) => {
+                self.sessions.insert(session_id, state);
+                self.scheduler.complete(session_id);
+                return Err(error);
+            }
+        };
+        self.last_speculative_stats = SpeculativeStats::default();
 
         let result = (|| -> anyhow::Result<GenerateResult> {
             let prefix_cache_hit_len =
@@ -1300,7 +1519,7 @@ impl Engine {
                     generated_text: &mut loop_state.generated_text,
                     generated_logprobs: &mut loop_state.logprobs,
                     rng: &mut loop_state.rng,
-                    callback: callback.as_deref_mut(),
+                    callback: None,
                 });
             }
 
@@ -1341,7 +1560,7 @@ impl Engine {
                     tokenizer,
                     max_context,
                 },
-                callback.as_deref_mut(),
+                None,
             )
         })()
         .and_then(|mut result| {
@@ -1352,9 +1571,34 @@ impl Engine {
             result.budget_cap = budget_cap;
             Ok(result)
         });
+        let result = match result {
+            Ok(result) => {
+                let _outcome = turn.committed();
+                Ok(result)
+            }
+            Err(error) => match turn.abort(
+                self,
+                session_id,
+                &mut state,
+                crate::pipeline::TurnAbortReason::ExecutionFailure,
+            ) {
+                Ok(_outcome) => Err(error),
+                Err(rollback) => Err(error.context(format!(
+                    "atomic decoder turn failed and its baseline restoration also failed: \
+                     {rollback:#}"
+                ))),
+            },
+        };
         self.sessions.insert(session_id, state);
         self.scheduler.complete(session_id);
-        result
+        result.and_then(|result| {
+            DecoderTurnParticipant::publish_committed_tokens(
+                self.require_tokenizer()?,
+                &result,
+                callback,
+            )?;
+            Ok(result)
+        })
     }
 
     /// Drive a set of already-arrived prioritized requests to completion.
@@ -1474,7 +1718,26 @@ impl Engine {
                         .map(generation_budget_cap);
                     active_request.options.max_new_tokens = max_tokens;
                 }
-                let step_result = self.step_active_generate(&mut active_request)?;
+                let step_result = match self.step_active_generate(&mut active_request) {
+                    Ok(result) => result,
+                    Err(error) => {
+                        let rollback = active_request.turn.abort(
+                            self,
+                            session_id,
+                            &mut active_request.state,
+                            crate::pipeline::TurnAbortReason::ExecutionFailure,
+                        );
+                        self.sessions.insert(session_id, active_request.state);
+                        self.scheduler.complete(session_id);
+                        return match rollback {
+                            Ok(_) => Err(error),
+                            Err(rollback) => Err(error.context(format!(
+                                "atomic prioritized turn failed and its baseline restoration \
+                                 also failed: {rollback:#}"
+                            ))),
+                        };
+                    }
+                };
                 generated_steps += 1;
                 if let Some(result) = step_result {
                     let session_id = active_request.session_id;
@@ -2258,6 +2521,17 @@ impl Engine {
             .sessions
             .remove(&request.session_id)
             .with_context(|| format!("session {} not found", request.session_id))?;
+        let turn = match DecoderTurnParticipant::admit(
+            self.workflow.next_turn_transaction_id(),
+            &mut state,
+            self.last_speculative_stats,
+        ) {
+            Ok(turn) => turn,
+            Err(error) => {
+                self.sessions.insert(request.session_id, state);
+                return Err(error);
+            }
+        };
         let prepared = (|| -> anyhow::Result<_> {
             let prefix_cache_hit_len =
                 self.prepare_session_prefix(request.session_id, &mut state, &prompt_tokens)?;
@@ -2316,8 +2590,20 @@ impl Engine {
         let (cursor, setup_finish, prefix_cache_hit_len, loop_state) = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
+                let rollback = turn.abort(
+                    self,
+                    request.session_id,
+                    &mut state,
+                    crate::pipeline::TurnAbortReason::ExecutionFailure,
+                );
                 self.sessions.insert(request.session_id, state);
-                return Err(error);
+                return match rollback {
+                    Ok(_) => Err(error),
+                    Err(rollback) => Err(error.context(format!(
+                        "atomic prioritized-turn preparation failed and its baseline restoration \
+                         also failed: {rollback:#}"
+                    ))),
+                };
             }
         };
         self.scheduler.enqueue_generate_request(
@@ -2328,6 +2614,7 @@ impl Engine {
         );
         Ok(ActiveGenerate {
             cursor,
+            turn,
             session_id: request.session_id,
             state,
             options,
@@ -2478,22 +2765,44 @@ impl Engine {
     }
 
     fn finish_active_generate(&mut self, mut active: ActiveGenerate) -> anyhow::Result<()> {
-        // The workflow's own emit and the tokens this drive committed describe
-        // the same generation; if they disagree, one is wrong and nothing
-        // outside can tell which.
-        crate::pipeline::generation::verify_emitted_tokens(
-            &self.workflow,
-            &active.cursor,
-            &active.generated_tokens,
-        )?;
-        active.cursor.finish(&self.workflow)?;
-        if !exceeded_context_limit(active.state.tokens.len(), active.max_context) {
-            self.ensure_session_kv_current(active.session_id, &mut active.state)?;
-            self.insert_cached_prefixes(active.session_id, &active.state, active.prompt_len)?;
-        }
-        self.sessions.insert(active.session_id, active.state);
+        let session_id = active.session_id;
+        let result = (|| -> anyhow::Result<()> {
+            // The workflow's own emit and the tokens this drive committed describe
+            // the same generation; if they disagree, one is wrong and nothing
+            // outside can tell which.
+            crate::pipeline::generation::verify_emitted_tokens(
+                &self.workflow,
+                &active.cursor,
+                &active.generated_tokens,
+            )?;
+            active.cursor.finish(&self.workflow)?;
+            if !exceeded_context_limit(active.state.tokens.len(), active.max_context) {
+                self.ensure_session_kv_current(active.session_id, &mut active.state)?;
+                self.insert_cached_prefixes(active.session_id, &active.state, active.prompt_len)?;
+            }
+            Ok(())
+        })();
+        let result = match result {
+            Ok(()) => {
+                let _outcome = active.turn.committed();
+                Ok(())
+            }
+            Err(error) => match active.turn.abort(
+                self,
+                session_id,
+                &mut active.state,
+                crate::pipeline::TurnAbortReason::CommitFailure,
+            ) {
+                Ok(_outcome) => Err(error),
+                Err(rollback) => Err(error.context(format!(
+                    "atomic prioritized turn failed during commit and its baseline restoration \
+                     also failed: {rollback:#}"
+                ))),
+            },
+        };
+        self.sessions.insert(session_id, active.state);
         self.scheduler.complete(active.session_id);
-        Ok(())
+        result
     }
 
     /// Borrow the ORT decoder session, returning an error instead of aborting
@@ -2772,6 +3081,13 @@ impl Engine {
         )?;
         let budget_cap = scheduled.budget_cap.map(generation_budget_cap);
         options.max_new_tokens = scheduled.max_tokens;
+        let turn = match NativeDecoderTurnParticipant::admit(self, session_id) {
+            Ok(turn) => turn,
+            Err(error) => {
+                self.scheduler.complete(session_id);
+                return Err(error);
+            }
+        };
         if let Err(error) = self
             .native_session
             .as_mut()
@@ -2779,7 +3095,13 @@ impl Engine {
             .prepare_generation_workspace_preserving_state(&prompt_tokens)
         {
             self.scheduler.complete(session_id);
-            return Err(error);
+            return match turn.abort(self, crate::pipeline::TurnAbortReason::ExecutionFailure) {
+                Ok(_) => Err(error),
+                Err(rollback) => Err(error.context(format!(
+                    "atomic native decoder turn failed during workspace preparation and its \
+                     baseline restoration also failed: {rollback:#}"
+                ))),
+            };
         }
         if let Some(callback) = admission_callback.as_mut() {
             callback();
@@ -2949,7 +3271,7 @@ impl Engine {
                     &chain,
                     tokenizer,
                     runtime,
-                    callback,
+                    None,
                 )?
             };
             result.budget_cap = budget_cap;
@@ -2967,8 +3289,30 @@ impl Engine {
 
             Ok(result)
         })();
+        let result = match result {
+            Ok(result) => {
+                let _outcome = turn.committed();
+                Ok(result)
+            }
+            Err(error) => {
+                match turn.abort(self, crate::pipeline::TurnAbortReason::ExecutionFailure) {
+                    Ok(_) => Err(error),
+                    Err(rollback) => Err(error.context(format!(
+                        "atomic native decoder turn failed and its baseline restoration also \
+                     failed: {rollback:#}"
+                    ))),
+                }
+            }
+        };
         self.scheduler.complete(session_id);
-        result
+        result.and_then(|result| {
+            DecoderTurnParticipant::publish_committed_tokens(
+                self.require_tokenizer()?,
+                &result,
+                callback,
+            )?;
+            Ok(result)
+        })
     }
 }
 

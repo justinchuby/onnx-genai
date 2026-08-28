@@ -263,6 +263,21 @@ impl<'a> BatchedSharedBufferDecodeSession<'a> {
         Ok(())
     }
 
+    /// Rewind one row's logical cursor and activity-visible cache residency.
+    /// Stale KV beyond the restored cursor remains physically allocated but is
+    /// excluded by the row's next attention mask and overwritten before use.
+    pub fn rewind_row(&mut self, row: usize, target_len: usize) -> Result<()> {
+        self.check_row(row)?;
+        if target_len > self.row_lens[row] {
+            return Err(OrtError::InvalidArgument(format!(
+                "cannot rewind shared-buffer row {row} from {} to larger length {target_len}",
+                self.row_lens[row]
+            )));
+        }
+        self.row_lens[row] = target_len;
+        Ok(())
+    }
+
     /// Alias for [`Self::assign_row`] to match the continuous-batch admit call.
     pub fn admit_row(&mut self, row: usize) -> Result<()> {
         self.assign_row(row)
@@ -577,6 +592,23 @@ impl<'a> BatchedDecodeSession<'a> for BatchedSharedBufferDecodeSession<'a> {
     }
     fn assign_row(&mut self, row: usize) -> Result<()> {
         BatchedSharedBufferDecodeSession::assign_row(self, row)
+    }
+    fn snapshot_row(&mut self, row: usize) -> Result<crate::decode::BatchedRowSnapshot> {
+        Ok(crate::decode::BatchedRowSnapshot::new(
+            row,
+            self.row_len(row)?,
+            self.is_active(row)?,
+        ))
+    }
+    fn restore_row(
+        &mut self,
+        row: usize,
+        snapshot: &crate::decode::BatchedRowSnapshot,
+    ) -> Result<()> {
+        snapshot.validate_row(row)?;
+        self.rewind_row(row, snapshot.logical_len())?;
+        self.active[row] = snapshot.active();
+        Ok(())
     }
     fn step_select(
         &mut self,

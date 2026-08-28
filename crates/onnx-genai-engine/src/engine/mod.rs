@@ -39,6 +39,7 @@ pub(crate) use onnx_genai_scheduler::{
     VramBreakdown,
 };
 pub(crate) use onnx_std::{MetadataHints, MetadataWarning, PlacementStrength};
+pub(crate) use runtime::DecoderTurnParticipant;
 pub(crate) use std::collections::HashMap;
 pub(crate) use std::path::Path;
 pub(crate) use std::sync::Arc;

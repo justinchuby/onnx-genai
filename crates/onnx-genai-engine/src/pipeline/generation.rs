@@ -599,17 +599,44 @@ pub(crate) fn run_declared_generation(
     mut core: Option<&mut dyn GenerationCore>,
     mut callback: Option<&mut GenerateTokenCallback<'_>>,
 ) -> anyhow::Result<GenerateResult> {
+    // The generic interpreter currently exposes only commit-only output
+    // publication. A callback is an irrevocable external sink, so accepting it
+    // would make a callback failure a post-commit abort. Refuse it before the
+    // turn begins until S4 supplies transaction-addressable revisions.
+    if callback.is_some() {
+        anyhow::bail!(
+            "this workflow uses commit_only output publication and cannot stream to a \
+             non-retractable callback; consume the committed result or declare a typed \
+             provisional revision sink"
+        );
+    }
     let hosted: &[&str] = match core.as_deref() {
         Some(core) => core.hosted_contracts(),
         None => &[],
     };
     let mut plan = WorkflowExecutionPlan::new_hosted(runtime, request, hosted)?;
+    let generic_execution = core.is_none();
     let outputs = {
         let mut host: Option<&mut dyn WorkflowNodeHost> = core
             .as_deref_mut()
             .map(|core| core as &mut dyn WorkflowNodeHost);
-        let (values, row_outputs) = plan.execute_retained_with_host(&mut host)?;
-        runtime.package_outputs(values, row_outputs)?
+        let (values, row_outputs) = plan.execute_retained_with_host_before_commit(
+            &mut host,
+            |values, row_outputs, ended_by_predicate| {
+                if generic_execution {
+                    preflight_generic_generation_output(
+                        runtime,
+                        options,
+                        tokenizer,
+                        values,
+                        row_outputs,
+                        ended_by_predicate,
+                    )?;
+                }
+                Ok(())
+            },
+        )?;
+        runtime.package_outputs(values, row_outputs)
     };
 
     let output = runtime
@@ -639,6 +666,60 @@ pub(crate) fn run_declared_generation(
     // which — so this refuses rather than picking one.
     if let Some(core) = core.as_deref() {
         assert_streams_agree(&output, &token_ids, &core.committed_tokens())?;
+    }
+
+    /// Reject generic token output conversion or decoding failures before its
+    /// enclosing turn commits. The same checks below then construct the result from
+    /// the already validated, commit-only output.
+    fn preflight_generic_generation_output(
+        runtime: &WorkflowRuntime,
+        options: &GenerateOptions,
+        tokenizer: Option<&Tokenizer>,
+        values: &super::PipelineTensors,
+        row_outputs: &std::collections::BTreeMap<String, Vec<String>>,
+        ended_by_predicate: bool,
+    ) -> anyhow::Result<()> {
+        let output = runtime
+            .workflow_spec()
+            .outputs
+            .iter()
+            .find(|(_, output)| output.role == onnx_genai_metadata::WorkflowOutputRole::Tokens)
+            .map(|(name, _)| name)
+            .context("generation requires one package output with role: tokens")?;
+        let rows = row_outputs
+            .get(output)
+            .into_iter()
+            .flatten()
+            .filter_map(|name| values.get(name))
+            .collect::<Vec<_>>();
+        anyhow::ensure!(
+            rows.len() <= 1,
+            "generation cannot flatten multi-row ragged output '{output}'; consume semantic row \
+             streams with the tensor workflow API instead"
+        );
+        let tokens = values
+            .get(output)
+            .or_else(|| rows.first().copied())
+            .with_context(|| format!("the workflow did not emit tokens output '{output}'"))?
+            .to_vec_i64()?
+            .into_iter()
+            .map(|token| {
+                u32::try_from(token).context("the workflow emitted a token outside uint32")
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let text = tokenizer
+            .map(|tokenizer| tokenizer.decode(&tokens))
+            .transpose()?;
+        ensure_constrained_finish(
+            options,
+            text.as_deref().unwrap_or_default(),
+            if ended_by_predicate {
+                FinishReason::EosToken
+            } else {
+                FinishReason::MaxTokens
+            },
+        )?;
+        Ok(())
     }
 
     // Why the loop stopped, from whatever knows: a decode core that reached a

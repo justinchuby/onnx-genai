@@ -215,3 +215,92 @@ fn live_row_residency_journal_and_completion_ownership_survive_backfill() -> any
     assert_live_row_ownership(&final_state);
     Ok(())
 }
+
+#[test]
+fn shared_row_abort_restores_only_that_row_and_retry_matches_isolated() -> anyhow::Result<()> {
+    let fixture = shared_buffer_fixture()?;
+    let requests = vec![
+        GenerateRequest {
+            prompt: GeneratePrompt::TokenIds(vec![1, 2]),
+            options: GenerateOptions {
+                greedy: true,
+                stop_on_eos: false,
+                max_new_tokens: 3,
+                ..GenerateOptions::default()
+            },
+        },
+        GenerateRequest {
+            prompt: GeneratePrompt::TokenIds(vec![3]),
+            options: GenerateOptions {
+                greedy: true,
+                stop_on_eos: false,
+                max_new_tokens: 4,
+                ..GenerateOptions::default()
+            },
+        },
+    ];
+    let expected = isolated_results(fixture.path(), &requests)?;
+    let mut engine = cpu_engine(fixture.path())?;
+    let mut manager = engine.continuous_batch_manager(2)?;
+    let aborted = manager.submit(requests[0].clone())?;
+    let sibling = manager.submit(requests[1].clone())?;
+
+    manager.step()?;
+    manager.step()?;
+    manager.step()?;
+    assert!(
+        manager.poll().is_empty(),
+        "commit_only rows must not publish token or completion events before the turn commits"
+    );
+    let before = manager.diagnostic()?;
+    assert_eq!(before.rows[0].generated_tokens, 1);
+    assert_eq!(before.rows[1].generated_tokens, 2);
+    assert!(before.committed_output_journal.iter().all(Vec::is_empty));
+
+    assert!(manager.cancel(aborted)?);
+    let aborted_events = manager.poll();
+    assert!(matches!(
+        aborted_events.as_slice(),
+        [ContinuousBatchEvent::Aborted {
+            handle,
+            outcome: onnx_genai_engine::pipeline::TurnTransactionOutcome::AbortToBaseline {
+                reason: onnx_genai_engine::pipeline::TurnAbortReason::Cancellation,
+                ..
+            },
+            ..
+        }] if *handle == aborted
+    ));
+    let restored = manager.diagnostic()?;
+    assert!(restored.rows[0].handle.is_none());
+    assert_eq!(restored.rows[0].resident_tokens, 0);
+    assert_eq!(restored.rows[1].handle, Some(sibling));
+    assert_eq!(restored.rows[1].generated_tokens, 2);
+    assert_eq!(
+        restored.rows[1].resident_tokens,
+        before.rows[1].resident_tokens
+    );
+    assert!(restored.committed_output_journal[0].is_empty());
+
+    let retry = manager.submit(requests[0].clone())?;
+    let mut completed = HashMap::new();
+    while manager.has_pending_work() {
+        manager.step()?;
+        for event in manager.poll() {
+            match event {
+                ContinuousBatchEvent::Finished { handle, result } => {
+                    completed.insert(handle, result);
+                }
+                ContinuousBatchEvent::Aborted { error, .. } => {
+                    anyhow::bail!("retry unexpectedly aborted: {error}")
+                }
+                ContinuousBatchEvent::Token { .. } => {}
+            }
+        }
+    }
+    manager.drain()?;
+
+    assert!(!completed.contains_key(&aborted));
+    assert_eq!(completed.get(&sibling), Some(&expected[1]));
+    assert_eq!(completed.get(&retry), Some(&expected[0]));
+    Ok(())
+}
