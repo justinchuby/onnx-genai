@@ -1322,9 +1322,14 @@ fn portable_checkpoints_are_distinct_from_private_state_transfer() {
     // is a declared property, not an emergent one.
     let exported = private.replace(
         "    state:\n      cache:",
-        "    outputs:\n      cache:\n        contract: { dtype: float16, shape: [batch, \
-         heads, sequence, head_dim], batch_layout: { kind: request_aligned, axis: 0 } }\n        \
-         role: tensor\n        stage: pre_adapter\n    state:\n      cache:",
+        r#"    outputs:
+      cache:
+        contract: { dtype: float16, shape: [batch, heads, sequence, head_dim], batch_layout: { kind: request_aligned, axis: 0 } }
+        role: tensor
+        family: { kind: materialized }
+        stage: pre_adapter
+    state:
+      cache:"#,
     );
     let failures = errors(&exported);
     assert!(
@@ -1355,9 +1360,9 @@ fn the_speculative_region_covers_every_component_in_the_loop_body() {
     let workflow = serving_workflow("permitted", SOUND_CAPABILITIES, "", &speculative_block(4));
     let with_sidecar = workflow
         .replace(
-            "capabilities: [workflow_ssa, serving_service_contract]",
-            "capabilities: [workflow_ssa, serving_service_contract, linear_effects, \
-             nested_control_flow]",
+            "capabilities: [workflow_ssa, serving_service_contract, canonical_speculation]",
+            "capabilities: [workflow_ssa, serving_service_contract, canonical_speculation, \
+             linear_effects, nested_control_flow]",
         )
         .replace(
             r#"      verifier:
@@ -1430,9 +1435,9 @@ fn runtime_owned_state_cannot_be_exported_under_an_alias() {
     // has to read the emitted value.
     let aliased = serving_workflow("permitted", SOUND_CAPABILITIES, "", "")
         .replace(
-            "capabilities: [workflow_ssa, serving_service_contract]",
-            "capabilities: [workflow_ssa, serving_service_contract, linear_effects, \
-             nested_control_flow, typed_emit]",
+            "capabilities: [workflow_ssa, serving_service_contract, canonical_speculation]",
+            "capabilities: [workflow_ssa, serving_service_contract, canonical_speculation, \
+             linear_effects, nested_control_flow, typed_emit]",
         )
         .replace(
             "      empty_cache:",
@@ -1464,6 +1469,7 @@ fn runtime_owned_state_cannot_be_exported_under_an_alias() {
       cache_dump:
         contract: { dtype: float16, shape: [batch, heads, sequence, head_dim], batch_layout: { kind: request_aligned, axis: 0 } }
         role: tensor
+        family: { kind: materialized }
         stage: pre_adapter
     state:
       cache:"#,

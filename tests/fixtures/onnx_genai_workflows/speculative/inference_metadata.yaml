@@ -274,6 +274,7 @@ pipeline:
             kind: request_aligned
             axis: 0
         role: tokens
+        family: { kind: materialized }
         stage: pre_adapter
     components:
       proposer:

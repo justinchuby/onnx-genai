@@ -86,6 +86,7 @@ pipeline:
           shape: [batch, proposal, vocab]
           batch_layout: {kind: request_aligned, axis: 0}
         role: tensor
+        family: { kind: materialized }
         stage: pre_adapter
     components:
       proposer:

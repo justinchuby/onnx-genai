@@ -36,6 +36,7 @@ pipeline:
             kind: request_aligned
             axis: 0
         role: audio
+        family: { kind: materialized }
         stage: post_adapter
     components:
       encoder:

@@ -92,7 +92,6 @@ impl Default for RuntimeCapabilities {
                 capability::NESTED_CONTROL_FLOW.to_string(),
                 capability::LOOP_INDUCTION_VALUES.to_string(),
                 capability::TYPED_EMIT.to_string(),
-                capability::STREAMING_EMIT.to_string(),
                 capability::TOKEN_CONTEXT.to_string(),
                 capability::CANONICAL_SPECULATION.to_string(),
             ],
@@ -330,13 +329,8 @@ fn collect_workflow_capabilities(node: &WorkflowNode, capabilities: &mut BTreeSe
                 collect_workflow_capabilities(default, capabilities);
             }
         }
-        WorkflowNode::Emit {
-            mode, valid_length, ..
-        } => {
+        WorkflowNode::Emit { valid_length, .. } => {
             capabilities.insert(capability::TYPED_EMIT.to_string());
-            if matches!(mode, crate::schema::WorkflowEmitMode::Event) {
-                capabilities.insert(capability::STREAMING_EMIT.to_string());
-            }
             if valid_length.is_some() {
                 capabilities.insert(capability::EMIT_VALID_LENGTH.to_string());
             }
@@ -2107,11 +2101,145 @@ fn validate_adapter_service(
     }
 }
 
+/// Validate output-level publication semantics before lowering makes the
+/// control-flow sites opaque. A family is declared once per output; a site may
+/// only select one of that family's operations.
+fn validate_output_protocols(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
+    for (name, output) in &workflow.outputs {
+        if let crate::schema::WorkflowOutputFamily::Revisions { version } = &output.family
+            && version != "1"
+        {
+            errors.push(format!(
+                "pipeline.workflow.outputs.{name}.family.version is '{version}', but this runtime \
+                 implements typed revision protocol version '1'; declare the exact supported \
+                 version rather than relying on a compatible-looking revision"
+            ));
+        }
+    }
+
+    fn walk(steps: &[WorkflowStep], workflow: &WorkflowSpec, path: &str, errors: &mut Vec<String>) {
+        for (index, step) in steps.iter().enumerate() {
+            let site = format!("{path}[{index}]");
+            match step {
+                WorkflowStep::Sequence { steps } => {
+                    walk(steps, workflow, &format!("{site}.steps"), errors);
+                }
+                WorkflowStep::Loop { setup, steps, .. } => {
+                    walk(setup, workflow, &format!("{site}.setup"), errors);
+                    walk(steps, workflow, &format!("{site}.steps"), errors);
+                }
+                WorkflowStep::Branch { cases, default, .. } => {
+                    for (case, step) in cases {
+                        walk(
+                            std::slice::from_ref(step),
+                            workflow,
+                            &format!("{site}.cases.{case}"),
+                            errors,
+                        );
+                    }
+                    if let Some(default) = default {
+                        walk(
+                            std::slice::from_ref(default.as_ref()),
+                            workflow,
+                            &format!("{site}.default"),
+                            errors,
+                        );
+                    }
+                }
+                WorkflowStep::Emit {
+                    value,
+                    when,
+                    valid_length,
+                    output,
+                    stream,
+                    mode,
+                    axis,
+                } => {
+                    let Some(declared) = workflow.outputs.get(output) else {
+                        continue;
+                    };
+                    if stream.as_deref().is_some_and(str::is_empty) {
+                        errors.push(format!(
+                            "{site}.stream is empty for output '{output}'; name a non-empty logical \
+                             stream or omit it to select the output default"
+                        ));
+                    }
+                    let carries_payload = matches!(
+                        mode,
+                        crate::schema::WorkflowEmitMode::Replace
+                            | crate::schema::WorkflowEmitMode::Append
+                            | crate::schema::WorkflowEmitMode::Event
+                    );
+                    if carries_payload && value.is_empty() {
+                        errors.push(format!(
+                            "{site}.value is required for {mode:?} publication to output '{output}'"
+                        ));
+                    }
+                    if !carries_payload && !value.is_empty() {
+                        errors.push(format!(
+                            "{site}.value names '{value}' for payloadless {mode:?} publication to \
+                             output '{output}' stream '{}'; remove the value because this operation \
+                             cannot carry or discard a payload",
+                            stream.as_deref().unwrap_or(output)
+                        ));
+                    }
+                    if !carries_payload
+                        && (when.is_some() || valid_length.is_some() || axis.is_some())
+                    {
+                        errors.push(format!(
+                            "{site} selects {mode:?} for output '{output}', which carries no payload \
+                             and therefore cannot declare `when`, `valid_length`, or `axis`"
+                        ));
+                    }
+                    let legal = matches!(
+                        (&declared.family, mode),
+                        (
+                            crate::schema::WorkflowOutputFamily::Materialized,
+                            crate::schema::WorkflowEmitMode::Replace
+                                | crate::schema::WorkflowEmitMode::Append,
+                        ) | (
+                            crate::schema::WorkflowOutputFamily::Events,
+                            crate::schema::WorkflowEmitMode::Event,
+                        ) | (
+                            crate::schema::WorkflowOutputFamily::Revisions { .. },
+                            crate::schema::WorkflowEmitMode::Append
+                                | crate::schema::WorkflowEmitMode::Replace
+                                | crate::schema::WorkflowEmitMode::Retract
+                                | crate::schema::WorkflowEmitMode::Finalize,
+                        )
+                    );
+                    if !legal {
+                        errors.push(format!(
+                            "{site} selects {mode:?} for output '{output}', but its declared family \
+                             {:?} does not permit that operation",
+                            declared.family
+                        ));
+                    }
+                    if matches!(
+                        declared.family,
+                        crate::schema::WorkflowOutputFamily::Materialized
+                    ) && stream.is_some()
+                    {
+                        errors.push(format!(
+                            "{site}.stream names a stream for materialized output '{output}'; \
+                             materialized values have exactly one output head"
+                        ));
+                    }
+                }
+                WorkflowStep::Invoke { .. } => {}
+            }
+        }
+    }
+
+    walk(&workflow.steps, workflow, "pipeline.workflow.steps", errors);
+}
+
 fn validate_workflow(
     workflow: &WorkflowSpec,
     version: crate::version::SchemaVersion,
     errors: &mut Vec<String>,
 ) {
+    validate_output_protocols(workflow, errors);
     let compiled = match crate::compile_workflow(workflow) {
         Ok(compiled) => compiled,
         Err(error) => {
@@ -6627,17 +6755,31 @@ fn validate_workflow_node(
             axis,
             effect_name,
             effect,
+            ..
         } => {
-            require_workflow_value(value, values, &format!("{path}.value"), errors);
-            validate_emit_axis(
-                value_contracts.get(value),
+            let carries_payload = matches!(
                 mode,
-                *axis,
-                valid_length.is_some(),
-                version,
-                path,
-                errors,
+                crate::schema::WorkflowEmitMode::Replace
+                    | crate::schema::WorkflowEmitMode::Append
+                    | crate::schema::WorkflowEmitMode::Event
             );
+            if carries_payload {
+                require_workflow_value(value, values, &format!("{path}.value"), errors);
+                validate_emit_axis(
+                    value_contracts.get(value),
+                    mode,
+                    *axis,
+                    valid_length.is_some(),
+                    version,
+                    path,
+                    errors,
+                );
+            } else if !value.is_empty() {
+                errors.push(format!(
+                    "{path}.value names '{value}', but {mode:?} carries no payload; remove \
+                     `value` from this control publication"
+                ));
+            }
             if let Some(when) = when {
                 require_workflow_value(when, values, &format!("{path}.when"), errors);
                 if let Some(contract) = value_contracts.get(when) {
@@ -6689,10 +6831,12 @@ fn validate_workflow_node(
             }
             if !workflow.outputs.contains_key(output) {
                 errors.push(format!("{path} emits undeclared output '{output}'"));
-            } else if let (Some(value_contract), Some(output_contract)) = (
-                value_contracts.get(value),
-                workflow.outputs.get(output).map(|output| &output.contract),
-            ) {
+            } else if carries_payload
+                && let (Some(value_contract), Some(output_contract)) = (
+                    value_contracts.get(value),
+                    workflow.outputs.get(output).map(|output| &output.contract),
+                )
+            {
                 if valid_length.is_some() {
                     require_emit_prefix_contracts(
                         value_contract,

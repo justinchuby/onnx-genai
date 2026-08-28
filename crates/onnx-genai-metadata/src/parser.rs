@@ -275,9 +275,9 @@ fn gate_document(document: &serde_yaml::Value) -> Result<(), crate::MetadataErro
     reject_retired_top_level_tokens(document)?;
     reject_invalid_tensor_contract_shapes(document, String::new())?;
     let declared = crate::version::declared_in(document).map_err(crate::MetadataError::Parse)?;
-    crate::version::gate(declared)
-        .map(|_| ())
-        .map_err(crate::MetadataError::Parse)?;
+    let version = crate::version::gate(declared).map_err(crate::MetadataError::Parse)?;
+    require_output_families(document, version)?;
+    reject_retired_streaming_emit(document)?;
     // After the version, deliberately. The flat packed spelling is a reshape
     // within the v1 line, so refusing it presumes the document belongs to that
     // line. A document from a version this build does not support is refused for
@@ -291,6 +291,86 @@ fn gate_document(document: &serde_yaml::Value) -> Result<(), crate::MetadataErro
     // retired spelling is only ever found by recognizing its shape.
     reject_flat_token_packed(document, String::new())
         .and_then(|_| reject_retired_batching_hints(document))
+}
+
+/// Output protocols are a v1.5 addition. Older packages retain their original
+/// materialized-value interpretation, while a v1.5 package must make the
+/// family explicit so an older reader cannot accidentally choose one.
+fn require_output_families(
+    document: &serde_yaml::Value,
+    version: crate::version::SchemaVersion,
+) -> Result<(), crate::MetadataError> {
+    if version < crate::version::OUTPUT_PROTOCOL_SCHEMA_VERSION {
+        return Ok(());
+    }
+    let Some(outputs) = document
+        .get("pipeline")
+        .and_then(|pipeline| pipeline.get("workflow"))
+        .and_then(|workflow| workflow.get("outputs"))
+        .and_then(serde_yaml::Value::as_mapping)
+    else {
+        return Ok(());
+    };
+    for (name, output) in outputs {
+        let name = name.as_str().unwrap_or("?");
+        if output.get("family").is_none() {
+            return Err(crate::MetadataError::Parse(format!(
+                "pipeline.workflow.outputs.{name} is missing required `family` in schema \
+                 version {version}; declare exactly one of `{{ kind: materialized }}`, \
+                 `{{ kind: events }}`, or `{{ kind: revisions, version: \"1\" }}`"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// `streaming_emit` was a redundant capability spelling: the output family
+/// alone decides whether a publication is an event or a revision. Refuse it
+/// before typed parsing so a producer gets a migration rather than a generic
+/// unsupported-capability error.
+fn reject_retired_streaming_emit(document: &serde_yaml::Value) -> Result<(), crate::MetadataError> {
+    fn walk(value: &serde_yaml::Value, path: String) -> Option<String> {
+        match value {
+            serde_yaml::Value::Mapping(mapping) => {
+                for (key, child) in mapping {
+                    let key = key.as_str().unwrap_or("?");
+                    let child_path = if path.is_empty() {
+                        key.to_string()
+                    } else {
+                        format!("{path}.{key}")
+                    };
+                    if key == "capabilities"
+                        && child.as_sequence().is_some_and(|items| {
+                            items
+                                .iter()
+                                .any(|item| item.as_str() == Some("streaming_emit"))
+                        })
+                    {
+                        return Some(child_path);
+                    }
+                    if let Some(found) = walk(child, child_path) {
+                        return Some(found);
+                    }
+                }
+                None
+            }
+            serde_yaml::Value::Sequence(items) => items
+                .iter()
+                .enumerate()
+                .find_map(|(index, child)| walk(child, format!("{path}[{index}]"))),
+            _ => None,
+        }
+    }
+
+    let Some(path) = walk(document, String::new()) else {
+        return Ok(());
+    };
+    Err(crate::MetadataError::Parse(format!(
+        "`{path}` declares retired capability `streaming_emit`. Remove it and select the \
+         workflow output's canonical `family`: `events` for ordered occurrences or \
+         `revisions` with an exact protocol version for replaceable output. `typed_emit` \
+         remains the capability for workflow output publication."
+    )))
 }
 
 /// Refuse tensor contracts that retain the duplicate rank authority or omit

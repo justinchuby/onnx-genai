@@ -58,6 +58,10 @@ pub const TOKEN_CONTEXT_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 4)
 /// only portable speculative authority.
 pub const CANONICAL_SPECULATION_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 5);
 
+/// The version that introduced output publication families and typed revision
+/// envelopes.
+pub const OUTPUT_PROTOCOL_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 5);
+
 /// Normalize a declared `schema_version` spelling.
 ///
 /// `None` is the initial version: a document written before anyone thought to

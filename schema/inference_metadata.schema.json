@@ -5126,7 +5126,9 @@
       "enum": [
         "replace",
         "append",
-        "event"
+        "event",
+        "retract",
+        "finalize"
       ],
       "type": "string"
     },
@@ -5291,6 +5293,10 @@
         "contract": {
           "$ref": "#/$defs/TensorContract"
         },
+        "family": {
+          "$ref": "#/$defs/WorkflowOutputFamily",
+          "description": "The sole publication family for this output boundary.\n\nThe default preserves documents authored before output protocols were\nintroduced. New schema-versioned documents must state this field; see\nthe parser's version gate."
+        },
         "media": {
           "anyOf": [
             {
@@ -5322,9 +5328,63 @@
       "required": [
         "contract",
         "role",
+        "family",
         "stage"
       ],
       "type": "object"
+    },
+    "WorkflowOutputFamily": {
+      "description": "Publication semantics selected once for a workflow output.\n\nThis classification describes workflow semantics only. Adapters render the\nresulting publications separately and cannot change an allowed operation.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "One value, replaced or grown along a declared axis.",
+          "properties": {
+            "kind": {
+              "const": "materialized",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Ordered, discrete typed occurrences.",
+          "properties": {
+            "kind": {
+              "const": "events",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A stream of typed, transaction-addressable revisions.",
+          "properties": {
+            "kind": {
+              "const": "revisions",
+              "type": "string"
+            },
+            "version": {
+              "description": "Exact revision-envelope protocol version.",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "version"
+          ],
+          "type": "object"
+        }
+      ]
     },
     "WorkflowOutputRole": {
       "oneOf": [
@@ -5658,6 +5718,14 @@
             "output": {
               "type": "string"
             },
+            "stream": {
+              "description": "Logical stream within the declared output. Omission selects the\noutput's default stream; it never selects an adapter.",
+              "minLength": 1,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "valid_length": {
               "type": [
                 "string",
@@ -5665,6 +5733,7 @@
               ]
             },
             "value": {
+              "description": "SSA value published by a value-carrying operation. `retract` and\n`finalize` carry no value, so this is absent for those operations.",
               "type": "string"
             },
             "when": {
@@ -5676,7 +5745,6 @@
           },
           "required": [
             "kind",
-            "value",
             "output",
             "mode"
           ],
