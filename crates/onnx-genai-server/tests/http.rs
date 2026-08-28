@@ -1338,6 +1338,46 @@ fn declared_protocol_envelope_failures_are_not_assistant_content() {
 }
 
 #[test]
+fn buffered_atem_route_rejects_text_outside_the_envelope_sequence() {
+    let protocol = declared_protocol("atem-xml");
+    let call = r#"<atem:invoke name="read"></atem:invoke>"#;
+    for (output, reason) in [
+        (format!("junk{call}"), "before the first invoke envelope"),
+        (
+            format!("{call}junk"),
+            "trailing text after an invoke envelope",
+        ),
+        (
+            format!("junk{call}junk"),
+            "before the first invoke envelope",
+        ),
+    ] {
+        let error = parse_assistant_output(Some(&protocol), None, output, "stop")
+            .expect_err("text outside a declared ATEM envelope sequence must fail closed")
+            .to_string();
+        assert!(error.contains("atem-xml@v1"), "{error}");
+        assert!(error.contains("malformed envelope"), "{error}");
+        assert!(error.contains("buffered generation boundary"), "{error}");
+        assert!(error.contains(reason), "{error}");
+    }
+}
+
+#[test]
+fn buffered_atem_route_accepts_surrounding_whitespace_and_multiple_calls() {
+    let protocol = declared_protocol("atem-xml");
+    let output = " \n<atem:invoke name=\"read\"></atem:invoke>\t\
+                  <atem:invoke name=\"write\"><atem:parameter name=\"path\">\
+                  \"src/lib.rs\"</atem:parameter></atem:invoke>\r\n"
+        .to_string();
+    let parsed = parse_assistant_output(Some(&protocol), None, output, "stop")
+        .expect("whitespace around and between ATEM envelopes is legal");
+    let calls = parsed.tool_calls.expect("two parsed tool calls");
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].function.name, "read");
+    assert_eq!(calls[1].function.name, "write");
+}
+
+#[test]
 fn declared_protocol_preserves_ordinary_no_call_assistant_text() {
     for identity in ["tagged-json", "atem-xml"] {
         let output = "ordinary assistant text".to_string();

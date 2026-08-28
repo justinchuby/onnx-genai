@@ -967,16 +967,20 @@ mod declared_tool_stream_tests {
     use onnx_genai_metadata::ToolProtocolDeclaration;
     use std::path::PathBuf;
 
-    fn protocol() -> ToolProtocol {
+    fn protocol(identity: &str) -> ToolProtocol {
         ToolProtocol::from_declaration(&ToolProtocolDeclaration {
-            identity: "tagged-json".to_string(),
+            identity: identity.to_string(),
             version: "v1".to_string(),
         })
         .unwrap()
     }
 
-    async fn injected_body(request: &ChatCompletionRequest, chunks: &[&str]) -> String {
-        let protocol = protocol();
+    async fn injected_body(
+        identity: &str,
+        request: &ChatCompletionRequest,
+        chunks: &[&str],
+    ) -> String {
+        let protocol = protocol(identity);
         let tokenizer_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/tiny-llm/tokenizer.json");
         let tokenizer = Tokenizer::from_file(&tokenizer_path).expect("fixture tokenizer");
@@ -1040,6 +1044,7 @@ mod declared_tool_stream_tests {
         }))
         .unwrap();
         let body = injected_body(
+            "tagged-json",
             &request,
             &[
                 r#"<tool_call>{"name":"weather","arguments":{"city":"Par"#,
@@ -1064,7 +1069,7 @@ mod declared_tool_stream_tests {
             "stream": true
         }))
         .unwrap();
-        let body = injected_body(&required, &["ordinary assistant text"]).await;
+        let body = injected_body("tagged-json", &required, &["ordinary assistant text"]).await;
         assert!(body.contains("event: error"), "{body}");
         assert!(body.contains("tagged-json@v1"), "{body}");
         assert!(body.contains("tool_choice required"), "{body}");
@@ -1082,6 +1087,7 @@ mod declared_tool_stream_tests {
         }))
         .unwrap();
         let body = injected_body(
+            "tagged-json",
             &specific,
             &[r#"<tool_call>{"name":"calendar","arguments":{}}</tool_call>"#],
         )
@@ -1090,6 +1096,67 @@ mod declared_tool_stream_tests {
         assert!(body.contains("tagged-json@v1"), "{body}");
         assert!(body.contains("weather"), "{body}");
         assert!(body.contains("calendar"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn injected_sse_route_rejects_text_outside_atem_envelopes() {
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "fixture",
+            "messages": [{"role": "user", "content": "read"}],
+            "tools": [{"type": "function", "function": {"name": "read"}}],
+            "tool_choice": "required",
+            "stream": true
+        }))
+        .unwrap();
+        let call = r#"<atem:invoke name="read"></atem:invoke>"#;
+        for (chunks, reason) in [
+            (vec!["junk", call], "before the first invoke envelope"),
+            (vec![call, "junk"], "trailing text after an invoke envelope"),
+            (
+                vec!["junk", call, "junk"],
+                "before the first invoke envelope",
+            ),
+        ] {
+            let body = injected_body("atem-xml", &request, &chunks).await;
+            assert!(body.contains("event: error"), "{body}");
+            assert!(body.contains("atem-xml@v1"), "{body}");
+            assert!(body.contains("malformed envelope"), "{body}");
+            assert!(body.contains("SSE chunk ingestion"), "{body}");
+            assert!(body.contains(reason), "{body}");
+            assert!(!body.contains("\"tool_calls\""), "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn injected_sse_route_accepts_whitespace_and_multiple_atem_calls() {
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "fixture",
+            "messages": [{"role": "user", "content": "read then write"}],
+            "tools": [
+                {"type": "function", "function": {"name": "read"}},
+                {"type": "function", "function": {"name": "write"}}
+            ],
+            "tool_choice": "required",
+            "stream": true
+        }))
+        .unwrap();
+        let body = injected_body(
+            "atem-xml",
+            &request,
+            &[
+                " \n<atem:inv",
+                "oke name=\"read\"></atem:invoke>\t",
+                "<atem:invoke name=\"write\"><atem:parameter name=\"path\">",
+                "\"src/lib.rs\"</atem:parameter></atem:invoke>\r\n",
+            ],
+        )
+        .await;
+        assert!(body.contains("\"tool_calls\""), "{body}");
+        assert!(body.contains("\"read\""), "{body}");
+        assert!(body.contains("\"write\""), "{body}");
+        assert!(body.contains("\\\"path\\\":\\\"src/lib.rs\\\""), "{body}");
+        assert!(body.contains("data: [DONE]"), "{body}");
+        assert!(!body.contains("event: error"), "{body}");
     }
 }
 
@@ -3436,8 +3503,7 @@ mod tool_name_alignment_tests {
     // offered tool, so the client dispatches it instead of rejecting `glob.glob`.
     #[test]
     fn a_namespaced_atem_call_dispatches_through_the_full_parse_path() {
-        let output = "to=functions.glob<|message|>\
-             <atem:invoke name=\"glob.glob\">\
+        let output = "<atem:invoke name=\"glob.glob\">\
              <atem:parameter name=\"pattern\">*.rs</atem:parameter>\
              </atem:invoke>"
             .to_string();

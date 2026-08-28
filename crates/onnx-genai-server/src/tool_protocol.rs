@@ -52,7 +52,11 @@ impl ToolCallStream {
             return ToolParseOutcome::Malformed(error);
         }
         self.input.push_str(chunk);
-        protocol.parse(&self.input)
+        let outcome = protocol.parse(&self.input);
+        if let ToolParseOutcome::Malformed(error) = &outcome {
+            self.terminal_error = Some(error.clone());
+        }
+        outcome
     }
 
     pub fn finish(self, protocol: &ToolProtocol) -> ToolParseOutcome {
@@ -625,7 +629,19 @@ fn parse_tagged_json(input: &str) -> ToolParseOutcome {
 fn parse_atem_xml(input: &str) -> ToolParseOutcome {
     const OPEN: &str = "<atem:invoke";
     const CLOSE: &str = "</atem:invoke>";
-    let Some(mut rest) = input.split_once(OPEN).map(|(_, rest)| rest) else {
+    let first = input.trim_start();
+    if first.is_empty() {
+        return ToolParseOutcome::NoCall;
+    }
+    let mut rest = if let Some(rest) = first.strip_prefix(OPEN) {
+        rest
+    } else if OPEN.starts_with(first) {
+        return ToolParseOutcome::Incomplete;
+    } else if let Some((prefix, _)) = input.split_once(OPEN) {
+        return ToolParseOutcome::Malformed(format!(
+            "atem-xml@v1 has non-whitespace text before the first invoke envelope: {prefix:?}"
+        ));
+    } else {
         return ToolParseOutcome::NoCall;
     };
     let mut values = Vec::new();
@@ -686,7 +702,18 @@ fn parse_atem_xml(input: &str) -> ToolParseOutcome {
                     "atem-xml@v1 has non-whitespace text between invoke envelopes: {between:?}"
                 ));
             }
-            None => return values_to_calls("atem-xml@v1", values),
+            None => {
+                let trailing = after.trim_start();
+                if trailing.is_empty() {
+                    return values_to_calls("atem-xml@v1", values);
+                }
+                if OPEN.starts_with(trailing) {
+                    return ToolParseOutcome::Incomplete;
+                }
+                return ToolParseOutcome::Malformed(format!(
+                    "atem-xml@v1 has non-whitespace trailing text after an invoke envelope: {trailing:?}"
+                ));
+            }
         }
     }
 }
@@ -852,6 +879,63 @@ mod tests {
                 "<atem:invoke name=\"tool\">unexpected<atem:parameter name=\"x\">1</atem:parameter></atem:invoke>"
             ),
             ToolParseOutcome::Malformed(_)
+        ));
+    }
+
+    #[test]
+    fn atem_xml_requires_the_complete_output_to_be_an_envelope_sequence() {
+        let resolved = protocol("atem-xml");
+        let call = r#"<atem:invoke name="read"></atem:invoke>"#;
+        for input in [
+            format!("junk{call}"),
+            format!("{call}junk"),
+            format!("junk{call}junk"),
+        ] {
+            assert!(
+                matches!(resolved.parse(&input), ToolParseOutcome::Malformed(_)),
+                "{input}"
+            );
+        }
+
+        let valid = format!(
+            " \n{call}\t<atem:invoke name=\"write\"><atem:parameter name=\"path\">\"src/lib.rs\"</atem:parameter></atem:invoke>\r\n"
+        );
+        let ToolParseOutcome::Complete(calls) = resolved.parse(&valid) else {
+            panic!("surrounding whitespace and adjacent calls must be accepted");
+        };
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].function.name, "read");
+        assert_eq!(calls[1].function.name, "write");
+    }
+
+    #[test]
+    fn atem_xml_partial_openers_remain_incomplete_but_surrounding_text_is_terminal() {
+        let resolved = protocol("atem-xml");
+        let call = r#"<atem:invoke name="read"></atem:invoke>"#;
+        let inputs = [
+            "<atem:inv".to_string(),
+            " \n<atem:inv".to_string(),
+            format!("{call}\n<atem:inv"),
+        ];
+        for input in inputs {
+            assert_eq!(
+                resolved.parse(&input),
+                ToolParseOutcome::Incomplete,
+                "{input}"
+            );
+        }
+
+        let mut stream = ToolCallStream::default();
+        assert_eq!(
+            stream.push(&resolved, &format!("{call}junk")),
+            ToolParseOutcome::Malformed(
+                "atem-xml@v1 has non-whitespace trailing text after an invoke envelope: \"junk\""
+                    .to_string()
+            )
+        );
+        assert!(matches!(
+            stream.push(&resolved, "<atem:invoke name=\"ignored\">"),
+            ToolParseOutcome::Malformed(message) if message.contains("trailing text")
         ));
     }
 
