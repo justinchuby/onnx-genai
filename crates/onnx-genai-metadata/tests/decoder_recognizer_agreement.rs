@@ -590,6 +590,17 @@ const MATRIX: &[Row] = &[
         true,
         Some("decoder"),
     ),
+    // An intentionally model-less package: loader admission must reject its
+    // unsupported canonical candidate-tree executor before inspecting an ONNX
+    // artifact, while structural workflow recognition remains NoGraph.
+    row(
+        "crates/onnx-genai-engine/tests/fixtures/unsupported-candidate-tree/inference_metadata.yaml",
+        0,
+        NoGraph,
+        None,
+        false,
+        None,
+    ),
     // The smallest document that declares a workflow at all: its one component
     // is a `binding`, so the workflow names no graph.
     row(

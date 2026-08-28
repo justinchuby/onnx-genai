@@ -327,6 +327,9 @@ impl Engine {
                 .ok()
                 .and_then(|directory| load_inference_metadata(&directory).ok()),
         };
+        if let Some(metadata) = metadata.as_ref() {
+            Self::reject_undispatched_canonical_speculation(metadata)?;
+        }
         metadata
             .as_ref()
             .and_then(|metadata| metadata.pipeline.as_ref())
@@ -344,6 +347,33 @@ impl Engine {
                     model_dir.display()
                 )
             })
+    }
+
+    /// Refuse canonical declaration variants for which this runtime has no
+    /// package-dispatch executor. This gate is before model/session loading, so
+    /// unsupported proposal data cannot mutate target, proposer, state, or S3
+    /// output participants and then silently fall through to plain generation.
+    fn reject_undispatched_canonical_speculation(
+        metadata: &InferenceMetadata,
+    ) -> anyhow::Result<()> {
+        let Some(contract) = metadata.speculative.as_ref() else {
+            return Ok(());
+        };
+        if !matches!(
+            contract.proposal_execution,
+            onnx_genai_metadata::SpeculativeProposalExecution::CandidateTree { .. }
+        ) {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "package declares canonical candidate-tree speculation \
+             (onnx-genai.speculative@{}), but this runtime has no candidate-tree \
+             package-dispatch executor. Refusing to silently run plain or MTP generation \
+             without the declared proposer, target verification, accepted-prefix commit, and \
+             rollback participants. Upgrade to a runtime that implements candidate-tree \
+             dispatch, or re-export this package with a supported canonical proposal execution.",
+            contract.version
+        );
     }
 
     /// Adopt the package's declared workflow as the one this runtime executes.
@@ -3169,6 +3199,31 @@ fn load_eagle3_model(
 #[cfg(test)]
 mod metadata_admission_tests {
     use super::*;
+
+    #[test]
+    fn candidate_tree_contract_is_refused_before_model_or_session_loading() {
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/unsupported-candidate-tree");
+
+        let Err(error) = Engine::from_dir(&fixture, EngineConfig::default()) else {
+            panic!("a declared candidate tree must never fall through to plain generation");
+        };
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("candidate-tree") && message.contains("onnx-genai.speculative@1"),
+            "the refusal must identify the exact canonical declaration: {message}"
+        );
+        assert!(
+            message.contains("no candidate-tree package-dispatch executor")
+                && message.contains("Refusing to silently run plain or MTP generation"),
+            "the refusal must explain why no model/session was loaded: {message}"
+        );
+        assert!(
+            !message.contains("model.onnx"),
+            "the candidate-tree admission guard must run before this fixture's intentionally \
+             absent model artifact is inspected: {message}"
+        );
+    }
 
     #[test]
     fn unsupported_declared_capability_is_reported_but_does_not_block_decode() {
