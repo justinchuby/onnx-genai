@@ -68,7 +68,6 @@ struct PendingContinuousRequest {
 
 struct ContinuousBatchRow {
     handle: ContinuousBatchHandle,
-    physical_row: usize,
     context_tokens: Vec<TokenId>,
     options: GenerateOptions,
     chain: ProcessorChain,
@@ -214,13 +213,13 @@ pub struct ContinuousBatchManager<'a> {
     cursor: Option<WorkflowGenerationCursor>,
     /// Iteration bound the authored loop is started with.
     iteration_bound: usize,
-    /// Tokens this pass's executor committed, per physical row.
+    /// Tokens this pass's executor committed, per positional row.
     ///
     /// Held against what the authored emit published — row by row, because a
     /// batch's emit accumulates one stream per row — so the declared emit stays
     /// load-bearing: a row whose tokens stopped reaching the stream would
     /// otherwise be invisible behind the event queue the caller actually reads.
-    committed_per_row: Vec<usize>,
+    committed_per_row: Vec<Vec<i64>>,
     /// Declared passes this manager has completed.
     ///
     /// A pass that ended while work remained would restart transparently on the
@@ -321,7 +320,7 @@ impl<'a> ContinuousBatchManager<'a> {
             // sequence the package says it can hold — a bound that is real
             // rather than a number invented to be large.
             iteration_bound: metadata_max_context.unwrap_or(static_max_len).max(1),
-            committed_per_row: vec![0; max_batch],
+            committed_per_row: vec![Vec::new(); max_batch],
             passes: 0,
         })
     }
@@ -423,16 +422,16 @@ impl<'a> ContinuousBatchManager<'a> {
     /// exactly the failure a recycled batch row can produce.
     fn finish_pass(&mut self, emitted: &[Vec<i64>]) -> anyhow::Result<()> {
         for (row, committed) in self.committed_per_row.iter().enumerate() {
-            let published = emitted.get(row).map_or(0, Vec::len);
+            let published = emitted.get(row).map_or(&[][..], Vec::as_slice);
             anyhow::ensure!(
-                published == *committed,
-                "the authored continuous-batch loop emitted {published} tokens into row {row} \
-                 while its executor committed {committed}; the declared token stream and the \
+                published == committed,
+                "the authored continuous-batch loop emitted {published:?} into row {row} \
+                 while its executor committed {committed:?}; the declared token stream and the \
                  generated one must be the same stream"
             );
         }
         self.cursor = None;
-        self.committed_per_row = vec![0; self.rows.len()];
+        self.committed_per_row = vec![Vec::new(); self.rows.len()];
         self.passes += 1;
         Ok(())
     }
@@ -503,10 +502,10 @@ impl<'a> ContinuousBatchManager<'a> {
                 .context("ready continuous row disappeared")?;
             let (token, finished) = self.advance_row(&mut row)?;
             committed[row_index] = Some(token);
-            self.committed_per_row[row_index] += 1;
+            self.committed_per_row[row_index].push(i64::from(token));
             if finished {
                 self.decode
-                    .deactivate_row(row.physical_row)
+                    .deactivate_row(row_index)
                     .map_err(|e| anyhow::anyhow!("Failed to deactivate continuous row: {e}"))?;
             } else {
                 self.rows[row_index] = Some(row);
@@ -740,7 +739,6 @@ impl<'a> ContinuousBatchManager<'a> {
         let loop_state = DecodeLoopState::with_rng(0, rng, pending.options.top_logprobs);
         let row = ContinuousBatchRow {
             handle: pending.handle,
-            physical_row: row_index,
             context_tokens: pending.prompt_tokens,
             options: pending.options,
             chain: pending.chain,
@@ -930,9 +928,12 @@ impl<'a> ContinuousBatchManager<'a> {
         let advancing_rows = self
             .rows
             .iter()
-            .flatten()
-            .filter(|row| row.pending.is_none())
-            .map(|row| row.physical_row)
+            .enumerate()
+            .filter_map(|(row_index, row)| {
+                row.as_ref()
+                    .is_some_and(|row| row.pending.is_none())
+                    .then_some(row_index)
+            })
             .collect::<Vec<_>>();
         if advancing_rows.is_empty() {
             return Ok(());
@@ -978,22 +979,26 @@ impl<'a> ContinuousBatchManager<'a> {
         let mut advance_rows = vec![false; self.max_batch()];
         let mut completes_context = vec![false; self.max_batch()];
         self.record_forward(advancing_rows.len(), "step_select");
-        for row in self.rows.iter().flatten() {
+        for (row_index, row) in self
+            .rows
+            .iter()
+            .enumerate()
+            .filter_map(|(row_index, row)| row.as_ref().map(|row| (row_index, row)))
+        {
             if row.pending.is_none() {
                 let row_len = self
                     .decode
-                    .row_len(row.physical_row)
+                    .row_len(row_index)
                     .map_err(|e| anyhow::anyhow!("Failed to read continuous row length: {e}"))?;
                 let token = *row.context_tokens.get(row_len).with_context(|| {
                     format!(
-                        "continuous row {} has no token to advance at offset {row_len}",
-                        row.physical_row
+                        "continuous row {row_index} has no token to advance at offset {row_len}"
                     )
                 })?;
-                input_ids[row.physical_row] = i64::from(token);
-                position_ids[row.physical_row] = row_len as i64;
-                advance_rows[row.physical_row] = true;
-                completes_context[row.physical_row] = row_len + 1 == row.context_tokens.len();
+                input_ids[row_index] = i64::from(token);
+                position_ids[row_index] = row_len as i64;
+                advance_rows[row_index] = true;
+                completes_context[row_index] = row_len + 1 == row.context_tokens.len();
             }
         }
         let mut logits = self
@@ -1004,9 +1009,12 @@ impl<'a> ContinuousBatchManager<'a> {
         let extract_rows = self
             .rows
             .iter()
-            .flatten()
-            .filter(|row| advance_rows[row.physical_row] && completes_context[row.physical_row])
-            .map(|row| row.physical_row)
+            .enumerate()
+            .filter_map(|(row_index, row)| {
+                row.as_ref()
+                    .is_some_and(|_| advance_rows[row_index] && completes_context[row_index])
+                    .then_some(row_index)
+            })
             .collect::<Vec<_>>();
         for physical_row in extract_rows {
             self.take_row_pending(&mut logits, physical_row, physical_row)?;
@@ -1039,6 +1047,21 @@ impl Engine {
                 "the declared generation loop is not eligible for the specialized shared \
                  live-row executor: {error:#}"
             ));
+        }
+        if self.workflow.workflow_spec().inputs.values().any(|input| {
+            matches!(
+                 &input.role,
+                 onnx_genai_metadata::SemanticInputRole::Runtime { role, .. }
+                     if *role == onnx_genai_metadata::RuntimeInputRole::RowSelection
+            )
+        }) {
+            return Some(
+                "the declared workflow supplies a positional row plan, but the specialized \
+                  shared decoder cannot apply that plan atomically to backend KV state, request \
+                  values, semantic state, effects, RNG, and output ownership; use isolated \
+                  workflow execution"
+                    .to_string(),
+            );
         }
         let capability = self.batching_capability();
         (!capability.supports_batching()).then(|| capability.reason().to_string())

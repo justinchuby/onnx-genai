@@ -1233,6 +1233,31 @@ impl<'a> WorkflowExecutionPlan<'a> {
         }
         let workflow = &engine.plan.workflow;
         let mut values = std::mem::take(&mut self.values);
+        let row_selection_name = workflow_row_selection_name(workflow);
+        let row_plan = workflow_row_selection(workflow, &values)?
+            .map(|selection| super::RowPlan::select(self.request_count, selection))
+            .transpose()?;
+        if let Some(plan) = &row_plan {
+            let mut replacements = Vec::new();
+            for (name, input) in &workflow.inputs {
+                if Some(name.as_str()) == row_selection_name || !values.contains_key(name) {
+                    continue;
+                }
+                let selected = super::row_state::gather_value_rows(
+                    values
+                        .get(name)
+                        .expect("the value was checked immediately above"),
+                    &input.contract.batch_layout,
+                    plan,
+                )
+                .with_context(|| format!("apply row plan to workflow input '{name}'"))?;
+                replacements.push((name.clone(), selected));
+            }
+            for (name, selected) in replacements {
+                values.insert(name, selected);
+            }
+            self.request_count = plan.selected_rows().len();
+        }
         let prepare_adapters = (|| -> anyhow::Result<()> {
             if let Some(service) = &engine.plan.adapter_service {
                 if !service.portable_fallback {
@@ -1274,19 +1299,6 @@ impl<'a> WorkflowExecutionPlan<'a> {
                     &active_rows,
                 )?;
                 *engine.worker.active_adapter_context.borrow_mut() = Some(context);
-                // A runtime-minted row selection expands or compacts the batch
-                // (beam search, speculative row cloning). It carries source
-                // positions within the current batch, never scheduler IDs, so
-                // every row-scoped component follows through the same ABI.
-                if let Some(selection) = workflow_row_selection(workflow, &values)?
-                    && let Some(context) =
-                        engine.worker.active_adapter_context.borrow_mut().as_mut()
-                {
-                    // The adapter context is one of the batch's row-scoped
-                    // carriers.  Route it through the shared plan rather than
-                    // letting this carrier interpret selection positions itself.
-                    super::RowPlan::select(batch_rows, selection)?.apply(&mut [context])?;
-                }
             }
             Ok(())
         })();
@@ -1331,6 +1343,16 @@ impl<'a> WorkflowExecutionPlan<'a> {
                     .transpose()?
                 else {
                     continue;
+                };
+                let value = if let Some(plan) = &row_plan {
+                    let state = workflow
+                        .state
+                        .get(cell)
+                        .expect("a classified state cell is declared");
+                    super::row_state::gather_value_rows(&value, &state.contract.batch_layout, plan)
+                        .with_context(|| format!("apply row plan to session state '{cell}'"))?
+                } else {
+                    value
                 };
                 match carrier {
                     // A loop reads its lease where it seeds the carry.
@@ -5382,18 +5404,7 @@ fn workflow_row_selection(
     workflow: &onnx_genai_metadata::WorkflowSpec,
     values: &PipelineTensors,
 ) -> anyhow::Result<Option<Vec<usize>>> {
-    let Some(name) = workflow
-        .inputs
-        .iter()
-        .find(|(_, input)| {
-            matches!(
-                &input.role,
-                onnx_genai_metadata::SemanticInputRole::Runtime { role, .. }
-                    if *role == RuntimeInputRole::RowSelection
-            )
-        })
-        .map(|(name, _)| name.as_str())
-    else {
+    let Some(name) = workflow_row_selection_name(workflow) else {
         return Ok(None);
     };
     let Some(value) = values.get(name) else {
@@ -5410,6 +5421,20 @@ fn workflow_row_selection(
         })
         .collect::<anyhow::Result<Vec<_>>>()
         .map(Some)
+}
+
+fn workflow_row_selection_name(workflow: &onnx_genai_metadata::WorkflowSpec) -> Option<&str> {
+    workflow
+        .inputs
+        .iter()
+        .find(|(_, input)| {
+            matches!(
+                &input.role,
+                onnx_genai_metadata::SemanticInputRole::Runtime { role, .. }
+                    if *role == RuntimeInputRole::RowSelection
+            )
+        })
+        .map(|(name, _)| name.as_str())
 }
 
 /// Component invocations reachable from a node, in order.

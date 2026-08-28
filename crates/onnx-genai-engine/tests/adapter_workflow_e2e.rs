@@ -23,6 +23,18 @@ fn run(
     values: &[f32],
     selection: AdapterSelection,
 ) -> anyhow::Result<Vec<f32>> {
+    let identity = (0..selection.rows.len())
+        .map(i64::try_from)
+        .collect::<Result<Vec<_>, _>>()?;
+    run_selected(engine, values, selection, &identity)
+}
+
+fn run_selected(
+    engine: &mut Engine,
+    values: &[f32],
+    selection: AdapterSelection,
+    row_selection: &[i64],
+) -> anyhow::Result<Vec<f32>> {
     // Rows are identified by their position in the batch the caller submits.
     // No slot id or epoch travels through the metadata contract.
     let rows = selection.rows.len();
@@ -56,6 +68,10 @@ fn run(
     .with_input(
         "request.adapter_scales",
         Value::from_slice_f32(&adapter_scales, &[batch, 2])?,
+    )
+    .with_input(
+        "request.row_selection",
+        Value::from_slice_i64(row_selection, &[batch])?,
     )
     .with_input("activations", Value::from_slice_f32(values, &[batch, 2])?);
     Ok(engine.run_pipeline(request)?["result"].to_vec_f32()?)
@@ -136,6 +152,10 @@ pipeline:
         contract: { dtype: float32, shape: [batch, 2], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: opaque }
         source: { kind: application, name: activations }
+      request.row_selection:
+        contract: { dtype: int64, shape: [batch], batch_layout: { kind: shared } }
+        role: { kind: runtime, version: "1.0", role: row_selection }
+        source: { kind: application, name: row_selection }
     outputs:
       result:
         contract: { dtype: float32, shape: [batch, 2], batch_layout: { kind: request_aligned, axis: 0 } }
@@ -211,6 +231,23 @@ pipeline:
     assert_eq!(
         run(&mut engine, &[5.0, 6.0, 1.0, 2.0], reordered)?,
         vec![25.5, 35.0, 2.0, 4.0]
+    );
+
+    // One runtime-minted positional plan clones and reorders the request
+    // tensors and adapter state together. Repeated source row 2 must receive
+    // both row 2's activation and row 2's composition.
+    let repeated = AdapterSelection::default()
+        .with_row(red_only.clone())
+        .with_row(none.clone())
+        .with_row(composed.clone());
+    assert_eq!(
+        run_selected(
+            &mut engine,
+            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            repeated,
+            &[2, 2, 0],
+        )?,
+        vec![25.5, 35.0, 25.5, 35.0, 2.0, 4.0]
     );
 
     // A row that reuses a batch position with a different selection gets the

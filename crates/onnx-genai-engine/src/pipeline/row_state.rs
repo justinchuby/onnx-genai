@@ -15,6 +15,8 @@
 //! request epoch ever crosses the boundary.
 
 use anyhow::Context;
+use onnx_genai_metadata::BatchLayout;
+use onnx_genai_ort::Value;
 
 /// Per-row state that survives continuous-batching compaction.
 pub trait RowScopedState {
@@ -153,6 +155,85 @@ pub fn gather_rows<T: Clone>(rows: &[T], selection: &[usize]) -> anyhow::Result<
         .collect())
 }
 
+/// Stage a positional selection for one tensor carrier.
+///
+/// The returned value is independent of the source, so callers can prepare
+/// every row-scoped carrier before committing any replacement.
+pub(crate) fn gather_value_rows(
+    value: &Value,
+    layout: &BatchLayout,
+    plan: &RowPlan,
+) -> anyhow::Result<Value> {
+    let selection = plan.selected_rows();
+    let (axis, factor) = match layout {
+        BatchLayout::Shared => return super::clone_value(value),
+        BatchLayout::RequestAligned { axis } => (*axis, 1),
+        BatchLayout::RequestExpanded { axis, factor } => (*axis, *factor),
+        BatchLayout::TokenPacked { .. } => anyhow::bail!(
+            "cannot apply a positional row plan to token-packed storage without rebuilding its \
+             ownership companions; decline shared batching before mutation"
+        ),
+        BatchLayout::RuntimeSequenceState => anyhow::bail!(
+            "cannot apply a positional row plan to runtime sequence state without a typed row \
+             state carrier; decline shared batching before mutation"
+        ),
+    };
+    let shape = value.shape();
+    let extent = *shape
+        .get(axis)
+        .with_context(|| format!("row axis {axis} is outside tensor shape {shape:?}"))?;
+    let extent = usize::try_from(extent)
+        .with_context(|| format!("row axis {axis} has negative extent {extent}"))?;
+    anyhow::ensure!(
+        factor > 0 && extent % factor == 0,
+        "row axis {axis} extent {extent} is not divisible by request expansion factor {factor}"
+    );
+    let source_rows = extent / factor;
+    anyhow::ensure!(
+        source_rows == plan.source_rows(),
+        "row plan expects {} source rows, but tensor shape {shape:?} carries {source_rows}; \
+         refuse to move only part of a batch",
+        plan.source_rows()
+    );
+    check_selection(&selection, source_rows)?;
+
+    let inner = shape[axis + 1..].iter().try_fold(1usize, |size, &dim| {
+        let dim = usize::try_from(dim)
+            .with_context(|| format!("tensor shape {shape:?} has negative extent {dim}"))?;
+        size.checked_mul(dim)
+            .with_context(|| format!("tensor shape {shape:?} is too large"))
+    })?;
+    let outer = shape[..axis].iter().try_fold(1usize, |size, &dim| {
+        let dim = usize::try_from(dim)
+            .with_context(|| format!("tensor shape {shape:?} has negative extent {dim}"))?;
+        size.checked_mul(dim)
+            .with_context(|| format!("tensor shape {shape:?} is too large"))
+    })?;
+    let group_bytes = factor
+        .checked_mul(inner)
+        .and_then(|elements| elements.checked_mul(value.dtype().size_of()))
+        .with_context(|| format!("tensor shape {shape:?} is too large"))?;
+    let source_outer_bytes = extent
+        .checked_mul(inner)
+        .and_then(|elements| elements.checked_mul(value.dtype().size_of()))
+        .with_context(|| format!("tensor shape {shape:?} is too large"))?;
+    let raw = value
+        .to_raw_bytes()
+        .context("row-scoped tensor must be host-accessible")?;
+    let mut gathered = Vec::with_capacity(outer * selection.len() * group_bytes);
+    for outer_index in 0..outer {
+        let outer_offset = outer_index * source_outer_bytes;
+        for &source in &selection {
+            let start = outer_offset + source * group_bytes;
+            gathered.extend_from_slice(&raw[start..start + group_bytes]);
+        }
+    }
+    let mut gathered_shape = shape.to_vec();
+    gathered_shape[axis] = i64::try_from(selection.len() * factor)?;
+    Value::from_raw_bytes(gathered, &gathered_shape, value.dtype())
+        .context("construct selected row-scoped tensor")
+}
+
 /// A generic row-scoped table for native and binding components.
 ///
 /// Components whose per-row state is a plain owned value get the mandatory ABI
@@ -226,6 +307,43 @@ mod tests {
         let mut table = RowTable::new(vec!["a", "b"]);
         table.compact(&[1, 1, 0]).expect("valid selection");
         assert_eq!(table.as_slice(), ["b", "b", "a"]);
+    }
+
+    #[test]
+    fn tensor_compaction_clones_the_same_positional_rows() {
+        let value =
+            Value::from_slice_i64(&[10, 11, 20, 21, 30, 31], &[3, 2]).expect("valid tensor");
+        let plan = RowPlan::select(3, vec![2, 2, 0]).expect("valid repeated selection");
+        let selected = gather_value_rows(&value, &BatchLayout::RequestAligned { axis: 0 }, &plan)
+            .expect("host tensor supports positional selection");
+
+        assert_eq!(selected.shape(), [3, 2]);
+        assert_eq!(
+            selected.to_vec_i64().expect("int64 tensor"),
+            [30, 31, 30, 31, 10, 11]
+        );
+        assert_eq!(
+            value.to_vec_i64().expect("source remains unchanged"),
+            [10, 11, 20, 21, 30, 31]
+        );
+    }
+
+    #[test]
+    fn expanded_tensor_compaction_moves_whole_request_groups() {
+        let value = Value::from_slice_i64(&[10, 11, 20, 21, 30, 31], &[6]).expect("valid tensor");
+        let plan = RowPlan::select(3, vec![2, 0]).expect("valid selection");
+        let selected = gather_value_rows(
+            &value,
+            &BatchLayout::RequestExpanded { axis: 0, factor: 2 },
+            &plan,
+        )
+        .expect("expanded host tensor supports positional selection");
+
+        assert_eq!(selected.shape(), [4]);
+        assert_eq!(
+            selected.to_vec_i64().expect("int64 tensor"),
+            [30, 31, 10, 11]
+        );
     }
 
     #[test]
