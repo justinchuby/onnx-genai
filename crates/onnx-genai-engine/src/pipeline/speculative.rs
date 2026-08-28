@@ -42,6 +42,7 @@ use rand::{Rng as _, SeedableRng as _};
 use super::execution_admission::{
     CandidateTreeExecutionMode, CandidateTreeExecutionPlan, CandidateTreeTopologyInput,
 };
+use super::workflow::{WorkflowLoopHostOutcome, WorkflowLoopHostStop};
 use super::{PipelineTensors, WorkflowRuntime};
 use crate::config::{FinishReason, GenerateOptions, GenerateResult, GenerateTokenCallback};
 use crate::speculative::{
@@ -472,6 +473,7 @@ struct CandidateTreeWorkflowHost<'a> {
     text: String,
     token_text: Vec<String>,
     commit_started: bool,
+    loop_stop: Option<WorkflowLoopHostStop>,
 }
 
 impl CandidateTreeWorkflowHost<'_> {
@@ -802,6 +804,20 @@ impl CandidateTreeWorkflowHost<'_> {
         });
         self.generated.extend_from_slice(&committed);
         self.blocks = self.blocks.saturating_add(1);
+        self.loop_stop = if self.finish_reason == FinishReason::EosToken {
+            Some(WorkflowLoopHostStop::EosCommitted)
+        } else if self.generated.len() >= self.options.max_new_tokens {
+            Some(WorkflowLoopHostStop::BudgetExhausted)
+        } else if self
+            .options
+            .max_context
+            .is_some_and(|limit| accepted_context.len() >= limit)
+        {
+            self.finish_reason = FinishReason::Length;
+            Some(WorkflowLoopHostStop::ContextExhausted)
+        } else {
+            None
+        };
         Ok(accepted_context)
     }
 
@@ -926,6 +942,13 @@ impl super::workflow::WorkflowNodeHost for CandidateTreeWorkflowHost<'_> {
                 Err(error.context("candidate-tree checkpoint failed before semantic commit"))
             }
         }
+    }
+
+    fn loop_host_outcome(&self) -> WorkflowLoopHostOutcome {
+        self.loop_stop.map_or(
+            WorkflowLoopHostOutcome::Continue,
+            WorkflowLoopHostOutcome::Stop,
+        )
     }
 
     fn turn_committed(&mut self, _outcome: super::TurnTransactionOutcome) {
@@ -1561,6 +1584,7 @@ impl WorkflowRuntime {
             text: String::new(),
             token_text: Vec::new(),
             commit_started: false,
+            loop_stop: None,
         };
         {
             let mut hosted: Option<&mut dyn super::workflow::WorkflowNodeHost> = Some(&mut host);

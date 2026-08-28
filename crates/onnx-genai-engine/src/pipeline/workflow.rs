@@ -1811,6 +1811,25 @@ pub(crate) fn runtime_contract_registry() -> &'static std::collections::HashSet<
     &REGISTRY
 }
 
+/// A request-level terminal condition a hosted generation seam committed.
+///
+/// It composes with, rather than overwrites, the authored loop predicate: the
+/// current body completed normally, but no later body may start for this turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkflowLoopHostStop {
+    BudgetExhausted,
+    EosCommitted,
+    ContextExhausted,
+}
+
+/// The host's contribution to the generic loop's next-iteration decision.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum WorkflowLoopHostOutcome {
+    #[default]
+    Continue,
+    Stop(WorkflowLoopHostStop),
+}
+
 /// A runtime-supplied executor for a workflow node the package does not ship a
 /// graph for.
 ///
@@ -1868,6 +1887,12 @@ pub(crate) trait WorkflowNodeHost {
     fn turn_committed(&mut self, _outcome: TurnTransactionOutcome) {}
 
     fn turn_aborted(&mut self, _outcome: TurnTransactionOutcome) {}
+
+    /// Report a committed request-level terminal condition before the
+    /// interpreter evaluates another authored loop body.
+    fn loop_host_outcome(&self) -> WorkflowLoopHostOutcome {
+        WorkflowLoopHostOutcome::Continue
+    }
 
     /// Execute one node bound to `contract`.
     ///
@@ -8254,6 +8279,11 @@ impl WorkflowRuntime {
         } = plan;
         let carried = *carried;
         let emits_generation_tokens = loop_emits_generation_tokens(body, workflow);
+        if host.as_deref_mut().is_some_and(|host| {
+            !matches!(host.loop_host_outcome(), WorkflowLoopHostOutcome::Continue)
+        }) {
+            return Ok(false);
+        }
         // Skipping the liveness read is an optimization for a predicate the
         // caller said it does not care about: with `stop_on_eos` off, an
         // in-graph EOS predicate cannot end the loop, so reading it every step

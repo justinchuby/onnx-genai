@@ -1470,6 +1470,55 @@ fn authored_loop_repeats_only_its_body_and_never_duplicates_setup() -> anyhow::R
     Ok(())
 }
 
+#[test]
+fn composed_loop_does_not_reenter_after_candidate_budget_or_eos_stop() -> anyhow::Result<()> {
+    for (label, request, expected, finish) in [
+        (
+            "request budget",
+            greedy_request(3),
+            vec![2, 4, 0],
+            FinishReason::MaxTokens,
+        ),
+        (
+            "committed EOS",
+            {
+                let mut request = greedy_request(5);
+                request.options.stop_on_eos = true;
+                request.options.eos_token_ids = vec![2];
+                request
+            },
+            vec![2],
+            FinishReason::EosToken,
+        ),
+    ] {
+        let root = repeated_composed_parent_package(3)?;
+        let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+        let result = engine.generate(request)?;
+        assert_eq!(
+            result.token_ids, expected,
+            "{label} must cap the committed path"
+        );
+        assert_eq!(result.finish_reason, finish, "{label} finish reason");
+        let invocations = engine.component_invocations();
+        assert_eq!(
+            invocations.get("proposer"),
+            Some(&2),
+            "{label} must not enter the next authored proposer iteration"
+        );
+        assert_eq!(
+            invocations.get("target"),
+            Some(&2),
+            "{label} must not enter the next authored target iteration"
+        );
+        assert_eq!(
+            invocations.get("setup"),
+            Some(&1),
+            "{label} must preserve exactly-once loop setup"
+        );
+    }
+    Ok(())
+}
+
 fn ancestor_package() -> anyhow::Result<PathBuf> {
     ancestor_package_with_sources(ANCESTOR_PROPOSER, ANCESTOR_TARGET)
 }
