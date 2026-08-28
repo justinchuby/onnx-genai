@@ -1895,7 +1895,6 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: {}
-                     loop_induction_values]
     inputs:
       sample: { contract: { dtype: float32, shape: [batch, width] },
                 role: { kind: opaque }, source: { kind: application, name: sample }, required: true }
@@ -2014,7 +2013,6 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: {}
-                     loop_induction_values]
     inputs:
       outer_count: { contract: { dtype: int64, shape: [] },
                      role: { kind: opaque }, source: { kind: application, name: outer_count },
