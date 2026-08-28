@@ -7,6 +7,11 @@ It defines what a model package states, what a runtime decides, what a caller
 supplies, and what a validator must reject. It supersedes contrary statements
 elsewhere in this repository.
 
+The design review in
+[#2302](https://github.com/justinchuby/onnx-genai/pull/2302) is non-normative
+evidence and rationale. This document contains the accepted rules; the review
+does not become a second specification.
+
 Requirement keywords (**MUST**, **MUST NOT**, **SHOULD**, **MAY**) are used in
 the RFC 2119 sense. Unless a subsection explicitly labels runtime behavior as
 unimplemented acceptance criteria, every **MUST** is enforced by the semantic
@@ -50,6 +55,10 @@ property of `crates/onnx-genai-metadata/src/schema/`. Section
 5. **A portable cross-runtime cache wire format.** See [§16](#16-distributed-execution).
 6. **Standardized diagnostics.** Determinism levels, profiling surfaces, and
    implementation-selection reports are runtime and API concerns.
+7. **API or network streaming.** HTTP/SSE/gRPC/WebSocket framing, flushing,
+   buffering, retry, reconnect, backpressure, and disconnect behavior are
+   runtime/API contracts. Metadata describes internal publication only; see
+   [§6.4](#64-internal-publication-turns-and-revisions).
 
 ---
 
@@ -90,7 +99,11 @@ The package states **what must be true for execution to be correct**:
 - adapter target manifests and artifact bindings;
 - generation defaults and the structural override surface;
 - legal sharding and replication facts;
-- correctness dependencies for cache reuse.
+- correctness dependencies for cache reuse;
+- typed internal publication and revision semantics;
+- the exact versioned tool render/parse protocol a package requires;
+- cross-invocation state identity, lifecycle, initialization, dataflow, update,
+  and commit/rollback semantics.
 
 ### 3.2 Runtime
 
@@ -104,13 +117,21 @@ The runtime decides **how to execute it here**:
 - adapter lifecycle, caching, budgeting, eviction;
 - speculative proposal width, tree shape, scheduling, and enablement;
 - distributed transfer protocols, QoS, tiering, deadlines;
-- diagnostics, determinism levels, and trust policy.
+- diagnostics, determinism levels, and trust policy;
+- session-turn transaction mechanics and recovery;
+- tool-protocol adapter implementation;
+- API/network delivery, buffering, and backpressure;
+- physical state transport and retention.
 
 ### 3.3 Caller
 
 The caller supplies **request data**: prompts, images, audio, grammars, JSON
 schemas, adapter selections, and overrides of generation fields the package
 structurally exposes ([§14](#14-generation)).
+
+For tools, the caller also supplies the offered functions, descriptions, JSON
+Schemas, `tool_choice`, prior calls, and tool results. Any externally supplied
+state is ordinary typed request data connected to a declared workflow input.
 
 ### 3.4 Distribution layer
 
@@ -314,8 +335,8 @@ or producer that defines them and MUST still fail closed when unavailable.
 | `telemetry_adapter` | adapters | Versioned timestamp/elapsed adapter ABI. | A component contract/adapter ABI `onnx-genai.telemetry@1`; validator-derived. | Enforce exact action bindings and effect semantics; reject unknown actions instead of approximating timing. | Adaptive proposal metrics; optional unless the workflow invokes it. |
 | `nested_control_flow` | syntax/IR | Loops or branches nested inside structural workflow nodes. | Any compiled loop or branch; validator-derived and manifest-required. | Preserve lexical SSA, zero-trip loops, branch phi results, and effect joins at every nesting level or reject. | Diffusion, autoregressive, weather, and nested audio/music workflows. |
 | `loop_induction_values` | syntax/IR | A typed zero-based iteration value visible to policy components. | A loop with `iteration`; validator-derived and manifest-required. | Produce the declared scalar/per-row induction tensor and keep it scoped to the loop. | Diffusion scheduler lookup, termination equations, nested codec loops; depends on nested control-flow support. |
-| `typed_emit` | syntax/IR | Publication of a typed SSA value to a declared workflow output. | Every compiled `emit`; validator-derived and manifest-required. | Enforce output contract, mode, row semantics, and effect ordering; reject undeclared or incompatible output publication. | All canonical workflows that return or stream values. |
-| `streaming_emit` | syntax/IR | Incremental event publication during execution. | An `emit` with `mode: event`; validator-derived. | Preserve event order and effect semantics without converting it silently to only a final result. | Token/audio chunk streaming; depends on `typed_emit`. |
+| `typed_emit` | syntax/IR | Publication of a typed SSA value to a declared workflow output. | Every compiled `emit`; validator-derived and manifest-required. | Enforce output contract, mode, row semantics, and effect ordering; reject undeclared or incompatible output publication. | All canonical workflows that return or incrementally publish values. |
+| `streaming_emit` | syntax/IR | Internal incremental event publication during workflow execution. The current spelling does **not** mean API or network streaming. | An `emit` with `mode: event`; validator-derived. | Preserve internal event order and effect semantics without converting the event silently to only a final value. It grants no HTTP/SSE/gRPC/WebSocket delivery capability. | Workflow event outputs; depends on `typed_emit`. |
 | `emit_valid_length` | syntax/IR | Ragged valid-prefix publication from a fixed-capacity tensor. | An `emit` with `valid_length`; validator-derived and manifest-required. | Slice each request row to its valid prefix, maintain positional row ownership through compaction, and reject incompatible output layout. | Speculative accepted-token prefixes and masked generation; depends on `typed_emit`. |
 | `input_presence` | syntax/IR | An observable boolean for whether an optional caller/application tensor was supplied. | Any workflow input with `present_as`; validator requires the manifest entry. | Set the presence SSA value from actual caller presence, require control flow before optional use, and never fabricate sentinel tensors. | Text-only requests to a VLM and optional audio/image inputs; typically combines with `nested_control_flow`. |
 | `explicit_transfer` | syntax/IR | A device-transfer node in the planner's lowered internal IR. | Derived only from internal `WorkflowNode::Transfer`; authored workflow steps MUST NOT serialize transfers. | Execute the transfer with correct ordering/device semantics or reject the lowered plan. | Heterogeneous placement; no authored model example because placement owns transfer insertion. |
@@ -345,6 +366,15 @@ Those strings select a versioned semantic ABI or state bound and are validated
 at the structure that owns them. They do not become negotiated capabilities
 merely because older comments used the word "capability" broadly.
 
+**Implementation status — unimplemented migration acceptance criteria.** The
+semantic term for `streaming_emit` is **incremental publication**. The accepted
+replacement identifier for the next schema change is
+`incremental_publication`, because it names the property metadata actually
+controls. Under the pre-release compatibility rule, that migration **MUST**
+replace `streaming_emit` rather than retain an alias. Until the schema migration
+lands, the current identifier remains serialized, but readers and documentation
+**MUST NOT** interpret it as a transport-delivery promise.
+
 `continuous_batching` is also not a capability identifier. It was retired
 because a runtime may always execute requests separately without changing
 correctness. Shared-forward feasibility is derived from the workflow/state
@@ -373,6 +403,34 @@ a strict and a permissive reader can share a plan.
 This hash is **identity, not integrity**. It says two documents are semantically
 the same. It says nothing about who produced either one. Trust belongs to the
 distribution layer ([§3.4](#34-distribution-layer)).
+
+### 4.5 Tensor shape is the sole rank authority
+
+**Implementation status — unimplemented migration acceptance criteria.** This
+subsection is the accepted contract for the next schema revision. The checked-in
+Rust and JSON schemas still require serialized `rank` and permit `shape` to be
+absent. A package or runtime **MUST NOT** claim conformance to this subsection
+until the schema, parser, importers, exporters, fixtures, examples, and runtime
+rank checks migrate together.
+
+In the accepted representation:
+
+1. `shape` is required and its list length is the tensor rank;
+2. each dimension is fixed, symbolic, or explicitly unconstrained as `Any`;
+3. each occurrence of `Any` means only “an arbitrary extent exists at this
+   position” and does not assert equality with another `Any`; and
+4. serialized `rank` does not exist.
+
+Thus `shape: []` is a scalar, `[Any]` is an unconstrained rank-one tensor, and
+`[batch, Any, hidden]` is rank three. Omitting `shape` is not another spelling
+for unknown rank: the contract must state which axes exist even when one of
+their extents is unconstrained.
+
+The migration **MUST** be atomic and fail closed. The generated schema and
+parser **MUST** reject the retired `rank` field, every producer/importer and
+normative example **MUST** emit `shape`, and runtime validation **MUST** derive
+rank only from `shape.len()`. No compatibility alias or inferred placeholder
+shape is permitted.
 
 ---
 
@@ -409,10 +467,24 @@ model-family dispatch:
 | `invoke` | binds named values to a component's ports |
 | `loop` | setup, body, condition, `max_iterations`, induction value, carried state |
 | `branch` | selects one case; exports only declared phi results and effect joins |
-| `emit` | publishes a streaming or final package output |
+| `emit` | publishes an internal incremental or final package output |
 
 Control-flow *location* defines lifecycle. A value produced inside a loop body
 is loop-scoped; a value carried across iterations is a declared carried cell.
+
+Canonical autoregressive lifecycle is structural, not a serialized phase:
+
+- root-prefix steps initialize the invocation and perform prefill;
+- the top-level generation loop performs per-token work; and
+- root-suffix steps perform post-generation work.
+
+For an optimized autoregressive generation workflow, the generation loop's
+`setup` **MUST** be empty. Prefill, restoration, and one-time initialization
+belong in the root prefix. A reader that selects the optimized per-token path
+**MUST** reject a non-empty generation-loop `setup`; it **MUST NOT** invent
+execute-once behavior or silently fall back while claiming the optimized
+contract. This restriction is about the optimized autoregressive path, not a
+removal of generic loop setup from the structural IR.
 
 `transfer` is **internal lowered IR only**. The planner introduces transfers when
 it assigns placement. A metadata document **MUST NOT** serialize one.
@@ -440,6 +512,73 @@ effects:
 A branch exports only values its declared phi mapping names. Every case **MUST**
 produce every exported value, and effect joins **MUST** be declared. This keeps
 liveness and effect ordering decidable without executing the branch.
+
+### 6.4 Internal publication, turns, and revisions
+
+Publication is a workflow semantic operation. It is not transport delivery.
+An `emit` identifies when an SSA value becomes an internal package output and
+how it updates that output. Metadata says nothing about whether an API flushes
+at that point, which network framing is used, or whether a disconnected client
+can reconnect. An implementation **MUST NOT** infer any such promise from
+`emit`, `event`, `streaming_emit`, or the future
+`incremental_publication` identifier.
+
+**Implementation status — unimplemented acceptance criteria.** The transaction
+and revision vocabulary below is accepted, but the checked-in schema and runtime
+do not yet implement it end to end. Until they do, a runtime **MUST NOT**
+advertise atomic-turn or revision-envelope conformance merely because it
+implements current `replace`, `append`, or `event` emits.
+
+#### Turn publication modes
+
+Every session turn uses one typed publication mode:
+
+- **`commit_only`** is the default. Output becomes committed only at the turn's
+  single commit point. A runtime **MAY** compute or buffer intermediate values,
+  but it **MUST NOT** expose them as committed output.
+- **`provisional_revisions`** permits typed provisional publications before the
+  turn commits. The runtime **MAY** overwrite provisional output through the
+  typed `replace` operation. If the turn aborts, every provisional publication
+  from that turn **MUST** be retracted or withheld from observers that cannot
+  process retraction.
+
+There is no caller-controlled/manual commit mode in this contract.
+
+A turn's semantic write set includes every participant whose value can affect
+the next invocation or an observed result: KV, recurrent and convolution state,
+RNG, grammar/constraint state, conversation continuation, declared effect
+domains, and publications. An exclusive session lease prevents concurrent
+writers; it does not make one writer atomic. A conforming atomic-turn runtime
+**MUST** commit or abort the complete write set as one unit. A state or effect
+domain that cannot participate in the declared mode **MUST** cause admission to
+fail before mutation begins.
+
+#### Closed revision algebra
+
+A revision-capable output uses a versioned typed envelope with stream identity,
+revision identity, deterministic order, typed payload where applicable, and
+exactly one operation from this closed algebra:
+
+| Operation | Meaning |
+| --- | --- |
+| `append` | Add the payload after the current provisional value on the declared growth axis. |
+| `replace` | Make the payload the stream's current provisional value. |
+| `retract` | Invalidate the named provisional revision and any value that depends on it. |
+| `finalize` | Mark the current revision final if the enclosing turn commits; later ordinary operations for that stream are invalid. |
+
+Unknown operations or envelope versions **MUST** fail closed. `event` is a
+workflow publication mode, not a fifth revision operation: when an event carries
+a revision envelope, its payload contains one of the four operations above.
+Turn commit and stream finality are distinct. `finalize` says no later revision
+may alter that stream after commit; the enclosing turn commit says the turn's
+complete write set became durable and visible. An abort discards or retracts a
+provisional `finalize` with the rest of the uncommitted turn.
+
+Revision ownership follows workflow dataflow and effect ordering. A runtime
+**MUST NOT** select a stream's final writer from component-map iteration order,
+lexicographic names, output-key spelling, or model identity. If multiple paths
+can update one stream, the workflow must order them and join them to one
+unambiguous final value.
 
 ---
 
@@ -510,6 +649,19 @@ Continuous batching is layered, and each layer is invisible to the one above:
    mapping, `cu_seqlens`. A private contract between the runtime and its
    kernels. Never serialized.
 3. **Metadata batching layout facts.** What a package declares.
+
+The normative execution term is **continuous live-row batching**: one shared
+forward advances each live physical row by one logical decode token when that
+row has pending logits. A prompt/context forward may update state without
+emitting a token. Rows may have unequal logical history lengths, represented by
+declared lengths, masks, write indices, or other typed companions.
+
+“Row-major continuous batch” **MUST NOT** be used as a scheduling or semantic
+term. Row-major describes memory layout and says nothing about admission,
+backfill, liveness, or per-row advancement. Metadata declares only the facts
+needed to preserve each row's meaning. Admission order, physical row identity,
+capacity, fairness, late backfill, and compaction strategy remain runtime
+policy.
 
 ### 8.2 Declared layout facts
 
@@ -1230,6 +1382,15 @@ state_service:
 Metadata **MUST NOT** select `paged`, `shared_buffer`, or `separate` storage, a
 slot-allocation algorithm, a device, or an execution provider.
 
+The same rule applies to tiering. Metadata **MUST NOT** name CPU/device/disk
+spill targets, budgets, watermarks, migration thresholds, compression,
+prefetch, or load-versus-recompute policy. It declares only semantic state,
+portable checkpoint form, reuse/eviction legality, and bounds. A runtime may
+move eligible storage between tiers only while preserving the exact semantic
+value. Spillability and legal prefix eviction are separate questions: being
+movable does not make state disposable, and being recomputable does not select a
+placement tier.
+
 ### 12.2 Retained graph ABI facts
 
 Removing storage policy must not remove real graph constraints. These are ABI
@@ -1489,6 +1650,31 @@ declares FP8 state is well formed and simply cannot use those backends.
 or forked, and `cascade` names the groups that must move with it. The runtime
 decides *when* to use them; the package decides *whether it is legal*.
 
+#### Fork is not prefix reuse
+
+A **session fork** creates a new logical conversation at a declared position.
+The child **MUST** reproduce every semantic participant at that position,
+including KV, recurrent/convolution state, RNG, grammar/constraint state,
+conversation continuation, and all cascaded session cells. Parent and child
+must then be independently mutable. Copy-on-write is a permitted storage
+optimization, not the meaning of fork.
+
+A **prefix-cache hit** reuses compatible computation for an input prefix. It
+does not create parent/child session identity and does not imply independent
+branch mutation. Its legality follows from derived cache dependencies and
+`reuse.prefix_reusable`; lookup, hashing, tenancy, admission, and eviction are
+runtime policy.
+
+`capabilities.fork` and `reuse.prefix_reusable` therefore **MUST NOT** imply one
+another. A runtime **MUST NOT** expose session-fork capability unless every
+semantic participant and transitive cascade can be forked. Partial backend
+support is a fail-closed capability gap, not permission to fork only KV.
+
+**Implementation status.** The metadata distinction and KV primitives exist,
+but current engine backends do not prove end-to-end fork of every semantic
+carrier. They **MUST NOT** advertise the complete capability until parent/child
+divergence conformance covers the full set.
+
 ### 12.4 Lifetime and release boundary
 
 - **Ordinary tensors** use SSA liveness. No annotation.
@@ -1598,7 +1784,7 @@ A lease declared `policy: exclusive` is single-flight: a second turn that starts
 while one is in flight is refused by name rather than allowed to read a
 conversation the first is about to replace.
 
-### 12.5b What a prompt-prefix conversation costs
+#### 12.5b What a prompt-prefix conversation costs
 
 A `prompt_prefix` continuation carries the conversation as **tokens**, not as a
 cache: the package's own cache cells are invocation-scoped and released when the
@@ -1612,6 +1798,60 @@ so a runtime handing it the previous turn's cache would produce a mask and a
 cache that disagree. A package that wants the linear cost declares its cache
 session-scoped and is executed by a core that keeps it. A package that publishes no token stream has no
 conversation to lose, and its session is an ordinary handle.
+
+#### 12.5c Atomic session turns
+
+**Implementation status — unimplemented acceptance criteria.** Session scope,
+exclusive leases, individual checkpoints, and speculative rollback exist, but
+they do not by themselves prove an atomic turn. End-to-end atomic-turn support
+requires the complete write set and publication modes defined in
+[§6.4](#64-internal-publication-turns-and-revisions).
+
+A runtime claiming atomic-turn conformance **MUST** establish one before-turn
+snapshot or equivalent undo path, one commit point, and one abort path spanning
+KV, recurrent/convolution state, RNG, grammar/constraint state, conversation
+continuation, transactional effects, and internal publications. Cancellation,
+execution failure, and commit failure **MUST** use the same all-or-nothing abort
+semantics.
+
+The acceptance proof is fault injection immediately before and after every
+mutation and publication boundary. After each injected failure, a subsequent
+turn must observe either the complete old state or the complete committed new
+state according to the declared mode, never a mixture. Specialized decoder
+paths and the generic workflow interpreter are held to the same proof.
+
+#### 12.5d One cross-invocation state mechanism
+
+`WorkflowStateCell` is the canonical home for cross-invocation state. Its map key
+is the portable state identity; `scope`, `initializer`, `recurrence`,
+`management`, `release_boundary`, `service_group`, and `session` declare its
+lifecycle and binding. Physical row, cache, or allocator slots remain
+runtime-private and **MUST NOT** become serialized state identity.
+
+The source and destination of state follow from explicit workflow structure:
+
+- `initializer` names the value used when no prior lease exists;
+- a request input or external binding makes state externally supplied;
+- a loop carry, session lease, or state-service alias carries state internally;
+- workflow SSA uses and component input bindings declare readers;
+- loop-carry outputs, state-service output aliases, and explicit workflow writes
+  declare writers; and
+- `ShapeRecurrence`, `StateGroupContract::update`, capabilities/cascades, and
+  [§6.4](#64-internal-publication-turns-and-revisions) declare update,
+  commit, abort, snapshot, fork, and rollback behavior.
+
+`StateManagement` answers who owns physical storage. It **MUST NOT** be
+interpreted as a second answer to where a semantic value comes from or how it
+reaches the next invocation. `StateGroupContract` extends a cell with shared
+model-state geometry, graph ports, and update discipline; it is not a parallel
+state-transfer mechanism.
+
+Metadata **MUST NOT** add ownership or transfer enums named for audio, overlap,
+chunks, KV, a model family, or any other modality or algorithm. Audio overlap,
+attention KV, recurrent carries, streaming feature state, and future stateful
+workflows are conformance examples of this one mechanism. Whether a value is
+resent by a caller or retained between invocations is determined by its
+initializer, workflow connections, and lifecycle boundaries.
 
 ### 12.6 Private state and checkpoints
 
@@ -1648,6 +1888,33 @@ Confusing the two is how a cluster silently corrupts state across a rolling
 upgrade, so the contract keeps them separate and names neither as a fallback for
 the other.
 
+#### Prefill/decode lifecycle and final-writer ownership
+
+Separate prefill and decode artifacts are ordinary workflow components, not
+model-family phases. For optimized autoregressive execution, restoration,
+empty-state initialization, preprocessing, and prefill occur in the root prefix
+([§6.1](#61-structural-ir)); decode occurs in the top-level loop.
+
+For a later session turn, the dataflow **MUST** distinguish restored prior state
+from empty initialization, pass prior state to incremental prefill when the
+prefill graph ABI accepts it, hand prefill's resulting state to decode, and
+commit the actual final writer. If prefill and decode use different private
+state representations, the runtime protocol **MUST** name a compatible
+versioned conversion or reject the pairing before execution. A portable
+checkpoint **MUST NOT** be assumed as an implicit hot-path conversion.
+
+Final-writer ownership is determined only by workflow SSA, control flow, state
+aliases/carries, and effect ordering. Component-map insertion order,
+lexicographic aliases, artifact filenames, and “prefill”/“decode” names have no
+semantic authority. A workflow with multiple possible state writers **MUST**
+join them to one unambiguous final value before the turn commit.
+
+**Implementation status — unimplemented acceptance criteria.** A conforming
+split-artifact session path requires a two-turn fixture proving that turn two
+restores prior state, processes only new prompt input where the graph ABI permits
+incremental prefill, seeds decode from the prefill result, and commits decode's
+actual final state. Current runtime paths do not yet provide that complete proof.
+
 ### 12.7 State representation and quantization
 
 Graph-visible state representation is **inferred from the graph**: tensor dtype,
@@ -1680,6 +1947,28 @@ speculative:
   max_proposal_width: 8
   distribution_preserving: true
 ```
+
+The workflow-native `SpeculativeContract` is the sole canonical structural
+authority. It owns proposer/target component references, typed port bindings,
+vocabulary relation, shared state and weights, rollback state and bound, and
+the distribution claim. A runtime **MUST NOT** derive those facts from an
+artifact filename, model family, or proposal-type name.
+
+The legacy `SpeculatorConfig` sidecar/discovery surface is not a second
+execution contract. Existing MTP sidecars are migration input only. The
+pre-release migration **MUST** map their verified facts into the workflow-native
+contract and then remove the overlapping discovery/config surface without an
+alias.
+
+For MTP, the mapped facts include the proposer artifact, target hidden output,
+typed hidden/state ports, recurrence, state ownership, shared embedding/lm-head
+initializers, and accepted-prefix rollback bound. Proposal width chosen for a
+request remains runtime policy within the declared bound.
+
+**Implementation status — unimplemented migration acceptance criteria.** The
+current parser still resolves `SpeculatorConfig`, and a canonical real-artifact
+MTP fixture has not yet proved the replacement path. Readers **MUST NOT** claim
+the legacy surface is already eliminated.
 
 ### 13.2 What the runtime owns
 
@@ -1752,6 +2041,43 @@ workflow declares `bitwise` or `distribution_preserving` equivalence
 `semantic` and withholds consent on its own, as does an empty workflow.
 Otherwise the caller must opt in — by naming a mode on the request or in the
 engine configuration.
+
+### 13.7 Evidence-gated speculative and n-gram forms
+
+#### Candidate trees
+
+Runtime policy may choose a tree only when it is an internal evaluation strategy
+for a package whose declared flat contract remains sufficient. A proposer that
+itself produces a candidate tree requires a new typed package form naming
+candidate tokens, parent topology or mask, verification outputs, accepted path,
+and rollback semantics.
+
+That form is currently unsupported. It **MUST NOT** be standardized until a
+verified producer artifact establishes the real tensor ports and state. A tree
+shape chosen by runtime policy is not evidence for a serialized candidate-tree
+ABI.
+
+#### DFlash
+
+`DFlash` is currently only a recognized proposal-type spelling and has no
+accepted algorithm, topology, graph ABI, state contract, implementation, or
+conformance fixture in this repository. It is unsupported. A reader **MUST**
+fail closed rather than infer semantics from the name, route it through another
+proposer, or publish a support claim. Schema work may begin only after
+authoritative algorithm and artifact evidence supplies those missing facts.
+
+#### Learned PLE
+
+A learned PLE n-gram embedding is model computation, not prompt-lookup
+speculation. It belongs inside an ONNX graph when exportable, or in a generic
+typed component with explicit ports and state when it is not. It **MUST NOT** be
+dispatched by model family or represented as prompt-history matching merely
+because both use the phrase “n-gram.”
+
+No verified Flash-Next PLE artifact, port ABI, or executable fixture exists in
+this repository. PLE-specific schema and runtime claims are therefore deferred
+until an audited artifact establishes its actual inputs, outputs, dimensions,
+state, and update semantics.
 
 ---
 
@@ -1889,6 +2215,42 @@ semantic contract, while byte-level integrity belongs to distribution. The
 constraint-language dialect and version matter because a caller-supplied grammar
 is only meaningful against a named dialect, and the component that interprets it
 is named so the dependency is derivable ([§11](#11-cache-correctness-dependencies)).
+
+### 15.1 Versioned tool-call protocol
+
+The caller owns the offered tools, function descriptions, JSON Schemas,
+`tool_choice`, prior assistant calls, and tool results. The package owns the
+protocol facts required to render those values into model input and parse model
+output. The runtime implements the package-declared protocol and translates
+between its typed result and the serving API.
+
+**Implementation status — unimplemented acceptance criteria.** The accepted v1
+implementation is a native typed/versioned registry. The current server still
+tries ATEM, Qwen, Llama, and Mistral parsers in a fixed order; that behavior is
+non-conforming and is not evidence of tool-protocol support.
+
+A tool-capable package **MUST** declare one exact protocol identifier and
+version. The registered v1 adapter contract covers:
+
+- request rendering and placement relative to the chat template;
+- output-envelope parsing and incremental token/chunk boundaries;
+- escaping and delimiter rules;
+- call identifiers and multiple/parallel calls; and
+- complete, incomplete, and malformed-output behavior.
+
+A runtime **MUST** select only the declared identifier/version. Unknown versions
+**MUST** fail closed with an actionable diagnostic; a runtime **MUST NOT** try
+another parser, inspect model or tokenizer family names, or accept the first
+format that happens to match. A boolean such as `supports_tools` is invalid
+because it names neither the wire grammar nor the version.
+
+Tool descriptions, JSON Schemas, tool results, chat-template values, and
+model-produced envelopes are untrusted structured input. Adapters **MUST**
+validate and bound them without executing tools or granting authority. Tool
+execution and tool selection remain caller/application responsibilities.
+
+The registry is native for v1; a future portable component may implement the
+same typed contract, but no portable DSL or fallback parser is implied.
 
 ---
 
@@ -2223,6 +2585,27 @@ cargo run -p onnx-genai-metadata --bin gen_schema
 
 `cargo test -p onnx-genai-metadata` fails when the committed schema differs from
 the Rust source.
+
+### 20.4 Accepted contracts awaiting implementation proof
+
+Normative direction and shipped conformance are deliberately separate. The
+following decisions are accepted but do not become implementation claims until
+their listed proof lands:
+
+| Accepted contract | Current status | Proof required before claiming support |
+| --- | --- | --- |
+| Shape is the sole rank authority; `Any` is an unconstrained dimension | Schema still serializes `rank` and optional `shape` | Atomic schema/parser/importer/exporter/runtime/example migration and fail-closed legacy-field tests |
+| Internal incremental publication is distinct from API/network streaming | Current capability spelling is `streaming_emit` | Clean replacement with `incremental_publication`, no alias, plus tests proving no transport claim |
+| Commit-only default and provisional revisions with `append`/`replace`/`retract`/`finalize` | No complete revision envelope or whole-turn coordinator | Boundary fault matrix across every semantic carrier and publication |
+| Native typed/versioned tool registry v1 | Server still tries family formats in order | Two declared protocols, arbitrary chunk-boundary tests, and unknown-version fail-closed behavior |
+| Generic cross-invocation state/dataflow | Existing cells and state groups cover the pieces; complete cross-path proof is pending | Fixtures proving external initialization and internal carry with identical lifecycle rules across KV, recurrent, feature-stream, and audio-window examples |
+| Workflow-native speculative contract is the sole authority | Legacy `SpeculatorConfig` remains in parser/runtime paths | Producer migration and real MTP execution without legacy-only discovery |
+| Complete session fork | Metadata bounds and partial state primitives exist | All-carrier parent/child divergence and capability-admission tests |
+| Split prefill/decode final-writer semantics | Workflow SSA can express ordering; multiturn proof is incomplete | Two-turn restored-state → incremental-prefill → decode → commit fixture |
+
+DFlash, serialized candidate-tree proposals, and learned PLE are not entries in
+this table because they are not accepted-but-unimplemented contracts. They are
+unsupported evidence-gated research topics under [§13.7](#137-evidence-gated-speculative-and-n-gram-forms).
 
 ---
 
@@ -2730,3 +3113,4 @@ The original approved decisions map to sections as follows.
 | 26–32 (state) | [§12](#12-state) |
 | 33–36 (generation, speculative, LoRA, state quantization) | [§9](#9-adapters-lora), [§13](#13-speculative-execution), [§14](#14-generation), [§12.7](#127-state-representation-and-quantization) |
 | 37–39 (distributed execution) | [§16](#16-distributed-execution) |
+| Review decisions accepted from #2302/#2303 | [§4.5](#45-tensor-shape-is-the-sole-rank-authority), [§6.4](#64-internal-publication-turns-and-revisions), [§8](#8-batching-varlen-and-paged-attention), [§12.3](#123-capabilities-and-cascade), [§12.5](#125-sessions), [§12.6](#126-private-state-and-checkpoints), [§13](#13-speculative-execution), [§15](#15-preprocessing-and-generated-inputs), [§20.4](#204-accepted-contracts-awaiting-implementation-proof) |
