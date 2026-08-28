@@ -68,7 +68,6 @@ struct PendingContinuousRequest {
 
 struct ContinuousBatchRow {
     handle: ContinuousBatchHandle,
-    physical_row: usize,
     context_tokens: Vec<TokenId>,
     options: GenerateOptions,
     chain: ProcessorChain,
@@ -214,13 +213,13 @@ pub struct ContinuousBatchManager<'a> {
     cursor: Option<WorkflowGenerationCursor>,
     /// Iteration bound the authored loop is started with.
     iteration_bound: usize,
-    /// Tokens this pass's executor committed, per physical row.
+    /// Tokens this pass's executor committed, per positional row.
     ///
     /// Held against what the authored emit published — row by row, because a
     /// batch's emit accumulates one stream per row — so the declared emit stays
     /// load-bearing: a row whose tokens stopped reaching the stream would
     /// otherwise be invisible behind the event queue the caller actually reads.
-    committed_per_row: Vec<usize>,
+    committed_per_row: Vec<Vec<i64>>,
     /// Declared passes this manager has completed.
     ///
     /// A pass that ended while work remained would restart transparently on the
@@ -250,6 +249,30 @@ pub struct BatchOccupancy {
     pub max_rows_in_step: usize,
     /// Physical decode rows the manager owns.
     pub max_batch: usize,
+}
+
+/// The manager-owned state of one physical decode row.
+///
+/// This is diagnostic evidence of row ownership and residency; it deliberately
+/// exposes positions and handles rather than mutable decode/KV storage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContinuousBatchRowDiagnostic {
+    pub physical_row: usize,
+    pub handle: Option<ContinuousBatchHandle>,
+    pub logical_tokens: usize,
+    pub generated_tokens: usize,
+    pub has_pending_token: bool,
+    pub resident_tokens: usize,
+}
+
+/// Snapshot of the live batch ownership and publication domain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContinuousBatchDiagnostic {
+    pub rows: Vec<ContinuousBatchRowDiagnostic>,
+    pub queued_handles: Vec<ContinuousBatchHandle>,
+    pub committed_output_journal: Vec<Vec<i64>>,
+    pub pending_token_handles: Vec<ContinuousBatchHandle>,
+    pub pending_completion_handles: Vec<ContinuousBatchHandle>,
 }
 
 impl BatchOccupancy {
@@ -321,7 +344,7 @@ impl<'a> ContinuousBatchManager<'a> {
             // sequence the package says it can hold — a bound that is real
             // rather than a number invented to be large.
             iteration_bound: metadata_max_context.unwrap_or(static_max_len).max(1),
-            committed_per_row: vec![0; max_batch],
+            committed_per_row: vec![Vec::new(); max_batch],
             passes: 0,
         })
     }
@@ -423,16 +446,16 @@ impl<'a> ContinuousBatchManager<'a> {
     /// exactly the failure a recycled batch row can produce.
     fn finish_pass(&mut self, emitted: &[Vec<i64>]) -> anyhow::Result<()> {
         for (row, committed) in self.committed_per_row.iter().enumerate() {
-            let published = emitted.get(row).map_or(0, Vec::len);
+            let published = emitted.get(row).map_or(&[][..], Vec::as_slice);
             anyhow::ensure!(
-                published == *committed,
-                "the authored continuous-batch loop emitted {published} tokens into row {row} \
-                 while its executor committed {committed}; the declared token stream and the \
+                published == committed,
+                "the authored continuous-batch loop emitted {published:?} into row {row} \
+                 while its executor committed {committed:?}; the declared token stream and the \
                  generated one must be the same stream"
             );
         }
         self.cursor = None;
-        self.committed_per_row = vec![0; self.rows.len()];
+        self.committed_per_row = vec![Vec::new(); self.rows.len()];
         self.passes += 1;
         Ok(())
     }
@@ -503,10 +526,10 @@ impl<'a> ContinuousBatchManager<'a> {
                 .context("ready continuous row disappeared")?;
             let (token, finished) = self.advance_row(&mut row)?;
             committed[row_index] = Some(token);
-            self.committed_per_row[row_index] += 1;
+            self.committed_per_row[row_index].push(i64::from(token));
             if finished {
                 self.decode
-                    .deactivate_row(row.physical_row)
+                    .deactivate_row(row_index)
                     .map_err(|e| anyhow::anyhow!("Failed to deactivate continuous row: {e}"))?;
             } else {
                 self.rows[row_index] = Some(row);
@@ -686,6 +709,50 @@ impl<'a> ContinuousBatchManager<'a> {
         self.occupancy
     }
 
+    /// Inspect the manager's current row ownership, logical/physical positions,
+    /// and unpublished output journal without draining events.
+    pub fn diagnostic(&self) -> anyhow::Result<ContinuousBatchDiagnostic> {
+        let rows = self
+            .rows
+            .iter()
+            .enumerate()
+            .map(|(physical_row, row)| {
+                let resident_tokens = self.decode.row_len(physical_row).map_err(|error| {
+                    anyhow::anyhow!(
+                        "failed to inspect continuous physical row {physical_row}: {error}"
+                    )
+                })?;
+                Ok(ContinuousBatchRowDiagnostic {
+                    physical_row,
+                    handle: row.as_ref().map(|row| row.handle),
+                    logical_tokens: row.as_ref().map_or(0, |row| row.context_tokens.len()),
+                    generated_tokens: row
+                        .as_ref()
+                        .map_or(0, |row| row.state.generated_tokens.len()),
+                    has_pending_token: row.as_ref().is_some_and(|row| row.pending.is_some()),
+                    resident_tokens,
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let mut pending_token_handles = Vec::new();
+        let mut pending_completion_handles = Vec::new();
+        for event in &self.events {
+            match event {
+                ContinuousBatchEvent::Token { handle, .. } => pending_token_handles.push(*handle),
+                ContinuousBatchEvent::Finished { handle, .. } => {
+                    pending_completion_handles.push(*handle);
+                }
+            }
+        }
+        Ok(ContinuousBatchDiagnostic {
+            rows,
+            queued_handles: self.queue.iter().map(|request| request.handle).collect(),
+            committed_output_journal: self.committed_per_row.clone(),
+            pending_token_handles,
+            pending_completion_handles,
+        })
+    }
+
     /// Cumulative device→host logits transfer cost of the backend driving this
     /// manager.
     ///
@@ -740,7 +807,6 @@ impl<'a> ContinuousBatchManager<'a> {
         let loop_state = DecodeLoopState::with_rng(0, rng, pending.options.top_logprobs);
         let row = ContinuousBatchRow {
             handle: pending.handle,
-            physical_row: row_index,
             context_tokens: pending.prompt_tokens,
             options: pending.options,
             chain: pending.chain,
@@ -930,9 +996,12 @@ impl<'a> ContinuousBatchManager<'a> {
         let advancing_rows = self
             .rows
             .iter()
-            .flatten()
-            .filter(|row| row.pending.is_none())
-            .map(|row| row.physical_row)
+            .enumerate()
+            .filter_map(|(row_index, row)| {
+                row.as_ref()
+                    .is_some_and(|row| row.pending.is_none())
+                    .then_some(row_index)
+            })
             .collect::<Vec<_>>();
         if advancing_rows.is_empty() {
             return Ok(());
@@ -978,22 +1047,26 @@ impl<'a> ContinuousBatchManager<'a> {
         let mut advance_rows = vec![false; self.max_batch()];
         let mut completes_context = vec![false; self.max_batch()];
         self.record_forward(advancing_rows.len(), "step_select");
-        for row in self.rows.iter().flatten() {
+        for (row_index, row) in self
+            .rows
+            .iter()
+            .enumerate()
+            .filter_map(|(row_index, row)| row.as_ref().map(|row| (row_index, row)))
+        {
             if row.pending.is_none() {
                 let row_len = self
                     .decode
-                    .row_len(row.physical_row)
+                    .row_len(row_index)
                     .map_err(|e| anyhow::anyhow!("Failed to read continuous row length: {e}"))?;
                 let token = *row.context_tokens.get(row_len).with_context(|| {
                     format!(
-                        "continuous row {} has no token to advance at offset {row_len}",
-                        row.physical_row
+                        "continuous row {row_index} has no token to advance at offset {row_len}"
                     )
                 })?;
-                input_ids[row.physical_row] = i64::from(token);
-                position_ids[row.physical_row] = row_len as i64;
-                advance_rows[row.physical_row] = true;
-                completes_context[row.physical_row] = row_len + 1 == row.context_tokens.len();
+                input_ids[row_index] = i64::from(token);
+                position_ids[row_index] = row_len as i64;
+                advance_rows[row_index] = true;
+                completes_context[row_index] = row_len + 1 == row.context_tokens.len();
             }
         }
         let mut logits = self
@@ -1004,9 +1077,12 @@ impl<'a> ContinuousBatchManager<'a> {
         let extract_rows = self
             .rows
             .iter()
-            .flatten()
-            .filter(|row| advance_rows[row.physical_row] && completes_context[row.physical_row])
-            .map(|row| row.physical_row)
+            .enumerate()
+            .filter_map(|(row_index, row)| {
+                row.as_ref()
+                    .is_some_and(|_| advance_rows[row_index] && completes_context[row_index])
+                    .then_some(row_index)
+            })
             .collect::<Vec<_>>();
         for physical_row in extract_rows {
             self.take_row_pending(&mut logits, physical_row, physical_row)?;
@@ -1016,6 +1092,69 @@ impl<'a> ContinuousBatchManager<'a> {
 }
 
 impl Engine {
+    /// Why this engine must use isolated generation rather than a shared
+    /// live-row forward.
+    ///
+    /// This is deliberately an eligibility check rather than package
+    /// validation.  The workflow remains executable when the selected backend
+    /// cannot share its forward, when the graph shape is unsuitable for the
+    /// specialized runner, or when its declared loop has no compactable
+    /// row-major form.
+    fn shared_batch_ineligible_reason(&self) -> Option<String> {
+        if !self.holds_decode_core() {
+            return Some(
+                "the declared workflow has no fused decode executor that can issue a shared \
+                 live-row forward"
+                    .to_string(),
+            );
+        }
+        if let Err(error) =
+            crate::pipeline::validate_generation_workflow(self.workflow.workflow_spec())
+        {
+            return Some(format!(
+                "the declared generation loop is not eligible for the specialized shared \
+                 live-row executor: {error:#}"
+            ));
+        }
+        if self.workflow.workflow_spec().inputs.values().any(|input| {
+            matches!(
+                 &input.role,
+                 onnx_genai_metadata::SemanticInputRole::Runtime { role, .. }
+                     if *role == onnx_genai_metadata::RuntimeInputRole::RowSelection
+            )
+        }) {
+            return Some(
+                "the declared workflow supplies a positional row plan, but the specialized \
+                  shared decoder cannot apply that plan atomically to backend KV state, request \
+                  values, semantic state, effects, RNG, and output ownership; use isolated \
+                  workflow execution"
+                    .to_string(),
+            );
+        }
+        let capability = self.batching_capability();
+        (!capability.supports_batching()).then(|| capability.reason().to_string())
+    }
+
+    /// Execute each request through the ordinary single-request path.
+    ///
+    /// Formation, row placement, and shared-forward support are optimization
+    /// concerns.  This is therefore the only fallback: it preserves the normal
+    /// scheduler admission, request-local state, callbacks, EOS handling, and
+    /// result order without inventing a second isolated token policy.
+    fn run_isolated_batch(
+        &mut self,
+        requests: Vec<GenerateRequest>,
+    ) -> anyhow::Result<Vec<GenerateResult>> {
+        requests
+            .into_iter()
+            .enumerate()
+            .map(|(index, request)| {
+                self.generate(request)
+                    .with_context(|| format!("isolated batch request {index}"))
+            })
+            .collect()
+    }
+
     /// Refuse a package whose declared workflow the batched routes cannot run.
     ///
     /// Batching advances N rows through *one* decoder forward pass, so it needs
@@ -1070,11 +1209,6 @@ impl Engine {
         if requests.is_empty() {
             return Ok(Vec::new());
         }
-        // Checked before the capability question, because "this package is not
-        // executable at all" is a different and prior answer to "this package
-        // cannot batch" -- reporting the capability first would tell a caller to
-        // go find a batchable model when the real problem is the package.
-        self.assert_batched_generation_declared()?;
         let max_batch = requests.len();
         self.run_continuous_batch(requests, max_batch)
     }
@@ -1341,8 +1475,32 @@ impl Engine {
         if requests.is_empty() {
             return Ok(Vec::new());
         }
+        if max_batch == 0 {
+            anyhow::bail!("continuous batch max_batch must be greater than zero");
+        }
+        if let Some(reason) = self.shared_batch_ineligible_reason() {
+            tracing::debug!(%reason, "declining shared live-row batching; using isolated execution");
+            return self.run_isolated_batch(requests);
+        }
+        // Constructing a shared session only allocates its private execution
+        // resources.  If a backend rejects its shape, capture, or binding ABI
+        // here, nothing request-visible has run yet and isolation remains
+        // correct.  Errors after construction are never retried in isolation:
+        // a forward may already have changed state or published output.
+        let fallback_requests = requests.clone();
         let expected_results = requests.len();
-        let mut manager = self.continuous_batch_manager(max_batch)?;
+        let manager_result = self.continuous_batch_manager(max_batch);
+        if let Err(error) = &manager_result {
+            tracing::debug!(
+                %error,
+                "shared live-row setup declined; using isolated execution"
+            );
+        }
+        if manager_result.is_err() {
+            drop(manager_result);
+            return self.run_isolated_batch(fallback_requests);
+        }
+        let mut manager = manager_result.expect("checked shared manager construction");
         let mut results = vec![None; expected_results];
         for request in requests {
             manager.submit(request)?;
@@ -1394,6 +1552,11 @@ impl Engine {
         if max_batch == 0 {
             anyhow::bail!("continuous batch max_batch must be greater than zero");
         }
+        if let Some(reason) = self.shared_batch_ineligible_reason() {
+            tracing::debug!(%reason, "declining scheduled shared live-row batching; using isolated execution");
+            return self.run_isolated_batch(requests);
+        }
+        let fallback_requests = requests.clone();
         let expected_results = requests.len();
 
         // Tokenize every prompt up front so the scheduler and the batch manager
@@ -1448,7 +1611,18 @@ impl Engine {
             );
         }
 
-        let mut manager = self.continuous_batch_manager(max_batch)?;
+        let manager_result = self.continuous_batch_manager(max_batch);
+        if let Err(error) = &manager_result {
+            tracing::debug!(
+                %error,
+                "scheduled shared live-row setup declined; using isolated execution"
+            );
+        }
+        if manager_result.is_err() {
+            drop(manager_result);
+            return self.run_isolated_batch(fallback_requests);
+        }
+        let mut manager = manager_result.expect("checked shared manager construction");
         let mut results = vec![None; expected_results];
         let mut pending_requests: Vec<Option<GenerateRequest>> =
             token_requests.into_iter().map(Some).collect();

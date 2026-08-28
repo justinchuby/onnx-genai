@@ -42,6 +42,31 @@ impl TensorContract {
     pub fn rank(&self) -> usize {
         self.shape.len()
     }
+
+    /// Whether two graph-visible contracts can share one representation
+    /// without an explicit conversion component.
+    pub(crate) fn representation_compatible_with(&self, other: &Self) -> bool {
+        fn normalize_dtype(dtype: &str) -> &str {
+            match dtype {
+                "fp32" => "float32",
+                "fp16" => "float16",
+                "bf16" => "bfloat16",
+                other => other,
+            }
+        }
+
+        normalize_dtype(&self.dtype) == normalize_dtype(&other.dtype)
+            && self.rank() == other.rank()
+            && self.batch_layout == other.batch_layout
+            && self.padding == other.padding
+            && self.shape.iter().zip(&other.shape).all(|(left, right)| {
+                !matches!(
+                    (left, right),
+                    (TensorDimension::Fixed(left), TensorDimension::Fixed(right))
+                        if left != right
+                )
+            })
+    }
 }
 
 /// One padded dimension of a value and the companion that bounds it.

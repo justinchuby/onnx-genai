@@ -23,8 +23,27 @@ fn run(
     values: &[f32],
     selection: AdapterSelection,
 ) -> anyhow::Result<Vec<f32>> {
-    // Rows are identified by their position in the batch the caller submits.
-    // No slot id or epoch travels through the metadata contract.
+    let identity = (0..selection.rows.len())
+        .map(i64::try_from)
+        .collect::<Result<Vec<_>, _>>()?;
+    run_selected(engine, values, selection, &identity)
+}
+
+fn run_selected(
+    engine: &mut Engine,
+    values: &[f32],
+    selection: AdapterSelection,
+    row_selection: &[i64],
+) -> anyhow::Result<Vec<f32>> {
+    let request = selected_request(values, selection, row_selection)?;
+    Ok(engine.run_pipeline(request)?["result"].to_vec_f32()?)
+}
+
+fn selected_request(
+    values: &[f32],
+    selection: AdapterSelection,
+    row_selection: &[i64],
+) -> anyhow::Result<PipelineGenerateRequest> {
     let rows = selection.rows.len();
     let batch = i64::try_from(rows)?;
     let mut segments = vec![-1i64; rows * 2];
@@ -41,7 +60,7 @@ fn run(
             adapter_scales[row * 2 + slot] = activation.scale;
         }
     }
-    let request = PipelineGenerateRequest::new(GenerateRequest {
+    Ok(PipelineGenerateRequest::new(GenerateRequest {
         prompt: GeneratePrompt::TokenIds(vec![]),
         options: Default::default(),
     })
@@ -57,8 +76,11 @@ fn run(
         "request.adapter_scales",
         Value::from_slice_f32(&adapter_scales, &[batch, 2])?,
     )
-    .with_input("activations", Value::from_slice_f32(values, &[batch, 2])?);
-    Ok(engine.run_pipeline(request)?["result"].to_vec_f32()?)
+    .with_input(
+        "request.row_selection",
+        Value::from_slice_i64(row_selection, &[i64::try_from(row_selection.len())?])?,
+    )
+    .with_input("activations", Value::from_slice_f32(values, &[batch, 2])?))
 }
 
 #[test]
@@ -136,6 +158,10 @@ pipeline:
         contract: { dtype: float32, shape: [batch, 2], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: opaque }
         source: { kind: application, name: activations }
+      request.row_selection:
+        contract: { dtype: int64, shape: [selected_batch], batch_layout: { kind: shared } }
+        role: { kind: runtime, version: "1.0", role: row_selection }
+        source: { kind: application, name: row_selection }
     outputs:
       result:
         contract: { dtype: float32, shape: [batch, 2], batch_layout: { kind: request_aligned, axis: 0 } }
@@ -213,6 +239,23 @@ pipeline:
         vec![25.5, 35.0, 2.0, 4.0]
     );
 
+    // One runtime-minted positional plan clones and reorders the request
+    // tensors and adapter state together. Repeated source row 2 must receive
+    // both row 2's activation and row 2's composition.
+    let repeated = AdapterSelection::default()
+        .with_row(red_only.clone())
+        .with_row(none.clone())
+        .with_row(composed.clone());
+    assert_eq!(
+        run_selected(
+            &mut engine,
+            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            repeated.clone(),
+            &[2, 2, 0],
+        )?,
+        vec![25.5, 35.0, 25.5, 35.0, 2.0, 4.0]
+    );
+
     // A row that reuses a batch position with a different selection gets the
     // new selection; there is no identity to inherit a stale one from.
     let blue_only = AdapterSelection::default().with_row([AdapterActivation::new("blue", 1.0)]);
@@ -229,6 +272,25 @@ pipeline:
         vec![7.0, 10.0]
     );
     assert_eq!(run(&mut engine, &[1.0, 2.0], blue_only)?, vec![7.0, 10.0]);
+
+    // A prepared plan retains canonical request rows. Both a repeated
+    // selection and a shrinking nonidentity selection therefore start from
+    // the same three-row source domain on every execution.
+    for (row_selection, expected) in [
+        (vec![2, 2, 0], vec![25.5, 35.0, 25.5, 35.0, 2.0, 4.0]),
+        (vec![2, 0], vec![25.5, 35.0, 2.0, 4.0]),
+    ] {
+        let request = selected_request(
+            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            repeated.clone(),
+            &row_selection,
+        )?;
+        let mut plan = engine.prepare_pipeline(request)?;
+        let first = plan.execute()?["result"].to_vec_f32()?;
+        let second = plan.execute()?["result"].to_vec_f32()?;
+        assert_eq!(first, expected, "first execution selected canonical rows");
+        assert_eq!(second, expected, "replay must not reselect retained rows");
+    }
 
     let diagnostic = engine.adapter_lifecycle_diagnostic();
     assert_eq!(diagnostic.loads, 2);
