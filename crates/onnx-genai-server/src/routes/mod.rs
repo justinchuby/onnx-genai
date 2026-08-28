@@ -39,11 +39,11 @@ use crate::{
     state::{AppState, DEFAULT_MAX_OUTPUT_TOKENS, ServerConfig},
     types::{
         AudioTranscriptionResponse, ChatChoice, ChatCompletionRequest, ChatCompletionResponse,
-        ChatLogprobs, ChatMessage, ChatMessageContent, ChatMessageToolCall,
-        ChatMessageToolCallFunction, ChatTokenLogprob, ChatTool, ChatTopLogprob, CompletionChoice,
-        CompletionLogprobs, CompletionRequest, CompletionResponse, EmbeddingData, EmbeddingInput,
-        EmbeddingRequest, EmbeddingResponse, EmbeddingUsage, EmbeddingVector, InputAudio,
-        ReasoningEffort, ResponseFormat, StopInput, ToolChoice, ToolChoiceMode, Usage,
+        ChatLogprobs, ChatMessage, ChatMessageContent, ChatMessageToolCall, ChatTokenLogprob,
+        ChatTool, ChatTopLogprob, CompletionChoice, CompletionLogprobs, CompletionRequest,
+        CompletionResponse, EmbeddingData, EmbeddingInput, EmbeddingRequest, EmbeddingResponse,
+        EmbeddingUsage, EmbeddingVector, InputAudio, ReasoningEffort, ResponseFormat, StopInput,
+        ToolChoice, ToolChoiceMode, Usage,
     },
 };
 
@@ -65,7 +65,6 @@ pub(crate) use admin::{
 pub(crate) use completions::prepare_completion;
 pub use completions::{
     ParsedAssistantOutput, build_generate_request, build_prompt, parse_assistant_output,
-    parse_tool_calls,
 };
 pub(crate) use completions::{
     chat_completions, collect_generation_result, completions, embeddings,

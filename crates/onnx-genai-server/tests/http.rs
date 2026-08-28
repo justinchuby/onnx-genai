@@ -5,9 +5,10 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use onnx_genai::GeneratePrompt;
 use onnx_genai_engine::GenerateConstraint;
+use onnx_genai_metadata::ToolProtocolDeclaration;
 use onnx_genai_server::{
-    AppState, ChatCompletionRequest, ServerConfig, app, build_generate_request,
-    parse_assistant_output, parse_tool_calls,
+    AppState, ChatCompletionRequest, ServerConfig, ToolCallStream, ToolParseOutcome, ToolProtocol,
+    app, build_generate_request, parse_assistant_output,
 };
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -1075,7 +1076,7 @@ fn auto_and_none_tool_choice_do_not_constrain_generation() {
 }
 
 #[test]
-fn chat_request_with_tools_renders_tool_schema_in_prompt() {
+fn generic_request_builder_does_not_guess_a_tool_protocol() {
     let request = chat_request(json!({
         "model": "tiny-llm",
         "messages": [
@@ -1110,21 +1111,46 @@ fn chat_request_with_tools_renders_tool_schema_in_prompt() {
     let GeneratePrompt::Text(prompt) = generate_request.prompt else {
         panic!("expected text prompt");
     };
-    assert!(prompt.contains("<|tools|>"), "{prompt}");
-    assert!(prompt.contains("get_weather"), "{prompt}");
-    assert!(
-        prompt.contains("\"city\":{\"type\":\"string\"}"),
-        "{prompt}"
-    );
+    assert!(!prompt.contains("<|tools|>"), "{prompt}");
+    assert!(!prompt.contains("<atem:tools>"), "{prompt}");
     assert!(prompt.contains("<|tool|>"), "{prompt}");
     assert!(prompt.contains("tool_call_id: call_0"), "{prompt}");
 }
 
+fn declared_protocol(identity: &str) -> ToolProtocol {
+    ToolProtocol::from_declaration(&ToolProtocolDeclaration {
+        identity: identity.to_string(),
+        version: "v1".to_string(),
+    })
+    .unwrap()
+}
+
+#[tokio::test]
+async fn tool_request_without_package_declaration_fails_before_generation() {
+    let response = post_json(
+        test_app().await,
+        "/v1/chat/completions",
+        json!({
+            "model": "tiny-llm",
+            "messages": [{"role": "user", "content": "weather?"}],
+            "tools": [{"type": "function", "function": {"name": "weather"}}]
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(message.contains("before inference"), "{message}");
+    assert!(message.contains("package.tool_protocol"), "{message}");
+}
+
 #[test]
-fn parser_converts_qwen_tool_call_blocks_to_openai_tool_calls() {
+fn declared_tagged_json_protocol_converts_multiple_calls_to_openai() {
+    let protocol = declared_protocol("tagged-json");
     let parsed = parse_assistant_output(
-        r#"Thinking...
-<tool_call>
+        Some(&protocol),
+        r#"<tool_call>
 {"name":"read_file","arguments":{"path":"src/lib.rs"}}
 </tool_call>
 <tool_call>
@@ -1150,78 +1176,30 @@ fn parser_converts_qwen_tool_call_blocks_to_openai_tool_calls() {
 }
 
 #[test]
-fn parser_keeps_qwen_single_tool_call_behavior() {
-    let calls = parse_tool_calls(
-        r#"<tool_call>{"name":"read_file","arguments":{"path":"src/lib.rs"}}</tool_call>"#,
-    );
-
-    assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].id, "call_0");
-    assert_eq!(calls[0].function.name, "read_file");
-    assert_eq!(calls[0].function.arguments, r#"{"path":"src/lib.rs"}"#);
-}
-
-#[test]
-fn parser_converts_llama_parameters_with_eom_terminator() {
-    let calls = parse_tool_calls(
-        r#"<|python_tag|>{"name":"get_weather","parameters":{"city":"Paris"}}<|eom_id|>"#,
-    );
-
-    assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].id, "call_0");
-    assert_eq!(calls[0].function.name, "get_weather");
-    assert_eq!(calls[0].function.arguments, r#"{"city":"Paris"}"#);
-}
-
-#[test]
-fn parser_converts_semicolon_separated_llama_calls() {
-    let calls = parse_tool_calls(
-        r#"<|python_tag|>{"name":"first","parameters":{"text":"a;b"}}; {"name":"second","parameters":{"value":2}}<|eot_id|>"#,
-    );
-
-    assert_eq!(calls.len(), 2);
-    assert_eq!(calls[0].id, "call_0");
-    assert_eq!(calls[0].function.name, "first");
-    assert_eq!(calls[0].function.arguments, r#"{"text":"a;b"}"#);
-    assert_eq!(calls[1].id, "call_1");
-    assert_eq!(calls[1].function.name, "second");
-    assert_eq!(calls[1].function.arguments, r#"{"value":2}"#);
-}
-
-#[test]
-fn parser_converts_mistral_tool_call_array() {
-    let calls = parse_tool_calls(
-        r#"[TOOL_CALLS][{"invalid":"missing-name"},{"name":"first","arguments":{"value":1}},{"name":"second","arguments":{"value":2}}]"#,
-    );
-
-    assert_eq!(calls.len(), 2);
-    assert_eq!(calls[0].id, "call_0");
-    assert_eq!(calls[0].function.name, "first");
-    assert_eq!(calls[1].id, "call_1");
-    assert_eq!(calls[1].function.name, "second");
-}
-
-#[test]
-fn parser_converts_atem_tool_call_blocks() {
-    let calls = parse_tool_calls(
-        r#"<atem:function_calls>
-<atem:invoke name="bash">
+fn declared_atem_xml_protocol_converts_escaped_values_to_openai() {
+    let protocol = declared_protocol("atem-xml");
+    let mut stream = ToolCallStream::default();
+    let outcome = stream.push(
+        &protocol,
+        r#"<atem:invoke name="bash">
 <atem:parameter name="command">{"cmd":"printf ok"}</atem:parameter>
-<atem:parameter name="description">run a command</atem:parameter>
-</atem:invoke>
-</atem:function_calls>"#,
+<atem:parameter name="description">"run a &lt; safe command"</atem:parameter>
+</atem:invoke>"#,
     );
-
+    let ToolParseOutcome::Complete(calls) = outcome else {
+        panic!("expected a complete declared ATEM envelope");
+    };
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].function.name, "bash");
     let arguments: Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
     assert_eq!(arguments["command"]["cmd"], "printf ok");
-    assert_eq!(arguments["description"], "run a command");
+    assert_eq!(arguments["description"], "run a < safe command");
 }
 
 #[test]
 fn parser_returns_only_atem_user_channel_content() {
     let parsed = parse_assistant_output(
+        None,
         "<|start|>assistant to=self<|message|>private reasoning<|eom|>\
          <|start|>assistant to=user<|message|>final answer<|eot|>"
             .to_string(),
@@ -1237,6 +1215,7 @@ fn parser_returns_only_atem_user_channel_content() {
 #[test]
 fn parser_withholds_atem_reasoning_without_a_user_channel() {
     let parsed = parse_assistant_output(
+        None,
         "<|start|>assistant to=self<|message|>private reasoning that ran long".to_string(),
         "length",
     );
@@ -1247,28 +1226,24 @@ fn parser_withholds_atem_reasoning_without_a_user_channel() {
 }
 
 #[test]
-fn parser_prefers_arguments_over_parameters() {
-    let calls = parse_tool_calls(
-        r#"<|python_tag|>{"name":"choose","arguments":{"source":"arguments"},"parameters":{"source":"parameters"}}"#,
-    );
-
-    assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].function.arguments, r#"{"source":"arguments"}"#);
-}
-
-#[test]
-fn parser_skips_malformed_tool_call_formats() {
-    assert!(parse_tool_calls(r#"<tool_call>{"name":</tool_call>"#).is_empty());
-    assert!(parse_tool_calls(r#"<|python_tag|>{"name":"broken""#).is_empty());
-    assert!(parse_tool_calls(r#"[TOOL_CALLS]{"name":"not-an-array"}"#).is_empty());
-    assert!(parse_tool_calls("").is_empty());
-    assert!(parse_tool_calls("ordinary assistant text").is_empty());
+fn declared_protocol_reports_incomplete_and_malformed_envelopes() {
+    let protocol = declared_protocol("tagged-json");
+    let mut stream = ToolCallStream::default();
+    assert!(matches!(
+        stream.push(&protocol, "<tool_call>{\"name\":\"read\"}"),
+        ToolParseOutcome::Incomplete
+    ));
+    let mut stream = ToolCallStream::default();
+    assert!(matches!(
+        stream.push(&protocol, "<tool_call>{\"name\":}</tool_call>"),
+        ToolParseOutcome::Malformed(_)
+    ));
 }
 
 #[test]
 fn plain_assistant_output_preserves_content() {
     let output = "ordinary assistant text".to_string();
-    let parsed = parse_assistant_output(output.clone(), "stop");
+    let parsed = parse_assistant_output(None, output.clone(), "stop");
 
     assert_eq!(parsed.content, Some(output));
     assert!(parsed.tool_calls.is_none());

@@ -344,6 +344,27 @@ fn collect_workflow_capabilities(node: &WorkflowNode, capabilities: &mut BTreeSe
 pub fn validate_metadata(metadata: &InferenceMetadata) -> Result<(), Vec<String>> {
     let mut errors = Vec::new();
 
+    if let Some(protocol) = metadata
+        .package
+        .as_ref()
+        .and_then(|package| package.tool_protocol.as_ref())
+    {
+        if protocol.identity.trim().is_empty() {
+            errors.push(
+                "package.tool_protocol.identity must name one exact non-empty protocol identity; \
+                 omit tool_protocol when the package does not support tools"
+                    .to_string(),
+            );
+        }
+        if protocol.version.trim().is_empty() {
+            errors.push(
+                "package.tool_protocol.version must name one exact non-empty protocol version; \
+                 specify the version whose rendering and envelope semantics the package uses"
+                    .to_string(),
+            );
+        }
+    }
+
     // An unreadable version is reported once, by `validate_schema_version`
     // below. Falling back to the initial version here validates the rest of the
     // document at the most permissive strictness rather than adding a second,
@@ -437,6 +458,21 @@ fn validate_schema_version(metadata: &InferenceMetadata, errors: &mut Vec<String
              `special_tokens` as an unknown field",
             crate::version::TOKEN_AUTHORITY_SCHEMA_VERSION,
             crate::version::TOKEN_AUTHORITY_SCHEMA_VERSION
+        ));
+    }
+    let has_tool_protocol = metadata
+        .package
+        .as_ref()
+        .and_then(|package| package.tool_protocol.as_ref())
+        .is_some();
+    if has_tool_protocol && declared < crate::version::TOOL_PROTOCOL_SCHEMA_VERSION {
+        let spelled = metadata.schema_version.as_deref().unwrap_or("<absent>");
+        errors.push(format!(
+            "this package declares `package.tool_protocol`, which schema version {} introduced, but \
+             declares schema_version '{spelled}' ({declared}); declare schema_version '{}' so an \
+             older reader refuses the package as a newer contract rather than guessing a tool protocol",
+            crate::version::TOOL_PROTOCOL_SCHEMA_VERSION,
+            crate::version::TOOL_PROTOCOL_SCHEMA_VERSION,
         ));
     }
     let Some(feature) = batching_schema_feature(metadata) else {

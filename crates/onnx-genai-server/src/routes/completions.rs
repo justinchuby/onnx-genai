@@ -1,4 +1,5 @@
 use super::*;
+use crate::tool_protocol::{self, ToolParseOutcome, ToolProtocol};
 
 pub(crate) async fn completions(
     State(state): State<AppState>,
@@ -324,6 +325,12 @@ pub(crate) async fn chat_completions(
 ) -> Result<Response, ApiError> {
     let handle = resolve_model(&state.registry, &request.model).await?;
     validate_request(&request, &state.config)?;
+    tool_protocol::validate_request(
+        &request,
+        handle.tool_protocol.as_ref(),
+        handle.tool_protocol_metadata_path.as_deref(),
+    )
+    .map_err(|error| ApiError::bad_request(error.to_string()))?;
     let requested_session_id = session_id_from_headers(&headers)?;
     // The session header names a conversation. Which runtime state continues it
     // — a decode core's paged KV sequence, or the interpreter's session-scoped
@@ -378,6 +385,7 @@ async fn run_chat_completion(
         client_session_id.is_some(),
         &PromptContext {
             chat_template: handle.chat_template.as_deref(),
+            tool_protocol: handle.tool_protocol.as_ref(),
             image_placeholder: placeholder.as_deref(),
             generation_defaults: handle.generation_defaults.as_ref(),
             default_reasoning_effort: state.config.default_reasoning_effort,
@@ -471,13 +479,15 @@ async fn run_chat_completion(
                 .map_err(|err| ApiError::internal(format!("logprobs conversion failed: {err}")))?;
             let output = assistant_output_text(&result, &tokenizer);
             let reasoning = atem_reasoning_content(&output).filter(|thought| !thought.is_empty());
-            let parsed = if tools_parseable_from_output(&request) {
-                parse_assistant_output(output, default_finish_reason).aligned_to(&request)
+            let parsed = if request.has_tool_context() {
+                parse_assistant_output(handle.tool_protocol.as_ref(), output, default_finish_reason)
+                    .aligned_to(&request)
             } else {
                 ParsedAssistantOutput {
                     content: Some(result.text),
                     tool_calls: None,
                     finish_reason: default_finish_reason,
+                    tool_parse: ToolParseOutcome::NoCall,
                 }
             };
             (
@@ -554,6 +564,7 @@ async fn stream_chat_completion(
         client_session_id.is_some(),
         &PromptContext {
             chat_template: handle.chat_template.as_deref(),
+            tool_protocol: handle.tool_protocol.as_ref(),
             image_placeholder: placeholder.as_deref(),
             generation_defaults: handle.generation_defaults.as_ref(),
             default_reasoning_effort: state.config.default_reasoning_effort,
@@ -624,8 +635,7 @@ async fn stream_chat_completion(
         let mut stop_buffer = StopBoundaryBuffer::new(user_stop_sequences.clone());
         let mut channel_gate = PrivateChannelGate::new(handle.private_channels);
         let mut buffered_text = String::new();
-        let buffer_for_tool_detection =
-            request.has_tool_context() && tools_parseable_from_output(&request);
+        let buffer_for_tool_detection = request.has_tool_context();
         let result = loop {
             match driver_rx.recv().await {
                 Some(DriverEvent::Token(token)) => {
@@ -673,7 +683,10 @@ async fn stream_chat_completion(
             Ok(result) => {
                 if let Some(requested_top_logprobs) = requested_top_logprobs {
                     let mut tool_calls = if buffer_for_tool_detection {
-                        parse_tool_calls(&assistant_output_text(&result, &tokenizer))
+                        complete_tool_calls(
+                            handle.tool_protocol.as_ref(),
+                            &assistant_output_text(&result, &tokenizer),
+                        )
                     } else {
                         Vec::new()
                     };
@@ -704,6 +717,7 @@ async fn stream_chat_completion(
                     }
                 } else if buffer_for_tool_detection {
                     let parsed = parse_assistant_output(
+                        handle.tool_protocol.as_ref(),
                         assistant_output_text(&result, &tokenizer),
                         finish_reason_label(&result.finish_reason),
                     )
@@ -1608,6 +1622,7 @@ fn positional_image_placeholder(
 /// fail, so they are passed as one value instead of four positional arguments.
 struct PromptContext<'a> {
     chat_template: Option<&'a ChatTemplate>,
+    tool_protocol: Option<&'a ToolProtocol>,
     image_placeholder: Option<&'a str>,
     generation_defaults: Option<&'a GenerationDefaults>,
     /// Applied when the request omits `reasoning_effort`.
@@ -1850,23 +1865,6 @@ fn json_constraint_stopped_incomplete_message(message: &str) -> bool {
     message.contains("JSON constrained decoding stopped before a complete JSON value")
 }
 
-fn tools_parseable_from_output(request: &ChatCompletionRequest) -> bool {
-    !matches!(
-        request.tool_choice,
-        Some(ToolChoice::Mode(ToolChoiceMode::None))
-    )
-}
-
-fn tools_offered_to_model(request: &ChatCompletionRequest) -> Option<&Vec<ChatTool>> {
-    if matches!(
-        request.tool_choice,
-        Some(ToolChoice::Mode(ToolChoiceMode::None))
-    ) {
-        return None;
-    }
-    request.tools.as_ref().filter(|tools| !tools.is_empty())
-}
-
 fn build_session_prompt(messages: &[ChatMessage], image_placeholder: Option<&str>) -> String {
     messages
         .last()
@@ -1937,13 +1935,17 @@ fn render_prompt(
             .iter()
             .map(|message| template_message(message, context.image_placeholder))
             .collect::<anyhow::Result<Vec<_>>>()?;
-        let tools_json = tools_offered_to_model(request)
-            .map(serde_json::to_string)
-            .transpose()?;
+        let rendered_tools = context
+            .tool_protocol
+            .map(|protocol| protocol.render(request))
+            .transpose()
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
         return chat_template
             .render_with_reasoning_effort(
                 &messages,
-                tools_json.as_deref(),
+                rendered_tools
+                    .as_ref()
+                    .and_then(|rendered| rendered.tools_json.as_deref()),
                 true,
                 request
                     .reasoning_effort
@@ -1952,24 +1954,25 @@ fn render_prompt(
             )
             .map_err(|err| anyhow::anyhow!("chat template render failed: {err}"));
     }
-    Ok(build_prompt(request))
+    let prefix = context
+        .tool_protocol
+        .map(|protocol| protocol.render(request))
+        .transpose()
+        .map_err(|error| anyhow::anyhow!("{error}"))?
+        .map_or_else(String::new, |rendered| rendered.fallback_prefix);
+    Ok(build_prompt_with_tool_prefix(request, &prefix))
 }
 
 /// Build the Phase 2 chat prompt with a simple role-tagged template:
 /// `<|role|>\n{content}\n` for every message, followed by `<|assistant|>\n`.
 /// Model-specific templates will replace this once tokenizer chat templates are wired.
 pub fn build_prompt(request: &ChatCompletionRequest) -> String {
+    build_prompt_with_tool_prefix(request, "")
+}
+
+fn build_prompt_with_tool_prefix(request: &ChatCompletionRequest, tool_prefix: &str) -> String {
     let mut prompt = String::new();
-    if let Some(tools) = tools_offered_to_model(request) {
-        prompt.push_str("<|tools|>\n");
-        prompt.push_str(&serde_json::to_string(tools).unwrap_or_else(|_| "[]".to_string()));
-        prompt.push('\n');
-    }
-    if let Some(tool_choice) = &request.tool_choice {
-        prompt.push_str("<|tool_choice|>\n");
-        prompt.push_str(&tool_choice_prompt(tool_choice));
-        prompt.push('\n');
-    }
+    prompt.push_str(tool_prefix);
     for message in &request.messages {
         prompt.push_str("<|");
         prompt.push_str(message.role.trim());
@@ -1995,165 +1998,17 @@ pub fn build_prompt(request: &ChatCompletionRequest) -> String {
     prompt
 }
 
-fn tool_choice_prompt(tool_choice: &ToolChoice) -> String {
-    match tool_choice {
-        ToolChoice::Mode(mode) => match mode {
-            ToolChoiceMode::Auto => "auto".to_string(),
-            ToolChoiceMode::None => "none".to_string(),
-            ToolChoiceMode::Required => "required".to_string(),
-        },
-        ToolChoice::Specific(choice) => format!("function: {}", choice.function.name),
+fn complete_tool_calls(protocol: Option<&ToolProtocol>, output: &str) -> Vec<ChatMessageToolCall> {
+    let Some(protocol) = protocol else {
+        return Vec::new();
+    };
+    let mut stream = tool_protocol::ToolCallStream::default();
+    match stream.push(protocol, output) {
+        ToolParseOutcome::Complete(calls) => calls,
+        ToolParseOutcome::NoCall
+        | ToolParseOutcome::Incomplete
+        | ToolParseOutcome::Malformed(_) => Vec::new(),
     }
-}
-
-pub fn parse_tool_calls(output: &str) -> Vec<ChatMessageToolCall> {
-    // Model families do not normally mix formats. When they do, use ATEM,
-    // Qwen, Llama, then Mistral order so generated call IDs remain deterministic.
-    let parsed_calls = extract_atem_tool_calls(output)
-        .into_iter()
-        .chain(extract_qwen_tool_calls(output))
-        .chain(extract_llama_tool_calls(output))
-        .chain(extract_mistral_tool_calls(output));
-    let mut calls = Vec::new();
-    for value in parsed_calls {
-        if let Some(call) = parsed_tool_call_to_openai(calls.len(), value) {
-            calls.push(call);
-        }
-    }
-    calls
-}
-
-fn extract_atem_tool_calls(output: &str) -> Vec<serde_json::Value> {
-    const INVOKE: &str = "<atem:invoke";
-    const INVOKE_CLOSE: &str = "</atem:invoke>";
-    const PARAMETER: &str = "<atem:parameter";
-    const PARAMETER_CLOSE: &str = "</atem:parameter>";
-
-    let mut calls = Vec::new();
-    let mut rest = output;
-    while let Some(start) = rest.find(INVOKE) {
-        rest = &rest[start + INVOKE.len()..];
-        let Some(tag_end) = rest.find('>') else {
-            break;
-        };
-        let Some(name) = tag_attribute(&rest[..tag_end], "name") else {
-            rest = &rest[tag_end + 1..];
-            continue;
-        };
-        rest = &rest[tag_end + 1..];
-        let Some(invoke_end) = rest.find(INVOKE_CLOSE) else {
-            break;
-        };
-        let body = &rest[..invoke_end];
-        let mut arguments = serde_json::Map::new();
-        let mut parameters = body;
-        while let Some(parameter_start) = parameters.find(PARAMETER) {
-            parameters = &parameters[parameter_start + PARAMETER.len()..];
-            let Some(parameter_tag_end) = parameters.find('>') else {
-                break;
-            };
-            let Some(key) = tag_attribute(&parameters[..parameter_tag_end], "name") else {
-                parameters = &parameters[parameter_tag_end + 1..];
-                continue;
-            };
-            parameters = &parameters[parameter_tag_end + 1..];
-            let Some(parameter_end) = parameters.find(PARAMETER_CLOSE) else {
-                break;
-            };
-            // A parameter that opens another parameter before it closes was
-            // opened twice: a value cannot contain a parameter, so the outer
-            // tag is a stray and the inner one is the real parameter. Taking
-            // the outer at its word would swallow the stray tag into the value
-            // and lose the argument the model meant to pass.
-            if let Some(nested) = parameters.find(PARAMETER)
-                && nested < parameter_end
-            {
-                parameters = &parameters[nested..];
-                continue;
-            }
-            let raw_value = &parameters[..parameter_end];
-            let value = serde_json::from_str(raw_value.trim())
-                .unwrap_or_else(|_| serde_json::Value::String(raw_value.to_string()));
-            arguments.insert(key, value);
-            parameters = &parameters[parameter_end + PARAMETER_CLOSE.len()..];
-        }
-        calls.push(serde_json::json!({
-            "name": name,
-            "arguments": arguments,
-        }));
-        rest = &rest[invoke_end + INVOKE_CLOSE.len()..];
-    }
-    calls
-}
-
-fn tag_attribute(tag: &str, attribute: &str) -> Option<String> {
-    let marker = format!("{attribute}=\"");
-    let value = tag.split_once(&marker)?.1;
-    Some(value.split_once('"')?.0.to_string())
-}
-
-fn extract_qwen_tool_calls(output: &str) -> Vec<serde_json::Value> {
-    let mut values = Vec::new();
-    let mut rest = output;
-    while let Some(start) = rest.find("<tool_call>") {
-        rest = &rest[start + "<tool_call>".len()..];
-        let Some(end) = rest.find("</tool_call>") else {
-            break;
-        };
-        let body = rest[..end].trim();
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(body) {
-            values.push(value);
-        }
-        rest = &rest[end + "</tool_call>".len()..];
-    }
-    values
-}
-
-fn extract_llama_tool_calls(output: &str) -> Vec<serde_json::Value> {
-    const MARKER: &str = "<|python_tag|>";
-    let mut values = Vec::new();
-    let mut rest = output;
-    while let Some(start) = rest.find(MARKER) {
-        rest = &rest[start + MARKER.len()..];
-        let mut json = rest;
-        loop {
-            json = json.trim_start();
-            if let Some(after_separator) = json.strip_prefix(';') {
-                json = after_separator;
-                continue;
-            }
-            if json.is_empty() || json.starts_with("<|") {
-                break;
-            }
-            let Some((value, consumed)) = parse_json_value_prefix(json) else {
-                break;
-            };
-            values.push(value);
-            json = &json[consumed..];
-        }
-    }
-    values
-}
-
-fn extract_mistral_tool_calls(output: &str) -> Vec<serde_json::Value> {
-    const MARKER: &str = "[TOOL_CALLS]";
-    let mut values = Vec::new();
-    let mut rest = output;
-    while let Some(start) = rest.find(MARKER) {
-        rest = &rest[start + MARKER.len()..];
-        if let Some((serde_json::Value::Array(calls), _)) =
-            parse_json_value_prefix(rest.trim_start())
-        {
-            values.extend(calls);
-        }
-    }
-    values
-}
-
-fn parse_json_value_prefix(input: &str) -> Option<(serde_json::Value, usize)> {
-    let mut stream = serde_json::Deserializer::from_str(input).into_iter::<serde_json::Value>();
-    let value = stream.next()?.ok()?;
-    Some((value, stream.byte_offset()))
 }
 
 #[derive(Debug, Clone)]
@@ -2161,6 +2016,7 @@ pub struct ParsedAssistantOutput {
     pub content: Option<String>,
     pub tool_calls: Option<Vec<ChatMessageToolCall>>,
     pub finish_reason: &'static str,
+    pub tool_parse: ToolParseOutcome,
 }
 
 impl ParsedAssistantOutput {
@@ -2196,7 +2052,12 @@ impl ParsedAssistantOutput {
 /// reject, because inventing a target it never offered would be worse than the
 /// error it already knows how to report.
 fn align_tool_calls(calls: &mut [ChatMessageToolCall], request: &ChatCompletionRequest) {
-    let Some(offered) = tools_offered_to_model(request) else {
+    let Some(offered) = request.tools.as_ref().filter(|_| {
+        !matches!(
+            request.tool_choice,
+            Some(ToolChoice::Mode(ToolChoiceMode::None))
+        )
+    }) else {
         return;
     };
     let names_a_tool =
@@ -2220,24 +2081,31 @@ fn align_tool_calls(calls: &mut [ChatMessageToolCall], request: &ChatCompletionR
 }
 
 pub fn parse_assistant_output(
+    protocol: Option<&ToolProtocol>,
     output: String,
     default_finish_reason: &'static str,
 ) -> ParsedAssistantOutput {
     // OpenAI tool calls end the assistant turn. The batch row finishes normally
     // with finish_reason=tool_calls; role=tool follow-up messages are submitted
     // as a new turn rather than pausing and resuming mid-token.
-    let tool_calls = parse_tool_calls(&output);
-    if tool_calls.is_empty() {
+    let mut stream = tool_protocol::ToolCallStream::default();
+    let outcome = protocol.map_or(ToolParseOutcome::NoCall, |protocol| {
+        stream.push(protocol, &output)
+    });
+    if let ToolParseOutcome::Complete(tool_calls) = &outcome {
+        return ParsedAssistantOutput {
+            content: None,
+            tool_calls: Some(tool_calls.clone()),
+            finish_reason: "tool_calls",
+            tool_parse: outcome,
+        };
+    }
+    {
         ParsedAssistantOutput {
             content: Some(atem_visible_content(&output).unwrap_or(output)),
             tool_calls: None,
             finish_reason: default_finish_reason,
-        }
-    } else {
-        ParsedAssistantOutput {
-            content: None,
-            tool_calls: Some(tool_calls),
-            finish_reason: "tool_calls",
+            tool_parse: outcome,
         }
     }
 }
@@ -2454,26 +2322,6 @@ fn assistant_output_text(result: &GenerateResult, tokenizer: &Tokenizer) -> Stri
     } else {
         result.text.clone()
     }
-}
-
-fn parsed_tool_call_to_openai(
-    index: usize,
-    value: serde_json::Value,
-) -> Option<ChatMessageToolCall> {
-    let name = value.get("name")?.as_str()?.to_string();
-    let arguments = value
-        .get("arguments")
-        .or_else(|| value.get("parameters"))
-        .cloned()
-        .unwrap_or_else(|| serde_json::json!({}));
-    Some(ChatMessageToolCall {
-        id: format!("call_{index}"),
-        kind: "function".to_string(),
-        function: ChatMessageToolCallFunction {
-            name,
-            arguments: serde_json::to_string(&arguments).ok()?,
-        },
-    })
 }
 
 fn chat_logprobs(
@@ -2789,6 +2637,7 @@ mod prompt_rendering_tests {
     ) -> PromptContext<'a> {
         PromptContext {
             chat_template: Some(template),
+            tool_protocol: None,
             image_placeholder: None,
             generation_defaults: None,
             default_reasoning_effort,
@@ -3161,64 +3010,6 @@ mod output_budget_tests {
 }
 
 #[cfg(test)]
-mod atem_tool_call_parsing_tests {
-    use super::*;
-
-    fn arguments(output: &str) -> serde_json::Value {
-        let calls = parse_tool_calls(output);
-        assert_eq!(calls.len(), 1, "expected one call from {output:?}");
-        serde_json::from_str(&calls[0].function.arguments).expect("arguments")
-    }
-
-    // Observed from OpenCode: the model opened the same parameter twice, and
-    // taking the outer tag at its word swallowed the stray tag into the value,
-    // so the call reached the client with the argument it needed missing.
-    #[test]
-    fn a_parameter_opened_twice_keeps_the_inner_one() {
-        assert_eq!(
-            arguments(concat!(
-                "<atem:invoke name=\"bash\">\n",
-                "<atem:parameter name=\"command\">\n",
-                "<atem:parameter name=\"command\">ls -la</atem:parameter>\n",
-                "</atem:invoke>",
-            )),
-            serde_json::json!({"command": "ls -la"})
-        );
-    }
-
-    // The repair is confined to the parameter that was opened twice; the ones
-    // around it are read exactly as they were written.
-    #[test]
-    fn a_stray_open_tag_does_not_disturb_its_neighbours() {
-        assert_eq!(
-            arguments(concat!(
-                "<atem:invoke name=\"edit\">\n",
-                "<atem:parameter name=\"path\">a.py</atem:parameter>\n",
-                "<atem:parameter name=\"text\">",
-                "<atem:parameter name=\"text\">hi</atem:parameter>\n",
-                "<atem:parameter name=\"count\">2</atem:parameter>\n",
-                "</atem:invoke>",
-            )),
-            serde_json::json!({"path": "a.py", "text": "hi", "count": 2})
-        );
-    }
-
-    // A well-formed call is unaffected, including a value that legitimately
-    // carries angle brackets.
-    #[test]
-    fn a_well_formed_call_is_read_as_written() {
-        assert_eq!(
-            arguments(concat!(
-                "<atem:invoke name=\"bash\">\n",
-                "<atem:parameter name=\"command\">echo \"<b>hi</b>\"</atem:parameter>\n",
-                "</atem:invoke>",
-            )),
-            serde_json::json!({"command": "echo \"<b>hi</b>\""})
-        );
-    }
-}
-
-#[cfg(test)]
 mod tool_name_alignment_tests {
     use super::*;
     use serde_json::json;
@@ -3318,8 +3109,14 @@ mod tool_name_alignment_tests {
              <atem:parameter name=\"pattern\">*.rs</atem:parameter>\
              </atem:invoke>"
             .to_string();
-        let parsed =
-            parse_assistant_output(output, "stop").aligned_to(&request_offering(&["glob", "read"]));
+        let protocol =
+            ToolProtocol::from_declaration(&onnx_genai_metadata::ToolProtocolDeclaration {
+                identity: "atem-xml".to_string(),
+                version: "v1".to_string(),
+            })
+            .unwrap();
+        let parsed = parse_assistant_output(Some(&protocol), output, "stop")
+            .aligned_to(&request_offering(&["glob", "read"]));
         let calls = parsed.tool_calls.expect("an ATEM invoke is a tool call");
         assert_eq!(calls.len(), 1);
         assert_eq!(
@@ -3559,7 +3356,9 @@ mod buffered_reasoning_tests {
                 .to_string();
         assert_eq!(atem_reasoning_content(&output).as_deref(), Some("weigh it"));
         assert_eq!(
-            parse_assistant_output(output, "stop").content.as_deref(),
+            parse_assistant_output(None, output, "stop")
+                .content
+                .as_deref(),
             Some("Hi")
         );
     }
@@ -3574,7 +3373,9 @@ mod buffered_reasoning_tests {
             Some("still going")
         );
         assert_eq!(
-            parse_assistant_output(output, "stop").content.as_deref(),
+            parse_assistant_output(None, output, "stop")
+                .content
+                .as_deref(),
             Some("")
         );
     }
