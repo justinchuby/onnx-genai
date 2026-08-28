@@ -93,6 +93,12 @@ static GLOBAL_STAGING_FILL_REGIONS: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_STAGING_FILL_CALLS: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_MATERIALIZE_FALLBACK_CALLS: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_HTOD_BYTES: AtomicU64 = AtomicU64::new(0);
+// Indexed expert page-ins (#2323). Payload remains part of
+// `GLOBAL_HTOD_BYTES`; these counters only describe how that unchanged payload
+// was submitted.
+static GLOBAL_INDEXED_PAGE_IN_BATCHES: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_INDEXED_PAGE_IN_ENTRIES: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_INDEXED_EXPERT_PAGE_INS: AtomicU64 = AtomicU64::new(0);
 // Host-blocking cuMemAlloc/cuMemFree spans for paged weight buffers.
 static GLOBAL_VRAM_ALLOC_NS: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_VRAM_FREE_NS: AtomicU64 = AtomicU64::new(0);
@@ -245,6 +251,14 @@ pub struct GlobalOffloadStats {
     pub staging_fill_calls: u64,
     pub materialize_fallback_calls: u64,
     pub htod_bytes: u64,
+    /// Completed indexed multi-bank submissions. This counter brackets
+    /// completion, not driver acceptance; use `CudaRuntime::batch_copy_counts`
+    /// for the latter.
+    pub indexed_page_in_batches: u64,
+    /// Individual packed/aux-scale ranges carried by completed indexed batches.
+    pub indexed_page_in_entries: u64,
+    /// Expert misses completed by indexed batches.
+    pub indexed_expert_page_ins: u64,
     pub vram_alloc_ns: u64,
     /// Weight-page free code path: the `cuMemUnmap`/`cuMemRelease` driver calls
     /// plus the per-granule Rust bookkeeping in `decommit_allocation_range`/
@@ -391,6 +405,9 @@ pub fn global_offload_stats() -> GlobalOffloadStats {
         staging_fill_calls: GLOBAL_STAGING_FILL_CALLS.load(Ordering::Relaxed),
         materialize_fallback_calls: GLOBAL_MATERIALIZE_FALLBACK_CALLS.load(Ordering::Relaxed),
         htod_bytes: GLOBAL_HTOD_BYTES.load(Ordering::Relaxed),
+        indexed_page_in_batches: GLOBAL_INDEXED_PAGE_IN_BATCHES.load(Ordering::Relaxed),
+        indexed_page_in_entries: GLOBAL_INDEXED_PAGE_IN_ENTRIES.load(Ordering::Relaxed),
+        indexed_expert_page_ins: GLOBAL_INDEXED_EXPERT_PAGE_INS.load(Ordering::Relaxed),
         vram_alloc_ns: GLOBAL_VRAM_ALLOC_NS.load(Ordering::Relaxed),
         vram_free_ns: GLOBAL_VRAM_FREE_NS.load(Ordering::Relaxed),
         vram_free_sync_ns: GLOBAL_VRAM_FREE_SYNC_NS.load(Ordering::Relaxed),
@@ -440,6 +457,9 @@ pub fn reset_global_offload_stats() {
     GLOBAL_STAGING_FILL_CALLS.store(0, Ordering::Relaxed);
     GLOBAL_MATERIALIZE_FALLBACK_CALLS.store(0, Ordering::Relaxed);
     GLOBAL_HTOD_BYTES.store(0, Ordering::Relaxed);
+    GLOBAL_INDEXED_PAGE_IN_BATCHES.store(0, Ordering::Relaxed);
+    GLOBAL_INDEXED_PAGE_IN_ENTRIES.store(0, Ordering::Relaxed);
+    GLOBAL_INDEXED_EXPERT_PAGE_INS.store(0, Ordering::Relaxed);
     GLOBAL_VRAM_ALLOC_NS.store(0, Ordering::Relaxed);
     GLOBAL_VRAM_FREE_NS.store(0, Ordering::Relaxed);
     GLOBAL_VRAM_FREE_SYNC_NS.store(0, Ordering::Relaxed);
@@ -458,7 +478,21 @@ pub fn reset_global_offload_stats() {
     GLOBAL_PREFETCH_DECLINED_RESIDENT.store(0, Ordering::Relaxed);
     GLOBAL_PREFETCH_DECLINED_POOL_CAPACITY.store(0, Ordering::Relaxed);
     reset_key_trace();
+    crate::indexed_page_in::reset_indexed_page_in_attribution_stats();
     crate::pinned_pool::reset_pinned_pool_counters();
+}
+
+pub(crate) fn record_indexed_page_in_completion(
+    payload_bytes: u64,
+    entries: u64,
+    expert_misses: u64,
+    elapsed: Duration,
+) {
+    GLOBAL_HTOD_BYTES.fetch_add(payload_bytes, Ordering::Relaxed);
+    GLOBAL_INDEXED_PAGE_IN_BATCHES.fetch_add(1, Ordering::Relaxed);
+    GLOBAL_INDEXED_PAGE_IN_ENTRIES.fetch_add(entries, Ordering::Relaxed);
+    GLOBAL_INDEXED_EXPERT_PAGE_INS.fetch_add(expert_misses, Ordering::Relaxed);
+    add_duration(&GLOBAL_HTOD_NS, elapsed);
 }
 
 // ----- Per-key page-in trace (#837 item 3 characterisation) -----

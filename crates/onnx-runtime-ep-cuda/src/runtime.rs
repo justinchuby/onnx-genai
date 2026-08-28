@@ -43,6 +43,26 @@ pub struct CudaTransferCounts {
     pub async_host_to_device: u64,
 }
 
+/// Counts calls to CUDA's indexed batch-copy entry point.
+///
+/// `submissions` advances immediately after `cuMemcpyBatchAsync[_v2]` accepts
+/// the descriptor array, while `entries` is the number of individual copies
+/// carried by those accepted submissions. These counters bracket driver
+/// submissions, not DMA completion or payload bytes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CudaBatchCopyCounts {
+    pub submissions: u64,
+    pub entries: u64,
+}
+
+/// One source/destination range in an indexed CUDA batch copy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CudaBatchCopy {
+    pub src: CUdeviceptr,
+    pub dst: CUdeviceptr,
+    pub bytes: usize,
+}
+
 /// Whether a failed measured H2D operation can still be using its source and
 /// destination.
 #[derive(Debug)]
@@ -547,6 +567,8 @@ pub struct CudaRuntime {
     host_to_device_copies: AtomicU64,
     device_to_host_copies: AtomicU64,
     async_host_to_device_copies: AtomicU64,
+    batch_copy_submissions: AtomicU64,
+    batch_copy_entries: AtomicU64,
     /// Completion events recorded on a transfer/compute stream, keyed by an
     /// opaque fence id handed out to the executor inside an
     /// [`onnx_runtime_ep_api::Fence`]. `wait_*_fence` removes and waits on the
@@ -770,6 +792,8 @@ impl CudaRuntime {
             host_to_device_copies: AtomicU64::new(0),
             device_to_host_copies: AtomicU64::new(0),
             async_host_to_device_copies: AtomicU64::new(0),
+            batch_copy_submissions: AtomicU64::new(0),
+            batch_copy_entries: AtomicU64::new(0),
             fences: Mutex::new(HashMap::new()),
             next_fence_id: AtomicU64::new(1),
             capture_error: 0,
@@ -1067,6 +1091,14 @@ impl CudaRuntime {
             host_to_device: self.host_to_device_copies.load(Ordering::Relaxed),
             device_to_host: self.device_to_host_copies.load(Ordering::Relaxed),
             async_host_to_device: self.async_host_to_device_copies.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Snapshot accepted CUDA indexed batch-copy submissions.
+    pub fn batch_copy_counts(&self) -> CudaBatchCopyCounts {
+        CudaBatchCopyCounts {
+            submissions: self.batch_copy_submissions.load(Ordering::Relaxed),
+            entries: self.batch_copy_entries.load(Ordering::Relaxed),
         }
     }
 
@@ -1996,6 +2028,170 @@ impl CudaRuntime {
         self.async_host_to_device_copies
             .fetch_add(1, Ordering::Relaxed);
         Ok((elapsed_ms, CopyCompleted::new()))
+    }
+
+    /// Submit an indexed multi-range copy as one CUDA batch and wait for its
+    /// completion with transfer-stream events.
+    ///
+    /// The span is: record start, call `cuMemcpyBatchAsync[_v2]` once, record
+    /// end, host-synchronize end, and read elapsed time. The submission counter
+    /// advances immediately after the driver accepts the descriptor array;
+    /// callers must account payload bytes only after this method returns
+    /// `Ok`, when [`CopyCompleted`] proves every source read has retired.
+    ///
+    /// Source pointers may name registered host memory in CUDA's unified
+    /// address space; that remains a physical page-in copy, not zero-copy
+    /// execution. Destination ranges must be disjoint because CUDA does not
+    /// promise an execution order among batch entries.
+    ///
+    /// # Safety
+    /// Every source and destination must cover `bytes`, remain live until this
+    /// method returns, and belong to the bound CUDA context's unified address
+    /// space. Destination ranges must not overlap.
+    pub unsafe fn indexed_batch_copy_elapsed_ms(
+        &self,
+        copies: &[CudaBatchCopy],
+    ) -> std::result::Result<(f32, CopyCompleted), HtodAsyncElapsedError> {
+        self.bind().map_err(|error| HtodAsyncElapsedError {
+            detail: error.to_string(),
+            completion: FailedHtodCompletion::NotSubmitted,
+        })?;
+        if self.is_capturing().map_err(|error| HtodAsyncElapsedError {
+            detail: error.to_string(),
+            completion: FailedHtodCompletion::NotSubmitted,
+        })? {
+            return Err(HtodAsyncElapsedError {
+                detail: "cuda_ep: indexed expert page-in is a coarse-boundary operation and is \
+                         illegal during CUDA graph capture or replay"
+                    .into(),
+                completion: FailedHtodCompletion::NotSubmitted,
+            });
+        }
+        if copies.is_empty() {
+            return Ok((0.0, CopyCompleted::new()));
+        }
+        if copies.iter().any(|copy| copy.bytes == 0) {
+            return Err(HtodAsyncElapsedError {
+                detail: "cuda_ep: indexed batch copy contains an empty entry".into(),
+                completion: FailedHtodCompletion::NotSubmitted,
+            });
+        }
+
+        #[cfg(feature = "cuda-12060")]
+        {
+            let _ = copies;
+            return Err(HtodAsyncElapsedError {
+                detail: "cuda_ep: indexed batch copy requires CUDA API 12.8 or newer".into(),
+                completion: FailedHtodCompletion::NotSubmitted,
+            });
+        }
+
+        #[cfg(any(feature = "cuda-12080", feature = "cuda-12090", feature = "cuda-13000"))]
+        {
+            let start = self
+                .context
+                .new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))
+                .map_err(|error| HtodAsyncElapsedError {
+                    detail: driver_err("cuEventCreate(batch start)", error).to_string(),
+                    completion: FailedHtodCompletion::NotSubmitted,
+                })?;
+            let end = self
+                .context
+                .new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))
+                .map_err(|error| HtodAsyncElapsedError {
+                    detail: driver_err("cuEventCreate(batch end)", error).to_string(),
+                    completion: FailedHtodCompletion::NotSubmitted,
+                })?;
+            start
+                .record(&self.copy_stream)
+                .map_err(|error| HtodAsyncElapsedError {
+                    detail: driver_err("cuEventRecord(batch start)", error).to_string(),
+                    completion: FailedHtodCompletion::NotSubmitted,
+                })?;
+
+            let mut srcs: Vec<CUdeviceptr> = copies.iter().map(|copy| copy.src).collect();
+            let mut dsts: Vec<CUdeviceptr> = copies.iter().map(|copy| copy.dst).collect();
+            let mut sizes: Vec<usize> = copies.iter().map(|copy| copy.bytes).collect();
+            let invalid_location = cudarc::driver::sys::CUmemLocation {
+                type_: cudarc::driver::sys::CUmemLocationType_enum::CU_MEM_LOCATION_TYPE_INVALID,
+                id: 0,
+            };
+            let mut attributes = [cudarc::driver::sys::CUmemcpyAttributes {
+                srcAccessOrder: cudarc::driver::sys::CUmemcpySrcAccessOrder_enum::
+                    CU_MEMCPY_SRC_ACCESS_ORDER_STREAM,
+                srcLocHint: invalid_location,
+                dstLocHint: invalid_location,
+                flags: cudarc::driver::sys::CUmemcpyFlags_enum::CU_MEMCPY_FLAG_DEFAULT as u32,
+            }];
+            let mut attribute_indices = [0usize];
+            #[cfg(any(feature = "cuda-12080", feature = "cuda-12090"))]
+            let result = {
+                let mut fail_index = usize::MAX;
+                // SAFETY: arrays have `copies.len()` entries and remain live
+                // through the driver call; no optional attributes are supplied.
+                unsafe {
+                    cudarc::driver::sys::cuMemcpyBatchAsync(
+                        dsts.as_mut_ptr(),
+                        srcs.as_mut_ptr(),
+                        sizes.as_mut_ptr(),
+                        copies.len(),
+                        attributes.as_mut_ptr(),
+                        attribute_indices.as_mut_ptr(),
+                        attributes.len(),
+                        &mut fail_index,
+                        self.copy_stream.cu_stream(),
+                    )
+                }
+                .result()
+                .map_err(|error| {
+                    driver_err(
+                        &format!("cuMemcpyBatchAsync (failed descriptor index {fail_index})"),
+                        error,
+                    )
+                })
+            };
+            #[cfg(feature = "cuda-13000")]
+            let result = {
+                // SAFETY: arrays have `copies.len()` entries and remain live
+                // through the driver call; no optional attributes are supplied.
+                unsafe {
+                    cudarc::driver::sys::cuMemcpyBatchAsync_v2(
+                        dsts.as_mut_ptr(),
+                        srcs.as_mut_ptr(),
+                        sizes.as_mut_ptr(),
+                        copies.len(),
+                        attributes.as_mut_ptr(),
+                        attribute_indices.as_mut_ptr(),
+                        attributes.len(),
+                        self.copy_stream.cu_stream(),
+                    )
+                }
+                .result()
+                .map_err(|error| driver_err("cuMemcpyBatchAsync_v2", error))
+            };
+            result.map_err(|error| HtodAsyncElapsedError {
+                detail: error.to_string(),
+                completion: FailedHtodCompletion::NotSubmitted,
+            })?;
+            self.batch_copy_submissions.fetch_add(1, Ordering::Relaxed);
+            self.batch_copy_entries
+                .fetch_add(copies.len() as u64, Ordering::Relaxed);
+
+            if let Err(error) = end.record(&self.copy_stream) {
+                return Err(self
+                    .settle_submitted_htod_failure(driver_err("cuEventRecord(batch end)", error)));
+            }
+            let elapsed_ms = match start.elapsed_ms(&end) {
+                Ok(elapsed_ms) => elapsed_ms,
+                Err(error) => {
+                    return Err(self.settle_submitted_htod_failure(driver_err(
+                        "cuEventElapsedTime(batch copy)",
+                        error,
+                    )));
+                }
+            };
+            Ok((elapsed_ms, CopyCompleted::new()))
+        }
     }
 
     fn settle_submitted_htod_failure(&self, error: EpError) -> HtodAsyncElapsedError {

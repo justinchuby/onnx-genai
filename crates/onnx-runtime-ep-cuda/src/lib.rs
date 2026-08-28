@@ -108,6 +108,7 @@ mod trace;
 pub use onnx_runtime_cuda_memory::{virtual_memory, vmm_allocator};
 pub mod coarse_residency;
 pub mod granule_transition;
+pub mod indexed_page_in;
 pub mod prefill_double_buffer;
 pub mod route_residency;
 pub mod weight_paging;
@@ -115,6 +116,12 @@ pub mod weight_paging;
 pub use capture::{require_subgraph_graph_capturable, subgraph_graph_capturable};
 pub use cufft::{CufftPlanCacheStats, cufft_plan_cache_stats};
 pub use dynamic_library::set_wheel_search_paths;
+pub use indexed_page_in::{
+    ExpertSlot, IndexedBankKind, IndexedCopyIdentity, IndexedExpertBank,
+    IndexedMultiBankPageInPlan, IndexedPageInAttribution, IndexedPageInAttributionStats,
+    IndexedPageInPhase, IndexedPageInReceipt, ProjectionBankPair,
+    execute_indexed_multi_bank_page_in, indexed_page_in_attribution_stats,
+};
 pub use kernels::attention::AttentionKernel;
 pub use kernels::csa_checkpoint::{
     CsaAttentionMode, CsaCheckpoint, CsaCheckpointJournal, CsaCursors, CsaLayerMetrics, CsaMetrics,
