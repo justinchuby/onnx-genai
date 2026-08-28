@@ -591,6 +591,16 @@ const MATRIX: &[Row] = &[
         Some("decoder"),
     ),
     // ── crate-local fixtures ─────────────────────────────────────────────────
+    // DFlash has distinct proposer and verifier graphs and is therefore not
+    // classified as a single-decoder workflow.
+    row(
+        "crates/onnx-genai-engine/tests/fixtures/dflash-admission/inference_metadata.yaml",
+        2,
+        Composite,
+        None,
+        false,
+        None,
+    ),
     // A package fixture the engine's model-package tests load.
     row(
         "crates/onnx-genai-engine/tests/fixtures/model-package-cpu/cpu/inference_metadata.yaml",

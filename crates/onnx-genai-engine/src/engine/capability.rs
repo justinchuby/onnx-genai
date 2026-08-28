@@ -68,6 +68,19 @@ pub enum PackageCapabilityError {
         /// Derived capability that requires the unavailable execution driver.
         capability: String,
     },
+    /// DFlash components cannot be executed as an ordinary workflow pass:
+    /// doing so would bypass verification and accepted-prefix commit.
+    #[error(
+        "public workflow operation '{operation}' cannot execute a DFlash package because raw \
+         target/proposer execution would bypass verifier-owned acceptance and the S3 \
+         accepted-prefix transaction. Use `Engine::generate`, \
+         `Engine::generate_in_session`, or `Engine::generate_with_pipeline_request`; the \
+         runtime-owned DFlash driver is the only execution authority."
+    )]
+    DFlashRawWorkflowApi {
+        /// Public operation that would have bypassed the DFlash driver.
+        operation: String,
+    },
 }
 
 impl PackageCapabilityError {

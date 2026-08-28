@@ -869,6 +869,29 @@ impl WorkflowRuntime {
         Ok(())
     }
 
+    pub(crate) fn reject_dflash_raw_execution(&self, operation: &str) -> anyhow::Result<()> {
+        self.require_execution_admitted()?;
+        if self.is_dflash() {
+            return Err(
+                crate::engine::PackageCapabilityError::DFlashRawWorkflowApi {
+                    operation: operation.to_string(),
+                }
+                .into(),
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn is_dflash(&self) -> bool {
+        matches!(
+            self.plan
+                .speculative
+                .as_ref()
+                .map(|contract| &contract.proposal_execution),
+            Some(onnx_genai_metadata::SpeculativeProposalExecution::DflashFlatBlock { .. })
+        )
+    }
+
     #[cfg(test)]
     pub(crate) fn set_execution_admission_for_test(
         &mut self,
@@ -1411,7 +1434,7 @@ impl WorkflowRuntime {
         &self.plan.memory_strategy_plan
     }
 
-    pub fn models(&self) -> &PipelineModels {
+    pub(crate) fn models(&self) -> &PipelineModels {
         &self.backend.models
     }
 
@@ -1448,6 +1471,7 @@ impl WorkflowRuntime {
         &mut self,
         request: PipelineGenerateRequest,
     ) -> anyhow::Result<PipelineTensors> {
+        self.reject_dflash_raw_execution("WorkflowRuntime::run_pipeline")?;
         self.run_workflow(request)
     }
 
@@ -1464,6 +1488,7 @@ impl WorkflowRuntime {
         &mut self,
         request: PipelineGenerateRequest,
     ) -> anyhow::Result<PipelineTensors> {
+        self.reject_dflash_raw_execution("WorkflowRuntime::run_pipeline_retained")?;
         self.run_workflow_retained(request)
     }
 
@@ -1502,6 +1527,7 @@ impl WorkflowRuntime {
         &mut self,
         request: PipelineGenerateRequest,
     ) -> anyhow::Result<PipelineOutputs> {
+        self.reject_dflash_raw_execution("WorkflowRuntime::run_pipeline_outputs")?;
         self.run_workflow_outputs(request)
     }
 
@@ -1588,6 +1614,7 @@ impl WorkflowRuntime {
         &self,
         request: PipelineGenerateRequest,
     ) -> anyhow::Result<WorkflowExecutionPlan<'_>> {
+        self.reject_dflash_raw_execution("WorkflowRuntime::prepare_workflow_execution")?;
         WorkflowExecutionPlan::new(self, request)
     }
 

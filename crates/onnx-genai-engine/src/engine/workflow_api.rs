@@ -31,6 +31,10 @@ impl Engine {
         self.workflow.require_execution_admitted()
     }
 
+    fn reject_dflash_raw_workflow_api(&self, operation: &str) -> anyhow::Result<()> {
+        self.workflow.reject_dflash_raw_execution(operation)
+    }
+
     /// How many device→host materializations this runtime has performed.
     ///
     /// A proposal chain's per-token work is supposed to stay on the device that
@@ -136,7 +140,7 @@ impl Engine {
         &mut self,
         request: PipelineGenerateRequest,
     ) -> anyhow::Result<PipelineTensors> {
-        self.reject_undispatched_dflash_generation()?;
+        self.reject_dflash_raw_workflow_api("Engine::run_pipeline")?;
         let request = self.apply_pipeline_request_defaults(request)?;
         self.workflow_runtime_mut().run_pipeline(request)
     }
@@ -148,7 +152,7 @@ impl Engine {
         &mut self,
         request: PipelineGenerateRequest,
     ) -> anyhow::Result<WorkflowExecutionPlan<'_>> {
-        self.reject_undispatched_dflash_generation()?;
+        self.reject_dflash_raw_workflow_api("Engine::prepare_pipeline")?;
         let request = self.apply_pipeline_request_defaults(request)?;
         WorkflowExecutionPlan::new(self.workflow_runtime(), request)
     }
@@ -157,7 +161,7 @@ impl Engine {
         &mut self,
         request: PipelineGenerateRequest,
     ) -> anyhow::Result<PipelineOutputs> {
-        self.reject_undispatched_dflash_generation()?;
+        self.reject_dflash_raw_workflow_api("Engine::run_pipeline_outputs")?;
         let request = self.apply_pipeline_request_defaults(request)?;
         self.workflow_runtime_mut().run_pipeline_outputs(request)
     }
@@ -178,7 +182,7 @@ impl Engine {
         &mut self,
         request: PipelineGenerateRequest,
     ) -> anyhow::Result<PipelineTensors> {
-        self.reject_undispatched_dflash_generation()?;
+        self.reject_dflash_raw_workflow_api("Engine::run_pipeline_retained")?;
         let request = self.apply_pipeline_request_defaults(request)?;
         self.workflow_runtime_mut().run_pipeline_retained(request)
     }
@@ -313,6 +317,7 @@ impl Engine {
     }
 
     pub fn models(&self) -> anyhow::Result<&PipelineModels> {
+        self.reject_dflash_raw_workflow_api("Engine::models")?;
         Ok(self.workflow_runtime().models())
     }
 
@@ -344,7 +349,7 @@ impl Engine {
         &self,
         request: PipelineGenerateRequest,
     ) -> anyhow::Result<crate::pipeline::WorkflowExecutionPlan<'_>> {
-        self.reject_undispatched_dflash_generation()?;
+        self.reject_dflash_raw_workflow_api("Engine::prepare_workflow_execution")?;
         let request = self.apply_pipeline_request_defaults(request)?;
         self.workflow_runtime().prepare_workflow_execution(request)
     }

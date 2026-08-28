@@ -731,7 +731,7 @@ impl WorkflowRuntime {
         // inside this driver's transaction rather than committing an unrelated
         // workflow pass first.
         let (mut values, session_id) =
-            super::WorkflowExecutionPlan::new(self, request)?.into_bound_values();
+            super::WorkflowExecutionPlan::new_dflash_driver(self, request)?.into_bound_values();
         let mut state = plan.initial_state(&self.plan.workflow, &values)?;
         self.restore_dflash_session_state(&plan, session_id.as_deref(), &mut state)?;
         plan.install_state_inputs(&self.plan.workflow, &state, &mut values)?;
@@ -780,7 +780,8 @@ impl WorkflowRuntime {
                 budget_cap: None,
             });
         }
-        let mut context_start = 0_i64;
+        let mut context_start = i64::try_from(initial_tokens.len())
+            .context("DFlash prompt length exceeds the absolute position type")?;
         let mut generated = Vec::with_capacity(options.max_new_tokens);
         let mut random = StdRng::seed_from_u64(options.seed.unwrap_or(0));
         let mut finish_reason = FinishReason::MaxTokens;
@@ -880,12 +881,51 @@ impl WorkflowRuntime {
                     return Err(error.context("DFlash acceptance failed before commit"));
                 }
             };
+            let mut committed_path = Vec::with_capacity(acceptance.committed.len() + 1);
+            committed_path.push(anchor);
+            committed_path.extend_from_slice(&acceptance.committed);
+            committed_path.truncate(remaining);
+            if let Some(eos) = committed_path
+                .iter()
+                .position(|token| options.terminates(u32::try_from(*token).unwrap_or(u32::MAX)))
+            {
+                committed_path.truncate(eos + 1);
+            }
+            let committed_drafts = acceptance
+                .accepted
+                .min(committed_path.len().saturating_sub(1));
+            let committed_acceptance = DFlashAcceptance {
+                accepted: committed_drafts,
+                rejected_at: acceptance.rejected_at,
+                committed: committed_path[1..].to_vec(),
+            };
+
+            // The verifier executed the entire candidate suffix. Re-run the
+            // target from the admitted baseline on only the path that will
+            // commit, including the anchor and correction/bonus. This makes
+            // the next proposal consume hidden/state produced by committed
+            // tokens, never by a rejected candidate row.
+            if let Err(error) = self.invoke_dflash_target(
+                &plan,
+                &mut values,
+                &transaction.baseline,
+                Some(&committed_path),
+            ) {
+                let _ = self.abort_dflash_state_transaction(
+                    transaction,
+                    &mut state,
+                    super::TurnAbortReason::ExecutionFailure,
+                );
+                return Err(error
+                    .context("DFlash accepted-path target reconditioning failed before commit"));
+            }
             if let Err(error) = self.commit_dflash_state_transaction(
                 transaction,
                 &mut state,
                 &proposal,
                 &values,
-                &acceptance,
+                &committed_acceptance,
+                committed_path.len(),
             ) {
                 return Err(error.context("DFlash accepted-prefix state commit failed"));
             }
@@ -897,11 +937,11 @@ impl WorkflowRuntime {
             }
             plan.install_state_inputs(&self.plan.workflow, &state, &mut values)?;
             context_start = context_start
-                .checked_add(i64::try_from(acceptance.accepted).context(
-                    "DFlash accepted-prefix length does not fit the absolute position type",
+                .checked_add(i64::try_from(committed_path.len()).context(
+                    "DFlash committed path length does not fit the absolute position type",
                 )?)
                 .context("DFlash absolute position overflow")?;
-            for token in acceptance.committed {
+            for token in committed_path {
                 let token = u32::try_from(token)
                     .context("DFlash verifier emitted a token outside the u32 token domain")?;
                 generated.push(token);
@@ -939,6 +979,13 @@ impl WorkflowRuntime {
                         .transpose()?
                         .unwrap_or_default(),
                     finish_reason: (index + 1 == generated.len()).then(|| finish_reason.clone()),
+                })
+                .with_context(|| {
+                    format!(
+                        "DFlash output callback failed after semantic commit at token {index}; \
+                         committed state remains durable and this partial delivery will not be \
+                         replayed automatically"
+                    )
                 })?;
             }
         }
@@ -1827,6 +1874,7 @@ impl WorkflowRuntime {
         proposal: &DFlashProposal,
         verified: &PipelineTensors,
         acceptance: &DFlashAcceptance,
+        committed_target_tokens: usize,
     ) -> anyhow::Result<super::TurnTransactionOutcome> {
         self.require_execution_admitted()?;
         let contract = self
@@ -1885,6 +1933,12 @@ impl WorkflowRuntime {
                     source.component, source.output
                 )
             })?;
+            let source_is_target = source.component == contract.target;
+            let committed_prefix = if source_is_target {
+                committed_target_tokens
+            } else {
+                acceptance.accepted
+            };
             let accepted_value = match commit {
                 DFlashStateCommit::Sequence { .. } => {
                     let axis = group.sequence_axis.with_context(|| {
@@ -1903,7 +1957,7 @@ impl WorkflowRuntime {
                         })?)
                         .context("negative DFlash baseline sequence extent")?;
                     let length = baseline_len
-                        .checked_add(acceptance.accepted)
+                        .checked_add(committed_prefix)
                         .context("DFlash accepted state length overflow")?;
                     super::device_ops::tensor_ops_for(value)?
                         .truncate_axis(value, axis, length)
@@ -1912,13 +1966,20 @@ impl WorkflowRuntime {
                         })?
                 }
                 DFlashStateCommit::PrefixSnapshots { axis, .. } => {
-                    let slice = super::device_ops::tensor_ops_for(value)?
-                        .slice_axis(value, *axis, acceptance.accepted, 1)
-                        .with_context(|| {
+                    let snapshot = if source_is_target {
+                        committed_prefix.checked_sub(1).with_context(|| {
                             format!(
-                                "select DFlash state '{cell}' prefix snapshot {}",
-                                acceptance.accepted
+                                "DFlash target state '{cell}' cannot select a snapshot for an \
+                                 empty committed path"
                             )
+                        })?
+                    } else {
+                        committed_prefix
+                    };
+                    let slice = super::device_ops::tensor_ops_for(value)?
+                        .slice_axis(value, *axis, snapshot, 1)
+                        .with_context(|| {
+                            format!("select DFlash state '{cell}' prefix snapshot {snapshot}")
                         })?;
                     let mut shape = slice.shape().to_vec();
                     shape.remove(*axis);
