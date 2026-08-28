@@ -7,10 +7,8 @@ use std::collections::BTreeSet;
 pub struct TensorContract {
     #[schemars(with = "schema_vocabulary::TensorDType")]
     pub dtype: String,
-    #[schemars(range(min = 0))]
-    pub rank: usize,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub shape: Option<Vec<TensorDimension>>,
+    /// Complete tensor shape. Its length is the tensor rank.
+    pub shape: Vec<TensorDimension>,
     #[serde(default)]
     pub optional: bool,
     /// How this value relates to the runtime's private request/sequence table.
@@ -37,6 +35,13 @@ pub struct TensorContract {
     /// where two independent extents end.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub padding: Vec<PaddedDimension>,
+}
+
+impl TensorContract {
+    /// Tensor rank, derived exclusively from the required shape.
+    pub fn rank(&self) -> usize {
+        self.shape.len()
+    }
 }
 
 /// One padded dimension of a value and the companion that bounds it.

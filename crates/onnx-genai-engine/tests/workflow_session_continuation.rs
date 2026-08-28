@@ -67,7 +67,7 @@ fn narrow_the_conversation_bound(root: &Path, limit: i64) -> anyhow::Result<()> 
     let mut document: serde_yaml::Value =
         serde_yaml::from_str(&std::fs::read_to_string(&metadata)?)?;
     let declared: serde_yaml::Value = serde_yaml::from_str(&format!(
-        "contract: {{ dtype: int64, rank: 1, shape: [1] }}\nrole: {{ kind: opaque }}\nsource:          {{ kind: literal }}\nrequired: false\ndefault: {limit}\n"
+        "contract: {{ dtype: int64, shape: [1] }}\nrole: {{ kind: opaque }}\nsource:          {{ kind: literal }}\nrequired: false\ndefault: {limit}\n"
     ))?;
     document["pipeline"]["workflow"]["inputs"]
         .as_mapping_mut()

@@ -1144,11 +1144,10 @@ impl<'a> WorkflowExecutionPlan<'a> {
                 | onnx_genai_metadata::ShapeRecurrence::Bounded { axis, .. } => state
                     .contract
                     .shape
-                    .as_ref()
-                    .and_then(|shape| shape.get(*axis))
+                    .get(*axis)
                     .and_then(|dimension| match dimension {
                         TensorDimension::Symbol(symbol) => Some(symbol.clone()),
-                        TensorDimension::Fixed(_) => None,
+                        TensorDimension::Fixed(_) | TensorDimension::Any => None,
                     }),
                 onnx_genai_metadata::ShapeRecurrence::Invariant => None,
             })
@@ -1565,7 +1564,7 @@ impl<'a> WorkflowExecutionPlan<'a> {
                             .into(),
                         );
                     }
-                    let shape = match state.contract.rank {
+                    let shape = match state.contract.rank() {
                         1 => vec![length],
                         2 => vec![1, length],
                         rank => anyhow::bail!(
@@ -3894,7 +3893,7 @@ fn workflow_request_value(
                     .iter()
                     .map(|token| i64::from(*token))
                     .collect::<Vec<_>>();
-                let shape = match contract.rank {
+                let shape = match contract.rank() {
                     1 => vec![data.len() as i64],
                     2 => vec![1, data.len() as i64],
                     rank => anyhow::bail!(
@@ -3905,7 +3904,7 @@ fn workflow_request_value(
             }
             GeneratePrompt::TokenRows(rows) => {
                 anyhow::ensure!(
-                    contract.rank == 2,
+                    contract.rank() == 2,
                     "multi-row prompt token workflow input must have rank 2"
                 );
                 anyhow::ensure!(!rows.is_empty(), "multi-row prompt must not be empty");
@@ -3954,7 +3953,7 @@ fn workflow_request_value(
                 GeneratePrompt::Text(_) | GeneratePrompt::TokenIds(_) => 1,
             };
             let ids = ids.into_iter().map(i64::from).collect::<Vec<_>>();
-            match contract.rank {
+            match contract.rank() {
                 1 => Ok(Some(Value::from_slice_i64(
                     &ids,
                     &[i64::try_from(ids.len())?],
@@ -3986,9 +3985,9 @@ fn workflow_request_value(
                 GeneratePrompt::Text(_) | GeneratePrompt::TokenIds(_) => 1,
             };
             anyhow::ensure!(
-                contract.rank == 1,
+                contract.rank() == 1,
                 "EOS length workflow input must have rank 1, got {}",
-                contract.rank
+                contract.rank()
             );
             Ok(Some(Value::from_slice_i64(
                 &vec![i64::try_from(count)?; rows],
@@ -4143,7 +4142,7 @@ fn workflow_literal_value_with_shape(
 }
 
 fn scalar_or_batch_shape(contract: &TensorContract) -> anyhow::Result<Vec<i64>> {
-    match contract.rank {
+    match contract.rank() {
         0 => Ok(Vec::new()),
         1 => Ok(vec![1]),
         rank => anyhow::bail!("request scalar binding requires rank 0 or 1, got {rank}"),
@@ -4224,11 +4223,8 @@ fn resolve_workflow_shape(
     contract: &TensorContract,
     symbols: &HashMap<String, i64>,
 ) -> anyhow::Result<Vec<i64>> {
-    let shape = contract
+    contract
         .shape
-        .as_ref()
-        .context("workflow adapter output requires a declared shape")?;
-    shape
         .iter()
         .map(|dimension| match dimension {
             TensorDimension::Fixed(value) => Ok(*value),
@@ -4237,6 +4233,10 @@ fn resolve_workflow_shape(
                     "workflow adapter output requires unresolved dimension '{symbol}' for allocation"
                 )
             }),
+            TensorDimension::Any => anyhow::bail!(
+                "workflow adapter output shape contains Any, whose extent is unconstrained; \
+                 bind a concrete input-derived symbol or fixed extent before allocation"
+            ),
         })
         .collect()
 }
@@ -4245,11 +4245,8 @@ fn resolve_workflow_adapter_shape(
     contract: &TensorContract,
     _symbols: &HashMap<String, i64>,
 ) -> anyhow::Result<Vec<i64>> {
-    let shape = contract
+    contract
         .shape
-        .as_ref()
-        .context("workflow adapter output requires a declared shape")?;
-    shape
         .iter()
         .map(|dimension| match dimension {
             TensorDimension::Fixed(value) => Ok(*value),
@@ -4259,6 +4256,7 @@ fn resolve_workflow_adapter_shape(
             // (for example a source image and generated latent that both call
             // their private axes "height").
             TensorDimension::Symbol(_) => Ok(-1),
+            TensorDimension::Any => Ok(-1),
         })
         .collect()
 }
@@ -4275,7 +4273,7 @@ fn workflow_iteration_value(
         );
     }
     let index = i64::try_from(index).context("workflow loop iteration exceeds int64")?;
-    match contract.rank {
+    match contract.rank() {
         0 => Value::from_slice_i64(&[index], &[]).map_err(Into::into),
         1 => {
             let shape = resolve_workflow_shape(contract, symbols)?;
@@ -4352,25 +4350,20 @@ fn typed_image_bytes<T, const N: usize>(
 /// unbound axis the split is genuinely ambiguous, so the singleton guess stands
 /// and the caller gets the element-count error, which names the real problem.
 fn literal_shape(literal: &LiteralValue, contract: &TensorContract) -> anyhow::Result<Vec<i64>> {
-    let Some(shape) = &contract.shape else {
-        if contract.rank == 0 {
-            return Ok(Vec::new());
-        }
-        anyhow::bail!("literal workflow input requires a fully declared shape");
-    };
-    let symbolic_axes = shape
+    let shape = &contract.shape;
+    let unresolved_axes = shape
         .iter()
-        .filter(|dimension| matches!(dimension, TensorDimension::Symbol(_)))
+        .filter(|dimension| matches!(dimension, TensorDimension::Symbol(_) | TensorDimension::Any))
         .count();
     let fixed_extent: i64 = shape
         .iter()
         .filter_map(|dimension| match dimension {
             TensorDimension::Fixed(value) => Some(*value),
-            TensorDimension::Symbol(_) => None,
+            TensorDimension::Symbol(_) | TensorDimension::Any => None,
         })
         .product();
-    let symbolic_extent = match literal {
-        LiteralValue::Elements(elements) if symbolic_axes == 1 && fixed_extent > 0 => {
+    let unresolved_extent = match literal {
+        LiteralValue::Elements(elements) if unresolved_axes == 1 && fixed_extent > 0 => {
             let elements = elements.len() as i64;
             anyhow::ensure!(
                 elements % fixed_extent == 0,
@@ -4385,7 +4378,7 @@ fn literal_shape(literal: &LiteralValue, contract: &TensorContract) -> anyhow::R
         .iter()
         .map(|dimension| match dimension {
             TensorDimension::Fixed(value) => *value,
-            TensorDimension::Symbol(_) => symbolic_extent,
+            TensorDimension::Symbol(_) | TensorDimension::Any => unresolved_extent,
         })
         .collect())
 }
@@ -4421,9 +4414,7 @@ fn resolve_component_output_shapes(
         let Some(contract) = declaration.ports.outputs.get(port) else {
             continue;
         };
-        let Some(shape) = &contract.shape else {
-            continue;
-        };
+        let shape = &contract.shape;
         let mut dims = Vec::with_capacity(shape.len());
         let mut fully_known = true;
         for dim in shape {
@@ -4486,48 +4477,48 @@ pub(super) fn validate_workflow_value(
             contract.dtype
         );
     }
-    if value.shape().len() != contract.rank {
+    if value.shape().len() != contract.rank() {
         anyhow::bail!(
-            "workflow value '{name}' has rank {}, expected {}",
+            "workflow value '{name}' has rank {}, but required shape {:?} has rank {}",
             value.shape().len(),
-            contract.rank
+            contract.shape,
+            contract.rank()
         );
     }
-    if let Some(shape) = &contract.shape {
-        for (axis, (declared, actual)) in shape.iter().zip(value.shape()).enumerate() {
-            let symbolic_actual = if contract.batch_layout.request_axis() == Some(axis) {
-                let factor = i64::try_from(contract.batch_layout.request_expansion_factor())?;
-                anyhow::ensure!(
-                    factor > 0,
-                    "workflow value '{name}' has a zero request expansion factor"
-                );
-                if actual % factor != 0 {
-                    anyhow::bail!(
-                        "workflow value '{name}' axis {axis} is {actual}, which is not divisible \
+    for (axis, (declared, actual)) in contract.shape.iter().zip(value.shape()).enumerate() {
+        let symbolic_actual = if contract.batch_layout.request_axis() == Some(axis) {
+            let factor = i64::try_from(contract.batch_layout.request_expansion_factor())?;
+            anyhow::ensure!(
+                factor > 0,
+                "workflow value '{name}' has a zero request expansion factor"
+            );
+            if actual % factor != 0 {
+                anyhow::bail!(
+                    "workflow value '{name}' axis {axis} is {actual}, which is not divisible \
                          by its request expansion factor {factor}"
-                    );
-                }
-                actual / factor
-            } else {
-                *actual
-            };
-            match declared {
-                TensorDimension::Fixed(expected) if expected != actual => anyhow::bail!(
-                    "workflow value '{name}' axis {axis} is {actual}, expected {expected}"
-                ),
-                TensorDimension::Symbol(symbol) if dynamic_symbols.contains(symbol) => {}
-                TensorDimension::Symbol(symbol) => match symbols.get(symbol) {
-                    Some(expected) if *expected != symbolic_actual => anyhow::bail!(
-                        "workflow value '{name}' axis {axis} binds symbol '{symbol}' to \
-                         {symbolic_actual}, but it was already {expected}"
-                    ),
-                    Some(_) => {}
-                    None => {
-                        symbols.insert(symbol.clone(), symbolic_actual);
-                    }
-                },
-                TensorDimension::Fixed(_) => {}
+                );
             }
+            actual / factor
+        } else {
+            *actual
+        };
+        match declared {
+            TensorDimension::Fixed(expected) if expected != actual => anyhow::bail!(
+                "workflow value '{name}' axis {axis} is {actual}, expected {expected}"
+            ),
+            TensorDimension::Symbol(symbol) if dynamic_symbols.contains(symbol) => {}
+            TensorDimension::Symbol(symbol) => match symbols.get(symbol) {
+                Some(expected) if *expected != symbolic_actual => anyhow::bail!(
+                    "workflow value '{name}' axis {axis} binds symbol '{symbol}' to \
+                         {symbolic_actual}, but it was already {expected}"
+                ),
+                Some(_) => {}
+                None => {
+                    symbols.insert(symbol.clone(), symbolic_actual);
+                }
+            },
+            TensorDimension::Fixed(_) => {}
+            TensorDimension::Any => {}
         }
     }
     Ok(())
@@ -5114,14 +5105,13 @@ fn emit_chunk_contract(
     axis: Option<usize>,
 ) -> anyhow::Result<onnx_genai_metadata::TensorContract> {
     let mut contract = output.clone();
-    if let Some(shape) = &mut contract.shape {
-        let index = axis.unwrap_or(shape.len().saturating_sub(1));
-        anyhow::ensure!(
-            index < shape.len() && index < emitted.shape().len(),
-            "workflow prefix/append emit axis {index} exceeds the value rank"
-        );
-        shape[index] = TensorDimension::Fixed(emitted.shape()[index]);
-    }
+    let shape = &mut contract.shape;
+    let index = axis.unwrap_or(shape.len().saturating_sub(1));
+    anyhow::ensure!(
+        index < shape.len() && index < emitted.shape().len(),
+        "workflow prefix/append emit axis {index} exceeds the value rank"
+    );
+    shape[index] = TensorDimension::Fixed(emitted.shape()[index]);
     Ok(contract)
 }
 
@@ -5221,11 +5211,7 @@ fn emit_workflow_rows(
             output_contract.clone()
         };
         let mut row_symbols = symbols.clone();
-        if let Some(TensorDimension::Symbol(batch)) = validation_contract
-            .shape
-            .as_ref()
-            .and_then(|shape| shape.first())
-        {
+        if let Some(TensorDimension::Symbol(batch)) = validation_contract.shape.first() {
             row_symbols.insert(batch.clone(), 1);
         }
         validate_workflow_value(
@@ -5677,7 +5663,7 @@ mod workflow_scalar_tests {
         let current = Value::from_slice_i64(&[1, 2, 3, 4], &[2, 2]).expect("current");
         let next = Value::from_slice_i64(&[10, 20, 30, 40], &[2, 2]).expect("next");
         let state: onnx_genai_metadata::WorkflowStateCell = serde_yaml::from_str(
-            "contract: { dtype: int64, rank: 2, shape: [batch, 2], batch_layout: { kind: \
+            "contract: { dtype: int64, shape: [batch, 2], batch_layout: { kind: \
              request_aligned, axis: 0 } }\nscope: invocation\ninitializer: initial\nrecurrence: { \
              kind: invariant }",
         )
@@ -5692,7 +5678,7 @@ mod workflow_scalar_tests {
         let current = Value::from_slice_i64(&[1, 2, 3, 4, 5, 6, 7, 8], &[4, 2]).expect("current");
         let next = Value::from_slice_i64(&[10, 20, 30, 40, 50, 60, 70, 80], &[4, 2]).expect("next");
         let state: onnx_genai_metadata::WorkflowStateCell = serde_yaml::from_str(
-            "contract: { dtype: int64, rank: 2, shape: [guidance_rows, 2], batch_layout: { \
+            "contract: { dtype: int64, shape: [guidance_rows, 2], batch_layout: { \
              kind: request_expanded, axis: 0, factor: 2 } }\nscope: invocation\ninitializer: \
              initial\nrecurrence: { kind: invariant }",
         )
@@ -5710,7 +5696,7 @@ mod workflow_scalar_tests {
         let current = Value::from_slice_i64(&[1, 2, 3, 4], &[2, 2]).expect("current");
         let next = Value::from_slice_i64(&[10, 20, 30, 40, 50, 60], &[2, 3]).expect("next");
         let state: onnx_genai_metadata::WorkflowStateCell = serde_yaml::from_str(
-            "contract: { dtype: int64, rank: 2, shape: [batch, context], batch_layout: { kind: \
+            "contract: { dtype: int64, shape: [batch, context], batch_layout: { kind: \
              request_aligned, axis: 0 } }\nscope: invocation\ninitializer: initial\nrecurrence: { \
              kind: growing, axis: 1, increment: one, max: limit }",
         )
@@ -5728,7 +5714,7 @@ mod workflow_scalar_tests {
         let current = Value::from_slice_i64(&[1, 2, 3, 4], &[2, 2]).expect("current");
         let next = Value::from_slice_i64(&[10, 20, 30, 40], &[2, 2]).expect("next");
         let state: onnx_genai_metadata::WorkflowStateCell = serde_yaml::from_str(
-            "contract: { dtype: int64, rank: 2, shape: [features, batch], batch_layout: { kind: \
+            "contract: { dtype: int64, shape: [features, batch], batch_layout: { kind: \
              request_aligned, axis: 1 } }\nscope: invocation\ninitializer: initial\nrecurrence: { \
              kind: invariant }",
         )
@@ -5766,8 +5752,7 @@ mod workflow_scalar_tests {
         let mut counts = HashMap::new();
         let mut telemetry = WorkflowRunTelemetry::default();
         let contract: TensorContract =
-            serde_yaml::from_str("{ dtype: int64, rank: 2, shape: [batch, sequence] }")
-                .expect("contract");
+            serde_yaml::from_str("{ dtype: int64, shape: [batch, sequence] }").expect("contract");
         emit_workflow_rows(
             &mut values,
             &tensor,
@@ -5802,8 +5787,7 @@ mod workflow_scalar_tests {
         let mut counts = HashMap::new();
         let mut telemetry = WorkflowRunTelemetry::default();
         let contract: TensorContract =
-            serde_yaml::from_str("{ dtype: int64, rank: 2, shape: [batch, sequence] }")
-                .expect("contract");
+            serde_yaml::from_str("{ dtype: int64, shape: [batch, sequence] }").expect("contract");
         emit_workflow_rows(
             &mut values,
             &tensor,
@@ -5831,7 +5815,7 @@ mod workflow_scalar_tests {
     fn row_replace_without_ragged_length_preserves_declared_extent_validation() {
         let tensor = Value::from_slice_i64(&[10, 11, 12], &[1, 3]).expect("row tensor");
         let contract: TensorContract =
-            serde_yaml::from_str("{ dtype: int64, rank: 2, shape: [batch, 4] }").expect("contract");
+            serde_yaml::from_str("{ dtype: int64, shape: [batch, 4] }").expect("contract");
         let error = emit_workflow_rows(
             &mut PipelineTensors::new(),
             &tensor,
@@ -5856,8 +5840,7 @@ mod workflow_scalar_tests {
     fn row_emit_keeps_every_active_row_in_its_own_positional_slot() {
         let tensor = Value::from_slice_i64(&[10, 20], &[2, 1]).expect("row tensor");
         let contract: TensorContract =
-            serde_yaml::from_str("{ dtype: int64, rank: 2, shape: [batch, sequence] }")
-                .expect("contract");
+            serde_yaml::from_str("{ dtype: int64, shape: [batch, sequence] }").expect("contract");
         let mut values = PipelineTensors::new();
         let mut telemetry = WorkflowRunTelemetry::default();
         emit_workflow_rows(
@@ -5891,8 +5874,7 @@ mod workflow_scalar_tests {
     fn true_zero_length_row_emits_an_empty_value() {
         let tensor = Value::from_slice_i64(&[10], &[1, 1]).expect("row tensor");
         let contract: TensorContract =
-            serde_yaml::from_str("{ dtype: int64, rank: 2, shape: [batch, sequence] }")
-                .expect("contract");
+            serde_yaml::from_str("{ dtype: int64, shape: [batch, sequence] }").expect("contract");
         let mut values = PipelineTensors::new();
         let mut telemetry = WorkflowRunTelemetry::default();
         emit_workflow_rows(
@@ -5921,8 +5903,7 @@ mod workflow_scalar_tests {
     #[test]
     fn growing_state_uses_recurrence_instead_of_freezing_its_symbol() {
         let contract: TensorContract =
-            serde_yaml::from_str("{ dtype: int64, rank: 2, shape: [batch, sequence] }")
-                .expect("contract");
+            serde_yaml::from_str("{ dtype: int64, shape: [batch, sequence] }").expect("contract");
         let mut symbols = HashMap::new();
         let dynamic_symbols = std::collections::HashSet::from(["sequence".to_string()]);
         let current = Value::from_slice_i64(&[1, 2], &[1, 2]).expect("current");
@@ -5940,7 +5921,7 @@ mod workflow_scalar_tests {
 
         let state: onnx_genai_metadata::WorkflowStateCell = serde_yaml::from_str(
             r#"
-contract: { dtype: int64, rank: 2, shape: [batch, sequence] }
+contract: { dtype: int64, shape: [batch, sequence] }
 scope: invocation
 initializer: initial
 recurrence: { kind: growing, axis: 1, increment: accepted, max: max_context }
@@ -5969,7 +5950,7 @@ recurrence: { kind: growing, axis: 1, increment: accepted, max: max_context }
     fn kv_service_accepts_per_row_growth_controls() {
         let state: onnx_genai_metadata::WorkflowStateCell = serde_yaml::from_str(
             r#"
-contract: { dtype: int64, rank: 2, shape: [batch, sequence] }
+contract: { dtype: int64, shape: [batch, sequence] }
 scope: invocation
 initializer: initial
 recurrence: { kind: growing, axis: 1, increment: accepted, max: max_context }
@@ -5995,7 +5976,7 @@ service_group: decoder_cache
     #[test]
     fn literals_and_append_support_declared_runtime_dtypes() {
         let int_contract: TensorContract =
-            serde_yaml::from_str("{ dtype: int16, rank: 1, shape: [2] }").expect("contract");
+            serde_yaml::from_str("{ dtype: int16, shape: [2] }").expect("contract");
         let integer = workflow_literal_value(
             &LiteralValue::Scalar(ScalarValue::Integer(7)),
             &int_contract,
@@ -6004,7 +5985,7 @@ service_group: decoder_cache
         assert_eq!(integer.dtype(), DataType::Int16);
 
         let half_contract: TensorContract =
-            serde_yaml::from_str("{ dtype: float16, rank: 1, shape: [2] }").expect("contract");
+            serde_yaml::from_str("{ dtype: float16, shape: [2] }").expect("contract");
         let left = workflow_literal_value(
             &LiteralValue::Scalar(ScalarValue::Float(1.0)),
             &half_contract,
@@ -6025,7 +6006,7 @@ service_group: decoder_cache
         // Interleaved full-duplex models publish a per-stream delay pattern; it
         // is a tensor constant, not a broadcast scalar.
         let contract: TensorContract =
-            serde_yaml::from_str("{ dtype: int64, rank: 1, shape: [5] }").expect("contract");
+            serde_yaml::from_str("{ dtype: int64, shape: [5] }").expect("contract");
         let delays = LiteralValue::Elements(vec![
             ScalarValue::Integer(0),
             ScalarValue::Integer(0),
@@ -6134,8 +6115,7 @@ mod workflow_sampling_binding_tests {
         request.prompt = GeneratePrompt::TokenRows(vec![vec![1, 2, 3], vec![4, 5, 6]]);
         let contract = TensorContract {
             dtype: "int64".to_string(),
-            rank: 2,
-            shape: None,
+            shape: vec![TensorDimension::Any; 2],
             optional: false,
             batch_layout: BatchLayout::default(),
             padding: Vec::new(),
@@ -6157,8 +6137,7 @@ mod workflow_sampling_binding_tests {
         request.prompt = GeneratePrompt::TokenRows(vec![vec![1, 2], vec![3]]);
         let contract = TensorContract {
             dtype: "int64".to_string(),
-            rank: 2,
-            shape: None,
+            shape: vec![TensorDimension::Any; 2],
             optional: false,
             batch_layout: BatchLayout::default(),
             padding: Vec::new(),
@@ -6180,8 +6159,7 @@ mod workflow_sampling_binding_tests {
         request.prompt = GeneratePrompt::TokenRows(vec![vec![1], vec![4]]);
         let rank_two = TensorContract {
             dtype: "int64".to_string(),
-            rank: 2,
-            shape: None,
+            shape: vec![TensorDimension::Any; 2],
             optional: false,
             batch_layout: BatchLayout::default(),
             padding: Vec::new(),
@@ -6193,7 +6171,7 @@ mod workflow_sampling_binding_tests {
         assert_eq!(ids.to_vec_i64().expect("EOS rows"), [2, 3, 2, 3]);
 
         let lengths_contract = TensorContract {
-            rank: 1,
+            shape: vec![TensorDimension::Any],
             ..rank_two.clone()
         };
         let lengths = workflow_request_value(
@@ -6216,7 +6194,7 @@ mod workflow_sampling_binding_tests {
         assert_eq!(lengths.to_vec_i64().expect("EOS lengths"), [0, 0]);
 
         let rank_one = TensorContract {
-            rank: 1,
+            shape: vec![TensorDimension::Any],
             ..rank_two
         };
         let ids = workflow_request_value(&RuntimeInputRole::EosTokenIds, &request, &rank_one)
@@ -6234,8 +6212,7 @@ mod workflow_sampling_binding_tests {
         });
         let contract = TensorContract {
             dtype: "int64".to_string(),
-            rank: 1,
-            shape: Some(vec![TensorDimension::Fixed(1)]),
+            shape: vec![TensorDimension::Fixed(1)],
             optional: false,
             batch_layout: BatchLayout::default(),
             padding: Vec::new(),
@@ -6276,7 +6253,6 @@ components:
       inputs:
         payload:
           dtype: int64
-          rank: 1
           shape: [items]
           batch_layout:
             kind: token_packed
@@ -6285,12 +6261,10 @@ components:
               - {{ offsets: offsets, owner: owner }}
         offsets:
           dtype: int64
-          rank: 1
           shape: [offset_rows]
           batch_layout: {{ kind: shared }}
         owner:
           dtype: int64
-          rank: 1
           shape: [owner_rows]
           batch_layout: {{ kind: shared }}
       outputs: {{}}
@@ -6309,7 +6283,6 @@ inputs:
   rows:
     contract:
       dtype: int64
-      rank: 2
       shape: [batch, hidden]
       batch_layout: { kind: request_aligned, axis: 0 }
     role: { kind: opaque }
@@ -6323,7 +6296,6 @@ components:
       inputs:
         rows:
           dtype: int64
-          rank: 2
           shape: [batch, hidden]
           batch_layout: { kind: request_aligned, axis: 0 }
       outputs: {}
@@ -6342,7 +6314,6 @@ inputs:
   rows:
     contract:
       dtype: int64
-      rank: 2
       shape: [batch, hidden]
       batch_layout: { kind: request_aligned, axis: 0 }
     role: { kind: opaque }
@@ -6350,7 +6321,6 @@ inputs:
   seed:
     contract:
       dtype: int64
-      rank: 1
       shape: [seed_items]
       batch_layout: { kind: shared }
     role: { kind: opaque }
@@ -6358,7 +6328,6 @@ inputs:
   choose:
     contract:
       dtype: int64
-      rank: 1
       shape: [one]
       batch_layout: { kind: shared }
     role: { kind: opaque }
@@ -6373,13 +6342,11 @@ components:
       inputs:
         seed:
           dtype: int64
-          rank: 1
           shape: [seed_items]
           batch_layout: { kind: shared }
       outputs:
         packed:
           dtype: int64
-          rank: 1
           shape: [items]
           batch_layout:
             kind: token_packed
@@ -6388,12 +6355,10 @@ components:
               - { offsets: packed_offsets, owner: packed_owner }
         packed_offsets:
           dtype: int64
-          rank: 1
           shape: [offset_rows]
           batch_layout: { kind: shared }
         packed_owner:
           dtype: int64
-          rank: 1
           shape: [owner_rows]
           batch_layout: { kind: shared }
 state: {}
@@ -6796,12 +6761,10 @@ ports:
   outputs:
     good:
       dtype: int64
-      rank: 1
       shape: [batch]
       batch_layout: { kind: request_aligned, axis: 0 }
     packed:
       dtype: int64
-      rank: 1
       shape: [items]
       batch_layout:
         kind: token_packed
@@ -6810,12 +6773,10 @@ ports:
           - { offsets: packed_offsets, owner: packed_owner }
     packed_offsets:
       dtype: int64
-      rank: 1
       shape: [offset_rows]
       batch_layout: { kind: shared }
     packed_owner:
       dtype: int64
-      rank: 1
       shape: [owner_rows]
       batch_layout: { kind: shared }
 "#,

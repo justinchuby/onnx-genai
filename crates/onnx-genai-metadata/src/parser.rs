@@ -273,6 +273,7 @@ fn preparse(content: &str) -> Result<(), crate::MetadataError> {
 fn gate_document(document: &serde_yaml::Value) -> Result<(), crate::MetadataError> {
     reject_retired_model_io(document)?;
     reject_retired_top_level_tokens(document)?;
+    reject_invalid_tensor_contract_shapes(document, String::new())?;
     let declared = crate::version::declared_in(document).map_err(crate::MetadataError::Parse)?;
     crate::version::gate(declared)
         .map(|_| ())
@@ -290,6 +291,65 @@ fn gate_document(document: &serde_yaml::Value) -> Result<(), crate::MetadataErro
     // retired spelling is only ever found by recognizing its shape.
     reject_flat_token_packed(document, String::new())
         .and_then(|_| reject_retired_batching_hints(document))
+}
+
+/// Refuse tensor contracts that retain the duplicate rank authority or omit
+/// their sole shape authority.
+///
+/// This is a diagnostic recognizer, not a compatibility reader: it never
+/// rewrites the document. Typed deserialization would reject both forms, but it
+/// cannot reliably name the nested tensor/port path in YAML.
+fn reject_invalid_tensor_contract_shapes(
+    document: &serde_yaml::Value,
+    path: String,
+) -> Result<(), crate::MetadataError> {
+    match document {
+        serde_yaml::Value::Mapping(mapping) => {
+            let has_dtype = mapping.contains_key(serde_yaml::Value::from("dtype"));
+            let contract_fields = ["dtype", "shape", "optional", "batch_layout", "padding"];
+            let looks_like_contract = has_dtype
+                && mapping.keys().all(|key| {
+                    key.as_str()
+                        .is_some_and(|key| contract_fields.contains(&key) || key == "rank")
+                });
+            if looks_like_contract {
+                let at = if path.is_empty() { "<root>" } else { &path };
+                if mapping.contains_key(serde_yaml::Value::from("rank")) {
+                    return Err(crate::MetadataError::Parse(format!(
+                        "tensor contract at `{at}` declares retired field `rank`; remove it and \
+                         provide required `shape` explicitly. The tensor rank is `shape.len()`, \
+                         `shape: []` is scalar, and use `Any` for each independently unconstrained \
+                         dimension"
+                    )));
+                }
+                if !mapping.contains_key(serde_yaml::Value::from("shape")) {
+                    return Err(crate::MetadataError::Parse(format!(
+                        "tensor contract at `{at}` is missing required `shape`; provide the complete \
+                         shape because its length is the tensor rank. Use `shape: []` for a scalar \
+                         or `Any` for each independently unconstrained dimension"
+                    )));
+                }
+            }
+
+            for (key, value) in mapping {
+                let segment = key.as_str().unwrap_or("?");
+                let child = if path.is_empty() {
+                    segment.to_string()
+                } else {
+                    format!("{path}.{segment}")
+                };
+                reject_invalid_tensor_contract_shapes(value, child)?;
+            }
+            Ok(())
+        }
+        serde_yaml::Value::Sequence(items) => {
+            for (index, item) in items.iter().enumerate() {
+                reject_invalid_tensor_contract_shapes(item, format!("{path}[{index}]"))?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Refuse the short-lived top-level spelling before typed parsing obscures the
@@ -759,6 +819,59 @@ mod tests {
             "unexpected error: {error}"
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn tensor_contract_rank_is_rejected_with_its_full_path_and_required_shape() {
+        let document: serde_yaml::Value = serde_yaml::from_str(
+            "\
+pipeline:
+  workflow:
+    components:
+      decoder:
+        ports:
+          inputs:
+            input_ids:
+              dtype: int64
+              rank: 2
+",
+        )
+        .expect("test document parses");
+
+        let error = gate_document(&document).expect_err("retired tensor rank must fail closed");
+        let message = error.to_string();
+        assert!(
+            message.contains("pipeline.workflow.components.decoder.ports.inputs.input_ids")
+                && message.contains("retired field `rank`")
+                && message.contains("provide required `shape` explicitly")
+                && message.contains("shape.len()"),
+            "unexpected diagnostic: {message}"
+        );
+    }
+
+    #[test]
+    fn tensor_contract_without_shape_is_rejected_with_its_full_path() {
+        let document: serde_yaml::Value = serde_yaml::from_str(
+            "\
+pipeline:
+  workflow:
+    inputs:
+      request.input_ids:
+        contract:
+          dtype: int64
+",
+        )
+        .expect("test document parses");
+
+        let error = gate_document(&document).expect_err("missing tensor shape must fail closed");
+        let message = error.to_string();
+        assert!(
+            message.contains("pipeline.workflow.inputs.request.input_ids.contract")
+                && message.contains("missing required `shape`")
+                && message.contains("shape: []")
+                && message.contains("independently unconstrained"),
+            "unexpected diagnostic: {message}"
+        );
     }
 
     const SHARED_KV_YAML: &str = "\

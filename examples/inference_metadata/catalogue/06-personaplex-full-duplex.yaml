@@ -12,7 +12,6 @@ pipeline:
       request.active:
         contract:
           dtype: bool
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -27,7 +26,6 @@ pipeline:
       request.done:
         contract:
           dtype: bool
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -42,7 +40,6 @@ pipeline:
       request.accepted_len:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -57,7 +54,6 @@ pipeline:
       request.microphone_audio:
         contract:
           dtype: float32
-          rank: 2
           shape:
           - batch
           - audio_samples
@@ -74,7 +70,6 @@ pipeline:
       request.dialogue_state:
         contract:
           dtype: float16
-          rank: 2
           shape:
           - batch
           - hidden
@@ -90,7 +85,6 @@ pipeline:
       request.codec_history:
         contract:
           dtype: float16
-          rank: 3
           shape:
           - batch
           - channels
@@ -108,7 +102,6 @@ pipeline:
       tokens:
         contract:
           dtype: int64
-          rank: 2
           shape:
           - batch
           - 1
@@ -120,7 +113,6 @@ pipeline:
       audio:
         contract:
           dtype: float32
-          rank: 2
           shape:
           - batch
           - output_samples
@@ -138,7 +130,6 @@ pipeline:
           inputs:
             microphone_audio:
               dtype: float32
-              rank: 2
               shape:
               - batch
               - audio_samples
@@ -148,7 +139,6 @@ pipeline:
           outputs:
             audio_features:
               dtype: float16
-              rank: 3
               shape:
               - batch
               - audio_frames
@@ -164,7 +154,6 @@ pipeline:
           inputs:
             audio_features:
               dtype: float16
-              rank: 3
               shape:
               - batch
               - audio_frames
@@ -174,7 +163,6 @@ pipeline:
                 axis: 0
             dialogue_state:
               dtype: float16
-              rank: 2
               shape:
               - batch
               - hidden
@@ -184,7 +172,6 @@ pipeline:
           outputs:
             response_tokens:
               dtype: int64
-              rank: 2
               shape:
               - batch
               - 1
@@ -193,7 +180,6 @@ pipeline:
                 axis: 0
             codec_codes:
               dtype: int64
-              rank: 2
               shape:
               - batch
               - codec_frames
@@ -202,7 +188,6 @@ pipeline:
                 axis: 0
             next_dialogue_state:
               dtype: float16
-              rank: 2
               shape:
               - batch
               - hidden
@@ -217,7 +202,6 @@ pipeline:
           inputs:
             codec_codes:
               dtype: int64
-              rank: 2
               shape:
               - batch
               - codec_frames
@@ -226,7 +210,6 @@ pipeline:
                 axis: 0
             codec_history:
               dtype: float16
-              rank: 3
               shape:
               - batch
               - channels
@@ -237,7 +220,6 @@ pipeline:
           outputs:
             speaker_audio:
               dtype: float32
-              rank: 2
               shape:
               - batch
               - output_samples
@@ -246,7 +228,6 @@ pipeline:
                 axis: 0
             next_codec_history:
               dtype: float16
-              rank: 3
               shape:
               - batch
               - channels
@@ -258,7 +239,6 @@ pipeline:
       dialogue_state:
         contract:
           dtype: float16
-          rank: 2
           shape:
           - batch
           - hidden
@@ -275,7 +255,6 @@ pipeline:
       codec_history:
         contract:
           dtype: float16
-          rank: 3
           shape:
           - batch
           - channels

@@ -661,15 +661,28 @@ pub fn graph_port_contracts(
         let Some(name) = value.name.clone() else {
             continue;
         };
-        let rank = value.shape.len();
         contracts.insert(
             name,
             onnx_genai_metadata::TensorContract {
                 dtype: ir_dtype_name(value.dtype).to_owned(),
-                rank,
-                // The graph's own symbols are its shape; restating them here
-                // would be a second place they could drift.
-                shape: None,
+                shape: value
+                    .shape
+                    .iter()
+                    .map(|dimension| match dimension {
+                        onnx_runtime_ir::Dim::Static(extent) => {
+                            onnx_genai_metadata::TensorDimension::Fixed(
+                                i64::try_from(*extent)
+                                    .expect("ONNX dimensions are non-negative signed int64"),
+                            )
+                        }
+                        onnx_runtime_ir::Dim::Symbolic(symbol) => graph
+                            .symbol_constraints
+                            .get(symbol)
+                            .and_then(|constraints| constraints.name.clone())
+                            .map(onnx_genai_metadata::TensorDimension::Symbol)
+                            .unwrap_or(onnx_genai_metadata::TensorDimension::Any),
+                    })
+                    .collect(),
                 optional: false,
                 batch_layout: onnx_genai_metadata::BatchLayout::RequestAligned { axis: 0 },
                 padding: Vec::new(),

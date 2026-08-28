@@ -316,27 +316,27 @@ pipeline:
       capabilities: [workflow_ssa, typed_emit]
     inputs:
       logits:
-        contract: {{ dtype: float32, rank: 2, shape: [{BATCH}, {VOCAB}] }}
+        contract: {{ dtype: float32, shape: [{BATCH}, {VOCAB}] }}
         role: {{ kind: opaque }}
         source: {{ kind: application, name: logits }}
         required: true
       min_p:
-        contract: {{ dtype: float32, rank: 1, shape: [1] }}
+        contract: {{ dtype: float32, shape: [1] }}
         role: {{ kind: runtime, version: "1", role: sampling_min_p }}
         source: {{ kind: request }}
         required: true
       eos:
-        contract: {{ dtype: int64, rank: 1, shape: [1] }}
+        contract: {{ dtype: int64, shape: [1] }}
         role: {{ kind: opaque }}
         source: {{ kind: application, name: eos }}
         required: true
     outputs:
       token:
-        contract: {{ dtype: int64, rank: 1, shape: [{BATCH}] }}
+        contract: {{ dtype: int64, shape: [{BATCH}] }}
         role: tokens
         stage: pre_adapter
       done:
-        contract: {{ dtype: bool, rank: 1, shape: [{BATCH}] }}
+        contract: {{ dtype: bool, shape: [{BATCH}] }}
         role: tensor
         stage: pre_adapter
     components:

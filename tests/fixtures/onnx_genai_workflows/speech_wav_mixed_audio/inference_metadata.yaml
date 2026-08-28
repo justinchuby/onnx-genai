@@ -12,7 +12,6 @@ pipeline:
       request.prompt_tokens:
         contract:
           dtype: int64
-          rank: 2
           shape:
           - batch
           - sequence_length
@@ -30,7 +29,6 @@ pipeline:
       audio:
         contract:
           dtype: float32
-          rank: 3
           shape:
           - batch
           - 2
@@ -49,7 +47,6 @@ pipeline:
       waveform:
         contract:
           dtype: float32
-          rank: 3
           shape:
           - batch
           - 1

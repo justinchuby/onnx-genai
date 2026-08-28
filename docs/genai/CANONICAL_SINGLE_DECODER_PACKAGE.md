@@ -24,13 +24,13 @@ pipeline:
 
     inputs:
       request.input_ids:          # the prompt
-        contract: {dtype: int64, rank: 2, shape: [batch, sequence],
+        contract: {dtype: int64, shape: [batch, sequence],
                    batch_layout: {kind: request_aligned, axis: 0}}
         role: {kind: runtime, version: '1.0', role: prompt_tokens}
         source: {kind: request}
         required: true
       request.max_iterations:     # generation bound
-        contract: {dtype: int64, rank: 1, shape: [1]}
+        contract: {dtype: int64, shape: [1]}
         role: {kind: runtime, version: '1.0', role: max_iterations}
         source: {kind: request}
         required: false
@@ -38,7 +38,7 @@ pipeline:
 
     outputs:
       tokens:
-        contract: {dtype: int64, rank: 2, shape: [batch, sequence],
+        contract: {dtype: int64, shape: [batch, sequence],
                    batch_layout: {kind: request_aligned, axis: 0}}
         role: tokens
         stage: pre_adapter
@@ -135,7 +135,7 @@ once, in `pipeline.workflow.state`:
 ```yaml
     state:
       conversation:
-        contract: {dtype: int64, rank: 2, shape: [batch, conversation_length],
+        contract: {dtype: int64, shape: [batch, conversation_length],
                    batch_layout: {kind: request_aligned, axis: 0}}
         class: semantic
         scope: session

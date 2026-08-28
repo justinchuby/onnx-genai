@@ -165,26 +165,28 @@ fn validate_workflow_signatures(
                         dtype_name(signature.dtype)
                     )));
                 }
-                if contract.rank != signature.rank() {
+                if contract.rank() != signature.rank() {
                     return Err(OrtError::InvalidArgument(format!(
-                        "workflow component '{component}' {direction} '{port}' declares rank {}, \
-                         but the ONNX graph exposes rank {}",
-                        contract.rank,
+                        "workflow component '{component}' {direction} port '{port}' declares \
+                         required shape {:?} (rank {}), but the ONNX graph exposes rank {}",
+                        contract.shape,
+                        contract.rank(),
                         signature.rank()
                     )));
                 }
-                if let Some(shape) = &contract.shape {
-                    for (axis, (declared, actual)) in shape.iter().zip(&signature.shape).enumerate()
+                for (axis, (declared, actual)) in
+                    contract.shape.iter().zip(&signature.shape).enumerate()
+                {
+                    if let (TensorDimension::Fixed(declared), PortDimension::Static(actual)) =
+                        (declared, actual)
+                        && usize::try_from(*declared).ok() != Some(*actual)
                     {
-                        if let (TensorDimension::Fixed(declared), PortDimension::Static(actual)) =
-                            (declared, actual)
-                            && usize::try_from(*declared).ok() != Some(*actual)
-                        {
-                            return Err(OrtError::InvalidArgument(format!(
-                                "workflow component '{component}' {direction} '{port}' axis \
-                                 {axis} declares {declared}, but the ONNX graph exposes {actual}"
-                            )));
-                        }
+                        return Err(OrtError::InvalidArgument(format!(
+                            "workflow component '{component}' {direction} port '{port}' required \
+                             shape {:?}, but axis {axis} declares {declared} and the ONNX graph \
+                             exposes {actual}",
+                            contract.shape
+                        )));
                     }
                 }
             }

@@ -1052,7 +1052,7 @@ fn test_decoder_runtime_inner(shape: TestSessionShape) -> anyhow::Result<Workflo
                 // Tokens accumulate on the final axis, which is the axis the
                 // recurrence has to name for a rank-2 contract.
                 recurrence: onnx_genai_metadata::ShapeRecurrence::Bounded {
-                    axis: contract.rank.saturating_sub(1),
+                    axis: contract.rank().saturating_sub(1),
                     max: bound,
                 },
                 contract,

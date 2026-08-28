@@ -16,9 +16,13 @@ A single decoder is a workflow with one ONNX component, not a second package sha
 ## Workflow boundary
 
 `workflow.inputs` and `workflow.outputs` are named, typed package values. Every value
-has a `TensorContract` (`dtype`, `rank`, optional symbolic shape). Inputs identify a
-versioned runtime role or remain opaque application values. Outputs identify their
-role and whether they are pre- or post-adapter.
+has a `TensorContract` with `dtype` and a required complete `shape`; the shape length
+is the tensor rank. `shape: []` is a scalar. Fixed extents and named symbols constrain
+dimensions, while each `Any` occurrence is independently unconstrained and never
+implies equality with another `Any`. Serialized `rank` is rejected rather than
+inferred or migrated. Inputs identify a versioned runtime role or remain opaque
+application values. Outputs identify their role and whether they are pre- or
+post-adapter.
 
 ## Components and graph
 

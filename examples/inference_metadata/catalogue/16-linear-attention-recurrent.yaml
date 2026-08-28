@@ -11,7 +11,6 @@ pipeline:
       request.active:
         contract:
           dtype: bool
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -26,7 +25,6 @@ pipeline:
       request.done:
         contract:
           dtype: bool
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -41,7 +39,6 @@ pipeline:
       request.accepted_len:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -56,7 +53,6 @@ pipeline:
       request.hidden_states:
         contract:
           dtype: float16
-          rank: 3
           shape:
           - batch
           - 1
@@ -73,7 +69,6 @@ pipeline:
       request.linear_accumulator:
         contract:
           dtype: float32
-          rank: 4
           shape:
           - batch
           - heads
@@ -92,7 +87,6 @@ pipeline:
       hidden_states:
         contract:
           dtype: float16
-          rank: 3
           shape:
           - batch
           - 1
@@ -111,7 +105,6 @@ pipeline:
           inputs:
             accumulator:
               dtype: float32
-              rank: 4
               shape:
               - batch
               - heads
@@ -122,7 +115,6 @@ pipeline:
                 axis: 0
             hidden_states:
               dtype: float16
-              rank: 3
               shape:
               - batch
               - 1
@@ -133,7 +125,6 @@ pipeline:
           outputs:
             next_accumulator:
               dtype: float32
-              rank: 4
               shape:
               - batch
               - heads
@@ -144,7 +135,6 @@ pipeline:
                 axis: 0
             output:
               dtype: float16
-              rank: 3
               shape:
               - batch
               - 1
@@ -156,7 +146,6 @@ pipeline:
       linear_accumulator:
         contract:
           dtype: float32
-          rank: 4
           shape:
           - batch
           - heads

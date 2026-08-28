@@ -287,33 +287,33 @@ pipeline:
       capabilities: [workflow_ssa, typed_emit]
     inputs:
       logits:
-        contract: { dtype: float32, rank: 2, shape: [batch, vocabulary] }
+        contract: { dtype: float32, shape: [batch, vocabulary] }
         role: { kind: opaque }
         source: { kind: application, name: logits }
         required: true
       temperature:
-        contract: { dtype: float32, rank: 1, shape: [1] }
+        contract: { dtype: float32, shape: [1] }
         role: { kind: runtime, version: "1", role: sampling_temperature }
         source: { kind: request }
         required: true
       top_k:
-        contract: { dtype: int64, rank: 1, shape: [1] }
+        contract: { dtype: int64, shape: [1] }
         role: { kind: runtime, version: "1", role: sampling_top_k }
         source: { kind: request }
         required: true
       top_p:
-        contract: { dtype: float32, rank: 1, shape: [1] }
+        contract: { dtype: float32, shape: [1] }
         role: { kind: runtime, version: "1", role: sampling_top_p }
         source: { kind: request }
         required: true
       grammar_mask:
-        contract: { dtype: bool, rank: 2, shape: [batch, vocabulary] }
+        contract: { dtype: bool, shape: [batch, vocabulary] }
         role: { kind: opaque }
         source: { kind: application, name: grammar_mask }
         required: true
     outputs:
       token:
-        contract: { dtype: int64, rank: 1, shape: [batch] }
+        contract: { dtype: int64, shape: [batch] }
         role: tokens
         stage: pre_adapter
     components:
@@ -356,39 +356,39 @@ pipeline:
         [workflow_ssa, typed_emit, streaming_emit,
          nested_control_flow, session_state_lease, linear_effects]
     inputs:
-      initial: { contract: { dtype: int64, rank: 0, shape: [] }, role: { kind: opaque },
+      initial: { contract: { dtype: int64, shape: [] }, role: { kind: opaque },
                  source: { kind: application, name: initial }, required: true }
-      run_branch: { contract: { dtype: bool, rank: 0, shape: [] }, role: { kind: opaque },
+      run_branch: { contract: { dtype: bool, shape: [] }, role: { kind: opaque },
                     source: { kind: application, name: run_branch }, required: true }
-      increment: { contract: { dtype: int64, rank: 0, shape: [] }, role: { kind: opaque },
+      increment: { contract: { dtype: int64, shape: [] }, role: { kind: opaque },
                    source: { kind: application, name: increment }, required: true }
-      limit: { contract: { dtype: int64, rank: 0, shape: [] }, role: { kind: opaque },
+      limit: { contract: { dtype: int64, shape: [] }, role: { kind: opaque },
                source: { kind: application, name: limit }, required: true }
       iterations:
-        contract: { dtype: int64, rank: 0, shape: [] }
+        contract: { dtype: int64, shape: [] }
         role: { kind: runtime, version: v1, role: max_iterations }
         source: { kind: request }
         required: true
-      initial_continue: { contract: { dtype: bool, rank: 0, shape: [] },
+      initial_continue: { contract: { dtype: bool, shape: [] },
                           role: { kind: opaque },
                           source: { kind: application, name: initial_continue }, required: true }
     outputs:
-      state: { contract: { dtype: int64, rank: 0, shape: [] }, role: tensor, stage: pre_adapter }
-      events: { contract: { dtype: int64, rank: 0, shape: [] }, role: event, stage: pre_adapter }
+      state: { contract: { dtype: int64, shape: [] }, role: tensor, stage: pre_adapter }
+      events: { contract: { dtype: int64, shape: [] }, role: event, stage: pre_adapter }
     components:
       binding:
         implementation: { kind: binding }
         ports:
-          inputs: { value: { dtype: int64, rank: 0, shape: [] } }
-          outputs: { value: { dtype: int64, rank: 0, shape: [] } }
+          inputs: { value: { dtype: int64, shape: [] } }
+          outputs: { value: { dtype: int64, shape: [] } }
       update:
         implementation: { kind: onnx, artifact: update.onnx.textproto }
         ports:
           inputs:
-            current: { dtype: int64, rank: 0, shape: [] }
-            update: { dtype: int64, rank: 0, shape: [] }
+            current: { dtype: int64, shape: [] }
+            update: { dtype: int64, shape: [] }
           outputs:
-            next: { dtype: int64, rank: 0, shape: [] }
+            next: { dtype: int64, shape: [] }
         contract:
           id: onnx-genai.state-update
           version: "1"
@@ -400,19 +400,19 @@ pipeline:
         implementation: { kind: onnx, artifact: less.onnx.textproto }
         ports:
           inputs:
-            value: { dtype: int64, rank: 0, shape: [] }
-            limit: { dtype: int64, rank: 0, shape: [] }
+            value: { dtype: int64, shape: [] }
+            limit: { dtype: int64, shape: [] }
           outputs:
-            continue: { dtype: bool, rank: 0, shape: [] }
+            continue: { dtype: bool, shape: [] }
     state:
       world:
-        contract: { dtype: int64, rank: 0, shape: [] }
+        contract: { dtype: int64, shape: [] }
         scope: session
         initializer: initial
         recurrence: { kind: invariant }
         session: { policy: exclusive }
       active:
-        contract: { dtype: bool, rank: 0, shape: [] }
+        contract: { dtype: bool, shape: [] }
         scope: invocation
         initializer: initial_continue
         recurrence: { kind: invariant }
@@ -479,18 +479,18 @@ pipeline:
       capabilities: [workflow_ssa, typed_emit]
     inputs:
       input:
-        contract: { dtype: int64, rank: 1, shape: [4] }
+        contract: { dtype: int64, shape: [4] }
         role: { kind: opaque }
         source: { kind: application, name: input }
         required: true
       k:
-        contract: { dtype: int64, rank: 1, shape: [1] }
+        contract: { dtype: int64, shape: [1] }
         role: { kind: opaque }
         source: { kind: application, name: k }
         required: true
     outputs:
       indices:
-        contract: { dtype: int64, rank: 1, shape: [2] }
+        contract: { dtype: int64, shape: [2] }
         role: tensor
         stage: pre_adapter
     components:
@@ -498,11 +498,11 @@ pipeline:
         implementation: { kind: onnx, artifact: topk.onnx.textproto }
         ports:
           inputs:
-            input: { dtype: int64, rank: 1, shape: [4] }
-            k: { dtype: int64, rank: 1, shape: [1] }
+            input: { dtype: int64, shape: [4] }
+            k: { dtype: int64, shape: [1] }
           outputs:
-            values: { dtype: int64, rank: 1, shape: [2] }
-            indices: { dtype: int64, rank: 1, shape: [2] }
+            values: { dtype: int64, shape: [2] }
+            indices: { dtype: int64, shape: [2] }
     steps:
       - kind: invoke
         component: topk

@@ -503,15 +503,6 @@
             "null"
           ]
         },
-        "rank": {
-          "description": "Tensor rank of the emitted tensor.\n\nRedundant with `contract.rank` and retained only for programs that\ndeclare no full contract; workflow packages declare `contract`.",
-          "format": "uint",
-          "minimum": 0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
         "source": {
           "description": "Program-local value produced by a transform.",
           "minLength": 1,
@@ -3807,24 +3798,17 @@
           },
           "type": "array"
         },
-        "rank": {
-          "format": "uint",
-          "minimum": 0,
-          "type": "integer"
-        },
         "shape": {
+          "description": "Complete tensor shape. Its length is the tensor rank.",
           "items": {
             "$ref": "#/$defs/TensorDimension"
           },
-          "type": [
-            "array",
-            "null"
-          ]
+          "type": "array"
         }
       },
       "required": [
         "dtype",
-        "rank"
+        "shape"
       ],
       "type": "object"
     },
@@ -3884,12 +3868,12 @@
           "type": "integer"
         },
         {
-          "description": "A runtime shape symbol.",
+          "description": "A non-empty runtime shape symbol. `Any` means one independently\nunconstrained occurrence.",
           "minLength": 1,
           "type": "string"
         }
       ],
-      "description": "One fixed or runtime-resolved tensor-shape dimension."
+      "description": "One fixed, symbolic, or unconstrained tensor-shape dimension."
     },
     "TensorShardFacts": {
       "additionalProperties": false,

@@ -10,7 +10,6 @@ pipeline:
       request.input_values:
         contract:
           dtype: float32
-          rank: 2
           shape:
           - batch
           - samples
@@ -27,7 +26,6 @@ pipeline:
       request.attention_mask:
         contract:
           dtype: int64
-          rank: 2
           shape:
           - batch
           - samples
@@ -44,7 +42,6 @@ pipeline:
       logits:
         contract:
           dtype: float32
-          rank: 3
           shape:
           - batch
           - frames
@@ -60,7 +57,6 @@ pipeline:
       frame_lengths:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -76,7 +72,6 @@ pipeline:
           inputs:
             input_values:
               dtype: float32
-              rank: 2
               shape:
               - batch
               - samples
@@ -85,7 +80,6 @@ pipeline:
                 axis: 0
             attention_mask:
               dtype: int64
-              rank: 2
               shape:
               - batch
               - samples
@@ -95,7 +89,6 @@ pipeline:
           outputs:
             logits:
               dtype: float32
-              rank: 3
               shape:
               - batch
               - frames
@@ -108,7 +101,6 @@ pipeline:
                 valid_lengths: frame_lengths
             frame_lengths:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
