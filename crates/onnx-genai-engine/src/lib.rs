@@ -37,8 +37,9 @@ pub mod speculative;
 pub use onnx_genai_scheduler::SchedulerAdmissionError;
 
 pub use batched::{
-    BatchOccupancy, BatchingCapability, ContinuousBatchAdmission, ContinuousBatchEvent,
-    ContinuousBatchHandle, ContinuousBatchManager,
+    BatchOccupancy, BatchingCapability, ContinuousBatchAdmission, ContinuousBatchDiagnostic,
+    ContinuousBatchEvent, ContinuousBatchHandle, ContinuousBatchManager,
+    ContinuousBatchRowDiagnostic,
 };
 pub use connector_bridge::{ConnectorLookupOutcome, ConnectorStats};
 pub use embedding::{EmbeddingOptions, EmbeddingPooling};

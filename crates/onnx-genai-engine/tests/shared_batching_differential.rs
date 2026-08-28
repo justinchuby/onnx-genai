@@ -1,7 +1,9 @@
 use onnx_genai_engine::{
-    Engine, EngineConfig, GenerateOptions, GeneratePrompt, GenerateRequest, GenerateResult,
+    ContinuousBatchDiagnostic, ContinuousBatchEvent, Engine, EngineConfig, GenerateOptions,
+    GeneratePrompt, GenerateRequest, GenerateResult,
 };
 use onnx_genai_ort::SessionOptions;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Once;
@@ -77,6 +79,40 @@ fn isolated_results(
         .collect()
 }
 
+fn assert_live_row_ownership(diagnostic: &ContinuousBatchDiagnostic) {
+    let mut owners = HashSet::new();
+    for row in &diagnostic.rows {
+        if let Some(handle) = row.handle {
+            assert!(
+                owners.insert(handle),
+                "handle {handle:?} owns more than one physical row: {diagnostic:?}"
+            );
+            assert!(
+                row.resident_tokens <= row.logical_tokens,
+                "physical row {} is resident beyond its logical request position: {row:?}",
+                row.physical_row
+            );
+            assert!(
+                row.generated_tokens <= row.logical_tokens,
+                "row {} published more tokens than it owns: {row:?}",
+                row.physical_row
+            );
+        } else {
+            assert_eq!(
+                row.logical_tokens, 0,
+                "vacant physical row {} retains logical request ownership: {row:?}",
+                row.physical_row
+            );
+        }
+    }
+    for handle in &diagnostic.queued_handles {
+        assert!(
+            !owners.contains(handle),
+            "queued handle {handle:?} is also resident: {diagnostic:?}"
+        );
+    }
+}
+
 #[test]
 fn static_shared_batch_matches_isolated_ragged_rows() -> anyhow::Result<()> {
     let fixture = shared_buffer_fixture()?;
@@ -88,7 +124,12 @@ fn static_shared_batch_matches_isolated_ragged_rows() -> anyhow::Result<()> {
         "fixture must exercise the production shared-forward path"
     );
 
-    assert_eq!(engine.generate_batched_static(requests)?, expected);
+    assert_eq!(engine.generate_batched_static(requests.clone())?, expected);
+    assert_eq!(
+        engine.generate_batched_static(requests)?,
+        expected,
+        "a second static batch on the same engine must not inherit row state, output, or residency"
+    );
     Ok(())
 }
 
@@ -104,10 +145,71 @@ fn scheduled_shared_batch_matches_isolated_through_backfill_and_row_reuse() -> a
     );
 
     assert_eq!(
+        engine.run_continuous_batch_scheduled(requests.clone(), 2)?,
+        expected
+    );
+    assert_eq!(
         engine.run_continuous_batch_scheduled(requests, 2)?,
         expected,
-        "two physical rows must retire unequal requests, admit queued work, and reuse both slots \
-         without carrying prior output, RNG, completion, or state ownership"
+        "two physical rows must retire unequal requests, backfill and reuse slots without \
+         carrying prior output, RNG, completion, state ownership, or residency"
     );
+    Ok(())
+}
+
+#[test]
+fn live_row_residency_journal_and_completion_ownership_survive_backfill() -> anyhow::Result<()> {
+    let fixture = shared_buffer_fixture()?;
+    let requests = ragged_requests();
+    let expected = isolated_results(&fixture, &requests)?;
+    let mut engine = cpu_engine(&fixture)?;
+    let mut manager = engine.continuous_batch_manager(2)?;
+    let handles = requests
+        .into_iter()
+        .map(|request| manager.submit(request))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    let initial = manager.diagnostic()?;
+    assert_eq!(initial.queued_handles, handles);
+    assert!(initial.rows.iter().all(|row| row.handle.is_none()));
+    assert_live_row_ownership(&initial);
+
+    let mut completed = HashMap::new();
+    let mut saw_journal = false;
+    while manager.has_pending_work() {
+        manager.step()?;
+        let diagnostic = manager.diagnostic()?;
+        assert_live_row_ownership(&diagnostic);
+        saw_journal |= diagnostic
+            .committed_output_journal
+            .iter()
+            .any(|tokens| !tokens.is_empty());
+        for event in manager.poll() {
+            if let ContinuousBatchEvent::Finished { handle, result } = event {
+                assert!(
+                    completed.insert(handle, result).is_none(),
+                    "handle {handle:?} completed more than once"
+                );
+            }
+        }
+    }
+    manager.drain()?;
+
+    assert!(
+        saw_journal,
+        "the authored output journal must record tokens before pass completion"
+    );
+    assert_eq!(completed.len(), handles.len());
+    for (index, handle) in handles.into_iter().enumerate() {
+        assert_eq!(
+            completed.remove(&handle),
+            Some(expected[index].clone()),
+            "backfill or row reuse leaked state into request {index}"
+        );
+    }
+    let final_state = manager.diagnostic()?;
+    assert!(final_state.rows.iter().all(|row| row.handle.is_none()));
+    assert!(final_state.queued_handles.is_empty());
+    assert_live_row_ownership(&final_state);
     Ok(())
 }

@@ -251,6 +251,30 @@ pub struct BatchOccupancy {
     pub max_batch: usize,
 }
 
+/// The manager-owned state of one physical decode row.
+///
+/// This is diagnostic evidence of row ownership and residency; it deliberately
+/// exposes positions and handles rather than mutable decode/KV storage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContinuousBatchRowDiagnostic {
+    pub physical_row: usize,
+    pub handle: Option<ContinuousBatchHandle>,
+    pub logical_tokens: usize,
+    pub generated_tokens: usize,
+    pub has_pending_token: bool,
+    pub resident_tokens: usize,
+}
+
+/// Snapshot of the live batch ownership and publication domain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContinuousBatchDiagnostic {
+    pub rows: Vec<ContinuousBatchRowDiagnostic>,
+    pub queued_handles: Vec<ContinuousBatchHandle>,
+    pub committed_output_journal: Vec<Vec<i64>>,
+    pub pending_token_handles: Vec<ContinuousBatchHandle>,
+    pub pending_completion_handles: Vec<ContinuousBatchHandle>,
+}
+
 impl BatchOccupancy {
     /// Mean rows per batched forward, or `None` before any forward ran.
     ///
@@ -683,6 +707,50 @@ impl<'a> ContinuousBatchManager<'a> {
     /// backend really advanced several sequences per step.
     pub fn occupancy(&self) -> BatchOccupancy {
         self.occupancy
+    }
+
+    /// Inspect the manager's current row ownership, logical/physical positions,
+    /// and unpublished output journal without draining events.
+    pub fn diagnostic(&self) -> anyhow::Result<ContinuousBatchDiagnostic> {
+        let rows = self
+            .rows
+            .iter()
+            .enumerate()
+            .map(|(physical_row, row)| {
+                let resident_tokens = self.decode.row_len(physical_row).map_err(|error| {
+                    anyhow::anyhow!(
+                        "failed to inspect continuous physical row {physical_row}: {error}"
+                    )
+                })?;
+                Ok(ContinuousBatchRowDiagnostic {
+                    physical_row,
+                    handle: row.as_ref().map(|row| row.handle),
+                    logical_tokens: row.as_ref().map_or(0, |row| row.context_tokens.len()),
+                    generated_tokens: row
+                        .as_ref()
+                        .map_or(0, |row| row.state.generated_tokens.len()),
+                    has_pending_token: row.as_ref().is_some_and(|row| row.pending.is_some()),
+                    resident_tokens,
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let mut pending_token_handles = Vec::new();
+        let mut pending_completion_handles = Vec::new();
+        for event in &self.events {
+            match event {
+                ContinuousBatchEvent::Token { handle, .. } => pending_token_handles.push(*handle),
+                ContinuousBatchEvent::Finished { handle, .. } => {
+                    pending_completion_handles.push(*handle);
+                }
+            }
+        }
+        Ok(ContinuousBatchDiagnostic {
+            rows,
+            queued_handles: self.queue.iter().map(|request| request.handle).collect(),
+            committed_output_journal: self.committed_per_row.clone(),
+            pending_token_handles,
+            pending_completion_handles,
+        })
     }
 
     /// Cumulative device→host logits transfer cost of the backend driving this

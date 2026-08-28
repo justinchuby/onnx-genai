@@ -263,7 +263,6 @@ pub(crate) struct WorkflowPerformanceCounters {
 pub struct WorkflowExecutionPlan<'a> {
     engine: &'a WorkflowRuntime,
     values: PipelineTensors,
-    input_names: Vec<String>,
     input_aliases: HashMap<String, String>,
     initial_symbols: HashMap<String, i64>,
     dynamic_symbols: std::collections::HashSet<String>,
@@ -867,10 +866,9 @@ impl WorkflowRuntime {
     ) -> anyhow::Result<PipelineTensors> {
         let mut plan = WorkflowExecutionPlan::new(self, request)?;
         let (mut values, _) = plan.execute_retained()?;
-        // `execute_retained` parks the pass's inputs back on the plan for replay.
-        // A retained run has no replay — the caller wanted the whole value map —
-        // so fold them back in; a proposal chain binds the proposer's borrowed
-        // shared KV and masks straight from these request values.
+        // The plan retains canonical inputs for replay. A retained run returns
+        // the complete execution view, so fold the unchanged source bindings
+        // in beside values produced by the pass.
         for (name, value) in std::mem::take(&mut plan.values) {
             values.entry(name).or_insert(value);
         }
@@ -1080,7 +1078,6 @@ impl<'a> WorkflowExecutionPlan<'a> {
             )?;
         }
         let request_count = super::batching::validate_workflow_batch_inputs(workflow, &values)?;
-        let input_names = values.keys().cloned().collect::<Vec<_>>();
         // The bound the continuation cell declares is the package's own context
         // limit, and this is the only place it can be checked: a continuation is
         // deliberately not loop-carried, so it never reaches the carry path's
@@ -1126,7 +1123,6 @@ impl<'a> WorkflowExecutionPlan<'a> {
         Ok(Self {
             engine,
             values,
-            input_names,
             input_aliases,
             initial_symbols,
             dynamic_symbols,
@@ -1184,9 +1180,6 @@ impl<'a> WorkflowExecutionPlan<'a> {
                 self.request_count
             );
         }
-        if !self.input_names.contains(package_name) {
-            self.input_names.push(package_name.clone());
-        }
         Ok(())
     }
 
@@ -1232,11 +1225,18 @@ impl<'a> WorkflowExecutionPlan<'a> {
             island.begin_execution(pass.id);
         }
         let workflow = &engine.plan.workflow;
-        let mut values = std::mem::take(&mut self.values);
+        // A prepared plan names its canonical request rows. Selection is an
+        // execution-local view over that domain: retaining selected bindings
+        // would make a replay apply the same positional plan to an already
+        // selected batch.
+        let mut values = clone_pipeline_tensors(&self.values)?;
         let row_selection_name = workflow_row_selection_name(workflow);
         let row_plan = workflow_row_selection(workflow, &values)?
             .map(|selection| super::RowPlan::select(self.request_count, selection))
             .transpose()?;
+        let execution_request_count = row_plan
+            .as_ref()
+            .map_or(self.request_count, |plan| plan.selected_rows().len());
         if let Some(plan) = &row_plan {
             let mut replacements = Vec::new();
             for (name, input) in &workflow.inputs {
@@ -1256,7 +1256,6 @@ impl<'a> WorkflowExecutionPlan<'a> {
             for (name, selected) in replacements {
                 values.insert(name, selected);
             }
-            self.request_count = plan.selected_rows().len();
         }
         let prepare_adapters = (|| -> anyhow::Result<()> {
             if let Some(service) = &engine.plan.adapter_service {
@@ -1302,10 +1301,7 @@ impl<'a> WorkflowExecutionPlan<'a> {
             }
             Ok(())
         })();
-        if let Err(error) = prepare_adapters {
-            self.retain_inputs(&mut values);
-            return Err(error);
-        }
+        prepare_adapters?;
         let _adapter_context_guard =
             ActiveAdapterContextGuard(&engine.worker.active_adapter_context);
         // A package may declare session state and still be asked for a single
@@ -1321,15 +1317,10 @@ impl<'a> WorkflowExecutionPlan<'a> {
         // exclusive, and cells without one use the schema's exclusive default,
         // so every carried session cell requires this guard.
         let _session_lease = match (self.session_id.as_deref(), session_state.carries_any()) {
-            (Some(session_id), true) => {
-                match SessionLeaseGuard::acquire(&engine.worker.session_leases, session_id) {
-                    Ok(guard) => Some(guard),
-                    Err(error) => {
-                        self.retain_inputs(&mut values);
-                        return Err(error);
-                    }
-                }
-            }
+            (Some(session_id), true) => Some(SessionLeaseGuard::acquire(
+                &engine.worker.session_leases,
+                session_id,
+            )?),
             _ => None,
         };
         if let Some(session_id) = self.session_id.as_ref() {
@@ -1380,7 +1371,27 @@ impl<'a> WorkflowExecutionPlan<'a> {
                 }
             }
         }
-        let mut symbols = self.initial_symbols.clone();
+        // Request-aligned values now have the selected extent, not the
+        // canonical extent recorded during preparation. Rebind symbols from
+        // this transient execution view so a shrinking selection cannot keep
+        // the source batch size pinned in component/output validation.
+        let mut symbols = if row_plan.is_some() {
+            let mut symbols = HashMap::new();
+            for (name, input) in &workflow.inputs {
+                if let Some(value) = values.get(name) {
+                    validate_workflow_value(
+                        name,
+                        value,
+                        &input.contract,
+                        &mut symbols,
+                        &self.dynamic_symbols,
+                    )?;
+                }
+            }
+            symbols
+        } else {
+            self.initial_symbols.clone()
+        };
         let mut emit_counts = HashMap::new();
         let mut final_state_refs = HashMap::new();
         let result = engine.run_workflow_node(
@@ -1389,17 +1400,14 @@ impl<'a> WorkflowExecutionPlan<'a> {
             &mut values,
             &mut symbols,
             &self.dynamic_symbols,
-            self.request_count,
+            execution_request_count,
             &mut emit_counts,
             &mut final_state_refs,
             &self.component_overrides,
             &mut pass.telemetry,
             host,
         );
-        if let Err(error) = result {
-            self.retain_inputs(&mut values);
-            return Err(error);
-        }
+        result?;
         for output in workflow_emitted_outputs(&engine.plan.compiled_workflow.graph) {
             let Some(value) = values.get(&output) else {
                 continue;
@@ -1517,20 +1525,7 @@ impl<'a> WorkflowExecutionPlan<'a> {
         }
         let row_outputs = std::mem::take(&mut pass.telemetry.row_outputs);
         engine.publish_workflow_telemetry(pass.telemetry);
-        let inputs = self.take_inputs(&mut values);
-        self.values = inputs;
         Ok((values, row_outputs))
-    }
-
-    fn retain_inputs(&mut self, values: &mut PipelineTensors) {
-        self.values = self.take_inputs(values);
-    }
-
-    fn take_inputs(&self, values: &mut PipelineTensors) -> PipelineTensors {
-        self.input_names
-            .iter()
-            .filter_map(|name| values.remove(name).map(|value| (name.clone(), value)))
-            .collect()
     }
 }
 
