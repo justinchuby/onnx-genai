@@ -557,6 +557,7 @@ impl WorkflowRuntime {
         run: &PipelineTensors,
         options: DFlashProposalOptions,
     ) -> anyhow::Result<DFlashProposal> {
+        self.require_execution_admitted()?;
         let contract = self
             .plan
             .speculative
@@ -1039,6 +1040,7 @@ impl WorkflowRuntime {
         proposal: &DFlashProposal,
         mode: DFlashVerificationMode,
     ) -> anyhow::Result<DFlashAcceptance> {
+        self.require_execution_admitted()?;
         let contract = self
             .plan
             .speculative
@@ -1192,6 +1194,7 @@ impl WorkflowRuntime {
         &self,
         current: &PipelineTensors,
     ) -> anyhow::Result<DFlashStateTransaction> {
+        self.require_execution_admitted()?;
         let contract = self
             .plan
             .speculative
@@ -1232,6 +1235,7 @@ impl WorkflowRuntime {
         verified: &PipelineTensors,
         acceptance: &DFlashAcceptance,
     ) -> anyhow::Result<super::TurnTransactionOutcome> {
+        self.require_execution_admitted()?;
         let contract = self
             .plan
             .speculative
@@ -1343,6 +1347,7 @@ impl WorkflowRuntime {
         current: &mut PipelineTensors,
         reason: super::TurnAbortReason,
     ) -> anyhow::Result<super::TurnTransactionOutcome> {
+        self.require_execution_admitted()?;
         for (cell, value) in transaction.baseline {
             current.insert(cell, value);
         }

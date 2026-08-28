@@ -1,0 +1,288 @@
+
+schema_version: v1.5
+package:
+  tokenizer:
+    special_tokens:
+      eos_token_id: [10]
+pipeline:
+  workflow:
+    manifest:
+      capabilities:
+        [workflow_ssa, typed_emit, serving_service_contract, dflash_flat_block]
+    inputs:
+      request.active:
+        contract: { dtype: bool, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
+        role: { kind: opaque }
+        source: { kind: application, name: active }
+        required: true
+      request.done:
+        contract: { dtype: bool, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
+        role: { kind: opaque }
+        source: { kind: application, name: done }
+        required: true
+      request.accepted_len:
+        contract: { dtype: int64, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
+        role: { kind: opaque }
+        source: { kind: application, name: accepted_len }
+        required: true
+      request.target_tokens:
+        contract: { dtype: int64, shape: [batch, verify], batch_layout: { kind: request_aligned, axis: 0 } }
+        role: { kind: runtime, version: v1, role: prompt_tokens }
+        source: { kind: request }
+        required: true
+      request.target_cache:
+        contract: { dtype: float32, shape: [batch, target_sequence, 3], batch_layout: { kind: request_aligned, axis: 0 } }
+        role: { kind: opaque }
+        source: { kind: application, name: target_cache }
+        required: true
+      request.draft_cache:
+        contract: { dtype: float32, shape: [batch, draft_sequence, 3], batch_layout: { kind: request_aligned, axis: 0 } }
+        role: { kind: opaque }
+        source: { kind: application, name: draft_cache }
+        required: true
+      request.token_history:
+        contract: { dtype: int64, shape: [batch, token_sequence], batch_layout: { kind: request_aligned, axis: 0 } }
+        role: { kind: opaque }
+        source: { kind: application, name: token_history }
+        required: true
+      request.recurrent:
+        contract: { dtype: float32, shape: [batch, 2], batch_layout: { kind: request_aligned, axis: 0 } }
+        role: { kind: opaque }
+        source: { kind: application, name: recurrent }
+        required: true
+      request.target_hidden:
+        contract: { dtype: float32, shape: [batch, verify, 9], batch_layout: { kind: request_aligned, axis: 0 } }
+        role: { kind: opaque }
+        source: { kind: application, name: target_hidden }
+        required: true
+      request.noise:
+        contract: { dtype: float32, shape: [batch, 4, 3], batch_layout: { kind: request_aligned, axis: 0 } }
+        role: { kind: opaque }
+        source: { kind: application, name: noise }
+        required: true
+      request.masked:
+        contract: { dtype: bool, shape: [batch, 4], batch_layout: { kind: request_aligned, axis: 0 } }
+        role: { kind: opaque }
+        source: { kind: application, name: masked }
+        required: true
+      request.positions:
+        contract: { dtype: int64, shape: [batch, total], batch_layout: { kind: request_aligned, axis: 0 } }
+        role: { kind: opaque }
+        source: { kind: application, name: positions }
+        required: true
+      request.attention:
+        contract: { dtype: int64, shape: [batch, total], batch_layout: { kind: request_aligned, axis: 0 } }
+        role: { kind: opaque }
+        source: { kind: application, name: attention }
+        required: true
+      request.output_projection:
+        contract: { dtype: float32, shape: [3, 11], batch_layout: { kind: shared } }
+        role: { kind: opaque }
+        source: { kind: application, name: output_projection }
+        required: true
+    outputs:
+      target_logits:
+        contract: { dtype: float32, shape: [batch, verify, 11], batch_layout: { kind: request_aligned, axis: 0 } }
+        role: tensor
+        stage: pre_adapter
+    components:
+      termination_policy:
+        implementation: { kind: binding }
+        ports: {}
+        contract: { id: onnx-genai.token-policy, version: "1.0" }
+      parallel_adapter:
+        implementation: { kind: onnx, artifact: proposer.onnx.textproto }
+        ports:
+          inputs:
+            target_features: { dtype: float32, shape: [batch, verify, 9], batch_layout: { kind: request_aligned, axis: 0 } }
+            noise_embeddings: { dtype: float32, shape: [batch, 4, 3], batch_layout: { kind: request_aligned, axis: 0 } }
+            masked_positions: { dtype: bool, shape: [batch, 4], batch_layout: { kind: request_aligned, axis: 0 } }
+            position_ids: { dtype: int64, shape: [batch, total], batch_layout: { kind: request_aligned, axis: 0 } }
+            attention_mask: { dtype: int64, shape: [batch, total], batch_layout: { kind: request_aligned, axis: 0 } }
+            output_projection: { dtype: float32, shape: [3, 11], batch_layout: { kind: shared } }
+            past_draft: { dtype: float32, shape: [batch, draft_sequence, 3], batch_layout: { kind: request_aligned, axis: 0 } }
+          outputs:
+            candidate_tokens: { dtype: int64, shape: [batch, 3], batch_layout: { kind: request_aligned, axis: 0 } }
+            proposal_probabilities: { dtype: float32, shape: [batch, 3, 11], batch_layout: { kind: request_aligned, axis: 0 } }
+            present_draft: { dtype: float32, shape: [batch, updated_draft_sequence, 3], batch_layout: { kind: request_aligned, axis: 0 } }
+      verifier:
+        implementation: { kind: onnx, artifact: target.onnx.textproto }
+        ports:
+          inputs:
+            tokens: { dtype: int64, shape: [batch, verify], batch_layout: { kind: request_aligned, axis: 0 } }
+            past_target: { dtype: float32, shape: [batch, target_sequence, 3], batch_layout: { kind: request_aligned, axis: 0 } }
+            token_history: { dtype: int64, shape: [batch, token_sequence], batch_layout: { kind: request_aligned, axis: 0 } }
+            recurrent: { dtype: float32, shape: [batch, 2], batch_layout: { kind: request_aligned, axis: 0 } }
+          outputs:
+            hidden_2:
+              dtype: float32
+              shape: [batch, verify, 3]
+              batch_layout: { kind: request_aligned, axis: 0 }
+            hidden_7:
+              dtype: float32
+              shape: [batch, verify, 3]
+              batch_layout: { kind: request_aligned, axis: 0 }
+            hidden_12:
+              dtype: float32
+              shape: [batch, verify, 3]
+              batch_layout: { kind: request_aligned, axis: 0 }
+            logits: { dtype: float32, shape: [batch, verify, 11], batch_layout: { kind: request_aligned, axis: 0 } }
+            present_target: { dtype: float32, shape: [batch, updated_target_sequence, 3], batch_layout: { kind: request_aligned, axis: 0 } }
+            present_tokens: { dtype: int64, shape: [batch, updated_target_sequence], batch_layout: { kind: request_aligned, axis: 0 } }
+            next_recurrent: { dtype: float32, shape: [batch, 2], batch_layout: { kind: request_aligned, axis: 0 } }
+            recurrent_prefixes: { dtype: float32, shape: [batch, prefix, 2], batch_layout: { kind: request_aligned, axis: 0 } }
+          roles:
+            hidden_2: hidden_states
+            hidden_7: hidden_states
+            hidden_12: hidden_states
+            logits: logits
+    state:
+      target_cache:
+        contract: { dtype: float32, shape: [batch, target_sequence, 3], batch_layout: { kind: request_aligned, axis: 0 } }
+        scope: invocation
+        initializer: request.target_cache
+        recurrence: { kind: invariant }
+        management: runtime
+        release_boundary: invocation
+        service_group: target_cache
+      draft_cache:
+        contract: { dtype: float32, shape: [batch, draft_sequence, 3], batch_layout: { kind: request_aligned, axis: 0 } }
+        scope: invocation
+        initializer: request.draft_cache
+        recurrence: { kind: invariant }
+        management: runtime
+        release_boundary: invocation
+        service_group: draft_cache
+      token_history:
+        contract: { dtype: int64, shape: [batch, token_sequence], batch_layout: { kind: request_aligned, axis: 0 } }
+        scope: invocation
+        initializer: request.token_history
+        recurrence: { kind: invariant }
+        management: runtime
+        release_boundary: invocation
+        service_group: token_history
+      recurrent:
+        contract: { dtype: float32, shape: [batch, 2], batch_layout: { kind: request_aligned, axis: 0 } }
+        scope: invocation
+        initializer: request.recurrent
+        recurrence: { kind: invariant }
+        management: runtime
+        release_boundary: invocation
+        service_group: recurrent
+    steps:
+      - kind: invoke
+        component: verifier
+        inputs:
+          tokens: request.target_tokens
+          past_target: request.target_cache
+          token_history: request.token_history
+          recurrent: request.recurrent
+        outputs:
+          hidden_2: target.hidden_2
+          hidden_7: target.hidden_7
+          hidden_12: target.hidden_12
+          logits: target.scores
+          present_target: target.present
+          present_tokens: target.tokens
+          next_recurrent: target.recurrent
+          recurrent_prefixes: target.recurrent_prefixes
+      - kind: invoke
+        component: parallel_adapter
+        inputs:
+          target_features: request.target_hidden
+          noise_embeddings: request.noise
+          masked_positions: request.masked
+          position_ids: request.positions
+          attention_mask: request.attention
+          output_projection: request.output_projection
+          past_draft: request.draft_cache
+        outputs:
+          candidate_tokens: proposal.tokens
+          proposal_probabilities: proposal.probabilities
+          present_draft: proposal.present
+      - { kind: emit, value: target.scores, output: target_logits, mode: replace }
+    serving:
+      active: request.active
+      done: request.done
+      accepted_len: request.accepted_len
+      state_service:
+        groups:
+          target_cache:
+            kind: full_attention
+            sequence_axis: 1
+            layout: bsh
+            update: { kind: append }
+            capabilities: { rollback_positions: 3, snapshot: true, fork: true, cascade: [draft_cache, token_history, recurrent] }
+            ports:
+              verifier:
+                target_cache: { input: past_target, output: present_target }
+          draft_cache:
+            kind: full_attention
+            sequence_axis: 1
+            layout: bsh
+            update: { kind: append }
+            capabilities: { rollback_positions: 3, snapshot: true, fork: true, cascade: [target_cache, token_history, recurrent] }
+            ports:
+              parallel_adapter:
+                draft_cache: { input: past_draft, output: present_draft }
+          token_history:
+            kind: recurrent
+            sequence_axis: 1
+            layout: bs
+            update: { kind: append }
+            capabilities: { rollback_positions: 3, snapshot: true, fork: true, cascade: [target_cache, draft_cache, recurrent] }
+            ports:
+              verifier:
+                token_history: { input: token_history, output: present_tokens }
+          recurrent:
+            kind: recurrent
+            layout: bf
+            update: { kind: replace }
+            capabilities: { rollback_positions: 3, snapshot: true, fork: true, cascade: [target_cache, draft_cache, token_history] }
+            ports:
+              verifier:
+                recurrent: { input: recurrent, output: next_recurrent }
+speculative:
+  proposer: parallel_adapter
+  target: verifier
+  proposal_execution:
+    kind: dflash_flat_block
+    version: "1"
+    conditioning:
+      sources:
+        - { component: verifier, output: hidden_2 }
+        - { component: verifier, output: hidden_7 }
+        - { component: verifier, output: hidden_12 }
+      proposer_input: target_features
+      combination: { kind: concatenate, axis: 2 }
+    block:
+      noise_embeddings_input: noise_embeddings
+      masked_positions_input: masked_positions
+      position_ids_input: position_ids
+      attention_mask_input: attention_mask
+      anchor_position: 0
+      first_candidate_position: 1
+      mask_token_id: 10
+    outputs:
+      candidate_tokens: candidate_tokens
+      proposal_probabilities: proposal_probabilities
+      verifier_logits: { component: verifier, output: logits }
+    shared_weights:
+      input_embedding: { component: verifier, table: token_embedding }
+      output_projection:
+        component: verifier
+        initializer: missing_lm_head
+        proposer_input: output_projection
+        layout: hidden_vocabulary
+    draft_private_state: [draft_cache]
+    accepted_prefix_state:
+      target_cache: { kind: sequence, source: { component: verifier, output: present_target } }
+      draft_cache: { kind: sequence, source: { component: parallel_adapter, output: present_draft } }
+      token_history: { kind: sequence, source: { component: verifier, output: present_tokens } }
+      recurrent: { kind: prefix_snapshots, source: { component: verifier, output: recurrent_prefixes }, axis: 1 }
+    structure: { kind: base }
+  shared_weights: [token_embedding, missing_lm_head]
+  vocabulary: { kind: identical }
+  max_proposal_width: 3
+  distribution_preserving: true
+  rollback_state: [target_cache, draft_cache, token_history, recurrent]

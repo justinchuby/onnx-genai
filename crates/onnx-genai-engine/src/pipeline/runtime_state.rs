@@ -127,6 +127,8 @@ pub(crate) struct WorkflowPlan {
     pub(crate) device_bridge_components: HashSet<String>,
     pub(crate) memory_strategy_plan: MemoryStrategyPlan,
     pub(crate) decode_backend: EngineDecodeBackend,
+    /// Canonical construction-time decision reused by every execution entry.
+    pub(crate) execution_admission: super::WorkflowExecutionAdmission,
     pub(crate) adapter_service: Option<onnx_genai_metadata::AdapterServiceContract>,
     pub(crate) preprocessing: Option<PreprocessingSpec>,
     /// The package's speculative compatibility contract, when it declares one.
