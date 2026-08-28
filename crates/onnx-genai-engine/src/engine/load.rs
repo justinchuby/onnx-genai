@@ -194,8 +194,10 @@ impl Engine {
     /// decode core is the registered executor for
     /// `onnx-genai.autoregressive-decode`: one fused session that owns paged
     /// KV, the device sampling fast paths and a captured graph. It can stand in
-    /// for a declared decode step only when that step is the package's *whole*
-    /// graph, because it loads one model directory and holds one session.
+    /// for a declared decode step only when that step is the package's whole
+    /// workflow graph. A canonical MTP proposer is excluded from that count
+    /// because the speculative driver, not the workflow interpreter, executes
+    /// it.
     ///
     /// It does not re-derive that shape. `contracted_single_decoder` is layer 2
     /// of the one classification in `onnx-genai-metadata`: layer 1 (this
@@ -210,10 +212,36 @@ impl Engine {
     /// the package names. There is no second generation path either way — only
     /// a faster executor for one declared step, when that step is one this
     /// runtime registered an executor for.
-    fn decode_core_covers(workflow: &onnx_genai_metadata::WorkflowSpec) -> bool {
-        onnx_genai_metadata::classify_workflow(workflow)
+    fn decode_core_covers(
+        workflow: &onnx_genai_metadata::WorkflowSpec,
+        speculative: Option<&onnx_genai_metadata::SpeculativeContract>,
+    ) -> bool {
+        if onnx_genai_metadata::classify_workflow(workflow)
             .contracted_single_decoder()
             .is_some()
+        {
+            return true;
+        }
+        let Some(speculative) = speculative else {
+            return false;
+        };
+        if !matches!(
+            speculative.proposal_execution,
+            onnx_genai_metadata::SpeculativeProposalExecution::Mtp { .. }
+        ) {
+            return false;
+        }
+
+        let mut target_workflow = workflow.clone();
+        if target_workflow
+            .components
+            .remove(&speculative.proposer)
+            .is_none()
+        {
+            return false;
+        }
+        onnx_genai_metadata::classify_workflow(&target_workflow).contracted_single_decoder()
+            == Some(speculative.target.as_str())
     }
 
     /// Freeze the immutable resources needed by additional ORT workers.
@@ -307,15 +335,15 @@ impl Engine {
         })
     }
 
-    /// The workflow a package declares, read from the package.
+    /// Whether the decode core covers the workflow the package declares.
     ///
     /// Nothing is synthesized: a package from before the workflow existed is
     /// refused rather than repaired, because inventing one at load would mean
     /// the package on disk says one thing and the runtime executes another.
-    pub(crate) fn declared_workflow(
+    pub(crate) fn decode_core_covers_declared_workflow(
         model_dir: &Path,
         backend: EngineDecodeBackend,
-    ) -> anyhow::Result<onnx_genai_metadata::WorkflowSpec> {
+    ) -> anyhow::Result<bool> {
         // An authored package answers from its own metadata. Only a package
         // that ships none needs the `genai_config.json` importer, which converts
         // that foreign format into this project's one representation — and which
@@ -343,13 +371,21 @@ impl Engine {
                     }
                     Err(error) => return Err(anyhow::anyhow!("{error}")),
                 };
-            return Ok(directory.spec.workflow);
+            let workflow = directory.spec.workflow;
+            let decode_core_covers = Self::decode_core_covers(
+                &workflow,
+                directory
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.speculative.as_ref()),
+            );
+            return Ok(decode_core_covers);
         } else {
             onnx_genai_ort::ModelDirectory::load(model_dir)
                 .ok()
                 .and_then(|directory| load_inference_metadata(&directory).ok())
         };
-        metadata
+        let workflow = metadata
             .as_ref()
             .and_then(|metadata| metadata.pipeline.as_ref())
             .map(|pipeline| pipeline.workflow.clone())
@@ -365,7 +401,13 @@ impl Engine {
                     model_dir.display(),
                     model_dir.display()
                 )
-            })
+            })?;
+        Ok(Self::decode_core_covers(
+            &workflow,
+            metadata
+                .as_ref()
+                .and_then(|metadata| metadata.speculative.as_ref()),
+        ))
     }
 
     /// Adopt the package's declared workflow as the one this runtime executes.
@@ -430,8 +472,7 @@ impl Engine {
     /// executor for the package's declared decode step, which is a question
     /// about the contract that step names.
     pub fn from_dir(model_dir: &Path, config: EngineConfig) -> anyhow::Result<Self> {
-        let workflow = Self::declared_workflow(model_dir, config.decode_backend)?;
-        if !Self::decode_core_covers(&workflow) {
+        if !Self::decode_core_covers_declared_workflow(model_dir, config.decode_backend)? {
             return Self::from_interpreted_dir(model_dir, config, SessionOptions::default(), None);
         }
         Self::from_dir_impl(model_dir, config, SessionOptions::default(), false, None)
@@ -443,8 +484,7 @@ impl Engine {
         config: EngineConfig,
         provider: Arc<dyn MemoryAuthorityProvider>,
     ) -> anyhow::Result<Self> {
-        let workflow = Self::declared_workflow(model_dir, config.decode_backend)?;
-        if !Self::decode_core_covers(&workflow) {
+        if !Self::decode_core_covers_declared_workflow(model_dir, config.decode_backend)? {
             return Self::from_interpreted_dir(
                 model_dir,
                 config,
@@ -467,8 +507,7 @@ impl Engine {
         config: EngineConfig,
         session_options: SessionOptions,
     ) -> anyhow::Result<Self> {
-        let workflow = Self::declared_workflow(model_dir, config.decode_backend)?;
-        if !Self::decode_core_covers(&workflow) {
+        if !Self::decode_core_covers_declared_workflow(model_dir, config.decode_backend)? {
             return Self::from_interpreted_dir(model_dir, config, session_options, None);
         }
         Self::from_dir_impl(model_dir, config, session_options, true, None)
@@ -3576,7 +3615,7 @@ mod decode_core_coverage_tests {
         ));
 
         for (name, workflow) in corpus {
-            if Engine::decode_core_covers(&workflow) {
+            if Engine::decode_core_covers(&workflow, None) {
                 assert!(
                     onnx_genai_metadata::is_single_decoder_workflow(&workflow),
                     "{name}: the loader chose the fused executor for a package the metadata, CLI \
@@ -3595,7 +3634,7 @@ mod decode_core_coverage_tests {
     fn the_loader_declines_a_decode_contract_with_no_roles() {
         let mut workflow = single_decoder_workflow();
         assert!(
-            Engine::decode_core_covers(&workflow),
+            Engine::decode_core_covers(&workflow, None),
             "the unmodified fixture is exactly what the decode core covers",
         );
         workflow
@@ -3605,7 +3644,7 @@ mod decode_core_coverage_tests {
             .ports
             .roles = std::collections::BTreeMap::new();
         assert!(
-            !Engine::decode_core_covers(&workflow),
+            !Engine::decode_core_covers(&workflow, None),
             "a component naming the decode step without the roles that resolve its ABI must not \
              be handed to the fused executor",
         );

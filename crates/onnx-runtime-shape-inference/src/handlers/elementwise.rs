@@ -107,6 +107,9 @@ pub fn where_op(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
 /// an exactly-representable result for every element.
 fn binary_shape_data(op: &str, a: Option<&ShapeData>, b: Option<&ShapeData>) -> Option<ShapeData> {
     let (a, b) = (a?, b?);
+    if a.float_elems.is_some() || b.float_elems.is_some() {
+        return None;
+    }
     let apply = |x: &DimExpr, y: &DimExpr| -> Option<DimExpr> {
         match op {
             "Add" => Some(x.add(y)),
@@ -130,20 +133,20 @@ fn binary_shape_data(op: &str, a: Option<&ShapeData>, b: Option<&ShapeData>) -> 
                 .collect::<Option<Vec<_>>>()?
         }
         (false, true) => {
-            let y = &b.elems[0];
+            let y = b.elems.first()?;
             a.elems
                 .iter()
                 .map(|x| apply(x, y))
                 .collect::<Option<Vec<_>>>()?
         }
         (true, false) => {
-            let x = &a.elems[0];
+            let x = a.elems.first()?;
             b.elems
                 .iter()
                 .map(|y| apply(x, y))
                 .collect::<Option<Vec<_>>>()?
         }
-        (true, true) => vec![apply(&a.elems[0], &b.elems[0])?],
+        (true, true) => vec![apply(a.elems.first()?, b.elems.first()?)?],
     };
     let dims = if a.is_scalar() && b.is_scalar() {
         Vec::new()
@@ -246,5 +249,20 @@ pub fn register(reg: &mut InferenceRegistry) {
     // com.microsoft elementwise activations (shape-preserving).
     for op in ["Gelu", "FastGelu", "BiasGelu", "QuickGelu", "Silu"] {
         reg.register("com.microsoft", op, 1, unary);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use onnx_runtime_ir::DataType;
+
+    #[test]
+    fn shape_data_arithmetic_ignores_float_side_channels() {
+        let float = ShapeData::float_scalar(DataType::Float32, 1.0);
+        let integer = ShapeData::scalar(DataType::Int64, DimExpr::constant(2));
+
+        assert_eq!(binary_shape_data("Add", Some(&float), Some(&integer)), None);
+        assert_eq!(binary_shape_data("Add", Some(&integer), Some(&float)), None);
     }
 }

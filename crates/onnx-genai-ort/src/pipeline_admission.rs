@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use onnx_genai_metadata::{PipelineSpec, TensorDimension};
 use onnx_runtime_loader::proto::onnx::{ValueInfoProto, tensor_shape_proto, type_proto};
-use onnx_std::ir::{DataType, Dim};
+use onnx_std::ir::DataType;
 
 use crate::{OrtError, Result};
 
@@ -631,7 +631,7 @@ fn inspect_component_signatures(
 }
 
 fn inspect_component_signature(component: &str, path: &Path) -> Result<ComponentSignature> {
-    let model = if path
+    let bytes = if path
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("textproto"))
     {
@@ -642,7 +642,7 @@ fn inspect_component_signature(component: &str, path: &Path) -> Result<Component
                 format!("the ONNX textproto could not be read: {error}"),
             )
         })?;
-        onnx_std::textproto::from_textproto(&text).map_err(|error| {
+        onnx_runtime_loader::proto::textproto_to_binary(&text).map_err(|error| {
             component_inspection_error(
                 component,
                 path,
@@ -650,22 +650,19 @@ fn inspect_component_signature(component: &str, path: &Path) -> Result<Component
             )
         })
     } else {
-        onnx_std::load_model(path).map_err(|error| {
+        std::fs::read(path).map_err(|error| {
             component_inspection_error(
                 component,
                 path,
-                format!("the ONNX model could not be loaded: {error}"),
+                format!("the ONNX model could not be read: {error}"),
             )
         })
     }?;
-    // Admission must inspect the retained protobuf before scanning the execution
-    // projection: graph_builder.rs:118-121 and 143-147 intentionally omit empty
-    // GraphProto input/output names from the loaded IR.
-    let source_proto = model.to_proto().map_err(|error| {
+    let source_proto = onnx_runtime_loader::proto::decode_model(&bytes).map_err(|error| {
         component_inspection_error(
             component,
             path,
-            format!("the retained ONNX protobuf could not be inspected: {error}"),
+            format!("the ONNX protobuf could not be decoded: {error}"),
         )
     })?;
     let source_graph = source_proto.graph.as_ref().ok_or_else(|| {
@@ -736,26 +733,11 @@ fn inspect_component_signature(component: &str, path: &Path) -> Result<Component
             .insert(name, raw_input_signature(component, path, input)?);
     }
 
-    for output in &model.graph.outputs {
-        let value = model.graph.value(*output);
-        let name = value
-            .name
-            .clone()
-            .expect("validated GraphProto output names survive loader projection");
-        signature.outputs.insert(
-            name,
-            PortSignature {
-                dtype: value.dtype,
-                shape: value
-                    .shape
-                    .iter()
-                    .map(|dimension| match dimension {
-                        Dim::Static(value) => PortDimension::Static(*value),
-                        Dim::Symbolic(_) => PortDimension::Dynamic,
-                    })
-                    .collect(),
-            },
-        );
+    for output in &source_graph.output {
+        let name = output.name.clone();
+        signature
+            .outputs
+            .insert(name, raw_port_signature(component, path, output, "output")?);
     }
 
     Ok(signature)
@@ -798,11 +780,20 @@ fn raw_input_signature(
     path: &Path,
     input: &ValueInfoProto,
 ) -> Result<PortSignature> {
-    let tensor = input
+    raw_port_signature(component, path, input, "input")
+}
+
+fn raw_port_signature(
+    component: &str,
+    path: &Path,
+    value: &ValueInfoProto,
+    direction: &str,
+) -> Result<PortSignature> {
+    let tensor = value
         .r#type
         .as_ref()
-        .and_then(|input_type| input_type.value.as_ref())
-        .and_then(|input_type| match input_type {
+        .and_then(|value_type| value_type.value.as_ref())
+        .and_then(|value_type| match value_type {
             type_proto::Value::TensorType(tensor) => Some(tensor),
             _ => None,
         })
@@ -811,8 +802,8 @@ fn raw_input_signature(
                 component,
                 path,
                 format!(
-                    "ONNX graph input '{}' does not declare a tensor type",
-                    input.name
+                    "ONNX graph {direction} '{}' does not declare a tensor type",
+                    value.name
                 ),
             )
         })?;
@@ -821,8 +812,8 @@ fn raw_input_signature(
             component,
             path,
             format!(
-                "ONNX graph input '{}' declares unsupported tensor dtype {}",
-                input.name, tensor.elem_type
+                "ONNX graph {direction} '{}' declares unsupported tensor dtype {}",
+                value.name, tensor.elem_type
             ),
         )
     })?;
