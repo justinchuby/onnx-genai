@@ -1240,6 +1240,23 @@ features. Its contract declares conditioning, masked candidate positions,
 draft-private state, candidate tokens, proposal probabilities, immutable weight
 sharing, and accepted-prefix rollback for target and draft state.
 
+The built-in structural identities are exact:
+
+- `dflash_flat_block` version `"1"` is base DFlash: one verifier-produced
+  anchor followed by masked positions predicted in parallel. Target hidden
+  outputs are named with component/output provenance and concatenation axis;
+  the target embedding and output projection are immutable initializer
+  relationships, not copied proposer weights.
+- version `"2"` is the selector/convolution form. It declares the selected
+  path, top-k candidate ids, conditional probabilities, selector rank/top-k,
+  grouped convolution kernel/group sizes, and the anchor predecessor rule.
+  Merely finding optional tensors or familiar names never upgrades version 1.
+
+Every mutable proposer/target state-service alias belongs to the one
+`rollback_state` participant set. `accepted_prefix_state` gives exactly one
+commit mechanism for each member: sequence-axis truncation, or an explicit
+per-prefix snapshot output for fixed recurrent/convolution state.
+
 The target verifies candidates exactly. Greedy execution accepts the longest
 matching prefix; sampling is permitted only when the declared proposal
 probabilities support distribution-preserving correction. EOS, context limits,
@@ -1251,6 +1268,15 @@ rows in isolation without changing DFlash conformance. Candidate-tree proposals
 are independent typed forms and neither block nor redefine DFlash; a DFlash
 variant with additional selector or convolution semantics requires its own
 versioned contract.
+
+The executable Qwen3.8-27B reference fixture takes the published DFlash 2
+checkpoint geometry as its source (block size 8, five target taps
+5/19/33/47/61, five drafter layers), and exercises the common base flow:
+target-feature injection, shared embedding and LM head, and parallel block
+prediction. It deliberately declares version 1 and does not claim the version-2
+selector/convolution extension. Vocabulary, hidden width, and learned tensors
+are reduced deterministically; this is structural/equation conformance, not
+official-weight numerical parity.
 
 ---
 

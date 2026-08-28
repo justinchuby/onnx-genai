@@ -379,12 +379,69 @@ impl Engine {
         Some(&*self.workflow).and_then(WorkflowRuntime::speculative_contract)
     }
 
+    pub fn dflash_diagnostic(&self) -> Option<crate::pipeline::speculative::DFlashDiagnostic> {
+        self.workflow_runtime().dflash_diagnostic()
+    }
+
     pub fn propose_chained(
         &self,
         run: &PipelineTensors,
         options: crate::pipeline::speculative::ChainedProposalOptions,
     ) -> anyhow::Result<crate::pipeline::speculative::ChainedProposal> {
         self.workflow_runtime().propose_chained(run, options)
+    }
+
+    pub fn propose_dflash(
+        &self,
+        run: &PipelineTensors,
+        options: crate::pipeline::speculative::DFlashProposalOptions,
+    ) -> anyhow::Result<crate::pipeline::speculative::DFlashProposal> {
+        self.workflow_runtime().propose_dflash(run, options)
+    }
+
+    pub fn verify_dflash(
+        &self,
+        verified: &PipelineTensors,
+        proposal: &crate::pipeline::speculative::DFlashProposal,
+        mode: crate::pipeline::speculative::DFlashVerificationMode,
+    ) -> anyhow::Result<crate::pipeline::speculative::DFlashAcceptance> {
+        self.workflow_runtime()
+            .verify_dflash(verified, proposal, mode)
+    }
+
+    pub fn begin_dflash_state_transaction(
+        &self,
+        current: &PipelineTensors,
+    ) -> anyhow::Result<crate::pipeline::speculative::DFlashStateTransaction> {
+        self.workflow_runtime()
+            .begin_dflash_state_transaction(current)
+    }
+
+    pub fn commit_dflash_state_transaction(
+        &self,
+        transaction: crate::pipeline::speculative::DFlashStateTransaction,
+        current: &mut PipelineTensors,
+        proposal: &crate::pipeline::speculative::DFlashProposal,
+        verified: &PipelineTensors,
+        acceptance: &crate::pipeline::speculative::DFlashAcceptance,
+    ) -> anyhow::Result<crate::pipeline::TurnTransactionOutcome> {
+        self.workflow_runtime().commit_dflash_state_transaction(
+            transaction,
+            current,
+            proposal,
+            verified,
+            acceptance,
+        )
+    }
+
+    pub fn abort_dflash_state_transaction(
+        &self,
+        transaction: crate::pipeline::speculative::DFlashStateTransaction,
+        current: &mut PipelineTensors,
+        reason: crate::pipeline::TurnAbortReason,
+    ) -> anyhow::Result<crate::pipeline::TurnTransactionOutcome> {
+        self.workflow_runtime()
+            .abort_dflash_state_transaction(transaction, current, reason)
     }
 
     pub fn accept_chained_proposal(

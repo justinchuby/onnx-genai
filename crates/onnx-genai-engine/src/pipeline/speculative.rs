@@ -31,10 +31,12 @@ use std::collections::BTreeMap;
 
 use anyhow::Context as _;
 use onnx_genai_metadata::{
-    SpeculativeContract, SpeculativeProposalExecution, SpeculativeRecurrenceBinding,
-    StatePortAccess, WorkflowSpec, WorkflowStep,
+    DFlashStateCommit, DFlashStructure, SpeculativeContract, SpeculativeProposalExecution,
+    SpeculativeRecurrenceBinding, StatePortAccess, WorkflowSpec, WorkflowStep,
 };
 use onnx_genai_ort::{DataType, Value};
+use rand::rngs::StdRng;
+use rand::{Rng as _, SeedableRng as _};
 
 use super::{PipelineTensors, WorkflowRuntime};
 
@@ -87,6 +89,217 @@ pub struct ChainedProposalOptions {
     pub width: usize,
 }
 
+/// One DFlash flat-block proposal.
+pub struct DFlashProposal {
+    /// Candidate tokens after the verifier-produced anchor.
+    pub tokens: Vec<i64>,
+    /// Proposal distribution required by rejection sampling.
+    pub probabilities: Option<DFlashProposalProbabilities>,
+    /// Proposer outputs retained for accepted-prefix draft-state commit.
+    proposer_outputs: PipelineTensors,
+    verification_seed: u64,
+}
+
+impl std::fmt::Debug for DFlashProposal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DFlashProposal")
+            .field("tokens", &self.tokens)
+            .field("probabilities", &self.probabilities)
+            .field(
+                "proposer_outputs",
+                &self.proposer_outputs.keys().collect::<Vec<_>>(),
+            )
+            .finish()
+    }
+}
+
+/// Exact proposal-distribution representation emitted by a DFlash contract.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DFlashProposalProbabilities {
+    /// One full target-vocabulary distribution per proposed position.
+    FullVocabulary {
+        values: Vec<f32>,
+        proposal: usize,
+        vocabulary: usize,
+    },
+    /// DFlash 2 selector distribution over explicitly emitted candidate ids.
+    SparseCandidates {
+        candidate_ids: Vec<i64>,
+        values: Vec<f32>,
+        proposal: usize,
+        candidates: usize,
+        vocabulary: usize,
+    },
+}
+
+impl DFlashProposalProbabilities {
+    fn proposal_len(&self) -> usize {
+        match self {
+            Self::FullVocabulary { proposal, .. } | Self::SparseCandidates { proposal, .. } => {
+                *proposal
+            }
+        }
+    }
+
+    fn vocabulary(&self) -> usize {
+        match self {
+            Self::FullVocabulary { vocabulary, .. } | Self::SparseCandidates { vocabulary, .. } => {
+                *vocabulary
+            }
+        }
+    }
+
+    fn row(&self, position: usize) -> anyhow::Result<Vec<f32>> {
+        match self {
+            Self::FullVocabulary {
+                values,
+                proposal,
+                vocabulary,
+            } => {
+                anyhow::ensure!(
+                    position < *proposal,
+                    "proposal probability row {position} is outside {proposal} positions"
+                );
+                let start = position * vocabulary;
+                Ok(values[start..start + vocabulary].to_vec())
+            }
+            Self::SparseCandidates {
+                candidate_ids,
+                values,
+                proposal,
+                candidates,
+                vocabulary,
+            } => {
+                anyhow::ensure!(
+                    position < *proposal,
+                    "proposal probability row {position} is outside {proposal} positions"
+                );
+                let mut dense = vec![0.0f32; *vocabulary];
+                let start = position * candidates;
+                for (&token, &probability) in candidate_ids[start..start + candidates]
+                    .iter()
+                    .zip(&values[start..start + candidates])
+                {
+                    let token = usize::try_from(token)
+                        .ok()
+                        .filter(|token| *token < *vocabulary)
+                        .with_context(|| {
+                            format!(
+                                "DFlash sparse candidate token {token} at proposal position \
+                                 {position} is outside vocabulary {vocabulary}"
+                            )
+                        })?;
+                    dense[token] += probability;
+                }
+                Ok(dense)
+            }
+        }
+    }
+
+    fn truncate(&mut self, proposal_len: usize) {
+        match self {
+            Self::FullVocabulary {
+                values,
+                proposal,
+                vocabulary,
+            } => {
+                *proposal = proposal_len.min(*proposal);
+                values.truncate(*proposal * *vocabulary);
+            }
+            Self::SparseCandidates {
+                candidate_ids,
+                values,
+                proposal,
+                candidates,
+                ..
+            } => {
+                *proposal = proposal_len.min(*proposal);
+                candidate_ids.truncate(*proposal * *candidates);
+                values.truncate(*proposal * *candidates);
+            }
+        }
+    }
+}
+
+/// Runtime-selected DFlash proposal mode.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DFlashProposalMode {
+    Greedy,
+    Sampling { seed: u64 },
+}
+
+/// Request-local values needed to materialize one DFlash block.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DFlashProposalOptions {
+    /// Verifier-produced token at block position zero.
+    pub anchor_token: i64,
+    /// Number of masked candidate positions to predict.
+    pub width: usize,
+    /// Absolute position of the first target-hidden context row.
+    pub context_start_position: i64,
+    /// Candidate selection mode.
+    pub mode: DFlashProposalMode,
+    /// EOS ids crop the proposal at the first EOS, inclusive.
+    pub eos_token_ids: Vec<i64>,
+}
+
+/// Result of exact target verification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DFlashAcceptance {
+    /// Proposed positions accepted before correction/bonus.
+    pub accepted: usize,
+    /// First rejected proposal position, absent on full acceptance.
+    pub rejected_at: Option<usize>,
+    /// Accepted proposal prefix followed by the target correction or bonus.
+    pub committed: Vec<i64>,
+}
+
+impl DFlashAcceptance {
+    pub fn requires_rollback(&self) -> bool {
+        self.rejected_at.is_some()
+    }
+}
+
+/// Sampling parameters for exact DFlash verification.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DFlashVerificationMode {
+    Greedy,
+    Sampling { temperature: f32 },
+}
+
+/// Inspectable DFlash admission facts. This reports the contract the package
+/// declared; it contains no scheduling, kernel, or proposal-budget policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DFlashDiagnostic {
+    pub version: String,
+    pub proposer: String,
+    pub target: String,
+    pub target_hidden_sources: Vec<String>,
+    pub max_proposal_width: usize,
+    pub proposal_probabilities: bool,
+    pub rollback_participants: Vec<String>,
+    pub draft_private_state: Vec<String>,
+    pub structure: &'static str,
+    pub shared_batching_supported: bool,
+}
+
+/// S3 transaction participant for target, draft-private, recurrent, and
+/// token-context state advanced by one DFlash block.
+pub struct DFlashStateTransaction {
+    turn: super::TurnTransaction,
+    baseline: PipelineTensors,
+}
+
+impl std::fmt::Debug for DFlashStateTransaction {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DFlashStateTransaction")
+            .field("states", &self.baseline.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
 /// Resolved, contract-derived view of a chained proposal execution.
 #[derive(Debug)]
 struct ChainedPlan<'a> {
@@ -108,6 +321,102 @@ struct ChainedPlan<'a> {
     /// Overrides `proposer_bindings` for exactly those ports: see
     /// [`borrowed_state_bindings`].
     borrowed_state: BTreeMap<String, String>,
+}
+
+#[derive(Debug)]
+struct DFlashPlan<'a> {
+    contract: &'a SpeculativeContract,
+    version: &'a str,
+    conditioning: &'a onnx_genai_metadata::DFlashConditioning,
+    block: &'a onnx_genai_metadata::DFlashBlockLayout,
+    outputs: &'a onnx_genai_metadata::DFlashOutputs,
+    shared_weights: &'a onnx_genai_metadata::DFlashSharedWeights,
+    accepted_prefix_state: &'a BTreeMap<String, DFlashStateCommit>,
+    structure: &'a DFlashStructure,
+    proposer_bindings: BTreeMap<String, String>,
+    proposer_outputs: BTreeMap<String, String>,
+    target_outputs: BTreeMap<String, String>,
+}
+
+impl<'a> DFlashPlan<'a> {
+    fn resolve(contract: &'a SpeculativeContract, workflow: &WorkflowSpec) -> anyhow::Result<Self> {
+        let SpeculativeProposalExecution::DflashFlatBlock {
+            version,
+            conditioning,
+            block,
+            outputs,
+            shared_weights,
+            accepted_prefix_state,
+            structure,
+            ..
+        } = &contract.proposal_execution
+        else {
+            anyhow::bail!(
+                "speculative.proposal_execution is not dflash_flat_block; candidate-tree, \
+                 chained, and generic block contracts are independent proposal forms"
+            );
+        };
+        match (version.as_str(), structure.as_ref()) {
+            ("1", DFlashStructure::Base) | ("2", DFlashStructure::SelectorConvolutionV1 { .. }) => {
+            }
+            _ => anyhow::bail!(
+                "unsupported DFlash flat-block contract version/structure {version}/{structure:?}; \
+                 supported pairs are 1/base and 2/selector_convolution_v1"
+            ),
+        }
+        let (proposer_bindings, proposer_outputs) =
+            component_invocation(workflow, &contract.proposer).with_context(|| {
+                format!(
+                    "DFlash proposer '{}' is never invoked by the workflow, so its explicit \
+                     bindings cannot be resolved",
+                    contract.proposer
+                )
+            })?;
+        let (_, target_outputs) =
+            component_invocation(workflow, &contract.target).with_context(|| {
+                format!(
+                    "DFlash target '{}' is never invoked by the workflow, so hidden and verifier \
+                     outputs cannot be resolved",
+                    contract.target
+                )
+            })?;
+        Ok(Self {
+            contract,
+            version,
+            conditioning,
+            block,
+            outputs,
+            shared_weights,
+            accepted_prefix_state,
+            structure,
+            proposer_bindings,
+            proposer_outputs,
+            target_outputs,
+        })
+    }
+
+    fn source_value_name(&self, source: &onnx_genai_metadata::SpeculativeValueRef) -> Option<&str> {
+        if source.component == self.contract.proposer {
+            self.proposer_outputs
+                .get(&source.output)
+                .map(String::as_str)
+        } else if source.component == self.contract.target {
+            self.target_outputs.get(&source.output).map(String::as_str)
+        } else {
+            None
+        }
+    }
+
+    fn has_sampling_probabilities(&self) -> bool {
+        if self.outputs.proposal_probabilities.is_some() {
+            return true;
+        }
+        matches!(
+            self.structure,
+            DFlashStructure::SelectorConvolutionV1 { selector, .. }
+                if selector.conditional_probabilities_output.is_some()
+        )
+    }
 }
 
 /// Proposer ports that are read-only views of another component's state.
@@ -196,6 +505,848 @@ impl WorkflowRuntime {
     /// The package's speculative compatibility contract, when it declares one.
     pub fn speculative_contract(&self) -> Option<&SpeculativeContract> {
         self.plan.speculative.as_ref()
+    }
+
+    pub fn dflash_diagnostic(&self) -> Option<DFlashDiagnostic> {
+        let contract = self.plan.speculative.as_ref()?;
+        let SpeculativeProposalExecution::DflashFlatBlock {
+            version,
+            conditioning,
+            outputs,
+            draft_private_state,
+            structure,
+            ..
+        } = &contract.proposal_execution
+        else {
+            return None;
+        };
+        Some(DFlashDiagnostic {
+            version: version.clone(),
+            proposer: contract.proposer.clone(),
+            target: contract.target.clone(),
+            target_hidden_sources: conditioning
+                .sources
+                .iter()
+                .map(|source| format!("{}::{}", source.component, source.output))
+                .collect(),
+            max_proposal_width: contract.max_proposal_width,
+            proposal_probabilities: outputs.proposal_probabilities.is_some()
+                || matches!(
+                    structure.as_ref(),
+                    DFlashStructure::SelectorConvolutionV1 { selector, .. }
+                        if selector.conditional_probabilities_output.is_some()
+                ),
+            rollback_participants: contract.rollback_state.iter().cloned().collect(),
+            draft_private_state: draft_private_state.iter().cloned().collect(),
+            structure: match structure.as_ref() {
+                DFlashStructure::Base => "base",
+                DFlashStructure::SelectorConvolutionV1 { .. } => "selector_convolution_v1",
+            },
+            shared_batching_supported: false,
+        })
+    }
+
+    /// Materialize one target-hidden-conditioned DFlash proposal block.
+    ///
+    /// Shared batching is intentionally not claimed: this path admits exactly
+    /// one request row and tells a batching caller to execute rows in isolation
+    /// before the proposer mutates draft-private state. The same contract and
+    /// component dispatch are used for every isolated row.
+    pub fn propose_dflash(
+        &self,
+        run: &PipelineTensors,
+        options: DFlashProposalOptions,
+    ) -> anyhow::Result<DFlashProposal> {
+        let contract = self
+            .plan
+            .speculative
+            .as_ref()
+            .context("package declares no speculative contract")?;
+        let plan = DFlashPlan::resolve(contract, &self.plan.workflow)?;
+        anyhow::ensure!(
+            options.width >= 1,
+            "DFlash proposal width must be at least 1"
+        );
+        anyhow::ensure!(
+            options.width <= contract.max_proposal_width,
+            "requested DFlash proposal width {} exceeds max_proposal_width {}",
+            options.width,
+            contract.max_proposal_width
+        );
+        if matches!(options.mode, DFlashProposalMode::Sampling { .. }) {
+            anyhow::ensure!(
+                plan.has_sampling_probabilities(),
+                "DFlash sampling requires declared proposal probabilities, but contract \
+                 version {} exposes neither full-vocabulary probabilities nor a DFlash 2 \
+                 selector distribution; use greedy execution or re-export the proposer",
+                plan.version
+            );
+        }
+
+        let proposer = self
+            .plan
+            .workflow
+            .components
+            .get(&contract.proposer)
+            .expect("metadata validation admitted the proposer");
+        let residency = self.component_execution_residency()?;
+        let ops = super::device_ops::tensor_ops_for_residency(residency)?;
+
+        let mut hidden_sources = Vec::with_capacity(plan.conditioning.sources.len());
+        let mut batch = None;
+        let mut context = None;
+        let mut hidden_total = 0usize;
+        let mut hidden_dtype = None;
+        for source in &plan.conditioning.sources {
+            let value_name = plan.target_outputs.get(&source.output).with_context(|| {
+                format!(
+                    "DFlash conditioning source {}::{} has no workflow output binding",
+                    source.component, source.output
+                )
+            })?;
+            let value = run.get(value_name).with_context(|| {
+                format!(
+                    "DFlash conditioning source {}::{} expects workflow value '{value_name}', \
+                     which the target pass did not produce",
+                    source.component, source.output
+                )
+            })?;
+            let shape = value.shape();
+            anyhow::ensure!(
+                shape.len() == 3,
+                "DFlash conditioning source {}::{} has shape {shape:?}; expected \
+                 [batch, sequence, hidden]",
+                source.component,
+                source.output
+            );
+            let source_batch = usize::try_from(shape[0]).context("negative DFlash batch extent")?;
+            let source_context =
+                usize::try_from(shape[1]).context("negative DFlash context extent")?;
+            let source_hidden =
+                usize::try_from(shape[2]).context("negative DFlash hidden extent")?;
+            if let Some(expected) = batch {
+                anyhow::ensure!(
+                    source_batch == expected,
+                    "DFlash conditioning source {}::{} has batch {source_batch}, expected \
+                     {expected}",
+                    source.component,
+                    source.output
+                );
+            } else {
+                batch = Some(source_batch);
+            }
+            if let Some(expected) = context {
+                anyhow::ensure!(
+                    source_context == expected,
+                    "DFlash conditioning source {}::{} has sequence {source_context}, expected \
+                     {expected}",
+                    source.component,
+                    source.output
+                );
+            } else {
+                context = Some(source_context);
+            }
+            if let Some(expected) = hidden_dtype {
+                anyhow::ensure!(
+                    value.dtype() == expected,
+                    "DFlash conditioning source {}::{} has {:?}, expected {expected:?}; \
+                     concatenate inputs must share one tensor currency",
+                    source.component,
+                    source.output,
+                    value.dtype()
+                );
+            } else {
+                hidden_dtype = Some(value.dtype());
+            }
+            hidden_total = hidden_total
+                .checked_add(source_hidden)
+                .context("DFlash conditioning hidden width overflow")?;
+            hidden_sources.push(ops.adopt(value).with_context(|| {
+                format!(
+                    "bring DFlash conditioning source {}::{} onto {residency}",
+                    source.component, source.output
+                )
+            })?);
+        }
+        let batch = batch.context("DFlash declares no target hidden conditioning sources")?;
+        let context = context.context("DFlash target hidden context is unavailable")?;
+        anyhow::ensure!(
+            batch == 1,
+            "shared DFlash proposal batching is not supported for batch {batch}; decline the \
+             shared optimization before mutation and execute each request row in isolation"
+        );
+        anyhow::ensure!(
+            context > 0,
+            "DFlash conditioning requires at least one accepted target-hidden position"
+        );
+        let hidden_dtype = hidden_dtype.expect("a non-empty source list has a dtype");
+        let conditioning = ops.zeros(
+            &[
+                i64::try_from(batch).context("DFlash batch exceeds i64")?,
+                i64::try_from(context).context("DFlash context exceeds i64")?,
+                i64::try_from(hidden_total).context("DFlash hidden width exceeds i64")?,
+            ],
+            hidden_dtype,
+        )?;
+        let mut hidden_offset = 0usize;
+        for source in &hidden_sources {
+            ops.scatter_into_last_axis(&conditioning, hidden_offset, source)?;
+            hidden_offset += usize::try_from(
+                *source
+                    .shape()
+                    .last()
+                    .context("DFlash hidden source has rank zero")?,
+            )
+            .context("negative DFlash hidden width")?;
+        }
+
+        let block_len = proposer
+            .ports
+            .inputs
+            .get(&plan.block.noise_embeddings_input)
+            .and_then(|contract| contract.shape.get(1))
+            .and_then(|dimension| match dimension {
+                onnx_genai_metadata::TensorDimension::Fixed(extent) => {
+                    usize::try_from(*extent).ok()
+                }
+                onnx_genai_metadata::TensorDimension::Symbol(_)
+                | onnx_genai_metadata::TensorDimension::Any => None,
+            })
+            .with_context(|| {
+                format!(
+                    "DFlash proposer '{}' noise input '{}' must declare a fixed block extent; \
+                     proposal width is runtime policy within that structural capacity",
+                    contract.proposer, plan.block.noise_embeddings_input
+                )
+            })?;
+        anyhow::ensure!(
+            plan.block.first_candidate_position + options.width <= block_len,
+            "requested DFlash width {} does not fit declared block extent {block_len} with first \
+             candidate position {}",
+            options.width,
+            plan.block.first_candidate_position
+        );
+        let embedding =
+            self.embedding_table_resident(&plan.shared_weights.input_embedding, residency)?;
+        anyhow::ensure!(
+            options.anchor_token >= 0 && (options.anchor_token as usize) < embedding.vocab_size(),
+            "DFlash anchor token {} is outside shared target vocabulary {}",
+            options.anchor_token,
+            embedding.vocab_size()
+        );
+        anyhow::ensure!(
+            (plan.block.mask_token_id as usize) < embedding.vocab_size(),
+            "DFlash mask token {} is outside shared target vocabulary {}",
+            plan.block.mask_token_id,
+            embedding.vocab_size()
+        );
+        let mut noise_ids = vec![i64::from(plan.block.mask_token_id); block_len];
+        noise_ids[plan.block.anchor_position] = options.anchor_token;
+        let gathered = ops.gather_rows(embedding.value(), &noise_ids)?;
+        let noise_embeddings = alias_with_shape(
+            gathered,
+            &[
+                1,
+                i64::try_from(block_len).context("DFlash block length exceeds i64")?,
+                i64::try_from(embedding.hidden_size())
+                    .context("DFlash embedding width exceeds i64")?,
+            ],
+        )
+        .map_err(|error| anyhow::anyhow!("shape DFlash noise embeddings: {error}"))?;
+        let masked_positions = Value::from_raw_bytes(
+            (0..block_len)
+                .map(|position| u8::from(position >= plan.block.first_candidate_position))
+                .collect(),
+            &[1, block_len as i64],
+            DataType::Bool,
+        )?;
+        let total_positions = context
+            .checked_add(block_len)
+            .context("DFlash position length overflow")?;
+        let position_ids = Value::from_slice_i64(
+            &(0..total_positions)
+                .map(|offset| {
+                    options
+                        .context_start_position
+                        .checked_add(offset as i64)
+                        .context("DFlash absolute position overflow")
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?,
+            &[1, total_positions as i64],
+        )?;
+        let attention_contract = proposer
+            .ports
+            .inputs
+            .get(&plan.block.attention_mask_input)
+            .expect("metadata validation admitted the attention-mask input");
+        let attention_mask = match attention_contract.dtype.as_str() {
+            "bool" => Value::from_raw_bytes(
+                vec![1; total_positions],
+                &[1, total_positions as i64],
+                DataType::Bool,
+            )?,
+            "int64" => {
+                Value::from_slice_i64(&vec![1; total_positions], &[1, total_positions as i64])?
+            }
+            dtype => anyhow::bail!(
+                "DFlash attention mask port '{}' has unsupported dtype {dtype}; metadata \
+                 admission should have required bool or int64",
+                plan.block.attention_mask_input
+            ),
+        };
+        let output_projection = self.shared_initializer(&plan.shared_weights.output_projection)?;
+        let projection_shape = output_projection.shape();
+        let expected_projection = match plan.shared_weights.output_projection.layout {
+            onnx_genai_metadata::DFlashProjectionLayout::HiddenVocabulary => {
+                [embedding.hidden_size(), embedding.vocab_size()]
+            }
+            onnx_genai_metadata::DFlashProjectionLayout::VocabularyHidden => {
+                [embedding.vocab_size(), embedding.hidden_size()]
+            }
+        };
+        anyhow::ensure!(
+            projection_shape == [expected_projection[0] as i64, expected_projection[1] as i64],
+            "DFlash shared output projection '{}' has shape {projection_shape:?}, but layout \
+             {:?} and embedding [{}, {}] require [{}, {}]",
+            plan.shared_weights.output_projection.initializer,
+            plan.shared_weights.output_projection.layout,
+            embedding.vocab_size(),
+            embedding.hidden_size(),
+            expected_projection[0],
+            expected_projection[1]
+        );
+
+        let overridden = [
+            plan.conditioning.proposer_input.as_str(),
+            plan.block.noise_embeddings_input.as_str(),
+            plan.block.masked_positions_input.as_str(),
+            plan.block.position_ids_input.as_str(),
+            plan.block.attention_mask_input.as_str(),
+            plan.shared_weights
+                .output_projection
+                .proposer_input
+                .as_str(),
+        ]
+        .into_iter()
+        .collect::<std::collections::HashSet<_>>();
+        let mut owned_inputs = Vec::new();
+        for (port, value_name) in &plan.proposer_bindings {
+            if overridden.contains(port.as_str()) {
+                continue;
+            }
+            let value = run.get(value_name).with_context(|| {
+                format!(
+                    "DFlash proposer '{}' input '{port}' references unavailable workflow value \
+                     '{value_name}'",
+                    contract.proposer
+                )
+            })?;
+            owned_inputs.push((port.clone(), clone_value(value)?));
+        }
+        owned_inputs.extend([
+            (plan.conditioning.proposer_input.clone(), conditioning),
+            (plan.block.noise_embeddings_input.clone(), noise_embeddings),
+            (plan.block.masked_positions_input.clone(), masked_positions),
+            (plan.block.position_ids_input.clone(), position_ids),
+            (plan.block.attention_mask_input.clone(), attention_mask),
+            (
+                plan.shared_weights.output_projection.proposer_input.clone(),
+                clone_value(&output_projection)?,
+            ),
+        ]);
+        let input_refs = owned_inputs
+            .iter()
+            .map(|(port, value)| (port.as_str(), value))
+            .collect::<Vec<_>>();
+        let produced = self.invoke_component_values(
+            &contract.proposer,
+            &input_refs,
+            &plan.proposer_outputs,
+            &std::collections::HashMap::new(),
+            1,
+        )?;
+        let mut proposer_outputs = PipelineTensors::new();
+        for (port, value) in produced {
+            proposer_outputs.insert(port, value);
+        }
+
+        let candidate_value = proposer_outputs
+            .get(&plan.outputs.candidate_tokens)
+            .with_context(|| {
+                format!(
+                    "DFlash proposer '{}' did not produce candidate_tokens output '{}'",
+                    contract.proposer, plan.outputs.candidate_tokens
+                )
+            })?;
+        let candidate_shape = candidate_value.shape();
+        anyhow::ensure!(
+            candidate_shape.len() == 2 && candidate_shape[0] == 1,
+            "DFlash candidate_tokens has shape {candidate_shape:?}; isolated execution requires \
+             [1, proposal]"
+        );
+        let proposal_extent =
+            usize::try_from(candidate_shape[1]).context("negative DFlash proposal extent")?;
+        anyhow::ensure!(
+            proposal_extent >= options.width,
+            "DFlash proposer produced {proposal_extent} candidates for requested width {}",
+            options.width
+        );
+        let mut tokens = candidate_value.to_vec_i64()?[..options.width].to_vec();
+        for (position, token) in tokens.iter().copied().enumerate() {
+            anyhow::ensure!(
+                token >= 0 && (token as usize) < embedding.vocab_size(),
+                "DFlash proposer emitted candidate token {token} at position {position}, outside \
+                 shared target vocabulary {}",
+                embedding.vocab_size()
+            );
+        }
+
+        let mut probabilities =
+            self.dflash_proposal_probabilities(&plan, &proposer_outputs, embedding.vocab_size())?;
+        if let Some(probabilities) = &probabilities {
+            anyhow::ensure!(
+                probabilities.proposal_len() >= options.width,
+                "DFlash proposer probabilities cover {} positions, requested {}",
+                probabilities.proposal_len(),
+                options.width
+            );
+            anyhow::ensure!(
+                probabilities.vocabulary() == embedding.vocab_size(),
+                "DFlash proposer probabilities use vocabulary {}, but the shared target \
+                 embedding declares {}",
+                probabilities.vocabulary(),
+                embedding.vocab_size()
+            );
+        }
+
+        let verification_seed = match options.mode {
+            DFlashProposalMode::Greedy => 0,
+            DFlashProposalMode::Sampling { seed } => {
+                let probabilities = probabilities
+                    .as_ref()
+                    .context("DFlash sampling passed admission without a proposal distribution")?;
+                let mut rng = StdRng::seed_from_u64(seed);
+                for (position, token) in tokens.iter_mut().enumerate() {
+                    let row = probabilities.row(position)?;
+                    *token = sample_probability_row(&row, rng.random())? as i64;
+                }
+                rng.random()
+            }
+        };
+
+        if let Some(position) = tokens
+            .iter()
+            .position(|token| options.eos_token_ids.contains(token))
+        {
+            tokens.truncate(position + 1);
+            if let Some(probabilities) = &mut probabilities {
+                probabilities.truncate(position + 1);
+            }
+        } else if let Some(probabilities) = &mut probabilities {
+            probabilities.truncate(options.width);
+        }
+
+        Ok(DFlashProposal {
+            tokens,
+            probabilities,
+            proposer_outputs,
+            verification_seed,
+        })
+    }
+
+    fn dflash_proposal_probabilities(
+        &self,
+        plan: &DFlashPlan<'_>,
+        outputs: &PipelineTensors,
+        vocabulary: usize,
+    ) -> anyhow::Result<Option<DFlashProposalProbabilities>> {
+        if let DFlashStructure::SelectorConvolutionV1 { selector, .. } = plan.structure {
+            let Some(probability_port) = &selector.conditional_probabilities_output else {
+                return Ok(None);
+            };
+            let ids = outputs
+                .get(&selector.candidate_ids_output)
+                .with_context(|| {
+                    format!(
+                        "DFlash 2 proposer did not produce selector candidate ids '{}'",
+                        selector.candidate_ids_output
+                    )
+                })?;
+            let probabilities = outputs.get(probability_port).with_context(|| {
+                format!(
+                    "DFlash 2 proposer did not produce selector conditional probabilities \
+                     '{probability_port}'"
+                )
+            })?;
+            let ids_shape = ids.shape();
+            let probability_shape = probabilities.shape();
+            anyhow::ensure!(
+                ids_shape == probability_shape
+                    && ids_shape.len() == 3
+                    && ids_shape[0] == 1
+                    && ids_shape[2] == selector.top_k as i64,
+                "DFlash 2 selector ids/probabilities must both be [1, proposal, top_k={}], got \
+                 {ids_shape:?} and {probability_shape:?}",
+                selector.top_k
+            );
+            let proposal =
+                usize::try_from(ids_shape[1]).context("negative DFlash 2 proposal extent")?;
+            let candidate_ids = ids.to_vec_i64()?;
+            let values = probabilities.to_vec_f32()?;
+            validate_probability_rows(&values, proposal, selector.top_k, probability_port)?;
+            return Ok(Some(DFlashProposalProbabilities::SparseCandidates {
+                candidate_ids,
+                values,
+                proposal,
+                candidates: selector.top_k,
+                vocabulary,
+            }));
+        }
+        if let Some(port) = &plan.outputs.proposal_probabilities {
+            let value = outputs.get(port).with_context(|| {
+                format!("DFlash proposer did not produce declared proposal probabilities '{port}'")
+            })?;
+            let shape = value.shape();
+            anyhow::ensure!(
+                shape.len() == 3 && shape[0] == 1,
+                "DFlash proposal probabilities '{port}' have shape {shape:?}; expected \
+                 [1, proposal, vocabulary]"
+            );
+            let proposal =
+                usize::try_from(shape[1]).context("negative DFlash proposal probability extent")?;
+            let declared_vocabulary = usize::try_from(shape[2])
+                .context("negative DFlash probability vocabulary extent")?;
+            anyhow::ensure!(
+                declared_vocabulary == vocabulary,
+                "DFlash proposal probabilities '{port}' declare vocabulary \
+                 {declared_vocabulary}, but shared target weights declare {vocabulary}"
+            );
+            let values = value.to_vec_f32()?;
+            validate_probability_rows(&values, proposal, vocabulary, port)?;
+            return Ok(Some(DFlashProposalProbabilities::FullVocabulary {
+                values,
+                proposal,
+                vocabulary,
+            }));
+        }
+        Ok(None)
+    }
+
+    /// Verify a DFlash proposal against the target's exact logits.
+    pub fn verify_dflash(
+        &self,
+        verified: &PipelineTensors,
+        proposal: &DFlashProposal,
+        mode: DFlashVerificationMode,
+    ) -> anyhow::Result<DFlashAcceptance> {
+        let contract = self
+            .plan
+            .speculative
+            .as_ref()
+            .context("package declares no speculative contract")?;
+        let plan = DFlashPlan::resolve(contract, &self.plan.workflow)?;
+        if matches!(mode, DFlashVerificationMode::Sampling { .. }) {
+            anyhow::ensure!(
+                proposal.probabilities.is_some(),
+                "DFlash sampling verification requires proposal probabilities; this proposal \
+                 carries none, so rejection sampling cannot preserve the target distribution"
+            );
+        }
+        let value_name = plan
+            .target_outputs
+            .get(&plan.outputs.verifier_logits.output)
+            .with_context(|| {
+                format!(
+                    "DFlash verifier logits output '{}::{}' has no workflow binding",
+                    plan.outputs.verifier_logits.component, plan.outputs.verifier_logits.output
+                )
+            })?;
+        let logits = verified.get(value_name).with_context(|| {
+            format!("DFlash verification pass did not produce target logits value '{value_name}'")
+        })?;
+        let shape = logits.shape();
+        anyhow::ensure!(
+            shape.len() == 3 && shape[0] == 1,
+            "DFlash verifier logits have shape {shape:?}; isolated verification requires \
+             [1, proposal_plus_bonus, vocabulary]"
+        );
+        let rows = usize::try_from(shape[1]).context("negative DFlash verifier row extent")?;
+        let vocabulary =
+            usize::try_from(shape[2]).context("negative DFlash verifier vocabulary extent")?;
+        anyhow::ensure!(
+            rows == proposal.tokens.len() + 1,
+            "verifying a {}-token DFlash proposal requires {} target distributions (one bonus), \
+             found {rows}",
+            proposal.tokens.len(),
+            proposal.tokens.len() + 1
+        );
+        let target_logits = logits.to_vec_f32()?;
+
+        let (accepted, correction) = match mode {
+            DFlashVerificationMode::Greedy => {
+                let mut accepted = 0usize;
+                for (position, token) in proposal.tokens.iter().enumerate() {
+                    let row = &target_logits[position * vocabulary..(position + 1) * vocabulary];
+                    let target = crate::sampling::sample_greedy(row) as i64;
+                    if target != *token {
+                        break;
+                    }
+                    accepted += 1;
+                }
+                let row = &target_logits[accepted * vocabulary..(accepted + 1) * vocabulary];
+                (accepted, crate::sampling::sample_greedy(row) as i64)
+            }
+            DFlashVerificationMode::Sampling { temperature } => {
+                anyhow::ensure!(
+                    temperature.is_finite() && temperature > 0.0,
+                    "DFlash sampling temperature must be finite and positive, got {temperature}"
+                );
+                let probabilities = proposal
+                    .probabilities
+                    .as_ref()
+                    .expect("sampling checked probabilities above");
+                anyhow::ensure!(
+                    probabilities.vocabulary() == vocabulary,
+                    "DFlash proposal vocabulary {} does not match verifier vocabulary \
+                     {vocabulary}",
+                    probabilities.vocabulary()
+                );
+                let target_probabilities = target_logits
+                    .chunks_exact(vocabulary)
+                    .flat_map(|row| softmax(row, temperature))
+                    .collect::<Vec<_>>();
+                let mut rng = StdRng::seed_from_u64(proposal.verification_seed);
+                let mut accepted = 0usize;
+                for (position, token) in proposal.tokens.iter().enumerate() {
+                    let token = usize::try_from(*token)
+                        .ok()
+                        .filter(|token| *token < vocabulary)
+                        .with_context(|| {
+                            format!(
+                                "DFlash proposed token {} at position {position} outside \
+                                 verifier vocabulary {vocabulary}",
+                                proposal.tokens[position]
+                            )
+                        })?;
+                    let q = probabilities.row(position)?;
+                    let p_token = target_probabilities[position * vocabulary + token];
+                    let q_token = q[token];
+                    anyhow::ensure!(
+                        q_token.is_finite() && q_token > 0.0,
+                        "DFlash proposal probability q({token}) at position {position} is \
+                         {q_token}; the emitted token must have positive finite probability"
+                    );
+                    if rng.random::<f32>() * q_token >= p_token {
+                        let p = &target_probabilities
+                            [position * vocabulary..(position + 1) * vocabulary];
+                        let residual = p
+                            .iter()
+                            .zip(q)
+                            .map(|(p, q)| (p - q).max(0.0))
+                            .collect::<Vec<_>>();
+                        let total: f32 = residual.iter().sum();
+                        let distribution = if total > 0.0 && total.is_finite() {
+                            residual
+                                .iter()
+                                .map(|probability| probability / total)
+                                .collect::<Vec<_>>()
+                        } else {
+                            p.to_vec()
+                        };
+                        let correction =
+                            sample_probability_row(&distribution, rng.random())? as i64;
+                        return Ok(DFlashAcceptance {
+                            accepted,
+                            rejected_at: Some(position),
+                            committed: proposal.tokens[..accepted]
+                                .iter()
+                                .copied()
+                                .chain(std::iter::once(correction))
+                                .collect(),
+                        });
+                    }
+                    accepted += 1;
+                }
+                let bonus =
+                    &target_probabilities[accepted * vocabulary..(accepted + 1) * vocabulary];
+                (
+                    accepted,
+                    sample_probability_row(bonus, rng.random())? as i64,
+                )
+            }
+        };
+        Ok(DFlashAcceptance {
+            accepted,
+            rejected_at: (accepted < proposal.tokens.len()).then_some(accepted),
+            committed: proposal.tokens[..accepted]
+                .iter()
+                .copied()
+                .chain(std::iter::once(correction))
+                .collect(),
+        })
+    }
+
+    /// Admit every declared accepted-prefix participant under the S3
+    /// transaction identity before proposer or verifier execution.
+    pub fn begin_dflash_state_transaction(
+        &self,
+        current: &PipelineTensors,
+    ) -> anyhow::Result<DFlashStateTransaction> {
+        let contract = self
+            .plan
+            .speculative
+            .as_ref()
+            .context("package declares no speculative contract")?;
+        DFlashPlan::resolve(contract, &self.plan.workflow)?;
+        let mut baseline = PipelineTensors::new();
+        for cell in &contract.rollback_state {
+            let value = current.get(cell).with_context(|| {
+                format!(
+                    "cannot admit DFlash transaction: rollback participant state '{cell}' has no \
+                     current value"
+                )
+            })?;
+            baseline.insert(cell.clone(), clone_value(value)?);
+        }
+        Ok(DFlashStateTransaction {
+            turn: super::TurnTransaction::admit_runtime_participant(
+                self.worker.next_turn_transaction_id(),
+            ),
+            baseline,
+        })
+    }
+
+    /// Atomically replace every DFlash participant with the state for exactly
+    /// the accepted proposal prefix.
+    ///
+    /// `acceptance.committed` remains commit-only output until this returns a
+    /// committed outcome. A caller may deliver it to a non-retractable callback
+    /// only afterwards; a callback error is then a post-commit delivery failure
+    /// and never rewinds already committed target/draft state, matching the S3
+    /// decoder baseline.
+    pub fn commit_dflash_state_transaction(
+        &self,
+        transaction: DFlashStateTransaction,
+        current: &mut PipelineTensors,
+        proposal: &DFlashProposal,
+        verified: &PipelineTensors,
+        acceptance: &DFlashAcceptance,
+    ) -> anyhow::Result<super::TurnTransactionOutcome> {
+        let contract = self
+            .plan
+            .speculative
+            .as_ref()
+            .context("package declares no speculative contract")?;
+        let plan = DFlashPlan::resolve(contract, &self.plan.workflow)?;
+        anyhow::ensure!(
+            acceptance.accepted <= proposal.tokens.len(),
+            "DFlash acceptance length {} exceeds proposal length {}",
+            acceptance.accepted,
+            proposal.tokens.len()
+        );
+        let mut committed = clone_pipeline_tensors(current)?;
+        for (cell, commit) in plan.accepted_prefix_state {
+            let state = self
+                .plan
+                .workflow
+                .state
+                .get(cell)
+                .with_context(|| format!("DFlash state '{cell}' is undeclared"))?;
+            let group_name = state
+                .service_group
+                .as_deref()
+                .with_context(|| format!("DFlash state '{cell}' has no state-service group"))?;
+            let group = self
+                .plan
+                .workflow
+                .serving
+                .as_ref()
+                .and_then(|serving| serving.state_service.groups.get(group_name))
+                .with_context(|| {
+                    format!("DFlash state '{cell}' group '{group_name}' is undeclared")
+                })?;
+            let source = match commit {
+                DFlashStateCommit::Sequence { source }
+                | DFlashStateCommit::PrefixSnapshots { source, .. } => source,
+            };
+            let value = if source.component == contract.proposer {
+                proposal.proposer_outputs.get(&source.output)
+            } else if source.component == contract.target {
+                let value_name = plan.source_value_name(source).with_context(|| {
+                    format!(
+                        "DFlash state '{cell}' source {}::{} has no workflow binding",
+                        source.component, source.output
+                    )
+                })?;
+                verified.get(value_name)
+            } else {
+                None
+            }
+            .with_context(|| {
+                format!(
+                    "DFlash state '{cell}' source {}::{} was not produced",
+                    source.component, source.output
+                )
+            })?;
+            let accepted_value = match commit {
+                DFlashStateCommit::Sequence { .. } => {
+                    let axis = group.sequence_axis.with_context(|| {
+                        format!("DFlash sequence state '{cell}' has no sequence axis")
+                    })?;
+                    let baseline = transaction.baseline.get(cell).with_context(|| {
+                        format!("DFlash transaction has no baseline for state '{cell}'")
+                    })?;
+                    let baseline_len =
+                        usize::try_from(*baseline.shape().get(axis).with_context(|| {
+                            format!(
+                                "DFlash state '{cell}' sequence axis {axis} is outside baseline \
+                                 shape {:?}",
+                                baseline.shape()
+                            )
+                        })?)
+                        .context("negative DFlash baseline sequence extent")?;
+                    let length = baseline_len
+                        .checked_add(acceptance.accepted)
+                        .context("DFlash accepted state length overflow")?;
+                    super::device_ops::tensor_ops_for(value)?
+                        .truncate_axis(value, axis, length)
+                        .with_context(|| {
+                            format!("truncate DFlash state '{cell}' to accepted prefix {length}")
+                        })?
+                }
+                DFlashStateCommit::PrefixSnapshots { axis, .. } => {
+                    let slice = super::device_ops::tensor_ops_for(value)?
+                        .slice_axis(value, *axis, acceptance.accepted, 1)
+                        .with_context(|| {
+                            format!(
+                                "select DFlash state '{cell}' prefix snapshot {}",
+                                acceptance.accepted
+                            )
+                        })?;
+                    let mut shape = slice.shape().to_vec();
+                    shape.remove(*axis);
+                    alias_with_shape(slice, &shape).map_err(|error| {
+                        anyhow::anyhow!("remove DFlash state '{cell}' prefix axis {axis}: {error}")
+                    })?
+                }
+            };
+            committed.insert(cell.clone(), accepted_value);
+        }
+        *current = committed;
+        Ok(transaction.turn.committed())
+    }
+
+    /// Abort a DFlash block to its complete admitted participant baseline.
+    pub fn abort_dflash_state_transaction(
+        &self,
+        transaction: DFlashStateTransaction,
+        current: &mut PipelineTensors,
+        reason: super::TurnAbortReason,
+    ) -> anyhow::Result<super::TurnTransactionOutcome> {
+        for (cell, value) in transaction.baseline {
+            current.insert(cell, value);
+        }
+        Ok(transaction.turn.abort(reason))
     }
 
     /// Drive a chained speculative proposal through the interpreter's own
@@ -804,6 +1955,107 @@ impl WorkflowRuntime {
         outputs
     }
 
+    fn shared_initializer(
+        &self,
+        source: &onnx_genai_metadata::DFlashOutputProjection,
+    ) -> anyhow::Result<Value> {
+        let key = (source.component.clone(), source.initializer.clone());
+        if let Some(cached) = self.worker.shared_initializers.borrow().get(&key) {
+            return clone_value(cached);
+        }
+        let path = self
+            .backend
+            .models
+            .directory
+            .model_paths
+            .get(&source.component)
+            .with_context(|| {
+                format!(
+                    "DFlash output projection names component '{}', which has no ONNX artifact",
+                    source.component
+                )
+            })?
+            .to_path_buf();
+        let (graph, weights) =
+            onnx_runtime_loader::load_model_with_weights(&path).with_context(|| {
+                format!(
+                    "failed to read DFlash shared output projection '{}' from component '{}'",
+                    source.initializer, source.component
+                )
+            })?;
+        let (value_id, info) = graph
+            .values
+            .iter()
+            .find(|(_, value)| value.name.as_deref() == Some(source.initializer.as_str()))
+            .with_context(|| {
+                format!(
+                    "DFlash output projection initializer '{}' is not a value in component '{}' \
+                     ({})",
+                    source.initializer,
+                    source.component,
+                    path.display()
+                )
+            })?;
+        let weight = graph.initializers.get(&value_id).with_context(|| {
+            format!(
+                "DFlash output projection '{}' in component '{}' is not an immutable initializer",
+                source.initializer, source.component
+            )
+        })?;
+        let shape = onnx_runtime_ir::as_static_shape(&info.shape).with_context(|| {
+            format!(
+                "DFlash output projection '{}' has no static matrix shape",
+                source.initializer
+            )
+        })?;
+        anyhow::ensure!(
+            shape.len() == 2,
+            "DFlash output projection '{}' must be a rank-2 matrix, found shape {shape:?}",
+            source.initializer
+        );
+        let dtype = super::device_ops::value_dtype_from_ir(info.dtype).with_context(|| {
+            format!(
+                "DFlash output projection '{}' has unsupported element type {:?}",
+                source.initializer, info.dtype
+            )
+        })?;
+        anyhow::ensure!(
+            matches!(
+                dtype,
+                DataType::Float16 | DataType::BFloat16 | DataType::Float32
+            ),
+            "DFlash output projection '{}' must be floating, got {dtype:?}",
+            source.initializer
+        );
+        let bytes = weights.bytes(weight).with_context(|| {
+            format!(
+                "DFlash output projection '{}' has no initializer bytes",
+                source.initializer
+            )
+        })?;
+        anyhow::ensure!(
+            bytes.len() == shape[0] * shape[1] * dtype.size_of(),
+            "DFlash output projection '{}' holds {} bytes for shape {shape:?} {dtype:?}, which \
+             needs {}",
+            source.initializer,
+            bytes.len(),
+            shape[0] * shape[1] * dtype.size_of()
+        );
+        let value =
+            Value::from_raw_bytes(bytes.to_vec(), &[shape[0] as i64, shape[1] as i64], dtype)
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "materialize DFlash output projection '{}': {error}",
+                        source.initializer
+                    )
+                })?;
+        self.worker
+            .shared_initializers
+            .borrow_mut()
+            .insert(key, std::rc::Rc::new(clone_value(&value)?));
+        Ok(value)
+    }
+
     /// Read the declared `[vocab, hidden]` embedding table out of a component's
     /// ONNX artifact.
     ///
@@ -990,6 +2242,106 @@ fn scaled_rows(bytes: &[u8], dtype: DataType, scale: f32) -> anyhow::Result<Vec<
              meaningful on a float table, so either drop the scale or export the table scaled"
         ),
     })
+}
+
+fn clone_pipeline_tensors(values: &PipelineTensors) -> anyhow::Result<PipelineTensors> {
+    values
+        .iter()
+        .map(|(name, value)| Ok((name.clone(), clone_value(value)?)))
+        .collect()
+}
+
+#[allow(clippy::arc_with_non_send_sync)]
+fn alias_with_shape(value: Value, shape: &[i64]) -> onnx_genai_ort::Result<Value> {
+    Value::alias_with_shape(std::sync::Arc::new(value), shape)
+}
+
+fn validate_probability_rows(
+    values: &[f32],
+    rows: usize,
+    width: usize,
+    name: &str,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        values.len() == rows * width,
+        "DFlash probability output '{name}' has {} elements, expected {rows} * {width}",
+        values.len()
+    );
+    for (row_index, row) in values.chunks_exact(width).enumerate() {
+        anyhow::ensure!(
+            row.iter()
+                .all(|probability| probability.is_finite() && *probability >= 0.0),
+            "DFlash probability output '{name}' row {row_index} contains a negative or non-finite \
+             value"
+        );
+        let total: f32 = row.iter().sum();
+        anyhow::ensure!(
+            total.is_finite() && (total - 1.0).abs() <= 1e-4,
+            "DFlash probability output '{name}' row {row_index} sums to {total}, expected 1; \
+             rejection sampling requires normalized proposal probabilities"
+        );
+    }
+    Ok(())
+}
+
+fn softmax(logits: &[f32], temperature: f32) -> Vec<f32> {
+    let max = logits
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .map(|value| value / temperature)
+        .fold(f32::NEG_INFINITY, f32::max);
+    if !max.is_finite() {
+        let mut probabilities = vec![0.0; logits.len()];
+        if !probabilities.is_empty() {
+            probabilities[0] = 1.0;
+        }
+        return probabilities;
+    }
+    let mut probabilities = logits
+        .iter()
+        .map(|value| {
+            if value.is_finite() {
+                (value / temperature - max).exp()
+            } else {
+                0.0
+            }
+        })
+        .collect::<Vec<_>>();
+    let total: f32 = probabilities.iter().sum();
+    if total > 0.0 && total.is_finite() {
+        for probability in &mut probabilities {
+            *probability /= total;
+        }
+    }
+    probabilities
+}
+
+fn sample_probability_row(probabilities: &[f32], draw: f32) -> anyhow::Result<usize> {
+    anyhow::ensure!(
+        !probabilities.is_empty(),
+        "cannot sample an empty DFlash probability row"
+    );
+    anyhow::ensure!(
+        probabilities
+            .iter()
+            .all(|probability| probability.is_finite() && *probability >= 0.0),
+        "DFlash sampling distribution contains a negative or non-finite probability"
+    );
+    let total: f32 = probabilities.iter().sum();
+    anyhow::ensure!(
+        total.is_finite() && total > 0.0,
+        "DFlash sampling distribution has total probability {total}"
+    );
+    let target = draw.clamp(0.0, 1.0 - f32::EPSILON) * total;
+    let mut cumulative = 0.0f32;
+    for (index, probability) in probabilities.iter().enumerate() {
+        cumulative += probability;
+        if target < cumulative {
+            return Ok(index);
+        }
+    }
+    Ok(probabilities.len() - 1)
 }
 
 /// A dense `[vocab, hidden]` row-major embedding table read from a component,
@@ -1239,6 +2591,40 @@ pub(super) fn externally_used_values(
     let Some(contract) = contract else {
         return live;
     };
+    if let SpeculativeProposalExecution::DflashFlatBlock {
+        conditioning,
+        outputs,
+        accepted_prefix_state,
+        ..
+    } = &contract.proposal_execution
+    {
+        if let Some((inputs, outputs)) = component_invocation(workflow, &contract.proposer) {
+            live.extend(inputs.into_values());
+            live.extend(outputs.into_values());
+        }
+        if let Some((_, target_outputs)) = component_invocation(workflow, &contract.target) {
+            for source in &conditioning.sources {
+                if let Some(value) = target_outputs.get(&source.output) {
+                    live.insert(value.clone());
+                }
+            }
+            if let Some(value) = target_outputs.get(&outputs.verifier_logits.output) {
+                live.insert(value.clone());
+            }
+            for commit in accepted_prefix_state.values() {
+                let source = match commit {
+                    DFlashStateCommit::Sequence { source }
+                    | DFlashStateCommit::PrefixSnapshots { source, .. } => source,
+                };
+                if source.component == contract.target
+                    && let Some(value) = target_outputs.get(&source.output)
+                {
+                    live.insert(value.clone());
+                }
+            }
+        }
+        return live;
+    }
     let SpeculativeProposalExecution::Chained {
         folded_carry_seed, ..
     } = &contract.proposal_execution
