@@ -3,16 +3,12 @@
 Status: **Normative**
 
 This is the normative specification of the portable inference-metadata contract.
-It defines what a model package states, what a runtime decides, what a caller
-supplies, and what a validator must reject. It supersedes contrary statements
-elsewhere in this repository.
+It defines the target contract independently of any current parser, runtime,
+exporter, or optimization. Implementation and conformance work is tracked in
+[#2303](https://github.com/justinchuby/onnx-genai/issues/2303).
 
 Requirement keywords (**MUST**, **MUST NOT**, **SHOULD**, **MAY**) are used in
-the RFC 2119 sense. Unless a subsection explicitly labels runtime behavior as
-unimplemented acceptance criteria, every **MUST** is enforced by the semantic
-validator in `crates/onnx-genai-metadata/src/validation.rs` or is a structural
-property of `crates/onnx-genai-metadata/src/schema/`. Section
-[Conformance](#20-conformance) maps shipped requirements to tests.
+the RFC 2119 sense.
 
 ---
 
@@ -50,6 +46,11 @@ property of `crates/onnx-genai-metadata/src/schema/`. Section
 5. **A portable cross-runtime cache wire format.** See [§16](#16-distributed-execution).
 6. **Standardized diagnostics.** Determinism levels, profiling surfaces, and
    implementation-selection reports are runtime and API concerns.
+7. **API or network streaming.** HTTP/SSE/gRPC/WebSocket framing, flushing,
+   buffering, retry, reconnect, backpressure, and disconnect behavior are
+   runtime/API contracts. Metadata describes transport-neutral publication to
+   the workflow output boundary, not delivery beyond that boundary; see
+   [§6.4](#64-workflow-output-publication-and-revisions).
 
 ---
 
@@ -90,7 +91,11 @@ The package states **what must be true for execution to be correct**:
 - adapter target manifests and artifact bindings;
 - generation defaults and the structural override surface;
 - legal sharding and replication facts;
-- correctness dependencies for cache reuse.
+- correctness dependencies for cache reuse;
+- typed workflow output publication and revision semantics;
+- the exact versioned tool render/parse protocol a package requires;
+- cross-invocation state identity, lifecycle, initialization, dataflow, update,
+  and commit/rollback semantics.
 
 ### 3.2 Runtime
 
@@ -104,13 +109,21 @@ The runtime decides **how to execute it here**:
 - adapter lifecycle, caching, budgeting, eviction;
 - speculative proposal width, tree shape, scheduling, and enablement;
 - distributed transfer protocols, QoS, tiering, deadlines;
-- diagnostics, determinism levels, and trust policy.
+- diagnostics, determinism levels, and trust policy;
+- session-turn transaction mechanics and recovery;
+- tool-protocol adapter implementation;
+- API/network delivery, buffering, and backpressure;
+- physical state transport and retention.
 
 ### 3.3 Caller
 
 The caller supplies **request data**: prompts, images, audio, grammars, JSON
 schemas, adapter selections, and overrides of generation fields the package
 structurally exposes ([§14](#14-generation)).
+
+For tools, the caller also supplies the offered functions, descriptions, JSON
+Schemas, `tool_choice`, prior calls, and tool results. Any externally supplied
+state is ordinary typed request data connected to a declared workflow input.
 
 ### 3.4 Distribution layer
 
@@ -260,97 +273,21 @@ This is the only ignorable surface. Unknown *core* fields still fail. A strict
 reader can therefore load a package that carries a newer optional profile
 without either guessing or refusing.
 
-### 4.3a Capability admission and complete built-in catalogue
+### 4.3a Capability admission
 
-A **capability identifier** is a load-time promise by the reader. It is not a
-model name, component contract, deployment preference, or statement that a
-feature should be enabled. The package says "correct execution requires this
-semantic behavior"; the runtime either advertises that exact serialized string
-or rejects the package before execution.
+A capability identifier names versioned semantic behavior required for correct
+execution. It is not a model name, implementation preference, deployment policy,
+or feature-enable request. Required identifiers and versions **MUST** be selected
+exactly; an unsupported or ambiguous requirement **MUST** fail before execution.
 
-There are two declaration surfaces:
+Requirements that follow from workflow structure **MUST** be derived rather than
+duplicated as manually authored flags. Extension identifiers are permitted only
+on declared extension surfaces and remain fail-closed. Component contracts,
+adapter ABIs, and state bounds keep their own identities and do not become
+capabilities merely because a runtime implements them.
 
-- top-level `required_capabilities` states requirements not recoverable from the
-  workflow, including implementation and legacy model-package requirements;
-- `pipeline.workflow.manifest.capabilities` states requirements of the workflow
-  IR. The validator also derives requirements from structures such as loops,
-  emits, serving, state recurrence, and known adapter contracts, and rejects a
-  manifest that omits a capability its structure uses.
-
-Both fields intentionally accept extension-defined strings. Therefore no
-repository can enumerate every future vendor extension. The table below is the
-complete **built-in** vocabulary defined or advertised by this repository:
-**29 identifiers** — syntax/IR 10, state/serving 7, media 5, adapters 4,
-speculative 1, implementation 2, distributed 0. The source of truth is
-`onnx_genai_metadata::capabilities::BUILTIN`; a test compares that constant
-directly with this table. Adding a built-in identifier without documenting it
-fails CI. Extension-defined identifiers remain enumerable only by the runtime
-or producer that defines them and MUST still fail closed when unavailable.
-
-<!-- capability-catalogue:start -->
-| Serialized identifier | Category | Semantic feature admitted | Metadata that requires it | Runtime obligation and fail-closed rule | Representative examples and dependencies |
-| --- | --- | --- | --- | --- | --- |
-| `kv_cache` | state/serving | Runtime-owned autoregressive key/value state. | Explicit top-level `required_capabilities`; related state is described by workflow state-service groups. | Preserve the declared cache semantics and graph ABI; reject if no compatible cache implementation exists. | Decoder packages; commonly combined with an attention implementation capability. |
-| `grouped_query_attention` | implementation | Execution of grouped-query attention. | Explicit top-level `required_capabilities`; attention geometry remains a package fact, not an inferred grant. | Execute the declared GQA semantics or reject; never silently substitute MHA. | Gemma/Qwen-style decoders; often paired with `kv_cache`. |
-| `multi_head_attention` | implementation | Execution of ordinary multi-head attention. | Explicit top-level `required_capabilities`. | Execute MHA with the artifact's exact ABI or reject. | DeepSeek/GLM test fixtures; independent of GQA. |
-| `prefix_cache` | state/serving | Reuse of a compatible cached prefix. | Explicit top-level `required_capabilities`; reuse dependencies and state-group reuse facts constrain correctness. | Reuse only when all declared dependencies match; otherwise reject or do not admit the package if the capability is required. | Repeated-prefix text serving; builds on cache-state support. |
-| `control_flow_loop` | syntax/IR | Legacy admission of a runtime-controlled generation loop. | Explicit top-level `required_capabilities`; retained for bare/legacy packages. | Honor the loop contract or reject; do not guess termination defaults. | Legacy decoder metadata; new workflows use `workflow_ssa` plus structural loop capabilities. |
-| `image_preprocessing_program` | media | Typed, declarative image transform execution. | Explicit top-level `required_capabilities` with `preprocessing.image`. | Execute the declared transforms and tensor contracts exactly or reject. | Vision-language preprocessing; may combine with `packed_image_outputs`. |
-| `packed_image_outputs` | media | More than one packed image tensor output and its packing metadata. | Explicit top-level `required_capabilities` when the image program emits multiple packed tensors. | Preserve offsets/ownership and output contracts; reject readers that only understand one dense image tensor. | Multi-view or grid-aware VLM preprocessing; depends on `image_preprocessing_program`. |
-| `position_program` | media | Declarative construction of position IDs. | Explicit top-level `required_capabilities` with a preprocessing position program. | Produce the declared coordinates rather than inventing model-family position logic. | Vision-language token expansion and routed position construction. |
-| `multi_axis_positions` | media | Position coordinates whose position axis has rank greater than one. | Explicit top-level `required_capabilities` when the position program emits multi-axis coordinates. | Preserve every coordinate axis and its ordering; reject scalar-only position implementations. | Spatial/temporal multimodal positions; normally depends on `position_program`. |
-| `loop_carried_state` | state/serving | Legacy fixed-shape recurrent state with replace semantics. | Explicit top-level `required_capabilities`. | Carry the exact state tensor across iterations or reject. | Older recurrent decoder packages; structural workflows normally use state cells and `bounded_state_recurrence`. |
-| `dual_sequence_inputs` | media | One decoder invocation consumes raw-token and routed-sequence inputs together. | Explicit top-level `required_capabilities` when the decoder ABI exposes both. | Bind both inputs without dropping or conflating either sequence. | Multimodal embedding/routing pipelines; independent of model-family identity. |
-| `workflow_ssa` | syntax/IR | Typed SSA values and structural workflow execution. | Every `pipeline.workflow`; validator-derived and required in the manifest. | Compile/bind values without name guessing, enforce single assignment and lexical control-flow scope, or reject. | Every canonical catalogue workflow; foundation for the other workflow capabilities. |
-| `linear_effects` | syntax/IR | Explicit, linearly threaded external-effect domains. | Manifest declaration for workflows/components with external mutation semantics. | Preserve effect order, branch joins, retry class, and speculation safety; reject unsupported effect semantics. | Grammar state, telemetry, session mutation, and streams; pure tensor state does not need an effect. |
-| `serving_service_contract` | state/serving | Generic serving controls and runtime-owned state-service groups. | Presence of `pipeline.workflow.serving`; validator-derived and manifest-required. | Own active/done/accepted-length handling, state-group lifecycle, and declared rollback/fork bounds; reject incomplete service support. | Autoregressive, recurrent, weather-rollout, and hybrid speculative workflows. |
-| `parameter_adapters` | adapters | Parameter overlay/application against resolved targets. | Top-level `adapters`; validator-derived. | Apply only validated target bindings and the declared application ABI, or use an allowed portable fallback; otherwise reject. | LoRA adapter selection; coupled to `onnx-genai.adapters@1`, which is an ABI identifier rather than this capability string. |
-| `heterogeneous_adapter_batching` | adapters | Different adapter sets and scales for different request rows in one batch. | Top-level `adapters.selection`; validator-derived with `parameter_adapters`. | Keep adapter selection request-aligned through batching/compaction and never leak a row's adapter set to another row. | Batched LoRA serving; depends on `parameter_adapters` and row-safe batching. |
-| `session_state_lease` | state/serving | State whose lifetime extends across invocations under a runtime lease. | Any workflow state cell with `scope: session`; validator-derived and manifest-required. | Create, restore, isolate, expire, and release leased state according to its contract; reject if only invocation state is supported. | Full-duplex/audio sessions and long-running rollouts. |
-| `bounded_state_recurrence` | state/serving | Loop-carried state with metadata-declared bounded growth. | Any state cell with `recurrence.kind: bounded`; validator-derived and manifest-required. | Enforce the bound and recurrence axis without unbounded allocation or silent truncation. | Decoder masks/history, video schedules, nested audio loops. |
-| `advisory_state` | state/serving | Droppable/resettable state that cannot change semantic correctness or output distribution. | Any state cell with `class: advisory`; validator-derived and manifest-required. | Keep advisory state out of semantic checkpoints and permit reset only because correctness is invariant; reject if that distinction cannot be honored. | Adaptive speculative estimates; often paired with `adaptive_proposal_budget`. |
-| `adaptive_proposal_budget` | speculative | Runtime-visible adaptive choice of speculative proposal width. | A component contract with ID `onnx-genai.adaptive-proposal-budget`; validator-derived. | Execute the contract while treating estimate state as advisory; fixed or unsupported behavior must not masquerade as adaptive support. | Speculative proposer/verifier workflows; may use telemetry and advisory state. |
-| `grammar_guidance_adapter` | adapters | Stateful grammar clone/lookahead/commit ABI. | A component contract/adapter ABI `onnx-genai.grammar-guidance@1`; validator-derived. | Enforce the action-specific binding set, linear effect ordering, and speculation-safety declaration or reject. | JSON/grammar-constrained speculative decoding; combines with policy sampling rather than replacing it. |
-| `telemetry_adapter` | adapters | Versioned timestamp/elapsed adapter ABI. | A component contract/adapter ABI `onnx-genai.telemetry@1`; validator-derived. | Enforce exact action bindings and effect semantics; reject unknown actions instead of approximating timing. | Adaptive proposal metrics; optional unless the workflow invokes it. |
-| `nested_control_flow` | syntax/IR | Loops or branches nested inside structural workflow nodes. | Any compiled loop or branch; validator-derived and manifest-required. | Preserve lexical SSA, zero-trip loops, branch phi results, and effect joins at every nesting level or reject. | Diffusion, autoregressive, weather, and nested audio/music workflows. |
-| `loop_induction_values` | syntax/IR | A typed zero-based iteration value visible to policy components. | A loop with `iteration`; validator-derived and manifest-required. | Produce the declared scalar/per-row induction tensor and keep it scoped to the loop. | Diffusion scheduler lookup, termination equations, nested codec loops; depends on nested control-flow support. |
-| `typed_emit` | syntax/IR | Publication of a typed SSA value to a declared workflow output. | Every compiled `emit`; validator-derived and manifest-required. | Enforce output contract, mode, row semantics, and effect ordering; reject undeclared or incompatible output publication. | All canonical workflows that return or stream values. |
-| `streaming_emit` | syntax/IR | Incremental event publication during execution. | An `emit` with `mode: event`; validator-derived. | Preserve event order and effect semantics without converting it silently to only a final result. | Token/audio chunk streaming; depends on `typed_emit`. |
-| `emit_valid_length` | syntax/IR | Ragged valid-prefix publication from a fixed-capacity tensor. | An `emit` with `valid_length`; validator-derived and manifest-required. | Slice each request row to its valid prefix, maintain positional row ownership through compaction, and reject incompatible output layout. | Speculative accepted-token prefixes and masked generation; depends on `typed_emit`. |
-| `input_presence` | syntax/IR | An observable boolean for whether an optional caller/application tensor was supplied. | Any workflow input with `present_as`; validator requires the manifest entry. | Set the presence SSA value from actual caller presence, require control flow before optional use, and never fabricate sentinel tensors. | Text-only requests to a VLM and optional audio/image inputs; typically combines with `nested_control_flow`. |
-| `explicit_transfer` | syntax/IR | A device-transfer node in the planner's lowered internal IR. | Derived only from internal `WorkflowNode::Transfer`; authored workflow steps MUST NOT serialize transfers. | Execute the transfer with correct ordering/device semantics or reject the lowered plan. | Heterogeneous placement; no authored model example because placement owns transfer insertion. |
-<!-- capability-catalogue:end -->
-
-The following similar-looking strings are **not entries in this capability
-table**:
-
-- component contract IDs plus versions, such as
-  `onnx-genai.token-sampler@1`, `onnx-genai.token-sampler@2`,
-  `onnx-genai.termination-predicate@1`,
-  `onnx-genai.termination-predicate@2`, `onnx-genai.state-update@1`,
-  `onnx-genai.state-update@2`,
-  `onnx-genai.solver-step@1`, `onnx-genai.speculative-verifier@1`,
-  `onnx-genai.counter-rng@1`, and `onnx-genai.guidance-combine@1`;
-- adapter ABIs such as `onnx-genai.grammar-guidance@1`,
-  `onnx-genai.telemetry@1`, `onnx-genai.image-preprocess@1`, and
-  `onnx-genai.audio-preprocess@1`;
-- adapter application/loader identifiers such as `onnx-genai.adapters@1`,
-  `onnx-genai.adapters.hf-peft@1`,
-  `onnx-genai.adapters.safetensors@1`,
-  `onnx-genai.adapters.json@1`, and `onnxruntime.lora-adapter@1`;
-- bounded facts inside a state group, such as `rollback_positions`, `snapshot`,
-  `fork`, and `cascade`.
-
-Those strings select a versioned semantic ABI or state bound and are validated
-at the structure that owns them. They do not become negotiated capabilities
-merely because older comments used the word "capability" broadly.
-
-`continuous_batching` is also not a capability identifier. It was retired
-because a runtime may always execute requests separately without changing
-correctness. Shared-forward feasibility is derived from the workflow/state
-contract and resolved backend; enabling and sizing batches is deployment policy.
-The parser rejects the old capability, profile, and model-hint spellings with
-their migrations.
+Output publication is governed by the declared output protocol and ordinary
+`emit`; it has no separate streaming or transport-delivery capability.
 
 ### 4.4 Semantic identity
 
@@ -373,6 +310,15 @@ a strict and a permissive reader can share a plan.
 This hash is **identity, not integrity**. It says two documents are semantically
 the same. It says nothing about who produced either one. Trust belongs to the
 distribution layer ([§3.4](#34-distribution-layer)).
+
+### 4.5 Tensor shape is the sole rank authority
+
+`shape` is required and its length is the tensor rank. Each dimension is fixed,
+symbolic, or explicitly unconstrained as `Any`; separate `Any` occurrences do
+not imply equal extents. `shape: []` is scalar and `[Any]` is rank one.
+
+Serialized `rank` **MUST NOT** exist. A reader **MUST** reject an omitted shape,
+a retired `rank` field, or an attempt to infer placeholder axes.
 
 ---
 
@@ -409,13 +355,16 @@ model-family dispatch:
 | `invoke` | binds named values to a component's ports |
 | `loop` | setup, body, condition, `max_iterations`, induction value, carried state |
 | `branch` | selects one case; exports only declared phi results and effect joins |
-| `emit` | publishes a streaming or final package output |
+| `emit` | publishes a typed value to its declared workflow output boundary |
 
-Control-flow *location* defines lifecycle. A value produced inside a loop body
-is loop-scoped; a value carried across iterations is a declared carried cell.
+Control-flow location defines lifecycle. A loop's authored `setup` executes
+exactly once before its first body evaluation, including an empty or zero-trip
+loop. An optimized execution path **MUST** preserve that exactly-once behavior or
+decline only the optimization and use generic workflow execution. A package
+**MUST NOT** be rejected solely because a loop setup is non-empty.
 
-`transfer` is **internal lowered IR only**. The planner introduces transfers when
-it assigns placement. A metadata document **MUST NOT** serialize one.
+`transfer` is internal lowered IR only. The planner introduces transfers after
+placement; metadata **MUST NOT** serialize one.
 
 ### 6.2 Values and effects
 
@@ -440,6 +389,45 @@ effects:
 A branch exports only values its declared phi mapping names. Every case **MUST**
 produce every exported value, and effect joins **MUST** be declared. This keeps
 liveness and effect ordering decidable without executing the branch.
+
+### 6.4 Workflow output publication and revisions
+
+`emit` publishes a typed SSA value to a declared workflow output boundary. The
+publication is outward and observable through the host runtime contract but is
+transport-neutral: metadata does not define HTTP/SSE/gRPC/WebSocket framing,
+flush timing, buffering, reconnect, retry, or backpressure.
+
+Each output declares exactly one protocol family. Every emit targeting it
+selects only an operation allowed by that family and preserves its typed value,
+guard, valid length, and effect ordering:
+
+| Family | Allowed publication semantics |
+| --- | --- |
+| materialized value | replace, or append on a declared growth axis |
+| discrete events | ordered typed occurrences |
+| typed revisions | versioned `append`, `replace`, `retract`, or optional `finalize` |
+
+An emit **MUST NOT** redefine the output family. Output identity, row behavior,
+payload contract, and growth rules are output-level invariants; workflow
+control/dataflow and effect ordering determine publication order.
+
+A typed revision envelope identifies its output/stream, enclosing transaction,
+deterministic sequence, revision, required lineage/base, operation, and typed
+payload where applicable. Unknown versions or operations, illegal bases,
+duplicate `finalize`, post-finalize updates, and family/operation mismatches
+**MUST** fail closed.
+
+`abort_to_baseline` is a typed turn/transaction outcome, not a
+revision-envelope operation. It identifies the aborted transaction and its
+recorded committed baseline, and invalidates every provisional publication
+owned by that transaction.
+
+`finalize` closes one revision stream early. It is optional and remains
+provisional until the enclosing turn commits. Successful turn commit finalizes
+ordinary outputs and every still-open revision stream by default. Turn abort
+undoes every provisional publication, including an early close, to the output
+heads recorded by the transaction described in [§12.5](#125-sessions).
+Per-stream `retract` invalidates named revision lineage; it is not turn abort.
 
 ---
 
@@ -500,16 +488,19 @@ arbitrary custom operator into the graph by name.
 
 ## 8. Batching, varlen, and paged attention
 
-### 8.1 Three layers
+### 8.1 Semantic batching contract
 
-Continuous batching is layered, and each layer is invisible to the one above:
+Metadata declares request axes, row-scoped state, lengths/masks/write-index
+companions, inactive-row preservation, and legal compaction or release. It never
+declares request identity, physical slots, fairness, capacity allocation,
+backfill timing, or scheduler policy.
 
-1. **Runtime-private request/sequence table.** Requests, rows, slots, epochs,
-   and their lifetimes. Never serialized.
-2. **Kernel/runtime varlen ABI.** `block_tables`, sequence lengths, slot
-   mapping, `cu_seqlens`. A private contract between the runtime and its
-   kernels. Never serialized.
-3. **Metadata batching layout facts.** What a package declares.
+A shared live-row forward is an optimization. It may advance one logical decode
+step for each eligible live row, while prompt/context forwards may update state
+without publishing a token. Eligibility is derived from the complete workflow,
+state, and output contracts. If a selected backend cannot execute a correct
+shared forward, the runtime **MUST** use isolated execution unless the package
+independently requires an unsupported semantic capability.
 
 ### 8.2 Declared layout facts
 
@@ -527,12 +518,8 @@ batch_layout: { kind: runtime_sequence_state }                  # opaque runtime
 That is the whole vocabulary. It states **where the request axis is**, never
 **which request occupies which position**.
 
-`token_packed` carries an ordered `levels` chain rather than a single
-`offsets`/`owner` pair. The one-level form above is exactly what the earlier flat
-spelling `{ offsets, owner, axis }` meant; the flat spelling is **replaced**, not
-retained alongside it, and that replacement is the one deliberate compatibility
-break in the v1.1 surface
-([`ENCODER_BATCHING.md` §4](ENCODER_BATCHING.md#4-validation-shipped-on-main)).
+`token_packed` carries an ordered `levels` chain. Each level declares the
+offsets and positional ownership needed to recover the next enclosing level.
 
 ### 8.3 No row identity
 
@@ -573,24 +560,18 @@ The last rule is what makes compaction possible without identities: it
 guarantees that anything holding per-request state has said which axis its rows
 lie on.
 
-### 8.6 Mandatory row ABI
+### 8.6 Compaction and release
 
-Every row-scoped native or stateful component **MUST** implement two runtime
-operations:
+Every row-scoped state or effect participant admitted to a shared batch **MUST**
+support semantic selection/reordering and release. Selection is positional,
+may repeat a source row, and applies consistently to every row-aligned carrier;
+out-of-range positions fail closed. Inactive or released rows **MUST NOT** mutate
+state or receive another row's publications.
 
-```rust
-fn compact(&mut self, selection: &[usize]) -> Result<()>;  // keep/reorder rows
-fn release(&mut self, row: usize) -> Result<()>;           // drop one row
-```
-
-This is an **ABI invariant, not a negotiated capability**. There is no
-`supports_compaction` flag, because a component that cannot compact cannot be
-batched, and a package that cannot be batched is not a deployable package. The
-trait is `onnx_genai_engine::RowScopedState`.
-
-`selection` is positional and **MAY** repeat a source position — that is how a
-beam clone or a speculative fork expands rows. An out-of-range position fails
-loudly.
+These semantics define shared-batch eligibility, not package deployability and
+not a particular language trait or method signature. A runtime lacking them for
+one execution path declines shared batching and preserves behavior through
+isolated execution.
 
 ### 8.7 Runtime-minted row selection
 
@@ -644,10 +625,8 @@ carry different numbers of adapters — and **ordered composition** — a row ma
 stack several adapters in a declared order. The runtime associates rows with
 requests through its output API; the package never learns a request identity.
 
-Because the selection tensors are request-aligned, they compact with every other
-row-scoped value. The adapter run context implements `RowScopedState`
-([§8.6](#86-mandatory-row-abi)), so an adapter selection survives compaction by
-construction.
+Because the selection tensors are request-aligned, they follow the same
+selection, compaction, and release semantics as every other row-scoped value.
 
 ---
 
@@ -664,7 +643,7 @@ counts use `token_packed`:
 image_features:
   contract:
     dtype: float32
-    rank: 2
+    shape: [packed_items, features]
     batch_layout:
       kind: token_packed
       axis: 0
@@ -673,13 +652,9 @@ image_features:
           owner: image_owner       # per-item owning row
 ```
 
-An `offsets`/`owner` pair is the only fact needed to map packed items back to
-rows, and one level is the whole chain when items sit directly in rows. A second
-level expresses items that nest — the frames of a video clip
-([§10.5](#105-generic-component-batching)). This replaced the earlier
-flat `{ offsets, owner, axis }` spelling of the same fact; see
-[`ENCODER_BATCHING.md` §4](ENCODER_BATCHING.md#4-validation-shipped-on-main)
-for why the flat form was migrated rather than kept.
+An `offsets`/`owner` pair maps packed items to the next enclosing level. One
+level is sufficient when items sit directly in rows; additional declared levels
+represent nested ownership such as frames within clips.
 
 ### 10.2 Externally suppliable results
 
@@ -703,449 +678,24 @@ The decoder consumes encoder results through request-aligned splice descriptors
 splice is therefore correct under compaction for the same reason everything else
 is: it is request-aligned, so it permutes with its row.
 
-### 10.4 What §10.1 did not have
+### 10.4 Generic component batching
 
-**Status.** This subsection records the state that motivated
-[§10.5](#105-generic-component-batching); the metadata half of it shipped in
-[#2009](https://github.com/justinchuby/onnx-genai/pull/2009) (`0448f2bc6`) and
-is preserved in the past tense rather than deleted, because the reasons a field
-exists are not recoverable from the field. The runtime half — the interpreter,
-the preprocessor, and the scheduler — is still open.
+A component may declare that grouping multiple request-owned items into one
+invocation is semantically equivalent to isolated execution. The declaration
+states only portable facts: grouping bounds, dimensions that must agree,
+padding with explicit valid lengths, and ordered packed-ownership levels.
+Absence of that declaration means isolated invocation.
 
-[§10.1](#101-independent-encoder-batching) states the layout of a packed encoder
-result. It did not state whether a component may *see* more than one item in one
-invocation, and nothing else did either:
+Packed and padded values **MUST** carry enough typed companions to reconstruct
+request-local spans without serialized request identities. Companions and
+payloads must agree on dtype, rank, extents, ownership order, and validity; a
+reader **MUST** reject ambiguous, missing, inconsistent, non-monotone, or
+out-of-range structure rather than guess or clamp.
 
-- `WorkflowComponent` declared no batching capacity, bound, or co-batching
-  precondition. It now carries `batch_capacity`
-  (`crates/onnx-genai-metadata/src/schema/ir.rs:919`, within the struct at
-  `ir.rs:883-990`);
-- `token_packed` has no runtime consumer outside this crate —
-  `BatchLayout::request_axis` deliberately returns `None` for it (`ir.rs:194-199`),
-  so the interpreter's three request-axis call sites never see a packed value.
-  **This one is still true**, and it is the phase after the metadata surface;
-- the image preprocessing adapter passes exactly one encoded item per invocation
-  (`crates/onnx-genai-engine/src/pipeline/workflow.rs:3135`), even though the
-  preprocessor underneath accepts many;
-- no declared preprocessing program could name the `offsets`/`owner` pair that
-  `token_packed` references. `pack_offsets`, `pack_owner`, and `valid_lengths`
-  are now in the vision and audio vocabularies, and `preprocessing.video` uses
-  the shared vision program type. Runtime production is still missing: the
-  image/audio adapter executors accept one encoded item per workflow invocation,
-  and no video adapter executor is registered;
-- validation checked nothing about `offsets`/`owner` beyond the serving-emit rule
-  in `validation.rs`, which accepted `request_aligned` or `token_packed` without
-  distinguishing them. [§10.6](#106-packed-companions-must-validate) is now
-  implemented;
-- and nothing expressed *nesting*. `levels` now supplies frame → clip → request
-  ownership, while the video program schema supplies `sample_frames` and
-  `pad_frames`. What remains absent is executable runtime production and grouped
-  assembly, not the metadata spelling.
-
-The consequence of the last point was already visible: the schema doc comment
-called `offsets` request-aligned, the canonical fixture declared it `shared`,
-and [§10.1](#101-independent-encoder-batching) describes it as a
-`cu_seqlens`-style `rows + 1` vector. Nothing rejected any of the three. All
-three are reconciled by the surface below, which shipped in
-[#2009](https://github.com/justinchuby/onnx-genai/pull/2009).
-
-There was also no mechanism through which any of it could ship, and supplying one
-was a precondition rather than a detail. The metadata structs were already closed
-— `InferenceMetadata` is `#[serde(deny_unknown_fields)]`
-(`crates/onnx-genai-metadata/src/schema/mod.rs:38-40`) and `schema/ir.rs` carries
-45 more, including `TensorContract`, `BatchLayout`, `ComponentPorts`, and
-`WorkflowComponent` — so an older runtime meeting a new field rejected the whole
-document rather than ignoring it. At the time, no pre-deserialization gate
-validated `schema_version`, so a future document failed field by field instead
-of reporting that the runtime needed an upgrade. #2009 replaced that missing
-mechanism with the normalized version contract now documented at
-`schema/mod.rs:62-78` and enforced by
-`crates/onnx-genai-metadata/src/version.rs:42,78`.
-
-### 10.5 Generic component batching
-
-**Status.** The metadata surface below — `batch_capacity`, `padding`, the
-`levels` ownership chain, the companion roles, and the version gate — shipped in
-[#2009](https://github.com/justinchuby/onnx-genai/pull/2009) (`0448f2bc6`) and
-is validated at load. No runtime consumes it yet: nothing groups, nothing packs,
-the image/audio adapters still accept one encoded item, and no video adapter
-executor is registered. Read the schema and validator rules as implemented.
-Runtime statements are acceptance criteria for the open work listed in
-[`ENCODER_BATCHING.md`](ENCODER_BATCHING.md) §10.
-
-The requirement keywords in this subsection are schema fields and validator rules
-at load, and describe runtime behaviour that is not yet implemented. The design
-of record, with the evidence, phasing, and acceptance matrix, is
-[`ENCODER_BATCHING.md`](ENCODER_BATCHING.md).
-
-The ownership split is strict:
-
-- the package authors `batch_capacity`, layouts, padding provenance, ownership,
-  and static footprint bounds;
-- the runtime derives compatibility, request-local spans, and backend
-  feasibility from those contracts;
-- deployment policy decides whether, when, and how much to group.
-
-There is no second supports-batching flag. The former
-`profiles.*.batch_invariance`,
-`model.runtime_configurable.continuous_batching`, and built-in
-`continuous_batching` capability are retired. `batch_capacity` is the sole
-authored assertion that grouped execution is semantically equivalent to solo
-execution; if padding or co-batching changes the result, the component omits it.
-
-Vision encoders — images and video — motivate the work; nothing about it is
-modality-specific. The contracts carry shape symbols, bounds, lengths, and
-ownership levels; a modality vocabulary only produces the semantic values those
-contracts point at, so audio windows and text segments reach the same path
-without a new concept. The surface is three additions, each absent by default:
-
-```yaml
-components:
-  media_encoder:
-    implementation: { kind: onnx, artifact: encoder.onnx }
-    batch_capacity:
-      uniform_dimensions: [features]         # symbols that must agree across items
-      budgets:                                # materialized-footprint bounds
-        - { dimensions: [clips],  max_total: 4 }
-        - { dimensions: [frames], max_total: 64 }
-        - { dimensions: [frames, patches], max_total: 65536 }
-    ports:
-      inputs:
-        pixel_values:
-          dtype: float32
-          rank: 3
-          shape: [frames, patches, features]  # one flattened packed axis
-          batch_layout:
-            kind: token_packed
-            axis: 0
-            levels:                            # innermost first
-              - { offsets: frame_offsets, owner: frame_owner }   # frames -> clips
-              - { offsets: clip_offsets,  owner: clip_owner }    # clips  -> rows
-          padding:
-            - { dimension: patches, valid_lengths: patch_lengths }
-```
-
-Grouping faces three independent kinds of raggedness: how many items a request
-owns, which an ownership level's `offsets`/`owner` answer; how far two items
-differ in extent, which a `padding` entry answers on the dimension that differs;
-and how many parts an item nests — frames in a clip, windows in an utterance —
-which an *additional ownership level over the same packed axis* answers. Each is
-declared on its own dimension and they never compete for one.
-
-- **Declarations are keyed by shape symbol, never by axis index.** A component's
-  ports differ in rank — a rank-3 payload, a rank-1 companion, a rank-2 pooled
-  output — so a component-global axis integer cannot be interpreted coherently
-  across them, while a `TensorDimension::Symbol`
-  (`crates/onnx-genai-metadata/src/schema/decoder_abi.rs:266-273`) names the same
-  quantity on every port that mentions it. The axis a value is packed on is a
-  property of that value's own layout.
-- **`batch_capacity` absent means one request row per invocation** — today's
-  behavior exactly. A runtime **MUST NOT** group a component that has not
-  declared a capacity, and every budget is an upper bound, never an obligation.
-- **`budgets` bind the group's materialized footprint**, keyed by symbol: a
-  packed dimension is charged the sum of the participating items' valid extents,
-  a padded dimension is charged *enclosing count × padded extent* — the rectangle
-  actually allocated, not the sum of the valid lengths — a composed entry
-  multiplies its symbols' footprints, and a `request_expanded` axis is charged
-  `rows × factor`. There is no separate item-count integer: the item bound is the
-  budget on that level's own symbol. Items and packed positions bind
-  independently, and a grouping layer **MUST NOT** reuse a decode-side row bound
-  as an item bound — one request may contribute many items and many requests may
-  contribute one between them. Device memory is not among these bounds; it is
-  runtime measurement, never metadata ([§1.2](#12-non-goals)).
-- **`uniform_dimensions`** are the symbols two items must agree on before they
-  may share an invocation — spatial and temporal alike — which makes batch
-  compatibility a derived predicate rather than a policy. They name **ordinary
-  per-item dimensions only**: a symbol listed there **MUST NOT** be a port's
-  flattened packed symbol and **MUST NOT** be an ownership level's unit-count
-  symbol, since both count the *group* the scheduler assembled rather than a
-  property of an item. A fixed frame count is therefore not a pinned level but
-  the absence of one — the frames→clips level is dropped and `frames` becomes an
-  ordinary per-clip dimension that items must agree on. Every free dimension
-  **MUST** be reconciled either by a `padding` entry or by the packed axis; a
-  component that declares batchability without declaring how raggedness is
-  expressed is rejected at load. A dimension **MUST NOT** be both padded and
-  pinned.
-- **Pinned is not the same as known, and budgets are group-rooted.** A
-  `budgets` entry is a nesting path read outermost-first whose first symbol
-  **MUST** be group-rooted — the flattened packed symbol or a level's unit-count
-  symbol — so a *singleton* entry naming a per-item symbol such as `patches` is
-  rejected: it bounds one item's shape, not the invocation. A pinned symbol
-  **MAY**, and where it contributes to a materialized footprint **MUST**, appear
-  in a *composed* entry such as
-  `{ dimensions: [frames, patches], max_total: 65536 }`. Pinning means equal
-  *within* a group, not fixed *across* groups: one group may pin `patches` at 64
-  and the next at 1024, and a footprint bound that omitted the pinned symbol
-  would bound nothing. An earlier revision's "pinned or budgeted, never both" is
-  withdrawn.
-- **`padding`** is a list of entries, each linking a padded dimension to an
-  `int64` `valid_lengths` companion giving how much of each item is real, so a
-  runtime never fabricates padding it cannot describe. The companion is `shared`
-  and its shape is exactly the axes **outer** to the padded axis, in order — one
-  length per enclosing position. **Padding is appended, never prepended or
-  interleaved:** real entries form a prefix. Lengths rather than a boolean mask,
-  because right-padding makes a mask `O(items × extent)` state for an `O(items)`
-  fact, and because the runtime must read those numbers to build and split a
-  group — a payload-sized mask would have to come back from the device to do it.
-  A component whose graph consumes a materialized mask declares that mask as an
-  ordinary port and its program produces it; the lengths remain the single truth.
-  One entry per dimension, and never on the dimension the layout packs: padding
-  and packing are two answers to one question. **Nor may an emit trim a padded
-  output:** `WorkflowNode::Emit.valid_length`
-  (`crates/onnx-genai-metadata/src/schema/ir.rs:1169-1186`) is honored by slicing
-  the payload (`crates/onnx-genai-engine/src/pipeline/workflow.rs:2215-2226` and
-  `4852-4882`), so an emit that both trims and declares `padding` publishes a
-  shorter tensor beside a length vector measuring the tensor it replaced —
-  either lengths that overrun the payload, or a value the runtime rewrote behind
-  the metadata that describes it. The rule is exclusion, not reconciliation: an
-  `Emit` whose output declares `padding` **MUST NOT** carry `valid_length`, and
-  the refusal names `padding.valid_lengths` as the authoritative account, since
-  a trim is invisible in the contract while a padding entry is part of what the
-  caller reads. The exclusion does not ask which axis the trim is about: an
-  emit's growth axis is only a default (`ir.rs:1178-1185`), so narrowing it would
-  mean guessing in the direction of admitting the ambiguous case. A `token_packed`
-  output needs no separate rule, because an emit-level `valid_length` into a
-  layout with no request axis is already refused at load as ragged emission
-  lacking a row axis
-  (in `validate_compaction_derivability`,
-  `crates/onnx-genai-metadata/src/validation.rs:4811-4825`); a packed **and**
-  padded output hears from both rules, which is correct — they answer different
-  questions. For CTC, padding the logits dimension selected by
-  `decoding.time_axis` also requires `decoding.lengths`. That field names a
-  profile output role, and the role **MUST** map to the exact workflow output
-  named by the padding entry's `valid_lengths`; a missing or different source is
-  rejected. The generic padding rules above supply the companion's `int64`
-  dtype, `shared` layout, and outer-prefix rank and shape. Unpadded logits, or
-  padding only outside `time_axis`, need no CTC lengths binding. The exclusion
-  is keyed on `padding` being non-empty rather than on
-  the layout, because a packed value may legally pad: the no-double-spelling rule
-  in [§10.6](#106-packed-companions-must-validate) forbids a `padding` entry only
-  on the dimension the layout *packs*. Scoping it to layouts with a request axis
-  would exempt the value with the most extents a trim can misdescribe.
-  `padding` states validity provenance. Grouping safety is asserted by the
-  component's `batch_capacity`: a component whose result changes when padded
-  omits the capacity and runs per item.
-- **Ownership is an ordered chain of levels over one physically packed axis.**
-  `TokenPacked` declares `axis` — which **MUST** be `0` wherever `token_packed`
-  appears, not only on a component that declares a capacity, because the runtime
-  splits any packed value per request and every such split wants a contiguous
-  span — and `levels`, one or two `{ offsets, owner }` pairs, innermost first. Level 0
-  maps packed positions to their parent unit, the last level maps units to
-  request rows, and composing them gives each row a single contiguous span. There
-  is no second physical packed axis: frames are flattened across clips and across
-  requests, and the frame→clip and clip→row maps are bookkeeping over that one
-  axis. Two content roles, `pack_offsets` and `pack_owner`, join the preprocessing
-  vocabularies so a declared program can produce them at any level, and a
-  preprocessing-program value named as a level companion **MUST** carry the
-  matching one. That is stricter than the `padding` reference, which resolves by
-  name and treats the length role as descriptive, and deliberately so: length
-  vectors have established modality spellings that predate this design, while the
-  companion roles are new and have nothing to accommodate. A third role,
-  `valid_lengths`, is **new**: no such role existed — the audio vocabulary
-  offered `valid_frames`, `valid_samples`, `sample_lengths`, `frame_lengths`, and
-  `validity_mask` (`crates/onnx-genai-metadata/src/schema/mod.rs:428-456`) — and
-  an earlier revision's claim that it generalized an existing role is withdrawn.
-  It coexists with those names rather than replacing them: a `padding` entry
-  references a value **by name**, so an audio program may point at a
-  `frame_lengths` value it already emits, while a modality with no established
-  spelling uses the generic role instead of inventing one. Owner values carry a
-  **position**, never a request identity ([§8.3](#83-no-row-identity)). Depth
-  stops at two levels, so a third is a deliberate schema change rather than
-  something a package asserts into existence.
-- **Raggedness leaves a workflow with the metadata that decodes it.** An emitted
-  `token_packed` value publishes every level's `offsets` and `owner`, and an
-  emitted padded value publishes each entry's `valid_lengths` — published meaning
-  *emitted by some declared step*, since an output nothing writes delivers an
-  empty vector beside a ragged payload. The serving rule that rejects an emitted
-  rank > 0 `shared` value
-  (in `validate_compaction_derivability`,
-  `crates/onnx-genai-metadata/src/validation.rs:4858-4862`) is carved out for
-  exactly those referenced companions — `int64`, of the rank that reference
-  demands, named by another emitted value's layout or `padding` entry in the same
-  workflow — and for nothing else. The rank is per reference rather than a flat
-  1: `offsets` and `owner` are rank 1 by construction, but a `valid_lengths` has
-  one entry per position of the axes *outer* to the dimension it bounds, so a
-  value padded on axis 2 publishes a rank-2 length vector.
-  Withholding a length vector is not a smaller version of the same package: since
-  a materialized validity mask is rejected for the contract, that vector is the
-  only account of the padding that exists.
-- **A row selection is lifted, never applied to a packed axis.**
-  `BatchLayout::request_axis()` returns `None` for `TokenPacked`
-  (`crates/onnx-genai-metadata/src/schema/ir.rs:194-199`) while `is_row_scoped()`
-  reports true, so compaction resolves each destination row's unit range through
-  the outer level, then each unit's positions through the inner level, producing
-  an item permutation; companions are then **recomputed**, never gathered.
-  `row_scope.axis` is therefore the component's **request row** axis and
-  **MUST NOT** be a packed item axis.
-
-Ownership is unchanged in shape: metadata describes the bound, the modality
-vocabulary defines the semantic values, the preprocessor produces the per-item
-tensors and their packing metadata, the scheduler decides which pending items
-co-batch, the interpreter builds and splits the grouped invocation, and both
-backends execute it through the one component-execution seam with identical
-results. A runtime **MUST NOT** make two items compatible by changing them:
-trimming frames, resampling a clip to a common frame count, or downscaling to a
-common resolution are semantic changes, so the correct response to an
-incompatible pair is two groups.
-
-The unimplemented runtime path has two acceptance requirements. First, grouping
-must not introduce a host round-trip for a value that is already device
-resident, and splitting a packed result back to rows should be an aliasing
-operation —
-which is the practical reason the packed axis is pinned to 0 and the ownership
-rules demand contiguity, since a no-copy view is a contiguous element window and
-"a slice along an inner axis is not a contiguous range"
-(`crates/onnx-genai-ort/src/value.rs:1524-1543`). Second, backend support for
-grouped execution is asked **before** a group is formed, never discovered by
-attempting one, and it is recorded per (component implementation, operator class,
-execution provider) rather than as one global flip: a triple that has not proven
-parity reports that it cannot group, receives no group, and the workload runs
-item by item as it does today. Declining is safe; attempting is not. Neither fact
-is a metadata field — residency and execution capability are runtime-owned
-([§10.2](#102-externally-suppliable-results)) — and both are specified in
-[`ENCODER_BATCHING.md` §9](ENCODER_BATCHING.md#9-fail-closed-backend-readiness).
-
-**Shipping this surface required a version gate, not a compatibility claim, and
-the gate shipped with it** (`crates/onnx-genai-metadata/src/version.rs:78`,
-`SUPPORTED_SCHEMA_VERSION` `v1.1` at `version.rs:42`).
-`InferenceMetadata` and every struct this design extends are
-`#[serde(deny_unknown_fields)]` (`crates/onnx-genai-metadata/src/schema/mod.rs:38-40`
-and 45 occurrences in `schema/ir.rs`), so an older runtime **rejects the whole
-document** when it meets `batch_capacity`, `padding`, or `levels` — it does not
-ignore them. The current `schema_version` contract states the accepted grammar
-and normalization (`schema/mod.rs:62-78`), and the shipped gate reads the version
-from a generic parse and rejects an unsupported version with one actionable
-message **before** struct deserialization (`version.rs:42,78`):
-
-- **Normalization.** `[v]major[.minor]`, minor defaulting to 0. The legacy
-  spellings absent, `v1`, `1`, and `1.0` normalize to **v1.0**, so no existing
-  document changes meaning merely because its spelling predates the canonical
-  form. Anything unparseable is rejected as malformed.
-- **Direction.** Reject when the document's major differs from the runtime's,
-  **and** when the document's minor exceeds the runtime's supported minor.
-- **Deliberately stricter than the in-repo precedent.**
-  `onnx-model-package` parses `<major>.<minor>` and then ignores the minor
-  entirely, gating only on major (`crates/onnx-model-package/src/lib.rs:563-579`).
-  That is right for a container whose unknown parts are inert; it is wrong here,
-  because `deny_unknown_fields` makes unknown fields a hard parse failure and
-  because a runtime that silently skipped a `padding` entry while grouping would
-  produce wrong numbers.
-- **Canonical emission.** This additive surface is **v1.1**. A writer **MUST**
-  stamp `v1.1` when the document carries any of these fields and **MUST NOT**
-  otherwise, so packages that do not declare `batch_capacity` keep their current
-  bytes and version strings exactly and their minimum runtime does not move.
-
-Grouping still introduces **no new capability identifier** — but not because an
-old runtime would otherwise refuse a package it can execute, which
-`deny_unknown_fields` makes false. A capability is a load-time promise that
-correct execution *requires* a behavior
-([§4.3a](#43a-capability-admission-and-complete-built-in-catalogue)); no
-package's correctness requires that its encoder be batched, so a runtime that
-parses the document and chooses not to group stays correct. Version gating says
-"this document uses a newer vocabulary"; a capability says "you must do this or
-be wrong". This is also the general direction: a fact the workflow structure
-already determines is not additionally serialized as a flag.
-
-### 10.6 Packed companions must validate
-
-**Status.** Implemented in
-[#2009](https://github.com/justinchuby/onnx-genai/pull/2009) (`0448f2bc6`). The
-load-time half of this subsection is in force; the invocation-time checks it
-also specifies belong to the interpreter phase and are not implemented.
-
-Full rules and their negative fixtures are
-in [`ENCODER_BATCHING.md` §4](ENCODER_BATCHING.md#4-validation-shipped-on-main).
-In summary, a `token_packed` value's companions are checked at **load**: every
-level's `offsets` and `owner` **MUST** resolve to declared values; each is
-`shared`, `int64`, rank 1, with level `k`'s `owner` carrying that level's unit
-count and its `offsets` carrying the parent count plus one; `axis` **MUST** be
-`0` for every packed value, whether or not the component declares
-`batch_capacity`; a companion that is a preprocessing-program output carries
-`pack_offsets` or `pack_owner`; `levels` holds one or two entries, innermost
-first; every port naming a given `{ offsets, owner }` pair
-agrees on that pair's extent symbols — consistency is keyed on **pair identity,
-not on level index**, because a pair legitimately sits at level 1 of an input and
-level 0 of an output that pooled the inner level away; a packed value declares no
-`padding` entry **on the dimension it packs**, and no port is both
-`request_expanded` and packed on one axis.
-
-**Packing depth is capped at two levels.** Parts in items and items in rows
-covers every known workload — frame → clip → request, frame → window → request,
-token → segment → request — and each further level multiplies the validation
-surface, the split implementation, and the corruption cases that must be tested.
-
-**Every output level declares who produces its raggedness.** The declaration is
-per **level**, not per value: each entry of a packed output's `levels` carries
-`extent: preserved | produced`. `preserved` means this level's units correspond
-one-to-one and in order with an input level's, which the validator checks by
-comparing the referenced pair's extent symbols against the input port's;
-`produced` means the graph decides the count, so that level's `offsets` and
-`owner` **MUST** be declared outputs of the same component and naming an input
-companion there is rejected. Input levels carry no `extent`. A value-wide flag
-was considered and rejected as a category error: a token-merging encoder
-*produces* its token→clip level while *preserving* the clip→row level it never
-touched, and one flag can state only one of those. An output level omitting
-`extent` is rejected, because the runtime would otherwise guess whether the
-input's offsets still describe the result and split at the wrong boundaries in
-silence.
-
-**Serving admits companions, and only companions.** A serving workflow rejects an
-emitted value of rank > 0 that declares `shared`
-(in `validate_compaction_derivability`,
-`crates/onnx-genai-metadata/src/validation.rs:4858-4862`), which would reject
-the very companions a ragged emit is required to publish — a packed value's
-`offsets` and `owner`, and a padded value's `valid_lengths`. The carve-out is
-minimal and decidable from the workflow's own declarations — its outputs and its
-steps, with no runtime information: a `shared` emitted value
-is admitted **iff** it is `int64`, carries the rank that reference demands, and
-is named as an `offsets` or `owner` of another emitted value's layout, or as the
-`valid_lengths` of another emitted value's `padding` entry, in the same workflow;
-anything else keeps the existing rejection. The rank is read from the reference,
-not fixed at 1: an `offsets` and an `owner` are rank 1 by construction, while a
-`valid_lengths` has the rank [§10.5](#105-generic-component-batching)
-fixes — the number of axes outer to the padded one, equivalently `rank == axis`
-for the padded dimension's axis index — so a flat rank-1 admission
-would refuse a companion this design elsewhere requires, and would refuse it by
-advising the one layout a companion may not declare. A companion must also be
-**emitted**, not merely declared, and so must the value that names it: an output
-no step writes is an empty vector beside a ragged payload, which is this rule's
-failure case wearing the appearance of compliance, and asking for an emit on one
-side while accepting a bare declaration on the other lets a `shared` vector walk
-past the serving rule beside a padded output nothing writes. That check is
-whole-workflow rather than path-sensitive, because "written by some declared
-step" is what is decidable without evaluating branch predicates. A companion is
-never compacted and never split like a payload — each request receives its own
-span plus **rebased**, zero-based offsets for that span,
-and the slice of any `valid_lengths` that indexes its own items, which needs no
-rebasing because a length is already relative to what it measures. A declared
-`owner` output is **internal**: it must be declared so the workflow validates and
-the runtime can check the level, and it is never delivered, because its values
-are positions within a grouping the caller cannot see
-([§8.3](#83-no-row-identity)). Per-request owners, where a consumer wants
-them, are **derived** by the runtime from the rebased offsets.
-
-`offsets` is `shared` rather than `request_aligned` for a structural reason: an
-exclusive prefix sum is not permutation-followable. Permuting rows does not
-permute a prefix-offset vector, it invalidates it, so a runtime that changes the
-grouping recomputes `offsets` instead of gathering it. The doc comment that
-called it request-aligned was corrected when the rule landed.
-
-At **invocation** the runtime verifies, at every level, that extents resolve
-consistently, `offsets[0] == 0`, monotonicity, that the last offset equals the
-child count, that `owner[i]` is in range, and that each parent's children are
-contiguous; that every `valid_lengths` companion has the exact shape above and
-lies in `[0, padded_extent]`; and that the assembled group satisfies every budget
-and every pinned dimension. It reports a violation by naming the value, the
-level, the index, and the two facts that disagree — never by clamping or by a
-best-effort split. A request whose span is empty receives an empty span with rank
-preserved — never a fabricated placeholder — and a group with no items is not
-invoked at all. **None of these checks may cause a host transfer:** companions
-the runtime built are host-resident already, and companions a component produced
-are checked for dtype, rank, and resolved extent without reading data, with
-value-level arithmetic done on the companion-only transfer the split already
-requires.
-
----
+The runtime decides whether and how to form groups. It **MUST NOT** change input
+semantics to make items compatible, and unsupported grouped execution falls back
+to isolated execution. Placement, host/device transfers, allocation, group size,
+and scheduling remain runtime policy.
 
 ## 11. Cache correctness dependencies
 
@@ -1188,9 +738,8 @@ The runtime constructs the cache key, hash, salt, and tenant namespace from the
 derived dependency set. Cross-process cache identity and request salting are
 runtime and security responsibilities.
 
-A validator test proves that removing a LoRA adapter or a multimodal encoder
-input from a workflow changes the derived dependency set — the dependencies
-cannot be omitted by accident.
+Every value that can affect state **MUST** participate in the derived dependency
+set.
 
 ---
 
@@ -1230,6 +779,15 @@ state_service:
 Metadata **MUST NOT** select `paged`, `shared_buffer`, or `separate` storage, a
 slot-allocation algorithm, a device, or an execution provider.
 
+The same rule applies to tiering. Metadata **MUST NOT** name CPU/device/disk
+spill targets, budgets, watermarks, migration thresholds, compression,
+prefetch, or load-versus-recompute policy. It declares only semantic state,
+portable checkpoint form, reuse/eviction legality, and bounds. A runtime may
+move eligible storage between tiers only while preserving the exact semantic
+value. Spillability and legal prefix eviction are separate questions: being
+movable does not make state disposable, and being recomputable does not select a
+placement tier.
+
 ### 12.2 Retained graph ABI facts
 
 Removing storage policy must not remove real graph constraints. These are ABI
@@ -1261,7 +819,6 @@ state:
   linear_accumulator:
     contract:
       dtype: float16
-      rank: 4
       shape: [batch, heads, key_feature, value_feature]
       batch_layout: { kind: request_aligned, axis: 0 }
     scope: invocation
@@ -1273,7 +830,6 @@ state:
   causal_conv_history:
     contract:
       dtype: float16
-      rank: 3
       shape: [batch, channels, kernel_history]
       batch_layout: { kind: request_aligned, axis: 0 }
     scope: invocation
@@ -1411,83 +967,33 @@ defect §4.1a forbids. Adding the two port maps to `update` puts the missing fac
 where the binding that consumes it lives, and declaring the pair beside a
 workflow is now rejected.
 
-### 12.2c FP8 and other narrow cache element types
+### 12.2c Cache element types
 
-The dtype vocabulary includes `float8_e4m3fn` and `float8_e5m2`, and a package
-may declare state in them. This is a representability decision with a sharp
-boundary, because three capabilities are involved and they are supported
-independently:
+A package may declare any state element type admitted by the schema and graph
+ABI. Metadata validation **MUST NOT** reject a portable type merely because a
+particular backend lacks an allocator or kernel. Backend capability is resolved
+at admission, with an actionable error naming the incompatible state, operator,
+type, and backend.
 
-| Capability | Who decides | Status |
-| --- | --- | --- |
-| Declare FP8 state and ports | metadata format | supported |
-| Validate the document | validator | supported |
-| Allocate and bind FP8 buffers | runtime | supported |
-| Compute on FP8 in a kernel | execution provider | provider-dependent |
+A producer **MUST NOT** silently substitute another type when the requested
+graph ABI cannot represent the declared state. Runtime-private cache formats may
+be narrower than the portable contract, but that limits only those backends.
 
-The rule that follows: **validation must not pre-empt the provider.** Metadata is
-portable and cannot know which provider will load a package, so refusing an FP8
-dtype at validation time reports a missing kernel as a malformed document — and
-those two problems have opposite remedies. A capability gap tells the reader to
-change provider or build; a schema error tells them to edit a file that was
-correct. The runtime therefore carries FP8 as far as it can and fails, when it
-must, with the provider's own error naming the operator and the element type.
+### 12.3 Capabilities, cascade, fork, and reuse
 
-Measured on the CPU provider (ORT 1.28): an FP8 tensor allocates, binds, and
-round-trips through a session, so FP8 state is *loadable*. `ScatterND` has no FP8
-kernel there, so an FP8 *static* cache is not executable on that provider — the
-session fails to load with a type error naming `ScatterND` and
-`tensor(float8e4m3fn)`. That is an execution-provider blocker, not a metadata
-limitation, and it moves on its own when a provider registers the kernel.
+State-group capabilities declare legal rollback bounds, snapshots, and forks;
+`cascade` names all groups that must move with an operation. The runtime chooses
+when and how to exercise them.
 
-Measured on the CUDA provider (onnxruntime-gpu 1.29.0, H200): the blocker is real
-there too, but it surfaces in a **different shape**, and the difference matters to
-whoever has to read the error. FP8 KV is reachable only through
-`GroupQueryAttention`, whose `k_scale`/`v_scale` arrive as node inputs 12 and 13.
-With FP8 KV the node matches no registered kernel, so graph partitioning leaves it
-unassigned and session creation fails during initialization:
+A session fork creates a child at a declared position with every semantic state
+and effect participant reproduced there, after which parent and child mutate
+independently. Copy-on-write is optional. A prefix-cache hit only reuses
+compatible computation and creates no session identity. Fork and
+`reuse.prefix_reusable` **MUST NOT** imply one another.
 
-```
-transformer_memcpy.cc:253 IsNodeCompatibleWithProvider
-  Provider type for GroupQueryAttention node 'node_GroupQueryAttention_9' is not set
-```
-
-Note what that message does **not** say: it names neither FP8 nor the element
-type. Read alone it looks like a malformed graph, which is precisely the
-misreading §12.2c exists to prevent. A three-way split attributes it exactly:
-
-| Node | KV element type | Result |
-| --- | --- | --- |
-| 14-input GQA, scales at 12/13, quant attributes set | `float` | loads and runs |
-| same node, unchanged arity and attributes | `float8_e4m3fn` | node unassigned, init fails |
-| no FP8 pass at all | `float16` | loads and runs |
-
-Holding arity and attributes fixed and moving only the element type isolates the
-cause to the **KV type constraint** — `tensor(float8e4m3fn)` is absent from the
-CUDA GQA `past`/`present` type list in 1.29.0. It is not the scale-input arity,
-not the quantization attributes, and it is not a CUDA illegal memory access: no
-kernel is ever launched. So this is a missing kernel registration, which is the
-same class of blocker as the CPU `ScatterND` gap and moves the same way.
-
-One consequence for producers: a fixed-capacity export built from `TensorScatter`
-plus the ai.onnx `Attention` operator has no GQA node at all, so it has nowhere to
-carry `k_scale`/`v_scale` and cannot express FP8 KV regardless of the type list.
-A producer that is asked for both should fail closed with that diagnosis rather
-than silently emit 16-bit floats — the request was for something the operator set
-cannot represent, and a quiet dtype substitution turns an unsatisfiable request
-into a plausible wrong answer.
-
-Two runtime storage paths remain narrower than the format, and say so by name
-rather than by refusing the document: the **paged KV cache** stores fp32 and
-16-bit float pages only, and **host-side KV growth** materializes buffers through
-per-dtype host representations. Both are backend capabilities; a package that
-declares FP8 state is well formed and simply cannot use those backends.
-
-### 12.3 Capabilities and cascade
-
-`capabilities` declares the bounds within which a group can be rewound, snapshot,
-or forked, and `cascade` names the groups that must move with it. The runtime
-decides *when* to use them; the package decides *whether it is legal*.
+A runtime exposes fork only when every participant and transitive cascade can be
+forked. Otherwise it declines fork before creating the child; it does not fork a
+subset.
 
 ### 12.4 Lifetime and release boundary
 
@@ -1502,116 +1008,33 @@ storage), and a `session` release boundary requires session scope.
 
 ### 12.5 Sessions
 
-Session state is normative and minimal. Metadata declares:
+Session metadata declares typed semantic state, lifecycle, initialization or
+restore bindings, readers, writers, update discipline, final writer, release,
+and transaction behavior. Runtime session IDs, locks, TTL, storage, placement,
+retention, and physical row/cache identity are not package semantics.
 
-- the **scope** (`invocation` or `session`);
-- the typed **mutation semantics**;
-- the lease capability the reader must implement (`session_state_lease`).
+For every state value, initialization and restore **MUST** be unambiguous.
+Readers and writers are derived from workflow dataflow, component bindings,
+loop carries, and state-service aliases. All control-flow paths that write a
+value **MUST** join to one final writer before commit. Author-defined map keys,
+component order, filenames, modality names, and model-family names have no
+semantic authority. Storage management does not redefine dataflow.
 
-The runtime owns session IDs, TTL, storage, locking, migration, and retention.
-Interactive world-model, robotics, and streaming-observation workloads enter as
-separate workflow invocations with session state in between; the portable IR
-adds no network-aware `receive` or `await` operation.
+At turn admission, before mutation or publication, the runtime records one typed
+committed baseline for the complete state/effect write set and each workflow
+output's committed head, cursor, lineage, and closure state. The baseline and
+turn have stable identities. Provisional publications carry transaction and
+revision lineage; rollback targets **MUST NOT** be inferred from names, payloads,
+emit order, or container order.
 
-#### 12.5a How the next invocation reaches leased state
-
-Scope says *keep this*. It does not say how the next invocation reaches what was
-kept, and a package that leaves that unanswered advertises a continuity it does
-not have — every turn restarts and the failure reaches a caller as a model that
-forgot what it was told. A lease is reached through exactly three mechanisms, and
-a document uses one of them. Which one each session cell uses is answered once,
-by `classify_session_state`, and read by both the validator and the runtime —
-computing it twice is how they came to disagree.
-
-- **A loop carries the cell.** Its lease is what seeds the carry when the pass
-  enters the loop, in place of the initializer the document names. This is what a
-  full-duplex or streaming package does.
-- **A state service group holds it.** The group's alias names the `input` port
-  the graph reads and the `output` port that advances it, so the lease replaces
-  the value the cell's initializer names and the alias's output is what the next
-  lease holds. An alias with no output port is refused: the lease could be read
-  and never advanced, so every turn would replay the first.
-- **The request binding rejoins it**, declared on the lease:
-
-  ```yaml
-  conversation:
-    contract: { dtype: int64, rank: 2, shape: [batch, conversation_length],
-                batch_layout: { kind: request_aligned, axis: 0 } }
-    class: semantic
-    scope: session
-    initializer: request.input_ids
-    recurrence: { kind: bounded, axis: 1, max: package.max_context }
-    management: runtime
-    release_boundary: session
-    session:
-      policy: exclusive
-      continuation:
-        kind: prompt_prefix
-        prompt_input: request.input_ids   # must carry role prompt_tokens
-        tokens_output: tokens             # must carry role tokens
-  ```
-
-  The value bound to `prompt_input` becomes the cell's value followed by the
-  caller's tokens; when the invocation completes the cell becomes that
-  concatenation followed by what was published to `tokens_output`. A session
-  holding nothing contributes nothing, so a conversation's first turn and a
-  request with no session are the same execution — declaring a conversation
-  costs a package nothing when nobody asks for one.
-
-  The `recurrence` bound is load-bearing: a continuation is not loop-carried and
-  so never reaches the carry path's recurrence check, and this is the only place
-  it is honoured. Separately, the conversation's *current* length is what a front
-  end adds to a request's own before enforcing a context limit, because a
-  prompt-prefix conversation really is prefilled again on every turn — and it is
-  the only carrier for which that is true. A turn whose conversation would exceed it is refused before it
-  runs, and a turn whose own generation would exceed it is refused rather than
-  stored — a session left in a state its own declaration forbids has no way
-  back. Neither refusal changes what the session already held; `reset_session`
-  releases it.
-
-  This is what a decoder whose prefill starts from empty state declares. Such a
-  package's cache is rebuilt from the conversation on each turn; nothing in the
-  document asks the prefill to accept a cache it was never authored to take, and
-  no runtime has to invent that it should.
-
-The validator enforces the corollaries. A continuation must be `scope: session`,
-`class: semantic`, `management: runtime`, `release_boundary: session`, and must
-grow along a bound that names a declared input with a value by the time a turn is
-admitted; it must name a declared `prompt_tokens` input and a declared `tokens`
-output whose contracts match the cell's; it must not also be loop-carried, which
-would be two answers about the same value; and a workflow declares at most one,
-because a package has one conversation. A session-scoped cell binding a
-`service_group` must resolve to a declared group that aliases it.
-
-A **semantic** session-scoped cell with none of the three is refused at load:
-nothing in the document says how the next invocation reaches it. Advisory state
-is exempt, because it is droppable by declaration.
-
-A package that publishes a token stream and declares no session state at all is
-refused a session at `create_session` rather than handed one whose turns silently
-restart. That refusal is typed — `PackageCapabilityError` — so a front end
-answers it as a request/package mismatch (HTTP 409) rather than as a server
-fault. A package that publishes no token stream has no conversation to lose and
-keeps its session handle.
-
-A lease declared `policy: exclusive` is single-flight: a second turn that starts
-while one is in flight is refused by name rather than allowed to read a
-conversation the first is about to replace.
-
-### 12.5b What a prompt-prefix conversation costs
-
-A `prompt_prefix` continuation carries the conversation as **tokens**, not as a
-cache: the package's own cache cells are invocation-scoped and released when the
-invocation ends, so turn *N* re-prefills every earlier turn. Over a conversation
-of *N* tokens that is O(N²) prefill work, against O(N) for a decode core whose
-paged KV survives the turn.
-
-That is the cost of continuing a conversation a package can *express*. A decoder
-whose prefill accepts only an empty cache has no port for a prior session length,
-so a runtime handing it the previous turn's cache would produce a mask and a
-cache that disagree. A package that wants the linear cost declares its cache
-session-scoped and is executed by a core that keeps it. A package that publishes no token stream has no
-conversation to lose, and its session is an ordinary handle.
+Commit atomically advances every participating state, effect, and output head.
+Abort, cancellation, execution failure, or commit failure restores/retracts the
+whole turn to its recorded baseline. `commit_only` exposes nothing before commit;
+`provisional_revisions` may expose typed provisional publications and the typed
+`abort_to_baseline` turn/transaction outcome defined in
+[§6.4](#64-workflow-output-publication-and-revisions). A participant unable to
+join the transaction causes admission to fail before mutation. An exclusive
+lease is a concurrency primitive, not the transaction itself.
 
 ### 12.6 Private state and checkpoints
 
@@ -1648,6 +1071,18 @@ Confusing the two is how a cluster silently corrupts state across a rolling
 upgrade, so the contract keeps them separate and names neither as a fallback for
 the other.
 
+#### Prefill/decode lifecycle and final writer
+
+Separate prefill and decode artifacts are ordinary workflow components. On any
+invocation, prior restored state, explicit external initialization, or empty
+initialization is selected by typed dataflow. Prefill consumes the selected
+state when its graph ABI permits, and its result flows to decode. The turn
+commits the dataflow-derived final writer.
+
+If the artifacts use different private state representations, a compatible
+versioned conversion **MUST** be declared or the pairing rejected before
+execution. A portable checkpoint is not an implicit hot-path conversion.
+
 ### 12.7 State representation and quantization
 
 Graph-visible state representation is **inferred from the graph**: tensor dtype,
@@ -1657,11 +1092,25 @@ too many.
 
 The runtime-private cache representation — including whether the runtime
 quantizes its own cache — is **runtime-owned and runtime-validated**. Metadata
-carries no KV quantization mode and no KV quantization tolerance. The runtime
-policy type is `onnx_genai_kv::KvQuantPolicy`.
+carries no KV quantization mode and no KV quantization tolerance.
 
 This does not touch **model-weight** quantization intent, which remains in
 `quantization` and is a published property of the package.
+
+### 12.8 Stateful token-context features
+
+A package may derive deterministic features from explicit token identities and
+bounded token history through ordinary typed components and state dataflow.
+N-gram hashing, learned embeddings, projections, gating, convolution, and
+residual injection are graph semantics, not architecture or model identifiers.
+
+When embeddings and token-context features are both consumed, token IDs **MUST**
+be bound explicitly; reverse embedding lookup is forbidden. Each history is a
+separate semantic state participant with declared initialization, recurrence,
+update, lifecycle, compaction, checkpoint/fork, and rollback behavior.
+Full-sequence, chunked-prefill, and decode execution **MUST** agree at equivalent
+boundaries. Geometry and table contents are package facts; placement, sharding,
+offload, prefetch, and memory budgets are runtime policy.
 
 ---
 
@@ -1669,17 +1118,17 @@ This does not touch **model-weight** quantization intent, which remains in
 
 ### 13.1 What metadata declares
 
-```yaml
-speculative:
-  proposer: { ... }             # typed ports
-  target: { ... }               # typed ports
-  shared_state: [decoder_cache] # shared state groups
-  shared_weights: []            # shared weight bindings
-  vocabulary: { kind: identical }
-  rollback_state: [cache]       # workflow state cells that must rewind
-  max_proposal_width: 8
-  distribution_preserving: true
-```
+The canonical speculative contract declares proposer and target components,
+typed port bindings, vocabulary relation, immutable shared weights, shared or
+private state, rollback participants and bound, and distribution equivalence.
+Those facts **MUST NOT** be inferred from filenames, model families, or proposal
+names. Overlapping legacy discovery/configuration surfaces are not alternative
+portable authorities.
+
+Proposal forms may use flat blocks or candidate trees. A candidate-tree proposer
+must declare candidate tokens, parent topology or mask, verification outputs,
+accepted path, proposal probabilities required for sampling, and rollback of all
+affected state. Unknown proposal-contract identities or versions fail closed.
 
 ### 13.2 What the runtime owns
 
@@ -1753,6 +1202,25 @@ workflow declares `bitwise` or `distribution_preserving` equivalence
 Otherwise the caller must opt in — by naming a mode on the request or in the
 engine configuration.
 
+### 13.7 DFlash
+
+DFlash is a distinct flat-block proposer conditioned on declared target hidden
+features. Its contract declares conditioning, masked candidate positions,
+draft-private state, candidate tokens, proposal probabilities, immutable weight
+sharing, and accepted-prefix rollback for target and draft state.
+
+The target verifies candidates exactly. Greedy execution accepts the longest
+matching prefix; sampling is permitted only when the declared proposal
+probabilities support distribution-preserving correction. EOS, context limits,
+zero/partial/full acceptance, cancellation, and failure preserve the transaction
+contract.
+
+Shared batching and compaction are optional optimizations. A runtime may execute
+rows in isolation without changing DFlash conformance. Candidate-tree proposals
+are independent typed forms and neither block nor redefine DFlash; a DFlash
+variant with additional selector or convolution semantics requires its own
+versioned contract.
+
 ---
 
 ## 14. Generation
@@ -1815,21 +1283,16 @@ In workflow metadata each program is materialized by one manifest-pinned
 adapter invocation (`onnx-genai.image-preprocess@1`,
 `onnx-genai.video-preprocess@1`, or `onnx-genai.audio-preprocess@1`) and every
 declared output **MUST** carry a `TensorContract` compatible with its adapter
-port. Current runtime support is narrower than the schema: image and audio
-executors accept one encoded item per invocation, and no video executor is
-registered. A package **MAY** instead hand the server an already-featurized
-media tensor with the full contract and no program; there the input's shape
-states the geometry. Text encoders use this typed-tensor path because there is
-no dedicated text preprocessing program.
+port. A package **MAY** instead supply an already-featurized media tensor with
+the full contract and no program; there the input's shape states the geometry.
+Text encoders use the same typed-tensor path.
 
 A program output can declare `pack_offsets`, `pack_owner`, and
 `valid_lengths`. These level-agnostic roles let image, video, and audio programs
 name the companions referenced by `token_packed` and `padding`. Existing audio
 roles such as `frame_lengths` and `sample_lengths` remain valid because a
-padding contract references its companion by value name. The missing part is
-runtime production of grouped companions, not schema vocabulary — see
-[§10.5](#105-generic-component-batching) and
-[`ENCODER_BATCHING.md`](ENCODER_BATCHING.md).
+padding contract references its companion by value name. See
+[§10.4](#104-generic-component-batching).
 
 Application policy inputs — a grammar, a JSON Schema, a regex — are **request
 data**, not metadata. What metadata carries is everything needed to interpret
@@ -1890,6 +1353,23 @@ constraint-language dialect and version matter because a caller-supplied grammar
 is only meaningful against a named dialect, and the component that interprets it
 is named so the dependency is derivable ([§11](#11-cache-correctness-dependencies)).
 
+### 15.1 Versioned tool-call protocol
+
+The caller owns offered tools, descriptions, JSON Schemas, choices, prior calls,
+and results. A tool-capable package declares the exact protocol identity and
+version needed to render those values and parse model output. The protocol
+covers template placement, envelopes, incremental boundaries, escaping, call
+identities, multiple calls, and complete/incomplete/malformed outcomes.
+
+A runtime **MUST** select only the declared protocol. Unknown, unsupported, or
+ambiguous identities and versions fail closed; parser trial order, model-family
+matching, and a boolean such as `supports_tools` are forbidden. Whether the
+implementation is native or portable is not part of the package contract.
+
+All caller-provided tool data, template values, and model-produced envelopes are
+untrusted structured input and **MUST** be bounded and validated. Metadata grants
+no authority to execute or select tools.
+
 ---
 
 ## 16. Distributed execution
@@ -1925,21 +1405,11 @@ There is no export path and no reverse synthesizer. A reverse synthesizer would
 have to approximate facts the new contract states precisely, and an approximation
 that looks like a package is worse than no package.
 
-`onnx_genai_genai_config::import` walks the *raw* JSON — not just the
-deserialized struct, because serde silently discards keys the wire types do not
-name — and classifies every key path:
-
-- **consumed** (`CONSUMED_KEYS`): read by the converter;
-- **known-dropped** (`KNOWN_DROPPED_KEYS`): deliberately not represented, with a
-  recorded reason (deployment policy, kernel varlen ABI, scheduler identity);
-- **unrecognized**: anything else.
-
-Any dropped key is an error by default. `--allow-lossy`
-(`ImportOptions::allow_lossy`) downgrades it to a recorded list in
-`ImportReport::dropped_keys` — the list is the point: a lossy import must be able
-to say exactly what it discarded.
-
-CLI: `import_genai_config [--allow-lossy] <genai_config.json>`.
+An importer **MUST** inspect the complete source document and classify each
+source field as consumed, deliberately dropped with a reason, or unrecognized.
+Dropped or unrecognized information is an error by default. An explicitly
+lossy conversion **MUST** report every discarded field; it must never silently
+approximate missing semantics.
 
 ---
 
@@ -1955,276 +1425,50 @@ Packages written against the previous contract migrate as follows:
 | `kv_service:` | `state_service:` with semantic `kind` per group |
 | `storage: paged` / `shared_buffer: true` | delete; declare `aliasing:` instead |
 | `slot_allocation: <mode>` | delete |
-| KV quant mode/tolerance | delete; runtime-owned (`KvQuantPolicy`) |
+| KV quant mode/tolerance | delete; runtime-owned |
 | implicit effect domains | declare `pipeline.workflow.effects` |
 | native stateful components | add `row_scope` and `cache_affects_state` |
 | contracts | add `equivalence` (defaults to `semantic`) |
 | state cells bound to a group | add `management: runtime` + `release_boundary` |
-| top-level `model.io` (with or without a `pipeline.workflow`) | run `migrate_model_io <package-dir>`; it declares port roles in `components.<c>.ports.roles` and cache ports in the owning `state_service` group |
+| top-level `model.io` | declare port roles in `components.<c>.ports.roles` and cache ports in the owning `state_service` group |
 | `model.io.static_cache` | `state_service.groups.<g>.update` (`indexed_scatter`, `write_indices_ports`, `kv_length_ports`) plus `role`/`layer` on the group's port pairs |
 | `pipeline.models.<c>.io` | deleted with the composite IR; use `components.<c>.ports` |
 
 Every removed field is rejected by name, so migration failures are precise rather
 than mysterious.
 
-### 18.1 Removal of `model.io` — complete
 
-The staged path this section used to describe has been carried out. What landed:
-
-1. `model.io` was deserialize-only, reachable through one deprecated accessor,
-   and rejected beside a workflow. *(done)*
-2. The `genai_config.json` importer states its result as a `pipeline.workflow`
-   rather than a `model.io` block. Import remains one-way and fail-closed
-   (§17); a *foreign* producer's format is converted into this project's one
-   representation, which is the whole point of an importer. *(done)*
-3. The staged warning step was skipped: with the field deleted there is nothing
-   left to warn *about*, and a warning that still loaded the package would have
-   kept the second answer alive for another release. *(superseded)*
-4. The field and its accessor are deleted, and the key is rejected by name.
-   `DecoderAbi` (formerly `ModelIoSpec`) survives as the *resolved* result of
-   `decoder_io()`: a derived value with no serialized form, now living beside
-   the recognizer that produces it rather than in the serialized schema. *(done)*
-
-**Converting a package.** `migrate_model_io <package-dir>` rewrites a retired
-block as the canonical workflow. It is deliberately an offline tool rather than
-a load-time step: a runtime that repaired packages in memory would mean the
-package on disk said one thing and the runtime executed another, which is the
-second authoritative answer this rule exists to prevent. A package whose ports
-were previously guessed from its ONNX graph states them once with
-`--abi <ports.yaml>`.
-
-**Why a single decoder is not a special case.** It is a workflow with one ONNX
-component and one runtime-bound token policy. Its generation loop, cache
-aliases, and token emit use the same constructs a multi-component workflow uses,
-so there is no decoder-shaped branch anywhere in the runtime — the decoder is
-recognized structurally, as the sole component that consumes the autoregressive
-sequence and produces logits.
-
-`generation.speculative_decoding.io` is the same class of debt for a proposer
-graph and is unchanged here: it describes a model with no workflow component of
-its own, so it needs a canonical component before it can follow this path.
-
-#### The `DecoderAbi` type is not a serialized block
-
-The resolved decode ABI and the retired `model.io` key were routinely mistaken
-for each other — enough that the type has been renamed `DecoderAbi` and moved
-beside the recognizer that produces it. A downstream producer once read
-`StaticCacheDecodeSession::new(.., io: Option<&DecoderAbi>)`
-as proof that the scatter driver *requires* a serialized `model.io.static_cache`
-block, and concluded that the driver and the coexistence rule were jointly
-unsatisfiable. They are not. The parameter is the **resolved** decode ABI —
-whatever `decoder_io()` returned — and for a workflow package that value is
-synthesized from the `state_service` group's `indexed_scatter` update and the
-decoder component's port roles. Nothing reads the serialized key.
-
-A type signature cannot show this, so it is pinned against a real graph instead.
-`crates/onnx-genai-ort/tests/workflow_derived_static_cache.rs` loads
-`tests/fixtures/tiny-llm-scatter-workflow/`, a package with **no `model:` block
-at all**, resolves its ABI through `decoder_io()`, and drives the ONNX scatter
-fixture through `StaticCacheDecodeSession`: the graph classifies, prefill runs,
-and a decode step advances the write cursor by exactly one row position. Its
-sibling `tests/fixtures/tiny-llm-scatter/` is the same graph converted by
-`migrate_model_io`, so the generated form and the hand-authored one are both
-exercised against the same driver.
-
-#### Declare roles; do not transcribe the graph
-
-Making the workflow the sole ABI raises a fair objection from producers: if a
-component's port list must be restated in YAML, the package carries a second
-copy of something the `.onnx` file already states authoritatively, and the two
-can drift. That objection is accepted. The canonical form asks for the part no
-graph carries and nothing more.
-
-A `TensorContract` under `ports.inputs`/`ports.outputs` is **optional**. An ONNX
-artifact already names its inputs, their element types, and their ranks; a
-producer whose artifact is the authority may omit the transcription entirely.
-What an ONNX graph cannot state is which of several same-typed ports carries
-which *meaning* — `input_ids` and `position_ids` are both rank-2 `int64`, and
-nothing in the graph distinguishes the autoregressive sequence from a positional
-index. That is why `ports.roles` is required, and it is one line per role:
-
-```yaml
-ports:
-  roles:
-    input_ids: token_ids
-```
-
-With that single declaration and no contracts at all, `decoder_io()` resolves
-the token port *and* the full `static_cache` ABI — the latter derives from the
-state-service group's port aliases, never from the component's port map. This is
-covered by `declared_roles_alone_yield_the_scatter_abi`, which strips
-`ports.inputs` and `ports.outputs` from the canonical fixture and asserts the
-ABI survives intact.
-
-The resolver therefore treats a role declaration as the naming authority and
-consults the declared contracts only to break a duplicate-role tie. An earlier
-form required a role's port to *also* appear in `ports.inputs`, which quietly
-inverted the intent: a producer who declared `input_ids: token_ids` and stopped
-there had that declaration discarded, and the runtime fell back to matching the
-spelling `input_ids` — reintroducing, in the one place it is least visible, the
-name-guessing this resolver exists to abolish. Absence of a transcription is not
-a claim that a port does not exist. A role naming a port the graph does not
-expose is still caught, against the live session, which is strictly stronger
-than any echo of the graph in YAML.
-
-The inverse mistake is the more tempting one, so it is now rejected rather than
-tolerated. A producer migrating to the workflow-only form may reasonably assume
-transcribing a full `TensorContract` for every port is the *more* complete
-declaration and that roles are optional shorthand. It is the other way around:
-contracts without roles resolve nothing, `decoder_io()` returns `None`, and the
-runtime silently falls back to inferring ports from shapes — the behaviour this
-form exists to remove. That failure used to validate cleanly. When a workflow's
-*only* neural component owns attention state, the package depends on the
-single-decoder lowering, so a missing `token_ids`/`inputs_embeds` role is now a
-validation error naming the component and the role. Workflows with several
-neural components — an encoder-decoder pair, a speculative draft and verifier, a
-TTS talker and code predictor — are exempt: each is driven through its own
-invoke bindings, `decoder_io()` deliberately declines to nominate one as "the"
-decoder, and requiring a declaration nothing reads would be noise.
-`port_contracts_do_not_substitute_for_a_declared_role` pins this.
-
----
-
-### 18.2 Session state: what tightened, and what it rejects
-
-`scope: session` used to validate on its own. It now has to say **how the next
-invocation reaches what the lease keeps** (§12.5a), because a lease nothing
-carries is written back on every pass and read by nothing — the package
-advertises a conversation that silently restarts every turn.
-
-A document that validated before and does not now is one of these. None is a
-rename; each is a statement the document was missing.
-
-| Rejected | Why | Fix |
-| --- | --- | --- |
-| a **semantic** session cell that no loop carries, no state service group holds, and whose lease names no `continuation` | nothing reaches the kept value | carry it in the loop, bind it to a group, or declare `session.continuation` |
-| a session cell naming a `service_group` the document does not declare | the lease has nothing to hold | declare the group, or drop `service_group` |
-| a session cell whose group declares no alias for it | same | add the alias, with `input` and `output` ports |
-| a group-only-carried cell whose alias declares no `output` port | the lease could be read and never advanced, so every turn replays the first | declare the port that advances the state |
-| a group-only-carried cell whose alias `input` port no step binds | the lease would have no reader | invoke the component binding that port |
-| a group-only-carried cell whose alias `input` port is bound to a value a step produces | the step would overwrite the lease | bind a workflow input, or carry the cell in the loop |
-| a `session.continuation` that is not `scope: session`, `class: semantic`, `management: runtime`, `release_boundary: session`, growing on the final axis, or is also loop-carried | the contract contradicts itself | see §12.5a |
-| a `session.continuation` whose `recurrence.max` names anything but a declared input with a value | the bound could not be read before the turn that would exceed it | name a required input, or an optional one with a default |
-| two `session.continuation` cells in one workflow | a package has one conversation | keep one |
-
-**Advisory session state is exempt** from the reachability rule: it is droppable
-by declaration, so a lease nothing reads costs correctness nothing.
-
-Runtime behaviour changed alongside it, for packages rather than documents:
-
-* a package that publishes a `tokens` output and declares no session state at all
-  still **loads and generates**, but `create_session` refuses it — typed, so a
-  server answers 409 rather than 500. Stateless generation is untouched;
-* a package that publishes no token stream is unaffected and keeps its session
-  handle;
-* `session_token_count` means the same thing on every backend (§12.5a). Whether
-  a request is *charged* for it is a different question, gated on one query —
-  `Engine::prepends_session_conversation`, read from the shared classifier. It is
-  true for `SessionStateCarrier::PromptContinuation` and nothing else, because
-  that is the one carrier whose mechanism is the prompt binding. A decode core
-  keeps its conversation in KV, and a loop-carried or group-held lease lives in a
-  cache the package bounds itself; charging either would count each turn twice,
-  inflating `usage`, halving the usable context and refusing requests at roughly
-  half the model's limit.
 
 ## 19. Invariants
 
-A conforming document satisfies all of these. Each is validator-enforced, and
-enforced on the path a producer actually runs: `load_metadata_package` — the
-entry point behind the `validate_metadata` binary and behind package loading —
-checks the document-level invariants, not only the pipeline-scoped ones. A rule
-reachable only from a direct `validate_metadata` call is not an invariant, it is
-a suggestion; the ban on a second serialized ABI was briefly in that state and
-`loading_a_package_rejects_a_second_serialized_abi` now holds it in place.
+A conforming document satisfies these rules:
 
-1. **No serialized row identity.** Row axis and layout are derivable from
-   `batch_layout`; native compaction (`compact`/`release`) is a mandatory ABI.
-2. **Batch compaction is total.** LoRA selection, native grammar state, and
-   vision state all survive compaction because all are row-scoped and declared.
-3. **Cache dependencies are complete.** LoRA, profile, and multimodal inputs
-   cannot be omitted from the derived dependency set.
-4. **Speculative rollback reads `speculation_safety`,** never the retry class.
-5. **Equivalence class gates substitution.** A `semantic` contract is never
-   automatically substituted.
-6. **Graph-visible KV ABI and runtime-private storage are distinct.** The former
-   is inferred from the graph; the latter is runtime-owned.
-7. **Alias legality survives.** `aliasing` retains the real graph constraint that
-   `shared_buffer` used to imply.
-8. **Canonical identity is stable.** Normalized identity protects external plan
-   and checkpoint compatibility, across key order, YAML-versus-JSON encoding,
-   numeric spelling, null and empty fields, and ignorable-profile skipping.
-   Normalization is syntactic and deliberately conservative: it never merges two
-   documents it cannot prove equivalent from syntax alone, because a spurious
-   identity change costs one recompile while a spurious match serves a stale
-   plan against changed semantics.
-9. **Generation override support is structural and fail-loud.**
-10. **Constraint dialect and replaceable tokenizer artifacts are represented.**
-11. **One-file profile evolution works.** Required profiles fail a reader that
-    does not understand them; ignorable profiles are skipped.
-12. **Session scope is normative.**
-13. **Checkpoint and private P/D transfer are explicitly different paths.**
-14. **One serialized graph ABI.** `pipeline.workflow` is the only place a
-    package states its executable port ABI. `model.io` is import-only, is read
-    only when no workflow is present, and is rejected beside one, so no document
-    holds two conflicting answers.
-
----
+1. Workflow dataflow is the sole executable graph ABI; retired parallel ABI
+   blocks are rejected.
+2. Row axes and ownership are derivable without serialized request identity.
+3. Shared-batch selection, compaction, release, state, effects, and publications
+   preserve isolated-execution semantics; unsupported sharing falls back.
+4. Cache dependencies include every value that can change cached state.
+5. Speculative rollback uses declared rollback semantics, never retry class.
+6. Automatic substitution requires the declared equivalence class.
+7. Graph-visible state ABI and runtime-private storage policy remain distinct.
+8. Canonical semantic identity is stable under its declared normalization.
+9. Generation overrides, tool protocols, and extension versions fail closed.
+10. Session state has unambiguous initialization/restore, dataflow-derived
+    readers and writers, one final writer, lifecycle, and atomic transaction.
+11. Checkpoints and private runtime state transfers are distinct paths.
+12. Workflow outputs publish through one declared protocol family; emit
+    operations cannot create a second authority.
 
 ## 20. Conformance
 
-### 20.1 Validation
-
-`onnx_genai_metadata::validate_metadata` runs the full semantic validation.
-The CLI is:
-
-```sh
-cargo run -p onnx-genai-metadata --bin validate_metadata -- <path>
-```
-
-### 20.2 Tests
-
-| Requirement | Test |
-| --- | --- |
-| Invariants 1–13 | `crates/onnx-genai-metadata/tests/redesign_invariants.rs` |
-| Removed fields rejected | `metadata_fixtures.rs::removed_row_identity_fields_are_rejected_fail_closed` |
-| Row-wise emit / ragged outputs | `metadata_fixtures.rs::row_wise_emit_requires_a_request_aligned_batch_layout` |
-| State semantics vs. allocator policy | `metadata_fixtures.rs::state_service_declares_semantics_not_allocator_policy` |
-| Adapter artifact compatibility | `crates/onnx-genai-metadata/tests/adapter_artifact_compat.rs` |
-| Canonical identity | `crates/onnx-genai-metadata/src/identity.rs` unit tests |
-| Cache dependency derivation | `crates/onnx-genai-metadata/src/cache.rs` + `redesign_invariants.rs` |
-| Row ABI (`compact`/`release`) | `crates/onnx-genai-engine/src/pipeline/row_state.rs` |
-| Generation override fail-loud | `crates/onnx-genai-engine/src/config.rs::generation_contract_tests` |
-| Legacy import fail-closed | `crates/onnx-genai-genai-config/src/import.rs` unit tests |
-| One canonical graph ABI, bare and composite | `crates/onnx-genai-metadata/tests/canonical_graph_abi.rs` |
-| `model.io` beside a workflow rejected | `static_cache_and_fp8_state.rs::model_io_beside_a_workflow_is_refused` |
-| Static-cache ABI recognized from the workflow | `static_cache_and_fp8_state.rs::the_decode_abi_is_recognized_from_the_workflow_alone` |
-| Per-layer cache order follows declared `layer` | `static_cache_and_fp8_state.rs::per_layer_cache_order_follows_the_declared_layer_index` |
-| End-to-end workflows | `crates/onnx-genai-engine/tests/onnx_genai_workflow_conformance.rs` |
-| Canonical packages | `tests/fixtures/onnx_genai_workflows/` |
-| Row axis derivable without identity | `redesign_invariants.rs::the_row_axis_is_derivable_without_any_serialized_row_identity` |
-| Row-scoped carriers survive compaction | `redesign_invariants.rs::every_row_scoped_carrier_survives_batch_compaction` |
-| Checkpoint vs. private transfer | `redesign_invariants.rs::portable_checkpoints_are_distinct_from_private_state_transfer` |
-| Speculative region spans the loop body | `redesign_invariants.rs::the_speculative_region_covers_every_component_in_the_loop_body` |
-| State cannot be exported under an alias | `redesign_invariants.rs::runtime_owned_state_cannot_be_exported_under_an_alias` |
-| Identity ignores numeric spelling | `redesign_invariants.rs::semantic_identity_ignores_how_a_number_was_spelled` |
-| Absent contract withholds consent | `crates/onnx-genai-engine/src/speculative/mod.rs::equivalence_gate_tests` |
-
-The last four close bypasses found by review rather than by a failing build.
-Each was written to fail against the implementation it guards, so a regression
-that reopens the bypass fails the suite rather than passing silently.
-
-### 20.3 Schema sync
-
-`schema/inference_metadata.schema.json` is generated:
-
-```sh
-cargo run -p onnx-genai-metadata --bin gen_schema
-```
-
-`cargo test -p onnx-genai-metadata` fails when the committed schema differs from
-the Rust source.
-
----
+A runtime or producer claims conformance only for contract versions and features
+it implements completely. Unsupported identifiers, versions, state/effect
+participants, output protocols, proposal forms, and optimization preconditions
+fail before semantic mutation. Implementation slices, fixtures, diagnostics,
+and acceptance evidence are tracked in
+[#2303](https://github.com/justinchuby/onnx-genai/issues/2303), not in this
+specification.
 
 ## Appendix A: examples
 
@@ -2244,7 +1488,6 @@ pipeline:
       request.tokens:
         contract:
           dtype: int64
-          rank: 2
           shape: [batch, sequence]
           batch_layout: { kind: request_aligned, axis: 0 }
         role: { kind: runtime, version: "1.0", role: input_ids }
@@ -2253,7 +1496,6 @@ pipeline:
       cache:
         contract:
           dtype: float32
-          rank: 4
           shape: [batch, heads, sequence, head_dim]
           batch_layout: { kind: runtime_sequence_state }
         scope: invocation
@@ -2284,13 +1526,11 @@ grammar:
     inputs:
       token:
         dtype: int64
-        rank: 2
         shape: [batch, generated]
         batch_layout: { kind: request_aligned, axis: 0 }
     outputs:
       guided:
         dtype: int64
-        rank: 2
         shape: [batch, generated]
         batch_layout: { kind: request_aligned, axis: 0 }
 ```
@@ -2450,7 +1690,6 @@ pipeline:
       frame_lengths:
         contract:
           dtype: int64
-          rank: 1
           shape: [batch]
           batch_layout: { kind: shared }
 profiles:
@@ -2640,93 +1879,3 @@ The package's target manifest states which parameters are adaptable. The
 runtime owns loading, caching, eviction, and kernel selection. Because adapter
 selection participates in dataflow and cache dependencies, two requests with
 different adapters cannot accidentally share an incompatible prefix cache.
-
-### A.4 Coverage and proof levels
-
-Representability, executability, and model correctness are different claims:
-
-| Level | Meaning |
-| --- | --- |
-| **R** | A complete document validates and contains all required dataflow, state, and control flow. |
-| **X** | The generic runtime executes a deterministic package through the complete workflow. |
-| **W** | A real-weight run matches an upstream implementation numerically or token-for-token. |
-| **B** | Multiple unequal request rows, permutation, compaction, or early completion are verified. |
-
-The current evidence is:
-
-| Workflow family | R | X | W | B | Evidence represented by the example |
-| --- | --- | --- | --- | --- | --- |
-| Autoregressive decoder | yes | yes | yes | yes | Prefill/decode, heterogeneous KV, shared KV, row-wise EOS |
-| Optional VLM | yes | yes | yes | partial | Image-present/text-only branch; workflow execution is currently per request |
-| Encoder-decoder ASR | yes | yes | yes | yes | Raw audio, encoder state, cached decode, unequal early EOS |
-| CTC ASR | yes | yes | yes | yes | One-pass logits, frame lengths, collapse, transcript |
-| Image diffusion | yes | yes | yes | yes | CFG, RNG, Euler/DPM-style history, VAE decode |
-| Image editing | yes | yes | yes | partial | Source/target packing and full denoise; distinct source images depend on caller/upstream batching |
-| Video diffusion | yes | yes | yes | yes | Rank-5 latent, causal chunk decode, non-terminal emit axis |
-| Masked diffusion | yes | yes | synthetic | yes | Discrete iterative refinement |
-| TTS and codec | yes | yes | producer graphs | yes | Nested token generation and audio publication |
-| Full-duplex speech | yes | component path | yes | trace parity | Nested frame/acoustic loops; full engine-driven session loop remains pending |
-| Speculative decoding | yes | yes | synthetic | yes | Accept, reject, rollback, correction |
-| LoRA composition | yes | yes | artifact parity | yes | Ordered adapters survive row compaction |
-| Embedding/classification/reranking | yes | trivial sequence | model-dependent | ordinary batching | Task profile plus invoke and emit |
-| Fixed-capacity (static) cache | yes | yes | real weights | yes | Indexed scatter, per-row cursors, unequal lengths, inactive-row freeze, rewind |
-| FP8 cache state | yes | provider-dependent | no | n/a | Declared, validated, allocated, and bound; compute awaits an FP8 kernel |
-
-“Partial” and “pending” are deliberate. They identify runtime or upstream
-limitations without weakening the representability claim. In particular:
-
-- Foundry Local serializes workflow requests, so it is not evidence for
-  continuous batching.
-- A full-duplex speech graph is representable and its real components have
-  trace parity, but the generic engine has not yet driven the complete
-  long-lived frame loop.
-- Model preprocessing must be fully declared. Supplying precomputed embeddings
-  proves the downstream workflow but not a raw-media request path.
-- Runtime-private storage formats such as paged KV do not require a new
-  workflow pattern; they are implementations of the declared state-service
-  semantics.
-- FP8 state is representable, validated, allocatable, and bindable, and its
-  “provider-dependent” execution level is a measurement, not a hedge: the CPU
-  provider has no FP8 `ScatterND` kernel, so a static FP8 cache fails to load
-  there with the provider's own type error, and the CUDA provider (1.29.0) has
-  no `float8_e4m3fn` in its GQA `past`/`present` type list, so the node is left
-  unassigned at partitioning and initialization fails without ever launching a
-  kernel. §12.2c records both shapes, why the CUDA message is the more
-  misleading of the two, and why neither must be turned into a validation error.
-- The fixed-capacity cache row claims **real weights** on the strength of a CUDA
-  run of a real static-cache export (onnxruntime-gpu 1.29.0, H200), not of an
-  upstream comparison: a `B=2` prefill reproduces the per-row `B=1` result
-  exactly (max |Δ| = 0), `TensorScatter` writes land inside the declared
-  `[0, nonpad)` prefix and nowhere else, decode with divergent per-row cursors
-  (one row advancing while another has finished) holds max |Δ| ≤ 3.1e-6 against
-  the single-row reference across three steps, and a finished row reclaims its
-  own last slot on each subsequent write without ever leaking past it. That is
-  the `indexed_scatter` discipline of §12.2b executing as specified on a real
-  export, including the inactive-row behaviour the declaration promises.
-
-The canonical executable packages cover decoder, VLM, image diffusion, guided
-diffusion, masked diffusion, speculative decoding, codec, TTS, video, and
-adapters. Each declares its graph ABI only in its workflow, so the bare
-single-ONNX decoder package and the three-graph VLM package are evidence for the
-same representation rather than for two (§4.1a,
-`crates/onnx-genai-metadata/tests/canonical_graph_abi.rs`). CTC and audio
-preprocessing have profile/validator coverage, while real-weight Whisper, CTC,
-image-edit, diffusion, video, VLM, and heterogeneous KV runs establish the
-higher proof levels. These examples therefore cover the known workflow *shapes*
-without claiming that an untested model automatically has a correct exporter.
-
----
-
-## Appendix B: decision index
-
-The original approved decisions map to sections as follows.
-
-| Decisions | Section |
-| --- | --- |
-| 1–6 (scope, compatibility, one document, profiles) | [§1](#1-goals-and-non-goals), [§4](#4-schema-model) |
-| 7–11 (component implementations, preprocessing) | [§7](#7-components-and-implementation-substitution), [§15](#15-preprocessing-and-generated-inputs) |
-| 12–19 (runtime-owned execution) | [§3](#3-ownership-layers), [§5](#5-ownership-layers-in-the-schema) |
-| 20–25 (batch and request identity) | [§8](#8-batching-varlen-and-paged-attention), [§10](#10-multimodal-encoders), [§11](#11-cache-correctness-dependencies) |
-| 26–32 (state) | [§12](#12-state) |
-| 33–36 (generation, speculative, LoRA, state quantization) | [§9](#9-adapters-lora), [§13](#13-speculative-execution), [§14](#14-generation), [§12.7](#127-state-representation-and-quantization) |
-| 37–39 (distributed execution) | [§16](#16-distributed-execution) |
