@@ -41,8 +41,9 @@ use std::sync::Arc;
 
 pub mod tree;
 pub use tree::{
-    KvRetentionPlan, SpecTree, SpecTreeBuilder, Topology, TreeNode, TreeScorer,
-    ancestor_attention_mask, relative_position_ids, verify_tree,
+    KvRetentionPlan, SamplingRandomness, SpecTree, SpecTreeBuilder, Topology, TreeNode,
+    TreeSamplingInputs, TreeSamplingVerification, TreeScorer, ancestor_attention_mask,
+    relative_position_ids, verify_tree, verify_tree_sampling,
 };
 
 /// Produces a target-model token embedding for an MTP proposal step.

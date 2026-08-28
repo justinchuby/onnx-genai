@@ -11,6 +11,9 @@ use crate::engine::{EngineDecodeBackend, PackageCapabilityError};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum WorkflowExecutionAdmission {
     Admitted,
+    CandidateTreeUnavailable {
+        version: String,
+    },
     DFlashUnavailable {
         version: String,
         capability: &'static str,
@@ -36,30 +39,42 @@ impl WorkflowExecutionAdmission {
         speculative: Option<&SpeculativeContract>,
         backend: EngineDecodeBackend,
     ) -> Self {
-        let Some(SpeculativeProposalExecution::DflashFlatBlock {
-            version, structure, ..
-        }) = speculative.map(|contract| &contract.proposal_execution)
-        else {
+        let Some(contract) = speculative else {
             return Self::Admitted;
         };
-        if version == "1"
-            && matches!(structure.as_ref(), DFlashStructure::Base)
-            && matches!(
-                backend,
-                EngineDecodeBackend::Auto | EngineDecodeBackend::Ort
-            )
-        {
-            return Self::Admitted;
-        }
-        Self::DFlashUnavailable {
-            version: version.clone(),
-            capability: capabilities::DFLASH_FLAT_BLOCK,
+        match &contract.proposal_execution {
+            SpeculativeProposalExecution::CandidateTree { .. } => Self::CandidateTreeUnavailable {
+                version: contract.version.clone(),
+            },
+            SpeculativeProposalExecution::DflashFlatBlock {
+                version, structure, ..
+            } if version == "1"
+                && matches!(structure.as_ref(), DFlashStructure::Base)
+                && matches!(
+                    backend,
+                    EngineDecodeBackend::Auto | EngineDecodeBackend::Ort
+                ) =>
+            {
+                Self::Admitted
+            }
+            SpeculativeProposalExecution::DflashFlatBlock { version, .. } => {
+                Self::DFlashUnavailable {
+                    version: version.clone(),
+                    capability: capabilities::DFLASH_FLAT_BLOCK,
+                }
+            }
+            _ => Self::Admitted,
         }
     }
 
     pub(crate) fn require_supported(&self) -> Result<(), PackageCapabilityError> {
         match self {
             Self::Admitted => Ok(()),
+            Self::CandidateTreeUnavailable { version } => {
+                Err(PackageCapabilityError::CandidateTreeExecutionUnavailable {
+                    version: version.clone(),
+                })
+            }
             Self::DFlashUnavailable {
                 version,
                 capability,
@@ -133,6 +148,21 @@ mod tests {
             WorkflowExecutionAdmission::DFlashUnavailable {
                 version: "2".to_string(),
                 capability: capabilities::DFLASH_FLAT_BLOCK,
+            }
+        );
+    }
+
+    #[test]
+    fn candidate_tree_and_dflash_are_independent_exact_capabilities() {
+        let candidate = onnx_genai_metadata::parse_metadata(
+            include_str!("../../tests/fixtures/unsupported-candidate-tree/inference_metadata.yaml"),
+            Some("yaml"),
+        )
+        .expect("candidate-tree fixture parses");
+        assert_eq!(
+            WorkflowExecutionAdmission::from_metadata(&candidate, EngineDecodeBackend::Ort),
+            WorkflowExecutionAdmission::CandidateTreeUnavailable {
+                version: "1".to_string(),
             }
         );
     }

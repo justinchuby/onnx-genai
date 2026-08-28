@@ -7,12 +7,17 @@ fn fixture(mode: WorkflowEmitMode) -> InferenceMetadata {
         "../../../examples/inference_metadata/catalogue/01-gemma4-text-decoder.yaml"
     ))
     .expect("catalogue fixture parses");
-    metadata.schema_version = Some("v1.4".to_string());
+    metadata.schema_version = Some("v1.5".to_string());
     let workflow = &mut metadata.pipeline.as_mut().expect("pipeline").workflow;
     let output = workflow.outputs.keys().next().expect("output").clone();
     workflow.outputs.get_mut(&output).expect("output").family = WorkflowOutputFamily::Revisions {
         version: "1".to_string(),
     };
+    workflow
+        .outputs
+        .get_mut(&output)
+        .expect("output")
+        .family_authored = true;
     workflow.steps.push(WorkflowStep::Emit {
         value: "payload_that_must_not_be_discarded".to_string(),
         when: None,

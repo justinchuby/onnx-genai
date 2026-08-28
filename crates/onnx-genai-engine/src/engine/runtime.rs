@@ -712,6 +712,16 @@ impl Engine {
         reject_native_request_speculation(&request.options)?;
         request.options.validate()?;
         let mut options = request.options;
+        if matches!(options.speculative_mode, Some(SpeculativeMode::Mtp(_)))
+            && !options.selects_greedily()
+        {
+            self.metadata
+                .speculative
+                .as_ref()
+                .context("native MTP mode was selected without a canonical speculative contract")?
+                .admit_sampling()
+                .map_err(anyhow::Error::msg)?;
+        }
         self.apply_eos_defaults(&mut options)?;
         let prompt_tokens = self.tokenize_prompt(&request.prompt)?;
         if prompt_tokens.is_empty() {

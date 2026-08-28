@@ -7238,6 +7238,7 @@ steps:
                 family: onnx_genai_metadata::WorkflowOutputFamily::Revisions {
                     version: TYPED_REVISION_PROTOCOL_VERSION.to_string(),
                 },
+                family_authored: true,
                 value_range: None,
                 stage: onnx_genai_metadata::OutputStage::PreAdapter,
                 media: None,

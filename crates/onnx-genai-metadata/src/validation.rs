@@ -93,6 +93,7 @@ impl Default for RuntimeCapabilities {
                 capability::LOOP_INDUCTION_VALUES.to_string(),
                 capability::TYPED_EMIT.to_string(),
                 capability::TOKEN_CONTEXT.to_string(),
+                capability::CANONICAL_SPECULATION.to_string(),
                 capability::DFLASH_FLAT_BLOCK.to_string(),
             ],
         }
@@ -159,6 +160,9 @@ fn metadata_only_required_capabilities(metadata: &InferenceMetadata) -> BTreeSet
     if metadata.adapters.is_some() {
         capabilities.insert(capability::PARAMETER_ADAPTERS.to_string());
         capabilities.insert(capability::HETEROGENEOUS_ADAPTER_BATCHING.to_string());
+    }
+    if metadata.speculative.is_some() {
+        capabilities.insert(capability::CANONICAL_SPECULATION.to_string());
     }
     capabilities
 }
@@ -449,6 +453,7 @@ fn validate_schema_version(metadata: &InferenceMetadata, errors: &mut Vec<String
         ));
         return;
     }
+    validate_output_protocol_version(metadata, declared, errors);
     let has_special_tokens = metadata
         .package
         .as_ref()
@@ -480,6 +485,18 @@ fn validate_schema_version(metadata: &InferenceMetadata, errors: &mut Vec<String
              older reader refuses the package as a newer contract rather than guessing a tool protocol",
             crate::version::TOOL_PROTOCOL_SCHEMA_VERSION,
             crate::version::TOOL_PROTOCOL_SCHEMA_VERSION,
+        ));
+    }
+    if metadata.speculative.is_some()
+        && declared < crate::version::CANONICAL_SPECULATION_SCHEMA_VERSION
+    {
+        let spelled = metadata.schema_version.as_deref().unwrap_or("<absent>");
+        errors.push(format!(
+            "this package declares `speculative`, which workflow-native canonical speculation \
+             schema version {} introduced, but declares schema_version '{spelled}' ({declared}); \
+             declare schema_version '{}' so older runtimes fail before mutation",
+            crate::version::CANONICAL_SPECULATION_SCHEMA_VERSION,
+            crate::version::CANONICAL_SPECULATION_SCHEMA_VERSION
         ));
     }
     let has_token_context = metadata.pipeline.as_ref().is_some_and(|pipeline| {
@@ -532,6 +549,93 @@ fn validate_schema_version(metadata: &InferenceMetadata, errors: &mut Vec<String
              refused for the reason that is true"
         ));
     }
+}
+
+fn validate_output_protocol_version(
+    metadata: &InferenceMetadata,
+    version: crate::version::SchemaVersion,
+    errors: &mut Vec<String>,
+) {
+    let Some(workflow) = metadata
+        .pipeline
+        .as_ref()
+        .map(|pipeline| &pipeline.workflow)
+    else {
+        return;
+    };
+    for (name, output) in &workflow.outputs {
+        if let Err(error) = crate::version::gate_feature_field(
+            version,
+            crate::version::SchemaFeature::OutputProtocols,
+            &format!("pipeline.workflow.outputs.{name}.family"),
+            output.family_authored,
+        ) {
+            errors.push(error);
+        }
+    }
+
+    fn validate_steps(
+        steps: &[WorkflowStep],
+        version: crate::version::SchemaVersion,
+        path: &str,
+        errors: &mut Vec<String>,
+    ) {
+        for (index, step) in steps.iter().enumerate() {
+            let site = format!("{path}[{index}]");
+            match step {
+                WorkflowStep::Sequence { steps } => {
+                    validate_steps(steps, version, &format!("{site}.steps"), errors);
+                }
+                WorkflowStep::Loop { setup, steps, .. } => {
+                    validate_steps(setup, version, &format!("{site}.setup"), errors);
+                    validate_steps(steps, version, &format!("{site}.steps"), errors);
+                }
+                WorkflowStep::Branch { cases, default, .. } => {
+                    for (case, step) in cases {
+                        validate_steps(
+                            std::slice::from_ref(step),
+                            version,
+                            &format!("{site}.cases.{case}"),
+                            errors,
+                        );
+                    }
+                    if let Some(default) = default {
+                        validate_steps(
+                            std::slice::from_ref(default.as_ref()),
+                            version,
+                            &format!("{site}.default"),
+                            errors,
+                        );
+                    }
+                }
+                WorkflowStep::Emit { stream, mode, .. } => {
+                    if stream.is_some()
+                        && let Err(error) = crate::version::gate_feature_use(
+                            version,
+                            crate::version::SchemaFeature::OutputProtocols,
+                            &format!("{site}.stream"),
+                        )
+                    {
+                        errors.push(error);
+                    }
+                    if matches!(
+                        mode,
+                        crate::schema::WorkflowEmitMode::Retract
+                            | crate::schema::WorkflowEmitMode::Finalize
+                    ) && let Err(error) = crate::version::gate_feature_use(
+                        version,
+                        crate::version::SchemaFeature::OutputProtocols,
+                        &format!("{site}.mode"),
+                    ) {
+                        errors.push(error);
+                    }
+                }
+                WorkflowStep::Invoke { .. } => {}
+            }
+        }
+    }
+
+    validate_steps(&workflow.steps, version, "pipeline.workflow.steps", errors);
 }
 
 /// Enforce one authority for numeric token facts and one executable stop policy.
@@ -597,7 +701,17 @@ fn validate_token_authority(
     let has_eos = special_tokens.is_some_and(|tokens| !tokens.eos_token_id.is_empty());
     validate_generation_eos_steps(&workflow.steps, workflow, has_eos, errors);
 
-    if metadata.speculative.is_some() {
+    if metadata.speculative.is_some()
+        && workflow.steps.iter().any(|step| {
+            matches!(
+                step,
+                crate::schema::WorkflowStep::Loop {
+                    termination: crate::schema::WorkflowLoopTermination::GenerationEos,
+                    ..
+                }
+            )
+        })
+    {
         if !has_eos {
             errors.push(
                 "a speculative autoregressive package must declare non-empty \
@@ -2104,35 +2218,49 @@ fn validate_adapter_service(
 /// Validate output-level publication semantics before lowering makes the
 /// control-flow sites opaque. A family is declared once per output; a site may
 /// only select one of that family's operations.
-fn validate_output_protocols(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
+fn validate_output_protocols(
+    workflow: &WorkflowSpec,
+    version: crate::version::SchemaVersion,
+    errors: &mut Vec<String>,
+) {
     for (name, output) in &workflow.outputs {
-        if let crate::schema::WorkflowOutputFamily::Revisions { version } = &output.family
-            && version != "1"
+        if output.family_authored
+            && let crate::schema::WorkflowOutputFamily::Revisions {
+                version: revision_version,
+            } = &output.family
+            && revision_version != "1"
         {
             errors.push(format!(
-                "pipeline.workflow.outputs.{name}.family.version is '{version}', but this runtime \
+                "pipeline.workflow.outputs.{name}.family.version is '{revision_version}', but this runtime \
                  implements typed revision protocol version '1'; declare the exact supported \
                  version rather than relying on a compatible-looking revision"
             ));
         }
     }
 
-    fn walk(steps: &[WorkflowStep], workflow: &WorkflowSpec, path: &str, errors: &mut Vec<String>) {
+    fn walk(
+        steps: &[WorkflowStep],
+        workflow: &WorkflowSpec,
+        version: crate::version::SchemaVersion,
+        path: &str,
+        errors: &mut Vec<String>,
+    ) {
         for (index, step) in steps.iter().enumerate() {
             let site = format!("{path}[{index}]");
             match step {
                 WorkflowStep::Sequence { steps } => {
-                    walk(steps, workflow, &format!("{site}.steps"), errors);
+                    walk(steps, workflow, version, &format!("{site}.steps"), errors);
                 }
                 WorkflowStep::Loop { setup, steps, .. } => {
-                    walk(setup, workflow, &format!("{site}.setup"), errors);
-                    walk(steps, workflow, &format!("{site}.steps"), errors);
+                    walk(setup, workflow, version, &format!("{site}.setup"), errors);
+                    walk(steps, workflow, version, &format!("{site}.steps"), errors);
                 }
                 WorkflowStep::Branch { cases, default, .. } => {
                     for (case, step) in cases {
                         walk(
                             std::slice::from_ref(step),
                             workflow,
+                            version,
                             &format!("{site}.cases.{case}"),
                             errors,
                         );
@@ -2141,6 +2269,7 @@ fn validate_output_protocols(workflow: &WorkflowSpec, errors: &mut Vec<String>) 
                         walk(
                             std::slice::from_ref(default.as_ref()),
                             workflow,
+                            version,
                             &format!("{site}.default"),
                             errors,
                         );
@@ -2191,23 +2320,29 @@ fn validate_output_protocols(workflow: &WorkflowSpec, errors: &mut Vec<String>) 
                              and therefore cannot declare `when`, `valid_length`, or `axis`"
                         ));
                     }
-                    let legal = matches!(
-                        (&declared.family, mode),
-                        (
-                            crate::schema::WorkflowOutputFamily::Materialized,
-                            crate::schema::WorkflowEmitMode::Replace
-                                | crate::schema::WorkflowEmitMode::Append,
-                        ) | (
-                            crate::schema::WorkflowOutputFamily::Events,
-                            crate::schema::WorkflowEmitMode::Event,
-                        ) | (
-                            crate::schema::WorkflowOutputFamily::Revisions { .. },
-                            crate::schema::WorkflowEmitMode::Append
-                                | crate::schema::WorkflowEmitMode::Replace
-                                | crate::schema::WorkflowEmitMode::Retract
-                                | crate::schema::WorkflowEmitMode::Finalize,
+                    let legacy = version < crate::version::OUTPUT_PROTOCOL_SCHEMA_VERSION
+                        && !declared.family_authored;
+                    let legal = if legacy {
+                        true
+                    } else {
+                        matches!(
+                            (&declared.family, mode),
+                            (
+                                crate::schema::WorkflowOutputFamily::Materialized,
+                                crate::schema::WorkflowEmitMode::Replace
+                                    | crate::schema::WorkflowEmitMode::Append,
+                            ) | (
+                                crate::schema::WorkflowOutputFamily::Events,
+                                crate::schema::WorkflowEmitMode::Event,
+                            ) | (
+                                crate::schema::WorkflowOutputFamily::Revisions { .. },
+                                crate::schema::WorkflowEmitMode::Append
+                                    | crate::schema::WorkflowEmitMode::Replace
+                                    | crate::schema::WorkflowEmitMode::Retract
+                                    | crate::schema::WorkflowEmitMode::Finalize,
+                            )
                         )
-                    );
+                    };
                     if !legal {
                         errors.push(format!(
                             "{site} selects {mode:?} for output '{output}', but its declared family \
@@ -2215,10 +2350,12 @@ fn validate_output_protocols(workflow: &WorkflowSpec, errors: &mut Vec<String>) 
                             declared.family
                         ));
                     }
-                    if matches!(
-                        declared.family,
-                        crate::schema::WorkflowOutputFamily::Materialized
-                    ) && stream.is_some()
+                    if !legacy
+                        && matches!(
+                            declared.family,
+                            crate::schema::WorkflowOutputFamily::Materialized
+                        )
+                        && stream.is_some()
                     {
                         errors.push(format!(
                             "{site}.stream names a stream for materialized output '{output}'; \
@@ -2231,7 +2368,13 @@ fn validate_output_protocols(workflow: &WorkflowSpec, errors: &mut Vec<String>) 
         }
     }
 
-    walk(&workflow.steps, workflow, "pipeline.workflow.steps", errors);
+    walk(
+        &workflow.steps,
+        workflow,
+        version,
+        "pipeline.workflow.steps",
+        errors,
+    );
 }
 
 fn validate_workflow(
@@ -2239,7 +2382,7 @@ fn validate_workflow(
     version: crate::version::SchemaVersion,
     errors: &mut Vec<String>,
 ) {
-    validate_output_protocols(workflow, errors);
+    validate_output_protocols(workflow, version, errors);
     let compiled = match crate::compile_workflow(workflow) {
         Ok(compiled) => compiled,
         Err(error) => {
@@ -4918,6 +5061,22 @@ fn validate_speculative_rollback(metadata: &InferenceMetadata, errors: &mut Vec<
         );
         return;
     };
+    if speculative.identity != "onnx-genai.speculative" {
+        errors.push(format!(
+            "speculative.identity '{}' is not supported; this runtime implements \
+             onnx-genai.speculative@1. Re-export the package with that canonical contract \
+             instead of relying on a legacy speculator sidecar",
+            speculative.identity
+        ));
+    }
+    if speculative.version != "1" {
+        errors.push(format!(
+            "speculative.version '{}' is not supported for identity '{}'; this runtime \
+             implements onnx-genai.speculative@1. Upgrade the runtime or re-export the \
+             package with the supported contract",
+            speculative.version, speculative.identity
+        ));
+    }
     for (role, component) in [
         ("proposer", &speculative.proposer),
         ("target", &speculative.target),
@@ -4926,6 +5085,371 @@ fn validate_speculative_rollback(metadata: &InferenceMetadata, errors: &mut Vec<
             errors.push(format!(
                 "speculative.{role} '{component}' is not a declared workflow component"
             ));
+        }
+    }
+    validate_speculative_verification(workflow, speculative, errors);
+    validate_speculative_bindings(workflow, speculative, errors);
+    validate_speculative_shared_state_and_weights(workflow, speculative, errors);
+    validate_speculative_proposal_ports(workflow, speculative, errors);
+    if let crate::schema::SpeculativeProposalExecution::Chained {
+        token_embedding_input,
+        logits_output: _,
+        recurrent: _,
+        folded_carry_output: _,
+        folded_carry_seed: _,
+        token_embedding: _,
+    } = &speculative.proposal_execution
+        && let Some(proposer) = workflow.components.get(&speculative.proposer)
+        && !proposer.ports.inputs.contains_key(token_embedding_input)
+    {
+        errors.push(format!(
+            "speculative chained proposer input '{token_embedding_input}' is not an input \
+             port of component '{}'",
+            speculative.proposer
+        ));
+    }
+
+    /// Check a cross-component output reference without relying on a port-name
+    /// convention. A speculative contract uses these references for target
+    /// verification, accepted paths, and rejection-sampling probabilities.
+    fn validate_speculative_value_ref(
+        workflow: &WorkflowSpec,
+        value: &crate::schema::SpeculativeValueRef,
+        expected_component: &str,
+        expected_role: &str,
+        field: &str,
+        errors: &mut Vec<String>,
+    ) {
+        if value.component != expected_component {
+            errors.push(format!(
+                "{field} component '{}' must be speculative.{expected_role} '{expected_component}'",
+                value.component,
+            ));
+            return;
+        }
+        match workflow.components.get(&value.component) {
+            Some(component) if component.ports.outputs.contains_key(&value.output) => {}
+            Some(_) => errors.push(format!(
+                "{field} output '{}' is not an output port of component '{}'",
+                value.output, value.component
+            )),
+            None => errors.push(format!(
+                "{field} component '{}' is not a declared workflow component",
+                value.component
+            )),
+        }
+    }
+
+    fn validate_speculative_verification(
+        workflow: &WorkflowSpec,
+        speculative: &crate::schema::SpeculativeContract,
+        errors: &mut Vec<String>,
+    ) {
+        let verification = &speculative.verification;
+        validate_speculative_value_ref(
+            workflow,
+            &verification.target_output,
+            &speculative.target,
+            "target",
+            "speculative.verification.target_output",
+            errors,
+        );
+        match &verification.accepted_path {
+            crate::schema::SpeculativeAcceptedPath::Runtime { binding } => {
+                if binding.trim().is_empty() {
+                    errors.push(
+                        "speculative.verification.accepted_path.binding must name the runtime \
+                             accepted-prefix output"
+                            .to_string(),
+                    );
+                }
+            }
+            crate::schema::SpeculativeAcceptedPath::Component { value } => {
+                match workflow.components.get(&value.component) {
+                    Some(component) if component.ports.outputs.contains_key(&value.output) => {}
+                    Some(_) => errors.push(format!(
+                        "speculative.verification.accepted_path output '{}' is not an output port \
+                             of component '{}'",
+                        value.output, value.component
+                    )),
+                    None => errors.push(format!(
+                        "speculative.verification.accepted_path component '{}' is not declared",
+                        value.component
+                    )),
+                }
+            }
+        }
+        if let Some(probabilities) = &verification.probabilities {
+            validate_speculative_value_ref(
+                workflow,
+                &probabilities.proposal,
+                &speculative.proposer,
+                "proposer",
+                "speculative.verification.probabilities.proposal",
+                errors,
+            );
+            validate_speculative_value_ref(
+                workflow,
+                &probabilities.target,
+                &speculative.target,
+                "target",
+                "speculative.verification.probabilities.target",
+                errors,
+            );
+        }
+    }
+
+    fn validate_speculative_bindings(
+        workflow: &WorkflowSpec,
+        speculative: &crate::schema::SpeculativeContract,
+        errors: &mut Vec<String>,
+    ) {
+        let check = |bindings: &BTreeMap<String, String>,
+                     component_name: &str,
+                     direction: &str,
+                     field: &str,
+                     errors: &mut Vec<String>| {
+            let Some(component) = workflow.components.get(component_name) else {
+                return;
+            };
+            for (role, port) in bindings {
+                if role.trim().is_empty() {
+                    errors.push(format!("{field} contains an empty protocol role"));
+                }
+                let exists = match direction {
+                    "input" => component.ports.inputs.contains_key(port),
+                    // A target binding may identify a port that the verifier reads
+                    // or writes. Its direction is explicitly declared elsewhere by
+                    // the component ABI, so this check only proves it is real.
+                    "either" => {
+                        component.ports.inputs.contains_key(port)
+                            || component.ports.outputs.contains_key(port)
+                    }
+                    _ => false,
+                };
+                if !exists {
+                    errors.push(format!(
+                        "{field}.{role} names '{port}', which is not a declared {direction} port \
+                             of component '{component_name}'"
+                    ));
+                }
+            }
+        };
+        check(
+            &speculative.port_bindings,
+            &speculative.proposer,
+            "input",
+            "speculative.port_bindings",
+            errors,
+        );
+        check(
+            &speculative.target_port_bindings,
+            &speculative.target,
+            "either",
+            "speculative.target_port_bindings",
+            errors,
+        );
+    }
+
+    fn validate_speculative_shared_state_and_weights(
+        workflow: &WorkflowSpec,
+        speculative: &crate::schema::SpeculativeContract,
+        errors: &mut Vec<String>,
+    ) {
+        let groups = workflow
+            .serving
+            .as_ref()
+            .map(|serving| &serving.state_service.groups);
+        for group in &speculative.shared_state {
+            if groups.is_none_or(|groups| !groups.contains_key(group)) {
+                errors.push(format!(
+                    "speculative.shared_state references undeclared state-service group '{group}'"
+                ));
+            }
+        }
+        let mut weights = BTreeSet::new();
+        for weight in &speculative.shared_weights {
+            let Some(component) = workflow.components.get(&weight.component) else {
+                errors.push(format!(
+                    "speculative.shared_weights initializer '{}' names undeclared component '{}'",
+                    weight.initializer, weight.component
+                ));
+                continue;
+            };
+            if !matches!(
+                component.implementation,
+                crate::schema::ComponentImplementation::Onnx { .. }
+            ) {
+                errors.push(format!(
+                    "speculative.shared_weights initializer '{}' belongs to component '{}', which \
+                         is not an ONNX artifact and cannot own immutable ONNX initializers",
+                    weight.initializer, weight.component
+                ));
+            }
+            if weight.initializer.trim().is_empty() {
+                errors.push(format!(
+                    "speculative.shared_weights on component '{}' names an empty initializer",
+                    weight.component
+                ));
+            }
+            if !weights.insert((weight.component.as_str(), weight.initializer.as_str())) {
+                errors.push(format!(
+                    "speculative.shared_weights repeats initializer '{}' from component '{}'",
+                    weight.initializer, weight.component
+                ));
+            }
+        }
+    }
+
+    fn validate_speculative_proposal_ports(
+        workflow: &WorkflowSpec,
+        speculative: &crate::schema::SpeculativeContract,
+        errors: &mut Vec<String>,
+    ) {
+        let Some(proposer) = workflow.components.get(&speculative.proposer) else {
+            return;
+        };
+        let require_input = |port: &str, field: &str, errors: &mut Vec<String>| {
+            if !proposer.ports.inputs.contains_key(port) {
+                errors.push(format!(
+                    "{field} '{port}' is not an input port of proposer component '{}'",
+                    speculative.proposer
+                ));
+            }
+        };
+        let require_output = |port: &str, field: &str, errors: &mut Vec<String>| {
+            if !proposer.ports.outputs.contains_key(port) {
+                errors.push(format!(
+                    "{field} '{port}' is not an output port of proposer component '{}'",
+                    speculative.proposer
+                ));
+            }
+        };
+        match &speculative.proposal_execution {
+            crate::schema::SpeculativeProposalExecution::Block => {}
+            crate::schema::SpeculativeProposalExecution::Chained { .. } => {}
+            crate::schema::SpeculativeProposalExecution::DflashFlatBlock { .. } => {}
+            crate::schema::SpeculativeProposalExecution::Mtp {
+                target_hidden,
+                target_hidden_input,
+                token_embedding_input,
+                hidden_output,
+                hidden_layout,
+                hidden_size,
+                hc_mult,
+                state_output,
+                weights,
+                state,
+            } => {
+                validate_speculative_value_ref(
+                    workflow,
+                    target_hidden,
+                    &speculative.target,
+                    "target",
+                    "speculative.proposal_execution.target_hidden",
+                    errors,
+                );
+                require_input(
+                    target_hidden_input,
+                    "speculative.proposal_execution.target_hidden_input",
+                    errors,
+                );
+                require_input(
+                    token_embedding_input,
+                    "speculative.proposal_execution.token_embedding_input",
+                    errors,
+                );
+                require_output(
+                    hidden_output,
+                    "speculative.proposal_execution.hidden_output",
+                    errors,
+                );
+                if matches!(hidden_layout, crate::schema::MtpHiddenStateLayout::Bsh)
+                    && *hc_mult != 1
+                {
+                    errors.push(format!(
+                        "speculative.proposal_execution declares hidden_layout bsh with hc_mult \
+                             {hc_mult}; bsh has no lane axis, so set hc_mult to 1 or declare bshc"
+                    ));
+                }
+                if *hidden_size == 0 {
+                    errors.push(
+                        "speculative.proposal_execution.hidden_size must be greater than zero"
+                            .to_string(),
+                    );
+                }
+                if let Some(output) = state_output {
+                    require_output(
+                        output,
+                        "speculative.proposal_execution.state_output",
+                        errors,
+                    );
+                }
+                for (name, weight) in [
+                    ("embedding", &weights.embedding),
+                    ("lm_head", &weights.lm_head),
+                ] {
+                    if weight.component != speculative.target {
+                        errors.push(format!(
+                            "speculative.proposal_execution.weights.{name} must belong to target \
+                                 component '{}', not '{}'",
+                            speculative.target, weight.component
+                        ));
+                    }
+                }
+                match state {
+                    crate::schema::MtpProposalState::ProposalLocal if state_output.is_some() => {
+                        errors.push(
+                                "speculative.proposal_execution.state_output requires \
+                                 state.kind accepted_prefix; proposal_local MTP state must not survive \
+                                 the proposal block"
+                                    .to_string(),
+                            );
+                    }
+                    crate::schema::MtpProposalState::AcceptedPrefix { recurrent } => {
+                        if recurrent.is_empty() {
+                            errors.push(
+                                    "speculative.proposal_execution.state accepted_prefix must declare \
+                                     every recurrent state participant"
+                                        .to_string(),
+                                );
+                        }
+                        for binding in recurrent {
+                            if !speculative.rollback_state.contains(&binding.state) {
+                                errors.push(format!(
+                                    "speculative MTP accepted-prefix state '{}' must be listed in \
+                                         rollback_state",
+                                    binding.state
+                                ));
+                            }
+                        }
+                    }
+                    crate::schema::MtpProposalState::ProposalLocal => {}
+                }
+            }
+            crate::schema::SpeculativeProposalExecution::CandidateTree {
+                candidate_tokens,
+                topology,
+            } => {
+                require_output(
+                    candidate_tokens,
+                    "speculative.proposal_execution.candidate_tokens",
+                    errors,
+                );
+                let (kind, output) = match topology {
+                    crate::schema::CandidateTreeTopology::ParentIndices { output } => {
+                        ("parent_indices", output)
+                    }
+                    crate::schema::CandidateTreeTopology::AncestorMask { output } => {
+                        ("ancestor_mask", output)
+                    }
+                };
+                require_output(
+                    output,
+                    &format!("speculative.proposal_execution.topology.{kind}"),
+                    errors,
+                );
+            }
         }
     }
     if matches!(
@@ -4944,13 +5468,6 @@ fn validate_speculative_rollback(metadata: &InferenceMetadata, errors: &mut Vec<
     } = &speculative.proposal_execution
         && let Some(proposer) = workflow.components.get(&speculative.proposer)
     {
-        if !proposer.ports.inputs.contains_key(token_embedding_input) {
-            errors.push(format!(
-                "speculative chained proposer input '{token_embedding_input}' is not an input \
-                 port of component '{}'",
-                speculative.proposer
-            ));
-        }
         if !proposer.ports.outputs.contains_key(logits_output) {
             errors.push(format!(
                 "speculative chained proposer logits '{logits_output}' is not an output port of \
@@ -5663,7 +6180,11 @@ fn validate_dflash_flat_block(
                 speculative.target
             ));
         }
-        if initializer.is_empty() || !speculative.shared_weights.contains(initializer) {
+        let reference = crate::schema::SpeculativeInitializerRef {
+            component: component.clone(),
+            initializer: initializer.clone(),
+        };
+        if initializer.is_empty() || !speculative.shared_weights.contains(&reference) {
             errors.push(format!(
                 "DFlash {role} initializer '{initializer}' must be non-empty and listed in \
                  speculative.shared_weights"

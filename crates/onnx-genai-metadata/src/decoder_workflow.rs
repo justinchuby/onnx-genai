@@ -529,6 +529,7 @@ pub fn decoder_workflow(
                 contract: token_contract(),
                 role: WorkflowOutputRole::Tokens,
                 family: crate::schema::WorkflowOutputFamily::Materialized,
+                family_authored: false,
                 value_range: None,
                 stage: crate::schema::OutputStage::PreAdapter,
                 media: None,

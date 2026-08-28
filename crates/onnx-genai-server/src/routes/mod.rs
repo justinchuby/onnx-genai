@@ -591,6 +591,9 @@ pub(crate) fn package_capability_failure(capability: PackageCapabilityError) -> 
         PackageCapabilityError::DFlashExecutionUnavailable { .. } => {
             ApiError::conflict(capability.to_string())
         }
+        PackageCapabilityError::CandidateTreeExecutionUnavailable { .. } => {
+            ApiError::conflict(capability.to_string())
+        }
         PackageCapabilityError::DFlashRawWorkflowApi { .. } => {
             ApiError::invalid_request(capability.to_string())
         }
