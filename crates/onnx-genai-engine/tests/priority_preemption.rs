@@ -11,6 +11,12 @@ fn tiny_fixture() -> anyhow::Result<PathBuf> {
         .canonicalize()?)
 }
 
+fn cursor_fallback_fixture() -> anyhow::Result<PathBuf> {
+    Ok(Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/tiny-llm-cursor-fallback")
+        .canonicalize()?)
+}
+
 fn priority_config() -> EngineConfig {
     EngineConfig {
         scheduler: SchedulerConfig {
@@ -30,6 +36,32 @@ fn token_request(tokens: Vec<u32>, max_new_tokens: usize) -> GenerateRequest {
     request.options.temperature = 0.0;
     request.options.stop_on_eos = false;
     request
+}
+
+#[test]
+fn cursor_ineligible_topology_dispatches_through_generic_generation() -> anyhow::Result<()> {
+    let request = token_request(vec![2, 4, 3], 2);
+    let expected = {
+        let mut engine = Engine::from_dir(&tiny_fixture()?, priority_config())?;
+        let session = engine.create_session()?;
+        engine.generate_in_session(session, request.clone())?
+    };
+
+    let mut engine = Engine::from_dir(&cursor_fallback_fixture()?, priority_config())?;
+    let session = engine.create_session()?;
+    let results = engine.drive_prioritized_requests(vec![PrioritizedGenerateRequest {
+        session_id: session,
+        request,
+        priority: Priority::High,
+    }])?;
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].session_id, session);
+    assert_eq!(results[0].result.token_ids, expected.token_ids);
+    assert_eq!(results[0].result.text, expected.text);
+    assert_eq!(results[0].result.finish_reason, expected.finish_reason);
+    engine.close_session(session)?;
+    Ok(())
 }
 
 #[test]

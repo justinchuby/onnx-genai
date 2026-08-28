@@ -1400,13 +1400,45 @@ impl Engine {
             {
                 let arrival = arrivals[next_arrival].clone();
                 next_arrival += 1;
-                let active_request = self.prepare_active_generate(arrival.request)?;
+                let active_request = match self.prepare_active_generate(arrival.request.clone()) {
+                    Ok(active) => active,
+                    Err(error)
+                        if error
+                            .downcast_ref::<crate::pipeline::PerTokenCursorIneligible>()
+                            .is_some() =>
+                    {
+                        let result = self
+                            .generate_in_session_with_priority_and_callback(
+                                arrival.request.session_id,
+                                arrival.request.request,
+                                arrival.request.priority,
+                                None,
+                                None,
+                                None,
+                            )
+                            .context(
+                                "the prioritized cursor declined a valid topology and generic \
+                                 workflow execution failed",
+                            )?;
+                        generated_steps += result.token_ids.len();
+                        results.push(PrioritizedGenerateResult {
+                            session_id: arrival.request.session_id,
+                            result,
+                        });
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
                 if active
                     .insert(active_request.session_id, active_request)
                     .is_some()
                 {
                     anyhow::bail!("session already has an active generation request");
                 }
+            }
+
+            if results.len() == total_requests {
+                break;
             }
 
             let decision = self.scheduler.schedule();
@@ -2213,6 +2245,7 @@ impl Engine {
 
         let max_context = self.max_context_for_request(&options);
         let chain = build_processor_chain(&options, Some(self.require_tokenizer()?), false)?;
+        crate::pipeline::WorkflowGenerationCursor::validate_per_token_capability(&self.workflow)?;
         let mut state = self
             .sessions
             .remove(&request.session_id)

@@ -6904,6 +6904,10 @@ steps:
             error.to_string().contains("one generation loop"),
             "{error:#}"
         );
+        assert!(
+            error.downcast_ref::<PerTokenCursorIneligible>().is_some(),
+            "a valid topology decline must remain distinct from package validation failure: {error:#}"
+        );
 
         let mut plan = WorkflowExecutionPlan::new_hosted(
             &runtime,
@@ -7065,6 +7069,185 @@ steps:
             committed.to_vec_i64()?,
             vec![22],
             "the next turn restores once, then each sequential loop carries the preceding update"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn two_turn_conversion_restores_the_persisted_state_representation() -> anyhow::Result<()> {
+        let workflow: WorkflowSpec = serde_yaml::from_str(
+            r#"
+manifest: {}
+inputs:
+  seed:
+    contract: { dtype: float32, shape: [1] }
+    role: { kind: opaque }
+    source: { kind: application, name: seed }
+outputs: {}
+components:
+  prefill:
+    implementation: { kind: binding }
+    contract: { id: test.state.f32, version: "1" }
+    ports:
+      inputs: { state: { dtype: float32, shape: [1] } }
+      outputs: { state: { dtype: float32, shape: [1] } }
+  compact:
+    implementation: { kind: binding }
+    contract: { id: test.state.f32-to-f16, version: "1" }
+    ports:
+      inputs: { state: { dtype: float32, shape: [1] } }
+      outputs: { state: { dtype: float16, shape: [1] } }
+  decode:
+    implementation: { kind: binding }
+    contract: { id: test.state.f16, version: "1" }
+    ports:
+      inputs: { state: { dtype: float16, shape: [1] } }
+      outputs: { state: { dtype: float16, shape: [1] } }
+  restore:
+    implementation: { kind: binding }
+    contract: { id: test.state.f16-to-f32, version: "1" }
+    ports:
+      inputs: { state: { dtype: float16, shape: [1] } }
+      outputs: { state: { dtype: float32, shape: [1] } }
+state:
+  memory:
+    contract: { dtype: float32, shape: [1] }
+    scope: session
+    initializer: seed
+    recurrence: { kind: invariant }
+    management: runtime
+    release_boundary: session
+    service_group: memory
+serving:
+  active: active
+  done: done
+  state_service:
+    groups:
+      memory:
+        kind: recurrent
+        layout: scalar
+        update: { kind: replace }
+        ports:
+          prefill: { memory: { input: state, output: state } }
+          compact: { memory: { input: state, output: state } }
+          decode: { memory: { input: state, output: state } }
+          restore: { memory: { input: state, output: state } }
+steps:
+  - kind: invoke
+    component: prefill
+    inputs: { state: seed }
+    outputs: { state: prefill.next }
+  - kind: invoke
+    component: compact
+    inputs: { state: prefill.next }
+    outputs: { state: compact.next }
+  - kind: invoke
+    component: decode
+    inputs: { state: compact.next }
+    outputs: { state: decode.next }
+  - kind: invoke
+    component: restore
+    inputs: { state: decode.next }
+    outputs: { state: restore.next }
+"#,
+        )?;
+        let runtime = test_runtime(workflow);
+
+        #[derive(Default)]
+        struct ConversionHost {
+            prefill_inputs: Vec<onnx_genai_ort::DataType>,
+            decode_inputs: Vec<onnx_genai_ort::DataType>,
+        }
+
+        impl WorkflowNodeHost for ConversionHost {
+            fn hosted_contracts(&self) -> &'static [&'static str] {
+                &[
+                    "test.state.f32",
+                    "test.state.f32-to-f16",
+                    "test.state.f16",
+                    "test.state.f16-to-f32",
+                ]
+            }
+
+            fn execute_contract_node(
+                &mut self,
+                request: WorkflowNodeRequest<'_>,
+            ) -> anyhow::Result<bool> {
+                let input = request
+                    .inputs
+                    .get("state")
+                    .context("conversion state input is bound")?;
+                let value = request
+                    .values
+                    .get(input)
+                    .context("conversion state input is available")?;
+                let output = request
+                    .outputs
+                    .get("state")
+                    .context("conversion state output is bound")?;
+                let next = match request.component {
+                    "prefill" => {
+                        self.prefill_inputs.push(value.dtype());
+                        Value::from_slice_f32(&[value.to_vec_f32()?[0] + 1.0], &[1])?
+                    }
+                    "compact" => {
+                        let bits = match value.to_vec_f32()?[0] as i64 {
+                            2 => 0x4000,
+                            3 => 0x4200,
+                            other => anyhow::bail!("unexpected compact input {other}"),
+                        };
+                        Value::from_vec_f16_bits(vec![bits], &[1])?
+                    }
+                    "decode" => {
+                        self.decode_inputs.push(value.dtype());
+                        Value::from_vec_f16_bits(value.to_vec_f16_bits()?, &[1])?
+                    }
+                    "restore" => {
+                        let value = match value.to_vec_f16_bits()?[0] {
+                            0x4000 => 2.0,
+                            0x4200 => 3.0,
+                            other => anyhow::bail!("unexpected restore input {other:#x}"),
+                        };
+                        Value::from_slice_f32(&[value], &[1])?
+                    }
+                    component => anyhow::bail!("unexpected conversion component '{component}'"),
+                };
+                request.values.insert(output.clone(), next);
+                Ok(true)
+            }
+        }
+
+        let mut host = ConversionHost::default();
+        for (seed, expected) in [(1.0, 2.0), (99.0, 3.0)] {
+            let request = PipelineGenerateRequest::new(GenerateRequest::new(
+                GeneratePrompt::TokenIds(Vec::new()),
+            ))
+            .with_input("seed", Value::from_slice_f32(&[seed], &[1])?)
+            .with_session_id("conversion-session");
+            let mut plan =
+                WorkflowExecutionPlan::new_hosted(&runtime, request, host.hosted_contracts())?;
+            let mut hosted: Option<&mut dyn WorkflowNodeHost> = Some(&mut host);
+            plan.execute_retained_with_host(&mut hosted)?;
+            let state = runtime.worker.session_state.borrow();
+            let committed = state
+                .get(&("conversion-session".to_string(), "memory".to_string()))
+                .context("converted session state commits")?;
+            assert_eq!(committed.dtype(), onnx_genai_ort::DataType::Float32);
+            assert_eq!(committed.to_vec_f32()?, vec![expected]);
+        }
+        assert_eq!(
+            host.prefill_inputs,
+            vec![
+                onnx_genai_ort::DataType::Float32,
+                onnx_genai_ort::DataType::Float32
+            ]
+        );
+        assert_eq!(
+            host.decode_inputs,
+            vec![
+                onnx_genai_ort::DataType::Float16,
+                onnx_genai_ort::DataType::Float16
+            ]
         );
         Ok(())
     }
@@ -7688,7 +7871,57 @@ pub(crate) struct WorkflowGenerationCursor {
     index: usize,
 }
 
+/// A valid workflow that cannot use the optimized suspend-after-one-token
+/// cursor. This is distinct from an invalid package: callers execute it with
+/// the complete generic workflow interpreter instead.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "the prioritized per-token cursor is ineligible: {reason}; execute the package through \
+     the generic workflow path"
+)]
+pub(crate) struct PerTokenCursorIneligible {
+    reason: &'static str,
+}
+
+impl PerTokenCursorIneligible {
+    fn new(reason: &'static str) -> Self {
+        Self { reason }
+    }
+}
+
 impl WorkflowGenerationCursor {
+    /// Check the structural restrictions of the optimized cursor before an
+    /// engine mutates a session for prefill. A decline is safe to reroute.
+    pub(crate) fn validate_per_token_capability(
+        runtime: &WorkflowRuntime,
+    ) -> Result<(), PerTokenCursorIneligible> {
+        if runtime.plan.adapter_service.is_some() {
+            return Err(PerTokenCursorIneligible::new(
+                "adapter selection is prepared once for a complete pass",
+            ));
+        }
+        if !runtime.backend.execution_islands.is_empty() {
+            return Err(PerTokenCursorIneligible::new(
+                "fused execution islands establish whole-pass bindings",
+            ));
+        }
+        if runtime
+            .plan
+            .workflow
+            .state
+            .values()
+            .any(|cell| cell.scope == onnx_genai_metadata::WorkflowStateScope::Session)
+        {
+            return Err(PerTokenCursorIneligible::new(
+                "session-scoped workflow state is published when a pass completes",
+            ));
+        }
+        let loop_node = sole_generation_loop(&runtime.plan.compiled_workflow.graph)
+            .map_err(|_| PerTokenCursorIneligible::new("the root is not one generation loop"))?;
+        validate_per_token_suspend_boundaries(loop_node, &runtime.plan.workflow)?;
+        Ok(())
+    }
+
     /// Bind a request and run the loop's authored setup exactly once, stopping
     /// before its first iteration.
     pub(crate) fn start(
@@ -7697,26 +7930,7 @@ impl WorkflowGenerationCursor {
         hosted: &[&str],
         host: &mut Option<&mut dyn WorkflowNodeHost>,
     ) -> anyhow::Result<Self> {
-        anyhow::ensure!(
-            runtime.plan.adapter_service.is_none(),
-            "the per-token drive cannot advance a package that selects adapters per request; \
-             adapter selection is prepared once for a whole pass"
-        );
-        anyhow::ensure!(
-            runtime.backend.execution_islands.is_empty(),
-            "the per-token drive cannot advance a package with fused execution islands, whose \
-             bindings are established for a whole pass"
-        );
-        anyhow::ensure!(
-            !runtime
-                .plan
-                .workflow
-                .state
-                .values()
-                .any(|cell| cell.scope == onnx_genai_metadata::WorkflowStateScope::Session),
-            "the per-token drive cannot advance a package with session-scoped workflow state, \
-             which is published when a pass completes"
-        );
+        Self::validate_per_token_capability(runtime)?;
         let loop_node = sole_generation_loop(&runtime.plan.compiled_workflow.graph)?;
         let mut plan = WorkflowExecutionPlan::new_hosted(runtime, request, hosted)?;
         let mut telemetry = WorkflowRunTelemetry::started(plan.max_iterations_only);
@@ -7866,6 +8080,114 @@ impl WorkflowGenerationCursor {
             emitted[row] = value.to_vec_i64()?;
         }
         Ok(emitted)
+    }
+}
+
+/// A cursor gives the scheduler control only between complete decode-policy
+/// pairs. Check that boundary structurally before setup can issue a decoder
+/// forward pass, rather than discovering an unsuspendable host mid-turn.
+fn validate_per_token_suspend_boundaries(
+    loop_node: &WorkflowNode,
+    workflow: &onnx_genai_metadata::WorkflowSpec,
+) -> Result<(), PerTokenCursorIneligible> {
+    let WorkflowNode::Loop { setup, body, .. } = loop_node else {
+        return Err(PerTokenCursorIneligible::new(
+            "the root is not one generation loop",
+        ));
+    };
+    if contains_decode_core_contract(setup, workflow) {
+        return Err(PerTokenCursorIneligible::new(
+            "loop setup contains a decode or token-policy step and cannot suspend before its first iteration",
+        ));
+    }
+    let WorkflowNode::Sequence { nodes } = body.as_ref() else {
+        return Err(PerTokenCursorIneligible::new(
+            "the generation-loop body is not a flat decode-policy sequence",
+        ));
+    };
+
+    let mut decoder_pending = false;
+    for node in nodes {
+        match node {
+            WorkflowNode::Invoke { component, .. } => {
+                let contract = workflow
+                    .components
+                    .get(component)
+                    .and_then(|component| component.contract.as_ref())
+                    .map(|contract| contract.id.as_str());
+                match contract {
+                    Some(onnx_genai_metadata::decoder_workflow::AUTOREGRESSIVE_DECODE_CONTRACT) => {
+                        if decoder_pending {
+                            return Err(PerTokenCursorIneligible::new(
+                                "the generation loop issues another decoder step before its token policy",
+                            ));
+                        }
+                        decoder_pending = true;
+                    }
+                    Some(onnx_genai_metadata::decoder_workflow::TOKEN_POLICY_CONTRACT) => {
+                        if !decoder_pending {
+                            return Err(PerTokenCursorIneligible::new(
+                                "the generation loop applies a token policy without a preceding decoder step",
+                            ));
+                        }
+                        decoder_pending = false;
+                    }
+                    _ => {}
+                }
+            }
+            WorkflowNode::Emit { .. } | WorkflowNode::Transfer { .. } => {}
+            WorkflowNode::Sequence { .. }
+            | WorkflowNode::Loop { .. }
+            | WorkflowNode::Branch { .. }
+            | WorkflowNode::ExecutionIsland { .. } => {
+                return Err(PerTokenCursorIneligible::new(
+                    "the generation-loop body has nested control flow between scheduler boundaries",
+                ));
+            }
+        }
+    }
+    if decoder_pending {
+        return Err(PerTokenCursorIneligible::new(
+            "the generation-loop body ends with a decoder step whose token policy is deferred",
+        ));
+    }
+    Ok(())
+}
+
+fn contains_decode_core_contract(
+    node: &WorkflowNode,
+    workflow: &onnx_genai_metadata::WorkflowSpec,
+) -> bool {
+    match node {
+        WorkflowNode::Sequence { nodes } => nodes
+            .iter()
+            .any(|node| contains_decode_core_contract(node, workflow)),
+        WorkflowNode::Invoke { component, .. } => workflow
+            .components
+            .get(component)
+            .and_then(|component| component.contract.as_ref())
+            .is_some_and(|contract| {
+                matches!(
+                    contract.id.as_str(),
+                    onnx_genai_metadata::decoder_workflow::AUTOREGRESSIVE_DECODE_CONTRACT
+                        | onnx_genai_metadata::decoder_workflow::TOKEN_POLICY_CONTRACT
+                )
+            }),
+        WorkflowNode::Loop { setup, body, .. } => {
+            contains_decode_core_contract(setup, workflow)
+                || contains_decode_core_contract(body, workflow)
+        }
+        WorkflowNode::Branch { cases, default, .. } => {
+            cases
+                .values()
+                .any(|case| contains_decode_core_contract(case, workflow))
+                || default
+                    .as_deref()
+                    .is_some_and(|node| contains_decode_core_contract(node, workflow))
+        }
+        WorkflowNode::Emit { .. }
+        | WorkflowNode::Transfer { .. }
+        | WorkflowNode::ExecutionIsland { .. } => false,
     }
 }
 

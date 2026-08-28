@@ -146,6 +146,9 @@ impl ResolvedStatePlan {
 struct TerminalCandidate {
     binding: String,
     writer: Option<StateWriter>,
+    /// Component writers whose output representation reaches this terminal
+    /// binding through control-flow joins and loop carries.
+    origins: BTreeSet<StateWriter>,
     provenance: ControlFlowProvenance,
 }
 
@@ -356,6 +359,66 @@ pub fn validate_state_plan(workflow: &WorkflowSpec, plan: &ResolvedStatePlan) ->
                  route every path through one explicit branch output or loop carry before commit"
             ));
         }
+        if cell.lifecycle.scope == WorkflowStateScope::Session && cell.transaction.required {
+            let persisted = &workflow
+                .state
+                .get(name)
+                .expect("resolved state cell is declared")
+                .contract;
+            let incompatible_terminal = match &cell.final_writer {
+                Some(StateFinalWriter::Continuation { output }) => {
+                    workflow.outputs.get(output).is_some_and(|output| {
+                        !output.contract.representation_compatible_with(persisted)
+                    })
+                }
+                Some(StateFinalWriter::Writer(_)) => plan
+                    .terminal_candidates
+                    .get(name)
+                    .filter(|candidates| candidates.len() == 1)
+                    .into_iter()
+                    .flatten()
+                    .flat_map(|candidate| &candidate.origins)
+                    .any(|origin| {
+                        origin
+                            .component
+                            .as_deref()
+                            .zip(origin.port.as_deref())
+                            .and_then(|(component, port)| {
+                                workflow
+                                    .components
+                                    .get(component)
+                                    .and_then(|component| component.ports.outputs.get(port))
+                            })
+                            .is_some_and(|contract| {
+                                !contract.representation_compatible_with(persisted)
+                            })
+                    }),
+                None => false,
+            };
+            if incompatible_terminal {
+                let writer = match cell
+                    .final_writer
+                    .as_ref()
+                    .expect("matched only when a final writer exists")
+                {
+                    StateFinalWriter::Writer(writer) => writer
+                        .component
+                        .as_deref()
+                        .zip(writer.port.as_deref())
+                        .map(|(component, port)| format!("{component}:{port}"))
+                        .unwrap_or_else(|| writer.id.clone()),
+                    StateFinalWriter::Continuation { output } => {
+                        format!("continuation output '{output}'")
+                    }
+                };
+                errors.push(format!(
+                    "pipeline.workflow.state.{name} terminal writer '{writer}' persists a \
+                     representation incompatible with its persisted state contract; add an \
+                     explicit typed, versioned conversion back to the state representation and \
+                     make that conversion the final writer"
+                ));
+            }
+        }
 
         if cell.lifecycle.scope != WorkflowStateScope::Session || !cell.transaction.required {
             continue;
@@ -440,9 +503,25 @@ fn analyze_state_flow(workflow: &WorkflowSpec) -> StateFlowAnalysis {
         writer: Option<StateWriter>,
         provenance: ControlFlowProvenance,
     ) -> BTreeSet<TerminalCandidate> {
+        let origins = writer.iter().cloned().collect();
         BTreeSet::from([TerminalCandidate {
             binding,
             writer,
+            origins,
+            provenance,
+        }])
+    }
+
+    fn derived_singleton(
+        binding: String,
+        writer: StateWriter,
+        origins: BTreeSet<StateWriter>,
+        provenance: ControlFlowProvenance,
+    ) -> BTreeSet<TerminalCandidate> {
+        BTreeSet::from([TerminalCandidate {
+            binding,
+            writer: Some(writer),
+            origins,
             provenance,
         }])
     }
@@ -712,9 +791,12 @@ fn analyze_state_flow(workflow: &WorkflowSpec) -> StateFlowAnalysis {
                 let body_flow =
                     walk_sequence(workflow, steps, body_flow, analysis, provenance.clone());
                 let mut exit_flow = setup_flow;
-                for (cell, candidates) in body_flow {
-                    if !carried_cells.contains(&cell) {
-                        exit_flow.entry(cell).or_default().extend(candidates);
+                for (cell, candidates) in &body_flow {
+                    if !carried_cells.contains(cell) {
+                        exit_flow
+                            .entry(cell.clone())
+                            .or_default()
+                            .extend(candidates.iter().cloned());
                     }
                 }
                 for carry in carried {
@@ -724,9 +806,15 @@ fn analyze_state_flow(workflow: &WorkflowSpec) -> StateFlowAnalysis {
                         port: None,
                         binding: carry.cell.clone(),
                     };
+                    let origins = body_flow
+                        .get(&carry.cell)
+                        .into_iter()
+                        .flatten()
+                        .flat_map(|candidate| candidate.origins.iter().cloned())
+                        .collect();
                     exit_flow.insert(
                         carry.cell.clone(),
-                        singleton(carry.cell.clone(), Some(writer), provenance.clone()),
+                        derived_singleton(carry.cell.clone(), writer, origins, provenance.clone()),
                     );
                 }
                 exit_flow
@@ -821,9 +909,13 @@ fn analyze_state_flow(workflow: &WorkflowSpec) -> StateFlowAnalysis {
                             port: None,
                             binding: output.clone(),
                         };
+                        let origins = candidates
+                            .iter()
+                            .flat_map(|candidate| candidate.origins.iter().cloned())
+                            .collect();
                         joined.insert(
                             cell.clone(),
-                            singleton(output.clone(), Some(writer), provenance.clone()),
+                            derived_singleton(output.clone(), writer, origins, provenance.clone()),
                         );
                     } else {
                         joined.insert(cell.clone(), candidates);
@@ -955,6 +1047,14 @@ components:
         state: { dtype: float16, shape: [batch, width] }
       outputs:
         state: { dtype: float16, shape: [batch, width] }
+  restore:
+    implementation: { kind: binding }
+    contract: { id: test.state-conversion, version: "1" }
+    ports:
+      inputs:
+        state: { dtype: float16, shape: [batch, width] }
+      outputs:
+        state: { dtype: float32, shape: [batch, width] }
 state:
   memory:
     contract: { dtype: float32, shape: [batch, width] }
@@ -977,6 +1077,10 @@ steps:
     component: last
     inputs: { state: converted.next }
     outputs: { state: last.next }
+  - kind: invoke
+    component: restore
+    inputs: { state: last.next }
+    outputs: { state: restored.next }
 serving:
   active: active
   done: done
@@ -993,6 +1097,8 @@ serving:
           convert:
             memory: { input: state, output: state }
           last:
+            memory: { input: state, output: state }
+          restore:
             memory: { input: state, output: state }
 "#,
         )
@@ -1198,6 +1304,88 @@ serving:
                     && error.contains("first.next")
                     && error.contains("last:state")
                     && error.contains("explicit typed, versioned conversion")
+            }),
+            "{errors:?}"
+        );
+
+        let mut wrong_terminal = split_representation_workflow();
+        wrong_terminal
+            .components
+            .get_mut("restore")
+            .expect("fixture declares restore conversion")
+            .ports
+            .outputs
+            .get_mut("state")
+            .expect("restore declares state output")
+            .dtype = "float16".to_string();
+        let errors = validate_state_plan(&wrong_terminal, &resolve_state_plan(&wrong_terminal));
+        assert!(
+            errors.iter().any(|error| {
+                error.contains("terminal writer 'restore:state'")
+                    && error.contains("persisted state contract")
+                    && error.contains("typed, versioned conversion")
+            }),
+            "{errors:?}"
+        );
+
+        let mut carried_terminal = split_representation_workflow();
+        let mut steps = std::mem::take(&mut carried_terminal.steps);
+        let convert = steps.remove(0);
+        let last = steps.remove(0);
+        carried_terminal.steps = vec![WorkflowStep::Loop {
+            setup: vec![convert],
+            steps: vec![last],
+            continue_when: "active".to_string(),
+            max_iterations: "request.max_iterations".to_string(),
+            termination: crate::schema::WorkflowLoopTermination::Predicate,
+            iteration: None,
+            carried: vec![crate::schema::WorkflowCarry {
+                cell: "memory".to_string(),
+                initial: None,
+                next: "loop.memory".to_string(),
+            }],
+        }];
+        let errors = validate_state_plan(&carried_terminal, &resolve_state_plan(&carried_terminal));
+        assert!(
+            errors.iter().any(|error| {
+                error.contains("terminal writer 'loop:loop.memory'")
+                    && error.contains("persisted state contract")
+            }),
+            "{errors:?}"
+        );
+
+        let mut branch_terminal = split_representation_workflow();
+        let mut steps = std::mem::take(&mut branch_terminal.steps);
+        let first = steps.remove(0);
+        let convert = steps.remove(0);
+        let last = steps.remove(0);
+        branch_terminal.steps = vec![
+            first,
+            convert,
+            WorkflowStep::Branch {
+                predicate: "active".to_string(),
+                cases: BTreeMap::from([
+                    ("false".to_string(), last.clone()),
+                    ("true".to_string(), last),
+                ]),
+                default: None,
+                outputs: BTreeMap::from([(
+                    "joined.memory".to_string(),
+                    crate::schema::WorkflowBranchOutput {
+                        cases: BTreeMap::from([
+                            ("false".to_string(), "last.next".to_string()),
+                            ("true".to_string(), "last.next".to_string()),
+                        ]),
+                        default: None,
+                    },
+                )]),
+            },
+        ];
+        let errors = validate_state_plan(&branch_terminal, &resolve_state_plan(&branch_terminal));
+        assert!(
+            errors.iter().any(|error| {
+                error.contains("terminal writer 'branch:joined.memory'")
+                    && error.contains("persisted state contract")
             }),
             "{errors:?}"
         );
