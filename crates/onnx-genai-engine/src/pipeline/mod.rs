@@ -2132,7 +2132,7 @@ opset_import { domain: "" version: 13 }
                 r#"
 pipeline:
   workflow:
-    manifest: {}
+    manifest: {{}}
     inputs:
       logits:
         contract: {{ dtype: float32, shape: [{BATCH}, {VOCAB}] }}
