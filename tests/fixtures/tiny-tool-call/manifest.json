@@ -1,5 +1,5 @@
 {
-  "generator": "tests/fixtures/tiny-tool-call (derived from tiny-llm for tool protocol conformance)",
+  "generator": "tests/fixtures/tiny-tool-call/generate_tiny_tool_call.py",
   "mobius_root": "/Users/justinc/Documents/GitHub/mobius",
   "seed": 20260712,
   "architecture": "GPT2CausalLMModel",
@@ -13,6 +13,6 @@
   "head_dim": 8,
   "files": {
     "model.onnx.textproto": 75291,
-    "tokenizer.json": 2695
+    "tokenizer.json": 2553
   }
 }

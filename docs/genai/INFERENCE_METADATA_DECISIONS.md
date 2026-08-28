@@ -1556,6 +1556,14 @@ All caller-provided tool data, template values, and model-produced envelopes are
 untrusted structured input and **MUST** be bounded and validated. Metadata grants
 no authority to execute or select tools.
 
+On a later caller turn, every assistant call ID is unique and every `role: tool`
+result supplies one outstanding `tool_call_id`; results associate by that typed
+ID, not by array position. A duplicate, unknown, or missing result ID, a
+result `name` that disagrees with its call, a non-`function` call, non-object
+call arguments, or a non-text result fails before inference with the message
+path. Tool execution remains caller-owned: the server validates and renders
+results but never invokes a declared function.
+
 ---
 
 ## 16. Distributed execution
