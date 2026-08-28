@@ -982,7 +982,20 @@ impl<'a> WorkflowExecutionPlan<'a> {
         engine: &'a WorkflowRuntime,
         request: PipelineGenerateRequest,
     ) -> anyhow::Result<Self> {
+        engine.reject_candidate_tree_raw_execution("WorkflowExecutionPlan::new")?;
         Self::new_hosted(engine, request, &[])
+    }
+
+    pub(super) fn new_candidate_tree_driver(
+        engine: &'a WorkflowRuntime,
+        request: PipelineGenerateRequest,
+    ) -> anyhow::Result<Self> {
+        engine.require_execution_admitted()?;
+        Self::new_hosted(engine, request, &[])
+    }
+
+    pub(crate) fn into_bound_values(self) -> (PipelineTensors, Option<String>) {
+        (self.values, self.session_id)
     }
 
     /// Prepare a pass in which `hosted` contracts are executed by the caller.
@@ -1004,6 +1017,7 @@ impl<'a> WorkflowExecutionPlan<'a> {
             inputs,
             session_id,
             component_overrides,
+            generation_control: _,
         } = request;
         let workflow = &engine.plan.workflow;
         let session_turn_version = session_id.as_ref().map(|session| {

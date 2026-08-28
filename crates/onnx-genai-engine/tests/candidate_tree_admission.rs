@@ -95,11 +95,11 @@ fn assert_candidate_tree_refusal(result: anyhow::Result<()>, constructor: &str) 
     assert!(
         message.contains("candidate-tree")
             && message.contains("onnx-genai.speculative@1")
-            && message.contains("no candidate-tree package-dispatch capability or executor"),
+            && message.contains("cannot execute the declared candidate-tree variant"),
         "{constructor} did not report the exact unsupported contract and capability: {message}"
     );
     assert!(
-        message.contains("Refusing to silently run plain or MTP generation"),
+        message.contains("silently running plain, MTP, or DFlash generation"),
         "{constructor} did not explain the fail-closed dispatch decision: {message}"
     );
     assert!(
@@ -171,7 +171,7 @@ fn candidate_tree_semantic_errors_precede_runtime_capability_admission() {
             "semantic validation did not identify {expected}: {message}"
         );
         assert!(
-            !message.contains("no candidate-tree package-dispatch capability or executor"),
+            !message.contains("cannot execute the declared candidate-tree variant"),
             "runtime capability refusal masked a semantic metadata error: {message}"
         );
     }
@@ -197,7 +197,7 @@ fn output_family_version_boundary_precedes_candidate_and_memory_admission() {
         "{message}"
     );
     assert!(
-        !message.contains("no candidate-tree package-dispatch capability or executor"),
+        !message.contains("cannot execute the declared candidate-tree variant"),
         "version-feature admission must fail before candidate capability dispatch: {message}"
     );
 }

@@ -1130,7 +1130,27 @@ impl Engine {
             request.with_session_id(session_id.to_string()),
             on_admitted,
             callback,
-        )?;
+        );
+        let delivery_commit = result
+            .as_ref()
+            .err()
+            .and_then(|error| {
+                error
+                    .downcast_ref::<crate::pipeline::speculative::CandidateTreeOutputDeliveryError>(
+                    )
+            })
+            .map(|error| error.committed_tokens);
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                if let Some(committed) = delivery_commit
+                    && let Some(count) = self.workflow_sessions.get_mut(&session_id)
+                {
+                    *count = count.saturating_add(committed);
+                }
+                return Err(error);
+            }
+        };
         // A package that declares its conversation knows how long it is; asking
         // it is what keeps `session_token_count` the same number a decode-core
         // session reports — prompt and generated tokens both — rather than the
@@ -1431,7 +1451,7 @@ impl Engine {
         admission_callback: Option<&mut dyn FnMut()>,
         token_callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
-        self.reject_undispatched_dflash_generation()?;
+        self.require_workflow_execution_admitted()?;
         // One entry point, one interpreter, one declared loop. What varies is
         // whether this runtime holds the fused decode session that implements
         // the package's declared `autoregressive-decode` step. Without one, the
@@ -1476,6 +1496,7 @@ impl Engine {
                 );
             }
         }
+
         let session_id = self.create_session()?;
         let result = self.generate_in_session_with_priority_and_callback(
             session_id,
@@ -1491,6 +1512,29 @@ impl Engine {
             (Err(error), _) => Err(error),
             (Ok(_), Err(error)) => Err(error),
         }
+    }
+
+    /// Generate a candidate-tree package with request-scoped cancellation and
+    /// deterministic transaction checkpoints.
+    pub fn generate_with_control_callbacks(
+        &mut self,
+        request: GenerateRequest,
+        control: crate::pipeline::GenerationControl,
+        admission_callback: Option<&mut dyn FnMut()>,
+        token_callback: Option<&mut GenerateTokenCallback<'_>>,
+    ) -> anyhow::Result<GenerateResult> {
+        if self.holds_decode_core() || self.candidate_tree_diagnostic().is_none() {
+            return Err(crate::pipeline::GenerationControlUnsupported {
+                operation: "Engine::generate_with_control_callbacks",
+                runtime: "a non-candidate-tree generation runtime",
+            }
+            .into());
+        }
+        self.generate_with_pipeline_callbacks(
+            crate::pipeline::PipelineGenerateRequest::new(request).with_generation_control(control),
+            admission_callback,
+            token_callback,
+        )
     }
 
     /// Generate text in a persistent session, reusing the session's accumulated KV state.
@@ -1549,6 +1593,31 @@ impl Engine {
         )
     }
 
+    /// Continue a candidate-tree workflow session with request-scoped
+    /// cancellation and deterministic transaction checkpoints.
+    pub fn generate_in_session_with_control_callbacks(
+        &mut self,
+        session_id: SessionId,
+        request: GenerateRequest,
+        control: crate::pipeline::GenerationControl,
+        admission_callback: Option<&mut dyn FnMut()>,
+        token_callback: Option<&mut GenerateTokenCallback<'_>>,
+    ) -> anyhow::Result<GenerateResult> {
+        if self.holds_decode_core() || self.candidate_tree_diagnostic().is_none() {
+            return Err(crate::pipeline::GenerationControlUnsupported {
+                operation: "Engine::generate_in_session_with_control_callbacks",
+                runtime: "a non-candidate-tree generation runtime",
+            }
+            .into());
+        }
+        self.generate_in_workflow_session(
+            session_id,
+            crate::pipeline::PipelineGenerateRequest::new(request).with_generation_control(control),
+            admission_callback,
+            token_callback,
+        )
+    }
+
     /// Generate text in a persistent session using a caller-supplied [`Sampler`].
     ///
     /// The custom sampler replaces the built-in greedy/categorical token
@@ -1582,7 +1651,7 @@ impl Engine {
         mut admission_callback: Option<&mut dyn FnMut()>,
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
-        self.reject_undispatched_dflash_generation()?;
+        self.require_workflow_execution_admitted()?;
         // A package with no decode core keeps its conversation in the
         // session-scoped cells its workflow declares. Routing here rather than
         // in one of the wrappers above is what makes every `generate_in_session`

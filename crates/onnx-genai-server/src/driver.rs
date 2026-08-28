@@ -12,9 +12,9 @@ use onnx_genai::{
 use onnx_genai_engine::{
     BatchingCapability, ContinuousBatchAdmission, ContinuousBatchEvent, ContinuousBatchHandle,
     ContinuousBatchManager, EmbeddingOptions, EncodedAudio, EngineGovernorError,
-    EngineMemoryAccounting, FimConfig, GovernorSnapshot, KvNotApplicable, KvTelemetry,
-    MemoryStrategyPlan, OrtEngineWorkerFactory, PipelineGenerateRequest, ResourceLimit,
-    SchedulerAdmissionError,
+    EngineMemoryAccounting, FimConfig, GenerationControl, GovernorSnapshot, KvNotApplicable,
+    KvTelemetry, MemoryStrategyPlan, OrtEngineWorkerFactory, PipelineGenerateRequest,
+    ResourceLimit, SchedulerAdmissionError,
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 
@@ -2362,6 +2362,17 @@ fn run_generation(
             return;
         }
     };
+    let cancellation_events = events.clone();
+    let generation_control =
+        GenerationControl::from_cancellation_probe(move || cancellation_events.is_closed());
+    let candidate_tree = engine.candidate_tree_diagnostic().is_some();
+    let bound = bound.map(|request| {
+        if candidate_tree {
+            request.with_generation_control(generation_control.clone())
+        } else {
+            request
+        }
+    });
     let mut admission = Some(admission);
     let mut callback = |token: GenerateToken| -> anyhow::Result<()> {
         metrics.token();
@@ -2387,6 +2398,21 @@ fn run_generation(
                 Some(&mut admitted),
                 Some(&mut callback),
             ),
+            (None, session) if candidate_tree => match session {
+                Some(session) => engine.generate_in_session_with_control_callbacks(
+                    session,
+                    request,
+                    generation_control,
+                    Some(&mut admitted),
+                    Some(&mut callback),
+                ),
+                None => engine.generate_with_control_callbacks(
+                    request,
+                    generation_control,
+                    Some(&mut admitted),
+                    Some(&mut callback),
+                ),
+            },
             (None, Some(session_id)) => engine.generate_in_session_with_callbacks(
                 session_id,
                 request,

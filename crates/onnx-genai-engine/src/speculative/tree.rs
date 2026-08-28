@@ -443,13 +443,13 @@ pub fn verify_tree_sampling(
         );
         let random = inputs.randomness[position];
         random.validate(position)?;
-        let acceptance = (target[token] / proposal[token]).min(1.0);
         anyhow::ensure!(
             proposal[token] > 0.0,
             "candidate-tree node {node} proposes token {} with zero declared proposal \
              probability; the proposal path cannot be sampled from its own distribution",
             candidate.token
         );
+        let acceptance = (target[token] / proposal[token]).min(1.0);
         if random.acceptance < acceptance {
             accepted_nodes.push(node);
             previous = Some(node);

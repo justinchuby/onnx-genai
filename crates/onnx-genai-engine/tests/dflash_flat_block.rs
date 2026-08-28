@@ -43,7 +43,7 @@ fn fixture() -> PathBuf {
 fn copied_fixture(name: &str) -> anyhow::Result<PathBuf> {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target-s13/test-fixtures/dflash-admission")
+        .join("../../target/dflash-admission")
         .join(format!("{name}-{}", NEXT.fetch_add(1, Ordering::Relaxed)));
     fs::create_dir_all(&root)?;
     for file in [
@@ -173,7 +173,7 @@ fn dflash_execution_and_manual_commit_helpers_consume_the_canonical_guard() {
         guarded_body(
             engine_api,
             helper,
-            "self.reject_undispatched_dflash_generation()?",
+            "self.require_workflow_execution_admitted()?",
         );
         guarded_body(runtime_api, helper, "self.require_execution_admitted()?");
     }

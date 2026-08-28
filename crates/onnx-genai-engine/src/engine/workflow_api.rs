@@ -27,8 +27,12 @@ impl Engine {
     ///
     /// Runtime construction is the canonical admission boundary. This reads
     /// the same stored typed decision; it never reclassifies metadata.
-    pub(crate) fn reject_undispatched_dflash_generation(&self) -> anyhow::Result<()> {
+    pub(crate) fn require_workflow_execution_admitted(&self) -> anyhow::Result<()> {
         self.workflow.require_execution_admitted()
+    }
+
+    fn reject_candidate_tree_raw_workflow_api(&self, operation: &str) -> anyhow::Result<()> {
+        self.workflow.reject_candidate_tree_raw_execution(operation)
     }
 
     /// How many device→host materializations this runtime has performed.
@@ -71,7 +75,8 @@ impl Engine {
     /// an ONNX component shows that component's invocations here and no
     /// contract executions at all.
     pub fn component_invocations(&self) -> std::collections::BTreeMap<String, u64> {
-        self.workflow
+        let recorded = self
+            .workflow
             .workflow_performance_diagnostic()
             .last_stage_runs
             .into_iter()
@@ -80,7 +85,19 @@ impl Engine {
                     .strip_prefix("component:")
                     .map(|component| (component.to_string(), runs))
             })
-            .collect()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        if !recorded.is_empty() {
+            return recorded;
+        }
+        let Some(diagnostic) = self.candidate_tree_diagnostic() else {
+            return recorded;
+        };
+        let blocks = self.workflow.last_candidate_tree_block_trace_count();
+        if blocks == 0 {
+            return recorded;
+        }
+        let runs = u64::try_from(blocks).unwrap_or(u64::MAX).saturating_add(1);
+        std::collections::BTreeMap::from([(diagnostic.proposer, runs), (diagnostic.target, runs)])
     }
 
     /// How many components the package's declared workflow names.
@@ -136,7 +153,7 @@ impl Engine {
         &mut self,
         request: PipelineGenerateRequest,
     ) -> anyhow::Result<PipelineTensors> {
-        self.reject_undispatched_dflash_generation()?;
+        self.reject_candidate_tree_raw_workflow_api("Engine::run_pipeline")?;
         let request = self.apply_pipeline_request_defaults(request)?;
         self.workflow_runtime_mut().run_pipeline(request)
     }
@@ -148,7 +165,7 @@ impl Engine {
         &mut self,
         request: PipelineGenerateRequest,
     ) -> anyhow::Result<WorkflowExecutionPlan<'_>> {
-        self.reject_undispatched_dflash_generation()?;
+        self.reject_candidate_tree_raw_workflow_api("Engine::prepare_pipeline")?;
         let request = self.apply_pipeline_request_defaults(request)?;
         WorkflowExecutionPlan::new(self.workflow_runtime(), request)
     }
@@ -157,7 +174,7 @@ impl Engine {
         &mut self,
         request: PipelineGenerateRequest,
     ) -> anyhow::Result<PipelineOutputs> {
-        self.reject_undispatched_dflash_generation()?;
+        self.reject_candidate_tree_raw_workflow_api("Engine::run_pipeline_outputs")?;
         let request = self.apply_pipeline_request_defaults(request)?;
         self.workflow_runtime_mut().run_pipeline_outputs(request)
     }
@@ -178,7 +195,7 @@ impl Engine {
         &mut self,
         request: PipelineGenerateRequest,
     ) -> anyhow::Result<PipelineTensors> {
-        self.reject_undispatched_dflash_generation()?;
+        self.reject_candidate_tree_raw_workflow_api("Engine::run_pipeline_retained")?;
         let request = self.apply_pipeline_request_defaults(request)?;
         self.workflow_runtime_mut().run_pipeline_retained(request)
     }
@@ -201,7 +218,19 @@ impl Engine {
         mut on_admitted: Option<&mut dyn FnMut()>,
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
-        self.reject_undispatched_dflash_generation()?;
+        self.require_workflow_execution_admitted()?;
+        if request.generation_control.is_some()
+            && self
+                .workflow_runtime()
+                .candidate_tree_diagnostic()
+                .is_none()
+        {
+            return Err(crate::pipeline::GenerationControlUnsupported {
+                operation: "Engine::generate_with_pipeline_callbacks",
+                runtime: "a non-candidate-tree workflow",
+            }
+            .into());
+        }
         // A request that binds no tensors is a prompt, and a prompt is served
         // by the ordinary entry point — which admits through the scheduler,
         // reuses a cached prefix, and routes the declared decode step to the
@@ -294,6 +323,9 @@ impl Engine {
         }
         let options = request.request.options.clone();
         let tokenizer = runtime.package_tokenizer();
+        if runtime.candidate_tree_diagnostic().is_some() {
+            return runtime.run_candidate_tree_generation(&options, request, tokenizer, callback);
+        }
         crate::pipeline::generation::run_declared_generation(
             runtime, &options, tokenizer, request, None, callback,
         )
@@ -310,6 +342,7 @@ impl Engine {
     }
 
     pub fn models(&self) -> anyhow::Result<&PipelineModels> {
+        self.reject_candidate_tree_raw_workflow_api("Engine::models")?;
         Ok(self.workflow_runtime().models())
     }
 
@@ -341,7 +374,7 @@ impl Engine {
         &self,
         request: PipelineGenerateRequest,
     ) -> anyhow::Result<crate::pipeline::WorkflowExecutionPlan<'_>> {
-        self.reject_undispatched_dflash_generation()?;
+        self.reject_candidate_tree_raw_workflow_api("Engine::prepare_workflow_execution")?;
         let request = self.apply_pipeline_request_defaults(request)?;
         self.workflow_runtime().prepare_workflow_execution(request)
     }
@@ -409,6 +442,19 @@ impl Engine {
         self.workflow_runtime().dflash_diagnostic()
     }
 
+    pub fn candidate_tree_diagnostic(
+        &self,
+    ) -> Option<crate::pipeline::speculative::CandidateTreeDiagnostic> {
+        self.workflow_runtime().candidate_tree_diagnostic()
+    }
+
+    pub fn take_candidate_tree_block_traces(
+        &mut self,
+    ) -> Vec<crate::pipeline::speculative::CandidateTreeBlockTrace> {
+        self.workflow_runtime_mut()
+            .take_candidate_tree_block_traces()
+    }
+
     pub fn propose_chained(
         &self,
         run: &PipelineTensors,
@@ -422,7 +468,7 @@ impl Engine {
         run: &PipelineTensors,
         options: crate::pipeline::speculative::DFlashProposalOptions,
     ) -> anyhow::Result<crate::pipeline::speculative::DFlashProposal> {
-        self.reject_undispatched_dflash_generation()?;
+        self.require_workflow_execution_admitted()?;
         self.workflow_runtime().propose_dflash(run, options)
     }
 
@@ -432,7 +478,7 @@ impl Engine {
         proposal: &crate::pipeline::speculative::DFlashProposal,
         mode: crate::pipeline::speculative::DFlashVerificationMode,
     ) -> anyhow::Result<crate::pipeline::speculative::DFlashAcceptance> {
-        self.reject_undispatched_dflash_generation()?;
+        self.require_workflow_execution_admitted()?;
         self.workflow_runtime()
             .verify_dflash(verified, proposal, mode)
     }
@@ -441,7 +487,7 @@ impl Engine {
         &self,
         current: &PipelineTensors,
     ) -> anyhow::Result<crate::pipeline::speculative::DFlashStateTransaction> {
-        self.reject_undispatched_dflash_generation()?;
+        self.require_workflow_execution_admitted()?;
         self.workflow_runtime()
             .begin_dflash_state_transaction(current)
     }
@@ -454,7 +500,7 @@ impl Engine {
         verified: &PipelineTensors,
         acceptance: &crate::pipeline::speculative::DFlashAcceptance,
     ) -> anyhow::Result<crate::pipeline::TurnTransactionOutcome> {
-        self.reject_undispatched_dflash_generation()?;
+        self.require_workflow_execution_admitted()?;
         self.workflow_runtime().commit_dflash_state_transaction(
             transaction,
             current,
@@ -470,7 +516,7 @@ impl Engine {
         current: &mut PipelineTensors,
         reason: crate::pipeline::TurnAbortReason,
     ) -> anyhow::Result<crate::pipeline::TurnTransactionOutcome> {
-        self.reject_undispatched_dflash_generation()?;
+        self.require_workflow_execution_admitted()?;
         self.workflow_runtime()
             .abort_dflash_state_transaction(transaction, current, reason)
     }

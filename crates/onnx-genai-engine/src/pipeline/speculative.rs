@@ -31,14 +31,19 @@ use std::collections::BTreeMap;
 
 use anyhow::Context as _;
 use onnx_genai_metadata::{
-    DFlashStateCommit, DFlashStructure, SpeculativeContract, SpeculativeProposalExecution,
-    SpeculativeRecurrenceBinding, StatePortAccess, WorkflowSpec, WorkflowStep,
+    CandidateTreeTopology, DFlashStateCommit, DFlashStructure, SpeculativeAcceptedPath,
+    SpeculativeContract, SpeculativeProposalExecution, SpeculativeRecurrenceBinding,
+    StateFinalWriter, StatePortAccess, WorkflowOutputFamily, WorkflowSpec, WorkflowStep,
 };
 use onnx_genai_ort::{DataType, Value};
 use rand::rngs::StdRng;
 use rand::{Rng as _, SeedableRng as _};
 
 use super::{PipelineTensors, WorkflowRuntime};
+use crate::config::{FinishReason, GenerateOptions, GenerateResult, GenerateTokenCallback};
+use crate::speculative::{
+    AcceptanceRule, SamplingRandomness, SpecTree, TreeSamplingInputs, verify_tree_sampling,
+};
 
 /// One materialized chained proposal.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -284,6 +289,53 @@ pub struct DFlashDiagnostic {
     pub shared_batching_supported: bool,
 }
 
+/// Inspectable facts for the exact candidate-tree executor selected from a
+/// canonical `onnx-genai.speculative@1` declaration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CandidateTreeDiagnostic {
+    pub version: String,
+    pub proposer: String,
+    pub target: String,
+    pub topology: &'static str,
+    pub max_proposal_width: usize,
+    pub distribution_preserving: bool,
+    pub proposal_probabilities: bool,
+    pub rollback_participants: Vec<String>,
+    pub shared_batching_supported: bool,
+}
+
+/// Evidence from one committed candidate-tree verification block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CandidateTreeBlockTrace {
+    pub candidates: Vec<u32>,
+    pub parents: Vec<Option<usize>>,
+    pub accepted_nodes: Vec<usize>,
+    pub committed_tokens: Vec<u32>,
+}
+
+/// Typed cancellation of an admitted candidate-tree turn.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "candidate-tree generation cancelled {boundary}; the admitted turn aborted to its explicit \
+     committed baseline"
+)]
+pub struct CandidateTreeGenerationCancelled {
+    pub boundary: super::GenerationBoundary,
+    pub outcome: super::TurnTransactionOutcome,
+}
+
+/// Output delivery failed after the candidate-tree transaction committed.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "candidate-tree output delivery failed after semantic commit for {committed_tokens} token(s); \
+     committed state remains durable and this partial delivery will not be replayed \
+     automatically: {message}"
+)]
+pub struct CandidateTreeOutputDeliveryError {
+    pub committed_tokens: usize,
+    pub message: String,
+}
+
 /// S3 transaction participant for target, draft-private, recurrent, and
 /// token-context state advanced by one DFlash block.
 pub struct DFlashStateTransaction {
@@ -298,6 +350,421 @@ impl std::fmt::Debug for DFlashStateTransaction {
             .field("states", &self.baseline.keys().collect::<Vec<_>>())
             .finish()
     }
+}
+
+#[derive(Debug)]
+struct CandidateTreePlan<'a> {
+    contract: &'a SpeculativeContract,
+    candidate_tokens: &'a str,
+    topology: &'a CandidateTreeTopology,
+    accepted_path_binding: &'a str,
+    proposer_bindings: BTreeMap<String, String>,
+    proposer_outputs: BTreeMap<String, String>,
+    target_bindings: BTreeMap<String, String>,
+    target_outputs: BTreeMap<String, String>,
+    proposer_context_input: &'a str,
+    target_context_input: &'a str,
+    target_candidate_input: &'a str,
+    target_ancestor_input: &'a str,
+    target_position_input: &'a str,
+    target_accepted_input: &'a str,
+    target_logits_value: String,
+    proposal_probabilities_value: Option<String>,
+    target_probabilities_value: Option<String>,
+}
+
+impl<'a> CandidateTreePlan<'a> {
+    fn resolve(contract: &'a SpeculativeContract, workflow: &WorkflowSpec) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            contract.version == "1",
+            "candidate-tree execution supports exactly onnx-genai.speculative@1, got version '{}'",
+            contract.version
+        );
+        let SpeculativeProposalExecution::CandidateTree {
+            candidate_tokens,
+            topology,
+        } = &contract.proposal_execution
+        else {
+            anyhow::bail!(
+                "candidate-tree execution was selected for a non-tree proposal form; MTP, \
+                 DFlash, chained, and flat-block proposals use independent drivers"
+            );
+        };
+        let SpeculativeAcceptedPath::Runtime { binding } = &contract.verification.accepted_path
+        else {
+            anyhow::bail!(
+                "candidate-tree version 1 requires a runtime accepted-path binding; \
+                 component-owned accepted paths are not implemented"
+            );
+        };
+        let (proposer_bindings, proposer_outputs) =
+            component_invocation(workflow, &contract.proposer).with_context(|| {
+                format!(
+                    "candidate-tree proposer '{}' has no workflow invocation",
+                    contract.proposer
+                )
+            })?;
+        let (target_bindings, target_outputs) = component_invocation(workflow, &contract.target)
+            .with_context(|| {
+                format!(
+                    "candidate-tree target '{}' has no workflow invocation",
+                    contract.target
+                )
+            })?;
+        let role = |roles: &'a BTreeMap<String, String>,
+                    name: &str,
+                    component: &str|
+         -> anyhow::Result<&'a str> {
+            roles.get(name).map(String::as_str).with_context(|| {
+                format!(
+                    "candidate-tree component '{component}' is missing required protocol \
+                         role '{name}'"
+                )
+            })
+        };
+        let proposer_context_input = role(
+            &contract.port_bindings,
+            "context_tokens",
+            &contract.proposer,
+        )?;
+        let target_context_input = role(
+            &contract.target_port_bindings,
+            "context_tokens",
+            &contract.target,
+        )?;
+        let target_candidate_input = role(
+            &contract.target_port_bindings,
+            "candidate_tokens",
+            &contract.target,
+        )?;
+        let target_ancestor_input = role(
+            &contract.target_port_bindings,
+            "ancestor_mask",
+            &contract.target,
+        )?;
+        let target_position_input = role(
+            &contract.target_port_bindings,
+            "position_ids",
+            &contract.target,
+        )?;
+        let target_accepted_input = role(
+            &contract.target_port_bindings,
+            "accepted_tokens",
+            &contract.target,
+        )?;
+        let output_value = |component: &str,
+                            output: &str,
+                            outputs: &BTreeMap<String, String>|
+         -> anyhow::Result<String> {
+            outputs.get(output).cloned().with_context(|| {
+                format!("candidate-tree output '{component}::{output}' has no workflow SSA binding")
+            })
+        };
+        let target_logits_value = output_value(
+            &contract.verification.target_output.component,
+            &contract.verification.target_output.output,
+            &target_outputs,
+        )?;
+        let (proposal_probabilities_value, target_probabilities_value) =
+            match &contract.verification.probabilities {
+                Some(probabilities) => (
+                    Some(output_value(
+                        &probabilities.proposal.component,
+                        &probabilities.proposal.output,
+                        &proposer_outputs,
+                    )?),
+                    Some(output_value(
+                        &probabilities.target.component,
+                        &probabilities.target.output,
+                        &target_outputs,
+                    )?),
+                ),
+                None => (None, None),
+            };
+        let plan = Self {
+            contract,
+            candidate_tokens,
+            topology,
+            accepted_path_binding: binding,
+            proposer_bindings,
+            proposer_outputs,
+            target_bindings,
+            target_outputs,
+            proposer_context_input,
+            target_context_input,
+            target_candidate_input,
+            target_ancestor_input,
+            target_position_input,
+            target_accepted_input,
+            target_logits_value,
+            proposal_probabilities_value,
+            target_probabilities_value,
+        };
+        plan.validate_state_authority(workflow)?;
+        Ok(plan)
+    }
+
+    fn validate_state_authority(&self, workflow: &WorkflowSpec) -> anyhow::Result<()> {
+        let state_plan = onnx_genai_metadata::resolve_state_plan(workflow);
+        for (cell, _) in state_plan
+            .session_cells()
+            .filter(|(_, resolved)| resolved.transaction.required)
+        {
+            anyhow::ensure!(
+                self.contract.rollback_state.contains(cell),
+                "candidate-tree session state '{cell}' participates in the atomic turn but is \
+                 absent from speculative.rollback_state"
+            );
+        }
+        for cell in &self.contract.rollback_state {
+            anyhow::ensure!(
+                self.state_alias(workflow, &self.contract.proposer, cell)
+                    .or_else(|| self.state_alias(workflow, &self.contract.target, cell))
+                    .is_some(),
+                "candidate-tree rollback participant '{cell}' has no proposer or target \
+                 read-write state-service alias"
+            );
+            let resolved = state_plan.cell(cell).cloned().with_context(|| {
+                format!("candidate-tree rollback participant '{cell}' is unresolved")
+            })?;
+            let StateFinalWriter::Writer(writer) = resolved.final_writer.with_context(|| {
+                format!(
+                    "candidate-tree rollback participant '{cell}' has no canonical final writer"
+                )
+            })?
+            else {
+                anyhow::bail!(
+                    "candidate-tree rollback participant '{cell}' uses session continuation; \
+                     accepted-path state must be written by the declared proposer or target"
+                );
+            };
+            anyhow::ensure!(
+                writer.component.as_deref() == Some(self.contract.proposer.as_str())
+                    || writer.component.as_deref() == Some(self.contract.target.as_str()),
+                "candidate-tree rollback participant '{cell}' final writer {:?} is outside the \
+                 proposer/target transaction",
+                writer.component
+            );
+        }
+        if let Some(serving) = &workflow.serving {
+            for group in serving.state_service.groups.values() {
+                for component in [&self.contract.proposer, &self.contract.target] {
+                    for (cell, alias) in group.ports.get(component).into_iter().flatten() {
+                        if alias.access == StatePortAccess::ReadWrite {
+                            anyhow::ensure!(
+                                self.contract.rollback_state.contains(cell),
+                                "candidate-tree component '{component}' mutates state '{cell}', \
+                                 but speculative.rollback_state omits it"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn state_alias<'workflow>(
+        &self,
+        workflow: &'workflow WorkflowSpec,
+        component: &str,
+        cell: &str,
+    ) -> Option<&'workflow onnx_genai_metadata::StatePortAlias> {
+        workflow
+            .serving
+            .as_ref()?
+            .state_service
+            .groups
+            .values()
+            .find_map(|group| group.ports.get(component)?.get(cell))
+            .filter(|alias| alias.access == StatePortAccess::ReadWrite)
+    }
+
+    fn state_for_input<'workflow>(
+        &self,
+        workflow: &'workflow WorkflowSpec,
+        component: &str,
+        input: &str,
+    ) -> Option<&'workflow str> {
+        workflow
+            .serving
+            .as_ref()?
+            .state_service
+            .groups
+            .values()
+            .find_map(|group| {
+                group
+                    .ports
+                    .get(component)?
+                    .iter()
+                    .find_map(|(cell, alias)| {
+                        (alias.access == StatePortAccess::ReadWrite && alias.input == input)
+                            .then_some(cell.as_str())
+                    })
+            })
+    }
+
+    fn initial_state(
+        &self,
+        workflow: &WorkflowSpec,
+        values: &PipelineTensors,
+    ) -> anyhow::Result<PipelineTensors> {
+        let mut state = PipelineTensors::new();
+        for cell in &self.contract.rollback_state {
+            let source = [&self.contract.proposer, &self.contract.target]
+                .into_iter()
+                .find_map(|component| {
+                    let alias = self.state_alias(workflow, component, cell)?;
+                    let bindings = if component == &self.contract.proposer {
+                        &self.proposer_bindings
+                    } else {
+                        &self.target_bindings
+                    };
+                    bindings.get(&alias.input)
+                })
+                .with_context(|| {
+                    format!("candidate-tree rollback participant '{cell}' has no bound state input")
+                })?;
+            state.insert(
+                cell.clone(),
+                crate::decode::clone_value(values.get(source).with_context(|| {
+                    format!(
+                        "candidate-tree rollback participant '{cell}' starts from unavailable \
+                         workflow value '{source}'"
+                    )
+                })?)?,
+            );
+        }
+        Ok(state)
+    }
+
+    fn topology_output(&self) -> &str {
+        match self.topology {
+            CandidateTreeTopology::ParentIndices { output }
+            | CandidateTreeTopology::AncestorMask { output } => output,
+        }
+    }
+}
+
+struct RuntimeCandidateTree {
+    tree: SpecTree,
+    tokens: Value,
+    ancestor_mask: Value,
+    position_ids: Value,
+}
+
+fn probability_or_logits_rows(
+    value: &Value,
+    expected_rows: usize,
+    authority: &str,
+    probabilities: bool,
+) -> anyhow::Result<Vec<Vec<f32>>> {
+    anyhow::ensure!(
+        matches!(
+            value.dtype(),
+            DataType::Float16 | DataType::BFloat16 | DataType::Float32
+        ),
+        "candidate-tree {authority} have {:?}; expected float16, bfloat16, or float32",
+        value.dtype()
+    );
+    let shape = value.shape();
+    anyhow::ensure!(
+        shape.len() == 3 && shape[0] == 1 && shape[1] >= 0 && shape[2] > 0,
+        "candidate-tree {authority} have shape {shape:?}; expected \
+         [1, tree_nodes_plus_anchor, vocabulary]"
+    );
+    let rows = usize::try_from(shape[1]).context("candidate-tree row extent is negative")?;
+    let vocabulary =
+        usize::try_from(shape[2]).context("candidate-tree vocabulary extent is negative")?;
+    anyhow::ensure!(
+        rows == expected_rows,
+        "candidate-tree {authority} have {rows} rows, but flattened path ordering requires \
+         exactly {expected_rows}: anchor row 0 followed by one row per proposer node"
+    );
+    let data = value.to_vec_f32_lossy()?;
+    let rows = data
+        .chunks_exact(vocabulary)
+        .enumerate()
+        .map(|(row, values)| {
+            anyhow::ensure!(
+                values.iter().all(|value| value.is_finite()),
+                "candidate-tree {authority} row {row} contains a non-finite value"
+            );
+            if probabilities {
+                anyhow::ensure!(
+                    values.iter().all(|value| *value >= 0.0),
+                    "candidate-tree {authority} row {row} contains a negative probability"
+                );
+                let total = values.iter().sum::<f32>();
+                anyhow::ensure!(
+                    (total - 1.0).abs() <= 1e-4,
+                    "candidate-tree {authority} row {row} sums to {total}, expected 1"
+                );
+            }
+            Ok(values.to_vec())
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    anyhow::ensure!(
+        rows.len() == expected_rows,
+        "candidate-tree {authority} payload length does not match its declared axes"
+    );
+    Ok(rows)
+}
+
+fn validate_candidate_probability_support(
+    tree: &SpecTree,
+    proposal: &[Vec<f32>],
+) -> anyhow::Result<()> {
+    for parent in std::iter::once(None).chain((0..tree.len()).map(Some)) {
+        let children = parent.map_or_else(|| tree.roots(), |node| tree.children(node));
+        if children.is_empty() {
+            continue;
+        }
+        let row = parent.map_or(0, |node| node + 1);
+        let expected = children
+            .iter()
+            .map(|node| tree.nodes()[*node].token as usize)
+            .collect::<std::collections::HashSet<_>>();
+        for token in &expected {
+            anyhow::ensure!(
+                *token < proposal[row].len(),
+                "candidate-tree proposal frontier token {token} is outside vocabulary {}",
+                proposal[row].len()
+            );
+            anyhow::ensure!(
+                proposal[row][*token] > 0.0,
+                "candidate-tree proposal row {row} gives declared frontier token {token} zero \
+                 probability"
+            );
+        }
+        for (token, probability) in proposal[row].iter().copied().enumerate() {
+            anyhow::ensure!(
+                probability <= 1e-6 || expected.contains(&token),
+                "candidate-tree proposal row {row} assigns probability {probability} to token \
+                 {token}, which is not a declared child of parent {parent:?}; the sampled path \
+                 could leave the emitted tree"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn sample_declared_distribution(probabilities: &[f32], random: f32) -> anyhow::Result<usize> {
+    anyhow::ensure!(
+        random.is_finite() && (0.0..1.0).contains(&random),
+        "candidate-tree sampling random variate {random} is outside [0, 1)"
+    );
+    let mut cumulative = 0.0_f32;
+    for (token, probability) in probabilities.iter().copied().enumerate() {
+        cumulative += probability;
+        if random < cumulative {
+            return Ok(token);
+        }
+    }
+    probabilities
+        .iter()
+        .rposition(|probability| *probability > 0.0)
+        .context("candidate-tree sampling distribution has empty support")
 }
 
 /// Resolved, contract-derived view of a chained proposal execution.
@@ -505,6 +972,934 @@ impl WorkflowRuntime {
     /// The package's speculative compatibility contract, when it declares one.
     pub fn speculative_contract(&self) -> Option<&SpeculativeContract> {
         self.plan.speculative.as_ref()
+    }
+
+    pub fn candidate_tree_diagnostic(&self) -> Option<CandidateTreeDiagnostic> {
+        let contract = self.plan.speculative.as_ref()?;
+        let SpeculativeProposalExecution::CandidateTree { topology, .. } =
+            &contract.proposal_execution
+        else {
+            return None;
+        };
+        Some(CandidateTreeDiagnostic {
+            version: contract.version.clone(),
+            proposer: contract.proposer.clone(),
+            target: contract.target.clone(),
+            topology: match topology {
+                CandidateTreeTopology::ParentIndices { .. } => "parent_indices",
+                CandidateTreeTopology::AncestorMask { .. } => "ancestor_mask",
+            },
+            max_proposal_width: contract.max_proposal_width,
+            distribution_preserving: contract.distribution_preserving,
+            proposal_probabilities: contract.verification.probabilities.is_some(),
+            rollback_participants: contract.rollback_state.iter().cloned().collect(),
+            shared_batching_supported: false,
+        })
+    }
+
+    pub(crate) fn is_candidate_tree(&self) -> bool {
+        self.candidate_tree_diagnostic().is_some()
+    }
+
+    pub(crate) fn reject_candidate_tree_raw_execution(
+        &self,
+        operation: &str,
+    ) -> anyhow::Result<()> {
+        self.require_execution_admitted()?;
+        if self.is_candidate_tree() {
+            return Err(
+                crate::engine::PackageCapabilityError::CandidateTreeRawWorkflowApi {
+                    operation: operation.to_string(),
+                }
+                .into(),
+            );
+        }
+        Ok(())
+    }
+
+    pub fn take_candidate_tree_block_traces(&mut self) -> Vec<CandidateTreeBlockTrace> {
+        std::mem::take(&mut *self.worker.last_candidate_tree_block_traces.borrow_mut())
+    }
+
+    pub(crate) fn last_candidate_tree_block_trace_count(&self) -> usize {
+        self.worker.last_candidate_tree_block_traces.borrow().len()
+    }
+
+    /// Execute canonical candidate-tree generation through one transaction
+    /// authority. Component outputs remain provisional until accepted-path
+    /// recomputation and the complete state/effect/output write set commit.
+    pub(crate) fn run_candidate_tree_generation(
+        &self,
+        options: &GenerateOptions,
+        request: super::PipelineGenerateRequest,
+        tokenizer: Option<&onnx_genai_ort::Tokenizer>,
+        mut callback: Option<&mut GenerateTokenCallback<'_>>,
+    ) -> anyhow::Result<GenerateResult> {
+        self.require_execution_admitted()?;
+        anyhow::ensure!(
+            matches!(
+                self.plan.decode_backend,
+                crate::EngineDecodeBackend::Auto | crate::EngineDecodeBackend::Ort
+            ),
+            "candidate-tree execution is implemented for the ORT workflow backend; selected \
+             backend is {:?}",
+            self.plan.decode_backend
+        );
+        anyhow::ensure!(
+            options.max_new_tokens > 0,
+            "candidate-tree generation requires max_new_tokens to be positive"
+        );
+        let contract = self
+            .plan
+            .speculative
+            .as_ref()
+            .context("candidate-tree generation was selected without a speculative contract")?;
+        let plan = CandidateTreePlan::resolve(contract, &self.plan.workflow)?;
+        let sampling = !options.selects_greedily();
+        if sampling {
+            contract
+                .admit_sampling()
+                .map_err(anyhow::Error::msg)
+                .context("candidate-tree sampling admission failed before component execution")?;
+            anyhow::ensure!(
+                options.temperature == 1.0
+                    && options.top_p >= 1.0
+                    && options.top_k == 0
+                    && options.min_p == 0.0
+                    && options.top_a == 0.0
+                    && options.typical_p >= 1.0
+                    && options.repetition_penalty <= 1.0
+                    && options.frequency_penalty == 0.0
+                    && options.presence_penalty == 0.0
+                    && options.dry.is_none()
+                    && options.mirostat.is_none()
+                    && options.xtc.is_none()
+                    && options.constraint.is_none(),
+                "candidate-tree sampling currently preserves the exact declared target \
+                 distribution only; temperature/logit processors/grammar require matching \
+                 proposer-side transforms and are refused before transaction admission"
+            );
+        }
+        let control = request.generation_control.clone().unwrap_or_default();
+        let (mut values, session_id) =
+            super::WorkflowExecutionPlan::new_candidate_tree_driver(self, request)?
+                .into_bound_values();
+        let context_binding = plan
+            .proposer_bindings
+            .get(plan.proposer_context_input)
+            .expect("candidate-tree preflight resolved proposer context binding");
+        let prompt_value = values.get(context_binding).with_context(|| {
+            format!("candidate-tree proposer context binding '{context_binding}' is unavailable")
+        })?;
+        let prompt_shape = prompt_value.shape();
+        anyhow::ensure!(
+            prompt_shape.len() == 2 && prompt_shape[0] == 1,
+            "candidate-tree execution uses isolated rows; prompt tokens have shape \
+             {prompt_shape:?}, expected [1, sequence]"
+        );
+        let prompt_tokens = prompt_value.to_vec_i64()?;
+        anyhow::ensure!(
+            !prompt_tokens.is_empty(),
+            "candidate-tree generation requires at least one prompt token"
+        );
+        if options
+            .max_context
+            .is_some_and(|limit| prompt_tokens.len() >= limit)
+        {
+            return Ok(GenerateResult {
+                text: String::new(),
+                token_ids: Vec::new(),
+                finish_reason: FinishReason::Length,
+                prefix_cache_hit_len: 0,
+                logprobs: None,
+                budget_cap: None,
+            });
+        }
+
+        let mut baseline_state = plan.initial_state(&self.plan.workflow, &values)?;
+        self.restore_candidate_tree_session_state(
+            &plan,
+            session_id.as_deref(),
+            &mut baseline_state,
+        )?;
+        let mut transaction = {
+            let state = self.worker.session_state.borrow();
+            let effects = self.worker.session_effects.borrow();
+            let outputs = self.worker.session_outputs.borrow();
+            super::TurnTransaction::admit(
+                self.worker.next_turn_transaction_id(),
+                session_id.as_deref(),
+                self.resolved_state_plan(),
+                self.transaction_effect_domains(),
+                [onnx_genai_metadata::decoder_workflow::TOKENS_OUTPUT.to_string()],
+                &state,
+                &effects,
+                &outputs,
+                super::TurnPublicationMode::CommitOnly,
+            )?
+        };
+        let mut publications = super::output::OutputPublicationJournal::new(
+            transaction.id(),
+            &self.plan.workflow,
+            transaction.output_baselines()?,
+        )?;
+        let mut rng = StdRng::seed_from_u64(options.seed.unwrap_or(0));
+        let mut generated = Vec::with_capacity(options.max_new_tokens);
+        let mut traces = Vec::new();
+        let mut blocks = 0_u64;
+        let mut finish_reason = FinishReason::MaxTokens;
+        let mut last_tree = None;
+        let empty_accepted = Value::from_slice_i64(&[], &[1, 0])?;
+
+        while generated.len() < options.max_new_tokens {
+            if options
+                .max_context
+                .is_some_and(|limit| prompt_tokens.len().saturating_add(generated.len()) >= limit)
+            {
+                finish_reason = FinishReason::Length;
+                break;
+            }
+            self.observe_candidate_tree_checkpoint(
+                &control,
+                &transaction,
+                super::GenerationBoundary::BeforeProposer,
+            )?;
+            let context = prompt_tokens
+                .iter()
+                .copied()
+                .chain(generated.iter().map(|token| i64::from(*token)))
+                .collect::<Vec<_>>();
+            let context_value = Value::from_slice_i64(
+                &context,
+                &[
+                    1,
+                    i64::try_from(context.len())
+                        .context("candidate-tree context length exceeds i64")?,
+                ],
+            )?;
+            self.invoke_candidate_tree_component(
+                &plan,
+                &contract.proposer,
+                &context_value,
+                None,
+                &empty_accepted,
+                &baseline_state,
+                &mut values,
+            )
+            .map_err(|error| {
+                let _ = transaction.abort(super::TurnAbortReason::ExecutionFailure);
+                error.context("candidate-tree proposer execution failed before commit")
+            })?;
+            self.observe_candidate_tree_checkpoint(
+                &control,
+                &transaction,
+                super::GenerationBoundary::AfterProposer,
+            )?;
+            let tree = self
+                .decode_runtime_candidate_tree(&plan, &values)
+                .map_err(|error| {
+                    let _ = transaction.abort(super::TurnAbortReason::ExecutionFailure);
+                    error.context(
+                        "candidate-tree proposer emitted malformed runtime topology before commit",
+                    )
+                })?;
+            self.invoke_candidate_tree_component(
+                &plan,
+                &contract.target,
+                &context_value,
+                Some(&tree),
+                &empty_accepted,
+                &baseline_state,
+                &mut values,
+            )
+            .map_err(|error| {
+                let _ = transaction.abort(super::TurnAbortReason::ExecutionFailure);
+                error.context("candidate-tree target verification failed before commit")
+            })?;
+            self.observe_candidate_tree_checkpoint(
+                &control,
+                &transaction,
+                super::GenerationBoundary::AfterVerifier,
+            )?;
+            let outcome = if sampling {
+                self.verify_candidate_tree_sampling(&plan, &tree.tree, &values, &mut rng)?
+            } else {
+                self.verify_candidate_tree_greedy(&plan, &tree.tree, &values)?
+            };
+            let remaining = options.max_new_tokens - generated.len();
+            let remaining_context = options
+                .max_context
+                .map(|limit| limit.saturating_sub(prompt_tokens.len() + generated.len()))
+                .unwrap_or(remaining);
+            let mut committed = outcome
+                .tokens
+                .into_iter()
+                .take(remaining.min(remaining_context))
+                .collect::<Vec<_>>();
+            if let Some(eos) = committed
+                .iter()
+                .position(|token| options.terminates(*token))
+            {
+                committed.truncate(eos + 1);
+                finish_reason = FinishReason::EosToken;
+            }
+            anyhow::ensure!(
+                !committed.is_empty(),
+                "candidate-tree verification produced no correction, accepted token, or bonus"
+            );
+            traces.push(CandidateTreeBlockTrace {
+                candidates: tree.tree.nodes().iter().map(|node| node.token).collect(),
+                parents: tree.tree.nodes().iter().map(|node| node.parent).collect(),
+                accepted_nodes: outcome.nodes,
+                committed_tokens: committed.clone(),
+            });
+            generated.extend_from_slice(&committed);
+            blocks = blocks.saturating_add(1);
+            last_tree = Some(tree);
+            if finish_reason == FinishReason::EosToken {
+                break;
+            }
+        }
+
+        self.observe_candidate_tree_checkpoint(
+            &control,
+            &transaction,
+            super::GenerationBoundary::BeforeAcceptedPathCommit,
+        )?;
+        if !generated.is_empty() {
+            let accepted_context = prompt_tokens
+                .iter()
+                .copied()
+                .chain(generated.iter().map(|token| i64::from(*token)))
+                .collect::<Vec<_>>();
+            let accepted_value = Value::from_slice_i64(
+                &accepted_context,
+                &[
+                    1,
+                    i64::try_from(accepted_context.len())
+                        .context("candidate-tree accepted context length exceeds i64")?,
+                ],
+            )?;
+            let runtime_path = traces
+                .last()
+                .map(|trace| {
+                    trace
+                        .accepted_nodes
+                        .iter()
+                        .map(|node| i64::try_from(*node))
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .transpose()
+                .context("candidate-tree accepted node index exceeds i64")?
+                .unwrap_or_default();
+            values.insert(
+                plan.accepted_path_binding.to_string(),
+                Value::from_slice_i64(
+                    &runtime_path,
+                    &[i64::try_from(runtime_path.len())
+                        .context("candidate-tree accepted path length exceeds i64")?],
+                )?,
+            );
+            self.invoke_candidate_tree_component(
+                &plan,
+                &contract.proposer,
+                &accepted_value,
+                None,
+                &empty_accepted,
+                &baseline_state,
+                &mut values,
+            )
+            .context("candidate-tree proposer accepted-path recomputation failed before commit")?;
+            let tree = last_tree
+                .as_ref()
+                .context("candidate-tree accepted-path commit has no verified runtime tree")?;
+            self.invoke_candidate_tree_component(
+                &plan,
+                &contract.target,
+                &accepted_value,
+                Some(tree),
+                &accepted_value,
+                &baseline_state,
+                &mut values,
+            )
+            .context("candidate-tree target accepted-path recomputation failed before commit")?;
+        }
+
+        for (cell, resolved) in self
+            .resolved_state_plan()
+            .session_cells()
+            .filter(|(_, state)| state.transaction.required)
+        {
+            let StateFinalWriter::Writer(writer) =
+                resolved.final_writer.as_ref().with_context(|| {
+                    format!("candidate-tree session state '{cell}' has no final writer")
+                })?
+            else {
+                anyhow::bail!(
+                    "candidate-tree session state '{cell}' cannot commit through continuation"
+                );
+            };
+            transaction.stage_state(
+                resolved.identity.clone(),
+                crate::decode::clone_value(values.get(&writer.binding).with_context(|| {
+                    format!(
+                        "candidate-tree accepted-path recomputation did not produce final state \
+                         '{cell}' binding '{}'",
+                        writer.binding
+                    )
+                })?)?,
+            );
+        }
+        transaction.stage_effects();
+        let output = self
+            .plan
+            .workflow
+            .outputs
+            .get(onnx_genai_metadata::decoder_workflow::TOKENS_OUTPUT)
+            .expect("candidate-tree preflight requires tokens output");
+        let mode = match &output.family {
+            WorkflowOutputFamily::Materialized => onnx_genai_metadata::WorkflowEmitMode::Append,
+            WorkflowOutputFamily::Events => onnx_genai_metadata::WorkflowEmitMode::Event,
+            WorkflowOutputFamily::Revisions { .. } => onnx_genai_metadata::WorkflowEmitMode::Append,
+        };
+        for token in &generated {
+            publications.publish(
+                onnx_genai_metadata::decoder_workflow::TOKENS_OUTPUT,
+                None,
+                &mode,
+                Some(Value::from_slice_i64(&[i64::from(*token)], &[1])?),
+            )?;
+        }
+        publications.finalize_on_commit()?;
+        transaction.stage_outputs(publications.committed_states()?);
+        let text = tokenizer
+            .map(|tokenizer| tokenizer.decode(&generated))
+            .transpose()
+            .context("decode committed candidate-tree output before semantic commit")?
+            .unwrap_or_default();
+        let token_text = generated
+            .iter()
+            .map(|token| {
+                tokenizer
+                    .map(|tokenizer| tokenizer.decode(&[*token]))
+                    .transpose()
+                    .map(|text| text.unwrap_or_default())
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .context("decode candidate-tree token events before semantic commit")?;
+
+        match control.begin_commit() {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(anyhow::Error::new(CandidateTreeGenerationCancelled {
+                    boundary: super::GenerationBoundary::BeforeSemanticCommit,
+                    outcome: transaction.abort(super::TurnAbortReason::Cancellation),
+                }));
+            }
+            Err(error) => {
+                let _ = transaction.abort(super::TurnAbortReason::ExecutionFailure);
+                return Err(
+                    error.context("candidate-tree checkpoint failed before semantic commit")
+                );
+            }
+        }
+        let commit = {
+            let mut state = self.worker.session_state.borrow_mut();
+            let mut effects = self.worker.session_effects.borrow_mut();
+            let mut outputs = self.worker.session_outputs.borrow_mut();
+            transaction.commit(&mut state, &mut effects, &mut outputs)
+        };
+        if let Err(error) = commit {
+            control.abort_commit();
+            let _ = transaction.abort(super::TurnAbortReason::CommitFailure);
+            return Err(error.context("candidate-tree atomic semantic commit failed"));
+        }
+        if let Some(session_id) = session_id {
+            let mut versions = self.worker.session_turn_versions.borrow_mut();
+            let version = versions.entry(session_id).or_default();
+            *version = version.saturating_add(1);
+        }
+        for _ in 0..blocks {
+            self.record_contract_execution(
+                onnx_genai_metadata::decoder_workflow::SPECULATIVE_BLOCK_CONTRACT,
+            );
+        }
+        *self.worker.last_candidate_tree_block_traces.borrow_mut() = traces;
+        *self.worker.last_output_publications.borrow_mut() = publications.take();
+        control.finish_commit();
+
+        match control.observe_after_commit(super::GenerationBoundary::BeforeOutputPublication) {
+            Ok(true) if callback.is_some() => {
+                return Err(anyhow::Error::new(CandidateTreeOutputDeliveryError {
+                    committed_tokens: generated.len(),
+                    message: "delivery was cancelled before the first callback".to_string(),
+                }));
+            }
+            Err(error) => {
+                return Err(anyhow::Error::new(CandidateTreeOutputDeliveryError {
+                    committed_tokens: generated.len(),
+                    message: format!("post-commit output checkpoint failed: {error:#}"),
+                }));
+            }
+            Ok(_) => {}
+        }
+        if let Some(callback) = callback.as_mut() {
+            for (index, token) in generated.iter().copied().enumerate() {
+                if let Err(error) = callback(crate::config::GenerateToken {
+                    token_id: token,
+                    text: token_text[index].clone(),
+                    finish_reason: (index + 1 == generated.len()).then(|| finish_reason.clone()),
+                }) {
+                    return Err(anyhow::Error::new(CandidateTreeOutputDeliveryError {
+                        committed_tokens: generated.len(),
+                        message: format!("callback failed at token {index}: {error:#}"),
+                    }));
+                }
+            }
+        }
+        Ok(GenerateResult {
+            text,
+            token_ids: generated,
+            finish_reason,
+            prefix_cache_hit_len: 0,
+            logprobs: None,
+            budget_cap: None,
+        })
+    }
+
+    fn observe_candidate_tree_checkpoint(
+        &self,
+        control: &super::GenerationControl,
+        turn: &super::TurnTransaction,
+        boundary: super::GenerationBoundary,
+    ) -> anyhow::Result<()> {
+        match control.observe(boundary) {
+            Ok(false) => Ok(()),
+            Ok(true) => Err(anyhow::Error::new(CandidateTreeGenerationCancelled {
+                boundary,
+                outcome: turn.abort(super::TurnAbortReason::Cancellation),
+            })),
+            Err(error) => {
+                let _ = turn.abort(super::TurnAbortReason::ExecutionFailure);
+                Err(error.context(format!(
+                    "candidate-tree generation checkpoint failed {boundary}"
+                )))
+            }
+        }
+    }
+
+    fn restore_candidate_tree_session_state(
+        &self,
+        plan: &CandidateTreePlan<'_>,
+        session_id: Option<&str>,
+        state: &mut PipelineTensors,
+    ) -> anyhow::Result<()> {
+        let Some(session_id) = session_id else {
+            return Ok(());
+        };
+        let committed = self.worker.session_state.borrow();
+        for cell in &plan.contract.rollback_state {
+            if self.plan.workflow.state.get(cell).is_some_and(|state| {
+                state.scope == onnx_genai_metadata::WorkflowStateScope::Session
+            }) && let Some(value) = committed.get(&(session_id.to_string(), cell.clone()))
+            {
+                state.insert(cell.clone(), crate::decode::clone_value(value)?);
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn invoke_candidate_tree_component(
+        &self,
+        plan: &CandidateTreePlan<'_>,
+        component: &str,
+        context: &Value,
+        tree: Option<&RuntimeCandidateTree>,
+        accepted_tokens: &Value,
+        state: &PipelineTensors,
+        values: &mut PipelineTensors,
+    ) -> anyhow::Result<()> {
+        let (bindings, outputs, context_port) = if component == plan.contract.proposer {
+            (
+                &plan.proposer_bindings,
+                &plan.proposer_outputs,
+                plan.proposer_context_input,
+            )
+        } else if component == plan.contract.target {
+            (
+                &plan.target_bindings,
+                &plan.target_outputs,
+                plan.target_context_input,
+            )
+        } else {
+            anyhow::bail!(
+                "candidate-tree component '{component}' is neither proposer '{}' nor target '{}'",
+                plan.contract.proposer,
+                plan.contract.target
+            );
+        };
+        let mut owned = Vec::with_capacity(bindings.len());
+        for (port, value_name) in bindings {
+            let value = if port == context_port {
+                crate::decode::clone_value(context)?
+            } else if component == plan.contract.target && port == plan.target_candidate_input {
+                crate::decode::clone_value(
+                    &tree
+                        .context("candidate-tree target invocation omitted candidate tokens")?
+                        .tokens,
+                )?
+            } else if component == plan.contract.target && port == plan.target_ancestor_input {
+                crate::decode::clone_value(
+                    &tree
+                        .context("candidate-tree target invocation omitted ancestor mask")?
+                        .ancestor_mask,
+                )?
+            } else if component == plan.contract.target && port == plan.target_position_input {
+                crate::decode::clone_value(
+                    &tree
+                        .context("candidate-tree target invocation omitted position ids")?
+                        .position_ids,
+                )?
+            } else if component == plan.contract.target && port == plan.target_accepted_input {
+                crate::decode::clone_value(accepted_tokens)?
+            } else if let Some(cell) = plan.state_for_input(&self.plan.workflow, component, port) {
+                crate::decode::clone_value(state.get(cell).with_context(|| {
+                    format!(
+                        "candidate-tree component '{component}' reads unavailable transaction \
+                         state '{cell}'"
+                    )
+                })?)?
+            } else {
+                crate::decode::clone_value(values.get(value_name).with_context(|| {
+                    format!(
+                        "candidate-tree component '{component}' input '{port}' references \
+                         unavailable workflow value '{value_name}'"
+                    )
+                })?)?
+            };
+            owned.push((port.clone(), value));
+        }
+        let refs = owned
+            .iter()
+            .map(|(port, value)| (port.as_str(), value))
+            .collect::<Vec<_>>();
+        let produced = self.invoke_component_values(
+            component,
+            &refs,
+            outputs,
+            &std::collections::HashMap::new(),
+            1,
+        )?;
+        for (port, value) in produced {
+            let binding = outputs.get(&port).with_context(|| {
+                format!("candidate-tree component '{component}' produced unbound output '{port}'")
+            })?;
+            values.insert(binding.clone(), value);
+        }
+        Ok(())
+    }
+
+    fn decode_runtime_candidate_tree(
+        &self,
+        plan: &CandidateTreePlan<'_>,
+        values: &PipelineTensors,
+    ) -> anyhow::Result<RuntimeCandidateTree> {
+        let tokens_binding = plan
+            .proposer_outputs
+            .get(plan.candidate_tokens)
+            .expect("candidate-tree preflight resolved candidate token binding");
+        let tokens_value = values.get(tokens_binding).with_context(|| {
+            format!(
+                "candidate-tree proposer did not produce candidate token value \
+                 '{tokens_binding}'"
+            )
+        })?;
+        anyhow::ensure!(
+            tokens_value.dtype() == DataType::Int64,
+            "candidate-tree tokens have {:?}; expected int64",
+            tokens_value.dtype()
+        );
+        let shape = tokens_value.shape();
+        anyhow::ensure!(
+            shape.len() == 2 && shape[0] == 1 && shape[1] > 0,
+            "candidate-tree tokens have shape {shape:?}; expected isolated [1, candidates] with \
+             at least one candidate"
+        );
+        let candidate_count =
+            usize::try_from(shape[1]).context("candidate-tree candidate extent is negative")?;
+        anyhow::ensure!(
+            candidate_count <= plan.contract.max_proposal_width,
+            "candidate-tree proposer emitted {candidate_count} candidates, exceeding declared \
+             max_proposal_width {}",
+            plan.contract.max_proposal_width
+        );
+        let tokens = tokens_value
+            .to_vec_i64()?
+            .into_iter()
+            .enumerate()
+            .map(|(index, token)| {
+                u32::try_from(token).with_context(|| {
+                    format!(
+                        "candidate-tree token at flattened node {index} is {token}, outside the \
+                         non-negative u32 token domain"
+                    )
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let topology_binding = plan
+            .proposer_outputs
+            .get(plan.topology_output())
+            .expect("candidate-tree preflight resolved topology binding");
+        let topology = values.get(topology_binding).with_context(|| {
+            format!("candidate-tree proposer did not produce topology value '{topology_binding}'")
+        })?;
+        let tree = match plan.topology {
+            CandidateTreeTopology::ParentIndices { .. } => {
+                anyhow::ensure!(
+                    topology.dtype() == DataType::Int64,
+                    "candidate-tree parent topology has {:?}; expected int64",
+                    topology.dtype()
+                );
+                anyhow::ensure!(
+                    topology.shape() == [1, shape[1]],
+                    "candidate-tree parent topology has shape {:?}; expected [1, {candidate_count}]",
+                    topology.shape()
+                );
+                let parents = topology
+                    .to_vec_i64()?
+                    .into_iter()
+                    .enumerate()
+                    .map(|(node, parent)| {
+                        if parent == -1 {
+                            Ok(None)
+                        } else {
+                            usize::try_from(parent).map(Some).with_context(|| {
+                                format!(
+                                    "candidate-tree parent at node {node} is {parent}; version 1 \
+                                     uses -1 for roots and non-negative preceding indices"
+                                )
+                            })
+                        }
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                SpecTree::from_parent_indices(tokens, parents)?
+            }
+            CandidateTreeTopology::AncestorMask { .. } => {
+                anyhow::ensure!(
+                    topology.dtype() == DataType::Bool,
+                    "candidate-tree ancestor topology has {:?}; expected bool",
+                    topology.dtype()
+                );
+                anyhow::ensure!(
+                    topology.shape() == [1, shape[1], shape[1]],
+                    "candidate-tree ancestor topology has shape {:?}; expected \
+                     [1, {candidate_count}, {candidate_count}]",
+                    topology.shape()
+                );
+                let flat = topology.to_vec_bool()?;
+                let mask = flat
+                    .chunks_exact(candidate_count)
+                    .map(|row| row.to_vec())
+                    .collect::<Vec<_>>();
+                SpecTree::from_ancestor_mask(tokens, &mask)?
+            }
+        };
+        let roots = tree.roots();
+        anyhow::ensure!(
+            !roots.is_empty(),
+            "candidate-tree proposer emitted no root attached to the committed anchor"
+        );
+        for parent in std::iter::once(None).chain((0..tree.len()).map(Some)) {
+            let children = match parent {
+                None => roots.clone(),
+                Some(node) => tree.children(node),
+            };
+            let mut sibling_tokens = std::collections::HashSet::new();
+            for child in &children {
+                anyhow::ensure!(
+                    sibling_tokens.insert(tree.nodes()[*child].token),
+                    "candidate-tree siblings under parent {parent:?} repeat token {}; target \
+                     verification could not identify one accepted node",
+                    tree.nodes()[*child].token
+                );
+            }
+            anyhow::ensure!(
+                children.len() <= plan.contract.max_proposal_width,
+                "candidate-tree parent {parent:?} has {} children, exceeding declared rollback \
+                 width {}",
+                children.len(),
+                plan.contract.max_proposal_width
+            );
+        }
+        let depth = tree
+            .nodes()
+            .iter()
+            .map(|node| node.depth + 1)
+            .max()
+            .unwrap_or_default();
+        anyhow::ensure!(
+            depth <= plan.contract.max_proposal_width,
+            "candidate-tree depth {depth} exceeds declared rollback width {}",
+            plan.contract.max_proposal_width
+        );
+        let mask = crate::speculative::ancestor_attention_mask(&tree);
+        let mask_bytes = mask
+            .iter()
+            .flat_map(|row| row.iter().map(|value| u8::from(*value)))
+            .collect::<Vec<_>>();
+        let ancestor_mask = Value::from_raw_bytes(
+            mask_bytes,
+            &[
+                1,
+                i64::try_from(tree.len()).context("candidate-tree width exceeds i64")?,
+                i64::try_from(tree.len()).context("candidate-tree width exceeds i64")?,
+            ],
+            DataType::Bool,
+        )?;
+        let positions = crate::speculative::relative_position_ids(&tree)
+            .into_iter()
+            .map(i64::try_from)
+            .collect::<Result<Vec<_>, _>>()
+            .context("candidate-tree depth exceeds i64")?;
+        let position_ids = Value::from_slice_i64(
+            &positions,
+            &[
+                1,
+                i64::try_from(tree.len()).context("candidate-tree width exceeds i64")?,
+            ],
+        )?;
+        Ok(RuntimeCandidateTree {
+            tree,
+            tokens: crate::decode::clone_value(tokens_value)?,
+            ancestor_mask,
+            position_ids,
+        })
+    }
+
+    fn target_tree_rows(
+        &self,
+        plan: &CandidateTreePlan<'_>,
+        tree: &SpecTree,
+        values: &PipelineTensors,
+    ) -> anyhow::Result<Vec<Vec<f32>>> {
+        probability_or_logits_rows(
+            values.get(&plan.target_logits_value).with_context(|| {
+                format!(
+                    "candidate-tree target did not produce declared verifier output '{}'",
+                    plan.target_logits_value
+                )
+            })?,
+            tree.len() + 1,
+            "target logits",
+            false,
+        )
+    }
+
+    fn verify_candidate_tree_greedy(
+        &self,
+        plan: &CandidateTreePlan<'_>,
+        tree: &SpecTree,
+        values: &PipelineTensors,
+    ) -> anyhow::Result<crate::speculative::AcceptOutcome> {
+        let rows = self.target_tree_rows(plan, tree, values)?;
+        for node in tree.nodes() {
+            anyhow::ensure!(
+                (node.token as usize) < rows[0].len(),
+                "candidate-tree token {} is outside target vocabulary {}",
+                node.token,
+                rows[0].len()
+            );
+        }
+        tree.accept(AcceptanceRule::Greedy, &rows[0], &rows[1..])
+    }
+
+    fn verify_candidate_tree_sampling(
+        &self,
+        plan: &CandidateTreePlan<'_>,
+        tree: &SpecTree,
+        values: &PipelineTensors,
+        rng: &mut StdRng,
+    ) -> anyhow::Result<crate::speculative::AcceptOutcome> {
+        let proposal_value = values
+            .get(
+                plan.proposal_probabilities_value
+                    .as_deref()
+                    .context("candidate-tree proposal probabilities were not admitted")?,
+            )
+            .context("candidate-tree proposer omitted declared proposal probabilities")?;
+        let target_value = values
+            .get(
+                plan.target_probabilities_value
+                    .as_deref()
+                    .context("candidate-tree target probabilities were not admitted")?,
+            )
+            .context("candidate-tree target omitted declared target probabilities")?;
+        let proposal = probability_or_logits_rows(
+            proposal_value,
+            tree.len() + 1,
+            "proposal probabilities",
+            true,
+        )?;
+        let target =
+            probability_or_logits_rows(target_value, tree.len() + 1, "target probabilities", true)?;
+        let logits = self.target_tree_rows(plan, tree, values)?;
+        anyhow::ensure!(
+            proposal[0].len() == target[0].len(),
+            "candidate-tree proposal vocabulary {} does not match target vocabulary {}",
+            proposal[0].len(),
+            target[0].len()
+        );
+        anyhow::ensure!(
+            logits[0].len() == target[0].len(),
+            "candidate-tree target logits vocabulary {} does not match declared target \
+             probability vocabulary {}",
+            logits[0].len(),
+            target[0].len()
+        );
+        for (row, (logits, probabilities)) in logits.iter().zip(&target).enumerate() {
+            anyhow::ensure!(
+                crate::speculative::argmax(logits) == crate::speculative::argmax(probabilities),
+                "candidate-tree target logits and probability bindings disagree on row {row}; \
+                 bind outputs from the same verifier distribution"
+            );
+        }
+        validate_candidate_probability_support(tree, &proposal)?;
+        let mut proposed_path = Vec::new();
+        let mut previous = None;
+        loop {
+            let frontier = previous.map_or_else(|| tree.roots(), |node| tree.children(node));
+            if frontier.is_empty() {
+                break;
+            }
+            let row = previous.map_or(0, |node| node + 1);
+            let token = sample_declared_distribution(&proposal[row], rng.random())?;
+            let node = frontier
+                .into_iter()
+                .find(|node| tree.nodes()[*node].token as usize == token)
+                .context(
+                    "candidate-tree proposal distribution sampled outside its declared frontier",
+                )?;
+            proposed_path.push(node);
+            previous = Some(node);
+        }
+        let randomness = (0..=proposed_path.len())
+            .map(|_| SamplingRandomness {
+                acceptance: rng.random(),
+                correction: rng.random(),
+            })
+            .collect();
+        let verification = verify_tree_sampling(
+            tree,
+            0,
+            &TreeSamplingInputs {
+                proposal_probabilities: proposal,
+                target_probabilities: target,
+                proposed_path,
+                randomness,
+            },
+        )?;
+        Ok(verification.outcome)
     }
 
     pub fn dflash_diagnostic(&self) -> Option<DFlashDiagnostic> {
@@ -2596,6 +3991,18 @@ pub(super) fn externally_used_values(
     let Some(contract) = contract else {
         return live;
     };
+    if matches!(
+        &contract.proposal_execution,
+        SpeculativeProposalExecution::CandidateTree { .. }
+    ) {
+        for component in [&contract.proposer, &contract.target] {
+            if let Some((inputs, outputs)) = component_invocation(workflow, component) {
+                live.extend(inputs.into_values());
+                live.extend(outputs.into_values());
+            }
+        }
+        return live;
+    }
     if let SpeculativeProposalExecution::DflashFlatBlock {
         conditioning,
         outputs,

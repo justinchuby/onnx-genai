@@ -41,8 +41,8 @@ use std::sync::Arc;
 
 pub mod tree;
 pub use tree::{
-    KvRetentionPlan, SamplingRandomness, SpecTree, SpecTreeBuilder, Topology, TreeNode,
-    TreeSamplingInputs, TreeSamplingVerification, TreeScorer, ancestor_attention_mask,
+    AcceptOutcome, KvRetentionPlan, SamplingRandomness, SpecTree, SpecTreeBuilder, Topology,
+    TreeNode, TreeSamplingInputs, TreeSamplingVerification, TreeScorer, ancestor_attention_mask,
     relative_position_ids, verify_tree, verify_tree_sampling,
 };
 

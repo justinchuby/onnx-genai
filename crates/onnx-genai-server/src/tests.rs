@@ -5798,6 +5798,17 @@ fn capability_refusals_map_to_the_status_their_variant_means() {
     assert_eq!(response.kind, "conflict_error");
     assert!(response.message.contains("onnx-genai.dflash-flat-block@1"));
 
+    let candidate_tree = crate::driver::DriverFailure::from_engine_error(&anyhow::Error::from(
+        PackageCapabilityError::CandidateTreeExecutionUnavailable {
+            version: "2".to_string(),
+            reason: "unsupported verifier ABI".to_string(),
+        },
+    ));
+    let response = crate::routes::generation_failure(candidate_tree);
+    assert_eq!(response.status, StatusCode::CONFLICT);
+    assert_eq!(response.kind, "conflict_error");
+    assert!(response.message.contains("onnx-genai.speculative@2"));
+
     let busy = crate::driver::DriverFailure::from_engine_error(&anyhow::Error::from(
         PackageCapabilityError::ExclusiveLeaseConflict {
             session: "shared".to_string(),

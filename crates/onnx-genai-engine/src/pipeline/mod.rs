@@ -23,6 +23,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 mod adapters;
 mod arg_reduce;
@@ -77,6 +78,186 @@ pub fn has_buffered_pcm16_wav_output(workflow: &WorkflowSpec) -> bool {
 }
 
 pub use audio::buffered_pcm16_wav_output_names;
+
+const GENERATION_ACTIVE: u8 = 0;
+const GENERATION_CANCELLED: u8 = 1;
+const GENERATION_COMMITTING: u8 = 2;
+const GENERATION_COMMITTED: u8 = 3;
+
+/// Transaction boundaries at which candidate-tree generation can observe
+/// cancellation or a deterministic execution guard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GenerationBoundary {
+    BeforeProposer,
+    AfterProposer,
+    AfterVerifier,
+    BeforeAcceptedPathCommit,
+    BeforeSemanticCommit,
+    BeforeOutputPublication,
+}
+
+impl std::fmt::Display for GenerationBoundary {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::BeforeProposer => "before proposer execution",
+            Self::AfterProposer => "after proposer execution",
+            Self::AfterVerifier => "after verifier execution",
+            Self::BeforeAcceptedPathCommit => "before accepted-path commit",
+            Self::BeforeSemanticCommit => "before semantic commit",
+            Self::BeforeOutputPublication => "before output publication",
+        })
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "{operation} cannot accept request-scoped generation control for {runtime}; use a \
+     candidate-tree generation path rather than silently dropping the signal"
+)]
+pub struct GenerationControlUnsupported {
+    pub operation: &'static str,
+    pub runtime: &'static str,
+}
+
+/// Request-scoped cancellation and deterministic candidate-tree checkpoints.
+///
+/// Cancellation races semantic commit through one atomic transition. If
+/// cancellation wins, no state or output head commits. If commit wins, later
+/// cancellation is a delivery outcome and cannot roll back the completed turn.
+#[derive(Clone)]
+pub struct GenerationControl {
+    state: Arc<AtomicU8>,
+    cancellation_probe: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    checkpoint:
+        Option<Arc<dyn Fn(GenerationBoundary) -> anyhow::Result<()> + Send + Sync + 'static>>,
+}
+
+impl std::fmt::Debug for GenerationControl {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GenerationControl")
+            .field("state", &self.state.load(Ordering::Acquire))
+            .field("has_cancellation_probe", &self.cancellation_probe.is_some())
+            .field("has_checkpoint", &self.checkpoint.is_some())
+            .finish()
+    }
+}
+
+impl Default for GenerationControl {
+    fn default() -> Self {
+        Self {
+            state: Arc::new(AtomicU8::new(GENERATION_ACTIVE)),
+            cancellation_probe: None,
+            checkpoint: None,
+        }
+    }
+}
+
+impl GenerationControl {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn from_cancellation_probe(probe: impl Fn() -> bool + Send + Sync + 'static) -> Self {
+        Self {
+            cancellation_probe: Some(Arc::new(probe)),
+            ..Self::default()
+        }
+    }
+
+    pub fn with_checkpoint(
+        mut self,
+        checkpoint: impl Fn(GenerationBoundary) -> anyhow::Result<()> + Send + Sync + 'static,
+    ) -> Self {
+        self.checkpoint = Some(Arc::new(checkpoint));
+        self
+    }
+
+    /// Request cancellation. Returns true only when cancellation wins before
+    /// semantic commit starts.
+    pub fn cancel(&self) -> bool {
+        self.state
+            .compare_exchange(
+                GENERATION_ACTIVE,
+                GENERATION_CANCELLED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    pub(crate) fn observe(&self, boundary: GenerationBoundary) -> anyhow::Result<bool> {
+        match self.state.load(Ordering::Acquire) {
+            GENERATION_CANCELLED => return Ok(true),
+            GENERATION_COMMITTING | GENERATION_COMMITTED => return Ok(false),
+            _ => {}
+        }
+        if let Some(checkpoint) = &self.checkpoint {
+            checkpoint(boundary)?;
+        }
+        if self
+            .cancellation_probe
+            .as_ref()
+            .is_some_and(|probe| probe())
+        {
+            self.cancel();
+        }
+        Ok(self.state.load(Ordering::Acquire) == GENERATION_CANCELLED)
+    }
+
+    pub(crate) fn begin_commit(&self) -> anyhow::Result<bool> {
+        if self.observe(GenerationBoundary::BeforeSemanticCommit)? {
+            return Ok(false);
+        }
+        match self.state.compare_exchange(
+            GENERATION_ACTIVE,
+            GENERATION_COMMITTING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => Ok(true),
+            Err(GENERATION_CANCELLED) => Ok(false),
+            Err(state) => anyhow::bail!(
+                "generation control cannot begin a second semantic commit from state {state}"
+            ),
+        }
+    }
+
+    pub(crate) fn finish_commit(&self) {
+        let previous = self
+            .state
+            .compare_exchange(
+                GENERATION_COMMITTING,
+                GENERATION_COMMITTED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .expect("semantic commit must own candidate-tree generation control");
+        debug_assert_eq!(previous, GENERATION_COMMITTING);
+    }
+
+    pub(crate) fn abort_commit(&self) {
+        let _ = self.state.compare_exchange(
+            GENERATION_COMMITTING,
+            GENERATION_CANCELLED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    pub(crate) fn observe_after_commit(
+        &self,
+        boundary: GenerationBoundary,
+    ) -> anyhow::Result<bool> {
+        if let Some(checkpoint) = &self.checkpoint {
+            checkpoint(boundary)?;
+        }
+        Ok(self
+            .cancellation_probe
+            .as_ref()
+            .is_some_and(|probe| probe()))
+    }
+}
 
 pub type PipelineTensors = HashMap<String, Value>;
 
@@ -239,6 +420,8 @@ pub struct PipelineGenerateRequest {
     pub session_id: Option<String>,
     /// Application-selected package components that replace overridable components.
     pub component_overrides: HashMap<String, String>,
+    /// Optional cancellation and deterministic transaction checkpoints.
+    pub generation_control: Option<GenerationControl>,
 }
 
 impl PipelineGenerateRequest {
@@ -248,6 +431,7 @@ impl PipelineGenerateRequest {
             inputs: HashMap::new(),
             session_id: None,
             component_overrides: HashMap::new(),
+            generation_control: None,
         }
     }
 
@@ -268,6 +452,11 @@ impl PipelineGenerateRequest {
     ) -> Self {
         self.component_overrides
             .insert(component.into(), replacement.into());
+        self
+    }
+
+    pub fn with_generation_control(mut self, control: GenerationControl) -> Self {
+        self.generation_control = Some(control);
         self
     }
 }
@@ -503,8 +692,32 @@ impl WorkflowRuntime {
         speculative: Option<onnx_genai_metadata::SpeculativeContract>,
     ) -> anyhow::Result<Self> {
         let execution_admission =
-            WorkflowExecutionAdmission::from_speculative(speculative.as_ref());
+            WorkflowExecutionAdmission::from_speculative(speculative.as_ref(), Some(&workflow));
         execution_admission.require_supported()?;
+        if speculative.as_ref().is_some_and(|contract| {
+            matches!(
+                &contract.proposal_execution,
+                onnx_genai_metadata::SpeculativeProposalExecution::CandidateTree { .. }
+            )
+        }) && !matches!(
+            decode_backend,
+            EngineDecodeBackend::Auto | EngineDecodeBackend::Ort
+        ) {
+            return Err(
+                crate::engine::PackageCapabilityError::CandidateTreeExecutionUnavailable {
+                    version: speculative
+                        .as_ref()
+                        .expect("candidate-tree contract checked above")
+                        .version
+                        .clone(),
+                    reason: format!(
+                        "backend {decode_backend:?} is unsupported; the production candidate-tree \
+                     executor currently uses ORT component sessions"
+                    ),
+                }
+                .into(),
+            );
+        }
         let compiled_workflow = onnx_genai_metadata::compile_workflow(&workflow)
             .map_err(|error| anyhow::anyhow!("Failed to lower workflow metadata: {error}"))?;
         let row_wise_outputs = workflow::workflow_row_wise_outputs(&compiled_workflow.graph);
@@ -581,6 +794,32 @@ impl WorkflowRuntime {
             .map(WorkflowExecutionAdmission::from_metadata)
             .unwrap_or(WorkflowExecutionAdmission::Admitted);
         let decode_backend = validate_pipeline_backend_request(config.decode_backend)?;
+        if let Some(contract) = directory
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.speculative.as_ref())
+            .filter(|contract| {
+                matches!(
+                    &contract.proposal_execution,
+                    onnx_genai_metadata::SpeculativeProposalExecution::CandidateTree { .. }
+                )
+            })
+            && !matches!(
+                decode_backend,
+                EngineDecodeBackend::Auto | EngineDecodeBackend::Ort
+            )
+        {
+            return Err(
+                crate::engine::PackageCapabilityError::CandidateTreeExecutionUnavailable {
+                    version: contract.version.clone(),
+                    reason: format!(
+                        "backend {decode_backend:?} is unsupported; the production candidate-tree \
+                     executor currently uses ORT component sessions"
+                    ),
+                }
+                .into(),
+            );
+        }
         let authority_domain = crate::engine::session_device_domain(&session_options)?;
         crate::engine::validate_shared_authority_limit(
             authority_provider.as_ref(),
@@ -1509,6 +1748,7 @@ impl WorkflowRuntime {
         &mut self,
         request: PipelineGenerateRequest,
     ) -> anyhow::Result<PipelineTensors> {
+        self.reject_candidate_tree_raw_execution("WorkflowRuntime::run_pipeline")?;
         self.run_workflow(request)
     }
 
@@ -1525,6 +1765,7 @@ impl WorkflowRuntime {
         &mut self,
         request: PipelineGenerateRequest,
     ) -> anyhow::Result<PipelineTensors> {
+        self.reject_candidate_tree_raw_execution("WorkflowRuntime::run_pipeline_retained")?;
         self.run_workflow_retained(request)
     }
 
@@ -1563,6 +1804,7 @@ impl WorkflowRuntime {
         &mut self,
         request: PipelineGenerateRequest,
     ) -> anyhow::Result<PipelineOutputs> {
+        self.reject_candidate_tree_raw_execution("WorkflowRuntime::run_pipeline_outputs")?;
         self.run_workflow_outputs(request)
     }
 
@@ -1649,6 +1891,7 @@ impl WorkflowRuntime {
         &self,
         request: PipelineGenerateRequest,
     ) -> anyhow::Result<WorkflowExecutionPlan<'_>> {
+        self.reject_candidate_tree_raw_execution("WorkflowRuntime::prepare_workflow_execution")?;
         WorkflowExecutionPlan::new(self, request)
     }
 
@@ -2328,7 +2571,7 @@ mod speculative_admission_tests {
         assert!(
             message.contains("candidate-tree")
                 && message.contains("onnx-genai.speculative@1")
-                && message.contains("no candidate-tree package-dispatch capability or executor"),
+                && message.contains("cannot execute the declared candidate-tree variant"),
             "{constructor} did not report the exact unsupported contract and capability: {message}"
         );
         assert!(
