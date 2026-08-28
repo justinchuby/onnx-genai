@@ -7,6 +7,11 @@ It defines what a model package states, what a runtime decides, what a caller
 supplies, and what a validator must reject. It supersedes contrary statements
 elsewhere in this repository.
 
+For a non-normative ownership and implementation-gap synthesis covering
+streaming, sessions, prefill/decode, batching, speculative execution, tool
+protocols, and audio windows, see
+[`INFERENCE_METADATA_REVIEW_FINDINGS.md`](INFERENCE_METADATA_REVIEW_FINDINGS.md).
+
 Requirement keywords (**MUST**, **MUST NOT**, **SHOULD**, **MAY**) are used in
 the RFC 2119 sense. Unless a subsection explicitly labels runtime behavior as
 unimplemented acceptance criteria, every **MUST** is enforced by the semantic
