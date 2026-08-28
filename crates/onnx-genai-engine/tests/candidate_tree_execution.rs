@@ -385,7 +385,7 @@ pipeline:
       inputs:
         history_tokens: prompt
         branch_ids: tree.ids
-        branch_ancestors: mask_seed
+        branch_ancestors: tree.ancestors
         branch_positions: position_seed
         committed_tokens: accepted_seed
         recurrent_cube: target_seed
@@ -563,44 +563,326 @@ fn parent_package(parents: &[i64; 6], decisions: &[usize; 7]) -> anyhow::Result<
     Ok(root)
 }
 
+fn replace_metadata(root: &Path, update: impl FnOnce(String) -> String) -> anyhow::Result<()> {
+    let path = root.join("inference_metadata.yaml");
+    let metadata = fs::read_to_string(&path)?;
+    fs::write(path, update(metadata))?;
+    Ok(())
+}
+
+fn assert_preload_candidate_refusal(
+    root: &Path,
+    expected: &[&str],
+) -> anyhow::Result<anyhow::Error> {
+    for entry in fs::read_dir(root)? {
+        let path = entry?.path();
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "textproto")
+        {
+            fs::write(path, "this artifact must not be parsed")?;
+        }
+    }
+    let error = expect_error(
+        Engine::from_dir(root, EngineConfig::default()),
+        "candidate-tree composition must fail before component loading",
+    );
+    let reason = match package_capability_error(&error) {
+        Some(PackageCapabilityError::CandidateTreeExecutionUnavailable { reason, .. }) => reason,
+        other => panic!("expected typed pre-load candidate-tree refusal, got {other:?}: {error:#}"),
+    };
+    for fragment in expected {
+        assert!(
+            reason.contains(fragment),
+            "candidate-tree refusal does not contain {fragment:?}: {reason}"
+        );
+    }
+    Ok(error)
+}
+
+fn with_control_flow_support(metadata: String) -> String {
+    metadata
+        .replacen(
+            "capabilities: [workflow_ssa, serving_service_contract, canonical_speculation, session_state_lease]",
+            "capabilities: [workflow_ssa, nested_control_flow, serving_service_contract, canonical_speculation, session_state_lease]",
+            1,
+        )
+        .replacen(
+            "      runtime.active:\n",
+            "      control.continue:\n        contract: {dtype: bool, shape: [1]}\n        role: {kind: opaque}\n        source: {kind: literal}\n        required: false\n        default: false\n      control.max:\n        contract: {dtype: int64, shape: [1]}\n        role: {kind: opaque}\n        source: {kind: literal}\n        required: false\n        default: 1\n      runtime.active:\n",
+            1,
+        )
+        .replacen(
+            "      proposer:\n",
+            "      observer:\n        implementation: {kind: onnx, artifact: observer.onnx.textproto}\n        ports: {inputs: {}, outputs: {}}\n        row_scope: {axis: 0, stateful: false}\n      proposer:\n",
+            1,
+        )
+}
+
+type MetadataUpdate = Box<dyn FnOnce(String) -> String>;
+type RefusalCase = (&'static str, MetadataUpdate, Vec<&'static str>);
+
 #[test]
 fn candidate_tree_emit_site_is_refused_before_the_specialized_driver_can_skip_it()
 -> anyhow::Result<()> {
     let root = parent_package(&[-1, -1, 0, 1, 2, 4], &[1, 4, 0, 0, 0, 0, 0])?;
-    let metadata_path = root.join("inference_metadata.yaml");
-    let metadata = fs::read_to_string(&metadata_path)?;
-    let metadata = metadata
-        .replacen(
-            "capabilities: [workflow_ssa, serving_service_contract, canonical_speculation, session_state_lease]",
-            "capabilities: [workflow_ssa, typed_emit, serving_service_contract, canonical_speculation, session_state_lease]",
-            1,
-        )
-        .replacen(
-            "    components:\n",
-            "      side:\n        contract: {dtype: int64, shape: [batch, 6], batch_layout: {kind: request_aligned, axis: 0}}\n        role: tensor\n        family: {kind: events}\n        stage: pre_adapter\n    components:\n",
-            1,
-        )
-        .replacen(
-            "    state:\n",
-            "    - kind: emit\n      value: proposed.tokens\n      output: side\n      mode: event\n    state:\n",
-            1,
-        );
-    fs::write(&metadata_path, metadata)?;
+    replace_metadata(&root, |metadata| {
+        metadata
+            .replacen(
+                "capabilities: [workflow_ssa, serving_service_contract, canonical_speculation, session_state_lease]",
+                "capabilities: [workflow_ssa, typed_emit, serving_service_contract, canonical_speculation, session_state_lease]",
+                1,
+            )
+            .replacen(
+                "    components:\n",
+                "      side:\n        contract: {dtype: int64, shape: [batch, 6], batch_layout: {kind: request_aligned, axis: 0}}\n        role: tensor\n        family: {kind: events}\n        stage: pre_adapter\n    components:\n",
+                1,
+            )
+            .replacen(
+                "    state:\n",
+                "    - kind: emit\n      value: proposed.tokens\n      output: side\n      mode: event\n    state:\n",
+                1,
+            )
+    })?;
+    assert_preload_candidate_refusal(
+        &root,
+        &[
+            "pipeline.workflow.steps[2]",
+            "cannot publish emit",
+            "S4 family/site",
+        ],
+    )?;
+    Ok(())
+}
 
-    let error = expect_error(
-        Engine::from_dir(&root, EngineConfig::default()),
-        "an authored emit cannot be skipped by candidate-tree generation",
-    );
-    assert!(
-        matches!(
-            package_capability_error(&error),
-            Some(PackageCapabilityError::CandidateTreeExecutionUnavailable { reason, .. })
-                if reason.contains("pipeline.workflow.steps[2]")
-                    && reason.contains("cannot publish emit")
-                    && reason.contains("S4 family/site")
+#[test]
+fn candidate_token_binding_requires_exact_proposer_ssa_provenance_before_loading()
+-> anyhow::Result<()> {
+    let parents = [-1, -1, 0, 1, 2, 4];
+    let decisions = [1, 4, 0, 0, 0, 0, 0];
+
+    let literal = parent_package(&parents, &decisions)?;
+    replace_metadata(&literal, |metadata| {
+        metadata.replacen(
+            "        candidate_tokens: proposed.tokens\n        ancestor_mask:",
+            "        candidate_tokens: runtime.position_ids\n        ancestor_mask:",
+            1,
+        )
+    })?;
+    assert_preload_candidate_refusal(
+        &literal,
+        &[
+            "pipeline.workflow.steps[1].inputs.candidate_tokens",
+            "must consume proposer",
+            "proposed.tokens",
+            "workflow input 'runtime.position_ids'",
+            "source Literal",
+        ],
+    )?;
+
+    let transformed = parent_package(&parents, &decisions)?;
+    replace_metadata(&transformed, |metadata| {
+        metadata
+            .replacen(
+                "      proposer:\n",
+                "      transformer:\n        implementation: {kind: onnx, artifact: transformer.onnx.textproto}\n        ports:\n          inputs: {}\n          outputs:\n            candidate_tokens: {dtype: int64, shape: [batch, 6], batch_layout: {kind: request_aligned, axis: 0}}\n        row_scope: {axis: 0, stateful: false}\n      proposer:\n",
+                1,
+            )
+            .replacen(
+                "    - kind: invoke\n      component: proposer\n",
+                "    - kind: invoke\n      component: transformer\n      outputs: {candidate_tokens: transformed.tokens}\n    - kind: invoke\n      component: proposer\n",
+                1,
+            )
+            .replacen(
+                "        candidate_tokens: proposed.tokens\n        ancestor_mask:",
+                "        candidate_tokens: transformed.tokens\n        ancestor_mask:",
+                1,
+            )
+    })?;
+    assert_preload_candidate_refusal(
+        &transformed,
+        &[
+            "inputs.candidate_tokens",
+            "proposed.tokens",
+            "component 'transformer' output port 'candidate_tokens'",
+            "unrelated component outputs do not prove candidate identity",
+        ],
+    )?;
+    Ok(())
+}
+
+#[test]
+fn topology_and_driver_owned_target_inputs_have_proved_sources_before_loading() -> anyhow::Result<()>
+{
+    let direct_topology = ancestor_package()?;
+    replace_metadata(&direct_topology, |metadata| {
+        metadata.replacen(
+            "        branch_ancestors: tree.ancestors\n        branch_positions:",
+            "        branch_ancestors: mask_seed\n        branch_positions:",
+            1,
+        )
+    })?;
+    assert_preload_candidate_refusal(
+        &direct_topology,
+        &[
+            "inputs.branch_ancestors",
+            "tree.ancestors",
+            "workflow input 'mask_seed'",
+            "candidate identity",
+        ],
+    )?;
+
+    let derived = parent_package(&[-1, -1, 0, 1, 2, 4], &[1, 4, 0, 0, 0, 0, 0])?;
+    replace_metadata(&derived, |metadata| {
+        metadata.replacen(
+            "      runtime.ancestor_mask:\n        contract: {dtype: bool, shape: [batch, 6, 6], batch_layout: {kind: request_aligned, axis: 0}}\n        role: {kind: opaque}\n        source: {kind: literal}",
+            "      runtime.ancestor_mask:\n        contract: {dtype: bool, shape: [batch, 6, 6], batch_layout: {kind: request_aligned, axis: 0}}\n        role: {kind: opaque}\n        source: {kind: application, name: tree.mask}",
+            1,
+        )
+    })?;
+    assert_preload_candidate_refusal(
+        &derived,
+        &[
+            "inputs.ancestor_mask",
+            "Application { name: \"tree.mask\" }",
+            "ancestor mask derived from the proved parent-index topology",
+            "cannot be ignored",
+        ],
+    )?;
+    Ok(())
+}
+
+#[test]
+fn ambiguous_phi_candidate_binding_refuses_before_loading() -> anyhow::Result<()> {
+    let root = parent_package(&[-1, -1, 0, 1, 2, 4], &[1, 4, 0, 0, 0, 0, 0])?;
+    replace_metadata(&root, |metadata| {
+        with_control_flow_support(metadata)
+            .replacen(
+                "    - kind: invoke\n      component: target\n",
+                "    - kind: branch\n      predicate: control.continue\n      cases:\n        \"true\": {kind: invoke, component: observer}\n      default: {kind: invoke, component: observer}\n      outputs:\n        joined.tokens:\n          cases: {\"true\": proposed.tokens}\n          default: runtime.position_ids\n    - kind: invoke\n      component: target\n",
+                1,
+            )
+            .replacen(
+                "        candidate_tokens: proposed.tokens\n        ancestor_mask:",
+                "        candidate_tokens: joined.tokens\n        ancestor_mask:",
+                1,
+            )
+    })?;
+    assert_preload_candidate_refusal(
+        &root,
+        &[
+            "inputs.candidate_tokens",
+            "joined.tokens",
+            "no unique proved source",
+            "proposed.tokens",
+        ],
+    )?;
+    Ok(())
+}
+
+#[test]
+fn unsupported_candidate_compositions_all_refuse_before_component_loading() -> anyhow::Result<()> {
+    let parents = [-1, -1, 0, 1, 2, 4];
+    let decisions = [1, 4, 0, 0, 0, 0, 0];
+    let cases: Vec<RefusalCase> = vec![
+        (
+            "empty-loop",
+            Box::new(|metadata| {
+                with_control_flow_support(metadata).replacen(
+                    "    - kind: invoke\n      component: proposer\n",
+                    "    - kind: loop\n      setup: []\n      steps:\n      - {kind: invoke, component: observer}\n      continue_when: control.continue\n      max_iterations: control.max\n    - kind: invoke\n      component: proposer\n",
+                    1,
+                )
+            }),
+            vec![
+                "pipeline.workflow.steps[0]",
+                "loop",
+                "condition/body ordering",
+            ],
         ),
-        "unexpected candidate-tree admission result: {error:#}"
-    );
+        (
+            "setup-loop",
+            Box::new(|metadata| {
+                with_control_flow_support(metadata).replacen(
+                    "    - kind: invoke\n      component: proposer\n",
+                    "    - kind: loop\n      setup:\n      - {kind: invoke, component: observer}\n      steps:\n      - {kind: invoke, component: observer}\n      continue_when: control.continue\n      max_iterations: control.max\n    - kind: invoke\n      component: proposer\n",
+                    1,
+                )
+            }),
+            vec!["pipeline.workflow.steps[0]", "loop", "non-empty setup"],
+        ),
+        (
+            "branch",
+            Box::new(|metadata| {
+                with_control_flow_support(metadata).replacen(
+                    "    - kind: invoke\n      component: proposer\n",
+                    "    - kind: branch\n      predicate: control.continue\n      cases:\n        \"true\": {kind: invoke, component: observer}\n      default: {kind: invoke, component: observer}\n    - kind: invoke\n      component: proposer\n",
+                    1,
+                )
+            }),
+            vec!["pipeline.workflow.steps[0]", "branch", "predicate/join"],
+        ),
+        (
+            "unrelated",
+            Box::new(|metadata| {
+                metadata
+                    .replacen(
+                        "      proposer:\n",
+                        "      observer:\n        implementation: {kind: onnx, artifact: observer.onnx.textproto}\n        ports: {inputs: {}, outputs: {}}\n        row_scope: {axis: 0, stateful: false}\n      proposer:\n",
+                        1,
+                    )
+                    .replacen(
+                        "    - kind: invoke\n      component: proposer\n",
+                        "    - kind: invoke\n      component: observer\n    - kind: invoke\n      component: proposer\n",
+                        1,
+                    )
+            }),
+            vec![
+                "pipeline.workflow.steps[0]",
+                "unrelated component 'observer'",
+            ],
+        ),
+        (
+            "effect",
+            Box::new(|metadata| {
+                metadata
+                    .replacen(
+                        "capabilities: [workflow_ssa, serving_service_contract, canonical_speculation, session_state_lease]",
+                        "capabilities: [workflow_ssa, linear_effects, serving_service_contract, canonical_speculation, session_state_lease]",
+                        1,
+                    )
+                    .replacen(
+                        "    serving:\n",
+                        "    effects:\n      audit: {retry: pure}\n    serving:\n",
+                        1,
+                    )
+            }),
+            vec![
+                "effectful candidate-tree regions",
+                "accepted-path transaction",
+            ],
+        ),
+        (
+            "extra-output",
+            Box::new(|metadata| {
+                metadata.replacen(
+                    "    components:\n",
+                    "      side:\n        contract: {dtype: int64, shape: [batch, 6], batch_layout: {kind: request_aligned, axis: 0}}\n        role: tensor\n        family: {kind: events}\n        stage: pre_adapter\n    components:\n",
+                    1,
+                )
+            }),
+            vec![
+                "declared output 'side'",
+                "no candidate-tree output-publication participant",
+            ],
+        ),
+    ];
+    for (name, update, expected) in cases {
+        let root = parent_package(&parents, &decisions)?;
+        replace_metadata(&root, update)?;
+        assert_preload_candidate_refusal(&root, &expected)
+            .map_err(|error| anyhow::anyhow!("{name}: {error:#}"))?;
+    }
     Ok(())
 }
 

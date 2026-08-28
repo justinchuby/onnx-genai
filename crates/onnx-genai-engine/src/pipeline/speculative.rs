@@ -31,14 +31,15 @@ use std::collections::BTreeMap;
 
 use anyhow::Context as _;
 use onnx_genai_metadata::{
-    CandidateTreeTopology, DFlashStateCommit, DFlashStructure, SpeculativeAcceptedPath,
-    SpeculativeContract, SpeculativeProposalExecution, SpeculativeRecurrenceBinding,
-    StateFinalWriter, StatePortAccess, WorkflowOutputFamily, WorkflowSpec, WorkflowStep,
+    CandidateTreeTopology, DFlashStateCommit, DFlashStructure, SpeculativeContract,
+    SpeculativeProposalExecution, SpeculativeRecurrenceBinding, StateFinalWriter, StatePortAccess,
+    WorkflowOutputFamily, WorkflowSpec, WorkflowStep,
 };
 use onnx_genai_ort::{DataType, Value};
 use rand::rngs::StdRng;
 use rand::{Rng as _, SeedableRng as _};
 
+use super::execution_admission::{CandidateTreeExecutionPlan, CandidateTreeTopologyInput};
 use super::{PipelineTensors, WorkflowRuntime};
 use crate::config::{FinishReason, GenerateOptions, GenerateResult, GenerateTokenCallback};
 use crate::speculative::{
@@ -352,234 +353,7 @@ impl std::fmt::Debug for DFlashStateTransaction {
     }
 }
 
-#[derive(Debug)]
-struct CandidateTreePlan<'a> {
-    contract: &'a SpeculativeContract,
-    candidate_tokens: &'a str,
-    topology: &'a CandidateTreeTopology,
-    accepted_path_binding: &'a str,
-    proposer_bindings: BTreeMap<String, String>,
-    proposer_outputs: BTreeMap<String, String>,
-    target_bindings: BTreeMap<String, String>,
-    target_outputs: BTreeMap<String, String>,
-    proposer_context_input: &'a str,
-    target_context_input: &'a str,
-    target_candidate_input: &'a str,
-    target_ancestor_input: &'a str,
-    target_position_input: &'a str,
-    target_accepted_input: &'a str,
-    target_logits_value: String,
-    proposal_probabilities_value: Option<String>,
-    target_probabilities_value: Option<String>,
-}
-
-impl<'a> CandidateTreePlan<'a> {
-    fn resolve(contract: &'a SpeculativeContract, workflow: &WorkflowSpec) -> anyhow::Result<Self> {
-        anyhow::ensure!(
-            contract.version == "1",
-            "candidate-tree execution supports exactly onnx-genai.speculative@1, got version '{}'",
-            contract.version
-        );
-        let SpeculativeProposalExecution::CandidateTree {
-            candidate_tokens,
-            topology,
-        } = &contract.proposal_execution
-        else {
-            anyhow::bail!(
-                "candidate-tree execution was selected for a non-tree proposal form; MTP, \
-                 DFlash, chained, and flat-block proposals use independent drivers"
-            );
-        };
-        let SpeculativeAcceptedPath::Runtime { binding } = &contract.verification.accepted_path
-        else {
-            anyhow::bail!(
-                "candidate-tree version 1 requires a runtime accepted-path binding; \
-                 component-owned accepted paths are not implemented"
-            );
-        };
-        let (proposer_bindings, proposer_outputs) =
-            component_invocation(workflow, &contract.proposer).with_context(|| {
-                format!(
-                    "candidate-tree proposer '{}' has no workflow invocation",
-                    contract.proposer
-                )
-            })?;
-        let (target_bindings, target_outputs) = component_invocation(workflow, &contract.target)
-            .with_context(|| {
-                format!(
-                    "candidate-tree target '{}' has no workflow invocation",
-                    contract.target
-                )
-            })?;
-        let role = |roles: &'a BTreeMap<String, String>,
-                    name: &str,
-                    component: &str|
-         -> anyhow::Result<&'a str> {
-            roles.get(name).map(String::as_str).with_context(|| {
-                format!(
-                    "candidate-tree component '{component}' is missing required protocol \
-                         role '{name}'"
-                )
-            })
-        };
-        let proposer_context_input = role(
-            &contract.port_bindings,
-            "context_tokens",
-            &contract.proposer,
-        )?;
-        let target_context_input = role(
-            &contract.target_port_bindings,
-            "context_tokens",
-            &contract.target,
-        )?;
-        let target_candidate_input = role(
-            &contract.target_port_bindings,
-            "candidate_tokens",
-            &contract.target,
-        )?;
-        let target_ancestor_input = role(
-            &contract.target_port_bindings,
-            "ancestor_mask",
-            &contract.target,
-        )?;
-        let target_position_input = role(
-            &contract.target_port_bindings,
-            "position_ids",
-            &contract.target,
-        )?;
-        let target_accepted_input = role(
-            &contract.target_port_bindings,
-            "accepted_tokens",
-            &contract.target,
-        )?;
-        let output_value = |component: &str,
-                            output: &str,
-                            outputs: &BTreeMap<String, String>|
-         -> anyhow::Result<String> {
-            outputs.get(output).cloned().with_context(|| {
-                format!("candidate-tree output '{component}::{output}' has no workflow SSA binding")
-            })
-        };
-        let target_logits_value = output_value(
-            &contract.verification.target_output.component,
-            &contract.verification.target_output.output,
-            &target_outputs,
-        )?;
-        let (proposal_probabilities_value, target_probabilities_value) =
-            match &contract.verification.probabilities {
-                Some(probabilities) => (
-                    Some(output_value(
-                        &probabilities.proposal.component,
-                        &probabilities.proposal.output,
-                        &proposer_outputs,
-                    )?),
-                    Some(output_value(
-                        &probabilities.target.component,
-                        &probabilities.target.output,
-                        &target_outputs,
-                    )?),
-                ),
-                None => (None, None),
-            };
-        let plan = Self {
-            contract,
-            candidate_tokens,
-            topology,
-            accepted_path_binding: binding,
-            proposer_bindings,
-            proposer_outputs,
-            target_bindings,
-            target_outputs,
-            proposer_context_input,
-            target_context_input,
-            target_candidate_input,
-            target_ancestor_input,
-            target_position_input,
-            target_accepted_input,
-            target_logits_value,
-            proposal_probabilities_value,
-            target_probabilities_value,
-        };
-        plan.validate_state_authority(workflow)?;
-        Ok(plan)
-    }
-
-    fn validate_state_authority(&self, workflow: &WorkflowSpec) -> anyhow::Result<()> {
-        let state_plan = onnx_genai_metadata::resolve_state_plan(workflow);
-        for (cell, _) in state_plan
-            .session_cells()
-            .filter(|(_, resolved)| resolved.transaction.required)
-        {
-            anyhow::ensure!(
-                self.contract.rollback_state.contains(cell),
-                "candidate-tree session state '{cell}' participates in the atomic turn but is \
-                 absent from speculative.rollback_state"
-            );
-        }
-        for cell in &self.contract.rollback_state {
-            anyhow::ensure!(
-                self.state_alias(workflow, &self.contract.proposer, cell)
-                    .or_else(|| self.state_alias(workflow, &self.contract.target, cell))
-                    .is_some(),
-                "candidate-tree rollback participant '{cell}' has no proposer or target \
-                 read-write state-service alias"
-            );
-            let resolved = state_plan.cell(cell).cloned().with_context(|| {
-                format!("candidate-tree rollback participant '{cell}' is unresolved")
-            })?;
-            let StateFinalWriter::Writer(writer) = resolved.final_writer.with_context(|| {
-                format!(
-                    "candidate-tree rollback participant '{cell}' has no canonical final writer"
-                )
-            })?
-            else {
-                anyhow::bail!(
-                    "candidate-tree rollback participant '{cell}' uses session continuation; \
-                     accepted-path state must be written by the declared proposer or target"
-                );
-            };
-            anyhow::ensure!(
-                writer.component.as_deref() == Some(self.contract.proposer.as_str())
-                    || writer.component.as_deref() == Some(self.contract.target.as_str()),
-                "candidate-tree rollback participant '{cell}' final writer {:?} is outside the \
-                 proposer/target transaction",
-                writer.component
-            );
-        }
-        if let Some(serving) = &workflow.serving {
-            for group in serving.state_service.groups.values() {
-                for component in [&self.contract.proposer, &self.contract.target] {
-                    for (cell, alias) in group.ports.get(component).into_iter().flatten() {
-                        if alias.access == StatePortAccess::ReadWrite {
-                            anyhow::ensure!(
-                                self.contract.rollback_state.contains(cell),
-                                "candidate-tree component '{component}' mutates state '{cell}', \
-                                 but speculative.rollback_state omits it"
-                            );
-                        }
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn state_alias<'workflow>(
-        &self,
-        workflow: &'workflow WorkflowSpec,
-        component: &str,
-        cell: &str,
-    ) -> Option<&'workflow onnx_genai_metadata::StatePortAlias> {
-        workflow
-            .serving
-            .as_ref()?
-            .state_service
-            .groups
-            .values()
-            .find_map(|group| group.ports.get(component)?.get(cell))
-            .filter(|alias| alias.access == StatePortAccess::ReadWrite)
-    }
-
+impl CandidateTreeExecutionPlan {
     fn state_for_input<'workflow>(
         &self,
         workflow: &'workflow WorkflowSpec,
@@ -610,12 +384,12 @@ impl<'a> CandidateTreePlan<'a> {
         values: &PipelineTensors,
     ) -> anyhow::Result<PipelineTensors> {
         let mut state = PipelineTensors::new();
-        for cell in &self.contract.rollback_state {
-            let source = [&self.contract.proposer, &self.contract.target]
+        for cell in &self.rollback_state {
+            let source = [&self.proposer, &self.target]
                 .into_iter()
                 .find_map(|component| {
                     let alias = self.state_alias(workflow, component, cell)?;
-                    let bindings = if component == &self.contract.proposer {
+                    let bindings = if component == &self.proposer {
                         &self.proposer_bindings
                     } else {
                         &self.target_bindings
@@ -637,18 +411,10 @@ impl<'a> CandidateTreePlan<'a> {
         }
         Ok(state)
     }
-
-    fn topology_output(&self) -> &str {
-        match self.topology {
-            CandidateTreeTopology::ParentIndices { output }
-            | CandidateTreeTopology::AncestorMask { output } => output,
-        }
-    }
 }
 
 struct RuntimeCandidateTree {
     tree: SpecTree,
-    tokens: Value,
     ancestor_mask: Value,
     position_ids: Value,
 }
@@ -976,23 +742,19 @@ impl WorkflowRuntime {
 
     pub fn candidate_tree_diagnostic(&self) -> Option<CandidateTreeDiagnostic> {
         let contract = self.plan.speculative.as_ref()?;
-        let SpeculativeProposalExecution::CandidateTree { topology, .. } =
-            &contract.proposal_execution
-        else {
-            return None;
-        };
+        let plan = self.plan.execution_admission.candidate_tree_plan()?;
         Some(CandidateTreeDiagnostic {
-            version: contract.version.clone(),
-            proposer: contract.proposer.clone(),
-            target: contract.target.clone(),
-            topology: match topology {
+            version: plan.version.clone(),
+            proposer: plan.proposer.clone(),
+            target: plan.target.clone(),
+            topology: match &plan.topology {
                 CandidateTreeTopology::ParentIndices { .. } => "parent_indices",
                 CandidateTreeTopology::AncestorMask { .. } => "ancestor_mask",
             },
-            max_proposal_width: contract.max_proposal_width,
+            max_proposal_width: plan.max_proposal_width,
             distribution_preserving: contract.distribution_preserving,
             proposal_probabilities: contract.verification.probabilities.is_some(),
-            rollback_participants: contract.rollback_state.iter().cloned().collect(),
+            rollback_participants: plan.rollback_state.iter().cloned().collect(),
             shared_batching_supported: false,
         })
     }
@@ -1054,7 +816,14 @@ impl WorkflowRuntime {
             .speculative
             .as_ref()
             .context("candidate-tree generation was selected without a speculative contract")?;
-        let plan = CandidateTreePlan::resolve(contract, &self.plan.workflow)?;
+        let plan = self
+            .plan
+            .execution_admission
+            .candidate_tree_plan()
+            .context(
+                "candidate-tree generation has no construction-time SSA/dataflow execution plan",
+            )?
+            .clone();
         let sampling = !options.selects_greedily();
         if sampling {
             contract
@@ -1086,7 +855,7 @@ impl WorkflowRuntime {
                 .into_bound_values();
         let context_binding = plan
             .proposer_bindings
-            .get(plan.proposer_context_input)
+            .get(&plan.proposer_context_input)
             .expect("candidate-tree preflight resolved proposer context binding");
         let prompt_value = values.get(context_binding).with_context(|| {
             format!("candidate-tree proposer context binding '{context_binding}' is unavailable")
@@ -1490,7 +1259,7 @@ impl WorkflowRuntime {
 
     fn restore_candidate_tree_session_state(
         &self,
-        plan: &CandidateTreePlan<'_>,
+        plan: &CandidateTreeExecutionPlan,
         session_id: Option<&str>,
         state: &mut PipelineTensors,
     ) -> anyhow::Result<()> {
@@ -1498,7 +1267,7 @@ impl WorkflowRuntime {
             return Ok(());
         };
         let committed = self.worker.session_state.borrow();
-        for cell in &plan.contract.rollback_state {
+        for cell in &plan.rollback_state {
             if self.plan.workflow.state.get(cell).is_some_and(|state| {
                 state.scope == onnx_genai_metadata::WorkflowStateScope::Session
             }) && let Some(value) = committed.get(&(session_id.to_string(), cell.clone()))
@@ -1512,7 +1281,7 @@ impl WorkflowRuntime {
     #[allow(clippy::too_many_arguments)]
     fn invoke_candidate_tree_component(
         &self,
-        plan: &CandidateTreePlan<'_>,
+        plan: &CandidateTreeExecutionPlan,
         component: &str,
         context: &Value,
         tree: Option<&RuntimeCandidateTree>,
@@ -1520,48 +1289,71 @@ impl WorkflowRuntime {
         state: &PipelineTensors,
         values: &mut PipelineTensors,
     ) -> anyhow::Result<()> {
-        let (bindings, outputs, context_port) = if component == plan.contract.proposer {
+        let (bindings, outputs, context_port) = if component == plan.proposer {
             (
                 &plan.proposer_bindings,
                 &plan.proposer_outputs,
-                plan.proposer_context_input,
+                plan.proposer_context_input.as_str(),
             )
-        } else if component == plan.contract.target {
+        } else if component == plan.target {
             (
                 &plan.target_bindings,
                 &plan.target_outputs,
-                plan.target_context_input,
+                plan.target_context_input.as_str(),
             )
         } else {
             anyhow::bail!(
                 "candidate-tree component '{component}' is neither proposer '{}' nor target '{}'",
-                plan.contract.proposer,
-                plan.contract.target
+                plan.proposer,
+                plan.target
             );
         };
         let mut owned = Vec::with_capacity(bindings.len());
         for (port, value_name) in bindings {
             let value = if port == context_port {
                 crate::decode::clone_value(context)?
-            } else if component == plan.contract.target && port == plan.target_candidate_input {
-                crate::decode::clone_value(
-                    &tree
-                        .context("candidate-tree target invocation omitted candidate tokens")?
-                        .tokens,
-                )?
-            } else if component == plan.contract.target && port == plan.target_ancestor_input {
-                crate::decode::clone_value(
-                    &tree
-                        .context("candidate-tree target invocation omitted ancestor mask")?
-                        .ancestor_mask,
-                )?
-            } else if component == plan.contract.target && port == plan.target_position_input {
+            } else if component == plan.target && port.as_str() == plan.target_candidate_input {
+                crate::decode::clone_value(values.get(&plan.target_candidate_value).with_context(
+                    || {
+                        format!(
+                            "candidate-tree target input '{port}' lost its admitted proposer SSA \
+                             value '{}'",
+                            plan.target_candidate_value
+                        )
+                    },
+                )?)?
+            } else if component == plan.target && port.as_str() == plan.target_topology_input {
+                match &plan.target_topology_value {
+                    CandidateTreeTopologyInput::ProposerValue { value } => {
+                        crate::decode::clone_value(values.get(value).with_context(|| {
+                            format!(
+                                "candidate-tree target topology input '{port}' lost its admitted \
+                                 proposer SSA value '{value}'"
+                            )
+                        })?)?
+                    }
+                    CandidateTreeTopologyInput::DerivedFromParentIndices {
+                        placeholder, ..
+                    } => {
+                        debug_assert_eq!(value_name, placeholder);
+                        crate::decode::clone_value(
+                            &tree
+                                .context(
+                                    "candidate-tree target invocation omitted derived ancestor mask",
+                                )?
+                                .ancestor_mask,
+                        )?
+                    }
+                }
+            } else if component == plan.target && port.as_str() == plan.target_position_input {
+                debug_assert_eq!(value_name, &plan.target_position_placeholder);
                 crate::decode::clone_value(
                     &tree
                         .context("candidate-tree target invocation omitted position ids")?
                         .position_ids,
                 )?
-            } else if component == plan.contract.target && port == plan.target_accepted_input {
+            } else if component == plan.target && port.as_str() == plan.target_accepted_input {
+                debug_assert_eq!(value_name, &plan.target_accepted_placeholder);
                 crate::decode::clone_value(accepted_tokens)?
             } else if let Some(cell) = plan.state_for_input(&self.plan.workflow, component, port) {
                 crate::decode::clone_value(state.get(cell).with_context(|| {
@@ -1602,13 +1394,10 @@ impl WorkflowRuntime {
 
     fn decode_runtime_candidate_tree(
         &self,
-        plan: &CandidateTreePlan<'_>,
+        plan: &CandidateTreeExecutionPlan,
         values: &PipelineTensors,
     ) -> anyhow::Result<RuntimeCandidateTree> {
-        let tokens_binding = plan
-            .proposer_outputs
-            .get(plan.candidate_tokens)
-            .expect("candidate-tree preflight resolved candidate token binding");
+        let tokens_binding = &plan.target_candidate_value;
         let tokens_value = values.get(tokens_binding).with_context(|| {
             format!(
                 "candidate-tree proposer did not produce candidate token value \
@@ -1629,10 +1418,10 @@ impl WorkflowRuntime {
         let candidate_count =
             usize::try_from(shape[1]).context("candidate-tree candidate extent is negative")?;
         anyhow::ensure!(
-            candidate_count <= plan.contract.max_proposal_width,
+            candidate_count <= plan.max_proposal_width,
             "candidate-tree proposer emitted {candidate_count} candidates, exceeding declared \
              max_proposal_width {}",
-            plan.contract.max_proposal_width
+            plan.max_proposal_width
         );
         let tokens = tokens_value
             .to_vec_i64()?
@@ -1647,10 +1436,12 @@ impl WorkflowRuntime {
                 })
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
-        let topology_binding = plan
-            .proposer_outputs
-            .get(plan.topology_output())
-            .expect("candidate-tree preflight resolved topology binding");
+        let topology_binding = match &plan.target_topology_value {
+            CandidateTreeTopologyInput::ProposerValue { value } => value,
+            CandidateTreeTopologyInput::DerivedFromParentIndices { topology_value, .. } => {
+                topology_value
+            }
+        };
         let topology = values.get(topology_binding).with_context(|| {
             format!("candidate-tree proposer did not produce topology value '{topology_binding}'")
         })?;
@@ -1725,11 +1516,11 @@ impl WorkflowRuntime {
                 );
             }
             anyhow::ensure!(
-                children.len() <= plan.contract.max_proposal_width,
+                children.len() <= plan.max_proposal_width,
                 "candidate-tree parent {parent:?} has {} children, exceeding declared rollback \
                  width {}",
                 children.len(),
-                plan.contract.max_proposal_width
+                plan.max_proposal_width
             );
         }
         let depth = tree
@@ -1739,9 +1530,9 @@ impl WorkflowRuntime {
             .max()
             .unwrap_or_default();
         anyhow::ensure!(
-            depth <= plan.contract.max_proposal_width,
+            depth <= plan.max_proposal_width,
             "candidate-tree depth {depth} exceeds declared rollback width {}",
-            plan.contract.max_proposal_width
+            plan.max_proposal_width
         );
         let mask = crate::speculative::ancestor_attention_mask(&tree);
         let mask_bytes = mask
@@ -1771,7 +1562,6 @@ impl WorkflowRuntime {
         )?;
         Ok(RuntimeCandidateTree {
             tree,
-            tokens: crate::decode::clone_value(tokens_value)?,
             ancestor_mask,
             position_ids,
         })
@@ -1779,7 +1569,7 @@ impl WorkflowRuntime {
 
     fn target_tree_rows(
         &self,
-        plan: &CandidateTreePlan<'_>,
+        plan: &CandidateTreeExecutionPlan,
         tree: &SpecTree,
         values: &PipelineTensors,
     ) -> anyhow::Result<Vec<Vec<f32>>> {
@@ -1798,7 +1588,7 @@ impl WorkflowRuntime {
 
     fn verify_candidate_tree_greedy(
         &self,
-        plan: &CandidateTreePlan<'_>,
+        plan: &CandidateTreeExecutionPlan,
         tree: &SpecTree,
         values: &PipelineTensors,
     ) -> anyhow::Result<crate::speculative::AcceptOutcome> {
@@ -1816,7 +1606,7 @@ impl WorkflowRuntime {
 
     fn verify_candidate_tree_sampling(
         &self,
-        plan: &CandidateTreePlan<'_>,
+        plan: &CandidateTreeExecutionPlan,
         tree: &SpecTree,
         values: &PipelineTensors,
         rng: &mut StdRng,

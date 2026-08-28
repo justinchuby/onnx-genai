@@ -769,14 +769,16 @@ impl WorkflowRuntime {
         authority_provider: Option<SharedMemoryAuthorityProvider>,
     ) -> anyhow::Result<(Self, EngineResourceGovernor)> {
         let mut capability_error = None;
+        let mut admitted_execution = None;
         let directory =
             match PipelineModelDirectory::load_with_metadata_preflight(pipeline_dir, |metadata| {
-                WorkflowExecutionAdmission::from_metadata(metadata)
-                    .require_supported()
-                    .map_err(|error| {
-                        capability_error = Some(error.clone());
-                        onnx_genai_ort::OrtError::InvalidArgument(error.to_string())
-                    })
+                let admission = WorkflowExecutionAdmission::from_metadata(metadata);
+                admission.require_supported().map_err(|error| {
+                    capability_error = Some(error.clone());
+                    onnx_genai_ort::OrtError::InvalidArgument(error.to_string())
+                })?;
+                admitted_execution = Some(admission);
+                Ok(())
             }) {
                 Ok(directory) => directory,
                 Err(_) if capability_error.is_some() => {
@@ -788,11 +790,12 @@ impl WorkflowRuntime {
                     ));
                 }
             };
-        let execution_admission = directory
-            .metadata
-            .as_ref()
-            .map(WorkflowExecutionAdmission::from_metadata)
-            .unwrap_or(WorkflowExecutionAdmission::Admitted);
+        let execution_admission = if directory.metadata.is_some() {
+            admitted_execution
+                .expect("metadata preflight stores the typed execution admission before loading")
+        } else {
+            WorkflowExecutionAdmission::Admitted
+        };
         let decode_backend = validate_pipeline_backend_request(config.decode_backend)?;
         if let Some(contract) = directory
             .metadata
