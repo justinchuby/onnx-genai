@@ -23,6 +23,106 @@ fn native_logical_len(engine: &Engine, id: SessionId) -> Option<usize> {
         .map(|state| state.tokens.len())
 }
 
+/// Commit-only token publication owned by one native decoder turn.
+///
+/// Native decode mutates its KV/session participants before it knows whether
+/// the whole turn will complete. Holding the externally visible payloads here
+/// makes an execution error after any selected token indistinguishable from a
+/// turn that produced no output at all. `flush` consumes the journal, so a
+/// successful turn cannot publish the same token twice through this authority.
+#[cfg(feature = "native-backend")]
+struct CommitOnlyTokenStager {
+    limit: usize,
+    tokens: Vec<crate::config::GenerateToken>,
+}
+
+#[cfg(feature = "native-backend")]
+impl CommitOnlyTokenStager {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            tokens: Vec::new(),
+        }
+    }
+
+    fn stage(&mut self, token: crate::config::GenerateToken) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.tokens.len() < self.limit,
+            "atomic native output staging exhausted its {}-token admission after buffering {} \
+             token(s); generation must not publish output beyond its admitted token budget",
+            self.limit,
+            self.tokens.len()
+        );
+        self.tokens
+            .try_reserve(1)
+            .context("failed to reserve the next atomic native output staging entry")?;
+        self.tokens.push(token);
+        Ok(())
+    }
+
+    /// Reject a divergent internal result before the turn commits. The callback
+    /// journal is the exact output the decoder selected, not a reconstruction
+    /// from a later result.
+    fn validate(&self, result: &GenerateResult) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.tokens.len() == result.token_ids.len(),
+            "native generation staged {} token event(s), but returned {} token id(s); refusing \
+             to commit divergent output",
+            self.tokens.len(),
+            result.token_ids.len()
+        );
+        for (index, (staged, token_id)) in self.tokens.iter().zip(&result.token_ids).enumerate() {
+            anyhow::ensure!(
+                staged.token_id == *token_id,
+                "native generation staged token {} at output index {index}, but returned token \
+                 {token_id}; refusing to commit divergent output",
+                staged.token_id
+            );
+        }
+        Ok(())
+    }
+
+    /// Deliver a committed, immutable journal in original token order.
+    ///
+    /// A receiver failure here is a post-commit delivery failure, matching the
+    /// decoder-turn contract: it cannot turn an already committed result into
+    /// an abort after any token may have reached its consumer.
+    fn flush(self, callback: Option<&mut GenerateTokenCallback<'_>>) -> anyhow::Result<()> {
+        let Some(callback) = callback else {
+            return Ok(());
+        };
+        for token in self.tokens {
+            callback(token)?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(all(feature = "native-backend", any(test, feature = "test-output-staging")))]
+thread_local! {
+    static TEST_NATIVE_OUTPUT_STAGE_LIMIT: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(feature = "native-backend")]
+fn native_output_stage_limit(admitted_limit: usize) -> usize {
+    #[cfg(any(test, feature = "test-output-staging"))]
+    if let Some(limit) = TEST_NATIVE_OUTPUT_STAGE_LIMIT.with(std::cell::Cell::get) {
+        return limit;
+    }
+    admitted_limit
+}
+
+#[cfg(all(test, feature = "native-backend"))]
+fn with_native_output_stage_limit_for_test<T>(limit: usize, operation: impl FnOnce() -> T) -> T {
+    TEST_NATIVE_OUTPUT_STAGE_LIMIT.with(|stage_limit| {
+        let previous = stage_limit.replace(Some(limit));
+        let output = operation();
+        stage_limit.set(previous);
+        output
+    })
+}
+
 /// Typed baseline for the runtime-owned half of an admitted decoder turn.
 ///
 /// Workflow cells use `TurnTransaction` directly. Decoder sessions cannot be
@@ -170,6 +270,7 @@ struct NativeDecoderTurnParticipant {
     active_before: Option<SessionId>,
     materialized_len: Option<usize>,
     recurrent: Option<crate::native_decode::RecurrentStateSnapshot>,
+    speculative_stats: SpeculativeStats,
     connector_stats: ConnectorStats,
 }
 
@@ -198,6 +299,7 @@ impl NativeDecoderTurnParticipant {
             active_before,
             materialized_len,
             recurrent,
+            speculative_stats: engine.last_speculative_stats,
             connector_stats: engine.connector.stats().clone(),
         })
     }
@@ -211,6 +313,7 @@ impl NativeDecoderTurnParticipant {
         engine: &mut Engine,
         reason: crate::pipeline::TurnAbortReason,
     ) -> anyhow::Result<crate::pipeline::TurnTransactionOutcome> {
+        engine.last_speculative_stats = self.speculative_stats;
         engine.connector.restore_stats(self.connector_stats);
         let native = engine.native_session.as_mut().context(
             "cannot abort atomic native decoder turn: native decoder session is unavailable",
@@ -603,7 +706,6 @@ impl Engine {
         mut admission_callback: Option<&mut dyn FnMut()>,
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
-        self.last_speculative_stats = SpeculativeStats::default();
         if request.options.speculative_mode.is_none() && self.mtp.is_some() {
             request.options.speculative_mode = Some(self.speculative_mode.clone());
         }
@@ -627,6 +729,16 @@ impl Engine {
         )?;
         let budget_cap = scheduled.budget_cap.map(generation_budget_cap);
         options.max_new_tokens = scheduled.max_tokens;
+        let mut staged_output =
+            CommitOnlyTokenStager::new(native_output_stage_limit(options.max_new_tokens));
+        let turn = match NativeDecoderTurnParticipant::admit(self, scheduler_session_id) {
+            Ok(turn) => turn,
+            Err(error) => {
+                self.scheduler.complete(scheduler_session_id);
+                return Err(error);
+            }
+        };
+        self.last_speculative_stats = SpeculativeStats::default();
         let workspace_query_rows = native_workspace_query_rows(
             prompt_tokens.len(),
             speculation_plan.as_ref(),
@@ -640,114 +752,148 @@ impl Engine {
             .prepare_generation_workspace_for_query_rows(&prompt_tokens, workspace_query_rows)
         {
             self.scheduler.complete(scheduler_session_id);
-            return Err(error);
+            return match turn.abort(self, crate::pipeline::TurnAbortReason::ExecutionFailure) {
+                Ok(_) => Err(error),
+                Err(rollback) => Err(error.context(format!(
+                    "atomic native cold turn failed during workspace preparation and its \
+                     baseline restoration also failed: {rollback:#}"
+                ))),
+            };
         }
         if let Some(callback) = admission_callback.as_mut() {
             callback();
         }
 
-        // Speculation ON (implemented greedy prompt-lookup) → the native
-        // speculative driver. Every other request stays on the untouched plain
-        // M=1 fast path below, preserving the 762 tok/s non-regression guarantee.
-        // Borrowed before the mutable native-session borrows below.
-        let tokenizer = self
-            .tokenizer
-            .as_ref()
-            .context("this package declares no tokenizer, so it cannot decode text")?;
-        let runtime = &*self.workflow;
-        // The authored block body this request iterates, read from the
-        // package's own declared loop. Resolved before the mutable native
-        // session borrow below, which the driver holds for the whole drive.
-        let block_runtime = match speculation_plan.as_ref() {
-            Some(_) => Some(self.workflow.iteration_runtime(
-                onnx_genai_metadata::decoder_workflow::IterationPolicy::SpeculativeBlock,
-            )?),
-            None => None,
-        };
-        let result = if let Some(plan) = speculation_plan {
-            let block_runtime = block_runtime.expect("a speculation plan resolves a block body");
-            let mut stats = SpeculativeStats::default();
-            let result = (|| {
+        let result = {
+            let mut stage_token = |token| staged_output.stage(token);
+            // Speculation ON (implemented greedy prompt-lookup) → the native
+            // speculative driver. Every other request stays on the untouched plain
+            // M=1 fast path below, preserving the 762 tok/s non-regression guarantee.
+            // Borrowed before the mutable native-session borrows below.
+            let tokenizer = self
+                .tokenizer
+                .as_ref()
+                .context("this package declares no tokenizer, so it cannot decode text")?;
+            let runtime = &*self.workflow;
+            // The authored block body this request iterates, read from the
+            // package's own declared loop. Resolved before the mutable native
+            // session borrow below, which the driver holds for the whole drive.
+            let block_runtime = match speculation_plan.as_ref() {
+                Some(_) => Some(self.workflow.iteration_runtime(
+                    onnx_genai_metadata::decoder_workflow::IterationPolicy::SpeculativeBlock,
+                )?),
+                None => None,
+            };
+            if let Some(plan) = speculation_plan {
+                let block_runtime =
+                    block_runtime.expect("a speculation plan resolves a block body");
+                let mut stats = SpeculativeStats::default();
+                let result = (|| {
+                    let native_session = self
+                        .native_session
+                        .as_mut()
+                        .context("native decoder session is unavailable")?;
+                    let mut driver = match plan.kind {
+                        NativeSpeculationKind::PromptLookup { ngram, max_tokens } => {
+                            crate::native_speculative::NativeSpeculativeDriver::new_prompt_lookup(
+                                native_session,
+                                ngram,
+                                max_tokens,
+                                plan.width,
+                            )?
+                        }
+                        NativeSpeculationKind::Mtp => {
+                            let mtp = self.mtp.as_ref().context(
+                                "native MTP speculation requested without a loaded MTP head",
+                            )?;
+                            // Reuse the generic MtpProposer (guaranteed target token +
+                            // K speculative drafts from the ORT MTP head) through the
+                            // native driver; the head runs on the ORT CUDA EP while the
+                            // hybrid GDN target runs natively. The recurrent-state
+                            // commit-by-accepted primitive (#1633) advances the target's
+                            // GDN/conv state on accept.
+                            let proposer = MtpProposer::new_owned(
+                                std::sync::Arc::clone(&mtp.session),
+                                onnx_genai_ort::MtpDecodeOptions {
+                                    kv_mode: mtp.kv_mode,
+                                    batch_size: 1,
+                                    hc_mult: mtp.runtime_config.hc_mult,
+                                    hidden_state_rank4: mtp.runtime_config.target_hidden_layout
+                                        == MtpHiddenLayout::Bshc,
+                                    hidden_output: mtp.runtime_config.mtp_hidden_output.clone(),
+                                    state_output: mtp.runtime_config.mtp_state_output.clone(),
+                                },
+                                mtp.embedder.clone(),
+                                mtp.lm_head.clone(),
+                                mtp.runtime_config.cache_scope,
+                            )?;
+                            let hidden_size = mtp
+                                .runtime_config
+                                .hc_mult
+                                .saturating_mul(mtp.config.hidden_size);
+                            crate::native_speculative::NativeSpeculativeDriver::new_mtp(
+                                native_session,
+                                proposer,
+                                hidden_size,
+                                plan.width,
+                            )?
+                        }
+                    };
+                    driver.generate(
+                        &prompt_tokens,
+                        &options,
+                        &chain,
+                        tokenizer,
+                        &block_runtime,
+                        &mut stats,
+                        Some(&mut stage_token),
+                    )
+                })();
+                self.last_speculative_stats = stats;
+                result
+            } else {
                 let native_session = self
                     .native_session
                     .as_mut()
                     .context("native decoder session is unavailable")?;
-                let mut driver = match plan.kind {
-                    NativeSpeculationKind::PromptLookup { ngram, max_tokens } => {
-                        crate::native_speculative::NativeSpeculativeDriver::new_prompt_lookup(
-                            native_session,
-                            ngram,
-                            max_tokens,
-                            plan.width,
-                        )?
-                    }
-                    NativeSpeculationKind::Mtp => {
-                        let mtp = self.mtp.as_ref().context(
-                            "native MTP speculation requested without a loaded MTP head",
-                        )?;
-                        // Reuse the generic MtpProposer (guaranteed target token +
-                        // K speculative drafts from the ORT MTP head) through the
-                        // native driver; the head runs on the ORT CUDA EP while the
-                        // hybrid GDN target runs natively. The recurrent-state
-                        // commit-by-accepted primitive (#1633) advances the target's
-                        // GDN/conv state on accept.
-                        let proposer = MtpProposer::new_owned(
-                            std::sync::Arc::clone(&mtp.session),
-                            onnx_genai_ort::MtpDecodeOptions {
-                                kv_mode: mtp.kv_mode,
-                                batch_size: 1,
-                                hc_mult: mtp.runtime_config.hc_mult,
-                                hidden_state_rank4: mtp.runtime_config.target_hidden_layout
-                                    == MtpHiddenLayout::Bshc,
-                                hidden_output: mtp.runtime_config.mtp_hidden_output.clone(),
-                                state_output: mtp.runtime_config.mtp_state_output.clone(),
-                            },
-                            mtp.embedder.clone(),
-                            mtp.lm_head.clone(),
-                            mtp.runtime_config.cache_scope,
-                        )?;
-                        let hidden_size = mtp
-                            .runtime_config
-                            .hc_mult
-                            .saturating_mul(mtp.config.hidden_size);
-                        crate::native_speculative::NativeSpeculativeDriver::new_mtp(
-                            native_session,
-                            proposer,
-                            hidden_size,
-                            plan.width,
-                        )?
-                    }
-                };
-                driver.generate(
+                native_session.generate_with_callback(
                     &prompt_tokens,
                     &options,
                     &chain,
                     tokenizer,
-                    &block_runtime,
-                    &mut stats,
-                    callback,
+                    runtime,
+                    Some(&mut stage_token),
                 )
-            })();
-            self.last_speculative_stats = stats;
-            result
-        } else {
-            let native_session = self
-                .native_session
-                .as_mut()
-                .context("native decoder session is unavailable")?;
-            native_session.generate_with_callback(
-                &prompt_tokens,
-                &options,
-                &chain,
-                tokenizer,
-                runtime,
-                callback,
-            )
+            }
+        };
+        let result = augment_backend_error(
+            result.and_then(|mut result| {
+                result.budget_cap = budget_cap;
+                staged_output.validate(&result)?;
+                Ok(result)
+            }),
+            EngineDecodeBackend::Native,
+        );
+        let result = match result {
+            Ok(result) => {
+                let _outcome = turn.committed();
+                Ok(result)
+            }
+            Err(error) => {
+                match turn.abort(self, crate::pipeline::TurnAbortReason::ExecutionFailure) {
+                    Ok(_) => Err(error),
+                    Err(rollback) => Err(error.context(format!(
+                        "atomic native cold turn failed and its baseline restoration also \
+                         failed: {rollback:#}"
+                    ))),
+                }
+            }
         };
         self.scheduler.complete(scheduler_session_id);
-        let mut result = augment_backend_error(result, EngineDecodeBackend::Native)?;
-        result.budget_cap = budget_cap;
-        Ok(result)
+        result.and_then(|result| {
+            staged_output.flush(callback)?;
+            Ok(result)
+        })
     }
 
     #[cfg(not(feature = "native-backend"))]
@@ -3075,6 +3221,15 @@ impl DecodeLoopBackend for SessionDecodeLoopBackend<'_> {
 
 #[cfg(feature = "native-backend")]
 impl Engine {
+    /// Override the native turn's staged-output bound for a dependent-crate
+    /// regression test. The `test-output-staging` feature is never enabled by
+    /// production feature sets.
+    #[cfg(feature = "test-output-staging")]
+    #[doc(hidden)]
+    pub fn set_native_output_staging_limit_for_test(&mut self, limit: Option<usize>) {
+        TEST_NATIVE_OUTPUT_STAGE_LIMIT.with(|stage_limit| stage_limit.set(limit));
+    }
+
     fn generate_native_in_session_with_callbacks(
         &mut self,
         session_id: SessionId,
@@ -3082,7 +3237,6 @@ impl Engine {
         mut admission_callback: Option<&mut dyn FnMut()>,
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
-        self.last_speculative_stats = SpeculativeStats::default();
         request.options.validate()?;
         let mut options = request.options;
         reject_native_request_speculation(&options)?;
@@ -3109,6 +3263,8 @@ impl Engine {
         )?;
         let budget_cap = scheduled.budget_cap.map(generation_budget_cap);
         options.max_new_tokens = scheduled.max_tokens;
+        let mut staged_output =
+            CommitOnlyTokenStager::new(native_output_stage_limit(options.max_new_tokens));
         let turn = match NativeDecoderTurnParticipant::admit(self, session_id) {
             Ok(turn) => turn,
             Err(error) => {
@@ -3116,6 +3272,7 @@ impl Engine {
                 return Err(error);
             }
         };
+        self.last_speculative_stats = SpeculativeStats::default();
         if let Err(error) = self
             .native_session
             .as_mut()
@@ -3270,6 +3427,7 @@ impl Engine {
             }
 
             let mut result = {
+                let mut stage_token = |token| staged_output.stage(token);
                 // Borrowed before the mutable native-session borrow below.
                 let tokenizer = self
                     .tokenizer
@@ -3299,7 +3457,7 @@ impl Engine {
                     &chain,
                     tokenizer,
                     runtime,
-                    None,
+                    Some(&mut stage_token),
                 )?
             };
             result.budget_cap = budget_cap;
@@ -3317,6 +3475,10 @@ impl Engine {
 
             Ok(result)
         })();
+        let result = result.and_then(|result| {
+            staged_output.validate(&result)?;
+            Ok(result)
+        });
         let result = match result {
             Ok(result) => {
                 let _outcome = turn.committed();
@@ -3334,11 +3496,7 @@ impl Engine {
         };
         self.scheduler.complete(session_id);
         result.and_then(|result| {
-            DecoderTurnParticipant::publish_committed_tokens(
-                self.require_tokenizer()?,
-                &result,
-                callback,
-            )?;
+            staged_output.flush(callback)?;
             Ok(result)
         })
     }
@@ -3358,6 +3516,130 @@ mod tests {
         assert!(generate_uses_scheduler(EngineDecodeBackend::Ort));
         assert!(generate_uses_scheduler(EngineDecodeBackend::Native));
         assert!(generate_uses_scheduler(EngineDecodeBackend::Auto));
+    }
+
+    #[cfg(feature = "native-backend")]
+    fn tiny_native_cold_engine() -> anyhow::Result<Engine> {
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-native-engine");
+        Engine::from_dir(
+            &fixture,
+            EngineConfig {
+                decode_backend: EngineDecodeBackend::Native,
+                native_device: Some(crate::NativeDecodeDevice::Cpu),
+                ..EngineConfig::default()
+            },
+        )
+    }
+
+    #[cfg(feature = "native-backend")]
+    fn tiny_native_cold_request(speculative: bool) -> GenerateRequest {
+        let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![0]));
+        request.options.max_new_tokens = 3;
+        request.options.temperature = 0.0;
+        request.options.greedy = true;
+        request.options.stop_on_eos = false;
+        if speculative {
+            request.options.speculative_mode = Some(crate::SpeculativeMode::PromptLookup {
+                ngram: 1,
+                max_tokens: 2,
+            });
+        }
+        request
+    }
+
+    /// The callback the server passes here emits `DriverEvent::Token`
+    /// immediately. Both routes must therefore retain all callback payloads
+    /// until their native turn has committed.
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn cold_native_and_prompt_lookup_flush_staged_tokens_once_in_order() -> anyhow::Result<()> {
+        for (route, speculative) in [("cold native", false), ("native prompt lookup", true)] {
+            let mut engine = tiny_native_cold_engine()?;
+            let request = tiny_native_cold_request(speculative);
+            let mut observed = Vec::new();
+            let mut callback = |token: crate::GenerateToken| -> anyhow::Result<()> {
+                observed.push(token.token_id);
+                Ok(())
+            };
+
+            let result = engine.generate_with_callback(request, Some(&mut callback))?;
+            assert_eq!(
+                observed, result.token_ids,
+                "{route} must flush each committed staged token once and in order"
+            );
+            assert_eq!(
+                observed.len(),
+                result.token_ids.len(),
+                "{route} must neither omit nor duplicate a staged token"
+            );
+        }
+        Ok(())
+    }
+
+    /// A one-token staging limit injects an error only after the first native
+    /// token has been selected and buffered. It exercises the same public cold
+    /// route the server calls, whose callback directly publishes token events.
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn cold_native_and_prompt_lookup_abort_after_staging_without_publishing_tokens()
+    -> anyhow::Result<()> {
+        for (route, speculative) in [("cold native", false), ("native prompt lookup", true)] {
+            let mut engine = tiny_native_cold_engine()?;
+            let request = tiny_native_cold_request(speculative);
+            let mut externally_published = Vec::new();
+            let mut callback = |token: crate::GenerateToken| -> anyhow::Result<()> {
+                externally_published.push(token.token_id);
+                Ok(())
+            };
+
+            let error = with_native_output_stage_limit_for_test(1, || {
+                engine.generate_with_callback(request.clone(), Some(&mut callback))
+            })
+            .expect_err("{route} must fail when its second staged token exceeds the test limit");
+            let message = format!("{error:#}");
+            assert!(
+                message
+                    .contains("output staging exhausted its 1-token admission after buffering 1"),
+                "{route} must fail after staging token one, got: {message}"
+            );
+            assert!(
+                externally_published.is_empty(),
+                "{route} must not publish a DriverEvent::Token-shaped callback from an aborted turn"
+            );
+            assert_eq!(
+                engine.native_active_session, None,
+                "{route} must restore the cold native-session baseline"
+            );
+            assert_eq!(
+                engine
+                    .native_session
+                    .as_ref()
+                    .expect("native engine owns its decode session")
+                    .current_len(),
+                0,
+                "{route} must restore the cold native decoder baseline"
+            );
+
+            let mut retry_events = Vec::new();
+            let mut retry_callback = |token: crate::GenerateToken| -> anyhow::Result<()> {
+                retry_events.push(token.token_id);
+                Ok(())
+            };
+            let retry =
+                engine.generate_with_callback(request.clone(), Some(&mut retry_callback))?;
+            let mut control = tiny_native_cold_engine()?;
+            let expected = control.generate(request)?;
+            assert_eq!(
+                retry.token_ids, expected.token_ids,
+                "{route} retry after an aborted staged turn must be deterministic"
+            );
+            assert_eq!(
+                retry_events, retry.token_ids,
+                "{route} retry must publish only its committed stream"
+            );
+        }
+        Ok(())
     }
 
     #[test]

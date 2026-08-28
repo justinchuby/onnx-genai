@@ -1911,6 +1911,26 @@ fn route_continuous_events(
                         .result(result.token_ids.len(), result.prefix_cache_hit_len);
                 }
             }
+            ContinuousBatchEvent::Aborted {
+                handle,
+                outcome,
+                error,
+            } => {
+                let failure = DriverFailure::internal(format!(
+                    "generation turn aborted to its committed baseline ({outcome:?}): {error}"
+                ));
+                if let Some(mut route) = routes.remove(&handle.id) {
+                    if let Some(sender) = route.admission.take() {
+                        let _ = sender.send(Err(failure.clone()));
+                    }
+                    let _ = deliver_driver_event(
+                        &route.events,
+                        DriverEvent::Error(failure),
+                        DELIVERY_GRACE,
+                    );
+                }
+                abandoned.remove(&handle.id);
+            }
         }
     }
 }
@@ -3062,6 +3082,124 @@ mod admission_tests {
         }
     }
 
+    #[test]
+    fn native_cold_and_prompt_lookup_abort_without_driver_token_or_finished_events() {
+        fn pending(
+            request: GenerateRequest,
+        ) -> (
+            PendingGeneration,
+            oneshot::Receiver<Result<(), DriverFailure>>,
+            mpsc::Receiver<DriverEvent>,
+        ) {
+            let (admission, admission_rx) = oneshot::channel();
+            let (events, events_rx) = mpsc::channel(DRIVER_OUTPUT_BUFFER);
+            let permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
+            (
+                PendingGeneration {
+                    request,
+                    lease: None,
+                    admission,
+                    events,
+                    permit: WorkerPermit::untracked(permit),
+                },
+                admission_rx,
+                events_rx,
+            )
+        }
+
+        for (route, speculative) in [("cold native", false), ("native prompt lookup", true)] {
+            let model_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/tiny-native-engine");
+            let mut engine = Engine::from_dir(
+                &model_dir,
+                onnx_genai_engine::EngineConfig {
+                    decode_backend: onnx_genai_engine::EngineDecodeBackend::Native,
+                    native_device: Some(onnx_genai_engine::NativeDecodeDevice::Cpu),
+                    ..onnx_genai_engine::EngineConfig::default()
+                },
+            )
+            .expect("load native test fixture");
+            let mut request = GenerateRequest::new(onnx_genai::GeneratePrompt::TokenIds(vec![0]));
+            request.options.max_new_tokens = 3;
+            request.options.temperature = 0.0;
+            request.options.greedy = true;
+            request.options.stop_on_eos = false;
+            if speculative {
+                request.options.speculative_mode =
+                    Some(onnx_genai_engine::SpeculativeMode::PromptLookup {
+                        ngram: 1,
+                        max_tokens: 2,
+                    });
+            }
+
+            // The test hook fails only when the second selected token attempts
+            // to enter the commit-only journal, so token one was already staged.
+            engine.set_native_output_staging_limit_for_test(Some(1));
+            let (pending_generation, mut admission_rx, mut events_rx) = pending(request.clone());
+            run_generation(&mut engine, None, None, pending_generation);
+            assert!(
+                admission_rx
+                    .try_recv()
+                    .expect("admitted native generation must resolve admission")
+                    .is_ok(),
+                "{route} must report scheduler admission before executing"
+            );
+            match events_rx
+                .try_recv()
+                .expect("aborted generation must report its error")
+            {
+                DriverEvent::Error(failure) => assert!(
+                    failure.message.contains(
+                        "output staging exhausted its 1-token admission after buffering 1"
+                    ),
+                    "{route} must fail after staging token one: {}",
+                    failure.message
+                ),
+                DriverEvent::Token(token) => {
+                    panic!(
+                        "{route} leaked DriverEvent::Token({}) from an aborted turn",
+                        token.token_id
+                    )
+                }
+                DriverEvent::Finished(_) => {
+                    panic!("{route} leaked a success completion from an aborted turn")
+                }
+            }
+            assert!(
+                events_rx.try_recv().is_err(),
+                "{route} must publish no token or success completion after its error"
+            );
+
+            engine.set_native_output_staging_limit_for_test(None);
+            let (pending_generation, mut admission_rx, mut events_rx) = pending(request);
+            run_generation(&mut engine, None, None, pending_generation);
+            assert!(
+                admission_rx
+                    .try_recv()
+                    .expect("retry admission must resolve")
+                    .is_ok(),
+                "{route} retry must be admitted"
+            );
+            let mut tokens = Vec::new();
+            let mut finished = None;
+            while let Ok(event) = events_rx.try_recv() {
+                match event {
+                    DriverEvent::Token(token) => tokens.push(token.token_id),
+                    DriverEvent::Finished(result) => finished = Some(result),
+                    DriverEvent::Error(failure) => {
+                        panic!("{route} deterministic retry failed: {}", failure.message)
+                    }
+                }
+            }
+            let finished = finished.expect("{route} retry must publish success completion");
+            assert_eq!(
+                tokens, finished.token_ids,
+                "{route} retry token event order"
+            );
+            assert_eq!(tokens, vec![1, 1, 1], "{route} retry must be deterministic");
+        }
+    }
+
     /// Shutting a driver down destroys the engine on the thread that owns it,
     /// before the call returns — and says so the same way twice.
     #[tokio::test]
@@ -3550,6 +3688,55 @@ mod driver_delivery_tests {
         assert!(finished, "the terminal event must survive a full channel");
         assert_eq!(abandoned, 0, "a reading consumer must not be abandoned");
         assert_eq!(live, 0, "the finished route is retired, not abandoned");
+    }
+
+    #[tokio::test]
+    async fn aborted_continuous_turn_publishes_only_an_error() {
+        let handle = ContinuousBatchHandle { id: 13 };
+        let (driver_route, mut events_rx) = route(2);
+        let mut routes = HashMap::from([(handle.id, driver_route)]);
+        let mut abandoned = HashMap::new();
+
+        route_continuous_events(
+            vec![ContinuousBatchEvent::Aborted {
+                handle,
+                outcome: onnx_genai_engine::pipeline::TurnTransactionOutcome::AbortToBaseline {
+                    transaction: onnx_genai_engine::pipeline::TurnTransactionId(3),
+                    baseline: onnx_genai_engine::pipeline::TurnBaselineId(3),
+                    reason: onnx_genai_engine::pipeline::TurnAbortReason::ExecutionFailure,
+                },
+                error: "injected later execution failure".to_string(),
+            }],
+            &mut routes,
+            &mut abandoned,
+        );
+
+        match events_rx.recv().await {
+            Some(DriverEvent::Error(failure)) => assert!(
+                failure
+                    .message
+                    .contains("aborted to its committed baseline")
+                    && failure.message.contains("injected later execution failure"),
+                "abort error must preserve actionable turn context: {}",
+                failure.message
+            ),
+            Some(DriverEvent::Token(token)) => {
+                panic!("aborted turn leaked DriverEvent::Token({})", token.token_id)
+            }
+            Some(DriverEvent::Finished(_)) => {
+                panic!("aborted turn leaked a success completion")
+            }
+            None => panic!("aborted turn must publish an error"),
+        }
+        assert!(
+            events_rx.recv().await.is_none(),
+            "aborted turn must not publish token or success completion after its error"
+        );
+        assert!(routes.is_empty(), "aborted route must be retired");
+        assert!(
+            abandoned.is_empty(),
+            "aborted route must not remain retained"
+        );
     }
 
     #[tokio::test]

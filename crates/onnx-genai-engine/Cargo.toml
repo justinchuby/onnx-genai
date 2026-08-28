@@ -64,6 +64,9 @@ required-features = ["native-cuda"]
 
 [features]
 default = ["cuda-13000"]
+# Test-only fault injection for transaction publication regression tests in
+# dependent crates. It is deliberately off every production feature path.
+test-output-staging = ["native-backend"]
 native-backend = [
     "dep:onnx-runtime-ep-cpu",
     "onnx-runtime-ep-cpu/tracing",
