@@ -102,6 +102,9 @@ def weights() -> dict[str, list[int] | list[float]]:
             ((index * 11 % 17) - 8.0) / 24.0
             for index in range(heads * GEOMETRY["hidden_size"])
         ],
+        "norm_key": [((index * 3 % 17) - 8.0) / 32.0 for index in range(channels)],
+        "norm_query": [((index * 5 % 19) - 9.0) / 40.0 for index in range(channels)],
+        "norm_conv": [((index * 7 % 23) - 11.0) / 48.0 for index in range(channels)],
         "conv_weights": [
             (0.5 ** ((index % GEOMETRY["conv_kernel"]) + 1))
             * (1.0 if (index % GEOMETRY["conv_kernel"]) % 2 == 0 else -1.0)
@@ -110,9 +113,16 @@ def weights() -> dict[str, list[int] | list[float]]:
     }
 
 
-def rms_norm(values: list[float]) -> list[float]:
+def rms_norm(values: list[float], learned_weight: list[float]) -> list[float]:
+    if len(values) != len(learned_weight):
+        raise ValueError(
+            f"RMSNorm values and learned weights differ: {len(values)} != {len(learned_weight)}"
+        )
     scale = math.sqrt(sum(value * value for value in values) / len(values) + 1.0e-6)
-    return [value / scale for value in values]
+    return [
+        value / scale * (1.0 + weight)
+        for value, weight in zip(values, learned_weight)
+    ]
 
 
 def matmul(vector: list[float], matrix: list[float], columns: int) -> list[float]:
@@ -170,8 +180,15 @@ def run_chunk(
         gated: list[float] = []
         for stream in range(hc_count):
             begin = stream * hidden_size
-            key_group = rms_norm(key[begin : begin + hidden_size])
-            query_group = rms_norm(query[begin : begin + hidden_size])
+            end = begin + hidden_size
+            key_group = rms_norm(
+                key[begin:end],
+                table["norm_key"][begin:end],
+            )
+            query_group = rms_norm(
+                query[begin:end],
+                table["norm_query"][begin:end],
+            )
             gate = sum(left * right for left, right in zip(key_group, query_group)) / math.sqrt(hidden_size)
             signed_root = math.copysign(math.sqrt(max(abs(gate), 1.0e-6)), gate)
             sigmoid = 1.0 / (1.0 + math.exp(-signed_root))
@@ -180,7 +197,13 @@ def run_chunk(
         normalized: list[float] = []
         for stream in range(hc_count):
             begin = stream * hidden_size
-            normalized.extend(rms_norm(gated[begin : begin + hidden_size]))
+            end = begin + hidden_size
+            normalized.extend(
+                rms_norm(
+                    gated[begin:end],
+                    table["norm_conv"][begin:end],
+                )
+            )
         current_normed.append(normalized)
 
     all_conv = [

@@ -23,9 +23,11 @@ base table size `20000000`, seed `1234`, and 48 text layers.
 `generate_qwen4_exp_ple_reference.py` independently expresses the published
 token-history/EOS reset, SplitMix-derived hash multipliers, per-head prime
 modulo and offsets, learned lookup, key/value projections, grouped RMS
-normalization, signed-root sigmoid gate, depthwise dilated convolution, and
-residual injection. It emits checked-in vectors for full, two-chunk, and
-single-token decode boundaries.
+normalization followed by each stream's learned `1 + weight` scale, signed-root
+sigmoid gate, depthwise dilated convolution, and residual injection. Distinct
+deterministic synthetic scales cover `norm_key`, `norm_query`, and `norm_conv`.
+It emits checked-in vectors for full, two-chunk, and single-token decode
+boundaries.
 
 The vectors use deterministic synthetic weights and reduced table/hidden
 geometry so they remain small and hermetic. They establish **reference
