@@ -1400,13 +1400,45 @@ impl Engine {
             {
                 let arrival = arrivals[next_arrival].clone();
                 next_arrival += 1;
-                let active_request = self.prepare_active_generate(arrival.request)?;
+                let active_request = match self.prepare_active_generate(arrival.request.clone()) {
+                    Ok(active) => active,
+                    Err(error)
+                        if error
+                            .downcast_ref::<crate::pipeline::PerTokenCursorIneligible>()
+                            .is_some() =>
+                    {
+                        let result = self
+                            .generate_in_session_with_priority_and_callback(
+                                arrival.request.session_id,
+                                arrival.request.request,
+                                arrival.request.priority,
+                                None,
+                                None,
+                                None,
+                            )
+                            .context(
+                                "the prioritized cursor declined a valid topology and generic \
+                                 workflow execution failed",
+                            )?;
+                        generated_steps += result.token_ids.len();
+                        results.push(PrioritizedGenerateResult {
+                            session_id: arrival.request.session_id,
+                            result,
+                        });
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
                 if active
                     .insert(active_request.session_id, active_request)
                     .is_some()
                 {
                     anyhow::bail!("session already has an active generation request");
                 }
+            }
+
+            if results.len() == total_requests {
+                break;
             }
 
             let decision = self.scheduler.schedule();
@@ -2206,33 +2238,82 @@ impl Engine {
             anyhow::bail!("session {} not found", request.session_id);
         }
         if self.should_use_speculative(&options) {
-            anyhow::bail!(
-                "prioritized drive API currently supports the single-sequence non-speculative path; batched/speculative drive is future work"
-            );
+            return Err(crate::pipeline::PerTokenCursorIneligible::new(
+                "this valid request selects speculative proposal and verification, which cannot \
+                 suspend at the prioritized cursor's one-target-token boundary",
+            )
+            .into());
         }
 
         let max_context = self.max_context_for_request(&options);
         let chain = build_processor_chain(&options, Some(self.require_tokenizer()?), false)?;
-        // The declared loop is bound and its setup run before scheduler
-        // admission: a package this drive cannot advance is refused without
-        // having admitted the request or touched its session state.
-        let cursor = crate::pipeline::WorkflowGenerationCursor::start(
-            &self.workflow,
-            crate::pipeline::PipelineGenerateRequest::new(GenerateRequest {
-                prompt: crate::GeneratePrompt::TokenIds(prompt_tokens.clone()),
-                options: options.clone(),
-            }),
-            crate::pipeline::generation::DECODE_CORE_CONTRACTS,
-            &mut None,
-        )?;
+        crate::pipeline::WorkflowGenerationCursor::validate_per_token_capability(&self.workflow)?;
         let mut state = self
             .sessions
             .remove(&request.session_id)
             .with_context(|| format!("session {} not found", request.session_id))?;
-        let prefix_cache_hit_len =
-            self.prepare_session_prefix(request.session_id, &mut state, &prompt_tokens)?;
-        let rng = SamplingRng::new(options.seed);
-        let logprobs = options.top_logprobs.map(|_| Vec::new());
+        let prepared = (|| -> anyhow::Result<_> {
+            let prefix_cache_hit_len =
+                self.prepare_session_prefix(request.session_id, &mut state, &prompt_tokens)?;
+            let mut loop_state =
+                DecodeLoopState::new(prefix_cache_hit_len, options.seed, options.top_logprobs);
+            let (cursor, setup_finish) = {
+                let tokenizer = self
+                    .tokenizer
+                    .as_ref()
+                    .context("this package declares no tokenizer, so it cannot decode text")?;
+                let mut backend = SessionDecodeLoopBackend {
+                    session: self
+                        .session
+                        .as_deref()
+                        .ok_or_else(|| anyhow::anyhow!(MISSING_ORT_SESSION))?,
+                    kv_model: self.kv_model.as_ref(),
+                    kv_cache: &mut self.kv_cache,
+                    scheduler: &mut self.scheduler,
+                    session_id: request.session_id,
+                    state: &mut state,
+                };
+                let mut host = crate::pipeline::generation::GenerationNodeHost::new(
+                    &mut backend,
+                    &mut loop_state,
+                    &crate::pipeline::generation::GenerationRequest {
+                        options: &options,
+                        chain: &chain,
+                        tokenizer,
+                        max_context,
+                    },
+                    None,
+                );
+                let cursor = {
+                    let mut host_ref: Option<&mut dyn crate::pipeline::WorkflowNodeHost> =
+                        Some(&mut host);
+                    crate::pipeline::WorkflowGenerationCursor::start(
+                        &self.workflow,
+                        crate::pipeline::PipelineGenerateRequest::new(GenerateRequest {
+                            prompt: crate::GeneratePrompt::TokenIds(prompt_tokens.clone()),
+                            options: options.clone(),
+                        }),
+                        crate::pipeline::generation::DECODE_CORE_CONTRACTS,
+                        &mut host_ref,
+                    )?
+                };
+                anyhow::ensure!(
+                    host.can_suspend(),
+                    "authored loop setup leaves a decoder result pending for a later policy node; \
+                     the prioritized per-token optimization cannot suspend at that boundary, so \
+                     execute this package through the generic generation path"
+                );
+                (cursor, host.reached_finish())
+            };
+            Ok((cursor, setup_finish, prefix_cache_hit_len, loop_state))
+        })();
+        let (cursor, setup_finish, prefix_cache_hit_len, loop_state) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.sessions.insert(request.session_id, state);
+                return Err(error);
+            }
+        };
         self.scheduler.enqueue_generate_request(
             request.session_id,
             prompt_tokens.len(),
@@ -2248,12 +2329,13 @@ impl Engine {
             max_context,
             prompt_len: prompt_tokens.len(),
             prefix_cache_hit_len,
-            generated_tokens: Vec::new(),
-            generated_text: String::new(),
-            logprobs,
+            generated_tokens: loop_state.generated_tokens,
+            generated_text: loop_state.generated_text,
+            logprobs: loop_state.logprobs,
             budget_cap: None,
-            step: 0,
-            rng,
+            step: loop_state.step,
+            rng: loop_state.rng,
+            setup_finish,
         })
     }
 
@@ -2270,7 +2352,24 @@ impl Engine {
             rng: std::mem::replace(&mut active.rng, SamplingRng::new(Some(0))),
             custom_sampler: None,
         };
-        let step_result = {
+        let step_result = if let Some(finish_reason) = active.setup_finish.take() {
+            let tokenizer = self
+                .tokenizer
+                .as_ref()
+                .context("this package declares no tokenizer, so it cannot decode text")?;
+            ensure_constrained_finish(
+                &active.options,
+                &loop_state.generated_text,
+                finish_reason.clone(),
+            )?;
+            Some(crate::decode_loop::finish_result(
+                tokenizer,
+                &loop_state.generated_tokens,
+                finish_reason,
+                loop_state.prefix_cache_hit_len,
+                loop_state.logprobs.as_deref(),
+            )?)
+        } else {
             // Borrowed before the disjoint mutable borrows the backend takes.
             let tokenizer = self
                 .tokenizer
@@ -2308,6 +2407,12 @@ impl Engine {
                 let mut host_ref: Option<&mut dyn crate::pipeline::WorkflowNodeHost> =
                     Some(&mut host);
                 let ran = cursor.advance(runtime, &mut host_ref)?;
+                anyhow::ensure!(
+                    host.can_suspend(),
+                    "an authored loop iteration leaves a decoder result pending for a later \
+                     policy node; the prioritized per-token optimization cannot suspend at that \
+                     boundary, so execute this package through the generic generation path"
+                );
                 (ran, host.reached_finish())
             };
             let finish = match (ran, finish) {

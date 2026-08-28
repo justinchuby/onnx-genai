@@ -53,7 +53,9 @@ pub use workflow::{
     MISSING_REQUIRED_INPUT, WorkflowExecutionPlan, WorkflowPerformanceDiagnostic,
     is_missing_required_input, workflow_carries_session_state,
 };
-pub(crate) use workflow::{WorkflowGenerationCursor, WorkflowNodeHost, WorkflowNodeRequest};
+pub(crate) use workflow::{
+    PerTokenCursorIneligible, WorkflowGenerationCursor, WorkflowNodeHost, WorkflowNodeRequest,
+};
 
 pub fn has_buffered_pcm16_wav_output(workflow: &WorkflowSpec) -> bool {
     audio::has_buffered_pcm16_wav_output(workflow)

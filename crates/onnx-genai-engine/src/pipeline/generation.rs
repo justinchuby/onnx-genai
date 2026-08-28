@@ -446,6 +446,12 @@ impl<'a, 'c, B: DecodeLoopBackend + ?Sized> GenerationNodeHost<'a, 'c, B> {
         self.finish.clone()
     }
 
+    /// Whether execution can move to another scheduler turn without dropping
+    /// decoder output that a later token-policy node still has to consume.
+    pub(crate) fn can_suspend(&self) -> bool {
+        self.pending_forward.is_none()
+    }
+
     fn run_decode_node(&mut self) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.pending_forward.is_none(),
