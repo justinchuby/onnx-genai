@@ -1282,7 +1282,10 @@ impl<'a> WorkflowExecutionPlan<'a> {
                     && let Some(context) =
                         engine.worker.active_adapter_context.borrow_mut().as_mut()
                 {
-                    context.compact(&selection)?;
+                    // The adapter context is one of the batch's row-scoped
+                    // carriers.  Route it through the shared plan rather than
+                    // letting this carrier interpret selection positions itself.
+                    super::RowPlan::select(batch_rows, selection)?.apply(&mut [context])?;
                 }
             }
             Ok(())

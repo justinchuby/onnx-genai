@@ -48,7 +48,7 @@ pub use batching::{
 pub(crate) use generation::validate_generation_workflow;
 pub use islands::ExecutionIslandDiagnostic;
 pub use onnx_genai_metadata::WorkflowOutputRole;
-pub use row_state::{RowScopedState, RowTable, check_selection, gather_rows};
+pub use row_state::{RowPlan, RowScopedState, RowTable, check_selection, gather_rows};
 pub use workflow::{
     MISSING_REQUIRED_INPUT, WorkflowExecutionPlan, WorkflowPerformanceDiagnostic,
     is_missing_required_input, workflow_carries_session_state,

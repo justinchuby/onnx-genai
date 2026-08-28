@@ -1016,6 +1016,54 @@ impl<'a> ContinuousBatchManager<'a> {
 }
 
 impl Engine {
+    /// Why this engine must use isolated generation rather than a shared
+    /// live-row forward.
+    ///
+    /// This is deliberately an eligibility check rather than package
+    /// validation.  The workflow remains executable when the selected backend
+    /// cannot share its forward, when the graph shape is unsuitable for the
+    /// specialized runner, or when its declared loop has no compactable
+    /// row-major form.
+    fn shared_batch_ineligible_reason(&self) -> Option<String> {
+        if !self.holds_decode_core() {
+            return Some(
+                "the declared workflow has no fused decode executor that can issue a shared \
+                 live-row forward"
+                    .to_string(),
+            );
+        }
+        if let Err(error) =
+            crate::pipeline::validate_generation_workflow(self.workflow.workflow_spec())
+        {
+            return Some(format!(
+                "the declared generation loop is not eligible for the specialized shared \
+                 live-row executor: {error:#}"
+            ));
+        }
+        let capability = self.batching_capability();
+        (!capability.supports_batching()).then(|| capability.reason().to_string())
+    }
+
+    /// Execute each request through the ordinary single-request path.
+    ///
+    /// Formation, row placement, and shared-forward support are optimization
+    /// concerns.  This is therefore the only fallback: it preserves the normal
+    /// scheduler admission, request-local state, callbacks, EOS handling, and
+    /// result order without inventing a second isolated token policy.
+    fn run_isolated_batch(
+        &mut self,
+        requests: Vec<GenerateRequest>,
+    ) -> anyhow::Result<Vec<GenerateResult>> {
+        requests
+            .into_iter()
+            .enumerate()
+            .map(|(index, request)| {
+                self.generate(request)
+                    .with_context(|| format!("isolated batch request {index}"))
+            })
+            .collect()
+    }
+
     /// Refuse a package whose declared workflow the batched routes cannot run.
     ///
     /// Batching advances N rows through *one* decoder forward pass, so it needs
@@ -1070,11 +1118,6 @@ impl Engine {
         if requests.is_empty() {
             return Ok(Vec::new());
         }
-        // Checked before the capability question, because "this package is not
-        // executable at all" is a different and prior answer to "this package
-        // cannot batch" -- reporting the capability first would tell a caller to
-        // go find a batchable model when the real problem is the package.
-        self.assert_batched_generation_declared()?;
         let max_batch = requests.len();
         self.run_continuous_batch(requests, max_batch)
     }
@@ -1341,8 +1384,32 @@ impl Engine {
         if requests.is_empty() {
             return Ok(Vec::new());
         }
+        if max_batch == 0 {
+            anyhow::bail!("continuous batch max_batch must be greater than zero");
+        }
+        if let Some(reason) = self.shared_batch_ineligible_reason() {
+            tracing::debug!(%reason, "declining shared live-row batching; using isolated execution");
+            return self.run_isolated_batch(requests);
+        }
+        // Constructing a shared session only allocates its private execution
+        // resources.  If a backend rejects its shape, capture, or binding ABI
+        // here, nothing request-visible has run yet and isolation remains
+        // correct.  Errors after construction are never retried in isolation:
+        // a forward may already have changed state or published output.
+        let fallback_requests = requests.clone();
         let expected_results = requests.len();
-        let mut manager = self.continuous_batch_manager(max_batch)?;
+        let manager_result = self.continuous_batch_manager(max_batch);
+        if let Err(error) = &manager_result {
+            tracing::debug!(
+                %error,
+                "shared live-row setup declined; using isolated execution"
+            );
+        }
+        if manager_result.is_err() {
+            drop(manager_result);
+            return self.run_isolated_batch(fallback_requests);
+        }
+        let mut manager = manager_result.expect("checked shared manager construction");
         let mut results = vec![None; expected_results];
         for request in requests {
             manager.submit(request)?;
@@ -1394,6 +1461,11 @@ impl Engine {
         if max_batch == 0 {
             anyhow::bail!("continuous batch max_batch must be greater than zero");
         }
+        if let Some(reason) = self.shared_batch_ineligible_reason() {
+            tracing::debug!(%reason, "declining scheduled shared live-row batching; using isolated execution");
+            return self.run_isolated_batch(requests);
+        }
+        let fallback_requests = requests.clone();
         let expected_results = requests.len();
 
         // Tokenize every prompt up front so the scheduler and the batch manager
@@ -1448,7 +1520,18 @@ impl Engine {
             );
         }
 
-        let mut manager = self.continuous_batch_manager(max_batch)?;
+        let manager_result = self.continuous_batch_manager(max_batch);
+        if let Err(error) = &manager_result {
+            tracing::debug!(
+                %error,
+                "scheduled shared live-row setup declined; using isolated execution"
+            );
+        }
+        if manager_result.is_err() {
+            drop(manager_result);
+            return self.run_isolated_batch(fallback_requests);
+        }
+        let mut manager = manager_result.expect("checked shared manager construction");
         let mut results = vec![None; expected_results];
         let mut pending_requests: Vec<Option<GenerateRequest>> =
             token_requests.into_iter().map(Some).collect();
