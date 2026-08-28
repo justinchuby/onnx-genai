@@ -96,11 +96,13 @@ fn generated_schema_preserves_all_root_constraints() {
     assert!(serialized.contains("\"segments\""));
     assert!(!serialized.contains("\"adapter_ids\""));
     let output = &schema["$defs"]["WorkflowOutput"];
+    assert!(output["properties"]["family"].is_object());
     assert!(
-        output["required"]
+        !output["required"]
             .as_array()
             .is_some_and(|required| required.contains(&serde_json::json!("family"))),
-        "every serialized workflow output must declare exactly one publication family"
+        "the nested output schema cannot condition requiredness on the root schema_version; \
+         parser and typed-admission tests enforce v1.5 while legacy documents omit family"
     );
     assert!(serialized.contains("\"retract\""));
     assert!(serialized.contains("\"finalize\""));

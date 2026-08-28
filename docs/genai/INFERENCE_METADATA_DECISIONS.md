@@ -397,9 +397,9 @@ publication is outward and observable through the host runtime contract but is
 transport-neutral: metadata does not define HTTP/SSE/gRPC/WebSocket framing,
 flush timing, buffering, reconnect, retry, or backpressure.
 
-Each output declares exactly one protocol family. Every emit targeting it
-selects only an operation allowed by that family and preserves its typed value,
-guard, valid length, and effect ordering:
+In schema v1.5 and later, each output declares exactly one protocol family.
+Every emit targeting it selects only an operation allowed by that family and
+preserves its typed value, guard, valid length, and effect ordering:
 
 | Family | Allowed publication semantics |
 | --- | --- |
@@ -410,6 +410,16 @@ guard, valid length, and effect ordering:
 An emit **MUST NOT** redefine the output family. Output identity, row behavior,
 payload contract, and growth rules are output-level invariants; workflow
 control/dataflow and effect ordering determine publication order.
+
+Output families, logical `stream` selection, and the `retract`/`finalize`
+operations enter the schema together at v1.5. A document below v1.5 **MUST NOT**
+author those fields or operations: omission retains the older per-emit
+`replace`/`append`/`event` semantics, and explicitly writing even
+`family: { kind: materialized }` does not opt an older document into the newer
+contract. A v1.5-or-newer document **MUST** declare exactly one `family` for
+every workflow output. Producers migrate by re-emitting the complete package at
+v1.5 or later, never by relying on a newer reader to ignore, drop, or reinterpret
+the field.
 
 A typed revision envelope identifies its output/stream, enclosing transaction,
 deterministic sequence, revision, required lineage/base, operation, and typed

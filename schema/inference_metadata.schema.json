@@ -5295,6 +5295,9 @@
         },
         "family": {
           "$ref": "#/$defs/WorkflowOutputFamily",
+          "default": {
+            "kind": "materialized"
+          },
           "description": "The sole publication family for this output boundary.\n\nThe default preserves documents authored before output protocols were\nintroduced. New schema-versioned documents must state this field; see\nthe parser's version gate."
         },
         "media": {
@@ -5328,7 +5331,6 @@
       "required": [
         "contract",
         "role",
-        "family",
         "stage"
       ],
       "type": "object"

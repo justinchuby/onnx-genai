@@ -276,7 +276,7 @@ fn gate_document(document: &serde_yaml::Value) -> Result<(), crate::MetadataErro
     reject_invalid_tensor_contract_shapes(document, String::new())?;
     let declared = crate::version::declared_in(document).map_err(crate::MetadataError::Parse)?;
     let version = crate::version::gate(declared).map_err(crate::MetadataError::Parse)?;
-    require_output_families(document, version)?;
+    gate_output_protocol_features(document, version)?;
     reject_retired_streaming_emit(document)?;
     // After the version, deliberately. The flat packed spelling is a reshape
     // within the v1 line, so refusing it presumes the document belongs to that
@@ -293,33 +293,99 @@ fn gate_document(document: &serde_yaml::Value) -> Result<(), crate::MetadataErro
         .and_then(|_| reject_retired_batching_hints(document))
 }
 
-/// Output protocols are a v1.5 addition. Older packages retain their original
-/// materialized-value interpretation, while a v1.5 package must make the
-/// family explicit so an older reader cannot accidentally choose one.
-fn require_output_families(
+/// Apply the canonical output-protocol version gate to the untyped document.
+///
+/// This runs before deserialization so authored presence is still observable:
+/// a legacy output without `family` defaults to materialized, while an explicit
+/// family, stream, retract, or finalize cannot smuggle v1.5 semantics into an
+/// older version.
+fn gate_output_protocol_features(
     document: &serde_yaml::Value,
     version: crate::version::SchemaVersion,
 ) -> Result<(), crate::MetadataError> {
-    if version < crate::version::OUTPUT_PROTOCOL_SCHEMA_VERSION {
-        return Ok(());
-    }
-    let Some(outputs) = document
+    if let Some(outputs) = document
         .get("pipeline")
         .and_then(|pipeline| pipeline.get("workflow"))
         .and_then(|workflow| workflow.get("outputs"))
         .and_then(serde_yaml::Value::as_mapping)
-    else {
-        return Ok(());
-    };
-    for (name, output) in outputs {
-        let name = name.as_str().unwrap_or("?");
-        if output.get("family").is_none() {
-            return Err(crate::MetadataError::Parse(format!(
-                "pipeline.workflow.outputs.{name} is missing required `family` in schema \
-                 version {version}; declare exactly one of `{{ kind: materialized }}`, \
-                 `{{ kind: events }}`, or `{{ kind: revisions, version: \"1\" }}`"
-            )));
+    {
+        for (name, output) in outputs {
+            let name = name.as_str().unwrap_or("?");
+            let family = output.get("family");
+            let authored = if version < crate::version::OUTPUT_PROTOCOL_SCHEMA_VERSION {
+                family.is_some()
+            } else {
+                family.is_some_and(|family| !family.is_null())
+            };
+            crate::version::gate_feature_field(
+                version,
+                crate::version::SchemaFeature::OutputProtocols,
+                &format!("pipeline.workflow.outputs.{name}.family"),
+                authored,
+            )
+            .map_err(crate::MetadataError::Parse)?;
         }
+    }
+
+    fn walk_emits(
+        value: &serde_yaml::Value,
+        version: crate::version::SchemaVersion,
+        path: &str,
+    ) -> Result<(), crate::MetadataError> {
+        match value {
+            serde_yaml::Value::Mapping(mapping) => {
+                let is_emit = mapping
+                    .get(serde_yaml::Value::from("kind"))
+                    .and_then(serde_yaml::Value::as_str)
+                    == Some("emit");
+                if is_emit {
+                    if mapping.contains_key(serde_yaml::Value::from("stream")) {
+                        crate::version::gate_feature_use(
+                            version,
+                            crate::version::SchemaFeature::OutputProtocols,
+                            &format!("{path}.stream"),
+                        )
+                        .map_err(crate::MetadataError::Parse)?;
+                    }
+                    if mapping
+                        .get(serde_yaml::Value::from("mode"))
+                        .and_then(serde_yaml::Value::as_str)
+                        .is_some_and(|mode| matches!(mode, "retract" | "finalize"))
+                    {
+                        crate::version::gate_feature_use(
+                            version,
+                            crate::version::SchemaFeature::OutputProtocols,
+                            &format!("{path}.mode"),
+                        )
+                        .map_err(crate::MetadataError::Parse)?;
+                    }
+                }
+                for (key, child) in mapping {
+                    let key = key.as_str().unwrap_or("?");
+                    let child_path = if path.is_empty() {
+                        key.to_string()
+                    } else {
+                        format!("{path}.{key}")
+                    };
+                    walk_emits(child, version, &child_path)?;
+                }
+            }
+            serde_yaml::Value::Sequence(items) => {
+                for (index, child) in items.iter().enumerate() {
+                    walk_emits(child, version, &format!("{path}[{index}]"))?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    if let Some(steps) = document
+        .get("pipeline")
+        .and_then(|pipeline| pipeline.get("workflow"))
+        .and_then(|workflow| workflow.get("steps"))
+    {
+        walk_emits(steps, version, "pipeline.workflow.steps")?;
     }
     Ok(())
 }

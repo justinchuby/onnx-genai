@@ -444,6 +444,7 @@ fn validate_schema_version(metadata: &InferenceMetadata, errors: &mut Vec<String
         ));
         return;
     }
+    validate_output_protocol_version(metadata, declared, errors);
     let has_special_tokens = metadata
         .package
         .as_ref()
@@ -522,6 +523,93 @@ fn validate_schema_version(metadata: &InferenceMetadata, errors: &mut Vec<String
              refused for the reason that is true"
         ));
     }
+}
+
+fn validate_output_protocol_version(
+    metadata: &InferenceMetadata,
+    version: crate::version::SchemaVersion,
+    errors: &mut Vec<String>,
+) {
+    let Some(workflow) = metadata
+        .pipeline
+        .as_ref()
+        .map(|pipeline| &pipeline.workflow)
+    else {
+        return;
+    };
+    for (name, output) in &workflow.outputs {
+        if let Err(error) = crate::version::gate_feature_field(
+            version,
+            crate::version::SchemaFeature::OutputProtocols,
+            &format!("pipeline.workflow.outputs.{name}.family"),
+            output.family_authored,
+        ) {
+            errors.push(error);
+        }
+    }
+
+    fn validate_steps(
+        steps: &[WorkflowStep],
+        version: crate::version::SchemaVersion,
+        path: &str,
+        errors: &mut Vec<String>,
+    ) {
+        for (index, step) in steps.iter().enumerate() {
+            let site = format!("{path}[{index}]");
+            match step {
+                WorkflowStep::Sequence { steps } => {
+                    validate_steps(steps, version, &format!("{site}.steps"), errors);
+                }
+                WorkflowStep::Loop { setup, steps, .. } => {
+                    validate_steps(setup, version, &format!("{site}.setup"), errors);
+                    validate_steps(steps, version, &format!("{site}.steps"), errors);
+                }
+                WorkflowStep::Branch { cases, default, .. } => {
+                    for (case, step) in cases {
+                        validate_steps(
+                            std::slice::from_ref(step),
+                            version,
+                            &format!("{site}.cases.{case}"),
+                            errors,
+                        );
+                    }
+                    if let Some(default) = default {
+                        validate_steps(
+                            std::slice::from_ref(default.as_ref()),
+                            version,
+                            &format!("{site}.default"),
+                            errors,
+                        );
+                    }
+                }
+                WorkflowStep::Emit { stream, mode, .. } => {
+                    if stream.is_some()
+                        && let Err(error) = crate::version::gate_feature_use(
+                            version,
+                            crate::version::SchemaFeature::OutputProtocols,
+                            &format!("{site}.stream"),
+                        )
+                    {
+                        errors.push(error);
+                    }
+                    if matches!(
+                        mode,
+                        crate::schema::WorkflowEmitMode::Retract
+                            | crate::schema::WorkflowEmitMode::Finalize
+                    ) && let Err(error) = crate::version::gate_feature_use(
+                        version,
+                        crate::version::SchemaFeature::OutputProtocols,
+                        &format!("{site}.mode"),
+                    ) {
+                        errors.push(error);
+                    }
+                }
+                WorkflowStep::Invoke { .. } => {}
+            }
+        }
+    }
+
+    validate_steps(&workflow.steps, version, "pipeline.workflow.steps", errors);
 }
 
 /// Enforce one authority for numeric token facts and one executable stop policy.
@@ -2104,35 +2192,49 @@ fn validate_adapter_service(
 /// Validate output-level publication semantics before lowering makes the
 /// control-flow sites opaque. A family is declared once per output; a site may
 /// only select one of that family's operations.
-fn validate_output_protocols(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
+fn validate_output_protocols(
+    workflow: &WorkflowSpec,
+    version: crate::version::SchemaVersion,
+    errors: &mut Vec<String>,
+) {
     for (name, output) in &workflow.outputs {
-        if let crate::schema::WorkflowOutputFamily::Revisions { version } = &output.family
-            && version != "1"
+        if output.family_authored
+            && let crate::schema::WorkflowOutputFamily::Revisions {
+                version: revision_version,
+            } = &output.family
+            && revision_version != "1"
         {
             errors.push(format!(
-                "pipeline.workflow.outputs.{name}.family.version is '{version}', but this runtime \
+                "pipeline.workflow.outputs.{name}.family.version is '{revision_version}', but this runtime \
                  implements typed revision protocol version '1'; declare the exact supported \
                  version rather than relying on a compatible-looking revision"
             ));
         }
     }
 
-    fn walk(steps: &[WorkflowStep], workflow: &WorkflowSpec, path: &str, errors: &mut Vec<String>) {
+    fn walk(
+        steps: &[WorkflowStep],
+        workflow: &WorkflowSpec,
+        version: crate::version::SchemaVersion,
+        path: &str,
+        errors: &mut Vec<String>,
+    ) {
         for (index, step) in steps.iter().enumerate() {
             let site = format!("{path}[{index}]");
             match step {
                 WorkflowStep::Sequence { steps } => {
-                    walk(steps, workflow, &format!("{site}.steps"), errors);
+                    walk(steps, workflow, version, &format!("{site}.steps"), errors);
                 }
                 WorkflowStep::Loop { setup, steps, .. } => {
-                    walk(setup, workflow, &format!("{site}.setup"), errors);
-                    walk(steps, workflow, &format!("{site}.steps"), errors);
+                    walk(setup, workflow, version, &format!("{site}.setup"), errors);
+                    walk(steps, workflow, version, &format!("{site}.steps"), errors);
                 }
                 WorkflowStep::Branch { cases, default, .. } => {
                     for (case, step) in cases {
                         walk(
                             std::slice::from_ref(step),
                             workflow,
+                            version,
                             &format!("{site}.cases.{case}"),
                             errors,
                         );
@@ -2141,6 +2243,7 @@ fn validate_output_protocols(workflow: &WorkflowSpec, errors: &mut Vec<String>) 
                         walk(
                             std::slice::from_ref(default.as_ref()),
                             workflow,
+                            version,
                             &format!("{site}.default"),
                             errors,
                         );
@@ -2191,23 +2294,29 @@ fn validate_output_protocols(workflow: &WorkflowSpec, errors: &mut Vec<String>) 
                              and therefore cannot declare `when`, `valid_length`, or `axis`"
                         ));
                     }
-                    let legal = matches!(
-                        (&declared.family, mode),
-                        (
-                            crate::schema::WorkflowOutputFamily::Materialized,
-                            crate::schema::WorkflowEmitMode::Replace
-                                | crate::schema::WorkflowEmitMode::Append,
-                        ) | (
-                            crate::schema::WorkflowOutputFamily::Events,
-                            crate::schema::WorkflowEmitMode::Event,
-                        ) | (
-                            crate::schema::WorkflowOutputFamily::Revisions { .. },
-                            crate::schema::WorkflowEmitMode::Append
-                                | crate::schema::WorkflowEmitMode::Replace
-                                | crate::schema::WorkflowEmitMode::Retract
-                                | crate::schema::WorkflowEmitMode::Finalize,
+                    let legacy = version < crate::version::OUTPUT_PROTOCOL_SCHEMA_VERSION
+                        && !declared.family_authored;
+                    let legal = if legacy {
+                        true
+                    } else {
+                        matches!(
+                            (&declared.family, mode),
+                            (
+                                crate::schema::WorkflowOutputFamily::Materialized,
+                                crate::schema::WorkflowEmitMode::Replace
+                                    | crate::schema::WorkflowEmitMode::Append,
+                            ) | (
+                                crate::schema::WorkflowOutputFamily::Events,
+                                crate::schema::WorkflowEmitMode::Event,
+                            ) | (
+                                crate::schema::WorkflowOutputFamily::Revisions { .. },
+                                crate::schema::WorkflowEmitMode::Append
+                                    | crate::schema::WorkflowEmitMode::Replace
+                                    | crate::schema::WorkflowEmitMode::Retract
+                                    | crate::schema::WorkflowEmitMode::Finalize,
+                            )
                         )
-                    );
+                    };
                     if !legal {
                         errors.push(format!(
                             "{site} selects {mode:?} for output '{output}', but its declared family \
@@ -2215,10 +2324,12 @@ fn validate_output_protocols(workflow: &WorkflowSpec, errors: &mut Vec<String>) 
                             declared.family
                         ));
                     }
-                    if matches!(
-                        declared.family,
-                        crate::schema::WorkflowOutputFamily::Materialized
-                    ) && stream.is_some()
+                    if !legacy
+                        && matches!(
+                            declared.family,
+                            crate::schema::WorkflowOutputFamily::Materialized
+                        )
+                        && stream.is_some()
                     {
                         errors.push(format!(
                             "{site}.stream names a stream for materialized output '{output}'; \
@@ -2231,7 +2342,13 @@ fn validate_output_protocols(workflow: &WorkflowSpec, errors: &mut Vec<String>) 
         }
     }
 
-    walk(&workflow.steps, workflow, "pipeline.workflow.steps", errors);
+    walk(
+        &workflow.steps,
+        workflow,
+        version,
+        "pipeline.workflow.steps",
+        errors,
+    );
 }
 
 fn validate_workflow(
@@ -2239,7 +2356,7 @@ fn validate_workflow(
     version: crate::version::SchemaVersion,
     errors: &mut Vec<String>,
 ) {
-    validate_output_protocols(workflow, errors);
+    validate_output_protocols(workflow, version, errors);
     let compiled = match crate::compile_workflow(workflow) {
         Ok(compiled) => compiled,
         Err(error) => {

@@ -19,8 +19,8 @@
 //! arbitrates.
 
 use onnx_genai_metadata::{
-    INITIAL_SCHEMA_VERSION, SCHEMA_VERSION, SUPPORTED_SCHEMA_VERSION, parse_metadata,
-    parse_metadata_json, validate_metadata, version,
+    INITIAL_SCHEMA_VERSION, SCHEMA_VERSION, SUPPORTED_SCHEMA_VERSION, WorkflowOutputFamily,
+    parse_metadata, parse_metadata_json, validate_metadata, version,
 };
 
 /// The smallest document that says nothing new.
@@ -72,6 +72,19 @@ pipeline:
         value: raw
         output: tokens
         mode: replace
+"#;
+
+const OUTPUT_WITHOUT_FAMILY: &str = r#"
+pipeline:
+  workflow:
+    manifest: { capabilities: [workflow_ssa, typed_emit] }
+    outputs:
+      answer:
+        contract: { dtype: int64, shape: [sequence] }
+        role: tensor
+        stage: pre_adapter
+    components: {}
+    steps: []
 "#;
 
 fn with_version(document: &str, spelling: Option<&str>) -> String {
@@ -126,32 +139,158 @@ fn a_newer_document_is_refused_by_version_rather_than_by_the_first_field_it_uses
 }
 
 #[test]
-fn output_protocol_families_are_required_by_the_version_that_introduced_them() {
-    let without_family = r#"
-schema_version: "v1.5"
-pipeline:
-  workflow:
-    manifest: { capabilities: [workflow_ssa, typed_emit] }
-    outputs:
-      answer:
-        contract: { dtype: int64, shape: [sequence] }
-        role: tensor
-        stage: pre_adapter
-    components: {}
-    steps: []
-"#;
-    let error = parse_metadata(without_family, Some("yaml"))
+fn v1_4_without_family_keeps_legacy_materialized_round_trip() {
+    let document = with_version(OUTPUT_WITHOUT_FAMILY, Some("v1.4"));
+    let metadata = parse_metadata(&document, Some("yaml")).expect("legacy output parses");
+    let output = &metadata
+        .pipeline
+        .as_ref()
+        .expect("pipeline")
+        .workflow
+        .outputs["answer"];
+    assert_eq!(output.family, WorkflowOutputFamily::Materialized);
+    assert!(!output.family_authored);
+
+    let round_trip = serde_yaml::to_string(output).expect("legacy output serializes");
+    assert!(
+        !round_trip.contains("family:"),
+        "serialization must not upgrade a v1.4 output by adding v1.5 semantics: {round_trip}"
+    );
+    let reparsed: onnx_genai_metadata::WorkflowOutput =
+        serde_yaml::from_str(&round_trip).expect("legacy output round-trip parses");
+    assert!(!reparsed.family_authored);
+}
+
+#[test]
+fn v1_4_rejects_each_explicit_output_family_at_the_version_boundary() {
+    for family in [
+        "{ kind: materialized }",
+        "{ kind: events }",
+        "{ kind: revisions, version: \"1\" }",
+    ] {
+        let document = with_version(
+            &OUTPUT_WITHOUT_FAMILY.replace(
+                "stage: pre_adapter",
+                &format!("family: {family}\n        stage: pre_adapter"),
+            ),
+            Some("v1.4"),
+        );
+        let error = parse_metadata(&document, Some("yaml"))
+            .expect_err("v1.4 must not opt into output-family semantics");
+        let reported = error.to_string();
+        assert!(
+            reported.contains("pipeline.workflow.outputs.answer.family")
+                && reported.contains("authored schema version v1.4")
+                && reported.contains("minimum schema version v1.5")
+                && reported.contains("migrate/re-emit"),
+            "{family}: {reported}"
+        );
+    }
+}
+
+#[test]
+fn typed_deserialization_retains_authored_family_for_validation_and_admission() {
+    let document = with_version(
+        &OUTPUT_WITHOUT_FAMILY.replace(
+            "stage: pre_adapter",
+            "family: { kind: materialized }\n        stage: pre_adapter",
+        ),
+        Some("v1.4"),
+    );
+    let metadata: onnx_genai_metadata::InferenceMetadata =
+        serde_yaml::from_str(&document).expect("typed deserializer retains the declaration");
+    assert!(
+        metadata
+            .pipeline
+            .as_ref()
+            .expect("pipeline")
+            .workflow
+            .outputs["answer"]
+            .family_authored
+    );
+    let errors = validate_metadata(&metadata).expect_err("typed validation must apply the gate");
+    assert!(
+        errors
+            .join("\n")
+            .contains("pipeline.workflow.outputs.answer.family"),
+        "{errors:#?}"
+    );
+}
+
+#[test]
+fn typed_validation_gates_other_v1_5_output_protocol_fields() {
+    for authored in [
+        "stream: named\n        mode: append",
+        "mode: retract",
+        "mode: finalize",
+    ] {
+        let document = with_version(
+            &OUTPUT_WITHOUT_FAMILY.replace(
+                "steps: []",
+                &format!(
+                    "steps:\n      - kind: emit\n        value: produced\n        output: answer\n        {authored}"
+                ),
+            ),
+            Some("v1.4"),
+        );
+        let metadata: onnx_genai_metadata::InferenceMetadata =
+            serde_yaml::from_str(&document).expect("typed deserializer retains the emit");
+        let errors =
+            validate_metadata(&metadata).expect_err("typed validation must apply the v1.5 gate");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("minimum schema version v1.5")),
+            "{authored}: {errors:#?}"
+        );
+    }
+}
+
+#[test]
+fn v1_5_requires_family_and_valid_families_round_trip() {
+    let without_family = with_version(OUTPUT_WITHOUT_FAMILY, Some("v1.5"));
+    let error = parse_metadata(&without_family, Some("yaml"))
         .expect_err("v1.5 output protocol must name an output family");
     assert!(
         error
             .to_string()
-            .contains("outputs.answer is missing required `family`"),
+            .contains("pipeline.workflow.outputs.answer.family is required"),
         "{error}"
     );
 
-    let unsupported_revision_version = without_family.replace(
-        "stage: pre_adapter",
-        "family: { kind: revisions, version: \"2\" }\n        stage: pre_adapter",
+    for family in [
+        "{ kind: materialized }",
+        "{ kind: events }",
+        "{ kind: revisions, version: \"1\" }",
+    ] {
+        let document = with_version(
+            &OUTPUT_WITHOUT_FAMILY.replace(
+                "stage: pre_adapter",
+                &format!("family: {family}\n        stage: pre_adapter"),
+            ),
+            Some("v1.5"),
+        );
+        let metadata = parse_metadata(&document, Some("yaml")).expect("v1.5 family parses");
+        let output = &metadata
+            .pipeline
+            .as_ref()
+            .expect("pipeline")
+            .workflow
+            .outputs["answer"];
+        let serialized = serde_yaml::to_string(output).expect("v1.5 family serializes");
+        assert!(serialized.contains("family:"), "{family}: {serialized}");
+        let reparsed: onnx_genai_metadata::WorkflowOutput =
+            serde_yaml::from_str(&serialized).expect("v1.5 family round-trips");
+        assert!(reparsed.family_authored);
+        assert_eq!(reparsed.family, output.family);
+    }
+
+    let unsupported_revision_version = with_version(
+        &OUTPUT_WITHOUT_FAMILY.replace(
+            "stage: pre_adapter",
+            "family: { kind: revisions, version: \"2\" }\n        stage: pre_adapter",
+        ),
+        Some("v1.5"),
     );
     let metadata =
         parse_metadata(&unsupported_revision_version, Some("yaml")).expect("typed document parses");
@@ -162,6 +301,34 @@ pipeline:
             .contains("outputs.answer.family.version is '2'"),
         "{errors:#?}"
     );
+}
+
+#[test]
+fn v1_4_rejects_stream_and_typed_revision_only_emit_operations() {
+    for authored in [
+        "stream: named\n        mode: append",
+        "mode: retract",
+        "mode: finalize",
+    ] {
+        let document = with_version(
+            &OUTPUT_WITHOUT_FAMILY.replace(
+                "steps: []",
+                &format!(
+                    "steps:\n      - kind: emit\n        value: produced\n        output: answer\n        {authored}"
+                ),
+            ),
+            Some("v1.4"),
+        );
+        let error = parse_metadata(&document, Some("yaml"))
+            .expect_err("v1.5-only emit declarations must fail below the boundary");
+        let reported = error.to_string();
+        assert!(
+            reported.contains("authored schema version v1.4")
+                && reported.contains("minimum schema version v1.5")
+                && reported.contains("pipeline.workflow.steps[0]"),
+            "{authored}: {reported}"
+        );
+    }
 }
 
 #[test]

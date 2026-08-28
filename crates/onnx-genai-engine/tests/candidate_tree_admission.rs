@@ -64,6 +64,31 @@ fn staged_missing_component_fixture(name: &str) -> PathBuf {
     )
 }
 
+fn staged_output_family_boundary_fixture() -> PathBuf {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/candidate-tree-admission")
+        .join("output-family-version-boundary");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("create output-family boundary fixture");
+    let source = fs::read_to_string(fixture().join("inference_metadata.yaml"))
+        .expect("read candidate-tree fixture")
+        .replacen("schema_version: v1.6", "schema_version: v1.4", 1)
+        .replacen(
+            "    components:",
+            r#"    outputs:
+      answer:
+        contract: {dtype: int64, shape: [sequence]}
+        role: tensor
+        family: {kind: materialized}
+        stage: pre_adapter
+    components:"#,
+            1,
+        );
+    fs::write(root.join("inference_metadata.yaml"), source)
+        .expect("write output-family boundary fixture");
+    root
+}
+
 fn assert_candidate_tree_refusal(result: anyhow::Result<()>, constructor: &str) {
     let error = result.expect_err("candidate-tree package must fail closed");
     let message = format!("{error:#}");
@@ -150,4 +175,29 @@ fn candidate_tree_semantic_errors_precede_runtime_capability_admission() {
             "runtime capability refusal masked a semantic metadata error: {message}"
         );
     }
+}
+
+#[test]
+fn output_family_version_boundary_precedes_candidate_and_memory_admission() {
+    let fixture = staged_output_family_boundary_fixture();
+    let error = match Engine::from_dir_with_memory_authority_provider(
+        &fixture,
+        EngineConfig::default(),
+        authority_provider(),
+    ) {
+        Ok(_) => panic!("v1.4 cannot opt into v1.5 output-family semantics"),
+        Err(error) => error,
+    };
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("pipeline.workflow.outputs.answer.family")
+            && message.contains("authored schema version v1.4")
+            && message.contains("minimum schema version v1.5")
+            && message.contains("migrate/re-emit"),
+        "{message}"
+    );
+    assert!(
+        !message.contains("no candidate-tree package-dispatch capability or executor"),
+        "version-feature admission must fail before candidate capability dispatch: {message}"
+    );
 }

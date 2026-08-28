@@ -62,6 +62,71 @@ pub const CANONICAL_SPECULATION_SCHEMA_VERSION: SchemaVersion = SchemaVersion::n
 /// envelopes.
 pub const OUTPUT_PROTOCOL_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 5);
 
+/// A serialized feature whose presence is bounded by one schema version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemaFeature {
+    OutputProtocols,
+}
+
+impl SchemaFeature {
+    pub const fn minimum_version(self) -> SchemaVersion {
+        match self {
+            Self::OutputProtocols => OUTPUT_PROTOCOL_SCHEMA_VERSION,
+        }
+    }
+
+    const fn description(self) -> &'static str {
+        match self {
+            Self::OutputProtocols => {
+                "workflow output families, logical streams, and typed revision operations"
+            }
+        }
+    }
+}
+
+/// Enforce a feature use against the document's authored schema version.
+///
+/// Parser tree checks and typed validation/admission call this same gate so a
+/// field cannot be accepted merely by entering through a different API.
+pub fn gate_feature_use(
+    version: SchemaVersion,
+    feature: SchemaFeature,
+    path: &str,
+) -> Result<(), String> {
+    let required = feature.minimum_version();
+    if version >= required {
+        return Ok(());
+    }
+    Err(format!(
+        "{path} is not legal in authored schema version {version}; {} require minimum schema \
+         version {required}. Remove the v1.5-only declaration to retain legacy output semantics, \
+         or migrate/re-emit the package with `schema_version: \"{required}\"` and explicit output \
+         families",
+        feature.description()
+    ))
+}
+
+/// Bidirectional gate for a field that became mandatory when its feature was
+/// introduced and was absent from the older contract.
+pub fn gate_feature_field(
+    version: SchemaVersion,
+    feature: SchemaFeature,
+    path: &str,
+    authored: bool,
+) -> Result<(), String> {
+    let required = feature.minimum_version();
+    match (version >= required, authored) {
+        (false, true) => gate_feature_use(version, feature, path),
+        (true, false) => Err(format!(
+            "{path} is required in authored schema version {version}; {} begin at schema version \
+             {required}. Declare exactly one of `{{ kind: materialized }}`, \
+             `{{ kind: events }}`, or `{{ kind: revisions, version: \"1\" }}`",
+            feature.description()
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// Normalize a declared `schema_version` spelling.
 ///
 /// `None` is the initial version: a document written before anyone thought to
@@ -172,7 +237,8 @@ mod tests {
     fn a_spelling_no_one_can_compare_says_how_to_write_one() {
         let error = normalize(Some("latest")).expect_err("'latest' is not a version");
         assert!(
-            error.contains("'v<major>.<minor>'") && error.contains("v1.5"),
+            error.contains("'v<major>.<minor>'")
+                && error.contains(&SUPPORTED_SCHEMA_VERSION.to_string()),
             "{error}"
         );
         assert!(normalize(Some("v1.2.3")).is_err());
@@ -194,12 +260,15 @@ mod tests {
 
     #[test]
     fn a_newer_minor_is_refused_by_number_rather_than_by_field_name() {
-        let error = gate(Some("1.6")).expect_err("1.6 is newer than this build");
+        let error = gate(Some("1.7")).expect_err("1.7 is newer than this build");
         assert!(
-            error.contains("declares inference-metadata schema version v1.6"),
+            error.contains("declares inference-metadata schema version v1.7"),
             "{error}"
         );
-        assert!(error.contains("reads up to v1.5"), "{error}");
+        assert!(
+            error.contains(&format!("reads up to {SUPPORTED_SCHEMA_VERSION}")),
+            "{error}"
+        );
         assert!(error.contains("refuses fields it does not know"), "{error}");
     }
 
@@ -227,5 +296,50 @@ mod tests {
             OUTPUT_PROTOCOL_SCHEMA_VERSION
         );
         assert_eq!(gate(Some("1.6")).expect("1.6"), SUPPORTED_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn output_protocol_family_gate_is_bidirectional() {
+        let path = "pipeline.workflow.outputs.answer.family";
+        gate_feature_field(
+            SchemaVersion::new(1, 4),
+            SchemaFeature::OutputProtocols,
+            path,
+            false,
+        )
+        .expect("legacy output omits the later field");
+        let below = gate_feature_field(
+            SchemaVersion::new(1, 4),
+            SchemaFeature::OutputProtocols,
+            path,
+            true,
+        )
+        .expect_err("older schema cannot opt into a later field");
+        assert!(
+            below.contains(path)
+                && below.contains("v1.4")
+                && below.contains("v1.5")
+                && below.contains("migrate/re-emit"),
+            "{below}"
+        );
+
+        let missing = gate_feature_field(
+            SchemaVersion::new(1, 5),
+            SchemaFeature::OutputProtocols,
+            path,
+            false,
+        )
+        .expect_err("the introducing version requires its field");
+        assert!(
+            missing.contains(path) && missing.contains("required"),
+            "{missing}"
+        );
+        gate_feature_field(
+            SchemaVersion::new(1, 5),
+            SchemaFeature::OutputProtocols,
+            path,
+            true,
+        )
+        .expect("v1.5 accepts its authored field");
     }
 }
