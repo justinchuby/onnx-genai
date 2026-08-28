@@ -1,6 +1,7 @@
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use onnx_genai_engine::{
     Engine, EngineConfig, GenerateOptions, GeneratePrompt, GenerateRequest, PipelineGenerateRequest,
@@ -74,13 +75,124 @@ const ALTERNATE: Geometry = Geometry {
 };
 
 fn package(geometry: Geometry) -> anyhow::Result<PathBuf> {
+    static NEXT_PACKAGE: AtomicU64 = AtomicU64::new(0);
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../target/test-fixtures/token-context")
-        .join(geometry.name);
+        .join(format!(
+            "{}-{}",
+            geometry.name,
+            NEXT_PACKAGE.fetch_add(1, Ordering::Relaxed)
+        ));
     fs::create_dir_all(&root)?;
     fs::write(root.join("inference_metadata.yaml"), metadata(geometry))?;
     fs::write(root.join("token-context.onnx.textproto"), model(geometry))?;
     Ok(root)
+}
+
+fn failing_after_publication_package(geometry: Geometry) -> anyhow::Result<PathBuf> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/test-fixtures/token-context")
+        .join(format!("{}-transaction-failure", geometry.name));
+    fs::create_dir_all(&root)?;
+    let mut document = metadata(geometry);
+    document = document.replacen(
+        "    inputs:\n      token_ids:",
+        r#"    inputs:
+      failure_index:
+        contract:
+          dtype: int64
+          shape: []
+          batch_layout: { kind: shared }
+        role: { kind: opaque }
+        source: { kind: application, name: failure_index }
+        required: false
+        default: 0
+      token_ids:"#,
+        1,
+    );
+    document = document.replacen(
+        "        batch_capacity: { uniform_dimensions: [sequence] }\n    state:",
+        &format!(
+            r#"        batch_capacity: {{ uniform_dimensions: [sequence] }}
+      fail_after_publication:
+        implementation: {{ kind: onnx, artifact: fail-after-publication.onnx.textproto }}
+        ports:
+          inputs:
+            value:
+              dtype: float32
+              shape: [batch, sequence, {channels}]
+              batch_layout: {{ kind: request_aligned, axis: 0 }}
+            index:
+              dtype: int64
+              shape: []
+              batch_layout: {{ kind: shared }}
+          outputs:
+            ignored:
+              dtype: float32
+              shape: [batch, {channels}]
+              batch_layout: {{ kind: request_aligned, axis: 0 }}
+        batch_capacity: {{ uniform_dimensions: [sequence] }}
+    state:"#,
+            channels = geometry.channels()
+        ),
+        1,
+    );
+    document = document.replacen(
+        "      - { kind: emit, value: accepted_len, output: valid_lengths, mode: replace }\n    serving:",
+        r#"      - { kind: emit, value: accepted_len, output: valid_lengths, mode: replace }
+      - kind: invoke
+        component: fail_after_publication
+        inputs: { value: context.output, index: failure_index }
+        outputs: { ignored: failure.ignored }
+    serving:"#,
+        1,
+    );
+    fs::write(root.join("inference_metadata.yaml"), document)?;
+    fs::write(root.join("token-context.onnx.textproto"), model(geometry))?;
+    fs::write(
+        root.join("fail-after-publication.onnx.textproto"),
+        failing_gather_model(geometry),
+    )?;
+    Ok(root)
+}
+
+fn failing_gather_model(geometry: Geometry) -> String {
+    format!(
+        r#"
+ir_version: 8
+graph {{
+  name: "fail_after_publication"
+  node {{
+    input: "value"
+    input: "index"
+    output: "ignored"
+    op_type: "Gather"
+    attribute {{ name: "axis" i: 1 type: INT }}
+  }}
+  input {{
+    name: "value"
+    type {{ tensor_type {{ elem_type: 1 shape {{
+      dim {{ dim_param: "batch" }}
+      dim {{ dim_param: "sequence" }}
+      dim {{ dim_value: {channels} }}
+    }} }} }}
+  }}
+  input {{
+    name: "index"
+    type {{ tensor_type {{ elem_type: 7 shape {{ }} }} }}
+  }}
+  output {{
+    name: "ignored"
+    type {{ tensor_type {{ elem_type: 1 shape {{
+      dim {{ dim_param: "batch" }}
+      dim {{ dim_value: {channels} }}
+    }} }} }}
+  }}
+}}
+opset_import {{ version: 18 }}
+"#,
+        channels = geometry.channels()
+    )
 }
 
 fn forged_position_package() -> anyhow::Result<PathBuf> {
@@ -1204,6 +1316,94 @@ fn assert_close(left: &[f32], right: &[f32]) {
             "value {index}: {left} != {right}"
         );
     }
+}
+
+fn assert_token_context_outputs_equal(
+    left: &std::collections::HashMap<String, Value>,
+    right: &std::collections::HashMap<String, Value>,
+) -> anyhow::Result<()> {
+    assert_close(
+        &left["hidden_states"].to_vec_f32()?,
+        &right["hidden_states"].to_vec_f32()?,
+    );
+    assert_eq!(
+        left["token_history"].to_vec_i64()?,
+        right["token_history"].to_vec_i64()?
+    );
+    assert_close(
+        &left["conv_history"].to_vec_f32()?,
+        &right["conv_history"].to_vec_f32()?,
+    );
+    assert_eq!(
+        left["valid_lengths"].to_vec_i64()?,
+        right["valid_lengths"].to_vec_i64()?
+    );
+    Ok(())
+}
+
+#[test]
+fn failed_selected_turn_restores_both_histories_output_and_sibling_rows() -> anyhow::Result<()> {
+    // The structurally different fixture proves transaction participation is
+    // derived from generic state groups rather than a model-family identity.
+    let geometry = ALTERNATE;
+    let root = failing_after_publication_package(geometry)?;
+    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+    let prefixes = [&[3, 5][..], &[17, 19][..], &[29, 31][..]];
+    for session in [
+        "failed-retry",
+        "expected-retry",
+        "failed-sibling",
+        "expected-sibling",
+    ] {
+        engine.run_pipeline(request_rows(geometry, session, &prefixes, 0, None)?)?;
+    }
+
+    let source_tokens = [&[23][..], &[37][..], &[41][..]];
+    for session in ["failed-retry", "failed-sibling"] {
+        let failed = request_rows(geometry, session, &source_tokens, 2, Some(&[2, 0]))?
+            .with_input("failure_index", Value::from_slice_i64(&[999], &[])?);
+        let error = match engine.run_pipeline(failed) {
+            Ok(_) => panic!("the post-publication gather must fail the admitted turn"),
+            Err(error) => error,
+        };
+        assert!(
+            format!("{error:#}").contains("Gather"),
+            "the injected failure must occur after the generalized history component: {error:#}"
+        );
+    }
+
+    let expected_retry = engine.run_pipeline(request_rows(
+        geometry,
+        "expected-retry",
+        &source_tokens,
+        2,
+        Some(&[2, 0]),
+    )?)?;
+    let actual_retry = engine.run_pipeline(request_rows(
+        geometry,
+        "failed-retry",
+        &source_tokens,
+        2,
+        Some(&[2, 0]),
+    )?)?;
+    assert_token_context_outputs_equal(&actual_retry, &expected_retry)?;
+
+    let expected_sibling = engine.run_pipeline(request_rows(
+        geometry,
+        "expected-sibling",
+        &source_tokens,
+        2,
+        Some(&[1]),
+    )?)?;
+    let actual_sibling = engine.run_pipeline(request_rows(
+        geometry,
+        "failed-sibling",
+        &source_tokens,
+        2,
+        Some(&[1]),
+    )?)?;
+    assert_token_context_outputs_equal(&actual_sibling, &expected_sibling)?;
+    Ok(())
 }
 
 #[test]
