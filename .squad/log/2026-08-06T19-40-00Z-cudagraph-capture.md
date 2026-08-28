@@ -1,3 +1,0 @@
-# Session log — CUDA-graph capture segment — 2026-08-06T19:40:00Z
-
-Scribe merged the CUDA-graph capture investigation drops into the live decisions ledger. Cohaagen's useful shipped outcome is PR #708/C3, which made GatedDeltaNet Split capture-safe and improved 35B-A3B QMoE hybrid decode to 12.132 ms/tok while preserving token `33803`. The rejected/negative results are also recorded: C2 synchronization removal is numerically unsafe, strict C1 static-only eligibility is a no-op, and matmul workspace pooling is deprioritized because steady-state matmul capture was already effectively complete. Harry approved #708 with nits only.
