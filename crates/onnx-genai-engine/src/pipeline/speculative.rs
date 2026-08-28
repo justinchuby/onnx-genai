@@ -455,6 +455,65 @@ struct PendingCandidateTree {
     tree: RuntimeCandidateTree,
 }
 
+fn finalize_candidate_staged_output(
+    staged_output_observer: Option<&mut super::ToolCallStagedOutputObserver>,
+    boundary: &'static str,
+) -> anyhow::Result<Option<super::GenerationStopReason>> {
+    let Some(observer) = staged_output_observer else {
+        return Ok(None);
+    };
+    let observation = observer.finish(boundary).map_err(|error| {
+        anyhow::Error::new(error)
+            .context("validate candidate-tree tool protocol before semantic commit")
+    })?;
+    Ok(matches!(
+        observation,
+        super::StagedOutputObservation::TerminalComplete(_)
+    )
+    .then(|| {
+        observer
+            .stop_reason()
+            .expect("terminal tool observer supplies a stop reason")
+    }))
+}
+
+fn finish_candidate_tree_without_generation(
+    mut staged_output_observer: Option<&mut super::ToolCallStagedOutputObserver>,
+    boundary: &'static str,
+    finish_reason: FinishReason,
+) -> anyhow::Result<GenerateResult> {
+    if let Some(observer) = staged_output_observer.as_deref_mut() {
+        observer.begin_turn();
+    }
+    let stop =
+        match finalize_candidate_staged_output(staged_output_observer.as_deref_mut(), boundary) {
+            Ok(stop) => stop,
+            Err(error) => {
+                if let Some(observer) = staged_output_observer.as_deref_mut() {
+                    observer.abort_turn();
+                }
+                return Err(error);
+            }
+        };
+    if let Some(observer) = staged_output_observer.as_deref_mut() {
+        observer.commit_turn();
+    }
+    Ok(GenerateResult {
+        text: String::new(),
+        token_ids: Vec::new(),
+        finish_reason: stop
+            .as_ref()
+            .map_or(finish_reason, |stop| stop.finish_reason()),
+        tool_calls: staged_output_observer
+            .as_deref()
+            .map(super::ToolCallStagedOutputObserver::committed_calls)
+            .unwrap_or_default(),
+        prefix_cache_hit_len: 0,
+        logprobs: None,
+        budget_cap: None,
+    })
+}
+
 struct CandidateTreeWorkflowHost<'a> {
     runtime: &'a WorkflowRuntime,
     plan: CandidateTreeExecutionPlan,
@@ -475,6 +534,7 @@ struct CandidateTreeWorkflowHost<'a> {
     commit_started: bool,
     loop_stop: Option<super::GenerationStopReason>,
     staged_output_observer: Option<&'a mut super::ToolCallStagedOutputObserver>,
+    staged_output_finalized: bool,
 }
 
 impl CandidateTreeWorkflowHost<'_> {
@@ -520,6 +580,20 @@ impl CandidateTreeWorkflowHost<'_> {
                     .initial_state(&self.runtime.plan.workflow, values)?,
             );
         }
+        Ok(())
+    }
+
+    fn finalize_staged_output(&mut self, boundary: &'static str) -> anyhow::Result<()> {
+        if self.staged_output_finalized {
+            return Ok(());
+        }
+        if let Some(stop) =
+            finalize_candidate_staged_output(self.staged_output_observer.as_deref_mut(), boundary)?
+        {
+            self.finish_reason = stop.finish_reason();
+            self.loop_stop = Some(stop);
+        }
+        self.staged_output_finalized = true;
         Ok(())
     }
 
@@ -817,7 +891,7 @@ impl CandidateTreeWorkflowHost<'_> {
                     )
                 })?;
         }
-        let mut loop_stop = if self.finish_reason == FinishReason::EosToken {
+        let loop_stop = if self.finish_reason == FinishReason::EosToken {
             Some(super::GenerationStopReason::EosCommitted)
         } else if self.generated.len() >= self.options.max_new_tokens {
             Some(super::GenerationStopReason::BudgetExhausted)
@@ -831,25 +905,10 @@ impl CandidateTreeWorkflowHost<'_> {
         } else {
             None
         };
-        if loop_stop.is_some()
-            && let Some(observer) = self.staged_output_observer.as_deref_mut()
-            && matches!(
-                observer
-                    .finish("candidate-tree terminal generation boundary")
-                    .map_err(|error| {
-                        anyhow::Error::new(error)
-                            .context("validate candidate-tree tool protocol before semantic commit")
-                    })?,
-                super::StagedOutputObservation::TerminalComplete(_)
-            )
-        {
-            loop_stop = observer.stop_reason();
-            self.finish_reason = loop_stop
-                .as_ref()
-                .expect("terminal tool observer supplies a stop reason")
-                .finish_reason();
-        }
         self.loop_stop = loop_stop;
+        if self.loop_stop.is_some() {
+            self.finalize_staged_output("candidate-tree terminal generation boundary")?;
+        }
         Ok(accepted_context)
     }
 
@@ -964,23 +1023,7 @@ impl super::workflow::WorkflowNodeHost for CandidateTreeWorkflowHost<'_> {
             })
             .collect::<Result<Vec<_>, _>>()
             .context("decode candidate-tree token events before semantic commit")?;
-        if let Some(observer) = self.staged_output_observer.as_deref_mut()
-            && matches!(
-                observer
-                    .finish("candidate-tree semantic commit")
-                    .map_err(|error| {
-                        anyhow::Error::new(error)
-                            .context("validate candidate-tree tool protocol before semantic commit")
-                    })?,
-                super::StagedOutputObservation::TerminalComplete(_)
-            )
-        {
-            let stop = observer
-                .stop_reason()
-                .expect("terminal tool observer supplies a stop reason");
-            self.finish_reason = stop.finish_reason();
-            self.loop_stop = Some(stop);
-        }
+        self.finalize_staged_output("candidate-tree semantic commit")?;
         match self.control.begin_commit() {
             Ok(true) => {
                 self.commit_started = true;
@@ -1615,15 +1658,11 @@ impl WorkflowRuntime {
                 crate::config::GeneratePrompt::Text(_) => false,
             }
         {
-            return Ok(GenerateResult {
-                text: String::new(),
-                token_ids: Vec::new(),
-                finish_reason: FinishReason::Length,
-                tool_calls: Vec::new(),
-                prefix_cache_hit_len: 0,
-                logprobs: None,
-                budget_cap: None,
-            });
+            return finish_candidate_tree_without_generation(
+                staged_output_observer,
+                "candidate-tree initial context-limit boundary",
+                FinishReason::Length,
+            );
         }
         let mut execution = super::WorkflowExecutionPlan::new_candidate_tree_driver(self, request)?;
         let mut host = CandidateTreeWorkflowHost {
@@ -1646,6 +1685,7 @@ impl WorkflowRuntime {
             commit_started: false,
             loop_stop: None,
             staged_output_observer,
+            staged_output_finalized: false,
         };
         {
             let mut hosted: Option<&mut dyn super::workflow::WorkflowNodeHost> = Some(&mut host);
@@ -2177,7 +2217,7 @@ impl WorkflowRuntime {
         options: &GenerateOptions,
         request: super::PipelineGenerateRequest,
         tokenizer: Option<&onnx_genai_ort::Tokenizer>,
-        _staged_output_observer: Option<&mut super::ToolCallStagedOutputObserver>,
+        mut staged_output_observer: Option<&mut super::ToolCallStagedOutputObserver>,
         mut callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
         self.require_execution_admitted()?;
@@ -2264,11 +2304,23 @@ impl WorkflowRuntime {
             .max_context
             .is_some_and(|limit| initial_tokens.len() >= limit)
         {
+            if let Some(observer) = staged_output_observer.as_deref_mut() {
+                observer.begin_turn();
+                if let Err(error) = observer.finish("DFlash initial context-limit boundary") {
+                    observer.abort_turn();
+                    return Err(anyhow::Error::new(error)
+                        .context("validate DFlash tool protocol before returning"));
+                }
+                observer.commit_turn();
+            }
             return Ok(GenerateResult {
                 text: String::new(),
                 token_ids: Vec::new(),
                 finish_reason: FinishReason::Length,
-                tool_calls: Vec::new(),
+                tool_calls: staged_output_observer
+                    .as_deref()
+                    .map(super::ToolCallStagedOutputObserver::committed_calls)
+                    .unwrap_or_default(),
                 prefix_cache_hit_len: 0,
                 logprobs: None,
                 budget_cap: None,
@@ -2277,6 +2329,9 @@ impl WorkflowRuntime {
         let turn = super::TurnTransaction::admit_runtime_participant(
             self.worker.next_turn_transaction_id(),
         );
+        if let Some(observer) = staged_output_observer.as_deref_mut() {
+            observer.begin_turn();
+        }
         let mut context_start = i64::try_from(initial_tokens.len())
             .context("DFlash prompt length exceeds the absolute position type")?;
         let mut generated = Vec::with_capacity(options.max_new_tokens);
@@ -2478,10 +2533,12 @@ impl WorkflowRuntime {
                     "DFlash committed path length does not fit the absolute position type",
                 )?)
                 .context("DFlash absolute position overflow")?;
+            let mut observed_tokens = Vec::with_capacity(committed_path.len());
             for token in committed_path {
                 let token = u32::try_from(token)
                     .context("DFlash verifier emitted a token outside the u32 token domain")?;
                 generated.push(token);
+                observed_tokens.push(token);
                 if options.terminates(token) {
                     finish_reason = FinishReason::EosToken;
                     break;
@@ -2489,6 +2546,17 @@ impl WorkflowRuntime {
                 if generated.len() == options.max_new_tokens {
                     break;
                 }
+            }
+            if let Some(observer) = staged_output_observer.as_deref_mut() {
+                let tokenizer = tokenizer
+                    .context("DFlash tool-call observation requires the package tokenizer")?;
+                observer
+                    .observe_tokens(tokenizer, &observed_tokens)
+                    .map_err(|error| {
+                        let _ = turn.abort(super::TurnAbortReason::ExecutionFailure);
+                        anyhow::Error::new(error)
+                            .context("DFlash staged tool-call observation failed before commit")
+                    })?;
             }
             staged_contract_executions = staged_contract_executions.saturating_add(1);
             if finish_reason == FinishReason::EosToken {
@@ -2500,6 +2568,18 @@ impl WorkflowRuntime {
             .map(|tokenizer| tokenizer.decode(&generated))
             .transpose()?
             .unwrap_or_default();
+        if let Some(observer) = staged_output_observer.as_deref_mut()
+            && matches!(
+                observer.finish("DFlash semantic commit").map_err(|error| {
+                    let _ = turn.abort(super::TurnAbortReason::ExecutionFailure);
+                    anyhow::Error::new(error)
+                        .context("validate DFlash tool protocol before semantic commit")
+                })?,
+                super::StagedOutputObservation::TerminalComplete(_)
+            )
+        {
+            finish_reason = FinishReason::ToolCalls;
+        }
         match control.begin_commit() {
             Ok(true) => {}
             Ok(false) => {
@@ -2527,6 +2607,9 @@ impl WorkflowRuntime {
         }
         *self.worker.last_dflash_block_traces.borrow_mut() = staged_block_traces;
         let _ = turn.committed();
+        if let Some(observer) = staged_output_observer.as_deref_mut() {
+            observer.commit_turn();
+        }
         control.finish_commit();
         if control
             .observe_after_commit(super::GenerationBoundary::BeforeOutputPublication)
@@ -2565,7 +2648,10 @@ impl WorkflowRuntime {
             text,
             token_ids: generated,
             finish_reason,
-            tool_calls: Vec::new(),
+            tool_calls: staged_output_observer
+                .as_deref()
+                .map(super::ToolCallStagedOutputObserver::committed_calls)
+                .unwrap_or_default(),
             prefix_cache_hit_len: 0,
             logprobs: None,
             budget_cap: None,
@@ -5176,7 +5262,7 @@ mod tests {
 
     const WORKFLOW: &str = r#"
 manifest:
-  capabilities: [workflow_ssa, typed_emit]
+  {}
 inputs: {}
 outputs: {}
 components:

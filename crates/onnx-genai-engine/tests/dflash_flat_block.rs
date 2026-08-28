@@ -1270,6 +1270,40 @@ fn context_exhaustion_finishes_before_the_first_dflash_component_run() -> anyhow
     Ok(())
 }
 
+#[test]
+fn dflash_context_exhaustion_enforces_required_tool_policy_before_component_run()
+-> anyhow::Result<()> {
+    let root = package("1", false, &[0, 0, 0, 0, 0, 0, 0, 0])?;
+    install_tool_protocol_tokenizer(
+        &root,
+        0,
+        r#"<tool_call>{"name":"weather","arguments":{}}</tool_call>"#,
+    )?;
+    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+    let error = engine
+        .generate_with_pipeline_request(
+            PipelineGenerateRequest::new(GenerateRequest {
+                prompt: GeneratePrompt::TokenIds(vec![1, 2]),
+                options: GenerateOptions {
+                    max_new_tokens: 4,
+                    max_context: Some(2),
+                    greedy: true,
+                    ..GenerateOptions::default()
+                },
+            })
+            .with_tool_call_policy(ToolCallPolicy::Required),
+        )
+        .expect_err("DFlash no-generation boundary must enforce required tool policy");
+    let error = format!("{error:#}");
+    assert!(
+        error.contains("DFlash initial context-limit boundary")
+            && error.contains("at least one was required"),
+        "{error}"
+    );
+    assert!(engine.contract_executions().is_empty());
+    Ok(())
+}
+
 fn controlled_request() -> GenerateRequest {
     GenerateRequest {
         prompt: GeneratePrompt::TokenIds(vec![1, 2]),

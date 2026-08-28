@@ -1888,7 +1888,6 @@ pub(crate) trait WorkflowNodeHost {
     }
 
     /// Observe newly staged generated token output without publishing it.
-    #[allow(dead_code)]
     fn observe_staged_generation_tokens(
         &mut self,
         _tokens: &[crate::TokenId],
@@ -2567,7 +2566,7 @@ impl WorkflowRuntime {
                         .request_axis()
                         .is_some()
                 {
-                    emit_workflow_rows_with_publications(
+                    let staged_generation_tokens = emit_workflow_rows_with_publications(
                         values,
                         &tensor,
                         value,
@@ -2583,7 +2582,13 @@ impl WorkflowRuntime {
                         telemetry,
                         symbols,
                         dynamic_symbols,
+                        output_contract.role == onnx_genai_metadata::WorkflowOutputRole::Tokens,
                     )?;
+                    if let Some(host) = host.as_deref_mut() {
+                        for tokens in staged_generation_tokens {
+                            host.observe_staged_generation_tokens(&tokens)?;
+                        }
+                    }
                     telemetry.record_stage("emit", emit_started.elapsed().as_nanos());
                     return Ok(());
                 }
@@ -2642,6 +2647,19 @@ impl WorkflowRuntime {
                             )
                         })?;
                 }
+                let staged_generation_tokens = (output_contract.role
+                    == onnx_genai_metadata::WorkflowOutputRole::Tokens)
+                    .then(|| {
+                        emitted
+                            .to_vec_i64()?
+                            .into_iter()
+                            .map(|token| {
+                                u32::try_from(token)
+                                    .context("the workflow emitted a token outside uint32")
+                            })
+                            .collect::<anyhow::Result<Vec<_>>>()
+                    })
+                    .transpose()?;
                 match mode {
                     WorkflowEmitMode::Replace => {
                         values.insert(output.clone(), emitted);
@@ -2663,6 +2681,11 @@ impl WorkflowRuntime {
                     WorkflowEmitMode::Retract | WorkflowEmitMode::Finalize => {
                         unreachable!("control publication returned before reading a payload")
                     }
+                }
+                if let Some(tokens) = staged_generation_tokens
+                    && let Some(host) = host.as_deref_mut()
+                {
+                    host.observe_staged_generation_tokens(&tokens)?;
                 }
                 telemetry.record_stage("emit", emit_started.elapsed().as_nanos());
             }
@@ -5528,7 +5551,9 @@ fn emit_workflow_rows(
         telemetry,
         symbols,
         dynamic_symbols,
+        false,
     )
+    .map(|_| ())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5548,7 +5573,8 @@ fn emit_workflow_rows_with_publications(
     telemetry: &mut WorkflowRunTelemetry,
     symbols: &HashMap<String, i64>,
     dynamic_symbols: &std::collections::HashSet<String>,
-) -> anyhow::Result<()> {
+    observe_generation_tokens: bool,
+) -> anyhow::Result<Vec<Vec<crate::TokenId>>> {
     let rows = tensor
         .shape()
         .first()
@@ -5565,6 +5591,7 @@ fn emit_workflow_rows_with_publications(
         );
     }
     let mut row_names = vec![String::new(); rows];
+    let mut staged_generation_tokens = Vec::new();
     for row in 0..rows {
         let active = guards.is_none_or(|values| values[if values.len() == 1 { 0 } else { row }]);
         if !active {
@@ -5588,6 +5615,17 @@ fn emit_workflow_rows_with_publications(
             &mut row_symbols,
             dynamic_symbols,
         )?;
+        if observe_generation_tokens {
+            staged_generation_tokens.push(
+                emitted
+                    .to_vec_i64()?
+                    .into_iter()
+                    .map(|token| {
+                        u32::try_from(token).context("the workflow emitted a token outside uint32")
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()?,
+            );
+        }
         if let Some(journal) = publication_journal.as_mut() {
             journal
                 .publish(output, stream, mode, Some(clone_value(&emitted)?))
@@ -5645,7 +5683,7 @@ fn emit_workflow_rows_with_publications(
             entry[row] = name;
         }
     }
-    Ok(())
+    Ok(staged_generation_tokens)
 }
 
 fn slice_workflow_row(

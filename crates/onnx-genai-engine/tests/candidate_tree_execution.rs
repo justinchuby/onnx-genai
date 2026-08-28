@@ -1445,6 +1445,44 @@ fn zero_trip_setup_and_component_map_reorder_preserve_semantics() -> anyhow::Res
 }
 
 #[test]
+fn zero_trip_candidate_workflow_finishes_required_policy_and_aborts_authored_mutations()
+-> anyhow::Result<()> {
+    let root = composed_parent_package(false, false)?;
+    install_tool_protocol_tokenizer(&root, &[])?;
+    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+    let session = engine.create_session()?;
+    let mut delivered = Vec::new();
+    let mut callback = |token: onnx_genai_engine::GenerateToken| {
+        delivered.push(token.token_id);
+        Ok(())
+    };
+    let error = engine
+        .generate_with_pipeline_tool_policy_callbacks(
+            PipelineGenerateRequest::new(greedy_request(3))
+                .with_session_id(session.to_string())
+                .with_tool_call_policy(ToolCallPolicy::Required),
+            None,
+            Some(&mut callback),
+        )
+        .expect_err("zero-trip generation must still enforce required tool policy");
+    let error = format!("{error:#}");
+    assert!(
+        error.contains("candidate-tree semantic commit")
+            && error.contains("at least one was required"),
+        "{error}"
+    );
+    assert!(delivered.is_empty());
+    assert_eq!(engine.session_token_count(session)?, 0);
+    assert_eq!(
+        engine.workflow_session_effect_cursor(&session.to_string(), "audit"),
+        None
+    );
+    assert!(engine.take_committed_workflow_publications().is_empty());
+    assert!(engine.component_invocations().is_empty());
+    Ok(())
+}
+
+#[test]
 fn sampling_candidate_path_executes_inside_the_composed_workflow() -> anyhow::Result<()> {
     let root = composed_parent_package(true, false)?;
     let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
@@ -1576,6 +1614,17 @@ fn greedy_request(max_new_tokens: usize) -> GenerateRequest {
     }
 }
 
+fn context_exhausted_tool_request(
+    session_id: String,
+    policy: ToolCallPolicy,
+) -> PipelineGenerateRequest {
+    let mut request = greedy_request(2);
+    request.options.max_context = Some(2);
+    PipelineGenerateRequest::new(request)
+        .with_session_id(session_id)
+        .with_tool_call_policy(policy)
+}
+
 fn expect_error<T>(result: anyhow::Result<T>, message: &str) -> anyhow::Error {
     match result {
         Ok(_) => panic!("{message}"),
@@ -1643,6 +1692,124 @@ fn candidate_tree_waits_for_budget_boundary_across_complete_call_blocks() -> any
             .map(|call| call.name.as_str())
             .collect::<Vec<_>>(),
         ["two", "four", "zero", "two", "four"]
+    );
+    Ok(())
+}
+
+#[test]
+fn initial_context_exhaustion_enforces_tool_policy_without_session_mutation() -> anyhow::Result<()>
+{
+    let root = parent_package(&[-1, -1, 0, 1, 2, 4], &[2, 0, 4, 0, 0, 0, 0])?;
+    install_tool_protocol_tokenizer(&root, &[])?;
+    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+    let session = engine.create_session()?;
+    let session_id = session.to_string();
+    let mut delivered = Vec::new();
+
+    for (policy, required_text) in [
+        (
+            ToolCallPolicy::Required,
+            "the model produced no tool call, but at least one was required",
+        ),
+        (
+            ToolCallPolicy::Specific {
+                function: "weather".to_string(),
+            },
+            "the model produced no tool call, but function \"weather\" was required",
+        ),
+    ] {
+        let mut callback = |token: onnx_genai_engine::GenerateToken| {
+            delivered.push(token.token_id);
+            Ok(())
+        };
+        let error = engine
+            .generate_with_pipeline_tool_policy_callbacks(
+                context_exhausted_tool_request(session_id.clone(), policy),
+                None,
+                Some(&mut callback),
+            )
+            .expect_err("a required tool policy must fail at the no-generation boundary");
+        let error = format!("{error:#}");
+        assert!(error.contains(required_text), "{error}");
+        assert!(
+            error.contains("candidate-tree initial context-limit boundary"),
+            "{error}"
+        );
+        assert!(delivered.is_empty());
+        assert_eq!(engine.session_token_count(session)?, 0);
+        assert!(engine.component_invocations().is_empty());
+        assert!(engine.take_committed_workflow_publications().is_empty());
+    }
+
+    for policy in [ToolCallPolicy::Auto, ToolCallPolicy::Disabled] {
+        let mut callback = |token: onnx_genai_engine::GenerateToken| {
+            delivered.push(token.token_id);
+            Ok(())
+        };
+        let result = engine.generate_with_pipeline_tool_policy_callbacks(
+            context_exhausted_tool_request(session_id.clone(), policy),
+            None,
+            Some(&mut callback),
+        )?;
+        assert!(result.token_ids.is_empty());
+        assert!(result.tool_calls.is_empty());
+        assert_eq!(result.finish_reason, FinishReason::Length);
+        assert!(delivered.is_empty());
+        assert_eq!(engine.session_token_count(session)?, 0);
+        assert!(engine.component_invocations().is_empty());
+        assert!(engine.take_committed_workflow_publications().is_empty());
+    }
+    Ok(())
+}
+
+#[test]
+fn incomplete_candidate_tool_output_aborts_and_same_session_disabled_retry_is_clean()
+-> anyhow::Result<()> {
+    let root = parent_package(&[-1, -1, 0, 1, 2, 4], &[2, 0, 4, 0, 0, 0, 0])?;
+    let incomplete = r#"<tool_call>{"name":"weather","arguments":{"city":"#;
+    install_tool_protocol_tokenizer(&root, &[(2, incomplete)])?;
+    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+    let session = engine.create_session()?;
+    let mut delivered = Vec::new();
+    let mut callback = |token: onnx_genai_engine::GenerateToken| {
+        delivered.push(token.token_id);
+        Ok(())
+    };
+    let error = engine
+        .generate_with_pipeline_tool_policy_callbacks(
+            PipelineGenerateRequest::new(greedy_request(1))
+                .with_session_id(session.to_string())
+                .with_tool_call_policy(ToolCallPolicy::Auto),
+            None,
+            Some(&mut callback),
+        )
+        .expect_err("unfinished candidate tool output must fail at the budget boundary");
+    let error = format!("{error:#}");
+    assert!(
+        error.contains("candidate-tree terminal generation boundary")
+            && error.contains("produced incomplete staged output"),
+        "{error}"
+    );
+    assert!(delivered.is_empty());
+    assert_eq!(engine.session_token_count(session)?, 0);
+    assert!(engine.take_committed_workflow_publications().is_empty());
+
+    let retry = engine.generate_with_pipeline_request(
+        PipelineGenerateRequest::new(greedy_request(1))
+            .with_session_id(session.to_string())
+            .with_tool_call_policy(ToolCallPolicy::Disabled),
+    )?;
+    assert_eq!(retry.token_ids, vec![2]);
+    assert_eq!(retry.text, incomplete);
+    assert_eq!(retry.finish_reason, FinishReason::MaxTokens);
+    assert!(retry.tool_calls.is_empty());
+    assert_eq!(engine.session_token_count(session)?, 0);
+    assert_eq!(
+        engine
+            .contract_executions()
+            .get("onnx-genai.speculative-block")
+            .copied(),
+        Some(1)
     );
     Ok(())
 }
