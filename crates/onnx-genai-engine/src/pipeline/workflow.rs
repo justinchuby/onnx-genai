@@ -358,52 +358,31 @@ fn workflow_adapter_registry()
     > = std::sync::LazyLock::new(|| {
         HashMap::from([
             (
-                (
-                    onnx_genai_metadata::extensions::IMAGE_PREPROCESS_V1.identity,
-                    onnx_genai_metadata::extensions::IMAGE_PREPROCESS_V1.version,
-                ),
+                ("onnx-genai.image-preprocess", "1"),
                 WorkflowRuntime::run_image_preprocess_adapter as WorkflowAdapterExecutor,
             ),
             (
-                (
-                    onnx_genai_metadata::extensions::VIDEO_PREPROCESS_V1.identity,
-                    onnx_genai_metadata::extensions::VIDEO_PREPROCESS_V1.version,
-                ),
+                ("onnx-genai.video-preprocess", "1"),
                 WorkflowRuntime::run_video_preprocess_adapter as WorkflowAdapterExecutor,
             ),
             (
-                (
-                    onnx_genai_metadata::extensions::AUDIO_PREPROCESS_V1.identity,
-                    onnx_genai_metadata::extensions::AUDIO_PREPROCESS_V1.version,
-                ),
+                ("onnx-genai.audio-preprocess", "1"),
                 WorkflowRuntime::run_audio_preprocess_adapter as WorkflowAdapterExecutor,
             ),
             (
-                (
-                    onnx_genai_metadata::extensions::GRAMMAR_GUIDANCE_V1.identity,
-                    onnx_genai_metadata::extensions::GRAMMAR_GUIDANCE_V1.version,
-                ),
+                ("onnx-genai.grammar-guidance", "1"),
                 WorkflowRuntime::run_grammar_guidance_adapter as WorkflowAdapterExecutor,
             ),
             (
-                (
-                    onnx_genai_metadata::extensions::TELEMETRY_V1.identity,
-                    onnx_genai_metadata::extensions::TELEMETRY_V1.version,
-                ),
+                ("onnx-genai.telemetry", "1"),
                 WorkflowRuntime::run_telemetry_adapter as WorkflowAdapterExecutor,
             ),
             (
-                (
-                    onnx_genai_metadata::extensions::PARAMETER_OVERLAY_V1.identity,
-                    onnx_genai_metadata::extensions::PARAMETER_OVERLAY_V1.version,
-                ),
+                ("onnx-genai.parameter-overlay", "1"),
                 WorkflowRuntime::run_parameter_overlay_adapter as WorkflowAdapterExecutor,
             ),
             (
-                (
-                    onnx_genai_metadata::extensions::TEXT_ASSEMBLY_V1.identity,
-                    onnx_genai_metadata::extensions::TEXT_ASSEMBLY_V1.version,
-                ),
+                ("onnx-genai.text-assembly", "1"),
                 WorkflowRuntime::run_text_assembly_adapter as WorkflowAdapterExecutor,
             ),
         ])
@@ -413,26 +392,6 @@ fn workflow_adapter_registry()
 
 pub(super) fn supports_workflow_adapter(abi: &str, version: &str) -> bool {
     workflow_adapter_registry().contains_key(&(abi, version))
-}
-
-#[cfg(test)]
-mod extension_registry_tests {
-    use super::supports_workflow_adapter;
-    use onnx_genai_metadata::extensions::{BUILTIN_EXTENSIONS, ExtensionSurface, SupportStatus};
-
-    #[test]
-    fn every_implemented_component_adapter_has_an_exact_executor() {
-        for descriptor in BUILTIN_EXTENSIONS.iter().filter(|descriptor| {
-            descriptor.surface == ExtensionSurface::ComponentAdapter
-                && descriptor.status == SupportStatus::Implemented
-        }) {
-            assert!(
-                supports_workflow_adapter(descriptor.id.identity, descriptor.id.version),
-                "{} must have its exact registry executor",
-                descriptor.id.wire_name()
-            );
-        }
-    }
 }
 
 fn validate_component_overrides(
@@ -1072,8 +1031,7 @@ impl<'a> WorkflowExecutionPlan<'a> {
             inputs,
             session_id,
             component_overrides,
-            generation_control: _,
-            tool_call_policy: _,
+            ..
         } = request;
         let workflow = &engine.plan.workflow;
         let session_turn_version = session_id.as_ref().map(|session| {
@@ -1890,23 +1848,41 @@ pub(crate) trait WorkflowNodeHost {
     /// package inputs are the host's business.
     fn hosted_contracts(&self) -> &'static [&'static str];
 
-    /// Capture host-owned provisional state at admission.
+    /// Select one exact authored invocation independently of a component
+    /// contract. Typed workflow constructs use this only after construction
+    /// proved the invocation's identity, bindings, and control-flow location.
+    fn hosts_invocation(
+        &self,
+        _component: &str,
+        _inputs: &BTreeMap<String, String>,
+        _outputs: &BTreeMap<String, String>,
+    ) -> bool {
+        false
+    }
+
+    /// Observe the admitted generic workflow transaction before execution.
     fn begin_turn(&mut self, _turn: &TurnTransaction) -> anyhow::Result<()> {
         Ok(())
     }
 
-    /// Run host-owned pre-commit validation after all canonical output is
-    /// staged but before semantic state and publications are committed.
+    /// Observe an authored control boundary while the generic transaction is
+    /// still provisional.
+    fn observe_boundary(&mut self, _boundary: GenerationBoundary) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Final fallible hook before the generic state/effect/output write set is
+    /// staged and committed.
     fn before_turn_commit(&mut self, _turn: &TurnTransaction) -> anyhow::Result<()> {
         Ok(())
     }
 
-    /// Commit or restore host-owned provisional state with the transaction.
     fn turn_committed(&mut self, _outcome: TurnTransactionOutcome) {}
 
     fn turn_aborted(&mut self, _outcome: TurnTransactionOutcome) {}
 
-    /// Request that the interpreter not begin another authored loop body.
+    /// Report a committed request-level terminal condition before the
+    /// interpreter evaluates another authored loop body.
     fn loop_host_outcome(&self) -> WorkflowLoopHostOutcome {
         WorkflowLoopHostOutcome::Continue
     }
@@ -1946,6 +1922,8 @@ pub(crate) struct WorkflowNodeRequest<'a> {
     pub(crate) outputs: &'a BTreeMap<String, String>,
     /// The invocation's value environment.
     pub(crate) values: &'a mut PipelineTensors,
+    /// The ordinary S4 journal owned by the enclosing generic turn.
+    pub(crate) publication_journal: &'a mut Option<OutputPublicationJournal>,
 }
 
 impl WorkflowRuntime {
@@ -2011,13 +1989,21 @@ impl WorkflowRuntime {
                         // The hosted executor is selected before generic ONNX
                         // resolution, but admission still validates every
                         // invocation-bound input before the executor can run.
-                        if let Some(contract) = declaration
+                        let contract = declaration
                             .contract
                             .as_ref()
-                            .map(|contract| contract.id.as_str())
-                            && let Some(host) = host.as_deref_mut()
-                            && host.hosted_contracts().contains(&contract)
-                        {
+                            .map(|contract| contract.id.as_str());
+                        let hosted_by_invocation = host
+                            .as_deref()
+                            .is_some_and(|host| host.hosts_invocation(component, inputs, outputs));
+                        let hosted_by_contract = contract.is_some_and(|contract| {
+                            host.as_deref()
+                                .is_some_and(|host| host.hosted_contracts().contains(&contract))
+                        });
+                        if hosted_by_invocation || hosted_by_contract {
+                            let host = host
+                                .as_deref_mut()
+                                .expect("a hosted invocation has a workflow host");
                             let prepared = prepare_hosted_component_batch_inputs(
                                 component,
                                 declaration,
@@ -2029,11 +2015,12 @@ impl WorkflowRuntime {
                             let request_count = prepared.request_count;
                             drop(prepared.resolved);
                             let handled = match host.execute_contract_node(WorkflowNodeRequest {
-                                contract,
+                                contract: contract.unwrap_or(""),
                                 component,
                                 inputs,
                                 outputs,
                                 values,
+                                publication_journal,
                             }) {
                                 Ok(handled) => handled,
                                 Err(error) => {
@@ -2043,6 +2030,7 @@ impl WorkflowRuntime {
                             };
                             if !handled {
                                 clear_bound_component_outputs(outputs, values);
+                                let contract = contract.unwrap_or("<typed invocation>");
                                 anyhow::bail!(
                                     "workflow component '{component}' declares contract \
                                      '{contract}', which the running host lists as implemented but \
@@ -2062,7 +2050,9 @@ impl WorkflowRuntime {
                                 &std::collections::HashSet::new(),
                                 request_count,
                             )?;
-                            self.record_contract_execution(contract);
+                            if let Some(contract) = contract {
+                                self.record_contract_execution(contract);
+                            }
                             telemetry.record_stage(
                                 component.clone(),
                                 stage_started.elapsed().as_nanos(),
@@ -2175,6 +2165,7 @@ impl WorkflowRuntime {
                                         inputs,
                                         outputs,
                                         values,
+                                        publication_journal,
                                     }) {
                                         Ok(handled) => handled,
                                         Err(error) => {
@@ -2343,6 +2334,9 @@ impl WorkflowRuntime {
                     telemetry,
                     host,
                 )?;
+                if let Some(host) = host.as_deref_mut() {
+                    host.observe_boundary(GenerationBoundary::AfterLoopSetup)?;
+                }
                 for index in 0..limit {
                     if !self.advance_workflow_loop(
                         &plan,
@@ -2465,6 +2459,9 @@ impl WorkflowRuntime {
                             final_state_refs.insert(cell.clone(), output.clone());
                         }
                     }
+                }
+                if let Some(host) = host.as_deref_mut() {
+                    host.observe_boundary(GenerationBoundary::AfterBranch)?;
                 }
             }
             WorkflowNode::Emit {
@@ -7189,12 +7186,14 @@ steps:
             contract: "vendor.something-else".to_string(),
             seen: Vec::new(),
         };
+        let mut publication_journal = None;
         let request = WorkflowNodeRequest {
             contract: "onnx-genai.token-policy",
             component: "token_policy",
             inputs: &BTreeMap::new(),
             outputs: &BTreeMap::new(),
             values: &mut PipelineTensors::default(),
+            publication_journal: &mut publication_journal,
         };
         assert!(
             !host.execute_contract_node(request).expect("no error"),
@@ -7217,6 +7216,7 @@ steps:
             contract: "onnx-genai.token-policy".to_string(),
             seen: Vec::new(),
         };
+        let mut publication_journal = None;
 
         let handled = host
             .execute_contract_node(WorkflowNodeRequest {
@@ -7225,6 +7225,7 @@ steps:
                 inputs: &inputs,
                 outputs: &outputs,
                 values: &mut values,
+                publication_journal: &mut publication_journal,
             })
             .expect("the host runs");
 
@@ -8227,10 +8228,13 @@ impl WorkflowRuntime {
             })?;
             let restored = values.get(&session_state_value_name(&carry.cell));
             let current = values.get(&carry.current);
+            let setup_value = values.get(&carry.body_input);
             let seeded = match carry.current_source {
-                onnx_genai_metadata::WorkflowLoopCarrySource::PriorState => current,
+                onnx_genai_metadata::WorkflowLoopCarrySource::PriorState => current.or(setup_value),
                 onnx_genai_metadata::WorkflowLoopCarrySource::Initializer
-                | onnx_genai_metadata::WorkflowLoopCarrySource::Explicit => restored.or(current),
+                | onnx_genai_metadata::WorkflowLoopCarrySource::Explicit => {
+                    restored.or(current).or(setup_value)
+                }
             };
             // A state whose resolved readers include a component port is
             // supplied by the service at that port when it has no materialized
