@@ -294,6 +294,9 @@ impl Engine {
         }
         let options = request.request.options.clone();
         let tokenizer = runtime.package_tokenizer();
+        if runtime.dflash_diagnostic().is_some() {
+            return runtime.run_dflash_generation(&options, request, tokenizer, callback);
+        }
         crate::pipeline::generation::run_declared_generation(
             runtime, &options, tokenizer, request, None, callback,
         )
@@ -415,64 +418,6 @@ impl Engine {
         options: crate::pipeline::speculative::ChainedProposalOptions,
     ) -> anyhow::Result<crate::pipeline::speculative::ChainedProposal> {
         self.workflow_runtime().propose_chained(run, options)
-    }
-
-    pub fn propose_dflash(
-        &self,
-        run: &PipelineTensors,
-        options: crate::pipeline::speculative::DFlashProposalOptions,
-    ) -> anyhow::Result<crate::pipeline::speculative::DFlashProposal> {
-        self.reject_undispatched_dflash_generation()?;
-        self.workflow_runtime().propose_dflash(run, options)
-    }
-
-    pub fn verify_dflash(
-        &self,
-        verified: &PipelineTensors,
-        proposal: &crate::pipeline::speculative::DFlashProposal,
-        mode: crate::pipeline::speculative::DFlashVerificationMode,
-    ) -> anyhow::Result<crate::pipeline::speculative::DFlashAcceptance> {
-        self.reject_undispatched_dflash_generation()?;
-        self.workflow_runtime()
-            .verify_dflash(verified, proposal, mode)
-    }
-
-    pub fn begin_dflash_state_transaction(
-        &self,
-        current: &PipelineTensors,
-    ) -> anyhow::Result<crate::pipeline::speculative::DFlashStateTransaction> {
-        self.reject_undispatched_dflash_generation()?;
-        self.workflow_runtime()
-            .begin_dflash_state_transaction(current)
-    }
-
-    pub fn commit_dflash_state_transaction(
-        &self,
-        transaction: crate::pipeline::speculative::DFlashStateTransaction,
-        current: &mut PipelineTensors,
-        proposal: &crate::pipeline::speculative::DFlashProposal,
-        verified: &PipelineTensors,
-        acceptance: &crate::pipeline::speculative::DFlashAcceptance,
-    ) -> anyhow::Result<crate::pipeline::TurnTransactionOutcome> {
-        self.reject_undispatched_dflash_generation()?;
-        self.workflow_runtime().commit_dflash_state_transaction(
-            transaction,
-            current,
-            proposal,
-            verified,
-            acceptance,
-        )
-    }
-
-    pub fn abort_dflash_state_transaction(
-        &self,
-        transaction: crate::pipeline::speculative::DFlashStateTransaction,
-        current: &mut PipelineTensors,
-        reason: crate::pipeline::TurnAbortReason,
-    ) -> anyhow::Result<crate::pipeline::TurnTransactionOutcome> {
-        self.reject_undispatched_dflash_generation()?;
-        self.workflow_runtime()
-            .abort_dflash_state_transaction(transaction, current, reason)
     }
 
     pub fn accept_chained_proposal(
@@ -644,26 +589,6 @@ mod tests {
                 .err()
                 .expect("prepare_workflow_execution must refuse"),
         );
-        assert_dflash_refusal(
-            engine
-                .propose_dflash(
-                    &PipelineTensors::new(),
-                    crate::pipeline::speculative::DFlashProposalOptions {
-                        anchor_token: 1,
-                        width: 1,
-                        context_start_position: 0,
-                        mode: crate::pipeline::speculative::DFlashProposalMode::Greedy,
-                        eos_token_ids: Vec::new(),
-                    },
-                )
-                .expect_err("manual proposal must refuse"),
-        );
-        assert_dflash_refusal(
-            engine
-                .begin_dflash_state_transaction(&PipelineTensors::new())
-                .expect_err("manual state transaction must refuse"),
-        );
-
         assert!(
             !admitted,
             "refusal must precede scheduler admission callback"

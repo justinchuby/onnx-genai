@@ -38,6 +38,8 @@ use onnx_genai_ort::{DataType, Value};
 use rand::rngs::StdRng;
 use rand::{Rng as _, SeedableRng as _};
 
+use crate::config::{FinishReason, GenerateOptions, GenerateResult, GenerateTokenCallback};
+
 use super::{PipelineTensors, WorkflowRuntime};
 
 /// One materialized chained proposal.
@@ -335,7 +337,9 @@ struct DFlashPlan<'a> {
     structure: &'a DFlashStructure,
     proposer_bindings: BTreeMap<String, String>,
     proposer_outputs: BTreeMap<String, String>,
+    target_bindings: BTreeMap<String, String>,
     target_outputs: BTreeMap<String, String>,
+    target_tokens_input: String,
 }
 
 impl<'a> DFlashPlan<'a> {
@@ -356,14 +360,14 @@ impl<'a> DFlashPlan<'a> {
                  chained, and generic block contracts are independent proposal forms"
             );
         };
-        match (version.as_str(), structure.as_ref()) {
-            ("1", DFlashStructure::Base) | ("2", DFlashStructure::SelectorConvolutionV1 { .. }) => {
-            }
-            _ => anyhow::bail!(
-                "unsupported DFlash flat-block contract version/structure {version}/{structure:?}; \
-                 supported pairs are 1/base and 2/selector_convolution_v1"
+        anyhow::ensure!(
+            matches!(
+                (version.as_str(), structure.as_ref()),
+                ("1", DFlashStructure::Base)
             ),
-        }
+            "this runtime executes only DFlash flat-block version 1 with structure base; \
+             version {version} / {structure:?} must be refused at admission"
+        );
         let (proposer_bindings, proposer_outputs) =
             component_invocation(workflow, &contract.proposer).with_context(|| {
                 format!(
@@ -372,14 +376,33 @@ impl<'a> DFlashPlan<'a> {
                     contract.proposer
                 )
             })?;
-        let (_, target_outputs) =
-            component_invocation(workflow, &contract.target).with_context(|| {
+        let (target_bindings, target_outputs) = component_invocation(workflow, &contract.target)
+            .with_context(|| {
                 format!(
                     "DFlash target '{}' is never invoked by the workflow, so hidden and verifier \
                      outputs cannot be resolved",
                     contract.target
                 )
             })?;
+        let target_token_inputs = target_bindings
+            .iter()
+            .filter(|(_, value)| {
+                matches!(
+                    workflow.inputs.get(*value).map(|input| &input.role),
+                    Some(onnx_genai_metadata::SemanticInputRole::Runtime { role, .. })
+                        if *role == onnx_genai_metadata::RuntimeInputRole::PromptTokens
+                )
+            })
+            .map(|(port, _)| port.clone())
+            .collect::<Vec<_>>();
+        anyhow::ensure!(
+            target_token_inputs.len() == 1,
+            "DFlash target '{}' must bind exactly one declared runtime prompt_tokens input; \
+             found {:?}. The verifier token port is semantic metadata, never inferred from a \
+             port name.",
+            contract.target,
+            target_token_inputs
+        );
         Ok(Self {
             contract,
             version,
@@ -391,7 +414,12 @@ impl<'a> DFlashPlan<'a> {
             structure,
             proposer_bindings,
             proposer_outputs,
+            target_bindings,
             target_outputs,
+            target_tokens_input: target_token_inputs
+                .into_iter()
+                .next()
+                .expect("checked to contain exactly one target token input"),
         })
     }
 
@@ -416,6 +444,103 @@ impl<'a> DFlashPlan<'a> {
             DFlashStructure::SelectorConvolutionV1 { selector, .. }
                 if selector.conditional_probabilities_output.is_some()
         )
+    }
+
+    fn state_for_component_input<'workflow>(
+        &self,
+        workflow: &'workflow WorkflowSpec,
+        component: &str,
+        input: &str,
+    ) -> Option<&'workflow str> {
+        workflow
+            .serving
+            .as_ref()?
+            .state_service
+            .groups
+            .iter()
+            .find_map(|(_, group)| {
+                group
+                    .ports
+                    .get(component)?
+                    .iter()
+                    .find_map(|(cell, alias)| {
+                        (alias.access == StatePortAccess::ReadWrite && alias.input == input)
+                            .then_some(cell.as_str())
+                    })
+            })
+    }
+
+    fn initial_state(
+        &self,
+        workflow: &WorkflowSpec,
+        values: &PipelineTensors,
+    ) -> anyhow::Result<PipelineTensors> {
+        let mut state = PipelineTensors::new();
+        for cell in &self.contract.rollback_state {
+            let source = workflow
+                .serving
+                .as_ref()
+                .and_then(|serving| {
+                    serving.state_service.groups.values().find_map(|group| {
+                        group.ports.iter().find_map(|(component, aliases)| {
+                            let alias = aliases.get(cell)?;
+                            if alias.access != StatePortAccess::ReadWrite {
+                                return None;
+                            }
+                            let binding = match component.as_str() {
+                                component if component == self.contract.target => {
+                                    self.target_bindings.get(&alias.input)
+                                }
+                                component if component == self.contract.proposer => {
+                                    self.proposer_bindings.get(&alias.input)
+                                }
+                                _ => None,
+                            }?;
+                            Some(binding.as_str())
+                        })
+                    })
+                })
+                .with_context(|| {
+                    format!(
+                        "DFlash rollback participant '{cell}' has no read-write target or \
+                         proposer input binding"
+                    )
+                })?;
+            let value = values.get(source).with_context(|| {
+                format!(
+                    "DFlash rollback participant '{cell}' starts from unavailable workflow \
+                     value '{source}'"
+                )
+            })?;
+            state.insert(cell.clone(), clone_value(value)?);
+        }
+        Ok(state)
+    }
+
+    fn install_state_inputs(
+        &self,
+        workflow: &WorkflowSpec,
+        state: &PipelineTensors,
+        values: &mut PipelineTensors,
+    ) -> anyhow::Result<()> {
+        for (component, bindings) in [
+            (self.contract.target.as_str(), &self.target_bindings),
+            (self.contract.proposer.as_str(), &self.proposer_bindings),
+        ] {
+            for (port, value_name) in bindings {
+                let Some(cell) = self.state_for_component_input(workflow, component, port) else {
+                    continue;
+                };
+                let value = state.get(cell).with_context(|| {
+                    format!(
+                        "DFlash component '{component}' reads rollback state '{cell}', which \
+                         has no transaction-local value"
+                    )
+                })?;
+                values.insert(value_name.clone(), clone_value(value)?);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -546,13 +671,481 @@ impl WorkflowRuntime {
         })
     }
 
+    /// Run the v1 DFlash flat-block algorithm as one runtime-owned generation
+    /// transaction.
+    ///
+    /// The caller supplies a normal workflow request, not a target/proposer
+    /// choreography.  Every tensor crossing the component boundary is found
+    /// through the declaration: the target's semantic prompt-token binding,
+    /// hidden-output provenance, state-service aliases, and immutable shared
+    /// weights.  This is deliberately separate from chained, MTP, prompt
+    /// lookup, and tree speculation; those proposal forms have different
+    /// contracts and cannot be treated as a DFlash block.
+    pub(crate) fn run_dflash_generation(
+        &self,
+        options: &GenerateOptions,
+        request: super::PipelineGenerateRequest,
+        tokenizer: Option<&onnx_genai_ort::Tokenizer>,
+        mut callback: Option<&mut GenerateTokenCallback<'_>>,
+    ) -> anyhow::Result<GenerateResult> {
+        self.require_execution_admitted()?;
+        anyhow::ensure!(
+            options.max_new_tokens > 0,
+            "DFlash generation requires max_new_tokens to be positive"
+        );
+        let contract =
+            self.plan.speculative.as_ref().context(
+                "DFlash generation was selected but the package declares no speculation",
+            )?;
+        let plan = DFlashPlan::resolve(contract, &self.plan.workflow)?;
+        let sampling = !options.selects_greedily();
+        if sampling {
+            anyhow::ensure!(
+                plan.has_sampling_probabilities(),
+                "DFlash sampling requires a declared proposal probability distribution; refuse \
+                 before proposer execution rather than mutating draft state with an \
+                 unverifiable proposal"
+            );
+            anyhow::ensure!(
+                options.top_p >= 1.0
+                    && options.top_k == 0
+                    && options.min_p == 0.0
+                    && options.top_a == 0.0
+                    && options.typical_p >= 1.0
+                    && options.repetition_penalty <= 1.0
+                    && options.frequency_penalty == 0.0
+                    && options.presence_penalty == 0.0
+                    && options.dry.is_none()
+                    && options.mirostat.is_none()
+                    && options.xtc.is_none()
+                    && options.constraint.is_none(),
+                "DFlash sampling currently supports the exact unwarped target distribution \
+                 only; processors require matching proposal-side transforms and are refused \
+                 before transaction admission"
+            );
+        }
+
+        // Bind once, before any component executes.  `WorkflowExecutionPlan`
+        // owns normal request/default/shape admission; taking the values before
+        // its generic execute method is what keeps the DFlash component passes
+        // inside this driver's transaction rather than committing an unrelated
+        // workflow pass first.
+        let (mut values, session_id) =
+            super::WorkflowExecutionPlan::new(self, request)?.into_bound_values();
+        let mut state = plan.initial_state(&self.plan.workflow, &values)?;
+        self.restore_dflash_session_state(&plan, session_id.as_deref(), &mut state)?;
+        plan.install_state_inputs(&self.plan.workflow, &state, &mut values)?;
+
+        let initial_tokens = values
+            .get(
+                plan.target_bindings
+                    .get(&plan.target_tokens_input)
+                    .expect("DFlash plan resolved the target token binding"),
+            )
+            .with_context(|| {
+                format!(
+                    "DFlash target '{}' has no bound prompt token input '{}'",
+                    contract.target, plan.target_tokens_input
+                )
+            })?
+            .to_vec_i64()?;
+        anyhow::ensure!(
+            !initial_tokens.is_empty(),
+            "DFlash generation requires at least one prompt token"
+        );
+        let initial_shape = values
+            .get(
+                plan.target_bindings
+                    .get(&plan.target_tokens_input)
+                    .expect("DFlash plan resolved the target token binding"),
+            )
+            .expect("target token value was checked above")
+            .shape()
+            .to_vec();
+        anyhow::ensure!(
+            initial_shape.len() == 2 && initial_shape[0] == 1,
+            "DFlash executes one request row in isolation; target prompt tokens have shape \
+             {initial_shape:?}, expected [1, sequence]"
+        );
+        if options
+            .max_context
+            .is_some_and(|limit| initial_tokens.len() >= limit)
+        {
+            return Ok(GenerateResult {
+                text: String::new(),
+                token_ids: Vec::new(),
+                finish_reason: FinishReason::Length,
+                prefix_cache_hit_len: 0,
+                logprobs: None,
+                budget_cap: None,
+            });
+        }
+        let mut context_start = 0_i64;
+        let mut generated = Vec::with_capacity(options.max_new_tokens);
+        let mut random = StdRng::seed_from_u64(options.seed.unwrap_or(0));
+        let mut finish_reason = FinishReason::MaxTokens;
+
+        // The initial target invocation produces the hidden state that
+        // conditions the first flat proposal.  It is real component execution,
+        // not a caller-injected replacement for hidden features or logits.
+        self.invoke_dflash_target(&plan, &mut values, &state, None)?;
+
+        while generated.len() < options.max_new_tokens {
+            if options
+                .max_context
+                .is_some_and(|limit| initial_tokens.len().saturating_add(generated.len()) >= limit)
+            {
+                finish_reason = FinishReason::Length;
+                break;
+            }
+            let anchor = self.dflash_anchor_token(&plan, &values, options, &mut random)?;
+            let remaining = options.max_new_tokens - generated.len();
+            let remaining_context = options
+                .max_context
+                .map(|limit| limit.saturating_sub(initial_tokens.len() + generated.len()))
+                .unwrap_or(remaining);
+            let width = remaining
+                .min(contract.max_proposal_width)
+                .min(remaining_context);
+            if width == 0 {
+                finish_reason = FinishReason::Length;
+                break;
+            }
+            let mode = if sampling {
+                DFlashProposalMode::Sampling {
+                    seed: random.random(),
+                }
+            } else {
+                DFlashProposalMode::Greedy
+            };
+            let proposal_options = DFlashProposalOptions {
+                anchor_token: anchor,
+                width,
+                context_start_position: context_start,
+                mode,
+                eos_token_ids: options
+                    .eos_token_ids
+                    .iter()
+                    .map(|id| i64::from(*id))
+                    .collect(),
+            };
+
+            // Snapshot every target, draft-private, recurrent, and token
+            // context participant *before* the proposer or verifier can
+            // advance one.  All error exits below resolve this same
+            // transaction back to that complete baseline.
+            let transaction = self.begin_dflash_state_transaction(&state)?;
+            let proposal = match self.propose_dflash(&values, proposal_options) {
+                Ok(proposal) => proposal,
+                Err(error) => {
+                    let _ = self.abort_dflash_state_transaction(
+                        transaction,
+                        &mut state,
+                        super::TurnAbortReason::ExecutionFailure,
+                    );
+                    return Err(error.context("DFlash proposer execution failed before commit"));
+                }
+            };
+            let mut block = Vec::with_capacity(proposal.tokens.len() + 1);
+            block.push(anchor);
+            block.extend_from_slice(&proposal.tokens);
+            if let Err(error) = self.invoke_dflash_target(&plan, &mut values, &state, Some(&block))
+            {
+                let _ = self.abort_dflash_state_transaction(
+                    transaction,
+                    &mut state,
+                    super::TurnAbortReason::ExecutionFailure,
+                );
+                return Err(error.context("DFlash verifier execution failed before commit"));
+            }
+            // `invoke_dflash_target` updated the driver's SSA map in place.
+            // Borrowing it through a separate binding makes the commit's
+            // target-output provenance explicit and avoids any caller-provided
+            // verifier logits or acceptance decision.
+            let verification = if sampling {
+                DFlashVerificationMode::Sampling {
+                    temperature: options.temperature,
+                }
+            } else {
+                DFlashVerificationMode::Greedy
+            };
+            let acceptance = match self.verify_dflash(&values, &proposal, verification) {
+                Ok(acceptance) => acceptance,
+                Err(error) => {
+                    let _ = self.abort_dflash_state_transaction(
+                        transaction,
+                        &mut state,
+                        super::TurnAbortReason::ExecutionFailure,
+                    );
+                    return Err(error.context("DFlash acceptance failed before commit"));
+                }
+            };
+            if let Err(error) = self.commit_dflash_state_transaction(
+                transaction,
+                &mut state,
+                &proposal,
+                &values,
+                &acceptance,
+            ) {
+                return Err(error.context("DFlash accepted-prefix state commit failed"));
+            }
+
+            for (port, value) in &proposal.proposer_outputs {
+                if let Some(value_name) = plan.proposer_outputs.get(port) {
+                    values.insert(value_name.clone(), clone_value(value)?);
+                }
+            }
+            plan.install_state_inputs(&self.plan.workflow, &state, &mut values)?;
+            context_start = context_start
+                .checked_add(i64::try_from(acceptance.accepted).context(
+                    "DFlash accepted-prefix length does not fit the absolute position type",
+                )?)
+                .context("DFlash absolute position overflow")?;
+            for token in acceptance.committed {
+                let token = u32::try_from(token)
+                    .context("DFlash verifier emitted a token outside the u32 token domain")?;
+                generated.push(token);
+                if options.terminates(token) {
+                    finish_reason = FinishReason::EosToken;
+                    break;
+                }
+                if generated.len() == options.max_new_tokens {
+                    break;
+                }
+            }
+            self.record_contract_execution(
+                onnx_genai_metadata::decoder_workflow::SPECULATIVE_BLOCK_CONTRACT,
+            );
+            if finish_reason == FinishReason::EosToken {
+                break;
+            }
+        }
+
+        let text = tokenizer
+            .map(|tokenizer| tokenizer.decode(&generated))
+            .transpose()?
+            .unwrap_or_default();
+        self.commit_dflash_session_state(&plan, session_id.as_deref(), &state)?;
+        // The entire generated token stream is staged in `generated` until all
+        // model execution and accepted-prefix commits have succeeded.  Callback
+        // failure is therefore delivery-only: state is already committed and is
+        // never semantically rolled back by an external receiver.
+        if let Some(callback) = callback.as_mut() {
+            for (index, token) in generated.iter().copied().enumerate() {
+                callback(crate::config::GenerateToken {
+                    token_id: token,
+                    text: tokenizer
+                        .map(|tokenizer| tokenizer.decode(&[token]))
+                        .transpose()?
+                        .unwrap_or_default(),
+                    finish_reason: (index + 1 == generated.len()).then(|| finish_reason.clone()),
+                })?;
+            }
+        }
+        Ok(GenerateResult {
+            text,
+            token_ids: generated,
+            finish_reason,
+            prefix_cache_hit_len: 0,
+            logprobs: None,
+            budget_cap: None,
+        })
+    }
+
+    /// Seed transaction-local DFlash participants from the committed workflow
+    /// session.  Invocation-scoped state deliberately keeps its declared
+    /// request initializer; a session cell replaces that seed only after a
+    /// complete value has been captured under the exact `(session, cell)`
+    /// identity.
+    fn restore_dflash_session_state(
+        &self,
+        plan: &DFlashPlan<'_>,
+        session_id: Option<&str>,
+        state: &mut PipelineTensors,
+    ) -> anyhow::Result<()> {
+        let Some(session_id) = session_id else {
+            return Ok(());
+        };
+        let committed = self.worker.session_state.borrow();
+        for cell in &plan.contract.rollback_state {
+            if self.plan.workflow.state.get(cell).is_some_and(|state| {
+                state.scope == onnx_genai_metadata::WorkflowStateScope::Session
+            }) && let Some(value) = committed.get(&(session_id.to_string(), cell.clone()))
+            {
+                state.insert(cell.clone(), clone_value(value)?);
+            }
+        }
+        Ok(())
+    }
+
+    /// Publish every session-scoped DFlash participant as one all-or-nothing
+    /// map update after the complete turn has succeeded.  All cloning and map
+    /// reservation happens first, leaving the final inserts infallible; an
+    /// execution/cancellation error earlier in the drive therefore leaves the
+    /// exact S3 baseline untouched.
+    fn commit_dflash_session_state(
+        &self,
+        plan: &DFlashPlan<'_>,
+        session_id: Option<&str>,
+        state: &PipelineTensors,
+    ) -> anyhow::Result<()> {
+        let Some(session_id) = session_id else {
+            return Ok(());
+        };
+        let writes = plan
+            .contract
+            .rollback_state
+            .iter()
+            .filter(|cell| {
+                self.plan.workflow.state.get(*cell).is_some_and(|state| {
+                    state.scope == onnx_genai_metadata::WorkflowStateScope::Session
+                })
+            })
+            .map(|cell| {
+                Ok((
+                    (session_id.to_string(), cell.clone()),
+                    clone_value(state.get(cell).with_context(|| {
+                        format!("DFlash commit has no transaction-local state '{cell}'")
+                    })?)?,
+                ))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        if writes.is_empty() {
+            return Ok(());
+        }
+        let mut committed = self.worker.session_state.borrow_mut();
+        committed
+            .try_reserve(writes.len())
+            .context("failed to reserve the DFlash session-state commit write set")?;
+        for (identity, value) in writes {
+            committed.insert(identity, value);
+        }
+        drop(committed);
+        let mut versions = self.worker.session_turn_versions.borrow_mut();
+        let version = versions.entry(session_id.to_string()).or_default();
+        *version = version.saturating_add(1);
+        Ok(())
+    }
+
+    /// Invoke the declared target graph for the current context or a verifier
+    /// block and install every declared output under its workflow SSA binding.
+    fn invoke_dflash_target(
+        &self,
+        plan: &DFlashPlan<'_>,
+        values: &mut PipelineTensors,
+        state: &PipelineTensors,
+        block: Option<&[i64]>,
+    ) -> anyhow::Result<()> {
+        let mut owned = Vec::new();
+        for (port, value_name) in &plan.target_bindings {
+            let value =
+                if port == &plan.target_tokens_input {
+                    match block {
+                    Some(tokens) => Value::from_slice_i64(
+                        tokens,
+                        &[1, i64::try_from(tokens.len()).context(
+                            "DFlash verifier block length does not fit the target tensor shape",
+                        )?],
+                    )?,
+                    None => clone_value(values.get(value_name).with_context(|| {
+                        format!(
+                            "DFlash target input '{port}' references unavailable workflow value \
+                             '{value_name}'"
+                        )
+                    })?)?,
+                }
+                } else if let Some(cell) =
+                    plan.state_for_component_input(&self.plan.workflow, &plan.contract.target, port)
+                {
+                    clone_value(state.get(cell).with_context(|| {
+                        format!(
+                            "DFlash target input '{port}' reads rollback state '{cell}', which is \
+                         unavailable"
+                        )
+                    })?)?
+                } else {
+                    clone_value(values.get(value_name).with_context(|| {
+                        format!(
+                            "DFlash target input '{port}' references unavailable workflow value \
+                         '{value_name}'"
+                        )
+                    })?)?
+                };
+            owned.push((port.clone(), value));
+        }
+        let input_refs = owned
+            .iter()
+            .map(|(port, value)| (port.as_str(), value))
+            .collect::<Vec<_>>();
+        let produced = self
+            .invoke_component_values(
+                &plan.contract.target,
+                &input_refs,
+                &plan.target_outputs,
+                &std::collections::HashMap::new(),
+                1,
+            )
+            .with_context(|| format!("invoke DFlash target '{}'", plan.contract.target))?;
+        for (port, value) in produced {
+            let value_name = plan.target_outputs.get(&port).with_context(|| {
+                format!(
+                    "DFlash target '{}' produced undeclared output '{port}'",
+                    plan.contract.target
+                )
+            })?;
+            values.insert(value_name.clone(), value);
+        }
+        Ok(())
+    }
+
+    fn dflash_anchor_token(
+        &self,
+        plan: &DFlashPlan<'_>,
+        values: &PipelineTensors,
+        options: &GenerateOptions,
+        rng: &mut StdRng,
+    ) -> anyhow::Result<i64> {
+        let value_name = plan
+            .target_outputs
+            .get(&plan.outputs.verifier_logits.output)
+            .with_context(|| {
+                format!(
+                    "DFlash target logits {}::{} have no workflow binding",
+                    plan.outputs.verifier_logits.component, plan.outputs.verifier_logits.output
+                )
+            })?;
+        let logits = values.get(value_name).with_context(|| {
+            format!("DFlash target did not produce declared logits value '{value_name}'")
+        })?;
+        let shape = logits.shape();
+        anyhow::ensure!(
+            shape.len() == 3 && shape[0] == 1 && shape[1] > 0 && shape[2] > 0,
+            "DFlash target logits have shape {shape:?}; expected [1, sequence, vocabulary]"
+        );
+        let vocabulary =
+            usize::try_from(shape[2]).context("DFlash target vocabulary extent is negative")?;
+        let data = logits.to_vec_f32_lossy()?;
+        let start = data
+            .len()
+            .checked_sub(vocabulary)
+            .context("DFlash target logits omit their final token distribution")?;
+        if options.selects_greedily() {
+            Ok(crate::sampling::sample_greedy(&data[start..]) as i64)
+        } else {
+            Ok(
+                sample_probability_row(&softmax(&data[start..], options.temperature), rng.random())?
+                    as i64,
+            )
+        }
+    }
+
     /// Materialize one target-hidden-conditioned DFlash proposal block.
     ///
     /// Shared batching is intentionally not claimed: this path admits exactly
     /// one request row and tells a batching caller to execute rows in isolation
     /// before the proposer mutates draft-private state. The same contract and
     /// component dispatch are used for every isolated row.
-    pub fn propose_dflash(
+    pub(crate) fn propose_dflash(
         &self,
         run: &PipelineTensors,
         options: DFlashProposalOptions,
@@ -1034,7 +1627,7 @@ impl WorkflowRuntime {
     }
 
     /// Verify a DFlash proposal against the target's exact logits.
-    pub fn verify_dflash(
+    pub(crate) fn verify_dflash(
         &self,
         verified: &PipelineTensors,
         proposal: &DFlashProposal,
@@ -1190,7 +1783,7 @@ impl WorkflowRuntime {
 
     /// Admit every declared accepted-prefix participant under the S3
     /// transaction identity before proposer or verifier execution.
-    pub fn begin_dflash_state_transaction(
+    pub(crate) fn begin_dflash_state_transaction(
         &self,
         current: &PipelineTensors,
     ) -> anyhow::Result<DFlashStateTransaction> {
@@ -1227,7 +1820,7 @@ impl WorkflowRuntime {
     /// only afterwards; a callback error is then a post-commit delivery failure
     /// and never rewinds already committed target/draft state, matching the S3
     /// decoder baseline.
-    pub fn commit_dflash_state_transaction(
+    pub(crate) fn commit_dflash_state_transaction(
         &self,
         transaction: DFlashStateTransaction,
         current: &mut PipelineTensors,
@@ -1341,7 +1934,7 @@ impl WorkflowRuntime {
     }
 
     /// Abort a DFlash block to its complete admitted participant baseline.
-    pub fn abort_dflash_state_transaction(
+    pub(crate) fn abort_dflash_state_transaction(
         &self,
         transaction: DFlashStateTransaction,
         current: &mut PipelineTensors,

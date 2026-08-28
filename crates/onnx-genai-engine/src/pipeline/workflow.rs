@@ -985,6 +985,15 @@ impl<'a> WorkflowExecutionPlan<'a> {
         Self::new_hosted(engine, request, &[])
     }
 
+    /// Consume a prepared request before execution and return exactly the
+    /// package inputs it resolved.  Runtime-owned execution constructs use
+    /// this to run their component sessions directly; exposing a pre-bound
+    /// map avoids a first generic pass whose effects would already be
+    /// committed before the construct's transaction is admitted.
+    pub(crate) fn into_bound_values(self) -> (PipelineTensors, Option<String>) {
+        (self.values, self.session_id)
+    }
+
     /// Prepare a pass in which `hosted` contracts are executed by the caller.
     ///
     /// The contract list is the caller's statement about what it can run, and

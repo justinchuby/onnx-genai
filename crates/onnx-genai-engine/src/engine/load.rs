@@ -330,10 +330,6 @@ impl Engine {
                 .ok()
                 .and_then(|directory| load_inference_metadata(&directory).ok())
         };
-        if let Some(metadata) = &metadata {
-            crate::pipeline::WorkflowExecutionAdmission::from_metadata(metadata)
-                .require_supported()?;
-        }
         metadata
             .as_ref()
             .and_then(|metadata| metadata.pipeline.as_ref())

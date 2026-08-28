@@ -139,51 +139,18 @@ impl std::ops::Deref for PipelineOutputs {
 #[cfg(test)]
 mod dflash_constructor_admission_tests {
     use super::*;
-    use crate::memory_authority::{DeviceCompatibilityDomain, DeviceMemoryAuthority};
-    use onnx_runtime_memory_governor::ProcessMemoryManager;
     use std::path::PathBuf;
-
-    struct PanicAuthorityProvider;
-
-    impl MemoryAuthorityProvider for PanicAuthorityProvider {
-        fn process_memory_manager(&self) -> ProcessMemoryManager {
-            panic!("DFlash admission must precede authority allocation")
-        }
-
-        fn validate_limit(
-            &self,
-            _domain: &DeviceCompatibilityDomain,
-            _requested: crate::ResourceLimit,
-        ) -> anyhow::Result<()> {
-            panic!("DFlash admission must precede authority validation")
-        }
-
-        fn authority(
-            &self,
-            _domain: &DeviceCompatibilityDomain,
-            _resolved_limit_bytes: u64,
-        ) -> anyhow::Result<DeviceMemoryAuthority> {
-            panic!("DFlash admission must precede device authority allocation")
-        }
-    }
 
     fn fixture() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dflash-admission")
     }
 
-    fn assert_dflash_refusal(error: anyhow::Error) {
-        assert!(matches!(
-            crate::engine::package_capability_error(&error),
-            Some(crate::engine::PackageCapabilityError::DFlashExecutionUnavailable {
-                version,
-                capability,
-            }) if version == "1"
-                && capability == onnx_genai_metadata::capabilities::DFLASH_FLAT_BLOCK
-        ));
+    fn assert_not_dflash_refusal(error: anyhow::Error) {
+        assert!(crate::engine::package_capability_error(&error).is_none());
     }
 
     #[test]
-    fn every_direct_workflow_constructor_refuses_before_model_or_authority_allocation() {
+    fn supported_dflash_v1_reaches_component_model_admission() {
         let root = fixture();
         assert!(
             PipelineModelDirectory::load(&root).is_err(),
@@ -196,18 +163,8 @@ mod dflash_constructor_admission_tests {
             SessionOptions::default(),
         )
         .err()
-        .expect("direct workflow construction must refuse DFlash");
-        assert_dflash_refusal(error);
-
-        let error = WorkflowRuntime::from_dir_with_session_options_and_memory_authority_provider(
-            &root,
-            EngineConfig::default(),
-            SessionOptions::default(),
-            Arc::new(PanicAuthorityProvider),
-        )
-        .err()
-        .expect("provider workflow construction must refuse DFlash");
-        assert_dflash_refusal(error);
+        .expect("the empty ONNX loader spy must reject model construction");
+        assert_not_dflash_refusal(error);
     }
 }
 
@@ -503,7 +460,7 @@ impl WorkflowRuntime {
         speculative: Option<onnx_genai_metadata::SpeculativeContract>,
     ) -> anyhow::Result<Self> {
         let execution_admission =
-            WorkflowExecutionAdmission::from_speculative(speculative.as_ref());
+            WorkflowExecutionAdmission::from_speculative(speculative.as_ref(), decode_backend);
         execution_admission.require_supported()?;
         let compiled_workflow = onnx_genai_metadata::compile_workflow(&workflow)
             .map_err(|error| anyhow::anyhow!("Failed to lower workflow metadata: {error}"))?;
@@ -557,9 +514,10 @@ impl WorkflowRuntime {
     ) -> anyhow::Result<(Self, EngineResourceGovernor)> {
         let metadata = onnx_genai_metadata::load_metadata_package(pipeline_dir)
             .map_err(|error| anyhow::anyhow!("Failed to resolve workflow package: {error}"))?;
-        let execution_admission = WorkflowExecutionAdmission::from_metadata(&metadata);
-        execution_admission.require_supported()?;
         let decode_backend = validate_pipeline_backend_request(config.decode_backend)?;
+        let execution_admission =
+            WorkflowExecutionAdmission::from_metadata(&metadata, decode_backend);
+        execution_admission.require_supported()?;
         let authority_domain = crate::engine::session_device_domain(&session_options)?;
         crate::engine::validate_shared_authority_limit(
             authority_provider.as_ref(),
