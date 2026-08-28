@@ -292,6 +292,9 @@ pub(crate) struct WorkerRuntimeState {
     /// replace this journal.
     pub(crate) last_candidate_tree_block_traces:
         RefCell<Vec<super::speculative::CandidateTreeBlockTrace>>,
+    /// DFlash execution evidence is staged with the turn and becomes visible
+    /// only after the same semantic commit as state and output.
+    pub(crate) last_dflash_block_traces: RefCell<Vec<super::speculative::DFlashBlockTrace>>,
     /// Sessions with a pass in flight, for leases declared `policy: exclusive`.
     ///
     /// Two turns of one conversation that both read the history before either
@@ -354,6 +357,7 @@ impl Default for WorkerRuntimeState {
             session_outputs: RefCell::new(HashMap::new()),
             last_output_publications: RefCell::new(Vec::new()),
             last_candidate_tree_block_traces: RefCell::new(Vec::new()),
+            last_dflash_block_traces: RefCell::new(Vec::new()),
             session_leases: RefCell::new(HashSet::new()),
             session_turn_versions: RefCell::new(HashMap::new()),
             iteration_runtimes: RefCell::new(BTreeMap::new()),

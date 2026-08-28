@@ -2365,9 +2365,10 @@ fn run_generation(
     let cancellation_events = events.clone();
     let generation_control =
         GenerationControl::from_cancellation_probe(move || cancellation_events.is_closed());
-    let candidate_tree = engine.candidate_tree_diagnostic().is_some();
+    let specialized_speculation =
+        engine.candidate_tree_diagnostic().is_some() || engine.dflash_diagnostic().is_some();
     let bound = bound.map(|request| {
-        if candidate_tree {
+        if specialized_speculation {
             request.with_generation_control(generation_control.clone())
         } else {
             request
@@ -2398,7 +2399,7 @@ fn run_generation(
                 Some(&mut admitted),
                 Some(&mut callback),
             ),
-            (None, session) if candidate_tree => match session {
+            (None, session) if specialized_speculation => match session {
                 Some(session) => engine.generate_in_session_with_control_callbacks(
                     session,
                     request,

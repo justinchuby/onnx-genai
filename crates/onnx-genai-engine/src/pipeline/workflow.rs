@@ -983,6 +983,7 @@ impl<'a> WorkflowExecutionPlan<'a> {
         request: PipelineGenerateRequest,
     ) -> anyhow::Result<Self> {
         engine.reject_candidate_tree_raw_execution("WorkflowExecutionPlan::new")?;
+        engine.reject_dflash_raw_execution("WorkflowExecutionPlan::new")?;
         Self::new_hosted(engine, request, &[])
     }
 
@@ -994,6 +995,19 @@ impl<'a> WorkflowExecutionPlan<'a> {
         Self::new_hosted(engine, request, &[])
     }
 
+    pub(super) fn new_dflash_driver(
+        engine: &'a WorkflowRuntime,
+        request: PipelineGenerateRequest,
+    ) -> anyhow::Result<Self> {
+        engine.require_execution_admitted()?;
+        Self::new_hosted(engine, request, &[])
+    }
+
+    /// Consume a prepared request before execution and return exactly the
+    /// package inputs it resolved.  Runtime-owned execution constructs use
+    /// this to run their component sessions directly; exposing a pre-bound
+    /// map avoids a first generic pass whose effects would already be
+    /// committed before the construct's transaction is admitted.
     pub(crate) fn into_bound_values(self) -> (PipelineTensors, Option<String>) {
         (self.values, self.session_id)
     }
@@ -1583,11 +1597,14 @@ impl<'a> WorkflowExecutionPlan<'a> {
                 &pass.telemetry.row_outputs,
                 pass.telemetry.loop_ended_by_predicate,
             )?;
-            // Every semantic session cell in the canonical plan is staged,
-            // including one whose current turn did not change its value.  A
-            // complete write set makes a partial commit unrepresentable.
-            for (cell, resolved) in state_plan
-                .session_cells()
+            // Every semantic session cell in the canonical plan is staged when
+            // this pass names a session, including one whose current turn did
+            // not change its value. A stateless tensor pass owns no conversation
+            // to update.
+            for (cell, resolved) in self
+                .session_id
+                .iter()
+                .flat_map(|_| state_plan.session_cells())
                 .filter(|(_, state)| state.transaction.required)
             {
                 let state = workflow.state.get(cell).with_context(|| {
@@ -1651,6 +1668,44 @@ impl<'a> WorkflowExecutionPlan<'a> {
                 };
                 transaction.stage_state(resolved.identity.clone(), value);
             }
+            let mut advisory_updates = Vec::new();
+            if let Some(session_id) = self.session_id.as_ref() {
+                for (cell, resolved) in state_plan
+                    .session_cells()
+                    .filter(|(_, state)| !state.transaction.required)
+                {
+                    let onnx_genai_metadata::StateFinalWriter::Writer(writer) =
+                        resolved.final_writer.as_ref().with_context(|| {
+                            format!("advisory session state '{cell}' has no resolved final writer")
+                        })?
+                    else {
+                        anyhow::bail!(
+                            "advisory session state '{cell}' cannot own prompt continuation"
+                        );
+                    };
+                    let value_ref = if values.contains_key(&writer.binding) {
+                        writer.binding.as_str()
+                    } else {
+                        final_state_refs
+                            .get(cell)
+                            .map(String::as_str)
+                            .with_context(|| {
+                                format!(
+                                    "advisory session state '{cell}' has no final value '{}'",
+                                    writer.binding
+                                )
+                            })?
+                    };
+                    advisory_updates.push((
+                        (session_id.clone(), cell.to_string()),
+                        clone_value(values.get(value_ref).with_context(|| {
+                            format!(
+                                "advisory session state '{cell}' has no final value '{value_ref}'"
+                            )
+                        })?)?,
+                    ));
+                }
+            }
             transaction.stage_effects();
             if let Some(journal) = publication_journal.as_mut() {
                 journal.finalize_on_commit()?;
@@ -1659,13 +1714,13 @@ impl<'a> WorkflowExecutionPlan<'a> {
             let mut session_state = engine.worker.session_state.borrow_mut();
             let mut session_effects = engine.worker.session_effects.borrow_mut();
             let mut session_outputs = engine.worker.session_outputs.borrow_mut();
-            transaction
-                .commit(
-                    &mut session_state,
-                    &mut session_effects,
-                    &mut session_outputs,
-                )
-                .map(|_| ())
+            transaction.commit(
+                &mut session_state,
+                &mut session_effects,
+                &mut session_outputs,
+            )?;
+            session_state.extend(advisory_updates);
+            Ok(())
         })();
         if let Err(error) = staged_commit {
             let _ = transaction.abort(TurnAbortReason::CommitFailure);

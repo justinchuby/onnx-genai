@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use onnx_genai_metadata::{PipelineSpec, TensorDimension};
 use onnx_runtime_loader::proto::onnx::{ValueInfoProto, tensor_shape_proto, type_proto};
-use onnx_std::ir::{DataType, Dim};
+use onnx_std::ir::DataType;
 
 use crate::{OrtError, Result};
 
@@ -36,6 +36,8 @@ struct ComponentSignature {
     /// initializers resolved from sidecar files are included. This is what a
     /// speculative shared-weight relationship must resolve against.
     initializers: BTreeSet<String>,
+    /// Graph outputs transitively reached by each graph input or initializer.
+    reachable_outputs: BTreeMap<String, BTreeSet<String>>,
 }
 
 pub(crate) fn validate_pipeline_admission(
@@ -47,6 +49,128 @@ pub(crate) fn validate_pipeline_admission(
     validate_workflow_signatures(&spec.workflow, &signatures)?;
     if let Some(speculative) = speculative {
         validate_speculative_shared_initializers(speculative, &signatures)?;
+        validate_dflash_required_input_reachability(speculative, &signatures)?;
+    }
+    Ok(())
+}
+
+fn validate_dflash_required_input_reachability(
+    speculative: &onnx_genai_metadata::SpeculativeContract,
+    signatures: &BTreeMap<String, ComponentSignature>,
+) -> Result<()> {
+    let onnx_genai_metadata::SpeculativeProposalExecution::DflashFlatBlock {
+        conditioning,
+        block,
+        outputs,
+        shared_weights,
+        ..
+    } = &speculative.proposal_execution
+    else {
+        return Ok(());
+    };
+    let proposer = signatures.get(&speculative.proposer).ok_or_else(|| {
+        OrtError::InvalidArgument(format!(
+            "DFlash proposer '{}' has no inspected ONNX graph",
+            speculative.proposer
+        ))
+    })?;
+    let target = signatures.get(&speculative.target).ok_or_else(|| {
+        OrtError::InvalidArgument(format!(
+            "DFlash target '{}' has no inspected ONNX graph",
+            speculative.target
+        ))
+    })?;
+    let mut semantic_outputs = BTreeSet::from([outputs.candidate_tokens.clone()]);
+    if let Some(probabilities) = outputs.proposal_probabilities.as_ref() {
+        semantic_outputs.insert(probabilities.clone());
+    }
+    for (field, port) in [
+        (
+            "conditioning.proposer_input",
+            conditioning.proposer_input.as_str(),
+        ),
+        (
+            "block.noise_embeddings_input",
+            block.noise_embeddings_input.as_str(),
+        ),
+        (
+            "block.masked_positions_input",
+            block.masked_positions_input.as_str(),
+        ),
+        (
+            "block.position_ids_input",
+            block.position_ids_input.as_str(),
+        ),
+        (
+            "block.attention_mask_input",
+            block.attention_mask_input.as_str(),
+        ),
+        (
+            "shared_weights.output_projection.proposer_input",
+            shared_weights.output_projection.proposer_input.as_str(),
+        ),
+    ] {
+        let reached = proposer
+            .reachable_outputs
+            .get(port)
+            .cloned()
+            .unwrap_or_default();
+        if reached.is_disjoint(&semantic_outputs) {
+            return Err(OrtError::InvalidArgument(format!(
+                "package admission rejected DFlash {field} port '{port}' on proposer '{}': the \
+                 ONNX graph does not connect this required semantic input to candidate output \
+                 '{}'{}; decorative or unused DFlash inputs would make the declared block \
+                 semantics false. Connect the input into the proposer computation that produces \
+                 the declared candidates/probabilities.",
+                speculative.proposer,
+                outputs.candidate_tokens,
+                outputs
+                    .proposal_probabilities
+                    .as_deref()
+                    .map(|name| format!(" or probability output '{name}'"))
+                    .unwrap_or_default(),
+            )));
+        }
+    }
+
+    let conditioning_outputs = conditioning
+        .sources
+        .iter()
+        .map(|source| source.output.clone())
+        .collect::<BTreeSet<_>>();
+    let embedding_reached = target
+        .reachable_outputs
+        .get(&shared_weights.input_embedding.table)
+        .cloned()
+        .unwrap_or_default();
+    if !conditioning_outputs.is_subset(&embedding_reached) {
+        let missing = conditioning_outputs
+            .difference(&embedding_reached)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(OrtError::InvalidArgument(format!(
+            "package admission rejected DFlash input_embedding.table initializer '{}' on target \
+             '{}': it does not reach declared conditioning output(s) [{missing}]. A shared token \
+             embedding must participate in the target features the proposer consumes, not exist \
+             only as decorative initializer metadata.",
+            shared_weights.input_embedding.table, speculative.target
+        )));
+    }
+    let projection_reached = target
+        .reachable_outputs
+        .get(&shared_weights.output_projection.initializer)
+        .cloned()
+        .unwrap_or_default();
+    if !projection_reached.contains(&speculative.verification.target_output.output) {
+        return Err(OrtError::InvalidArgument(format!(
+            "package admission rejected DFlash output_projection.initializer '{}' on target '{}': \
+             it does not reach verifier output '{}'. The declared shared LM head must be consumed \
+             by both target verification and proposer projection dataflow.",
+            shared_weights.output_projection.initializer,
+            speculative.target,
+            speculative.verification.target_output.output
+        )));
     }
     Ok(())
 }
@@ -507,7 +631,7 @@ fn inspect_component_signatures(
 }
 
 fn inspect_component_signature(component: &str, path: &Path) -> Result<ComponentSignature> {
-    let model = if path
+    let bytes = if path
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("textproto"))
     {
@@ -518,7 +642,7 @@ fn inspect_component_signature(component: &str, path: &Path) -> Result<Component
                 format!("the ONNX textproto could not be read: {error}"),
             )
         })?;
-        onnx_std::textproto::from_textproto(&text).map_err(|error| {
+        onnx_runtime_loader::proto::textproto_to_binary(&text).map_err(|error| {
             component_inspection_error(
                 component,
                 path,
@@ -526,22 +650,19 @@ fn inspect_component_signature(component: &str, path: &Path) -> Result<Component
             )
         })
     } else {
-        onnx_std::load_model(path).map_err(|error| {
+        std::fs::read(path).map_err(|error| {
             component_inspection_error(
                 component,
                 path,
-                format!("the ONNX model could not be loaded: {error}"),
+                format!("the ONNX model could not be read: {error}"),
             )
         })
     }?;
-    // Admission must inspect the retained protobuf before scanning the execution
-    // projection: graph_builder.rs:118-121 and 143-147 intentionally omit empty
-    // GraphProto input/output names from the loaded IR.
-    let source_proto = model.to_proto().map_err(|error| {
+    let source_proto = onnx_runtime_loader::proto::decode_model(&bytes).map_err(|error| {
         component_inspection_error(
             component,
             path,
-            format!("the retained ONNX protobuf could not be inspected: {error}"),
+            format!("the ONNX protobuf could not be decoded: {error}"),
         )
     })?;
     let source_graph = source_proto.graph.as_ref().ok_or_else(|| {
@@ -585,6 +706,22 @@ fn inspect_component_signature(component: &str, path: &Path) -> Result<Component
         .iter()
         .map(|name| name.to_string())
         .collect();
+    let graph_outputs = source_graph
+        .output
+        .iter()
+        .map(|output| output.name.as_str())
+        .collect::<BTreeSet<_>>();
+    for source in source_graph
+        .input
+        .iter()
+        .map(|input| input.name.as_str())
+        .chain(initializer_names.iter().copied())
+    {
+        signature.reachable_outputs.insert(
+            source.to_string(),
+            reachable_graph_outputs(source_graph, source, &graph_outputs),
+        );
+    }
 
     for input in &source_graph.input {
         let name = input.name.clone();
@@ -596,29 +733,46 @@ fn inspect_component_signature(component: &str, path: &Path) -> Result<Component
             .insert(name, raw_input_signature(component, path, input)?);
     }
 
-    for output in &model.graph.outputs {
-        let value = model.graph.value(*output);
-        let name = value
-            .name
-            .clone()
-            .expect("validated GraphProto output names survive loader projection");
-        signature.outputs.insert(
-            name,
-            PortSignature {
-                dtype: value.dtype,
-                shape: value
-                    .shape
-                    .iter()
-                    .map(|dimension| match dimension {
-                        Dim::Static(value) => PortDimension::Static(*value),
-                        Dim::Symbolic(_) => PortDimension::Dynamic,
-                    })
-                    .collect(),
-            },
-        );
+    for output in &source_graph.output {
+        let name = output.name.clone();
+        signature
+            .outputs
+            .insert(name, raw_port_signature(component, path, output, "output")?);
     }
 
     Ok(signature)
+}
+
+fn reachable_graph_outputs(
+    graph: &onnx_runtime_loader::proto::onnx::GraphProto,
+    source: &str,
+    graph_outputs: &BTreeSet<&str>,
+) -> BTreeSet<String> {
+    let mut reachable = BTreeSet::from([source.to_string()]);
+    loop {
+        let mut changed = false;
+        for node in &graph.node {
+            if node
+                .input
+                .iter()
+                .any(|input| !input.is_empty() && reachable.contains(input))
+            {
+                for output in &node.output {
+                    if !output.is_empty() {
+                        changed |= reachable.insert(output.clone());
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    graph_outputs
+        .iter()
+        .filter(|output| reachable.contains(**output))
+        .map(|output| (*output).to_string())
+        .collect()
 }
 
 fn raw_input_signature(
@@ -626,11 +780,20 @@ fn raw_input_signature(
     path: &Path,
     input: &ValueInfoProto,
 ) -> Result<PortSignature> {
-    let tensor = input
+    raw_port_signature(component, path, input, "input")
+}
+
+fn raw_port_signature(
+    component: &str,
+    path: &Path,
+    value: &ValueInfoProto,
+    direction: &str,
+) -> Result<PortSignature> {
+    let tensor = value
         .r#type
         .as_ref()
-        .and_then(|input_type| input_type.value.as_ref())
-        .and_then(|input_type| match input_type {
+        .and_then(|value_type| value_type.value.as_ref())
+        .and_then(|value_type| match value_type {
             type_proto::Value::TensorType(tensor) => Some(tensor),
             _ => None,
         })
@@ -639,8 +802,8 @@ fn raw_input_signature(
                 component,
                 path,
                 format!(
-                    "ONNX graph input '{}' does not declare a tensor type",
-                    input.name
+                    "ONNX graph {direction} '{}' does not declare a tensor type",
+                    value.name
                 ),
             )
         })?;
@@ -649,8 +812,8 @@ fn raw_input_signature(
             component,
             path,
             format!(
-                "ONNX graph input '{}' declares unsupported tensor dtype {}",
-                input.name, tensor.elem_type
+                "ONNX graph {direction} '{}' declares unsupported tensor dtype {}",
+                value.name, tensor.elem_type
             ),
         )
     })?;

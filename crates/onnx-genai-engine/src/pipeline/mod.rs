@@ -84,16 +84,27 @@ const GENERATION_CANCELLED: u8 = 1;
 const GENERATION_COMMITTING: u8 = 2;
 const GENERATION_COMMITTED: u8 = 3;
 
-/// Transaction boundaries at which candidate-tree generation can observe
-/// cancellation or a deterministic execution guard.
+/// Portable transaction boundaries at which a generation can observe
+/// cancellation or a caller-provided execution guard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GenerationBoundary {
     BeforeProposer,
     AfterProposer,
     AfterVerifier,
     BeforeAcceptedPathCommit,
+    BeforeAcceptedPrefixCommit,
     BeforeSemanticCommit,
     BeforeOutputPublication,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "{operation} cannot accept request-scoped generation control for {runtime}; use a \
+     cancellation-capable generation path rather than silently dropping the signal"
+)]
+pub struct GenerationControlUnsupported {
+    pub operation: &'static str,
+    pub runtime: &'static str,
 }
 
 impl std::fmt::Display for GenerationBoundary {
@@ -103,27 +114,19 @@ impl std::fmt::Display for GenerationBoundary {
             Self::AfterProposer => "after proposer execution",
             Self::AfterVerifier => "after verifier execution",
             Self::BeforeAcceptedPathCommit => "before accepted-path commit",
+            Self::BeforeAcceptedPrefixCommit => "before accepted-prefix commit",
             Self::BeforeSemanticCommit => "before semantic commit",
             Self::BeforeOutputPublication => "before output publication",
         })
     }
 }
 
-#[derive(Debug, thiserror::Error)]
-#[error(
-    "{operation} cannot accept request-scoped generation control for {runtime}; use a \
-     candidate-tree generation path rather than silently dropping the signal"
-)]
-pub struct GenerationControlUnsupported {
-    pub operation: &'static str,
-    pub runtime: &'static str,
-}
-
-/// Request-scoped cancellation and deterministic candidate-tree checkpoints.
+/// Request-scoped cancellation and deterministic transaction checkpoints.
 ///
-/// Cancellation races semantic commit through one atomic transition. If
-/// cancellation wins, no state or output head commits. If commit wins, later
-/// cancellation is a delivery outcome and cannot roll back the completed turn.
+/// `cancel` races with `begin_commit` through one atomic state transition. If
+/// cancellation wins, no semantic state can commit. If commit wins, later
+/// cancellation is delivery or next-turn behavior and cannot roll back the
+/// committed turn.
 #[derive(Clone)]
 pub struct GenerationControl {
     state: Arc<AtomicU8>,
@@ -158,6 +161,8 @@ impl GenerationControl {
         Self::default()
     }
 
+    /// Observe an existing cancellation authority, such as a closed response
+    /// stream, without introducing a second request lifecycle.
     pub fn from_cancellation_probe(probe: impl Fn() -> bool + Send + Sync + 'static) -> Self {
         Self {
             cancellation_probe: Some(Arc::new(probe)),
@@ -165,6 +170,11 @@ impl GenerationControl {
         }
     }
 
+    /// Install a portable execution checkpoint.
+    ///
+    /// Returning an error aborts the admitted turn as an execution failure.
+    /// This is useful for watchdogs and deterministic fault testing; it does
+    /// not bypass the transaction or publication boundary.
     pub fn with_checkpoint(
         mut self,
         checkpoint: impl Fn(GenerationBoundary) -> anyhow::Result<()> + Send + Sync + 'static,
@@ -173,8 +183,8 @@ impl GenerationControl {
         self
     }
 
-    /// Request cancellation. Returns true only when cancellation wins before
-    /// semantic commit starts.
+    /// Request cancellation. Returns true only when cancellation wins the
+    /// linearization race against semantic commit.
     pub fn cancel(&self) -> bool {
         self.state
             .compare_exchange(
@@ -232,7 +242,7 @@ impl GenerationControl {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
-            .expect("semantic commit must own candidate-tree generation control");
+            .expect("semantic commit must own the generation control");
         debug_assert_eq!(previous, GENERATION_COMMITTING);
     }
 
@@ -320,51 +330,18 @@ impl std::ops::Deref for PipelineOutputs {
 #[cfg(test)]
 mod dflash_constructor_admission_tests {
     use super::*;
-    use crate::memory_authority::{DeviceCompatibilityDomain, DeviceMemoryAuthority};
-    use onnx_runtime_memory_governor::ProcessMemoryManager;
     use std::path::PathBuf;
-
-    struct PanicAuthorityProvider;
-
-    impl MemoryAuthorityProvider for PanicAuthorityProvider {
-        fn process_memory_manager(&self) -> ProcessMemoryManager {
-            panic!("DFlash admission must precede authority allocation")
-        }
-
-        fn validate_limit(
-            &self,
-            _domain: &DeviceCompatibilityDomain,
-            _requested: crate::ResourceLimit,
-        ) -> anyhow::Result<()> {
-            panic!("DFlash admission must precede authority validation")
-        }
-
-        fn authority(
-            &self,
-            _domain: &DeviceCompatibilityDomain,
-            _resolved_limit_bytes: u64,
-        ) -> anyhow::Result<DeviceMemoryAuthority> {
-            panic!("DFlash admission must precede device authority allocation")
-        }
-    }
 
     fn fixture() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dflash-admission")
     }
 
-    fn assert_dflash_refusal(error: anyhow::Error) {
-        assert!(matches!(
-            crate::engine::package_capability_error(&error),
-            Some(crate::engine::PackageCapabilityError::DFlashExecutionUnavailable {
-                version,
-                capability,
-            }) if version == "1"
-                && capability == onnx_genai_metadata::capabilities::DFLASH_FLAT_BLOCK
-        ));
+    fn assert_not_dflash_refusal(error: anyhow::Error) {
+        assert!(crate::engine::package_capability_error(&error).is_none());
     }
 
     #[test]
-    fn every_direct_workflow_constructor_refuses_before_model_or_authority_allocation() {
+    fn supported_dflash_v1_reaches_component_model_admission() {
         let root = fixture();
         assert!(
             PipelineModelDirectory::load(&root).is_err(),
@@ -377,18 +354,8 @@ mod dflash_constructor_admission_tests {
             SessionOptions::default(),
         )
         .err()
-        .expect("direct workflow construction must refuse DFlash");
-        assert_dflash_refusal(error);
-
-        let error = WorkflowRuntime::from_dir_with_session_options_and_memory_authority_provider(
-            &root,
-            EngineConfig::default(),
-            SessionOptions::default(),
-            Arc::new(PanicAuthorityProvider),
-        )
-        .err()
-        .expect("provider workflow construction must refuse DFlash");
-        assert_dflash_refusal(error);
+        .expect("the empty ONNX loader spy must reject model construction");
+        assert_not_dflash_refusal(error);
     }
 }
 
@@ -420,7 +387,8 @@ pub struct PipelineGenerateRequest {
     pub session_id: Option<String>,
     /// Application-selected package components that replace overridable components.
     pub component_overrides: HashMap<String, String>,
-    /// Optional cancellation and deterministic transaction checkpoints.
+    /// Request lifecycle and transaction checkpoints. Absence means the caller
+    /// supplied no cancellation authority.
     pub generation_control: Option<GenerationControl>,
 }
 
@@ -501,6 +469,10 @@ pub(crate) struct WorkflowRuntime {
 impl WorkflowRuntime {
     pub(crate) fn take_committed_output_publications(&mut self) -> Vec<WorkflowOutputPublication> {
         std::mem::take(&mut *self.worker.last_output_publications.borrow_mut())
+    }
+
+    pub(crate) fn take_dflash_block_traces(&mut self) -> Vec<speculative::DFlashBlockTrace> {
+        std::mem::take(&mut *self.worker.last_dflash_block_traces.borrow_mut())
     }
 }
 
@@ -691,33 +663,12 @@ impl WorkflowRuntime {
         models: PipelineModels,
         speculative: Option<onnx_genai_metadata::SpeculativeContract>,
     ) -> anyhow::Result<Self> {
-        let execution_admission =
-            WorkflowExecutionAdmission::from_speculative(speculative.as_ref(), Some(&workflow));
-        execution_admission.require_supported()?;
-        if speculative.as_ref().is_some_and(|contract| {
-            matches!(
-                &contract.proposal_execution,
-                onnx_genai_metadata::SpeculativeProposalExecution::CandidateTree { .. }
-            )
-        }) && !matches!(
+        let execution_admission = WorkflowExecutionAdmission::from_speculative(
+            speculative.as_ref(),
+            Some(&workflow),
             decode_backend,
-            EngineDecodeBackend::Auto | EngineDecodeBackend::Ort
-        ) {
-            return Err(
-                crate::engine::PackageCapabilityError::CandidateTreeExecutionUnavailable {
-                    version: speculative
-                        .as_ref()
-                        .expect("candidate-tree contract checked above")
-                        .version
-                        .clone(),
-                    reason: format!(
-                        "backend {decode_backend:?} is unsupported; the production candidate-tree \
-                     executor currently uses ORT component sessions"
-                    ),
-                }
-                .into(),
-            );
-        }
+        );
+        execution_admission.require_supported()?;
         let compiled_workflow = onnx_genai_metadata::compile_workflow(&workflow)
             .map_err(|error| anyhow::anyhow!("Failed to lower workflow metadata: {error}"))?;
         let row_wise_outputs = workflow::workflow_row_wise_outputs(&compiled_workflow.graph);
@@ -768,11 +719,12 @@ impl WorkflowRuntime {
         session_options: SessionOptions,
         authority_provider: Option<SharedMemoryAuthorityProvider>,
     ) -> anyhow::Result<(Self, EngineResourceGovernor)> {
+        let decode_backend = validate_pipeline_backend_request(config.decode_backend)?;
         let mut capability_error = None;
         let mut admitted_execution = None;
         let directory =
             match PipelineModelDirectory::load_with_metadata_preflight(pipeline_dir, |metadata| {
-                let admission = WorkflowExecutionAdmission::from_metadata(metadata);
+                let admission = WorkflowExecutionAdmission::from_metadata(metadata, decode_backend);
                 admission.require_supported().map_err(|error| {
                     capability_error = Some(error.clone());
                     onnx_genai_ort::OrtError::InvalidArgument(error.to_string())
@@ -796,33 +748,6 @@ impl WorkflowRuntime {
         } else {
             WorkflowExecutionAdmission::Admitted
         };
-        let decode_backend = validate_pipeline_backend_request(config.decode_backend)?;
-        if let Some(contract) = directory
-            .metadata
-            .as_ref()
-            .and_then(|metadata| metadata.speculative.as_ref())
-            .filter(|contract| {
-                matches!(
-                    &contract.proposal_execution,
-                    onnx_genai_metadata::SpeculativeProposalExecution::CandidateTree { .. }
-                )
-            })
-            && !matches!(
-                decode_backend,
-                EngineDecodeBackend::Auto | EngineDecodeBackend::Ort
-            )
-        {
-            return Err(
-                crate::engine::PackageCapabilityError::CandidateTreeExecutionUnavailable {
-                    version: contract.version.clone(),
-                    reason: format!(
-                        "backend {decode_backend:?} is unsupported; the production candidate-tree \
-                     executor currently uses ORT component sessions"
-                    ),
-                }
-                .into(),
-            );
-        }
         let authority_domain = crate::engine::session_device_domain(&session_options)?;
         crate::engine::validate_shared_authority_limit(
             authority_provider.as_ref(),
@@ -1170,6 +1095,29 @@ impl WorkflowRuntime {
     pub(crate) fn require_execution_admitted(&self) -> anyhow::Result<()> {
         self.plan.execution_admission.require_supported()?;
         Ok(())
+    }
+
+    pub(crate) fn reject_dflash_raw_execution(&self, operation: &str) -> anyhow::Result<()> {
+        self.require_execution_admitted()?;
+        if self.is_dflash() {
+            return Err(
+                crate::engine::PackageCapabilityError::DFlashRawWorkflowApi {
+                    operation: operation.to_string(),
+                }
+                .into(),
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn is_dflash(&self) -> bool {
+        matches!(
+            self.plan
+                .speculative
+                .as_ref()
+                .map(|contract| &contract.proposal_execution),
+            Some(onnx_genai_metadata::SpeculativeProposalExecution::DflashFlatBlock { .. })
+        )
     }
 
     #[cfg(test)]
@@ -1714,7 +1662,7 @@ impl WorkflowRuntime {
         &self.plan.memory_strategy_plan
     }
 
-    pub fn models(&self) -> &PipelineModels {
+    pub(crate) fn models(&self) -> &PipelineModels {
         &self.backend.models
     }
 
@@ -1752,6 +1700,7 @@ impl WorkflowRuntime {
         request: PipelineGenerateRequest,
     ) -> anyhow::Result<PipelineTensors> {
         self.reject_candidate_tree_raw_execution("WorkflowRuntime::run_pipeline")?;
+        self.reject_dflash_raw_execution("WorkflowRuntime::run_pipeline")?;
         self.run_workflow(request)
     }
 
@@ -1769,6 +1718,7 @@ impl WorkflowRuntime {
         request: PipelineGenerateRequest,
     ) -> anyhow::Result<PipelineTensors> {
         self.reject_candidate_tree_raw_execution("WorkflowRuntime::run_pipeline_retained")?;
+        self.reject_dflash_raw_execution("WorkflowRuntime::run_pipeline_retained")?;
         self.run_workflow_retained(request)
     }
 
@@ -1808,6 +1758,7 @@ impl WorkflowRuntime {
         request: PipelineGenerateRequest,
     ) -> anyhow::Result<PipelineOutputs> {
         self.reject_candidate_tree_raw_execution("WorkflowRuntime::run_pipeline_outputs")?;
+        self.reject_dflash_raw_execution("WorkflowRuntime::run_pipeline_outputs")?;
         self.run_workflow_outputs(request)
     }
 
@@ -1895,6 +1846,7 @@ impl WorkflowRuntime {
         request: PipelineGenerateRequest,
     ) -> anyhow::Result<WorkflowExecutionPlan<'_>> {
         self.reject_candidate_tree_raw_execution("WorkflowRuntime::prepare_workflow_execution")?;
+        self.reject_dflash_raw_execution("WorkflowRuntime::prepare_workflow_execution")?;
         WorkflowExecutionPlan::new(self, request)
     }
 
@@ -1964,7 +1916,7 @@ impl WorkflowRuntime {
 
 #[cfg(test)]
 mod tests {
-    use super::workflow_initializer_reservation_bytes;
+    use super::{GenerationControl, workflow_initializer_reservation_bytes};
 
     #[test]
     fn fused_workflow_reserves_source_and_every_linked_initializer_copy() {
@@ -1989,6 +1941,35 @@ mod tests {
             workflow_initializer_reservation_bytes(u64::MAX, 1, true).is_err(),
             "managed accounting still validates the topology-derived maximum"
         );
+    }
+
+    #[test]
+    fn cancellation_and_commit_have_one_atomic_winner() {
+        for _ in 0..256 {
+            let control = GenerationControl::new();
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let commit_control = control.clone();
+            let commit_barrier = barrier.clone();
+            let commit = std::thread::spawn(move || {
+                commit_barrier.wait();
+                let committed = commit_control.begin_commit().unwrap();
+                if committed {
+                    commit_control.finish_commit();
+                }
+                committed
+            });
+            let cancel_control = control.clone();
+            let cancel = std::thread::spawn(move || {
+                barrier.wait();
+                cancel_control.cancel()
+            });
+            let committed = commit.join().unwrap();
+            let cancelled = cancel.join().unwrap();
+            assert_ne!(
+                committed, cancelled,
+                "the race must linearize to either committed-new or aborted-old"
+            );
+        }
     }
 
     #[cfg(feature = "ort-cuda")]

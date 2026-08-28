@@ -300,6 +300,19 @@ impl Engine {
                     .to_string(),
             });
         }
+        if self.workflow.is_dflash() {
+            return Err(SessionForkError::UnsupportedParticipant {
+                participant: "dflash.accepted_prefix".to_string(),
+                state: source.to_string(),
+                state_type:
+                    "target, draft-private, token-context, output, and logical-position state"
+                        .to_string(),
+                backend: "workflow-interpreter".to_string(),
+                reason: "DFlash session fork is declined before child allocation until every \
+                         accepted-prefix participant has a typed clone implementation"
+                    .to_string(),
+            });
+        }
         let current = self
             .workflow
             .session_committed_position(&source.to_string());

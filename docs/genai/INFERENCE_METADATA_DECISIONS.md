@@ -1327,6 +1327,15 @@ probabilities support distribution-preserving correction. EOS, context limits,
 zero/partial/full acceptance, cancellation, and failure preserve the transaction
 contract.
 
+Cancellation uses the generation request's ordinary cancellation authority, not
+a DFlash-specific side channel. It is observed before proposal mutation, after
+proposal and verification, before accepted-prefix and turn commit, and before
+output publication. Turn commit is the cancellation linearization point:
+cancellation either wins and restores the complete admitted target, draft,
+history, recurrent, cache, RNG, cursor, and output baseline, or commit wins and
+the complete new state is authoritative. A post-commit cancellation is delivery
+or next-turn behavior and cannot retroactively retract committed output.
+
 Shared batching and compaction are optional optimizations. A runtime may execute
 rows in isolation without changing DFlash conformance. Candidate-tree proposals
 are independent typed forms and neither block nor redefine DFlash; a DFlash

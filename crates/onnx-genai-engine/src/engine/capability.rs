@@ -80,21 +80,35 @@ pub enum PackageCapabilityError {
         /// Public operation that was refused before component execution.
         operation: String,
     },
-    /// The package declares an exact DFlash ABI this runtime can validate but
-    /// does not yet have a transaction-owned execution driver for.
+    /// The package declares a DFlash ABI/backend pair this runtime has not
+    /// implemented. The production driver accepts only the base v1 contract
+    /// through the portable ORT component execution seam.
     #[error(
-        "package declares canonical DFlash flat-block speculation \
+        "package declares DFlash flat-block speculation \
          (onnx-genai.dflash-flat-block@{version}) and requires capability '{capability}', but this \
-         runtime has no transaction-owned DFlash execution driver. Refusing before model/session \
-         allocation or workflow mutation rather than silently running plain generation. Use a \
-         runtime that implements target conditioning, proposer/verifier execution, accepted-prefix \
-         S3 commit, rollback participants, and required output-family handling."
+         runtime implements only the exact v1/base contract through the ORT component backend. \
+         Refusing before workflow mutation rather than silently running a different speculative \
+         mode. Re-export the package as v1/base for the ORT backend or use a runtime that \
+         implements this version/backend pair."
     )]
     DFlashExecutionUnavailable {
         /// Exact DFlash contract version declared by the package.
         version: String,
         /// Derived capability that requires the unavailable execution driver.
         capability: String,
+    },
+    /// DFlash components cannot be executed as an ordinary workflow pass:
+    /// doing so would bypass verification and accepted-prefix commit.
+    #[error(
+        "public workflow operation '{operation}' cannot execute a DFlash package because raw \
+         target/proposer execution would bypass verifier-owned acceptance and the S3 \
+         accepted-prefix transaction. Use `Engine::generate`, \
+         `Engine::generate_in_session`, or `Engine::generate_with_pipeline_request`; the \
+         runtime-owned DFlash driver is the only execution authority."
+    )]
+    DFlashRawWorkflowApi {
+        /// Public operation that would have bypassed the DFlash driver.
+        operation: String,
     },
 }
 

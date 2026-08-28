@@ -1,13 +1,13 @@
 //! Canonical workflow execution-capability admission.
 
 use onnx_genai_metadata::{
-    CandidateTreeTopology, ComponentImplementation, InferenceMetadata, RuntimeInputRole,
-    SemanticInputRole, SpeculativeAcceptedPath, SpeculativeContract, SpeculativeProposalExecution,
-    StateFinalWriter, StatePortAccess, WorkflowSpec, WorkflowStep, capabilities,
-    derived_capabilities,
+    CandidateTreeTopology, ComponentImplementation, DFlashStructure, InferenceMetadata,
+    RuntimeInputRole, SemanticInputRole, SpeculativeAcceptedPath, SpeculativeContract,
+    SpeculativeProposalExecution, StateFinalWriter, StatePortAccess, WorkflowSpec, WorkflowStep,
+    capabilities, derived_capabilities,
 };
 
-use crate::engine::PackageCapabilityError;
+use crate::engine::{EngineDecodeBackend, PackageCapabilityError};
 
 type InvocationBindings<'a> = (
     &'a std::collections::BTreeMap<String, String>,
@@ -76,13 +76,17 @@ pub(crate) enum WorkflowExecutionAdmission {
 }
 
 impl WorkflowExecutionAdmission {
-    pub(crate) fn from_metadata(metadata: &InferenceMetadata) -> Self {
+    pub(crate) fn from_metadata(
+        metadata: &InferenceMetadata,
+        backend: EngineDecodeBackend,
+    ) -> Self {
         let admission = Self::from_speculative(
             metadata.speculative.as_ref(),
             metadata
                 .pipeline
                 .as_ref()
                 .map(|pipeline| &pipeline.workflow),
+            backend,
         );
         if matches!(admission, Self::DFlashUnavailable { .. }) {
             debug_assert!(
@@ -96,19 +100,42 @@ impl WorkflowExecutionAdmission {
     pub(crate) fn from_speculative(
         speculative: Option<&SpeculativeContract>,
         workflow: Option<&onnx_genai_metadata::WorkflowSpec>,
+        backend: EngineDecodeBackend,
     ) -> Self {
         let Some(contract) = speculative else {
             return Self::Admitted;
         };
         match &contract.proposal_execution {
             SpeculativeProposalExecution::CandidateTree { .. } => {
-                match resolve_candidate_tree_execution_plan(contract, workflow) {
+                let resolved = if matches!(
+                    backend,
+                    EngineDecodeBackend::Auto | EngineDecodeBackend::Ort
+                ) {
+                    resolve_candidate_tree_execution_plan(contract, workflow)
+                } else {
+                    Err(format!(
+                        "backend {backend:?} is unsupported; the production candidate-tree \
+                         executor uses the ORT component execution seam"
+                    ))
+                };
+                match resolved {
                     Ok(plan) => Self::CandidateTree(Box::new(plan)),
                     Err(reason) => Self::CandidateTreeUnavailable {
                         version: contract.version.clone(),
                         reason,
                     },
                 }
+            }
+            SpeculativeProposalExecution::DflashFlatBlock {
+                version, structure, ..
+            } if version == "1"
+                && matches!(structure.as_ref(), DFlashStructure::Base)
+                && matches!(
+                    backend,
+                    EngineDecodeBackend::Auto | EngineDecodeBackend::Ort
+                ) =>
+            {
+                Self::Admitted
             }
             SpeculativeProposalExecution::DflashFlatBlock { version, .. } => {
                 Self::DFlashUnavailable {
@@ -1046,7 +1073,10 @@ mod tests {
     #[test]
     fn plain_and_canonical_chained_mtp_remain_admitted() {
         assert_eq!(
-            WorkflowExecutionAdmission::from_metadata(&InferenceMetadata::default()),
+            WorkflowExecutionAdmission::from_metadata(
+                &InferenceMetadata::default(),
+                EngineDecodeBackend::Ort,
+            ),
             WorkflowExecutionAdmission::Admitted
         );
         let mtp = onnx_genai_metadata::parse_metadata(
@@ -1057,39 +1087,66 @@ mod tests {
             )
             .expect("canonical chained MTP fixture parses");
         assert_eq!(
-            WorkflowExecutionAdmission::from_metadata(&mtp),
+            WorkflowExecutionAdmission::from_metadata(&mtp, EngineDecodeBackend::Ort),
             WorkflowExecutionAdmission::Admitted
         );
     }
 
     #[test]
-    fn exact_dflash_contract_resolves_to_one_capability_refusal() {
+    fn only_the_implemented_dflash_v1_ort_pair_is_admitted() {
         let dflash = onnx_genai_metadata::parse_metadata(
             include_str!("../../tests/fixtures/dflash-admission/inference_metadata.yaml"),
             Some("yaml"),
         )
         .expect("DFlash fixture parses");
-        for version in ["1", "2"] {
-            let mut versioned = dflash.clone();
-            let SpeculativeProposalExecution::DflashFlatBlock {
-                version: declared, ..
-            } = &mut versioned
-                .speculative
-                .as_mut()
-                .expect("fixture declares speculation")
-                .proposal_execution
-            else {
-                panic!("fixture declares DFlash")
-            };
-            *declared = version.to_string();
-            assert_eq!(
-                WorkflowExecutionAdmission::from_metadata(&versioned),
-                WorkflowExecutionAdmission::DFlashUnavailable {
-                    version: version.to_string(),
-                    capability: capabilities::DFLASH_FLAT_BLOCK,
-                }
-            );
-        }
+        assert_eq!(
+            WorkflowExecutionAdmission::from_metadata(&dflash, EngineDecodeBackend::Ort),
+            WorkflowExecutionAdmission::Admitted
+        );
+        assert_eq!(
+            WorkflowExecutionAdmission::from_metadata(&dflash, EngineDecodeBackend::Native),
+            WorkflowExecutionAdmission::DFlashUnavailable {
+                version: "1".to_string(),
+                capability: capabilities::DFLASH_FLAT_BLOCK,
+            }
+        );
+
+        let mut versioned = dflash;
+        let SpeculativeProposalExecution::DflashFlatBlock {
+            version: declared, ..
+        } = &mut versioned
+            .speculative
+            .as_mut()
+            .expect("fixture declares speculation")
+            .proposal_execution
+        else {
+            panic!("fixture declares DFlash")
+        };
+        *declared = "2".to_string();
+        assert_eq!(
+            WorkflowExecutionAdmission::from_metadata(&versioned, EngineDecodeBackend::Ort),
+            WorkflowExecutionAdmission::DFlashUnavailable {
+                version: "2".to_string(),
+                capability: capabilities::DFLASH_FLAT_BLOCK,
+            }
+        );
+    }
+
+    #[test]
+    fn candidate_tree_and_dflash_are_independent_exact_capabilities() {
+        let candidate = onnx_genai_metadata::parse_metadata(
+            include_str!("../../tests/fixtures/unsupported-candidate-tree/inference_metadata.yaml"),
+            Some("yaml"),
+        )
+        .expect("candidate-tree fixture parses");
+        assert!(matches!(
+            WorkflowExecutionAdmission::from_metadata(&candidate, EngineDecodeBackend::Ort),
+            WorkflowExecutionAdmission::CandidateTreeUnavailable {
+                version,
+                reason,
+            }
+                if version == "1" && !reason.is_empty()
+        ));
     }
 
     #[test]
@@ -1100,7 +1157,7 @@ mod tests {
         )
         .expect("candidate tree parses");
         assert!(matches!(
-            WorkflowExecutionAdmission::from_metadata(&tree),
+            WorkflowExecutionAdmission::from_metadata(&tree, EngineDecodeBackend::Ort),
             WorkflowExecutionAdmission::CandidateTreeUnavailable { reason, .. }
                 if reason.contains("tokens")
         ));

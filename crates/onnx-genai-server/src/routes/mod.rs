@@ -591,9 +591,12 @@ pub(crate) fn package_capability_failure(capability: PackageCapabilityError) -> 
         PackageCapabilityError::DFlashExecutionUnavailable { .. } => {
             ApiError::conflict(capability.to_string())
         }
-        PackageCapabilityError::CandidateTreeExecutionUnavailable { .. }
-        | PackageCapabilityError::CandidateTreeRawWorkflowApi { .. } => {
+        PackageCapabilityError::CandidateTreeExecutionUnavailable { .. } => {
             ApiError::conflict(capability.to_string())
+        }
+        PackageCapabilityError::CandidateTreeRawWorkflowApi { .. }
+        | PackageCapabilityError::DFlashRawWorkflowApi { .. } => {
+            ApiError::invalid_request(capability.to_string())
         }
         PackageCapabilityError::ConversationOverBound { .. } => {
             ApiError::invalid_request(capability.to_string())

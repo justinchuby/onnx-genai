@@ -1514,8 +1514,8 @@ impl Engine {
         }
     }
 
-    /// Generate a candidate-tree package with request-scoped cancellation and
-    /// deterministic transaction checkpoints.
+    /// Generate through the ordinary Engine surface with a request-scoped
+    /// cancellation authority and transaction checkpoints.
     pub fn generate_with_control_callbacks(
         &mut self,
         request: GenerateRequest,
@@ -1523,10 +1523,10 @@ impl Engine {
         admission_callback: Option<&mut dyn FnMut()>,
         token_callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
-        if self.holds_decode_core() || self.candidate_tree_diagnostic().is_none() {
+        if self.holds_decode_core() {
             return Err(crate::pipeline::GenerationControlUnsupported {
                 operation: "Engine::generate_with_control_callbacks",
-                runtime: "a non-candidate-tree generation runtime",
+                runtime: "the fused decode backend",
             }
             .into());
         }
@@ -1593,8 +1593,8 @@ impl Engine {
         )
     }
 
-    /// Continue a candidate-tree workflow session with request-scoped
-    /// cancellation and deterministic transaction checkpoints.
+    /// Continue an interpreted workflow session with request-scoped
+    /// cancellation and transaction checkpoints.
     pub fn generate_in_session_with_control_callbacks(
         &mut self,
         session_id: SessionId,
@@ -1603,10 +1603,10 @@ impl Engine {
         admission_callback: Option<&mut dyn FnMut()>,
         token_callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
-        if self.holds_decode_core() || self.candidate_tree_diagnostic().is_none() {
+        if self.holds_decode_core() {
             return Err(crate::pipeline::GenerationControlUnsupported {
                 operation: "Engine::generate_in_session_with_control_callbacks",
-                runtime: "a non-candidate-tree generation runtime",
+                runtime: "the fused decode backend",
             }
             .into());
         }
