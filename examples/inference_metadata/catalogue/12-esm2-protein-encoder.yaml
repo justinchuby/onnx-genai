@@ -10,7 +10,6 @@ pipeline:
       request.residue_ids:
         contract:
           dtype: int64
-          rank: 2
           shape:
           - batch
           - residues
@@ -26,7 +25,6 @@ pipeline:
       request.attention_mask:
         contract:
           dtype: int64
-          rank: 2
           shape:
           - batch
           - residues
@@ -43,7 +41,6 @@ pipeline:
       embeddings:
         contract:
           dtype: float32
-          rank: 3
           shape:
           - batch
           - residues
@@ -62,7 +59,6 @@ pipeline:
           inputs:
             input_ids:
               dtype: int64
-              rank: 2
               shape:
               - batch
               - residues
@@ -71,7 +67,6 @@ pipeline:
                 axis: 0
             attention_mask:
               dtype: int64
-              rank: 2
               shape:
               - batch
               - residues
@@ -81,7 +76,6 @@ pipeline:
           outputs:
             last_hidden_state:
               dtype: float32
-              rank: 3
               shape:
               - batch
               - residues

@@ -23,7 +23,6 @@ pipeline:
       package.accepted_len:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - batch
           optional: false
@@ -39,7 +38,6 @@ pipeline:
       package.active:
         contract:
           dtype: bool
-          rank: 1
           shape:
           - batch
           optional: false
@@ -55,7 +53,6 @@ pipeline:
       package.cache_lengths:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - batch
           optional: false
@@ -71,7 +68,6 @@ pipeline:
       package.capacity:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - 1
           optional: false
@@ -84,7 +80,6 @@ pipeline:
       package.done:
         contract:
           dtype: bool
-          rank: 1
           shape:
           - batch
           optional: false
@@ -100,7 +95,6 @@ pipeline:
       package.sequence_capacity:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - 1
           optional: false
@@ -113,7 +107,7 @@ pipeline:
       package.state_seed:
         contract:
           dtype: float32
-          rank: 3
+          shape: [Any, Any, Any]
           optional: false
           batch_layout:
             kind: request_aligned
@@ -127,7 +121,6 @@ pipeline:
       request.input_ids:
         contract:
           dtype: int64
-          rank: 2
           shape:
           - batch
           - sequence
@@ -145,7 +138,6 @@ pipeline:
       request.max_iterations:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - 1
           optional: false
@@ -161,7 +153,6 @@ pipeline:
       tokens:
         contract:
           dtype: int64
-          rank: 2
           shape:
           - batch
           - sequence
@@ -180,21 +171,20 @@ pipeline:
           inputs:
             input_ids:
               dtype: int64
-              rank: 2
+              shape: [Any, Any]
               optional: false
               batch_layout:
                 kind: request_aligned
                 axis: 0
             key_cache.0:
               dtype: float32
-              rank: 3
+              shape: [Any, Any, Any]
               optional: false
               batch_layout:
                 kind: request_aligned
                 axis: 0
             nonpad_kv_seqlen:
               dtype: int64
-              rank: 1
               shape:
               - batch
               optional: false
@@ -203,14 +193,13 @@ pipeline:
                 axis: 0
             value_cache.0:
               dtype: float32
-              rank: 3
+              shape: [Any, Any, Any]
               optional: false
               batch_layout:
                 kind: request_aligned
                 axis: 0
             write_indices:
               dtype: int64
-              rank: 1
               shape:
               - batch
               optional: false
@@ -220,21 +209,21 @@ pipeline:
           outputs:
             logits:
               dtype: float32
-              rank: 3
+              shape: [Any, Any, Any]
               optional: false
               batch_layout:
                 kind: request_aligned
                 axis: 0
             updated_key_cache.0:
               dtype: float32
-              rank: 3
+              shape: [Any, Any, Any]
               optional: false
               batch_layout:
                 kind: request_aligned
                 axis: 0
             updated_value_cache.0:
               dtype: float32
-              rank: 3
+              shape: [Any, Any, Any]
               optional: false
               batch_layout:
                 kind: request_aligned
@@ -257,7 +246,7 @@ pipeline:
           inputs:
             logits:
               dtype: float32
-              rank: 3
+              shape: [Any, Any, Any]
               optional: false
               batch_layout:
                 kind: request_aligned
@@ -265,7 +254,6 @@ pipeline:
           outputs:
             accepted_len:
               dtype: int64
-              rank: 1
               shape:
               - batch
               optional: false
@@ -274,7 +262,6 @@ pipeline:
                 axis: 0
             active:
               dtype: bool
-              rank: 1
               shape:
               - batch
               optional: false
@@ -283,7 +270,6 @@ pipeline:
                 axis: 0
             cache_lengths:
               dtype: int64
-              rank: 1
               shape:
               - batch
               optional: false
@@ -292,7 +278,6 @@ pipeline:
                 axis: 0
             done:
               dtype: bool
-              rank: 1
               shape:
               - batch
               optional: false
@@ -301,7 +286,6 @@ pipeline:
                 axis: 0
             token:
               dtype: int64
-              rank: 2
               shape:
               - batch
               - sequence
@@ -321,7 +305,6 @@ pipeline:
       accepted_len:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - batch
           optional: false
@@ -337,7 +320,6 @@ pipeline:
       active:
         contract:
           dtype: bool
-          rank: 1
           shape:
           - batch
           optional: false
@@ -353,7 +335,6 @@ pipeline:
       cache_lengths:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - batch
           optional: false
@@ -369,7 +350,7 @@ pipeline:
       decoder_kv.0000:
         contract:
           dtype: float32
-          rank: 3
+          shape: [Any, Any, Any]
           optional: false
           batch_layout:
             kind: request_aligned
@@ -385,7 +366,7 @@ pipeline:
       decoder_kv.0001:
         contract:
           dtype: float32
-          rank: 3
+          shape: [Any, Any, Any]
           optional: false
           batch_layout:
             kind: request_aligned
@@ -401,7 +382,6 @@ pipeline:
       done:
         contract:
           dtype: bool
-          rank: 1
           shape:
           - batch
           optional: false
@@ -417,7 +397,6 @@ pipeline:
       sequence:
         contract:
           dtype: int64
-          rank: 2
           shape:
           - batch
           - sequence
@@ -510,7 +489,6 @@ pipeline:
         value: loop.iteration
         contract:
           dtype: int64
-          rank: 1
           shape:
           - 1
           optional: false

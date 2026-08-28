@@ -5521,7 +5521,7 @@ async fn a_conversation_past_its_bound_is_a_typed_client_error() {
         serde_yaml::from_str(&std::fs::read_to_string(&metadata).expect("read metadata"))
             .expect("parse metadata");
     document["pipeline"]["workflow"]["inputs"]["package.conversation_limit"] = json!({
-        "contract": {"dtype": "int64", "rank": 1, "shape": [1]},
+        "contract": {"dtype": "int64", "shape": [1]},
         "role": {"kind": "opaque"},
         "source": {"kind": "literal"},
         "required": false,
@@ -5578,7 +5578,7 @@ async fn a_failed_turn_releases_its_lease() {
         serde_yaml::from_str(&std::fs::read_to_string(&metadata).expect("read metadata"))
             .expect("parse metadata");
     document["pipeline"]["workflow"]["inputs"]["package.conversation_limit"] = json!({
-        "contract": {"dtype": "int64", "rank": 1, "shape": [1]},
+        "contract": {"dtype": "int64", "shape": [1]},
         "role": {"kind": "opaque"},
         "source": {"kind": "literal"},
         "required": false,
@@ -5879,7 +5879,7 @@ async fn every_session_refusal_reports_a_status_and_a_type_a_client_can_branch_o
         serde_yaml::from_str(&std::fs::read_to_string(&metadata).expect("read metadata"))
             .expect("parse metadata");
     document["pipeline"]["workflow"]["inputs"]["package.conversation_limit"] = json!({
-        "contract": {"dtype": "int64", "rank": 1, "shape": [1]},
+        "contract": {"dtype": "int64", "shape": [1]},
         "role": {"kind": "opaque"},
         "source": {"kind": "literal"},
         "required": false,

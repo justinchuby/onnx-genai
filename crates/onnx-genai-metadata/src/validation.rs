@@ -1116,19 +1116,21 @@ fn validate_ctc_logits_contract(
     let Some(logits) = workflow.outputs.get(logits_output) else {
         return;
     };
-    if decoding.time_axis >= logits.contract.rank {
+    if decoding.time_axis >= logits.contract.rank() {
         errors.push(format!(
             "profiles.{profile_name}.decoding.time_axis {} is outside workflow output \
              '{logits_output}' rank {}",
-            decoding.time_axis, logits.contract.rank
+            decoding.time_axis,
+            logits.contract.rank()
         ));
         return;
     }
-    if decoding.class_axis >= logits.contract.rank {
+    if decoding.class_axis >= logits.contract.rank() {
         errors.push(format!(
             "profiles.{profile_name}.decoding.class_axis {} is outside workflow output \
              '{logits_output}' rank {}",
-            decoding.class_axis, logits.contract.rank
+            decoding.class_axis,
+            logits.contract.rank()
         ));
     }
     let Some(padding) = logits.contract.padding.iter().find(|padding| {
@@ -1357,11 +1359,12 @@ fn validate_preprocessing_program(
     }
     let (adapter_name, adapter) = adapters[0];
     match adapter.ports.inputs.get("encoded") {
-        Some(contract) if contract.dtype == "uint8" && contract.rank == 1 => {}
+        Some(contract) if contract.dtype == "uint8" && contract.rank() == 1 => {}
         Some(contract) => errors.push(format!(
             "workflow {kind} preprocessing adapter '{adapter_name}' input 'encoded' must be uint8 \
                  rank 1, got {} rank {}",
-            contract.dtype, contract.rank
+            contract.dtype,
+            contract.rank()
         )),
         None => errors.push(format!(
             "workflow {kind} preprocessing adapter '{adapter_name}' must declare input 'encoded'"
@@ -1481,7 +1484,7 @@ fn require_compatible_tensor_contracts(
     // entries are real, than the port it feeds would let per-request rows drift
     // out of alignment with the rest of the workflow.
     if normalize(&source.dtype) != normalize(&target.dtype)
-        || source.rank != target.rank
+        || source.rank() != target.rank()
         || source.shape != target.shape
         || source.batch_layout != target.batch_layout
         || source.padding != target.padding
@@ -1546,8 +1549,8 @@ fn validate_adapter_selection_input(
     match workflow.inputs.get(name) {
         Some(input)
             if input.contract.dtype == dtype
-                && input.contract.rank == rank
-                && input.contract.shape.as_deref().is_some_and(expected_shape)
+                && input.contract.rank() == rank
+                && expected_shape(&input.contract.shape)
                 && input.contract.batch_layout
                     == crate::schema::BatchLayout::RequestAligned { axis: 0 }
                 && input.required
@@ -2052,17 +2055,6 @@ fn validate_workflow(
                 "{path} declares request_expanded.factor 0; the expansion factor must be at least 1"
             ));
         }
-        if contract
-            .shape
-            .as_ref()
-            .is_some_and(|shape| shape.len() != contract.rank)
-        {
-            errors.push(format!(
-                "{path} declares rank {} but has {} shape dimensions",
-                contract.rank,
-                contract.shape.as_ref().map_or(0, Vec::len)
-            ));
-        }
         if !matches!(
             contract.dtype.as_str(),
             "float16"
@@ -2411,11 +2403,11 @@ fn validate_workflow(
             crate::schema::ShapeRecurrence::Invariant => None,
         };
         if let Some(axis) = dynamic_axis
-            && axis >= state.contract.rank
+            && axis >= state.contract.rank()
         {
             errors.push(format!(
                 "workflow state '{name}' varies on axis {axis}, outside rank {}",
-                state.contract.rank
+                state.contract.rank()
             ));
         }
         if let Some(group_name) = &state.service_group {
@@ -2430,10 +2422,10 @@ fn validate_workflow(
                 continue;
             };
             if let Some(sequence_axis) = group.sequence_axis {
-                if sequence_axis >= state.contract.rank {
+                if sequence_axis >= state.contract.rank() {
                     errors.push(format!(
                         "state service group '{group_name}' sequence_axis {sequence_axis} is outside state '{name}' rank {}",
-                        state.contract.rank
+                        state.contract.rank()
                     ));
                 }
                 if dynamic_axis.is_some_and(|axis| axis != sequence_axis) {
@@ -2491,7 +2483,7 @@ fn validate_workflow(
                             ),
                             errors,
                         );
-                        if lengths.contract.rank != 1 {
+                        if lengths.contract.rank() != 1 {
                             errors.push(format!(
                                 "state service group '{group_name}' logical_lengths state \
                                  '{logical_lengths}' must be rank one with one value per row"
@@ -2614,8 +2606,7 @@ fn validate_workflow(
                 present_as.clone(),
                 crate::schema::TensorContract {
                     dtype: "bool".to_string(),
-                    rank: 0,
-                    shape: Some(Vec::new()),
+                    shape: Vec::new(),
                     optional: false,
                     batch_layout: crate::schema::BatchLayout::Shared,
                     padding: Vec::new(),
@@ -2703,7 +2694,7 @@ fn validate_workflow(
                 // Serving control values steer one request each. Without a
                 // request-aligned layout a runtime cannot permute them when it
                 // compacts the batch.
-                if contract.rank > 0 && contract.batch_layout.request_axis() != Some(0) {
+                if contract.rank() > 0 && contract.batch_layout.request_axis() != Some(0) {
                     errors.push(format!(
                         "pipeline.workflow.serving.{role} '{value}' must declare a \
                          request_aligned batch_layout on axis 0"
@@ -2863,11 +2854,12 @@ fn validate_row_scoped_components(workflow: &WorkflowSpec, errors: &mut Vec<Stri
                 if !contract.batch_layout.is_row_scoped() {
                     continue;
                 }
-                if row_scope.axis >= contract.rank {
+                if row_scope.axis >= contract.rank() {
                     errors.push(format!(
                         "workflow component '{name}' declares row_scope axis {} but {direction} \
                          port '{port}' has rank {}",
-                        row_scope.axis, contract.rank
+                        row_scope.axis,
+                        contract.rank()
                     ));
                 }
                 if contract
@@ -3356,10 +3348,10 @@ fn validate_token_packed_layout(
     scope: &LayoutReferenceScope<'_>,
     errors: &mut Vec<String>,
 ) {
-    if axis >= contract.rank {
+    if axis >= contract.rank() {
         errors.push(format!(
             "{path} packs items along axis {axis}, outside its rank {}",
-            contract.rank
+            contract.rank()
         ));
         return;
     }
@@ -3410,11 +3402,7 @@ fn validate_token_packed_layout(
             ));
         }
     }
-    let packed_symbol = contract
-        .shape
-        .as_ref()
-        .and_then(|shape| shape.get(axis))
-        .and_then(symbol_of);
+    let packed_symbol = contract.shape.get(axis).and_then(symbol_of);
     for (index, level) in levels.iter().enumerate() {
         let owner = validate_ownership_level(path, value, index, level, scope, errors);
         // Level zero's owner has one entry per packed position, so the two are
@@ -3504,11 +3492,11 @@ fn validate_ownership_level<'a>(
                 companion_contract.dtype
             ));
         }
-        if companion_contract.rank != 1 {
+        if companion_contract.rank() != 1 {
             errors.push(format!(
                 "{path} level {index} {role} '{companion}' has rank {} but must be rank 1; it \
                  carries one entry per unit and nothing else",
-                companion_contract.rank
+                companion_contract.rank()
             ));
         }
         if !companion_contract.batch_layout.is_shared() {
@@ -3533,7 +3521,7 @@ fn validate_ownership_level<'a>(
 fn symbol_of(dimension: &crate::schema::TensorDimension) -> Option<&str> {
     match dimension {
         crate::schema::TensorDimension::Symbol(symbol) => Some(symbol.as_str()),
-        crate::schema::TensorDimension::Fixed(_) => None,
+        crate::schema::TensorDimension::Fixed(_) | crate::schema::TensorDimension::Any => None,
     }
 }
 
@@ -3541,9 +3529,8 @@ fn symbol_of(dimension: &crate::schema::TensorDimension) -> Option<&str> {
 fn extent_symbol(contract: &crate::schema::TensorContract) -> Option<&str> {
     contract
         .shape
-        .as_ref()
-        .filter(|shape| shape.len() == 1)
-        .and_then(|shape| shape.first())
+        .first()
+        .filter(|_| contract.shape.len() == 1)
         .and_then(symbol_of)
 }
 
@@ -3551,7 +3538,6 @@ fn extent_symbol(contract: &crate::schema::TensorContract) -> Option<&str> {
 fn axis_of_symbol(contract: &crate::schema::TensorContract, symbol: &str) -> Option<usize> {
     contract
         .shape
-        .as_ref()?
         .iter()
         .position(|dimension| symbol_of(dimension) == Some(symbol))
 }
@@ -3673,18 +3659,17 @@ fn validate_valid_lengths_shape(
     companion: &crate::schema::TensorContract,
     errors: &mut Vec<String>,
 ) {
-    if companion.rank != axis {
+    if companion.rank() != axis {
         errors.push(format!(
             "{path} valid_lengths '{valid_lengths}' has rank {} but dimension '{dimension}' is \
              axis {axis}, so it must have rank {axis}: one entry per position of the axes outer \
              to '{dimension}'",
-            companion.rank
+            companion.rank()
         ));
         return;
     }
-    let (Some(outer), Some(declared)) = (contract.shape.as_ref(), companion.shape.as_ref()) else {
-        return;
-    };
+    let outer = &contract.shape;
+    let declared = &companion.shape;
     if outer.len() <= axis || declared.len() != axis {
         return;
     }
@@ -3692,7 +3677,7 @@ fn validate_valid_lengths_shape(
         let Some(actual) = declared.get(index) else {
             continue;
         };
-        if actual != expected {
+        if !dimensions_equal_or_any(actual, expected) {
             errors.push(format!(
                 "{path} valid_lengths '{valid_lengths}' declares {} on axis {index} but the value \
                  it bounds declares {} there; the companion carries one entry per position of the \
@@ -3708,7 +3693,40 @@ fn describe_dimension(dimension: &crate::schema::TensorDimension) -> String {
     match dimension {
         crate::schema::TensorDimension::Fixed(fixed) => fixed.to_string(),
         crate::schema::TensorDimension::Symbol(symbol) => format!("'{symbol}'"),
+        crate::schema::TensorDimension::Any => "Any".to_string(),
     }
+}
+
+fn dimensions_equal_or_any(
+    left: &crate::schema::TensorDimension,
+    right: &crate::schema::TensorDimension,
+) -> bool {
+    matches!(
+        (left, right),
+        (
+            crate::schema::TensorDimension::Any,
+            crate::schema::TensorDimension::Any
+        ) | (
+            crate::schema::TensorDimension::Any,
+            crate::schema::TensorDimension::Fixed(_) | crate::schema::TensorDimension::Symbol(_)
+        ) | (
+            crate::schema::TensorDimension::Fixed(_) | crate::schema::TensorDimension::Symbol(_),
+            crate::schema::TensorDimension::Any
+        )
+    ) || left == right
+}
+
+fn dimensions_compatible(
+    left: &crate::schema::TensorDimension,
+    right: &crate::schema::TensorDimension,
+) -> bool {
+    !matches!(
+        (left, right),
+        (
+            crate::schema::TensorDimension::Fixed(left),
+            crate::schema::TensorDimension::Fixed(right)
+        ) if left != right
+    )
 }
 
 /// A declared batching capacity is a promise about the artifact's own shape, so
@@ -3755,10 +3773,7 @@ fn validate_batch_capacity(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
 fn declared_symbols(ports: &crate::schema::ComponentPorts) -> BTreeMap<&str, &str> {
     let mut symbols = BTreeMap::new();
     for (port, contract) in ports.inputs.iter().chain(ports.outputs.iter()) {
-        let Some(shape) = &contract.shape else {
-            continue;
-        };
-        for dimension in shape {
+        for dimension in &contract.shape {
             if let Some(symbol) = symbol_of(dimension) {
                 symbols.entry(symbol).or_insert(port.as_str());
             }
@@ -3861,11 +3876,7 @@ fn validate_budgets<'a>(
 fn group_rooted_symbols(ports: &crate::schema::ComponentPorts) -> BTreeMap<&str, String> {
     let mut rooted: BTreeMap<&str, String> = BTreeMap::new();
     fn axis_symbol(contract: &crate::schema::TensorContract, axis: usize) -> Option<&str> {
-        contract
-            .shape
-            .as_ref()
-            .and_then(|shape| shape.get(axis))
-            .and_then(symbol_of)
+        contract.shape.get(axis).and_then(symbol_of)
     }
     for (port, contract) in ports.inputs.iter().chain(ports.outputs.iter()) {
         match &contract.batch_layout {
@@ -3926,11 +3937,7 @@ fn ownership_count_symbols(ports: &crate::schema::ComponentPorts) -> BTreeMap<&s
             continue;
         }
         if let Some(axis) = contract.batch_layout.packed_axis()
-            && let Some(symbol) = contract
-                .shape
-                .as_ref()
-                .and_then(|shape| shape.get(axis))
-                .and_then(symbol_of)
+            && let Some(symbol) = contract.shape.get(axis).and_then(symbol_of)
         {
             counts
                 .entry(symbol)
@@ -4057,9 +4064,7 @@ fn validate_free_dimensions(
         if companions.contains(port.as_str()) {
             continue;
         }
-        let Some(shape) = &contract.shape else {
-            continue;
-        };
+        let shape = &contract.shape;
         let padded: BTreeSet<&str> = contract
             .padding
             .iter()
@@ -4427,11 +4432,11 @@ fn validate_session_continuity(workflow: &WorkflowSpec, errors: &mut Vec<String>
         match &cell.recurrence {
             crate::schema::ShapeRecurrence::Bounded { axis, max }
             | crate::schema::ShapeRecurrence::Growing { axis, max, .. } => {
-                if *axis != cell.contract.rank.saturating_sub(1) {
+                if *axis != cell.contract.rank().saturating_sub(1) {
                     errors.push(format!(
                         "{path} continues a conversation along axis {axis}, but tokens accumulate \
                          on the final axis of a rank-{} contract",
-                        cell.contract.rank
+                        cell.contract.rank()
                     ));
                 }
                 // A continuation is not loop-carried, so its bound never reaches
@@ -4486,16 +4491,16 @@ fn validate_session_continuity(workflow: &WorkflowSpec, errors: &mut Vec<String>
                     ));
                 }
                 if input.contract.dtype != cell.contract.dtype
-                    || input.contract.rank != cell.contract.rank
+                    || input.contract.rank() != cell.contract.rank()
                 {
                     errors.push(format!(
                         "{path}.session.continuation.prompt_input '{prompt_input}' has contract \
                          {:?}/rank {} but the cell holds {:?}/rank {}; a prefix must be the same \
                          kind of tensor as what it prefixes",
                         input.contract.dtype,
-                        input.contract.rank,
+                        input.contract.rank(),
                         cell.contract.dtype,
-                        cell.contract.rank
+                        cell.contract.rank()
                     ));
                 }
             }
@@ -5180,8 +5185,9 @@ fn validate_compaction_derivability(
             let expectations = output_companions(workflow);
             let claimed = expectations.get(output.as_str());
             let is_shape_companion = contract.dtype == "int64"
-                && claimed.is_some_and(|roles| roles.iter().any(|role| role.admits(contract.rank)));
-            if contract.rank > 0
+                && claimed
+                    .is_some_and(|roles| roles.iter().any(|role| role.admits(contract.rank())));
+            if contract.rank() > 0
                 && matches!(contract.batch_layout, crate::schema::BatchLayout::Shared)
                 && workflow.serving.is_some()
                 && !is_shape_companion
@@ -5217,7 +5223,8 @@ fn validate_compaction_derivability(
                          output names as {expected}, but it is {} at rank {}; a companion is \
                          admitted into a serving workflow only at the shape the declaration \
                          naming it requires",
-                        contract.dtype, contract.rank
+                        contract.dtype,
+                        contract.rank()
                     ));
                 } else if let Some(unwritten) = unwritten.filter(|names| !names.is_empty()) {
                     errors.push(format!(
@@ -5705,22 +5712,21 @@ fn validate_workflow_node(
                 body_effects.insert(domain.clone(), merge.body_input.clone());
             }
             if let Some(iteration) = iteration {
-                if iteration.contract.dtype != "int64" || !matches!(iteration.contract.rank, 0 | 1)
+                if iteration.contract.dtype != "int64"
+                    || !matches!(iteration.contract.rank(), 0 | 1)
                 {
                     errors.push(format!(
                         "{path}.iteration must declare int64 rank 0 or rank 1, got {} rank {}",
-                        iteration.contract.dtype, iteration.contract.rank
+                        iteration.contract.dtype,
+                        iteration.contract.rank()
                     ));
                 }
-                match (iteration.contract.rank, iteration.contract.shape.as_ref()) {
-                    (0, Some(shape)) if !shape.is_empty() => errors.push(format!(
+                match iteration.contract.rank() {
+                    0 if !iteration.contract.shape.is_empty() => errors.push(format!(
                         "{path}.iteration scalar contract must have an empty shape"
                     )),
-                    (1, Some(shape)) if shape.len() != 1 => errors.push(format!(
+                    1 if iteration.contract.shape.len() != 1 => errors.push(format!(
                         "{path}.iteration rank-one broadcast contract must have one dimension"
-                    )),
-                    (1, None) => errors.push(format!(
-                        "{path}.iteration rank-one broadcast contract must declare its shape"
                     )),
                     _ => {}
                 }
@@ -6195,10 +6201,10 @@ fn validate_workflow_node(
                     let Some(contract) = control.and_then(|name| value_contracts.get(name)) else {
                         continue;
                     };
-                    let singleton = contract.rank == 0
-                        || (contract.rank == 1
+                    let singleton = contract.rank() == 0
+                        || (contract.rank() == 1
                             && matches!(
-                                contract.shape.as_deref().and_then(|shape| shape.first()),
+                                contract.shape.first(),
                                 Some(crate::schema::TensorDimension::Fixed(1))
                             ));
                     if !singleton {
@@ -6295,10 +6301,10 @@ fn validate_emit_axis(
         return;
     };
     if let Some(axis) = axis {
-        if axis >= contract.rank {
+        if axis >= contract.rank() {
             errors.push(format!(
                 "{path}.axis is {axis}, outside the rank {} of value it emits",
-                contract.rank
+                contract.rank()
             ));
         }
         return;
@@ -6307,11 +6313,11 @@ fn validate_emit_axis(
         return;
     }
     let incremental = matches!(mode, crate::schema::WorkflowEmitMode::Append) || length_limited;
-    if incremental && contract.rank >= 4 {
+    if incremental && contract.rank() >= 4 {
         errors.push(format!(
             "{path} grows a rank-{} output but names no axis; the default final axis is a \
              spatial extent for a value of this rank, so the axis it grows along must be stated",
-            contract.rank
+            contract.rank()
         ));
     }
 }
@@ -6327,20 +6333,12 @@ fn validate_integer_scalar_contract(
     ) {
         errors.push(format!("{path} must have an integer dtype"));
     }
-    match contract.rank {
-        0 => {
-            if contract
-                .shape
-                .as_ref()
-                .is_some_and(|shape| !shape.is_empty())
-            {
-                errors.push(format!("{path} rank-zero contract must have shape []"));
-            }
-        }
+    match contract.rank() {
+        0 => {}
         1 => {
             if !matches!(
-                contract.shape.as_deref(),
-                Some([crate::schema::TensorDimension::Fixed(1)])
+                contract.shape.as_slice(),
+                [crate::schema::TensorDimension::Fixed(1)]
             ) {
                 errors.push(format!(
                     "{path} rank-one control contract must have static shape [1]"
@@ -6460,7 +6458,7 @@ fn validate_state_update(
                 ),
                 errors,
             );
-            if cell.contract.rank != 1 {
+            if cell.contract.rank() != 1 {
                 errors.push(format!(
                     "state service group '{group_name}' write_indices state '{write_indices}' \
                      must be rank one with one destination per row"
@@ -6673,7 +6671,7 @@ fn validate_integer_control_contract(
     if !is_integer_dtype(&contract.dtype) {
         errors.push(format!("{path} must have an integer dtype"));
     }
-    if !matches!(contract.rank, 0 | 1) {
+    if !matches!(contract.rank(), 0 | 1) {
         errors.push(format!("{path} must be a scalar or rank-one tensor"));
     }
 }
@@ -6686,7 +6684,7 @@ fn validate_bool_control_contract(
     if contract.dtype != "bool" {
         errors.push(format!("{path} must have bool dtype"));
     }
-    if !matches!(contract.rank, 0 | 1) {
+    if !matches!(contract.rank(), 0 | 1) {
         errors.push(format!("{path} must be a scalar or rank-one row tensor"));
     }
 }
@@ -6699,14 +6697,14 @@ fn validate_predicate_contract(
     if contract.dtype != "bool" && !is_integer_dtype(&contract.dtype) {
         errors.push(format!("{path} must have a bool or integer dtype"));
     }
-    if !matches!(contract.rank, 0 | 1) {
+    if !matches!(contract.rank(), 0 | 1) {
         errors.push(format!(
             "{path} must be a scalar or rank-one broadcast tensor"
         ));
-    } else if contract.rank == 1
+    } else if contract.rank() == 1
         && !matches!(
-            contract.shape.as_deref(),
-            Some([crate::schema::TensorDimension::Fixed(1)])
+            contract.shape.as_slice(),
+            [crate::schema::TensorDimension::Fixed(1)]
         )
     {
         errors.push(format!(
@@ -6865,23 +6863,20 @@ fn require_emit_prefix_contracts(
     path: &str,
     errors: &mut Vec<String>,
 ) {
-    if actual.rank == 0 || declared.rank == 0 {
+    if actual.rank() == 0 || declared.rank() == 0 {
         errors.push(format!(
             "{path} valid_length requires emitted value and output contracts with rank >= 1"
         ));
         return;
     }
-    if actual.dtype != declared.dtype || actual.rank != declared.rank {
+    if actual.dtype != declared.dtype || actual.rank() != declared.rank() {
         errors.push(format!(
             "{path} has incompatible dtype or rank for prefix emission"
         ));
         return;
     }
-    let (Some(actual_shape), Some(declared_shape)) = (&actual.shape, &declared.shape) else {
-        return;
-    };
-    let prefix_axis = actual.rank.saturating_sub(1);
-    for (axis, (actual, declared)) in actual_shape.iter().zip(declared_shape).enumerate() {
+    let prefix_axis = actual.rank().saturating_sub(1);
+    for (axis, (actual, declared)) in actual.shape.iter().zip(&declared.shape).enumerate() {
         if axis != prefix_axis
             && matches!(
                 (actual, declared),
@@ -6938,28 +6933,24 @@ fn require_compatible_contracts(
         }
     }
     if normalize_dtype(&source.dtype) != normalize_dtype(&target.dtype)
-        || source.rank != target.rank
+        || source.rank() != target.rank()
     {
         errors.push(format!(
             "{path} has incompatible tensor contracts: {} rank {} -> {} rank {}",
-            source.dtype, source.rank, target.dtype, target.rank
+            source.dtype,
+            source.rank(),
+            target.dtype,
+            target.rank()
         ));
         return;
     }
-    if let (Some(source_shape), Some(target_shape)) = (&source.shape, &target.shape) {
-        for (axis, (source, target)) in source_shape.iter().zip(target_shape).enumerate() {
-            if matches!(
-                (source, target),
-                (
-                    crate::schema::TensorDimension::Fixed(_),
-                    crate::schema::TensorDimension::Fixed(_)
-                )
-            ) && source != target
-            {
-                errors.push(format!(
-                    "{path} has incompatible fixed dimension at axis {axis}"
-                ));
-            }
+    for (axis, (source, target)) in source.shape.iter().zip(&target.shape).enumerate() {
+        if !dimensions_compatible(source, target) {
+            errors.push(format!(
+                "{path} has incompatible dimensions at axis {axis}: {} -> {}",
+                describe_dimension(source),
+                describe_dimension(target)
+            ));
         }
     }
 }
@@ -6981,33 +6972,22 @@ fn require_state_contract(
         }
     }
     if normalize_dtype(&actual.dtype) != normalize_dtype(&declared.dtype)
-        || actual.rank != declared.rank
+        || actual.rank() != declared.rank()
     {
         errors.push(format!(
             "{path} is incompatible with state contract {} rank {}",
-            declared.dtype, declared.rank
+            declared.dtype,
+            declared.rank()
         ));
         return;
     }
-    let (Some(actual_shape), Some(declared_shape)) = (&actual.shape, &declared.shape) else {
-        return;
-    };
     let dynamic_axis = match recurrence {
         crate::schema::ShapeRecurrence::Growing { axis, .. } if next => Some(*axis),
         crate::schema::ShapeRecurrence::Bounded { axis, .. } => Some(*axis),
         _ => None,
     };
-    for (axis, (actual, declared)) in actual_shape.iter().zip(declared_shape).enumerate() {
-        if Some(axis) != dynamic_axis
-            && matches!(
-                (actual, declared),
-                (
-                    crate::schema::TensorDimension::Fixed(_),
-                    crate::schema::TensorDimension::Fixed(_)
-                )
-            )
-            && actual != declared
-        {
+    for (axis, (actual, declared)) in actual.shape.iter().zip(&declared.shape).enumerate() {
+        if Some(axis) != dynamic_axis && !dimensions_compatible(actual, declared) {
             errors.push(format!(
                 "{path} has incompatible state dimension at axis {axis}"
             ));

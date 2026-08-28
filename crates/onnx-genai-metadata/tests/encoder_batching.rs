@@ -44,23 +44,22 @@ pipeline:
       pixel_values:
         contract:
           dtype: float32
-          rank: 4
           shape: [batch, max_tiles, height, width]
           batch_layout: { kind: request_aligned, axis: 0 }
           padding: [{ dimension: max_tiles, valid_lengths: tile_lengths }]
         role: { kind: opaque }
         source: { kind: application, name: pixel_values }
       tile_lengths:
-        contract: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: shared } }
+        contract: { dtype: int64, shape: [batch], batch_layout: { kind: shared } }
         role: { kind: opaque }
         source: { kind: application, name: tile_lengths }
       prompt:
-        contract: { dtype: int64, rank: 2, shape: [batch, sequence], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: int64, shape: [batch, sequence], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: opaque }
         source: { kind: application, name: prompt }
     outputs:
       tokens:
-        contract: { dtype: int64, rank: 2, shape: [batch, generated], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: int64, shape: [batch, generated], batch_layout: { kind: request_aligned, axis: 0 } }
         role: tokens
         stage: pre_adapter
     components:
@@ -75,21 +74,20 @@ pipeline:
           inputs:
             pixels:
               dtype: float32
-              rank: 4
               shape: [batch, max_tiles, height, width]
               batch_layout: { kind: request_aligned, axis: 0 }
               padding: [{ dimension: max_tiles, valid_lengths: lengths }]
-            lengths: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: shared } }
+            lengths: { dtype: int64, shape: [batch], batch_layout: { kind: shared } }
           outputs:
-            features: { dtype: float32, rank: 3, shape: [batch, tiles, hidden], batch_layout: { kind: request_aligned, axis: 0 } }
+            features: { dtype: float32, shape: [batch, tiles, hidden], batch_layout: { kind: request_aligned, axis: 0 } }
       splice:
         implementation: { kind: onnx, artifact: splice.onnx }
         ports:
           inputs:
-            prompt: { dtype: int64, rank: 2, shape: [batch, sequence], batch_layout: { kind: request_aligned, axis: 0 } }
-            features: { dtype: float32, rank: 3, shape: [batch, tiles, hidden], batch_layout: { kind: request_aligned, axis: 0 } }
+            prompt: { dtype: int64, shape: [batch, sequence], batch_layout: { kind: request_aligned, axis: 0 } }
+            features: { dtype: float32, shape: [batch, tiles, hidden], batch_layout: { kind: request_aligned, axis: 0 } }
           outputs:
-            token: { dtype: int64, rank: 2, shape: [batch, generated], batch_layout: { kind: request_aligned, axis: 0 } }
+            token: { dtype: int64, shape: [batch, generated], batch_layout: { kind: request_aligned, axis: 0 } }
     steps:
       - kind: invoke
         component: vision
@@ -118,7 +116,6 @@ pipeline:
       image_pixels:
         contract:
           dtype: float32
-          rank: 4
           shape: [items, channels, height, width]
           batch_layout:
             kind: token_packed
@@ -128,20 +125,20 @@ pipeline:
         role: { kind: opaque }
         source: { kind: application, name: image_pixels }
       image_offsets:
-        contract: { dtype: int64, rank: 1, shape: [rows_plus_one], batch_layout: { kind: shared } }
+        contract: { dtype: int64, shape: [rows_plus_one], batch_layout: { kind: shared } }
         role: { kind: opaque }
         source: { kind: application, name: image_offsets }
       image_owner:
-        contract: { dtype: int64, rank: 1, shape: [items], batch_layout: { kind: shared } }
+        contract: { dtype: int64, shape: [items], batch_layout: { kind: shared } }
         role: { kind: opaque }
         source: { kind: application, name: image_owner }
       prompt:
-        contract: { dtype: int64, rank: 2, shape: [batch, sequence], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: int64, shape: [batch, sequence], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: opaque }
         source: { kind: application, name: prompt }
     outputs:
       tokens:
-        contract: { dtype: int64, rank: 2, shape: [batch, generated], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: int64, shape: [batch, generated], batch_layout: { kind: request_aligned, axis: 0 } }
         role: tokens
         stage: pre_adapter
     components:
@@ -155,19 +152,17 @@ pipeline:
           inputs:
             pixels:
               dtype: float32
-              rank: 4
               shape: [items, channels, height, width]
               batch_layout:
                 kind: token_packed
                 axis: 0
                 levels:
                   - { offsets: offsets, owner: owner }
-            offsets: { dtype: int64, rank: 1, shape: [rows_plus_one], batch_layout: { kind: shared } }
-            owner: { dtype: int64, rank: 1, shape: [items], batch_layout: { kind: shared } }
+            offsets: { dtype: int64, shape: [rows_plus_one], batch_layout: { kind: shared } }
+            owner: { dtype: int64, shape: [items], batch_layout: { kind: shared } }
           outputs:
             features:
               dtype: float32
-              rank: 2
               shape: [items, hidden]
               batch_layout:
                 kind: token_packed
@@ -178,10 +173,9 @@ pipeline:
         implementation: { kind: onnx, artifact: splice.onnx }
         ports:
           inputs:
-            prompt: { dtype: int64, rank: 2, shape: [batch, sequence], batch_layout: { kind: request_aligned, axis: 0 } }
+            prompt: { dtype: int64, shape: [batch, sequence], batch_layout: { kind: request_aligned, axis: 0 } }
             features:
               dtype: float32
-              rank: 2
               shape: [items, hidden]
               batch_layout:
                 kind: token_packed
@@ -189,7 +183,7 @@ pipeline:
                 levels:
                   - { offsets: image_offsets, owner: image_owner }
           outputs:
-            token: { dtype: int64, rank: 2, shape: [batch, generated], batch_layout: { kind: request_aligned, axis: 0 } }
+            token: { dtype: int64, shape: [batch, generated], batch_layout: { kind: request_aligned, axis: 0 } }
     steps:
       - kind: invoke
         component: vision
@@ -322,8 +316,8 @@ fn a_packed_owner_map_must_name_a_declared_value() {
 #[test]
 fn packed_companions_are_shared_rank_one_integers() {
     let document = PACKED_VISION_ENCODER.replace(
-        "      image_offsets:\n        contract: { dtype: int64, rank: 1, shape: [rows_plus_one], batch_layout: { kind: shared } }",
-        "      image_offsets:\n        contract: { dtype: float32, rank: 2, shape: [rows_plus_one, pad], batch_layout: { kind: shared } }",
+        "      image_offsets:\n        contract: { dtype: int64, shape: [rows_plus_one], batch_layout: { kind: shared } }",
+        "      image_offsets:\n        contract: { dtype: float32, shape: [rows_plus_one, pad], batch_layout: { kind: shared } }",
     );
     let reported = errors(&document);
     assert!(
@@ -348,8 +342,8 @@ fn an_ownership_companion_is_rebuilt_rather_than_permuted() {
     // permute it, it invalidates it. Calling it request-aligned would invite a
     // gather that silently produces nonsense.
     let document = PACKED_VISION_ENCODER.replace(
-        "        contract: { dtype: int64, rank: 1, shape: [rows_plus_one], batch_layout: { kind: shared } }",
-        "        contract: { dtype: int64, rank: 1, shape: [rows_plus_one], batch_layout: { kind: request_aligned, axis: 0 } }",
+        "        contract: { dtype: int64, shape: [rows_plus_one], batch_layout: { kind: shared } }",
+        "        contract: { dtype: int64, shape: [rows_plus_one], batch_layout: { kind: request_aligned, axis: 0 } }",
     );
     assert_reports(
         &document,
@@ -395,8 +389,8 @@ fn packed_items_sit_on_the_outermost_axis() {
 #[test]
 fn an_owner_map_is_as_long_as_the_packing_it_describes() {
     let document = PACKED_VISION_ENCODER.replace(
-        "      image_owner:\n        contract: { dtype: int64, rank: 1, shape: [items], batch_layout: { kind: shared } }",
-        "      image_owner:\n        contract: { dtype: int64, rank: 1, shape: [other_items], batch_layout: { kind: shared } }",
+        "      image_owner:\n        contract: { dtype: int64, shape: [items], batch_layout: { kind: shared } }",
+        "      image_owner:\n        contract: { dtype: int64, shape: [other_items], batch_layout: { kind: shared } }",
     );
     assert_reports(
         &document,
@@ -408,8 +402,8 @@ fn an_owner_map_is_as_long_as_the_packing_it_describes() {
 #[test]
 fn offsets_are_one_longer_than_the_map_they_index() {
     let document = PACKED_VISION_ENCODER.replace(
-        "      image_offsets:\n        contract: { dtype: int64, rank: 1, shape: [rows_plus_one], batch_layout: { kind: shared } }",
-        "      image_offsets:\n        contract: { dtype: int64, rank: 1, shape: [items], batch_layout: { kind: shared } }",
+        "      image_offsets:\n        contract: { dtype: int64, shape: [rows_plus_one], batch_layout: { kind: shared } }",
+        "      image_offsets:\n        contract: { dtype: int64, shape: [items], batch_layout: { kind: shared } }",
     );
     assert_reports(
         &document,
@@ -434,8 +428,8 @@ fn a_packed_value_declares_at_least_one_ownership_level() {
 #[test]
 fn an_ownership_companion_carries_no_padding_of_its_own() {
     let document = PACKED_VISION_ENCODER.replace(
-        "      image_owner:\n        contract: { dtype: int64, rank: 1, shape: [items], batch_layout: { kind: shared } }",
-        "      image_owner:\n        contract: { dtype: int64, rank: 1, shape: [items], batch_layout: { kind: shared }, padding: [{ dimension: items, valid_lengths: image_offsets }] }",
+        "      image_owner:\n        contract: { dtype: int64, shape: [items], batch_layout: { kind: shared } }",
+        "      image_owner:\n        contract: { dtype: int64, shape: [items], batch_layout: { kind: shared }, padding: [{ dimension: items, valid_lengths: image_offsets }] }",
     );
     assert_reports(
         &document,
@@ -465,8 +459,8 @@ fn two_values_that_share_offsets_share_the_grouping() {
     // owns, so two values naming it are claiming one grouping — wherever in
     // their chains they name it, since a level is the pair and not the position.
     let document = PACKED_VISION_ENCODER.replace(
-        "      tokens:\n        contract: { dtype: int64, rank: 2, shape: [batch, generated], batch_layout: { kind: request_aligned, axis: 0 } }\n        role: tokens",
-        "      tokens:\n        contract: { dtype: int64, rank: 2, shape: [items, generated], batch_layout: { kind: token_packed, axis: 0, levels: [{ offsets: image_offsets, owner: prompt }] } }\n        role: tokens",
+        "      tokens:\n        contract: { dtype: int64, shape: [batch, generated], batch_layout: { kind: request_aligned, axis: 0 } }\n        role: tokens",
+        "      tokens:\n        contract: { dtype: int64, shape: [items, generated], batch_layout: { kind: token_packed, axis: 0, levels: [{ offsets: image_offsets, owner: prompt }] } }\n        role: tokens",
     );
     assert_reports(
         &document,
@@ -491,8 +485,8 @@ fn a_valid_lengths_companion_must_name_a_declared_value() {
 #[test]
 fn a_valid_lengths_companion_counts_with_integers() {
     let document = PADDED_VISION_ENCODER.replace(
-        "      tile_lengths:\n        contract: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: shared } }",
-        "      tile_lengths:\n        contract: { dtype: bool, rank: 1, shape: [batch], batch_layout: { kind: shared } }",
+        "      tile_lengths:\n        contract: { dtype: int64, shape: [batch], batch_layout: { kind: shared } }",
+        "      tile_lengths:\n        contract: { dtype: bool, shape: [batch], batch_layout: { kind: shared } }",
     );
     assert_reports(
         &document,
@@ -504,8 +498,8 @@ fn a_valid_lengths_companion_counts_with_integers() {
 #[test]
 fn a_valid_lengths_companion_is_read_on_the_host_not_gathered() {
     let document = PADDED_VISION_ENCODER.replace(
-        "      tile_lengths:\n        contract: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: shared } }",
-        "      tile_lengths:\n        contract: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }",
+        "      tile_lengths:\n        contract: { dtype: int64, shape: [batch], batch_layout: { kind: shared } }",
+        "      tile_lengths:\n        contract: { dtype: int64, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }",
     );
     assert_reports(
         &document,
@@ -531,8 +525,8 @@ fn a_valid_lengths_companion_stops_where_the_dimension_it_bounds_begins() {
     // A length applies to a whole slice, so the axes inner to the padded one are
     // not indexed and the companion's rank is the padded axis itself.
     let document = PADDED_VISION_ENCODER.replace(
-        "      tile_lengths:\n        contract: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: shared } }",
-        "      tile_lengths:\n        contract: { dtype: int64, rank: 2, shape: [batch, max_tiles], batch_layout: { kind: shared } }",
+        "      tile_lengths:\n        contract: { dtype: int64, shape: [batch], batch_layout: { kind: shared } }",
+        "      tile_lengths:\n        contract: { dtype: int64, shape: [batch, max_tiles], batch_layout: { kind: shared } }",
     );
     assert_reports(
         &document,
@@ -544,8 +538,8 @@ fn a_valid_lengths_companion_stops_where_the_dimension_it_bounds_begins() {
 #[test]
 fn a_valid_lengths_companion_matches_the_axes_outer_to_the_padded_one() {
     let document = PADDED_VISION_ENCODER.replace(
-        "      tile_lengths:\n        contract: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: shared } }",
-        "      tile_lengths:\n        contract: { dtype: int64, rank: 1, shape: [rows], batch_layout: { kind: shared } }",
+        "      tile_lengths:\n        contract: { dtype: int64, shape: [batch], batch_layout: { kind: shared } }",
+        "      tile_lengths:\n        contract: { dtype: int64, shape: [rows], batch_layout: { kind: shared } }",
     );
     assert_reports(
         &document,
@@ -925,9 +919,8 @@ fn a_capacity_denies_unknown_fields_and_defaults_the_optional_ones() {
 
 #[test]
 fn a_contract_without_padding_stays_free_of_one() {
-    let contract: TensorContract =
-        serde_yaml::from_str("dtype: float32\nrank: 2\nshape: [batch, hidden]\n")
-            .expect("a contract with no padding parses");
+    let contract: TensorContract = serde_yaml::from_str("dtype: float32\nshape: [batch, hidden]\n")
+        .expect("a contract with no padding parses");
     assert!(contract.padding.is_empty(), "absence means no padding");
     let text = serde_yaml::to_string(&contract).expect("a contract serializes");
     assert!(
@@ -1042,7 +1035,6 @@ preprocessing:
         dtype: float32
         contract:
           dtype: float32
-          rank: 4
           shape: [items, channels, height, width]
           batch_layout:
             kind: token_packed
@@ -1053,12 +1045,12 @@ preprocessing:
         source: image.pack_offsets
         content: pack_offsets
         dtype: int64
-        contract: { dtype: int64, rank: 1, shape: [rows_plus_one], batch_layout: { kind: shared } }
+        contract: { dtype: int64, shape: [rows_plus_one], batch_layout: { kind: shared } }
       - name: image.owner
         source: image.pack_owner
         content: pack_owner
         dtype: int64
-        contract: { dtype: int64, rank: 1, shape: [items], batch_layout: { kind: shared } }
+        contract: { dtype: int64, shape: [items], batch_layout: { kind: shared } }
 pipeline:
   workflow:
     manifest:
@@ -1066,16 +1058,16 @@ pipeline:
       capabilities: [workflow_ssa, typed_emit]
     inputs:
       request.image:
-        contract: { dtype: uint8, rank: 1, shape: [encoded_bytes] }
+        contract: { dtype: uint8, shape: [encoded_bytes] }
         role: { kind: runtime, version: "1.0", role: media }
         source: { kind: request }
       prompt:
-        contract: { dtype: int64, rank: 2, shape: [batch, sequence], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: int64, shape: [batch, sequence], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: opaque }
         source: { kind: application, name: prompt }
     outputs:
       tokens:
-        contract: { dtype: int64, rank: 2, shape: [batch, generated], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: int64, shape: [batch, generated], batch_layout: { kind: request_aligned, axis: 0 } }
         role: tokens
         stage: pre_adapter
     components:
@@ -1083,27 +1075,25 @@ pipeline:
         implementation: { kind: adapter, abi: onnx-genai.image-preprocess, version: "1" }
         ports:
           inputs:
-            encoded: { dtype: uint8, rank: 1, shape: [encoded_bytes] }
+            encoded: { dtype: uint8, shape: [encoded_bytes] }
           outputs:
             image.pixel_values:
               dtype: float32
-              rank: 4
               shape: [items, channels, height, width]
               batch_layout:
                 kind: token_packed
                 axis: 0
                 levels:
                   - { offsets: image.offsets, owner: image.owner, extent: produced }
-            image.offsets: { dtype: int64, rank: 1, shape: [rows_plus_one], batch_layout: { kind: shared } }
-            image.owner: { dtype: int64, rank: 1, shape: [items], batch_layout: { kind: shared } }
+            image.offsets: { dtype: int64, shape: [rows_plus_one], batch_layout: { kind: shared } }
+            image.owner: { dtype: int64, shape: [items], batch_layout: { kind: shared } }
       splice:
         implementation: { kind: onnx, artifact: splice.onnx }
         ports:
           inputs:
-            prompt: { dtype: int64, rank: 2, shape: [batch, sequence], batch_layout: { kind: request_aligned, axis: 0 } }
+            prompt: { dtype: int64, shape: [batch, sequence], batch_layout: { kind: request_aligned, axis: 0 } }
             pixels:
               dtype: float32
-              rank: 4
               shape: [items, channels, height, width]
               batch_layout:
                 kind: token_packed
@@ -1111,7 +1101,7 @@ pipeline:
                 levels:
                   - { offsets: image.offsets, owner: image.owner }
           outputs:
-            token: { dtype: int64, rank: 2, shape: [batch, generated], batch_layout: { kind: request_aligned, axis: 0 } }
+            token: { dtype: int64, shape: [batch, generated], batch_layout: { kind: request_aligned, axis: 0 } }
     steps:
       - kind: invoke
         component: image_preprocess
@@ -1176,7 +1166,6 @@ preprocessing:
         dtype: float32
         contract:
           dtype: float32
-          rank: 5
           shape: [batch, frames, channels, height, width]
           batch_layout: { kind: request_aligned, axis: 0 }
           padding: [{ dimension: frames, valid_lengths: video.frame_lengths }]
@@ -1184,7 +1173,7 @@ preprocessing:
         source: video.frame_counts
         content: valid_lengths
         dtype: int64
-        contract: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: shared } }
+        contract: { dtype: int64, shape: [batch], batch_layout: { kind: shared } }
 pipeline:
   workflow:
     manifest:
@@ -1192,16 +1181,16 @@ pipeline:
       capabilities: [workflow_ssa, typed_emit]
     inputs:
       request.video:
-        contract: { dtype: uint8, rank: 1, shape: [encoded_bytes] }
+        contract: { dtype: uint8, shape: [encoded_bytes] }
         role: { kind: runtime, version: "1.0", role: media }
         source: { kind: request }
       prompt:
-        contract: { dtype: int64, rank: 2, shape: [batch, sequence], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: int64, shape: [batch, sequence], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: opaque }
         source: { kind: application, name: prompt }
     outputs:
       tokens:
-        contract: { dtype: int64, rank: 2, shape: [batch, generated], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: int64, shape: [batch, generated], batch_layout: { kind: request_aligned, axis: 0 } }
         role: tokens
         stage: pre_adapter
     components:
@@ -1209,15 +1198,14 @@ pipeline:
         implementation: { kind: adapter, abi: onnx-genai.video-preprocess, version: "1" }
         ports:
           inputs:
-            encoded: { dtype: uint8, rank: 1, shape: [encoded_bytes] }
+            encoded: { dtype: uint8, shape: [encoded_bytes] }
           outputs:
             pixel_values:
               dtype: float32
-              rank: 5
               shape: [batch, frames, channels, height, width]
               batch_layout: { kind: request_aligned, axis: 0 }
               padding: [{ dimension: frames, valid_lengths: video.frame_lengths }]
-            frame_lengths: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: shared } }
+            frame_lengths: { dtype: int64, shape: [batch], batch_layout: { kind: shared } }
       video_encoder:
         implementation: { kind: onnx, artifact: video_encoder.onnx }
         batch_capacity:
@@ -1229,21 +1217,20 @@ pipeline:
           inputs:
             frames:
               dtype: float32
-              rank: 5
               shape: [batch, frames, channels, height, width]
               batch_layout: { kind: request_aligned, axis: 0 }
               padding: [{ dimension: frames, valid_lengths: lengths }]
-            lengths: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: shared } }
+            lengths: { dtype: int64, shape: [batch], batch_layout: { kind: shared } }
           outputs:
-            embeddings: { dtype: float32, rank: 3, shape: [batch, video_tokens, hidden], batch_layout: { kind: request_aligned, axis: 0 } }
+            embeddings: { dtype: float32, shape: [batch, video_tokens, hidden], batch_layout: { kind: request_aligned, axis: 0 } }
       decoder:
         implementation: { kind: onnx, artifact: decoder.onnx }
         ports:
           inputs:
-            prompt: { dtype: int64, rank: 2, shape: [batch, sequence], batch_layout: { kind: request_aligned, axis: 0 } }
-            embeddings: { dtype: float32, rank: 3, shape: [batch, video_tokens, hidden], batch_layout: { kind: request_aligned, axis: 0 } }
+            prompt: { dtype: int64, shape: [batch, sequence], batch_layout: { kind: request_aligned, axis: 0 } }
+            embeddings: { dtype: float32, shape: [batch, video_tokens, hidden], batch_layout: { kind: request_aligned, axis: 0 } }
           outputs:
-            token: { dtype: int64, rank: 2, shape: [batch, generated], batch_layout: { kind: request_aligned, axis: 0 } }
+            token: { dtype: int64, shape: [batch, generated], batch_layout: { kind: request_aligned, axis: 0 } }
     steps:
       - kind: invoke
         component: video_preprocess
@@ -1338,7 +1325,7 @@ fn uniformity_is_required_of_temporal_and_spatial_dimensions_alike() {
             "          uniform_dimensions: [frames, channels, height, width]\n",
         )
         .replace(
-            "              padding: [{ dimension: frames, valid_lengths: lengths }]\n            lengths: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: shared } }\n",
+            "              padding: [{ dimension: frames, valid_lengths: lengths }]\n            lengths: { dtype: int64, shape: [batch], batch_layout: { kind: shared } }\n",
             "",
         )
         .replace(
@@ -1413,7 +1400,6 @@ pipeline:
       pixel_values:
         contract:
           dtype: float32
-          rank: 3
           shape: [frames, patches, features]
           batch_layout:
             kind: token_packed
@@ -1425,30 +1411,29 @@ pipeline:
         role: { kind: opaque }
         source: { kind: application, name: pixel_values }
       patch_lengths:
-        contract: { dtype: int64, rank: 1, shape: [frames], batch_layout: { kind: shared } }
+        contract: { dtype: int64, shape: [frames], batch_layout: { kind: shared } }
         role: { kind: opaque }
         source: { kind: application, name: patch_lengths }
       frame_offsets:
-        contract: { dtype: int64, rank: 1, shape: [frame_offsets_len], batch_layout: { kind: shared } }
+        contract: { dtype: int64, shape: [frame_offsets_len], batch_layout: { kind: shared } }
         role: { kind: opaque }
         source: { kind: application, name: frame_offsets }
       frame_owner:
-        contract: { dtype: int64, rank: 1, shape: [frames], batch_layout: { kind: shared } }
+        contract: { dtype: int64, shape: [frames], batch_layout: { kind: shared } }
         role: { kind: opaque }
         source: { kind: application, name: frame_owner }
       clip_offsets:
-        contract: { dtype: int64, rank: 1, shape: [clip_offsets_len], batch_layout: { kind: shared } }
+        contract: { dtype: int64, shape: [clip_offsets_len], batch_layout: { kind: shared } }
         role: { kind: opaque }
         source: { kind: application, name: clip_offsets }
       clip_owner:
-        contract: { dtype: int64, rank: 1, shape: [clips], batch_layout: { kind: shared } }
+        contract: { dtype: int64, shape: [clips], batch_layout: { kind: shared } }
         role: { kind: opaque }
         source: { kind: application, name: clip_owner }
     outputs:
       clip_embeddings:
         contract:
           dtype: float32
-          rank: 2
           shape: [clips, hidden]
           batch_layout:
             kind: token_packed
@@ -1458,11 +1443,11 @@ pipeline:
         role: tensor
         stage: pre_adapter
       clip_offsets:
-        contract: { dtype: int64, rank: 1, shape: [clip_offsets_len], batch_layout: { kind: shared } }
+        contract: { dtype: int64, shape: [clip_offsets_len], batch_layout: { kind: shared } }
         role: tensor
         stage: pre_adapter
       clip_owner:
-        contract: { dtype: int64, rank: 1, shape: [clips], batch_layout: { kind: shared } }
+        contract: { dtype: int64, shape: [clips], batch_layout: { kind: shared } }
         role: tensor
         stage: pre_adapter
     components:
@@ -1478,7 +1463,6 @@ pipeline:
           inputs:
             pixel_values:
               dtype: float32
-              rank: 3
               shape: [frames, patches, features]
               batch_layout:
                 kind: token_packed
@@ -1487,15 +1471,14 @@ pipeline:
                   - { offsets: frame_offsets, owner: frame_owner }
                   - { offsets: clip_offsets, owner: clip_owner }
               padding: [{ dimension: patches, valid_lengths: patch_lengths }]
-            patch_lengths: { dtype: int64, rank: 1, shape: [frames], batch_layout: { kind: shared } }
-            frame_offsets: { dtype: int64, rank: 1, shape: [frame_offsets_len], batch_layout: { kind: shared } }
-            frame_owner: { dtype: int64, rank: 1, shape: [frames], batch_layout: { kind: shared } }
-            clip_offsets: { dtype: int64, rank: 1, shape: [clip_offsets_len], batch_layout: { kind: shared } }
-            clip_owner: { dtype: int64, rank: 1, shape: [clips], batch_layout: { kind: shared } }
+            patch_lengths: { dtype: int64, shape: [frames], batch_layout: { kind: shared } }
+            frame_offsets: { dtype: int64, shape: [frame_offsets_len], batch_layout: { kind: shared } }
+            frame_owner: { dtype: int64, shape: [frames], batch_layout: { kind: shared } }
+            clip_offsets: { dtype: int64, shape: [clip_offsets_len], batch_layout: { kind: shared } }
+            clip_owner: { dtype: int64, shape: [clips], batch_layout: { kind: shared } }
           outputs:
             clip_embeddings:
               dtype: float32
-              rank: 2
               shape: [clips, hidden]
               batch_layout:
                 kind: token_packed
@@ -1504,7 +1487,6 @@ pipeline:
                   - { offsets: clip_offsets, owner: clip_owner, extent: preserved }
             media_tokens:
               dtype: float32
-              rank: 2
               shape: [media_tokens_total, hidden]
               batch_layout:
                 kind: token_packed
@@ -1512,8 +1494,8 @@ pipeline:
                 levels:
                   - { offsets: media_token_offsets, owner: media_token_owner, extent: produced }
                   - { offsets: clip_offsets, owner: clip_owner, extent: preserved }
-            media_token_offsets: { dtype: int64, rank: 1, shape: [media_token_offsets_len], batch_layout: { kind: shared } }
-            media_token_owner: { dtype: int64, rank: 1, shape: [media_tokens_total], batch_layout: { kind: shared } }
+            media_token_offsets: { dtype: int64, shape: [media_token_offsets_len], batch_layout: { kind: shared } }
+            media_token_owner: { dtype: int64, shape: [media_tokens_total], batch_layout: { kind: shared } }
     steps:
       - kind: invoke
         component: clip_encoder
@@ -1561,7 +1543,6 @@ pipeline:
       pixel_values:
         contract:
           dtype: float32
-          rank: 4
           shape: [clips, frames, patches, features]
           batch_layout:
             kind: token_packed
@@ -1571,18 +1552,17 @@ pipeline:
         role: { kind: opaque }
         source: { kind: application, name: pixel_values }
       clip_offsets:
-        contract: { dtype: int64, rank: 1, shape: [clip_offsets_len], batch_layout: { kind: shared } }
+        contract: { dtype: int64, shape: [clip_offsets_len], batch_layout: { kind: shared } }
         role: { kind: opaque }
         source: { kind: application, name: clip_offsets }
       clip_owner:
-        contract: { dtype: int64, rank: 1, shape: [clips], batch_layout: { kind: shared } }
+        contract: { dtype: int64, shape: [clips], batch_layout: { kind: shared } }
         role: { kind: opaque }
         source: { kind: application, name: clip_owner }
     outputs:
       clip_embeddings:
         contract:
           dtype: float32
-          rank: 2
           shape: [clips, hidden]
           batch_layout:
             kind: token_packed
@@ -1592,11 +1572,11 @@ pipeline:
         role: tensor
         stage: pre_adapter
       clip_offsets:
-        contract: { dtype: int64, rank: 1, shape: [clip_offsets_len], batch_layout: { kind: shared } }
+        contract: { dtype: int64, shape: [clip_offsets_len], batch_layout: { kind: shared } }
         role: tensor
         stage: pre_adapter
       clip_owner:
-        contract: { dtype: int64, rank: 1, shape: [clips], batch_layout: { kind: shared } }
+        contract: { dtype: int64, shape: [clips], batch_layout: { kind: shared } }
         role: tensor
         stage: pre_adapter
     components:
@@ -1611,19 +1591,17 @@ pipeline:
           inputs:
             pixel_values:
               dtype: float32
-              rank: 4
               shape: [clips, frames, patches, features]
               batch_layout:
                 kind: token_packed
                 axis: 0
                 levels:
                   - { offsets: clip_offsets, owner: clip_owner }
-            clip_offsets: { dtype: int64, rank: 1, shape: [clip_offsets_len], batch_layout: { kind: shared } }
-            clip_owner: { dtype: int64, rank: 1, shape: [clips], batch_layout: { kind: shared } }
+            clip_offsets: { dtype: int64, shape: [clip_offsets_len], batch_layout: { kind: shared } }
+            clip_owner: { dtype: int64, shape: [clips], batch_layout: { kind: shared } }
           outputs:
             clip_embeddings:
               dtype: float32
-              rank: 2
               shape: [clips, hidden]
               batch_layout:
                 kind: token_packed
@@ -1705,8 +1683,8 @@ fn a_pair_carries_the_same_two_counts_wherever_it_is_named() {
     // a different grouping would split the payload at boundaries that describe
     // something else.
     let document = FIXED_FRAME_VIDEO_ENCODER.replace(
-        "            clip_owner: { dtype: int64, rank: 1, shape: [clips], batch_layout: { kind: shared } }",
-        "            clip_owner: { dtype: int64, rank: 1, shape: [other_clips], batch_layout: { kind: shared } }",
+        "            clip_owner: { dtype: int64, shape: [clips], batch_layout: { kind: shared } }",
+        "            clip_owner: { dtype: int64, shape: [other_clips], batch_layout: { kind: shared } }",
     );
     assert_reports(
         &document,
@@ -1739,16 +1717,14 @@ fn a_packing_resolves_frames_through_clips_to_request_rows() {
         workflow.inputs[name]
             .contract
             .shape
-            .as_ref()
-            .and_then(|shape| shape.first())
+            .first()
             .cloned()
             .expect("a companion declares its extent")
     };
     let packed = workflow.inputs["pixel_values"]
         .contract
         .shape
-        .as_ref()
-        .and_then(|shape| shape.first())
+        .first()
         .cloned()
         .expect("a packed value declares its extent");
     assert_eq!(extent("frame_owner"), packed, "one owner entry per frame");
@@ -1757,8 +1733,7 @@ fn a_packing_resolves_frames_through_clips_to_request_rows() {
         workflow.outputs["clip_embeddings"]
             .contract
             .shape
-            .as_ref()
-            .and_then(|shape| shape.first())
+            .first()
             .cloned()
             .expect("the clip embedding declares its extent"),
         "the clip level counts clips, and a clip-packed output counts the same clips"
@@ -1851,8 +1826,8 @@ fn a_group_level_must_name_declared_values() {
 #[test]
 fn a_group_level_companion_is_a_shared_rank_one_integer() {
     let document = NESTED_VIDEO_ENCODER.replace(
-        "      clip_owner:\n        contract: { dtype: int64, rank: 1, shape: [clips], batch_layout: { kind: shared } }",
-        "      clip_owner:\n        contract: { dtype: float32, rank: 1, shape: [clips], batch_layout: { kind: shared } }",
+        "      clip_owner:\n        contract: { dtype: int64, shape: [clips], batch_layout: { kind: shared } }",
+        "      clip_owner:\n        contract: { dtype: float32, shape: [clips], batch_layout: { kind: shared } }",
     );
     assert_reports(
         &document,
@@ -1876,8 +1851,8 @@ fn no_two_ownership_levels_share_a_companion_value() {
 #[test]
 fn a_nested_owner_map_is_as_long_as_the_run_it_indexes() {
     let document = NESTED_VIDEO_ENCODER.replace(
-        "            clip_owner: { dtype: int64, rank: 1, shape: [clips], batch_layout: { kind: shared } }",
-        "            clip_owner: { dtype: int64, rank: 1, shape: [clip_offsets_len], batch_layout: { kind: shared } }",
+        "            clip_owner: { dtype: int64, shape: [clips], batch_layout: { kind: shared } }",
+        "            clip_owner: { dtype: int64, shape: [clip_offsets_len], batch_layout: { kind: shared } }",
     );
     assert_reports(
         &document,
@@ -1920,7 +1895,6 @@ pipeline:
       cache_lengths:
         contract:
           dtype: int64
-          rank: 1
           shape: [batch]
           batch_layout: { kind: request_aligned, axis: 0 }
         scope: invocation
@@ -1929,7 +1903,6 @@ pipeline:
       cache:
         contract:
           dtype: float32
-          rank: 2
           shape: [batch, capacity]
           batch_layout: { kind: request_aligned, axis: 0 }
         scope: invocation
@@ -1940,29 +1913,28 @@ pipeline:
         release_boundary: invocation
     inputs:
       active:
-        contract: { dtype: bool, rank: 1, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: bool, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: opaque }
         source: { kind: application, name: active }
       done:
-        contract: { dtype: bool, rank: 1, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: bool, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: opaque }
         source: { kind: application, name: done }
       accepted_len:
-        contract: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: int64, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: opaque }
         source: { kind: application, name: accepted_len }
       cache_lengths.initial:
-        contract: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: int64, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: opaque }
         source: { kind: application, name: cache_lengths.initial }
       cache.initial:
-        contract: { dtype: float32, rank: 2, shape: [batch, capacity], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: float32, shape: [batch, capacity], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: opaque }
         source: { kind: application, name: cache.initial }
       image_pixels:
         contract:
           dtype: float32
-          rank: 4
           shape: [items, channels, height, width]
           batch_layout:
             kind: token_packed
@@ -1972,18 +1944,17 @@ pipeline:
         role: { kind: opaque }
         source: { kind: application, name: image_pixels }
       image_offsets:
-        contract: { dtype: int64, rank: 1, shape: [rows_plus_one], batch_layout: { kind: shared } }
+        contract: { dtype: int64, shape: [rows_plus_one], batch_layout: { kind: shared } }
         role: { kind: opaque }
         source: { kind: application, name: image_offsets }
       image_owner:
-        contract: { dtype: int64, rank: 1, shape: [items], batch_layout: { kind: shared } }
+        contract: { dtype: int64, shape: [items], batch_layout: { kind: shared } }
         role: { kind: opaque }
         source: { kind: application, name: image_owner }
     outputs:
       features:
         contract:
           dtype: float32
-          rank: 2
           shape: [items, hidden]
           batch_layout:
             kind: token_packed
@@ -1993,11 +1964,11 @@ pipeline:
         role: tensor
         stage: pre_adapter
       image_offsets:
-        contract: { dtype: int64, rank: 1, shape: [rows_plus_one], batch_layout: { kind: shared } }
+        contract: { dtype: int64, shape: [rows_plus_one], batch_layout: { kind: shared } }
         role: tensor
         stage: pre_adapter
       image_owner:
-        contract: { dtype: int64, rank: 1, shape: [items], batch_layout: { kind: shared } }
+        contract: { dtype: int64, shape: [items], batch_layout: { kind: shared } }
         role: tensor
         stage: pre_adapter
     components:
@@ -2007,7 +1978,6 @@ pipeline:
           inputs:
             pixels:
               dtype: float32
-              rank: 4
               shape: [items, channels, height, width]
               batch_layout:
                 kind: token_packed
@@ -2017,7 +1987,6 @@ pipeline:
           outputs:
             features:
               dtype: float32
-              rank: 2
               shape: [items, hidden]
               batch_layout:
                 kind: token_packed
@@ -2056,8 +2025,8 @@ fn an_ownership_companion_may_be_emitted_by_a_serving_workflow() {
     // for the very values that state that correspondence, and for nothing else.
     let document = PACKED_EMIT_WORKFLOW
         .replace(
-            "      image_owner:\n        contract: { dtype: int64, rank: 1, shape: [items], batch_layout: { kind: shared } }\n        role: tensor\n        stage: pre_adapter\n",
-            "      unrelated:\n        contract: { dtype: int64, rank: 1, shape: [items], batch_layout: { kind: shared } }\n        role: tensor\n        stage: pre_adapter\n",
+            "      image_owner:\n        contract: { dtype: int64, shape: [items], batch_layout: { kind: shared } }\n        role: tensor\n        stage: pre_adapter\n",
+            "      unrelated:\n        contract: { dtype: int64, shape: [items], batch_layout: { kind: shared } }\n        role: tensor\n        stage: pre_adapter\n",
         )
         .replace(
             "        value: image_owner\n        output: image_owner\n",
@@ -2073,7 +2042,7 @@ fn an_ownership_companion_may_be_emitted_by_a_serving_workflow() {
 fn a_packed_emit_cannot_hide_the_companions_that_describe_it() {
     let document = PACKED_EMIT_WORKFLOW
         .replace(
-            "      image_owner:\n        contract: { dtype: int64, rank: 1, shape: [items], batch_layout: { kind: shared } }\n        role: tensor\n        stage: pre_adapter\n",
+            "      image_owner:\n        contract: { dtype: int64, shape: [items], batch_layout: { kind: shared } }\n        role: tensor\n        stage: pre_adapter\n",
             "",
         )
         .replace(
@@ -2095,8 +2064,8 @@ fn a_media_shaped_append_names_the_axis_it_grows() {
     // spatial extent that must never be concatenated.
     let document = PACKED_EMIT_WORKFLOW
         .replace(
-            "      image_owner:\n        contract: { dtype: int64, rank: 1, shape: [items], batch_layout: { kind: shared } }\n        role: tensor\n        stage: pre_adapter\n",
-            "      image_owner:\n        contract: { dtype: int64, rank: 1, shape: [items], batch_layout: { kind: shared } }\n        role: tensor\n        stage: pre_adapter\n      clip:\n        contract: { dtype: float32, rank: 4, shape: [items, channels, height, width], batch_layout: { kind: token_packed, axis: 0, levels: [{ offsets: image_offsets, owner: image_owner }] } }\n        role: video\n        stage: pre_adapter\n",
+            "      image_owner:\n        contract: { dtype: int64, shape: [items], batch_layout: { kind: shared } }\n        role: tensor\n        stage: pre_adapter\n",
+            "      image_owner:\n        contract: { dtype: int64, shape: [items], batch_layout: { kind: shared } }\n        role: tensor\n        stage: pre_adapter\n      clip:\n        contract: { dtype: float32, shape: [items, channels, height, width], batch_layout: { kind: token_packed, axis: 0, levels: [{ offsets: image_offsets, owner: image_owner }] } }\n        role: video\n        stage: pre_adapter\n",
         )
         .replace(
             "      - kind: emit\n        value: image_owner\n        output: image_owner\n        mode: replace\n",
@@ -2129,12 +2098,12 @@ pipeline:
       capabilities: [workflow_ssa, typed_emit]
     inputs:
       latent:
-        contract: { dtype: float32, rank: 4, shape: [batch, channels, height, width], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: float32, shape: [batch, channels, height, width], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: opaque }
         source: { kind: application, name: latent }
     outputs:
       trajectory:
-        contract: { dtype: float32, rank: 4, shape: [batch, channels, height, trajectory_width], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: float32, shape: [batch, channels, height, trajectory_width], batch_layout: { kind: request_aligned, axis: 0 } }
         role: tensor
         stage: pre_adapter
     components:
@@ -2142,9 +2111,9 @@ pipeline:
         implementation: { kind: onnx, artifact: denoiser.onnx }
         ports:
           inputs:
-            latent: { dtype: float32, rank: 4, shape: [batch, channels, height, width], batch_layout: { kind: request_aligned, axis: 0 } }
+            latent: { dtype: float32, shape: [batch, channels, height, width], batch_layout: { kind: request_aligned, axis: 0 } }
           outputs:
-            estimate: { dtype: float32, rank: 4, shape: [batch, channels, height, width], batch_layout: { kind: request_aligned, axis: 0 } }
+            estimate: { dtype: float32, shape: [batch, channels, height, width], batch_layout: { kind: request_aligned, axis: 0 } }
     steps:
       - kind: invoke
         component: denoiser
@@ -2230,7 +2199,6 @@ pipeline:
       cache_lengths:
         contract:
           dtype: int64
-          rank: 1
           shape: [batch]
           batch_layout: { kind: request_aligned, axis: 0 }
         scope: invocation
@@ -2239,7 +2207,6 @@ pipeline:
       cache:
         contract:
           dtype: float32
-          rank: 2
           shape: [batch, capacity]
           batch_layout: { kind: request_aligned, axis: 0 }
         scope: invocation
@@ -2250,50 +2217,48 @@ pipeline:
         release_boundary: invocation
     inputs:
       active:
-        contract: { dtype: bool, rank: 1, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: bool, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: opaque }
         source: { kind: application, name: active }
       done:
-        contract: { dtype: bool, rank: 1, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: bool, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: opaque }
         source: { kind: application, name: done }
       accepted_len:
-        contract: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: int64, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: opaque }
         source: { kind: application, name: accepted_len }
       cache_lengths.initial:
-        contract: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: int64, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: opaque }
         source: { kind: application, name: cache_lengths.initial }
       cache.initial:
-        contract: { dtype: float32, rank: 2, shape: [batch, capacity], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: float32, shape: [batch, capacity], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: opaque }
         source: { kind: application, name: cache.initial }
       pixel_values:
         contract:
           dtype: float32
-          rank: 4
           shape: [batch, max_tiles, height, width]
           batch_layout: { kind: request_aligned, axis: 0 }
           padding: [{ dimension: max_tiles, valid_lengths: tile_lengths }]
         role: { kind: opaque }
         source: { kind: application, name: pixel_values }
       tile_lengths:
-        contract: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: shared } }
+        contract: { dtype: int64, shape: [batch], batch_layout: { kind: shared } }
         role: { kind: opaque }
         source: { kind: application, name: tile_lengths }
     outputs:
       features:
         contract:
           dtype: float32
-          rank: 3
           shape: [batch, max_tiles, hidden]
           batch_layout: { kind: request_aligned, axis: 0 }
           padding: [{ dimension: max_tiles, valid_lengths: tile_lengths }]
         role: tensor
         stage: pre_adapter
       tile_lengths:
-        contract: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: shared } }
+        contract: { dtype: int64, shape: [batch], batch_layout: { kind: shared } }
         role: tensor
         stage: pre_adapter
     components:
@@ -2303,15 +2268,13 @@ pipeline:
           inputs:
             pixels:
               dtype: float32
-              rank: 4
               shape: [batch, max_tiles, height, width]
               batch_layout: { kind: request_aligned, axis: 0 }
               padding: [{ dimension: max_tiles, valid_lengths: lengths }]
-            lengths: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: shared } }
+            lengths: { dtype: int64, shape: [batch], batch_layout: { kind: shared } }
           outputs:
             features:
               dtype: float32
-              rank: 3
               shape: [batch, max_tiles, hidden]
               batch_layout: { kind: request_aligned, axis: 0 }
               padding: [{ dimension: max_tiles, valid_lengths: lengths }]
@@ -2399,8 +2362,8 @@ fn a_validity_companion_may_be_emitted_by_a_serving_workflow() {
     // per-request answer with no way back to a request.
     let document = PADDED_EMIT_WORKFLOW
         .replace(
-            "      tile_lengths:\n        contract: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: shared } }\n        role: tensor\n        stage: pre_adapter\n",
-            "      tile_lengths:\n        contract: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: shared } }\n        role: tensor\n        stage: pre_adapter\n      unrelated:\n        contract: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: shared } }\n        role: tensor\n        stage: pre_adapter\n",
+            "      tile_lengths:\n        contract: { dtype: int64, shape: [batch], batch_layout: { kind: shared } }\n        role: tensor\n        stage: pre_adapter\n",
+            "      tile_lengths:\n        contract: { dtype: int64, shape: [batch], batch_layout: { kind: shared } }\n        role: tensor\n        stage: pre_adapter\n      unrelated:\n        contract: { dtype: int64, shape: [batch], batch_layout: { kind: shared } }\n        role: tensor\n        stage: pre_adapter\n",
         )
         .replace(
             "      - kind: emit\n        value: tile_lengths\n        output: tile_lengths\n        mode: replace\n",
@@ -2420,7 +2383,7 @@ fn a_padded_emit_cannot_hide_the_lengths_that_bound_it() {
     // only account of the padding that exists.
     let document = PADDED_EMIT_WORKFLOW
         .replace(
-            "      tile_lengths:\n        contract: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: shared } }\n        role: tensor\n        stage: pre_adapter\n",
+            "      tile_lengths:\n        contract: { dtype: int64, shape: [batch], batch_layout: { kind: shared } }\n        role: tensor\n        stage: pre_adapter\n",
             "",
         )
         .replace(
@@ -2496,8 +2459,8 @@ fn a_packed_axis_is_axis_zero_whether_or_not_a_capacity_was_declared() {
     // that declares no `batch_capacity` earns no exemption — it has simply not
     // declared that it could pay for a strided gather.
     let document = PACKED_EMIT_WORKFLOW.replace(
-        "        contract:\n          dtype: float32\n          rank: 2\n          shape: [items, hidden]\n          batch_layout:\n            kind: token_packed\n            axis: 0\n",
-        "        contract:\n          dtype: float32\n          rank: 2\n          shape: [hidden, items]\n          batch_layout:\n            kind: token_packed\n            axis: 1\n",
+        "        contract:\n          dtype: float32\n          shape: [items, hidden]\n          batch_layout:\n            kind: token_packed\n            axis: 0\n",
+        "        contract:\n          dtype: float32\n          shape: [hidden, items]\n          batch_layout:\n            kind: token_packed\n            axis: 1\n",
     );
     assert!(
         !document.contains("batch_capacity"),
@@ -2571,7 +2534,6 @@ pipeline:
       image_pixels:
         contract:
           dtype: float32
-          rank: 4
           shape: [items, channels, height, width]
           batch_layout:
             kind: token_packed
@@ -2689,7 +2651,7 @@ fn the_recognizer_reaches_packed_layouts_and_nothing_else() {
     // documents that are perfectly current.
     let document = PACKED_VISION_ENCODER.replace(
         "      prompt:\n",
-        "      offsets:\n        contract: { dtype: int64, rank: 1, shape: [rows], batch_layout: { kind: shared } }\n        role: { kind: opaque }\n        source: { kind: application, name: offsets }\n      prompt:\n",
+        "      offsets:\n        contract: { dtype: int64, shape: [rows], batch_layout: { kind: shared } }\n        role: { kind: opaque }\n        source: { kind: application, name: offsets }\n      prompt:\n",
     );
     gated(&document).expect("a value named `offsets` is not a retired layout");
 }
@@ -2806,24 +2768,24 @@ fn published_schema_omits_retired_batching_hints() {
 fn two_padded_dimensions() -> String {
     PADDED_EMIT_WORKFLOW
         .replace(
-            "      tile_lengths:\n        contract: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: shared } }\n        role: { kind: opaque }\n        source: { kind: application, name: tile_lengths }\n",
-            "      tile_lengths:\n        contract: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: shared } }\n        role: { kind: opaque }\n        source: { kind: application, name: tile_lengths }\n      patch_lengths:\n        contract: { dtype: int64, rank: 2, shape: [batch, max_tiles], batch_layout: { kind: shared } }\n        role: { kind: opaque }\n        source: { kind: application, name: patch_lengths }\n",
+            "      tile_lengths:\n        contract: { dtype: int64, shape: [batch], batch_layout: { kind: shared } }\n        role: { kind: opaque }\n        source: { kind: application, name: tile_lengths }\n",
+            "      tile_lengths:\n        contract: { dtype: int64, shape: [batch], batch_layout: { kind: shared } }\n        role: { kind: opaque }\n        source: { kind: application, name: tile_lengths }\n      patch_lengths:\n        contract: { dtype: int64, shape: [batch, max_tiles], batch_layout: { kind: shared } }\n        role: { kind: opaque }\n        source: { kind: application, name: patch_lengths }\n",
         )
         .replace(
-            "      features:\n        contract:\n          dtype: float32\n          rank: 3\n          shape: [batch, max_tiles, hidden]\n          batch_layout: { kind: request_aligned, axis: 0 }\n          padding: [{ dimension: max_tiles, valid_lengths: tile_lengths }]\n",
-            "      features:\n        contract:\n          dtype: float32\n          rank: 4\n          shape: [batch, max_tiles, max_patches, hidden]\n          batch_layout: { kind: request_aligned, axis: 0 }\n          padding:\n            - { dimension: max_tiles, valid_lengths: tile_lengths }\n            - { dimension: max_patches, valid_lengths: patch_lengths }\n",
+            "      features:\n        contract:\n          dtype: float32\n          shape: [batch, max_tiles, hidden]\n          batch_layout: { kind: request_aligned, axis: 0 }\n          padding: [{ dimension: max_tiles, valid_lengths: tile_lengths }]\n",
+            "      features:\n        contract:\n          dtype: float32\n          shape: [batch, max_tiles, max_patches, hidden]\n          batch_layout: { kind: request_aligned, axis: 0 }\n          padding:\n            - { dimension: max_tiles, valid_lengths: tile_lengths }\n            - { dimension: max_patches, valid_lengths: patch_lengths }\n",
         )
         .replace(
-            "      tile_lengths:\n        contract: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: shared } }\n        role: tensor\n        stage: pre_adapter\n",
-            "      tile_lengths:\n        contract: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: shared } }\n        role: tensor\n        stage: pre_adapter\n      patch_lengths:\n        contract: { dtype: int64, rank: 2, shape: [batch, max_tiles], batch_layout: { kind: shared } }\n        role: tensor\n        stage: pre_adapter\n",
+            "      tile_lengths:\n        contract: { dtype: int64, shape: [batch], batch_layout: { kind: shared } }\n        role: tensor\n        stage: pre_adapter\n",
+            "      tile_lengths:\n        contract: { dtype: int64, shape: [batch], batch_layout: { kind: shared } }\n        role: tensor\n        stage: pre_adapter\n      patch_lengths:\n        contract: { dtype: int64, shape: [batch, max_tiles], batch_layout: { kind: shared } }\n        role: tensor\n        stage: pre_adapter\n",
         )
         .replace(
-            "            lengths: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: shared } }\n",
-            "            lengths: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: shared } }\n            patch_lens: { dtype: int64, rank: 2, shape: [batch, max_tiles], batch_layout: { kind: shared } }\n",
+            "            lengths: { dtype: int64, shape: [batch], batch_layout: { kind: shared } }\n",
+            "            lengths: { dtype: int64, shape: [batch], batch_layout: { kind: shared } }\n            patch_lens: { dtype: int64, shape: [batch, max_tiles], batch_layout: { kind: shared } }\n",
         )
         .replace(
-            "            features:\n              dtype: float32\n              rank: 3\n              shape: [batch, max_tiles, hidden]\n              batch_layout: { kind: request_aligned, axis: 0 }\n              padding: [{ dimension: max_tiles, valid_lengths: lengths }]\n",
-            "            features:\n              dtype: float32\n              rank: 4\n              shape: [batch, max_tiles, max_patches, hidden]\n              batch_layout: { kind: request_aligned, axis: 0 }\n              padding:\n                - { dimension: max_tiles, valid_lengths: lengths }\n                - { dimension: max_patches, valid_lengths: patch_lens }\n",
+            "            features:\n              dtype: float32\n              shape: [batch, max_tiles, hidden]\n              batch_layout: { kind: request_aligned, axis: 0 }\n              padding: [{ dimension: max_tiles, valid_lengths: lengths }]\n",
+            "            features:\n              dtype: float32\n              shape: [batch, max_tiles, max_patches, hidden]\n              batch_layout: { kind: request_aligned, axis: 0 }\n              padding:\n                - { dimension: max_tiles, valid_lengths: lengths }\n                - { dimension: max_patches, valid_lengths: patch_lens }\n",
         )
         .replace(
             "        inputs: { pixels: pixel_values, lengths: tile_lengths }\n",
@@ -2844,24 +2806,24 @@ fn two_padded_dimensions() -> String {
 fn packed_two_padded_dimensions() -> String {
     PACKED_EMIT_WORKFLOW
         .replace(
-            "      image_owner:\n        contract: { dtype: int64, rank: 1, shape: [items], batch_layout: { kind: shared } }\n        role: { kind: opaque }\n        source: { kind: application, name: image_owner }\n",
-            "      image_owner:\n        contract: { dtype: int64, rank: 1, shape: [items], batch_layout: { kind: shared } }\n        role: { kind: opaque }\n        source: { kind: application, name: image_owner }\n      tile_lengths:\n        contract: { dtype: int64, rank: 1, shape: [items], batch_layout: { kind: shared } }\n        role: { kind: opaque }\n        source: { kind: application, name: tile_lengths }\n      patch_lengths:\n        contract: { dtype: int64, rank: 2, shape: [items, max_tiles], batch_layout: { kind: shared } }\n        role: { kind: opaque }\n        source: { kind: application, name: patch_lengths }\n",
+            "      image_owner:\n        contract: { dtype: int64, shape: [items], batch_layout: { kind: shared } }\n        role: { kind: opaque }\n        source: { kind: application, name: image_owner }\n",
+            "      image_owner:\n        contract: { dtype: int64, shape: [items], batch_layout: { kind: shared } }\n        role: { kind: opaque }\n        source: { kind: application, name: image_owner }\n      tile_lengths:\n        contract: { dtype: int64, shape: [items], batch_layout: { kind: shared } }\n        role: { kind: opaque }\n        source: { kind: application, name: tile_lengths }\n      patch_lengths:\n        contract: { dtype: int64, shape: [items, max_tiles], batch_layout: { kind: shared } }\n        role: { kind: opaque }\n        source: { kind: application, name: patch_lengths }\n",
         )
         .replace(
-            "      features:\n        contract:\n          dtype: float32\n          rank: 2\n          shape: [items, hidden]\n          batch_layout:\n            kind: token_packed\n            axis: 0\n            levels:\n              - { offsets: image_offsets, owner: image_owner, extent: preserved }\n",
-            "      features:\n        contract:\n          dtype: float32\n          rank: 4\n          shape: [items, max_tiles, max_patches, hidden]\n          batch_layout:\n            kind: token_packed\n            axis: 0\n            levels:\n              - { offsets: image_offsets, owner: image_owner, extent: preserved }\n          padding:\n            - { dimension: max_tiles, valid_lengths: tile_lengths }\n            - { dimension: max_patches, valid_lengths: patch_lengths }\n",
+            "      features:\n        contract:\n          dtype: float32\n          shape: [items, hidden]\n          batch_layout:\n            kind: token_packed\n            axis: 0\n            levels:\n              - { offsets: image_offsets, owner: image_owner, extent: preserved }\n",
+            "      features:\n        contract:\n          dtype: float32\n          shape: [items, max_tiles, max_patches, hidden]\n          batch_layout:\n            kind: token_packed\n            axis: 0\n            levels:\n              - { offsets: image_offsets, owner: image_owner, extent: preserved }\n          padding:\n            - { dimension: max_tiles, valid_lengths: tile_lengths }\n            - { dimension: max_patches, valid_lengths: patch_lengths }\n",
         )
         .replace(
-            "      image_owner:\n        contract: { dtype: int64, rank: 1, shape: [items], batch_layout: { kind: shared } }\n        role: tensor\n        stage: pre_adapter\n",
-            "      image_owner:\n        contract: { dtype: int64, rank: 1, shape: [items], batch_layout: { kind: shared } }\n        role: tensor\n        stage: pre_adapter\n      tile_lengths:\n        contract: { dtype: int64, rank: 1, shape: [items], batch_layout: { kind: shared } }\n        role: tensor\n        stage: pre_adapter\n      patch_lengths:\n        contract: { dtype: int64, rank: 2, shape: [items, max_tiles], batch_layout: { kind: shared } }\n        role: tensor\n        stage: pre_adapter\n",
+            "      image_owner:\n        contract: { dtype: int64, shape: [items], batch_layout: { kind: shared } }\n        role: tensor\n        stage: pre_adapter\n",
+            "      image_owner:\n        contract: { dtype: int64, shape: [items], batch_layout: { kind: shared } }\n        role: tensor\n        stage: pre_adapter\n      tile_lengths:\n        contract: { dtype: int64, shape: [items], batch_layout: { kind: shared } }\n        role: tensor\n        stage: pre_adapter\n      patch_lengths:\n        contract: { dtype: int64, shape: [items, max_tiles], batch_layout: { kind: shared } }\n        role: tensor\n        stage: pre_adapter\n",
         )
         .replace(
             "                  - { offsets: image_offsets, owner: image_owner }\n          outputs:\n",
-            "                  - { offsets: image_offsets, owner: image_owner }\n            lengths: { dtype: int64, rank: 1, shape: [items], batch_layout: { kind: shared } }\n            patch_lens: { dtype: int64, rank: 2, shape: [items, max_tiles], batch_layout: { kind: shared } }\n          outputs:\n",
+            "                  - { offsets: image_offsets, owner: image_owner }\n            lengths: { dtype: int64, shape: [items], batch_layout: { kind: shared } }\n            patch_lens: { dtype: int64, shape: [items, max_tiles], batch_layout: { kind: shared } }\n          outputs:\n",
         )
         .replace(
-            "            features:\n              dtype: float32\n              rank: 2\n              shape: [items, hidden]\n              batch_layout:\n                kind: token_packed\n                axis: 0\n                levels:\n                  - { offsets: image_offsets, owner: image_owner, extent: preserved }\n",
-            "            features:\n              dtype: float32\n              rank: 4\n              shape: [items, max_tiles, max_patches, hidden]\n              batch_layout:\n                kind: token_packed\n                axis: 0\n                levels:\n                  - { offsets: image_offsets, owner: image_owner, extent: preserved }\n              padding:\n                - { dimension: max_tiles, valid_lengths: lengths }\n                - { dimension: max_patches, valid_lengths: patch_lens }\n",
+            "            features:\n              dtype: float32\n              shape: [items, hidden]\n              batch_layout:\n                kind: token_packed\n                axis: 0\n                levels:\n                  - { offsets: image_offsets, owner: image_owner, extent: preserved }\n",
+            "            features:\n              dtype: float32\n              shape: [items, max_tiles, max_patches, hidden]\n              batch_layout:\n                kind: token_packed\n                axis: 0\n                levels:\n                  - { offsets: image_offsets, owner: image_owner, extent: preserved }\n              padding:\n                - { dimension: max_tiles, valid_lengths: lengths }\n                - { dimension: max_patches, valid_lengths: patch_lens }\n",
         )
         .replace(
             "        inputs: { pixels: image_pixels }\n",
@@ -2902,12 +2864,12 @@ fn a_companion_is_admitted_at_its_own_rank_and_not_at_another_kinds() {
     // index the positions it claims to describe.
     let document = two_padded_dimensions()
         .replace(
-            "{ dtype: int64, rank: 2, shape: [batch, max_tiles], batch_layout: { kind: shared } }",
-            "{ dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: shared } }",
+            "{ dtype: int64, shape: [batch, max_tiles], batch_layout: { kind: shared } }",
+            "{ dtype: int64, shape: [batch], batch_layout: { kind: shared } }",
         )
         .replace(
-            "patch_lens: { dtype: int64, rank: 2, shape: [batch, max_tiles], batch_layout: { kind: shared } }",
-            "patch_lens: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: shared } }",
+            "patch_lens: { dtype: int64, shape: [batch, max_tiles], batch_layout: { kind: shared } }",
+            "patch_lens: { dtype: int64, shape: [batch], batch_layout: { kind: shared } }",
         );
     assert_reports(
         &document,
@@ -2992,8 +2954,8 @@ fn a_shared_result_that_describes_nothing_is_still_refused() {
     // back to a request, whatever its rank.
     let document = two_padded_dimensions()
         .replace(
-            "      patch_lengths:\n        contract: { dtype: int64, rank: 2, shape: [batch, max_tiles], batch_layout: { kind: shared } }\n        role: tensor\n        stage: pre_adapter\n",
-            "      patch_lengths:\n        contract: { dtype: int64, rank: 2, shape: [batch, max_tiles], batch_layout: { kind: shared } }\n        role: tensor\n        stage: pre_adapter\n      unrelated:\n        contract: { dtype: int64, rank: 2, shape: [batch, max_tiles], batch_layout: { kind: shared } }\n        role: tensor\n        stage: pre_adapter\n",
+            "      patch_lengths:\n        contract: { dtype: int64, shape: [batch, max_tiles], batch_layout: { kind: shared } }\n        role: tensor\n        stage: pre_adapter\n",
+            "      patch_lengths:\n        contract: { dtype: int64, shape: [batch, max_tiles], batch_layout: { kind: shared } }\n        role: tensor\n        stage: pre_adapter\n      unrelated:\n        contract: { dtype: int64, shape: [batch, max_tiles], batch_layout: { kind: shared } }\n        role: tensor\n        stage: pre_adapter\n",
         )
         .replace(
             "      - kind: emit\n        value: patch_lengths\n        output: patch_lengths\n        mode: replace\n",
@@ -3069,7 +3031,7 @@ fn an_emit_length_is_still_the_ordinary_way_to_publish_a_ragged_result() {
             "      - kind: emit\n        value: image_features\n        output: features\n        valid_length: accepted_len\n        mode: replace\n",
         )
         .replace(
-            "      tile_lengths:\n        contract: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: shared } }\n        role: tensor\n        stage: pre_adapter\n",
+            "      tile_lengths:\n        contract: { dtype: int64, shape: [batch], batch_layout: { kind: shared } }\n        role: tensor\n        stage: pre_adapter\n",
             "",
         );
     assert!(

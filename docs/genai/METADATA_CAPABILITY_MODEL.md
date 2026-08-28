@@ -100,7 +100,7 @@ Compact decoder example:
 # Request tensors carry semantic controls; they are not server configuration.
 inputs:
   request.temperature:
-    contract: {dtype: float32, rank: 1, shape: [batch]}
+    contract: {dtype: float32, shape: [batch]}
     role: {kind: runtime, version: "1.0", role: sampling_temperature}
     source: {kind: request}
     required: false

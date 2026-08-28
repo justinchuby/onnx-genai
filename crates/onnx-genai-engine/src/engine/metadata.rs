@@ -392,7 +392,7 @@ pub(crate) fn genai_config_compat_metadata_from_model_path(
     genai_config_path: Option<&Path>,
     model_path: &Path,
 ) -> anyhow::Result<Option<InferenceMetadata>> {
-    let decoder_graph = decoder_graph_info_from_model_path(model_path);
+    let decoder_graph = decoder_graph_info_from_model_path(model_path)?;
     let kv_native_dtype = decoder_graph.as_ref().and_then(|graph| {
         graph
             .inputs
@@ -441,42 +441,59 @@ pub(crate) fn genai_config_compat_metadata_from_model_path(
 }
 
 /// Best-effort decoder graph inventory read straight from an ONNX model file,
-/// mirroring the ORT loader's graph inspection. Returns `None` on any failure so
-/// callers fall back to pattern-expanded metadata. Only the graph interface
-/// (port names, dtypes, shapes) is needed — external weight data is never read.
+/// mirroring the ORT loader's graph inspection. Returns `None` when the model
+/// cannot be loaded so callers fall back to pattern-expanded metadata. An
+/// interface port with unknown rank fails conversion rather than masquerading
+/// as a scalar. Only the graph interface (port names, dtypes, shapes) is needed
+/// — external weight data is never read.
 pub(crate) fn decoder_graph_info_from_model_path(
     model_path: &Path,
-) -> Option<onnx_genai_genai_config::ModelGraphInfo> {
+) -> anyhow::Result<Option<onnx_genai_genai_config::ModelGraphInfo>> {
     use onnx_runtime_ir::Dim;
-    let graph = onnx_runtime_loader::load_model(model_path).ok()?;
-    let tensor_info =
-        |id: &onnx_runtime_ir::ValueId| -> Option<onnx_genai_genai_config::GraphTensorInfo> {
-            let value = graph.value(*id);
-            let name = value.name.clone()?;
-            Some(onnx_genai_genai_config::GraphTensorInfo {
-                name,
-                dtype: ir_dtype_name(value.dtype).to_owned(),
-                dimensions: value
-                    .shape
-                    .iter()
-                    .map(|dim| match dim {
-                        Dim::Static(value) => Some(*value),
-                        Dim::Symbolic(_) => None,
-                    })
-                    .collect(),
-            })
+    let Ok(graph) = onnx_runtime_loader::load_model(model_path) else {
+        return Ok(None);
+    };
+    let tensor_info = |direction: &str,
+                       id: &onnx_runtime_ir::ValueId|
+     -> anyhow::Result<Option<onnx_genai_genai_config::GraphTensorInfo>> {
+        let value = graph.value(*id);
+        let Some(name) = value.name.clone() else {
+            return Ok(None);
         };
+        require_known_graph_port_shape(&graph, *id, model_path, direction, &name)?;
+        Ok(Some(onnx_genai_genai_config::GraphTensorInfo {
+            name,
+            dtype: ir_dtype_name(value.dtype).to_owned(),
+            dimensions: value
+                .shape
+                .iter()
+                .map(|dim| match dim {
+                    Dim::Static(value) => Some(*value),
+                    Dim::Symbolic(_) => None,
+                })
+                .collect(),
+        }))
+    };
     let inputs = graph
         .inputs
         .iter()
-        .map(tensor_info)
-        .collect::<Option<Vec<_>>>()?;
+        .map(|id| tensor_info("input", id))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let Some(inputs) = inputs.into_iter().collect::<Option<Vec<_>>>() else {
+        return Ok(None);
+    };
     let outputs = graph
         .outputs
         .iter()
-        .map(tensor_info)
-        .collect::<Option<Vec<_>>>()?;
-    Some(onnx_genai_genai_config::ModelGraphInfo { inputs, outputs })
+        .map(|id| tensor_info("output", id))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let Some(outputs) = outputs.into_iter().collect::<Option<Vec<_>>>() else {
+        return Ok(None);
+    };
+    Ok(Some(onnx_genai_genai_config::ModelGraphInfo {
+        inputs,
+        outputs,
+    }))
 }
 
 /// Canonical lowercase dtype spelling for an `onnx_runtime_ir` graph dtype.
@@ -653,30 +670,265 @@ pub(crate) fn scan_top_level_control_flow(model_path: &Path) -> Option<bool> {
 /// strictly worse than not converting.
 pub fn graph_port_contracts(
     model_path: &Path,
-) -> Option<std::collections::BTreeMap<String, onnx_genai_metadata::TensorContract>> {
-    let graph = onnx_runtime_loader::load_model(model_path).ok()?;
+) -> anyhow::Result<std::collections::BTreeMap<String, onnx_genai_metadata::TensorContract>> {
+    let graph = onnx_runtime_loader::load_model(model_path).with_context(|| {
+        format!(
+            "Failed to inspect ONNX graph ports in '{}'",
+            model_path.display()
+        )
+    })?;
     let mut contracts = std::collections::BTreeMap::new();
-    for id in graph.inputs.iter().chain(graph.outputs.iter()) {
-        let value = graph.value(*id);
-        let Some(name) = value.name.clone() else {
-            continue;
+    for (direction, ids) in [("input", &graph.inputs), ("output", &graph.outputs)] {
+        for id in ids {
+            let value = graph.value(*id);
+            let Some(name) = value.name.clone() else {
+                continue;
+            };
+            require_known_graph_port_shape(&graph, *id, model_path, direction, &name)?;
+            contracts.insert(
+                name,
+                onnx_genai_metadata::TensorContract {
+                    dtype: ir_dtype_name(value.dtype).to_owned(),
+                    shape: value
+                        .shape
+                        .iter()
+                        .map(|dimension| match dimension {
+                            onnx_runtime_ir::Dim::Static(extent) => {
+                                onnx_genai_metadata::TensorDimension::Fixed(
+                                    i64::try_from(*extent)
+                                        .expect("ONNX dimensions are non-negative signed int64"),
+                                )
+                            }
+                            onnx_runtime_ir::Dim::Symbolic(symbol) => graph
+                                .symbol_constraints
+                                .get(symbol)
+                                .and_then(|constraints| constraints.name.clone())
+                                .map(onnx_genai_metadata::TensorDimension::Symbol)
+                                .unwrap_or(onnx_genai_metadata::TensorDimension::Any),
+                        })
+                        .collect(),
+                    optional: false,
+                    batch_layout: onnx_genai_metadata::BatchLayout::RequestAligned { axis: 0 },
+                    padding: Vec::new(),
+                },
+            );
+        }
+    }
+    Ok(contracts)
+}
+
+fn require_known_graph_port_shape(
+    graph: &onnx_runtime_ir::Graph,
+    id: onnx_runtime_ir::ValueId,
+    model_path: &Path,
+    direction: &str,
+    name: &str,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        graph.value_shape_is_known(id),
+        "Cannot derive portable metadata from ONNX model '{}': graph {direction} port '{name}' \
+         has unknown rank/shape. Portable metadata requires an explicit shape/rank; `shape: []` \
+         is reserved for a known scalar.",
+        model_path.display()
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod graph_port_contract_tests {
+    use super::*;
+    use onnx_runtime_loader::proto::onnx;
+    use prost::Message;
+
+    fn value_info(name: &str, dimensions: Option<&[i64]>) -> onnx::ValueInfoProto {
+        let shape = dimensions.map(|dimensions| onnx::TensorShapeProto {
+            dim: dimensions
+                .iter()
+                .map(|extent| onnx::tensor_shape_proto::Dimension {
+                    value: Some(onnx::tensor_shape_proto::dimension::Value::DimValue(
+                        *extent,
+                    )),
+                    ..Default::default()
+                })
+                .collect(),
+        });
+        onnx::ValueInfoProto {
+            name: name.to_owned(),
+            r#type: Some(onnx::TypeProto {
+                value: Some(onnx::type_proto::Value::TensorType(
+                    onnx::type_proto::Tensor {
+                        elem_type: onnx::tensor_proto::DataType::Float as i32,
+                        shape,
+                    },
+                )),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn identity(input: &str, output: &str) -> onnx::NodeProto {
+        onnx::NodeProto {
+            op_type: "Identity".to_owned(),
+            input: vec![input.to_owned()],
+            output: vec![output.to_owned()],
+            ..Default::default()
+        }
+    }
+
+    fn port_model(unknown_input_shape: bool) -> onnx::ModelProto {
+        let graph = if unknown_input_shape {
+            onnx::GraphProto {
+                name: "unknown_port_shape".to_owned(),
+                input: vec![value_info("unknown_input", None)],
+                output: vec![value_info("known_output", Some(&[1]))],
+                node: vec![identity("unknown_input", "known_output")],
+                ..Default::default()
+            }
+        } else {
+            onnx::GraphProto {
+                name: "known_port_shapes".to_owned(),
+                input: vec![
+                    value_info("scalar_input", Some(&[])),
+                    value_info("matrix_input", Some(&[2, 3])),
+                ],
+                output: vec![
+                    value_info("scalar_output", Some(&[])),
+                    value_info("matrix_output", Some(&[2, 3])),
+                ],
+                node: vec![
+                    identity("scalar_input", "scalar_output"),
+                    identity("matrix_input", "matrix_output"),
+                ],
+                ..Default::default()
+            }
         };
-        let rank = value.shape.len();
-        contracts.insert(
-            name,
-            onnx_genai_metadata::TensorContract {
-                dtype: ir_dtype_name(value.dtype).to_owned(),
-                rank,
-                // The graph's own symbols are its shape; restating them here
-                // would be a second place they could drift.
-                shape: None,
-                optional: false,
-                batch_layout: onnx_genai_metadata::BatchLayout::RequestAligned { axis: 0 },
-                padding: Vec::new(),
-            },
+        onnx::ModelProto {
+            ir_version: 8,
+            opset_import: vec![onnx::OperatorSetIdProto {
+                domain: String::new(),
+                version: 17,
+            }],
+            graph: Some(graph),
+            ..Default::default()
+        }
+    }
+
+    fn with_port_model<T>(
+        file_name: &str,
+        unknown_input_shape: bool,
+        test: impl FnOnce(&Path) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/producer_shape_tests");
+        std::fs::create_dir_all(&directory)?;
+        let path = directory.join(file_name);
+        std::fs::write(&path, port_model(unknown_input_shape).encode_to_vec())?;
+        let result = test(&path);
+        std::fs::remove_file(path)?;
+        result
+    }
+
+    fn assert_unknown_shape_error(message: &str, path: &str) {
+        assert!(message.contains(path), "{message}");
+        assert!(
+            message.contains("graph input port 'unknown_input' has unknown rank/shape"),
+            "{message}"
+        );
+        assert!(
+            message.contains("Portable metadata requires an explicit shape/rank"),
+            "{message}"
+        );
+        assert!(
+            message.contains("`shape: []` is reserved for a known scalar"),
+            "{message}"
         );
     }
-    Some(contracts)
+
+    #[test]
+    fn graph_port_contracts_preserves_known_shapes_and_rejects_unknown_rank() -> anyhow::Result<()>
+    {
+        let contracts = with_port_model("graph_port_contracts_known.onnx", false, |path| {
+            graph_port_contracts(path)
+        })?;
+        assert!(contracts["scalar_input"].shape.is_empty());
+        assert!(contracts["scalar_output"].shape.is_empty());
+        assert_eq!(
+            contracts["matrix_input"].shape,
+            vec![
+                onnx_genai_metadata::TensorDimension::Fixed(2),
+                onnx_genai_metadata::TensorDimension::Fixed(3),
+            ]
+        );
+        assert_eq!(
+            contracts["matrix_output"].shape,
+            vec![
+                onnx_genai_metadata::TensorDimension::Fixed(2),
+                onnx_genai_metadata::TensorDimension::Fixed(3),
+            ]
+        );
+
+        let (path, message) = with_port_model("graph_port_contracts_unknown.onnx", true, |path| {
+            let path = path.display().to_string();
+            let error = graph_port_contracts(Path::new(&path))
+                .expect_err("unknown rank must not become scalar metadata");
+            Ok((path, format!("{error:#}")))
+        })?;
+        assert_unknown_shape_error(&message, &path);
+        Ok(())
+    }
+
+    #[test]
+    fn decoder_graph_info_preserves_known_shapes_and_rejects_unknown_rank() -> anyhow::Result<()> {
+        let graph = with_port_model("decoder_graph_info_known.onnx", false, |path| {
+            decoder_graph_info_from_model_path(path)?
+                .ok_or_else(|| anyhow::anyhow!("known test model must produce graph information"))
+        })?;
+        assert!(
+            graph
+                .inputs
+                .iter()
+                .find(|value| value.name == "scalar_input")
+                .expect("scalar input")
+                .dimensions
+                .is_empty()
+        );
+        assert!(
+            graph
+                .outputs
+                .iter()
+                .find(|value| value.name == "scalar_output")
+                .expect("scalar output")
+                .dimensions
+                .is_empty()
+        );
+        assert_eq!(
+            graph
+                .inputs
+                .iter()
+                .find(|value| value.name == "matrix_input")
+                .expect("matrix input")
+                .dimensions,
+            vec![Some(2), Some(3)]
+        );
+        assert_eq!(
+            graph
+                .outputs
+                .iter()
+                .find(|value| value.name == "matrix_output")
+                .expect("matrix output")
+                .dimensions,
+            vec![Some(2), Some(3)]
+        );
+
+        let (path, message) = with_port_model("decoder_graph_info_unknown.onnx", true, |path| {
+            let path = path.display().to_string();
+            let error = decoder_graph_info_from_model_path(Path::new(&path))
+                .expect_err("unknown rank must not become scalar graph information");
+            Ok((path, format!("{error:#}")))
+        })?;
+        assert_unknown_shape_error(&message, &path);
+        Ok(())
+    }
 }
 
 #[cfg(test)]

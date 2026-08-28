@@ -17,7 +17,6 @@ pipeline:
       request.active:
         contract:
           dtype: bool
-          rank: 1
           shape: [batch]
           batch_layout: {kind: request_aligned, axis: 0}
         role: {kind: opaque}
@@ -26,7 +25,6 @@ pipeline:
       request.done:
         contract:
           dtype: bool
-          rank: 1
           shape: [batch]
           batch_layout: {kind: request_aligned, axis: 0}
         role: {kind: opaque}
@@ -35,7 +33,6 @@ pipeline:
       request.accepted_len:
         contract:
           dtype: int64
-          rank: 1
           shape: [batch]
           batch_layout: {kind: request_aligned, axis: 0}
         role: {kind: opaque}
@@ -44,7 +41,6 @@ pipeline:
       request.input_ids:
         contract:
           dtype: int64
-          rank: 2
           shape: [batch, sequence]
           batch_layout: {kind: request_aligned, axis: 0}
         role: {kind: runtime, version: '1.0', role: prompt_tokens}
@@ -53,7 +49,6 @@ pipeline:
       request.attention_key:
         contract:
           dtype: float16
-          rank: 4
           shape: [batch, kv_heads, sequence, head_dim]
           batch_layout: {kind: request_aligned, axis: 0}
         role: {kind: opaque}
@@ -62,7 +57,6 @@ pipeline:
       request.attention_value:
         contract:
           dtype: float16
-          rank: 4
           shape: [batch, kv_heads, sequence, head_dim]
           batch_layout: {kind: request_aligned, axis: 0}
         role: {kind: opaque}
@@ -71,7 +65,6 @@ pipeline:
       request.linear_accumulator:
         contract:
           dtype: float32
-          rank: 4
           shape: [batch, linear_heads, key_feature, value_feature]
           batch_layout: {kind: request_aligned, axis: 0}
         role: {kind: opaque}
@@ -80,7 +73,6 @@ pipeline:
       request.causal_conv_history:
         contract:
           dtype: float16
-          rank: 3
           shape: [batch, channels, kernel_history]
           batch_layout: {kind: request_aligned, axis: 0}
         role: {kind: opaque}
@@ -90,7 +82,6 @@ pipeline:
       target_logits:
         contract:
           dtype: float16
-          rank: 3
           shape: [batch, proposal, vocab]
           batch_layout: {kind: request_aligned, axis: 0}
         role: tensor
@@ -104,13 +95,11 @@ pipeline:
           inputs:
             input_ids:
               dtype: int64
-              rank: 2
               shape: [batch, sequence]
               batch_layout: {kind: request_aligned, axis: 0}
           outputs:
             draft_tokens:
               dtype: int64
-              rank: 2
               shape: [batch, proposal]
               batch_layout: {kind: request_aligned, axis: 0}
           roles:
@@ -123,53 +112,43 @@ pipeline:
           inputs:
             input_ids:
               dtype: int64
-              rank: 2
               shape: [batch, proposal]
               batch_layout: {kind: request_aligned, axis: 0}
             past_key:
               dtype: float16
-              rank: 4
               shape: [batch, kv_heads, sequence, head_dim]
               batch_layout: {kind: request_aligned, axis: 0}
             past_value:
               dtype: float16
-              rank: 4
               shape: [batch, kv_heads, sequence, head_dim]
               batch_layout: {kind: request_aligned, axis: 0}
             linear_state:
               dtype: float32
-              rank: 4
               shape: [batch, linear_heads, key_feature, value_feature]
               batch_layout: {kind: request_aligned, axis: 0}
             conv_state:
               dtype: float16
-              rank: 3
               shape: [batch, channels, kernel_history]
               batch_layout: {kind: request_aligned, axis: 0}
           outputs:
             logits:
               dtype: float16
-              rank: 3
               shape: [batch, proposal, vocab]
               batch_layout: {kind: request_aligned, axis: 0}
             present_key:
               dtype: float16
-              rank: 4
               shape: [batch, kv_heads, sequence, head_dim]
               batch_layout: {kind: request_aligned, axis: 0}
             present_value:
               dtype: float16
-              rank: 4
               shape: [batch, kv_heads, sequence, head_dim]
               batch_layout: {kind: request_aligned, axis: 0}
             next_linear_state:
               dtype: float32
-              rank: 4
               shape: [batch, linear_heads, key_feature, value_feature]
               batch_layout: {kind: request_aligned, axis: 0}
             next_conv_state:
               dtype: float16
-              rank: 3
               shape: [batch, channels, kernel_history]
               batch_layout: {kind: request_aligned, axis: 0}
           roles:
@@ -179,7 +158,6 @@ pipeline:
       attention_key:
         contract:
           dtype: float16
-          rank: 4
           shape: [batch, kv_heads, sequence, head_dim]
           batch_layout: {kind: request_aligned, axis: 0}
         scope: invocation
@@ -191,7 +169,6 @@ pipeline:
       attention_value:
         contract:
           dtype: float16
-          rank: 4
           shape: [batch, kv_heads, sequence, head_dim]
           batch_layout: {kind: request_aligned, axis: 0}
         scope: invocation
@@ -203,7 +180,6 @@ pipeline:
       linear_accumulator:
         contract:
           dtype: float32
-          rank: 4
           shape: [batch, linear_heads, key_feature, value_feature]
           batch_layout: {kind: request_aligned, axis: 0}
         scope: invocation
@@ -215,7 +191,6 @@ pipeline:
       causal_conv_history:
         contract:
           dtype: float16
-          rank: 3
           shape: [batch, channels, kernel_history]
           batch_layout: {kind: request_aligned, axis: 0}
         scope: invocation

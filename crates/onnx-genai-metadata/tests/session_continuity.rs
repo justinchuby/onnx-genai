@@ -18,19 +18,19 @@ pipeline:
       capabilities: [workflow_ssa, typed_emit, {manifest}]
     inputs:
       request.input_ids:
-        contract: {{ dtype: int64, rank: 2, shape: [batch, sequence], batch_layout: {{ kind: request_aligned, axis: 0 }} }}
+        contract: {{ dtype: int64, shape: [batch, sequence], batch_layout: {{ kind: request_aligned, axis: 0 }} }}
         role: {{ kind: runtime, version: '1.0', role: prompt_tokens }}
         source: {{ kind: request }}
         required: true
       package.max_context:
-        contract: {{ dtype: int64, rank: 1, shape: [1] }}
+        contract: {{ dtype: int64, shape: [1] }}
         role: {{ kind: opaque }}
         source: {{ kind: literal }}
         required: false
         default: 64
     outputs:
       tokens:
-        contract: {{ dtype: int64, rank: 2, shape: [batch, generated], batch_layout: {{ kind: request_aligned, axis: 0 }} }}
+        contract: {{ dtype: int64, shape: [batch, generated], batch_layout: {{ kind: request_aligned, axis: 0 }} }}
         role: tokens
         stage: pre_adapter
     components:
@@ -38,9 +38,9 @@ pipeline:
         implementation: {{ kind: onnx, artifact: model.onnx }}
         ports:
           inputs:
-            input_ids: {{ dtype: int64, rank: 2, shape: [batch, sequence], batch_layout: {{ kind: request_aligned, axis: 0 }} }}
+            input_ids: {{ dtype: int64, shape: [batch, sequence], batch_layout: {{ kind: request_aligned, axis: 0 }} }}
           outputs:
-            next_tokens: {{ dtype: int64, rank: 2, shape: [batch, generated], batch_layout: {{ kind: request_aligned, axis: 0 }} }}
+            next_tokens: {{ dtype: int64, shape: [batch, generated], batch_layout: {{ kind: request_aligned, axis: 0 }} }}
           roles:
             input_ids: token_ids
     state:
@@ -88,7 +88,7 @@ fn conversation_cell(overrides: &[(&str, &str)]) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        "      conversation:\n        contract: {{ dtype: int64, rank: 2, shape: [batch, \
+        "      conversation:\n        contract: {{ dtype: int64, shape: [batch, \
          conversation_length], batch_layout: {{ kind: request_aligned, axis: 0 }} }}\n{body}\n"
     )
 }
@@ -297,7 +297,7 @@ fn a_continuation_must_be_runtime_managed() {
 #[test]
 fn a_continuation_cannot_also_be_loop_carried() {
     const LOOPING_INPUT: &str = r#"      package.looping:
-        contract: { dtype: bool, rank: 1, shape: [1] }
+        contract: { dtype: bool, shape: [1] }
         role: { kind: opaque }
         source: { kind: literal }
         required: false
@@ -359,8 +359,8 @@ fn a_continuation_contract_must_match_the_prompt_it_prefixes() {
         "session_state_lease, bounded_state_recurrence",
     )
     .replace(
-        "conversation:\n        contract: { dtype: int64, rank: 2",
-        "conversation:\n        contract: { dtype: int32, rank: 2",
+        "conversation:\n        contract: { dtype: int64, shape:",
+        "conversation:\n        contract: { dtype: int32, shape:",
     );
     rejects(&wrong_dtype, "same kind of tensor as what it prefixes");
 
@@ -372,9 +372,9 @@ fn a_continuation_contract_must_match_the_prompt_it_prefixes() {
         "session_state_lease, bounded_state_recurrence",
     )
     .replace(
-        "conversation:\n        contract: { dtype: int64, rank: 2, shape: [batch, \
+        "conversation:\n        contract: { dtype: int64, shape: [batch, \
          conversation_length]",
-        "conversation:\n        contract: { dtype: int64, rank: 1, shape: [conversation_length]",
+        "conversation:\n        contract: { dtype: int64, shape: [conversation_length]",
     );
     rejects(&wrong_rank, "same kind of tensor as what it prefixes");
 }
@@ -388,8 +388,8 @@ fn a_continuation_output_dtype_must_match_the_cell() {
         "session_state_lease, bounded_state_recurrence",
     )
     .replace(
-        "      tokens:\n        contract: { dtype: int64, rank: 2, shape: [batch, generated]",
-        "      tokens:\n        contract: { dtype: int32, rank: 2, shape: [batch, generated]",
+        "      tokens:\n        contract: { dtype: int64, shape: [batch, generated]",
+        "      tokens:\n        contract: { dtype: int32, shape: [batch, generated]",
     );
     rejects(&wrong, "publishes");
 }
@@ -398,19 +398,19 @@ fn a_continuation_output_dtype_must_match_the_cell() {
 #[test]
 fn a_session_cell_whose_group_has_no_alias_for_it_is_refused() {
     const SERVING_INPUTS: &str = r#"      package.active_rows:
-        contract: { dtype: bool, rank: 1, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: bool, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: opaque }
         source: { kind: literal }
         required: false
         default: true
       package.done_rows:
-        contract: { dtype: bool, rank: 1, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: bool, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: opaque }
         source: { kind: literal }
         required: false
         default: false
       package.accepted:
-        contract: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: int64, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: opaque }
         source: { kind: literal }
         required: false

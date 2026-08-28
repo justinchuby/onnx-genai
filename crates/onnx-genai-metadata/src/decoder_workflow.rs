@@ -1338,13 +1338,11 @@ fn layout_name(abi: &DecoderAbi) -> String {
     }
 }
 
-fn dims(names: &[&str]) -> Option<Vec<crate::schema::TensorDimension>> {
-    Some(
-        names
-            .iter()
-            .map(|name| crate::schema::TensorDimension::Symbol(name.to_string()))
-            .collect(),
-    )
+fn dims(names: &[&str]) -> Vec<crate::schema::TensorDimension> {
+    names
+        .iter()
+        .map(|name| crate::schema::TensorDimension::Symbol(name.to_string()))
+        .collect()
 }
 
 fn request_aligned() -> BatchLayout {
@@ -1354,7 +1352,6 @@ fn request_aligned() -> BatchLayout {
 fn token_contract() -> TensorContract {
     TensorContract {
         dtype: "int64".to_string(),
-        rank: 2,
         shape: dims(&["batch", "sequence"]),
         optional: false,
         batch_layout: request_aligned(),
@@ -1365,7 +1362,6 @@ fn token_contract() -> TensorContract {
 fn mask_contract() -> TensorContract {
     TensorContract {
         dtype: "int64".to_string(),
-        rank: 2,
         shape: dims(&["batch", "kv_sequence"]),
         optional: false,
         batch_layout: request_aligned(),
@@ -1376,7 +1372,6 @@ fn mask_contract() -> TensorContract {
 fn logits_contract() -> TensorContract {
     TensorContract {
         dtype: "float32".to_string(),
-        rank: 3,
         shape: dims(&["batch", "sequence", "vocabulary"]),
         optional: false,
         batch_layout: request_aligned(),
@@ -1387,7 +1382,6 @@ fn logits_contract() -> TensorContract {
 fn hidden_contract() -> TensorContract {
     TensorContract {
         dtype: "float32".to_string(),
-        rank: 3,
         shape: dims(&["batch", "sequence", "hidden"]),
         optional: false,
         batch_layout: request_aligned(),
@@ -1398,7 +1392,6 @@ fn hidden_contract() -> TensorContract {
 fn state_contract() -> TensorContract {
     TensorContract {
         dtype: "float32".to_string(),
-        rank: 4,
         shape: dims(&["batch", "kv_heads", "kv_sequence", "head_dim"]),
         optional: false,
         batch_layout: request_aligned(),
@@ -1409,7 +1402,6 @@ fn state_contract() -> TensorContract {
 fn lengths_contract() -> TensorContract {
     TensorContract {
         dtype: "int64".to_string(),
-        rank: 1,
         shape: dims(&["batch"]),
         optional: false,
         batch_layout: request_aligned(),
@@ -1420,7 +1412,6 @@ fn lengths_contract() -> TensorContract {
 fn flag_contract() -> TensorContract {
     TensorContract {
         dtype: "bool".to_string(),
-        rank: 1,
         shape: dims(&["batch"]),
         optional: false,
         batch_layout: request_aligned(),
@@ -1431,8 +1422,7 @@ fn flag_contract() -> TensorContract {
 fn scalar_contract() -> TensorContract {
     TensorContract {
         dtype: "int64".to_string(),
-        rank: 1,
-        shape: Some(vec![crate::schema::TensorDimension::Fixed(1)]),
+        shape: vec![crate::schema::TensorDimension::Fixed(1)],
         optional: false,
         batch_layout: BatchLayout::Shared,
         padding: Vec::new(),

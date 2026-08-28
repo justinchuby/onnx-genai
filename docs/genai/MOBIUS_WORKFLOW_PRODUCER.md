@@ -93,7 +93,7 @@ Serialized metadata uses logical names and concise carries:
 ```yaml
 state:
   cache:
-    contract: { dtype: float16, rank: 4, shape: [batch, heads, cache_sequence, width] }
+    contract: { dtype: float16, shape: [batch, heads, cache_sequence, width] }
     scope: invocation
     initializer: cache.initial
     recurrence: { kind: bounded, axis: 2, max: max_context }
@@ -408,7 +408,7 @@ steps:
     max_iterations: request.max_iterations
     iteration:
       value: loop.iteration
-      contract: { dtype: int64, rank: 1, shape: [batch] }
+      contract: { dtype: int64, shape: [batch] }
     carried:
       - { cell: latent_state, next: latent.body }
       - { cell: history, next: history.body }

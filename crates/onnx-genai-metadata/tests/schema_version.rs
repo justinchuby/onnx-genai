@@ -36,19 +36,18 @@ pipeline:
       pixel_values:
         contract:
           dtype: float32
-          rank: 3
           shape: [batch, tiles, hidden]
           batch_layout: { kind: request_aligned, axis: 0 }
           padding: [{ dimension: tiles, valid_lengths: tile_lengths }]
         role: { kind: opaque }
         source: { kind: application, name: pixel_values }
       tile_lengths:
-        contract: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: shared } }
+        contract: { dtype: int64, shape: [batch], batch_layout: { kind: shared } }
         role: { kind: opaque }
         source: { kind: application, name: tile_lengths }
     outputs:
       tokens:
-        contract: { dtype: int64, rank: 2, shape: [batch, generated], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: int64, shape: [batch, generated], batch_layout: { kind: request_aligned, axis: 0 } }
         role: tokens
         stage: pre_adapter
     components:
@@ -58,13 +57,12 @@ pipeline:
           inputs:
             pixels:
               dtype: float32
-              rank: 3
               shape: [batch, tiles, hidden]
               batch_layout: { kind: request_aligned, axis: 0 }
               padding: [{ dimension: tiles, valid_lengths: lengths }]
-            lengths: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: shared } }
+            lengths: { dtype: int64, shape: [batch], batch_layout: { kind: shared } }
           outputs:
-            token: { dtype: int64, rank: 2, shape: [batch, generated], batch_layout: { kind: request_aligned, axis: 0 } }
+            token: { dtype: int64, shape: [batch, generated], batch_layout: { kind: request_aligned, axis: 0 } }
     steps:
       - kind: invoke
         component: vision
