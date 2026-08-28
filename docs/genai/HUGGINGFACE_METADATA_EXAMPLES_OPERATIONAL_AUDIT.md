@@ -186,7 +186,8 @@ report did not run generation. The verified hosted instructions are fixed at
 the Qwen model card's
 [README correction revision](https://huggingface.co/justinchuby/qwen2.5-0.5b-instruct-onnx-genai/commit/e5cc13d7232bfe2b49a9df4ef13ce60714170106).
 The CLI takes a downloaded local package directory after `generate` and the
-prompt as its final positional argument. `--prompt` (and `-p`) is obsolete.
+prompt canonically as its final positional argument. `--prompt` is also
+supported; supply exactly one prompt, not both forms. `-p` is not supported.
 For this Qwen package's ChatML template, omit `--raw` for unformatted prompts;
 use `--raw` only when the caller has already formatted this package's complete
 request as ChatML. Raw formatted text bypasses this package's template and its
