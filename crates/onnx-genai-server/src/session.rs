@@ -5,7 +5,7 @@ use std::{
 };
 
 use anyhow::Context;
-use onnx_genai_engine::PackageCapabilityError;
+use onnx_genai_engine::PackageExecutionError;
 
 use crate::lease::{ModelSessionPlacement, SessionLeaseGuard, SessionLeases};
 
@@ -124,7 +124,7 @@ pub(crate) enum SessionCloseError {
     /// A turn is in flight on this session. Closing it would destroy the state
     /// that turn is writing, so the close is refused with the same conflict an
     /// overlapping turn gets.
-    Busy(PackageCapabilityError),
+    Busy(PackageExecutionError),
 }
 
 impl fmt::Display for SessionCloseError {
@@ -214,7 +214,7 @@ impl SessionRegistry {
         &self,
         binding: ModelSessionPlacement,
         client_id: &str,
-    ) -> Result<SessionLeaseGuard, PackageCapabilityError> {
+    ) -> Result<SessionLeaseGuard, PackageExecutionError> {
         self.leases.acquire(binding, client_id)
     }
 
@@ -600,7 +600,7 @@ mod tests {
         let refused = registry.take_for_close("sess-a").expect_err("busy");
         assert!(matches!(
             refused,
-            SessionCloseError::Busy(PackageCapabilityError::ExclusiveLeaseConflict { ref session })
+            SessionCloseError::Busy(PackageExecutionError::ExclusiveLeaseConflict { ref session })
                 if session == "sess-a"
         ));
         assert_eq!(

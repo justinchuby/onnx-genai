@@ -404,8 +404,12 @@ mod tests {
             error.contains("fixtures/inference_metadata.yaml"),
             "{error}"
         );
-        assert!(error.contains("\"unknown\""), "{error}");
-        assert!(error.contains("\"v9\""), "{error}");
+        assert!(error.contains("'unknown@v9'"), "{error}");
+        assert!(error.contains("not registered"), "{error}");
+        assert!(
+            error.contains("do not add required_capabilities"),
+            "{error}"
+        );
     }
 
     #[test]

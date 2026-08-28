@@ -2160,7 +2160,7 @@ impl Engine {
                 // package cannot do, or whether the server failed. Matching on
                 // prose would make that a guess, and it was being reported as a
                 // 500 for a package that is simply stateless.
-                return Err(PackageCapabilityError::NoSessionState.into());
+                return Err(PackageExecutionError::NoSessionState.into());
             }
             let id = self.workflow_session_ids.mint();
             self.workflow_sessions.insert(id, 0);
@@ -4106,8 +4106,8 @@ mod tests {
             .expect_err("a package publishing tokens with no session state cannot hold a session");
 
         assert_eq!(
-            crate::engine::package_capability_error(&error),
-            Some(PackageCapabilityError::NoSessionState),
+            crate::engine::package_execution_error(&error),
+            Some(PackageExecutionError::NoSessionState),
             "the refusal must be the typed one a front end reads for its status code, \
              not prose that happens to say something similar: {error}"
         );

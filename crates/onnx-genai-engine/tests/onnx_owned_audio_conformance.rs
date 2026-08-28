@@ -12,6 +12,7 @@
 //! `audio` output's `media` contract; nothing keys off a model family.
 
 use onnx_genai_engine::{Engine, EngineConfig};
+use onnx_genai_metadata::{WorkflowStep, parse_metadata};
 use std::path::PathBuf;
 
 #[path = "common/hermetic_workflows.rs"]
@@ -21,6 +22,23 @@ fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/onnx_genai_workflows")
         .join(name)
+}
+
+fn contains_nested_loop(steps: &[WorkflowStep], inside_loop: bool) -> bool {
+    steps.iter().any(|step| match step {
+        WorkflowStep::Loop { setup, steps, .. } => {
+            inside_loop || contains_nested_loop(setup, true) || contains_nested_loop(steps, true)
+        }
+        WorkflowStep::Branch { cases, default, .. } => {
+            cases
+                .values()
+                .any(|case| contains_nested_loop(std::slice::from_ref(case), inside_loop))
+                || default.as_ref().is_some_and(|default| {
+                    contains_nested_loop(std::slice::from_ref(default.as_ref()), inside_loop)
+                })
+        }
+        _ => false,
+    })
 }
 
 /// Read a little-endian `u16` from a canonical PCM WAV header offset.
@@ -96,14 +114,16 @@ fn onnx_owned_speech_workflow_encodes_buffered_pcm16_wav() -> anyhow::Result<()>
 #[test]
 fn onnx_owned_nested_audio_workflow_executes_nested_generation() -> anyhow::Result<()> {
     let package = fixture("tts");
-    let metadata = std::fs::read_to_string(package.join("inference_metadata.yaml"))?;
+    let metadata_source = std::fs::read_to_string(package.join("inference_metadata.yaml"))?;
+    let metadata = parse_metadata(&metadata_source, Some("yaml"))?;
+    let workflow = &metadata
+        .pipeline
+        .as_ref()
+        .expect("TTS fixture declares a workflow")
+        .workflow;
     assert!(
-        metadata.contains("nested_control_flow"),
-        "the nested-audio package must declare nested control flow"
-    );
-    assert!(
-        metadata.contains("kind: loop"),
-        "the nested-audio package must drive a generation loop"
+        contains_nested_loop(&workflow.steps, false),
+        "the nested-audio package must structurally contain a nested generation loop"
     );
 
     let mut engine = Engine::from_dir(&package, EngineConfig::default())?;

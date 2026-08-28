@@ -921,7 +921,7 @@ impl WorkflowRuntime {
         self.require_execution_admitted()?;
         if self.is_candidate_tree() {
             return Err(
-                crate::engine::PackageCapabilityError::CandidateTreeRawWorkflowApi {
+                crate::engine::PackageExecutionError::CandidateTreeRawWorkflowApi {
                     operation: operation.to_string(),
                 }
                 .into(),
@@ -4978,8 +4978,7 @@ mod tests {
     use super::*;
 
     const WORKFLOW: &str = r#"
-manifest:
-  capabilities: [workflow_ssa, typed_emit]
+manifest: {}
 inputs: {}
 outputs: {}
 components:

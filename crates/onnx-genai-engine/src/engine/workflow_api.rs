@@ -597,7 +597,6 @@ mod tests {
         let mut runtime = crate::pipeline::generation::test_decoder_runtime()?;
         runtime.set_execution_admission_for_test(WorkflowExecutionAdmission::DFlashUnavailable {
             version: "1".to_string(),
-            capability: onnx_genai_metadata::capabilities::DFLASH_FLAT_BLOCK,
         });
         let governor = crate::engine::EngineResourceGovernor::new(
             ResourceLimits::default(),
@@ -616,14 +615,12 @@ mod tests {
 
     fn assert_dflash_refusal(error: anyhow::Error) {
         let capability =
-            crate::engine::package_capability_error(&error).expect("refusal stays typed");
+            crate::engine::package_execution_error(&error).expect("refusal stays typed");
         assert!(matches!(
             capability,
-            crate::engine::PackageCapabilityError::DFlashExecutionUnavailable {
+            crate::engine::PackageExecutionError::DFlashExecutionUnavailable {
                 ref version,
-                ref capability,
             } if version == "1"
-                && capability == onnx_genai_metadata::capabilities::DFLASH_FLAT_BLOCK
         ));
     }
 

@@ -2,7 +2,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::capabilities as capability;
+use crate::extensions::{
+    ADAPTERS_HF_PEFT_V1, ADAPTERS_JSON_V1, ADAPTERS_SAFETENSORS_V1, ADAPTERS_V1,
+    DFLASH_FLAT_BLOCK_V1, DFLASH_FLAT_BLOCK_V2, ExtensionConsumerSupport, ExtensionSurface,
+    GRAMMAR_GUIDANCE_V1, ORT_LORA_ADAPTER_V1, PARAMETER_OVERLAY_V1, SPECULATIVE_V1, TELEMETRY_V1,
+    TOKEN_CONTEXT_V1, admit_exact,
+};
 use crate::schema::{InferenceMetadata, PipelineSpec, WorkflowNode, WorkflowSpec, WorkflowStep};
 
 struct ContractObligation {
@@ -15,15 +20,15 @@ struct ContractObligation {
 
 const CONTRACT_OBLIGATIONS: &[ContractObligation] = &[
     ContractObligation {
-        id: "onnx-genai.grammar-guidance",
-        version: "1",
+        id: GRAMMAR_GUIDANCE_V1.identity,
+        version: GRAMMAR_GUIDANCE_V1.version,
         action: "clone",
         inputs: &["state"],
         outputs: &["next_state"],
     },
     ContractObligation {
-        id: "onnx-genai.grammar-guidance",
-        version: "1",
+        id: GRAMMAR_GUIDANCE_V1.identity,
+        version: GRAMMAR_GUIDANCE_V1.version,
         action: "lookahead",
         inputs: &["state", "tokens", "valid_length", "transition_table"],
         outputs: &[
@@ -35,320 +40,43 @@ const CONTRACT_OBLIGATIONS: &[ContractObligation] = &[
         ],
     },
     ContractObligation {
-        id: "onnx-genai.grammar-guidance",
-        version: "1",
+        id: GRAMMAR_GUIDANCE_V1.identity,
+        version: GRAMMAR_GUIDANCE_V1.version,
         action: "commit",
         inputs: &["state", "tokens", "valid_length", "transition_table"],
         outputs: &["next_state", "consumed_length"],
     },
     ContractObligation {
-        id: "onnx-genai.telemetry",
-        version: "1",
+        id: TELEMETRY_V1.identity,
+        version: TELEMETRY_V1.version,
         action: "start",
         inputs: &[],
         outputs: &["timestamp"],
     },
     ContractObligation {
-        id: "onnx-genai.telemetry",
-        version: "1",
+        id: TELEMETRY_V1.identity,
+        version: TELEMETRY_V1.version,
         action: "elapsed",
         inputs: &["timestamp"],
         outputs: &["duration_ms"],
     },
     ContractObligation {
-        id: "onnx-genai.parameter-overlay",
-        version: "1",
+        id: PARAMETER_OVERLAY_V1.identity,
+        version: PARAMETER_OVERLAY_V1.version,
         action: "apply",
         inputs: &["input"],
         outputs: &["output"],
     },
 ];
 
-const RETIRED_CONTINUOUS_BATCHING_CAPABILITY: &str = "continuous_batching";
-
-/// Capabilities this runtime supports.
-pub struct RuntimeCapabilities {
-    pub supported: Vec<String>,
-}
-
-impl Default for RuntimeCapabilities {
-    fn default() -> Self {
-        Self {
-            supported: vec![
-                capability::KV_CACHE.to_string(),
-                capability::GROUPED_QUERY_ATTENTION.to_string(),
-                capability::MULTI_HEAD_ATTENTION.to_string(),
-                capability::PREFIX_CACHE.to_string(),
-                capability::CONTROL_FLOW_LOOP.to_string(),
-                // Structural workflow capabilities. Every package now declares
-                // its execution as a workflow, including a single decoder, so a
-                // runtime that executes workflows implements these by
-                // definition. Listing them is what keeps the "declares a
-                // capability I do not implement" warning meaningful instead of
-                // firing on every load until operators learn to ignore it.
-                capability::WORKFLOW_SSA.to_string(),
-                capability::LINEAR_EFFECTS.to_string(),
-                capability::SERVING_SERVICE_CONTRACT.to_string(),
-                capability::NESTED_CONTROL_FLOW.to_string(),
-                capability::LOOP_INDUCTION_VALUES.to_string(),
-                capability::TYPED_EMIT.to_string(),
-                capability::TOKEN_CONTEXT.to_string(),
-                capability::CANONICAL_SPECULATION.to_string(),
-                capability::DFLASH_FLAT_BLOCK.to_string(),
-            ],
-        }
-    }
-}
-
-/// Validate the metadata document and required runtime capabilities.
+/// Validate the metadata document's core schema and typed semantic invariants.
 ///
-/// Reports structural defects and unsupported capabilities together. Canonical
-/// metadata is an execution contract: callers must reject unsupported required
-/// behavior rather than silently selecting a narrower legacy execution path.
-pub fn validate(
-    metadata: &InferenceMetadata,
-    runtime: &RuntimeCapabilities,
-) -> Result<(), Vec<String>> {
-    let report = validate_structure_and_capabilities(metadata, runtime);
-    let mut errors = report.structural;
-    errors.extend(report.unsupported_capabilities);
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(errors)
-    }
-}
-
-/// Structural defects and unsupported capabilities, kept apart.
-///
-/// These answer different questions while remaining equally fatal at package
-/// admission. Keeping them separate lets loaders report whether the package is
-/// malformed or the runtime lacks behavior the package requires.
-#[derive(Debug, Default, Clone)]
-pub struct CapabilityReport {
-    /// The document is malformed or self-inconsistent. Always fatal.
-    pub structural: Vec<String>,
-    /// Capabilities the package declares that this runtime does not implement.
-    pub unsupported_capabilities: Vec<String>,
-}
-
-/// Validate the document, reporting structural defects separately from
-/// capabilities this runtime does not implement.
-pub fn validate_structure_and_capabilities(
-    metadata: &InferenceMetadata,
-    runtime: &RuntimeCapabilities,
-) -> CapabilityReport {
-    let structural = validate_metadata(metadata).err().unwrap_or_default();
-    let required = metadata
-        .required_capabilities
-        .iter()
-        .cloned()
-        .chain(derived_capabilities(metadata))
-        .collect::<BTreeSet<_>>();
-    let unsupported_capabilities = required
-        .into_iter()
-        .filter(|capability| !runtime.supported.contains(capability))
-        .collect();
-    CapabilityReport {
-        structural,
-        unsupported_capabilities,
-    }
-}
-
-fn metadata_only_required_capabilities(metadata: &InferenceMetadata) -> BTreeSet<String> {
-    let mut capabilities = BTreeSet::new();
-    if metadata.adapters.is_some() {
-        capabilities.insert(capability::PARAMETER_ADAPTERS.to_string());
-        capabilities.insert(capability::HETEROGENEOUS_ADAPTER_BATCHING.to_string());
-    }
-    if metadata.speculative.is_some() {
-        capabilities.insert(capability::CANONICAL_SPECULATION.to_string());
-    }
-    capabilities
-}
-
-fn workflow_required_capabilities(
-    workflow: &WorkflowSpec,
-    compiled: Option<&WorkflowNode>,
-) -> BTreeSet<String> {
-    let mut capabilities = BTreeSet::new();
-    capabilities.insert(capability::WORKFLOW_SSA.to_string());
-    if workflow.serving.is_some() {
-        capabilities.insert(capability::SERVING_SERVICE_CONTRACT.to_string());
-    }
-    if workflow
-        .state
-        .values()
-        .any(|state| state.scope == crate::schema::WorkflowStateScope::Session)
-    {
-        capabilities.insert(capability::SESSION_STATE_LEASE.to_string());
-    }
-    if workflow.state.values().any(|state| {
-        matches!(
-            state.recurrence,
-            crate::schema::ShapeRecurrence::Bounded { .. }
-        )
-    }) {
-        capabilities.insert(capability::BOUNDED_STATE_RECURRENCE.to_string());
-    }
-    if workflow
-        .state
-        .values()
-        .any(|state| state.class == crate::schema::WorkflowStateClass::Advisory)
-    {
-        capabilities.insert(capability::ADVISORY_STATE.to_string());
-    }
-    if workflow
-        .inputs
-        .values()
-        .any(|input| input.present_as.is_some())
-    {
-        capabilities.insert(capability::INPUT_PRESENCE.to_string());
-    }
-    if workflow.inputs.values().any(|input| {
-        matches!(
-            &input.role,
-            crate::schema::SemanticInputRole::Runtime {
-                role: crate::schema::RuntimeInputRole::AdapterSegments
-                    | crate::schema::RuntimeInputRole::AdapterCounts
-                    | crate::schema::RuntimeInputRole::AdapterScales
-                    | crate::schema::RuntimeInputRole::AdapterActive,
-                ..
-            }
-        )
-    }) {
-        capabilities.insert(capability::HETEROGENEOUS_ADAPTER_BATCHING.to_string());
-    }
-    if !workflow.effects.is_empty()
-        || workflow
-            .components
-            .values()
-            .any(|component| !component.effects.is_empty())
-    {
-        capabilities.insert(capability::LINEAR_EFFECTS.to_string());
-    }
-    for component in workflow.components.values() {
-        let contract_id = component
-            .contract
-            .as_ref()
-            .map(|contract| contract.id.as_str());
-        let adapter_abi = match &component.implementation {
-            crate::schema::ComponentImplementation::Adapter { abi, .. } => Some(abi.as_str()),
-            _ => None,
-        };
-        for identifier in contract_id.into_iter().chain(adapter_abi) {
-            match identifier {
-                "onnx-genai.adaptive-proposal-budget" => {
-                    capabilities.insert(capability::ADAPTIVE_PROPOSAL_BUDGET.to_string());
-                }
-                "onnx-genai.grammar-guidance" => {
-                    capabilities.insert(capability::GRAMMAR_GUIDANCE_ADAPTER.to_string());
-                }
-                "onnx-genai.telemetry" => {
-                    capabilities.insert(capability::TELEMETRY_ADAPTER.to_string());
-                }
-                "onnx-genai.parameter-overlay" => {
-                    capabilities.insert(capability::PARAMETER_ADAPTERS.to_string());
-                }
-                "onnx-genai.token-context" => {
-                    capabilities.insert(capability::TOKEN_CONTEXT.to_string());
-                }
-                _ => {}
-            }
-        }
-    }
-    if let Some(compiled) = compiled {
-        collect_workflow_capabilities(compiled, &mut capabilities);
-    }
-    capabilities
-}
-
-fn metadata_required_capabilities(metadata: &InferenceMetadata) -> BTreeSet<String> {
-    let mut capabilities = metadata_only_required_capabilities(metadata);
-    if let Some(pipeline) = &metadata.pipeline {
-        let compiled = crate::compile_workflow(&pipeline.workflow).ok();
-        capabilities.extend(workflow_required_capabilities(
-            &pipeline.workflow,
-            compiled.as_ref().map(|compiled| &compiled.graph),
-        ));
-    }
-    capabilities
-}
-
-/// Capabilities implied by concrete metadata features.
-pub fn derived_capabilities(metadata: &InferenceMetadata) -> BTreeSet<String> {
-    let mut capabilities = metadata_required_capabilities(metadata);
-    if metadata.speculative.as_ref().is_some_and(|speculative| {
-        matches!(
-            &speculative.proposal_execution,
-            crate::schema::SpeculativeProposalExecution::DflashFlatBlock { .. }
-        )
-    }) {
-        capabilities.insert(capability::DFLASH_FLAT_BLOCK.to_string());
-    }
-    if let Some(pipeline) = &metadata.pipeline {
-        capabilities.extend(pipeline.workflow.manifest.capabilities.iter().cloned());
-    }
-    capabilities
-}
-
-fn collect_workflow_capabilities(node: &WorkflowNode, capabilities: &mut BTreeSet<String>) {
-    match node {
-        WorkflowNode::Sequence { nodes } => {
-            for node in nodes {
-                collect_workflow_capabilities(node, capabilities);
-            }
-        }
-        WorkflowNode::Invoke { effects, .. } => {
-            if !effects.is_empty() {
-                capabilities.insert(capability::LINEAR_EFFECTS.to_string());
-            }
-        }
-        WorkflowNode::Loop {
-            setup,
-            body,
-            iteration,
-            effects,
-            ..
-        } => {
-            capabilities.insert(capability::NESTED_CONTROL_FLOW.to_string());
-            if iteration.is_some() {
-                capabilities.insert(capability::LOOP_INDUCTION_VALUES.to_string());
-            }
-            if !effects.is_empty() {
-                capabilities.insert(capability::LINEAR_EFFECTS.to_string());
-            }
-            collect_workflow_capabilities(setup, capabilities);
-            collect_workflow_capabilities(body, capabilities);
-        }
-        WorkflowNode::Branch {
-            cases,
-            default,
-            effects,
-            ..
-        } => {
-            capabilities.insert(capability::NESTED_CONTROL_FLOW.to_string());
-            if !effects.is_empty() {
-                capabilities.insert(capability::LINEAR_EFFECTS.to_string());
-            }
-            for case in cases.values() {
-                collect_workflow_capabilities(case, capabilities);
-            }
-            if let Some(default) = default {
-                collect_workflow_capabilities(default, capabilities);
-            }
-        }
-        WorkflowNode::Emit { valid_length, .. } => {
-            capabilities.insert(capability::TYPED_EMIT.to_string());
-            if valid_length.is_some() {
-                capabilities.insert(capability::EMIT_VALID_LENGTH.to_string());
-            }
-        }
-        WorkflowNode::Transfer { .. } => {
-            capabilities.insert(capability::EXPLICIT_TRANSFER.to_string());
-        }
-        WorkflowNode::ExecutionIsland { .. } => {}
-    }
+/// Optional semantic modules are admitted by the exact typed declaration that
+/// owns them (for example a tool protocol, adapter ABI, or speculative
+/// contract). Core workflow semantics are schema-version conformance
+/// obligations and are deliberately not negotiated here.
+pub fn validate(metadata: &InferenceMetadata) -> Result<(), Vec<String>> {
+    validate_metadata(metadata)
 }
 
 /// Validate document-level invariants independent of runtime capabilities.
@@ -393,22 +121,8 @@ pub fn validate_metadata(metadata: &InferenceMetadata) -> Result<(), Vec<String>
             metadata.pipeline.as_ref().map(|p| &p.workflow),
             &mut errors,
         );
-        if let Some(workflow) = metadata
-            .pipeline
-            .as_ref()
-            .map(|pipeline| &pipeline.workflow)
-        {
-            for capability in metadata_only_required_capabilities(metadata)
-                .difference(&workflow.manifest.capabilities)
-            {
-                errors.push(format!(
-                    "pipeline.workflow.manifest.capabilities is missing used capability '{capability}'"
-                ));
-            }
-        }
     }
     validate_schema_version(metadata, &mut errors);
-    validate_retired_batching_capability(metadata, &mut errors);
     validate_preprocessing_workflow(metadata, &mut errors);
     validate_token_authority(metadata, version, &mut errors);
     validate_generation_contract(metadata, &mut errors);
@@ -504,16 +218,17 @@ fn validate_schema_version(metadata: &InferenceMetadata, errors: &mut Vec<String
             component
                 .contract
                 .as_ref()
-                .is_some_and(|contract| contract.id == "onnx-genai.token-context")
+                .is_some_and(|contract| contract.id == TOKEN_CONTEXT_V1.identity)
         })
     });
     if has_token_context && declared < crate::version::TOKEN_CONTEXT_SCHEMA_VERSION {
         let spelled = metadata.schema_version.as_deref().unwrap_or("<absent>");
         errors.push(format!(
-            "this package declares the onnx-genai.token-context component contract, which schema \
+            "this package declares the {} component contract, which schema \
              version {} introduced, but declares schema_version '{spelled}' ({declared}); declare \
              schema_version '{}' so an older reader refuses the package instead of silently \
              ignoring the token-identity contract",
+            TOKEN_CONTEXT_V1.wire_name(),
             crate::version::TOKEN_CONTEXT_SCHEMA_VERSION,
             crate::version::TOKEN_CONTEXT_SCHEMA_VERSION,
         ));
@@ -838,46 +553,6 @@ fn is_termination_contract(contract: &crate::schema::ComponentContract) -> bool 
         contract.id.as_str(),
         "onnx-genai.termination-predicate" | "onnx-genai.token-policy"
     )
-}
-
-/// Reject the old opt-in spelling for an optimization the runtime derives.
-///
-/// A capability says execution would be incorrect without a behavior.
-/// Continuous batching is never required for correctness: a runtime may always
-/// execute one request at a time. Whether a resolved decode path can share a
-/// forward is derived from its graph/state contract and backend, while whether
-/// to do so is deployment policy.
-fn validate_retired_batching_capability(metadata: &InferenceMetadata, errors: &mut Vec<String>) {
-    if metadata
-        .required_capabilities
-        .iter()
-        .any(|capability| capability == RETIRED_CONTINUOUS_BATCHING_CAPABILITY)
-    {
-        errors.push(
-            "required_capabilities contains retired capability 'continuous_batching'; remove it. \
-             Shared-forward support is derived from the workflow and resolved backend, and \
-             enabling or sizing batches is runtime policy, so single-request execution remains \
-             correct without a negotiated capability"
-                .to_string(),
-        );
-    }
-    if let Some(workflow) = metadata
-        .pipeline
-        .as_ref()
-        .map(|pipeline| &pipeline.workflow)
-        && workflow
-            .manifest
-            .capabilities
-            .iter()
-            .any(|capability| capability == RETIRED_CONTINUOUS_BATCHING_CAPABILITY)
-    {
-        errors.push(
-            "pipeline.workflow.manifest.capabilities contains retired capability \
-             'continuous_batching'; remove it. The workflow's typed batch layouts, state groups, \
-             and row-scoped ABI are the structural contract; grouping remains a runtime choice"
-                .to_string(),
-        );
-    }
 }
 
 /// The first `1.1` field this document uses, described the way a document
@@ -1785,8 +1460,11 @@ fn validate_adapter_service(
 ) {
     if service.application_capability.trim().is_empty() {
         errors.push("adapters.application_capability must not be empty".into());
-    } else if service.application_capability != "onnx-genai.adapters@1" {
-        errors.push("adapters.application_capability must be onnx-genai.adapters@1".into());
+    } else if !ADAPTERS_V1.matches_wire_name(&service.application_capability) {
+        errors.push(format!(
+            "adapters.application_capability must be {}",
+            ADAPTERS_V1.wire_name()
+        ));
     }
     if service.cache.max_entries == 0 {
         errors.push("adapters.cache.max_entries must be greater than zero".into());
@@ -2030,17 +1708,16 @@ fn validate_adapter_service(
                 ));
             }
             let expected_loader = match weight.format {
-                crate::schema::AdapterWeightFormat::Json => "onnx-genai.adapters.json@1",
-                crate::schema::AdapterWeightFormat::OrtGenai => "onnxruntime.lora-adapter@1",
-                crate::schema::AdapterWeightFormat::HfPeft => "onnx-genai.adapters.hf-peft@1",
-                crate::schema::AdapterWeightFormat::Safetensors => {
-                    "onnx-genai.adapters.safetensors@1"
-                }
+                crate::schema::AdapterWeightFormat::Json => ADAPTERS_JSON_V1,
+                crate::schema::AdapterWeightFormat::OrtGenai => ORT_LORA_ADAPTER_V1,
+                crate::schema::AdapterWeightFormat::HfPeft => ADAPTERS_HF_PEFT_V1,
+                crate::schema::AdapterWeightFormat::Safetensors => ADAPTERS_SAFETENSORS_V1,
             };
-            if weight.loader_capability != expected_loader {
+            if !expected_loader.matches_wire_name(&weight.loader_capability) {
                 errors.push(format!(
-                    "{path}.weights[{index}].loader_capability must be {expected_loader} for format {:?}",
-                    weight.format
+                    "{path}.weights[{index}].loader_capability must be {} for format {:?}",
+                    expected_loader.wire_name(),
+                    weight.format,
                 ));
             }
             match (&weight.format, &weight.scale_encoding) {
@@ -2825,10 +2502,42 @@ fn validate_workflow(
         .map(|serving| &serving.state_service)
     {
         for (group_name, group) in &state_service.groups {
+            validate_checkpoint_extension(group_name, group, errors);
             if group.layout.trim().is_empty() {
                 errors.push(format!(
                     "state service group '{group_name}' layout must not be empty"
                 ));
+            }
+
+            fn validate_checkpoint_extension(
+                group_name: &str,
+                group: &crate::schema::StateGroupContract,
+                errors: &mut Vec<String>,
+            ) {
+                let Some(checkpoint) = &group.checkpoint else {
+                    return;
+                };
+                let path = format!(
+                    "pipeline.workflow.serving.state_service.groups.{group_name}.checkpoint \
+                     (state kind {:?})",
+                    group.kind
+                );
+                if let Err(error) = admit_exact(
+                    ExtensionSurface::StateCheckpoint,
+                    &checkpoint.adapter,
+                    &checkpoint.version,
+                    path,
+                    ExtensionConsumerSupport::Unsupported {
+                        scope: "portable state checkpoint adapters on every backend/profile",
+                        reason: "this runtime has no portable checkpoint adapter implementation",
+                        guidance: "omit checkpoint to keep this state runtime-private; do not use session \
+                                   snapshot/fork APIs as a portable checkpoint adapter",
+                    },
+                    "Use an exact registered checkpoint adapter/version implemented by the selected runtime, \
+                     or omit checkpoint to keep the state private.",
+                ) {
+                    errors.push(error.to_string());
+                }
             }
             if let Some(logical_lengths) = &group.logical_lengths {
                 match workflow.state.get(logical_lengths) {
@@ -3061,13 +2770,6 @@ fn validate_workflow(
                 }
             }
         }
-    }
-
-    let used = workflow_required_capabilities(workflow, Some(&compiled.graph));
-    for capability in used.difference(&workflow.manifest.capabilities) {
-        errors.push(format!(
-            "pipeline.workflow.manifest.capabilities is missing used capability '{capability}'"
-        ));
     }
 }
 
@@ -5061,20 +4763,23 @@ fn validate_speculative_rollback(metadata: &InferenceMetadata, errors: &mut Vec<
         );
         return;
     };
-    if speculative.identity != "onnx-genai.speculative" {
+    if speculative.identity != SPECULATIVE_V1.identity {
         errors.push(format!(
             "speculative.identity '{}' is not supported; this runtime implements \
-             onnx-genai.speculative@1. Re-export the package with that canonical contract \
+             {}. Re-export the package with that canonical contract \
              instead of relying on a legacy speculator sidecar",
-            speculative.identity
+            speculative.identity,
+            SPECULATIVE_V1.wire_name(),
         ));
     }
-    if speculative.version != "1" {
+    if speculative.version != SPECULATIVE_V1.version {
         errors.push(format!(
             "speculative.version '{}' is not supported for identity '{}'; this runtime \
-             implements onnx-genai.speculative@1. Upgrade the runtime or re-export the \
+             implements {}. Upgrade the runtime or re-export the \
              package with the supported contract",
-            speculative.version, speculative.identity
+            speculative.version,
+            speculative.identity,
+            SPECULATIVE_V1.wire_name(),
         ));
     }
     for (role, component) in [
@@ -5885,20 +5590,23 @@ fn validate_dflash_flat_block(
     };
 
     match (version.as_str(), structure.as_ref()) {
-        ("1", DFlashStructure::Base) | ("2", DFlashStructure::SelectorConvolutionV1 { .. }) => {}
-        ("1", _) => errors.push(
+        (version, DFlashStructure::Base) if version == DFLASH_FLAT_BLOCK_V1.version => {}
+        (version, DFlashStructure::SelectorConvolutionV1 { .. })
+            if version == DFLASH_FLAT_BLOCK_V2.version => {}
+        (version, _) if version == DFLASH_FLAT_BLOCK_V1.version => errors.push(
             "DFlash version 1 is the base flat-block contract; selector/convolution semantics \
              require exact version '2'"
                 .to_string(),
         ),
-        ("2", _) => errors.push(
+        (version, _) if version == DFLASH_FLAT_BLOCK_V2.version => errors.push(
             "DFlash version 2 requires structure.kind selector_convolution_v1; optional tensors \
              cannot implicitly select that architecture"
                 .to_string(),
         ),
         (unknown, _) => errors.push(format!(
             "unsupported DFlash flat-block contract version '{unknown}'; supported versions are \
-             '1' (base) and '2' (selector_convolution_v1)"
+             {} (base) and {} (selector_convolution_v1)",
+            DFLASH_FLAT_BLOCK_V1.version, DFLASH_FLAT_BLOCK_V2.version,
         )),
     }
 
@@ -8572,7 +8280,8 @@ fn walk_token_identity_provenance(
                 })
                 .collect::<Vec<_>>();
             let is_token_context = declaration.contract.as_ref().is_some_and(|contract| {
-                contract.id == "onnx-genai.token-context" && contract.version == "1"
+                contract.id == TOKEN_CONTEXT_V1.identity
+                    && contract.version == TOKEN_CONTEXT_V1.version
             });
             if is_token_context
                 && token_ports.len() == 1
@@ -8732,17 +8441,17 @@ fn validate_token_context_component(
     contract: &crate::schema::ComponentContract,
     errors: &mut Vec<String>,
 ) {
-    const TOKEN_CONTEXT_CONTRACT: &str = "onnx-genai.token-context";
-    const TOKEN_CONTEXT_VERSION: &str = "1";
-    if contract.id != TOKEN_CONTEXT_CONTRACT {
+    if contract.id != TOKEN_CONTEXT_V1.identity {
         return;
     }
 
-    if contract.version != TOKEN_CONTEXT_VERSION {
+    if contract.version != TOKEN_CONTEXT_V1.version {
         errors.push(format!(
             "workflow token-context component '{component_name}' declares unsupported contract \
-             {}@{}; supported graph ABI is {TOKEN_CONTEXT_CONTRACT}@{TOKEN_CONTEXT_VERSION}",
-            contract.id, contract.version
+             {}@{}; supported graph ABI is {}",
+            contract.id,
+            contract.version,
+            TOKEN_CONTEXT_V1.wire_name(),
         ));
     }
     if !matches!(

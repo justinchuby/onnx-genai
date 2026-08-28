@@ -67,8 +67,8 @@ pub(crate) use crate::speculative::{
 #[cfg(feature = "native-backend")]
 pub(crate) use crate::speculative::MtpProposer;
 
-mod capability;
 mod decode_backend;
+mod execution_error;
 mod governor;
 mod ids;
 mod load;
@@ -84,7 +84,7 @@ mod session_fork;
 pub(crate) mod session_state;
 mod speculative_load;
 mod workflow_api;
-pub use capability::{PackageCapabilityError, SessionPrefillCarry, package_capability_error};
+pub use execution_error::{PackageExecutionError, SessionPrefillCarry, package_execution_error};
 pub use metadata::graph_port_contracts;
 
 pub(crate) use decode_backend::*;

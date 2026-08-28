@@ -2,12 +2,7 @@
 schema_version: v1
 pipeline:
   workflow:
-    manifest:
-      capabilities:
-      - workflow_ssa
-      - typed_emit
-      - serving_service_contract
-      - session_state_lease
+    manifest: {}
     inputs:
       request.active:
         contract:

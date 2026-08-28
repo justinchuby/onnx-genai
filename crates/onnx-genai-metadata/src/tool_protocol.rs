@@ -6,7 +6,12 @@
 
 use std::{collections::BTreeSet, fmt, path::Path};
 
-use crate::ToolProtocolDeclaration;
+use crate::{
+    ToolProtocolDeclaration,
+    extensions::{
+        ATEM_XML_V1, ExtensionConsumerSupport, ExtensionSurface, TAGGED_JSON_V1, admit_exact,
+    },
+};
 
 /// Maximum complete protocol envelope size accepted from a model.
 pub const MAX_TOOL_PAYLOAD_BYTES: usize = 64 * 1024;
@@ -170,16 +175,21 @@ pub fn resolve(
     declaration: &ToolProtocolDeclaration,
     metadata_path: &Path,
 ) -> Result<ToolProtocol, ToolProtocolError> {
-    match (declaration.identity.as_str(), declaration.version.as_str()) {
-        ("tagged-json", "v1") => Ok(ToolProtocol::TaggedJsonV1),
-        ("atem-xml", "v1") => Ok(ToolProtocol::AtemXmlV1),
-        _ => Err(ToolProtocolError(format!(
-            "{} declares package.tool_protocol identity {:?} version {:?}, but this runtime implements no such protocol. \
-             Use one of tagged-json@v1 or atem-xml@v1, or install a runtime adapter for the declared protocol.",
-            metadata_path.display(),
-            declaration.identity,
-            declaration.version,
-        ))),
+    let admitted = admit_exact(
+        ExtensionSurface::ToolProtocol,
+        &declaration.identity,
+        &declaration.version,
+        format!("{}.package.tool_protocol", metadata_path.display()),
+        ExtensionConsumerSupport::Supported {
+            scope: "transport-neutral incremental parsing and request rendering",
+        },
+        "Use a registered tool protocol exact pair implemented by this runtime; do not add required_capabilities or a core capability flag.",
+    )
+    .map_err(|error| ToolProtocolError(error.to_string()))?;
+    match admitted.descriptor.id {
+        TAGGED_JSON_V1 => Ok(ToolProtocol::TaggedJsonV1),
+        ATEM_XML_V1 => Ok(ToolProtocol::AtemXmlV1),
+        _ => unreachable!("registry admitted an unsupported tool protocol consumer"),
     }
 }
 
@@ -473,7 +483,12 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("fixture.yaml"), "{error}");
-        assert!(error.contains("\"v2\""), "{error}");
+        assert!(error.contains("'tagged-json@v2'"), "{error}");
+        assert!(error.contains("version is not registered"), "{error}");
+        assert!(
+            error.contains("do not add required_capabilities"),
+            "{error}"
+        );
     }
 
     #[test]

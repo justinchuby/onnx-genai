@@ -5,8 +5,7 @@
 schema_version: v1.6
 pipeline:
   workflow:
-    manifest:
-      capabilities: [workflow_ssa, typed_emit, serving_service_contract, canonical_speculation]
+    manifest: {}
     inputs:
       request.input_ids:
         contract: {dtype: int64, shape: [batch, sequence], batch_layout: {kind: request_aligned, axis: 0}}

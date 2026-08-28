@@ -538,7 +538,7 @@ mod media_binding_tests {
     /// A workflow declaring exactly the given `media` runtime inputs.
     fn workflow(inputs: serde_json::Value) -> WorkflowSpec {
         serde_json::from_value(serde_json::json!({
-            "manifest": { "capabilities": ["workflow_ssa"] },
+            "manifest": {},
             "inputs": inputs,
             "outputs": {},
             "components": {},
@@ -589,6 +589,32 @@ mod media_binding_tests {
         assert_eq!(audio.n_mels, 80);
         assert_eq!(audio.n_frames, 3000);
         assert!(specs.vision.is_none());
+    }
+
+    #[test]
+    fn capability_free_media_workflow_parses_with_crlf() {
+        let authored = workflow(serde_json::json!({
+            "audio_features": media(serde_json::json!({
+                "dtype": "float32",
+                "shape": [1, 80, 3000],
+            })),
+        }));
+        let yaml = serde_yaml::to_string(&authored)
+            .expect("a structurally declared media workflow serializes");
+        assert!(
+            !yaml.contains("capabilities"),
+            "media eligibility is structural, not a manifest capability list"
+        );
+        let crlf = yaml.replace('\n', "\r\n");
+        let reparsed: WorkflowSpec =
+            serde_yaml::from_str(&crlf).expect("CRLF capability-free workflow parses");
+        assert!(
+            derive_specs(&reparsed, None, None)
+                .expect("media contract is sufficient")
+                .audio
+                .is_some(),
+            "the runtime media input and tensor contract, not a list flag, select audio"
+        );
     }
 
     #[test]

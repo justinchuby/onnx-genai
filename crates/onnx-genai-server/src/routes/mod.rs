@@ -14,7 +14,7 @@ use axum::{
 use onnx_genai::{FinishReason, GenerateOptions, GeneratePrompt, GenerateRequest, GenerateResult};
 use onnx_genai_engine::{
     DryConfig, EmbeddingOptions, EngineGovernorError, GenerateConstraint, GovernorSnapshot,
-    MirostatConfig, MirostatVersion, PackageCapabilityError, ResourceLimit, SamplingOverrides,
+    MirostatConfig, MirostatVersion, PackageExecutionError, ResourceLimit, SamplingOverrides,
     TokenLogprob, XtcConfig, parse_resource_limit,
 };
 use onnx_genai_metadata::GenerationDefaults;
@@ -538,8 +538,8 @@ pub(crate) fn session_create_failure(error: anyhow::Error) -> ApiError {
     {
         return ApiError::unavailable(unavailable.to_string());
     }
-    match onnx_genai_engine::package_capability_error(&error) {
-        Some(capability) => package_capability_failure(capability),
+    match onnx_genai_engine::package_execution_error(&error) {
+        Some(capability) => package_execution_failure(capability),
         None => ApiError::internal(format!("session create failed: {error}")),
     }
 }
@@ -582,23 +582,23 @@ pub(crate) fn session_fork_failure(error: anyhow::Error) -> ApiError {
 /// the routing lease — so an `ExclusiveLeaseConflict` answers 409 whether it was
 /// decided before the turn was enqueued or inside the pass that ran it. Matching
 /// the type rather than the wording is what keeps those answers identical.
-pub(crate) fn package_capability_failure(capability: PackageCapabilityError) -> ApiError {
+pub(crate) fn package_execution_failure(capability: PackageExecutionError) -> ApiError {
     match capability {
-        PackageCapabilityError::NoSessionState => ApiError::conflict(capability.to_string()),
-        PackageCapabilityError::DFlashExecutionUnavailable { .. } => {
+        PackageExecutionError::NoSessionState => ApiError::conflict(capability.to_string()),
+        PackageExecutionError::DFlashExecutionUnavailable { .. } => {
             ApiError::conflict(capability.to_string())
         }
-        PackageCapabilityError::CandidateTreeExecutionUnavailable { .. } => {
+        PackageExecutionError::CandidateTreeExecutionUnavailable { .. } => {
             ApiError::conflict(capability.to_string())
         }
-        PackageCapabilityError::CandidateTreeRawWorkflowApi { .. }
-        | PackageCapabilityError::DFlashRawWorkflowApi { .. } => {
+        PackageExecutionError::CandidateTreeRawWorkflowApi { .. }
+        | PackageExecutionError::DFlashRawWorkflowApi { .. } => {
             ApiError::invalid_request(capability.to_string())
         }
-        PackageCapabilityError::ConversationOverBound { .. } => {
+        PackageExecutionError::ConversationOverBound { .. } => {
             ApiError::invalid_request(capability.to_string())
         }
-        PackageCapabilityError::ExclusiveLeaseConflict { .. } => {
+        PackageExecutionError::ExclusiveLeaseConflict { .. } => {
             ApiError::conflict(capability.to_string())
         }
     }
@@ -618,7 +618,7 @@ pub(crate) fn generation_failure(error: DriverFailure) -> ApiError {
         // and the caller can shorten; a busy session is a conflict that the same
         // request succeeds at once the turn in flight finishes. Both are read
         // off the engine's own type, so neither status depends on wording.
-        DriverFailureKind::PackageCapability(capability) => package_capability_failure(capability),
+        DriverFailureKind::PackageExecution(capability) => package_execution_failure(capability),
         DriverFailureKind::WorkerUnavailable => ApiError::unavailable(error.message),
         DriverFailureKind::Internal => {
             ApiError::internal(format!("generation failed: {}", error.message))
@@ -847,7 +847,7 @@ pub(crate) fn session_close_failure(client_id: &str, error: SessionCloseError) -
         SessionCloseError::NotFound => {
             ApiError::not_found(format!("session {client_id} not found"))
         }
-        SessionCloseError::Busy(capability) => package_capability_failure(capability),
+        SessionCloseError::Busy(capability) => package_execution_failure(capability),
         SessionCloseError::Registry(error) => session_registry_failure(error),
     }
 }
