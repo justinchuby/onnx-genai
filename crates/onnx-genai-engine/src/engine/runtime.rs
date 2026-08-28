@@ -36,6 +36,7 @@ pub(crate) struct DecoderTurnParticipant {
     kv_token_count: usize,
     sampled_fastpath_failed: bool,
     speculative_stats: SpeculativeStats,
+    connector_stats: ConnectorStats,
     decode: crate::decode::DecodeTurnBaseline,
     draft: Option<DraftTurnParticipant>,
 }
@@ -51,6 +52,7 @@ impl DecoderTurnParticipant {
         transaction: crate::pipeline::TurnTransactionId,
         state: &mut EngineSession,
         speculative_stats: SpeculativeStats,
+        connector_stats: ConnectorStats,
     ) -> anyhow::Result<Self> {
         let decode = state
             .decode_state
@@ -76,6 +78,7 @@ impl DecoderTurnParticipant {
             kv_token_count: state.kv_token_count,
             sampled_fastpath_failed: state.sampled_fastpath_failed,
             speculative_stats,
+            connector_stats,
             decode,
             draft,
         })
@@ -131,6 +134,7 @@ impl DecoderTurnParticipant {
         .context("failed to restore target decoder participant to atomic-turn baseline")?;
         state.sampled_fastpath_failed = self.sampled_fastpath_failed;
         engine.last_speculative_stats = self.speculative_stats;
+        engine.connector.restore_stats(self.connector_stats);
         match (engine.draft.as_mut(), state.draft.as_mut(), self.draft) {
             (Some(model), Some(state), Some(baseline)) => {
                 crate::kv_bridge::restore_decode_turn_baseline(
@@ -166,6 +170,7 @@ struct NativeDecoderTurnParticipant {
     active_before: Option<SessionId>,
     materialized_len: Option<usize>,
     recurrent: Option<crate::native_decode::RecurrentStateSnapshot>,
+    connector_stats: ConnectorStats,
 }
 
 #[cfg(feature = "native-backend")]
@@ -193,6 +198,7 @@ impl NativeDecoderTurnParticipant {
             active_before,
             materialized_len,
             recurrent,
+            connector_stats: engine.connector.stats().clone(),
         })
     }
 
@@ -205,6 +211,7 @@ impl NativeDecoderTurnParticipant {
         engine: &mut Engine,
         reason: crate::pipeline::TurnAbortReason,
     ) -> anyhow::Result<crate::pipeline::TurnTransactionOutcome> {
+        engine.connector.restore_stats(self.connector_stats);
         let native = engine.native_session.as_mut().context(
             "cannot abort atomic native decoder turn: native decoder session is unavailable",
         )?;
@@ -1489,6 +1496,7 @@ impl Engine {
             self.workflow.next_turn_transaction_id(),
             &mut state,
             self.last_speculative_stats,
+            self.connector.stats().clone(),
         ) {
             Ok(turn) => turn,
             Err(error) => {
@@ -1566,7 +1574,6 @@ impl Engine {
         .and_then(|mut result| {
             if !exceeded_context_limit(state.tokens.len(), max_context) {
                 self.ensure_session_kv_current(session_id, &mut state)?;
-                self.insert_cached_prefixes(session_id, &state, prompt_tokens.len())?;
             }
             result.budget_cap = budget_cap;
             Ok(result)
@@ -1574,6 +1581,15 @@ impl Engine {
         let result = match result {
             Ok(result) => {
                 let _outcome = turn.committed();
+                if !exceeded_context_limit(state.tokens.len(), max_context)
+                    && let Err(error) =
+                        self.insert_cached_prefixes(session_id, &state, prompt_tokens.len())
+                {
+                    tracing::debug!(
+                        %error,
+                        "committed decoder turn could not publish optional prefix-cache state"
+                    );
+                }
                 Ok(result)
             }
             Err(error) => match turn.abort(
@@ -2525,6 +2541,7 @@ impl Engine {
             self.workflow.next_turn_transaction_id(),
             &mut state,
             self.last_speculative_stats,
+            self.connector.stats().clone(),
         ) {
             Ok(turn) => turn,
             Err(error) => {
@@ -2778,13 +2795,24 @@ impl Engine {
             active.cursor.finish(&self.workflow)?;
             if !exceeded_context_limit(active.state.tokens.len(), active.max_context) {
                 self.ensure_session_kv_current(active.session_id, &mut active.state)?;
-                self.insert_cached_prefixes(active.session_id, &active.state, active.prompt_len)?;
             }
             Ok(())
         })();
         let result = match result {
             Ok(()) => {
                 let _outcome = active.turn.committed();
+                if !exceeded_context_limit(active.state.tokens.len(), active.max_context)
+                    && let Err(error) = self.insert_cached_prefixes(
+                        active.session_id,
+                        &active.state,
+                        active.prompt_len,
+                    )
+                {
+                    tracing::debug!(
+                        %error,
+                        "committed prioritized turn could not publish optional prefix-cache state"
+                    );
+                }
                 Ok(())
             }
             Err(error) => match active.turn.abort(
@@ -3321,6 +3349,7 @@ mod tests {
     use super::*;
     #[cfg(feature = "native-backend")]
     use crate::ProcessorChain;
+    use std::path::Path;
     #[cfg(feature = "native-backend")]
     use std::path::PathBuf;
 
@@ -3329,6 +3358,97 @@ mod tests {
         assert!(generate_uses_scheduler(EngineDecodeBackend::Ort));
         assert!(generate_uses_scheduler(EngineDecodeBackend::Native));
         assert!(generate_uses_scheduler(EngineDecodeBackend::Auto));
+    }
+
+    #[test]
+    fn aborted_turn_restores_tier_journal_and_preserves_sibling_session() -> anyhow::Result<()> {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-llm")
+            .canonicalize()?;
+        let chunk_size = 2;
+        let config = EngineConfig {
+            kv_connector: KvConnectorConfig {
+                backend: KvConnectorBackend::LocalTiered(onnx_genai_kv::LocalTieredConfig {
+                    chunk_size,
+                    page_size: chunk_size,
+                    ..onnx_genai_kv::LocalTieredConfig::default()
+                }),
+                isolation: crate::config::KvConnectorIsolation::SharedDomain(
+                    "atomic-tier-rollback".to_string(),
+                ),
+                chunk_size,
+                ..KvConnectorConfig::default()
+            },
+            ..EngineConfig::default()
+        };
+        let mut engine = Engine::from_dir(&fixture, config)?;
+        let prompt = vec![10, 11, 12, 13, 14, 15];
+        let mut warm = GenerateRequest::new(GeneratePrompt::TokenIds(prompt.clone()));
+        warm.options.max_new_tokens = 1;
+        warm.options.temperature = 0.0;
+        warm.options.stop_on_eos = false;
+        engine.generate(warm)?;
+        assert!(engine.last_connector_stats().stores > 0);
+
+        let sibling = engine.create_session()?;
+        let mut sibling_request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![2, 4, 3]));
+        sibling_request.options.max_new_tokens = 1;
+        sibling_request.options.temperature = 0.0;
+        sibling_request.options.stop_on_eos = false;
+        engine.generate_in_session(sibling, sibling_request)?;
+        let sibling_len = engine.session_token_count(sibling)?;
+        assert!(sibling_len > 0);
+        let committed_connector_stats = engine.last_connector_stats();
+
+        engine.token_prefix_cache.clear();
+        engine.prefix_cache = PrefixCache::new();
+        let target = engine.create_session()?;
+        let mut state = engine
+            .sessions
+            .remove(&target)
+            .context("target session exists")?;
+        let turn = DecoderTurnParticipant::admit(
+            engine.workflow.next_turn_transaction_id(),
+            &mut state,
+            engine.last_speculative_stats,
+            engine.connector.stats().clone(),
+        )?;
+
+        let restored = engine.prepare_session_prefix(target, &mut state, &prompt)?;
+        assert!(restored > 0, "the aborted turn must exercise tier restore");
+        assert!(
+            engine.last_connector_stats().fetched_tokens > 0,
+            "tier restore activity must be staged inside the admitted turn"
+        );
+        assert!(state.kv_token_count > 0);
+
+        turn.abort(
+            &mut engine,
+            target,
+            &mut state,
+            crate::pipeline::TurnAbortReason::ExecutionFailure,
+        )?;
+        assert!(state.tokens.is_empty());
+        assert_eq!(state.kv_token_count, 0);
+        assert_eq!(engine.kv_cache.len(target)?, 0);
+        engine.sessions.insert(target, state);
+        assert_eq!(engine.session_token_count(target)?, 0);
+        assert_eq!(engine.session_token_count(sibling)?, sibling_len);
+        assert_eq!(
+            engine.last_connector_stats(),
+            committed_connector_stats,
+            "an aborted tier restore must not replace the last committed activity journal"
+        );
+
+        let mut retry = GenerateRequest::new(GeneratePrompt::TokenIds(prompt.clone()));
+        retry.options.max_new_tokens = 2;
+        retry.options.temperature = 0.0;
+        retry.options.stop_on_eos = false;
+        let actual = engine.generate_in_session(target, retry.clone())?;
+        let expected = Engine::from_dir(&fixture, EngineConfig::default())?.generate(retry)?;
+        assert_eq!(actual.token_ids, expected.token_ids);
+        assert_eq!(engine.session_token_count(sibling)?, sibling_len);
+        Ok(())
     }
 
     #[cfg(feature = "native-backend")]
