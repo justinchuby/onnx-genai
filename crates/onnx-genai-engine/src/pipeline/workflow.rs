@@ -6251,6 +6251,78 @@ steps:
         .expect("shared branch workflow")
     }
 
+    fn lifecycle_workflow() -> WorkflowSpec {
+        serde_yaml::from_str(
+            r#"
+manifest: {}
+inputs:
+  seed:
+    contract: { dtype: int64, shape: [1] }
+    role: { kind: opaque }
+    source: { kind: application, name: seed }
+  active:
+    contract: { dtype: bool, shape: [] }
+    role: { kind: opaque }
+    source: { kind: application, name: active }
+  limit:
+    contract: { dtype: int64, shape: [] }
+    role: { kind: opaque }
+    source: { kind: application, name: limit }
+outputs: {}
+components:
+  setup:
+    implementation: { kind: binding }
+    contract: { id: test.loop.lifecycle, version: "1" }
+    ports:
+      inputs:
+        value: { dtype: int64, shape: [1] }
+      outputs:
+        value: { dtype: int64, shape: [1] }
+  body:
+    implementation: { kind: binding }
+    contract: { id: test.loop.lifecycle, version: "1" }
+    ports:
+      inputs:
+        value: { dtype: int64, shape: [1] }
+      outputs:
+        value: { dtype: int64, shape: [1] }
+state: {}
+steps:
+  - kind: loop
+    setup:
+      - kind: invoke
+        component: setup
+        inputs: { value: seed }
+        outputs: { value: setup.value }
+    steps:
+      - kind: invoke
+        component: body
+        inputs: { value: setup.value }
+        outputs: { value: body.value }
+    continue_when: active
+    max_iterations: limit
+"#,
+        )
+        .expect("loop lifecycle workflow")
+    }
+
+    fn lifecycle_request(active: i64, limit: i64) -> PipelineGenerateRequest {
+        PipelineGenerateRequest::new(GenerateRequest::new(GeneratePrompt::TokenIds(Vec::new())))
+            .with_input(
+                "seed",
+                Value::from_slice_i64(&[7], &[1]).expect("seed value"),
+            )
+            .with_input(
+                "active",
+                Value::from_raw_bytes(vec![u8::from(active != 0)], &[], DataType::Bool)
+                    .expect("active value"),
+            )
+            .with_input(
+                "limit",
+                Value::from_slice_i64(&[limit], &[]).expect("limit value"),
+            )
+    }
+
     fn over_budget_values() -> PipelineTensors {
         PipelineTensors::from([
             (
@@ -6349,6 +6421,51 @@ steps:
     }
 
     struct StateAdvanceHost;
+
+    #[derive(Default)]
+    struct LifecycleHost {
+        prefix_runs: usize,
+        setup_runs: usize,
+        body_runs: usize,
+    }
+
+    impl WorkflowNodeHost for LifecycleHost {
+        fn hosted_contracts(&self) -> &'static [&'static str] {
+            &["test.loop.lifecycle"]
+        }
+
+        fn execute_contract_node(
+            &mut self,
+            request: WorkflowNodeRequest<'_>,
+        ) -> anyhow::Result<bool> {
+            if request.contract != "test.loop.lifecycle" {
+                return Ok(false);
+            }
+            match request.component {
+                "prefix" => self.prefix_runs += 1,
+                "setup" => self.setup_runs += 1,
+                "body" => self.body_runs += 1,
+                component => anyhow::bail!("unexpected lifecycle component '{component}'"),
+            }
+            let input = request
+                .inputs
+                .get("value")
+                .context("lifecycle input is bound")?;
+            let output = request
+                .outputs
+                .get("value")
+                .context("lifecycle output is bound")?;
+            let value = request
+                .values
+                .get(input)
+                .context("lifecycle input is available")?
+                .to_vec_i64()?;
+            request
+                .values
+                .insert(output.clone(), Value::from_slice_i64(&value, &[1])?);
+            Ok(true)
+        }
+    }
 
     impl WorkflowNodeHost for StateAdvanceHost {
         fn hosted_contracts(&self) -> &'static [&'static str] {
@@ -6698,23 +6815,131 @@ steps:
     }
 
     #[test]
-    fn sequential_state_loops_commit_the_terminal_update() -> anyhow::Result<()> {
+    fn generic_loop_runs_non_empty_setup_once_for_zero_trip() -> anyhow::Result<()> {
+        let workflow = lifecycle_workflow();
+        let runtime = test_runtime(workflow);
+        let mut plan = WorkflowExecutionPlan::new_hosted(
+            &runtime,
+            lifecycle_request(0, 3),
+            &["test.loop.lifecycle"],
+        )?;
+        let mut lifecycle = LifecycleHost::default();
+        {
+            let mut host: Option<&mut dyn WorkflowNodeHost> = Some(&mut lifecycle);
+            plan.execute_retained_with_host(&mut host)?;
+        }
+
+        assert_eq!(lifecycle.setup_runs, 1);
+        assert_eq!(lifecycle.body_runs, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn per_token_cursor_runs_setup_once_before_multiple_iterations() -> anyhow::Result<()> {
+        let workflow = lifecycle_workflow();
+        let runtime = test_runtime(workflow);
+        let mut lifecycle = LifecycleHost::default();
+        let mut cursor = {
+            let mut host: Option<&mut dyn WorkflowNodeHost> = Some(&mut lifecycle);
+            WorkflowGenerationCursor::start(
+                &runtime,
+                lifecycle_request(1, 2),
+                &["test.loop.lifecycle"],
+                &mut host,
+            )?
+        };
+        assert_eq!(lifecycle.setup_runs, 1);
+        assert_eq!(lifecycle.body_runs, 0);
+        {
+            let mut host: Option<&mut dyn WorkflowNodeHost> = Some(&mut lifecycle);
+            assert!(cursor.advance(&runtime, &mut host)?);
+            assert!(cursor.advance(&runtime, &mut host)?);
+            assert!(!cursor.advance(&runtime, &mut host)?);
+        }
+        assert_eq!(lifecycle.setup_runs, 1);
+        assert_eq!(lifecycle.body_runs, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn generic_path_executes_workflow_when_cursor_declines_topology() -> anyhow::Result<()> {
+        let mut workflow = lifecycle_workflow();
+        let prefix = workflow
+            .components
+            .get("setup")
+            .expect("fixture declares setup")
+            .clone();
+        workflow.components.insert("prefix".to_string(), prefix);
+        workflow.steps.insert(
+            0,
+            onnx_genai_metadata::WorkflowStep::Invoke {
+                component: "prefix".to_string(),
+                inputs: BTreeMap::from([("value".to_string(), "seed".to_string())]),
+                outputs: BTreeMap::from([("value".to_string(), "prefix.value".to_string())]),
+            },
+        );
+        let onnx_genai_metadata::WorkflowStep::Loop { setup, .. } =
+            workflow.steps.get_mut(1).expect("fixture loop remains")
+        else {
+            panic!("second step is the lifecycle loop");
+        };
+        let onnx_genai_metadata::WorkflowStep::Invoke { inputs, .. } =
+            setup.first_mut().expect("fixture setup remains")
+        else {
+            panic!("setup step is an invocation");
+        };
+        inputs.insert("value".to_string(), "prefix.value".to_string());
+
+        let runtime = test_runtime(workflow);
+        let error = match WorkflowGenerationCursor::start(
+            &runtime,
+            lifecycle_request(0, 3),
+            &["test.loop.lifecycle"],
+            &mut None,
+        ) {
+            Ok(_) => panic!("the per-token cursor must decline a multi-step root"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("one generation loop"),
+            "{error:#}"
+        );
+
+        let mut plan = WorkflowExecutionPlan::new_hosted(
+            &runtime,
+            lifecycle_request(0, 3),
+            &["test.loop.lifecycle"],
+        )?;
+        let mut lifecycle = LifecycleHost::default();
+        {
+            let mut host: Option<&mut dyn WorkflowNodeHost> = Some(&mut lifecycle);
+            plan.execute_retained_with_host(&mut host)?;
+        }
+
+        assert_eq!(lifecycle.prefix_runs, 1);
+        assert_eq!(lifecycle.setup_runs, 1);
+        assert_eq!(lifecycle.body_runs, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn two_turn_split_state_commits_the_true_final_writer() -> anyhow::Result<()> {
         let workflow: WorkflowSpec = serde_yaml::from_str(
             r#"
 manifest: {}
 inputs:
   seed:
-    contract: { dtype: int64, rank: 1, shape: [1] }
+    contract: { dtype: int64, shape: [1] }
     role: { kind: opaque }
     source: { kind: application, name: seed }
   keep_running:
-    contract: { dtype: bool, rank: 0, shape: [] }
+    contract: { dtype: bool, shape: [] }
     role: { kind: opaque }
     source: { kind: literal }
     required: false
     default: true
   one_iteration:
-    contract: { dtype: int64, rank: 0, shape: [] }
+    contract: { dtype: int64, shape: [] }
     role: { kind: opaque }
     source: { kind: literal }
     required: false
@@ -6726,20 +6951,20 @@ components:
     contract: { id: test.state.advance, version: "1" }
     ports:
       inputs:
-        state: { dtype: int64, rank: 1, shape: [1] }
+        state: { dtype: int64, shape: [1] }
       outputs:
-        state: { dtype: int64, rank: 1, shape: [1] }
+        state: { dtype: int64, shape: [1] }
   decode:
     implementation: { kind: binding }
     contract: { id: test.state.advance, version: "1" }
     ports:
       inputs:
-        state: { dtype: int64, rank: 1, shape: [1] }
+        state: { dtype: int64, shape: [1] }
       outputs:
-        state: { dtype: int64, rank: 1, shape: [1] }
+        state: { dtype: int64, shape: [1] }
 state:
   accumulator:
-    contract: { dtype: int64, rank: 1, shape: [1] }
+    contract: { dtype: int64, shape: [1] }
     scope: session
     initializer: seed
     recurrence: { kind: invariant }
@@ -6851,29 +7076,29 @@ steps:
 manifest: {}
 inputs:
   state:
-    contract: { dtype: int64, rank: 1, shape: [1] }
+    contract: { dtype: int64, shape: [1] }
     role: { kind: opaque }
     source: { kind: application, name: state }
   choose:
-    contract: { dtype: int64, rank: 0, shape: [] }
+    contract: { dtype: int64, shape: [] }
     role: { kind: opaque }
     source: { kind: application, name: choose }
   add_zero:
-    contract: { dtype: int64, rank: 0, shape: [] }
+    contract: { dtype: int64, shape: [] }
     role: { kind: opaque }
     source: { kind: application, name: add_zero }
   add_ten:
-    contract: { dtype: int64, rank: 0, shape: [] }
+    contract: { dtype: int64, shape: [] }
     role: { kind: opaque }
     source: { kind: application, name: add_ten }
   active:
-    contract: { dtype: bool, rank: 0, shape: [] }
+    contract: { dtype: bool, shape: [] }
     role: { kind: opaque }
     source: { kind: literal }
     required: false
     default: true
   done:
-    contract: { dtype: bool, rank: 0, shape: [] }
+    contract: { dtype: bool, shape: [] }
     role: { kind: opaque }
     source: { kind: literal }
     required: false
@@ -6885,13 +7110,13 @@ components:
     contract: { id: test.state.branch_advance, version: "1" }
     ports:
       inputs:
-        state: { dtype: int64, rank: 1, shape: [1] }
-        increment: { dtype: int64, rank: 0, shape: [] }
+        state: { dtype: int64, shape: [1] }
+        increment: { dtype: int64, shape: [] }
       outputs:
-        state: { dtype: int64, rank: 1, shape: [1] }
+        state: { dtype: int64, shape: [1] }
 state:
   accumulator:
-    contract: { dtype: int64, rank: 1, shape: [1] }
+    contract: { dtype: int64, shape: [1] }
     scope: session
     initializer: state
     recurrence: { kind: invariant }
@@ -7464,8 +7689,8 @@ pub(crate) struct WorkflowGenerationCursor {
 }
 
 impl WorkflowGenerationCursor {
-    /// Bind a request and run the loop's setup, stopping before its first
-    /// iteration.
+    /// Bind a request and run the loop's authored setup exactly once, stopping
+    /// before its first iteration.
     pub(crate) fn start(
         runtime: &WorkflowRuntime,
         request: PipelineGenerateRequest,
@@ -7493,14 +7718,6 @@ impl WorkflowGenerationCursor {
              which is published when a pass completes"
         );
         let loop_node = sole_generation_loop(&runtime.plan.compiled_workflow.graph)?;
-        anyhow::ensure!(
-            matches!(
-                loop_plan(loop_node)?.setup,
-                WorkflowNode::Sequence { nodes } if nodes.is_empty()
-            ),
-            "the per-token drive cannot advance a loop with setup steps: setup runs once per \
-             pass, and a drive that hands out one iteration at a time has no pass to run it in"
-        );
         let mut plan = WorkflowExecutionPlan::new_hosted(runtime, request, hosted)?;
         let mut telemetry = WorkflowRunTelemetry::started(plan.max_iterations_only);
         let mut values = std::mem::take(&mut plan.values);

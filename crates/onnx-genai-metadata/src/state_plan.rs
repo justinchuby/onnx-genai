@@ -486,6 +486,98 @@ fn analyze_state_flow(workflow: &WorkflowSpec) -> StateFlowAnalysis {
         writers
     }
 
+    fn state_port_alias<'a>(
+        workflow: &'a WorkflowSpec,
+        cell: &str,
+        component: &str,
+    ) -> Option<&'a crate::schema::StatePortAlias> {
+        let state = workflow.state.get(cell)?;
+        workflow
+            .serving
+            .as_ref()?
+            .state_service
+            .groups
+            .get(state.service_group.as_deref()?)?
+            .ports
+            .get(component)?
+            .get(cell)
+    }
+
+    fn candidate_contract<'a>(
+        workflow: &'a WorkflowSpec,
+        candidate: &TerminalCandidate,
+    ) -> Option<&'a crate::schema::TensorContract> {
+        let writer = candidate.writer.as_ref()?;
+        let component = workflow.components.get(writer.component.as_deref()?)?;
+        component.ports.outputs.get(writer.port.as_deref()?)
+    }
+
+    fn validate_state_representation_transition(
+        workflow: &WorkflowSpec,
+        component: &str,
+        inputs: &BTreeMap<String, String>,
+        outputs: &BTreeMap<String, String>,
+        flow: &Flow,
+        analysis: &mut StateFlowAnalysis,
+    ) {
+        let Some(declaration) = workflow.components.get(component) else {
+            return;
+        };
+        for (cell, state) in &workflow.state {
+            let Some(alias) = state_port_alias(workflow, cell, component) else {
+                continue;
+            };
+            let Some(input_binding) = inputs.get(&alias.input) else {
+                continue;
+            };
+            let Some(input_contract) = declaration.ports.inputs.get(&alias.input) else {
+                continue;
+            };
+            let Some(candidates) = flow.get(cell) else {
+                continue;
+            };
+            if candidates.len() == 1 {
+                let candidate = candidates.iter().next().expect("one candidate");
+                let source_contract =
+                    candidate_contract(workflow, candidate).unwrap_or(&state.contract);
+                if !source_contract.representation_compatible_with(input_contract) {
+                    analysis.errors.push(format!(
+                        "pipeline.workflow state '{cell}' flows from '{}' into \
+                         '{component}:{}' as binding '{input_binding}', but their tensor \
+                         representations are incompatible; insert an explicit typed, versioned \
+                         conversion component before this reader",
+                        candidate.binding, alias.input
+                    ));
+                }
+            }
+
+            let Some(output_port) = alias.output.as_deref() else {
+                continue;
+            };
+            if !outputs.contains_key(output_port) {
+                continue;
+            }
+            let Some(output_contract) = declaration.ports.outputs.get(output_port) else {
+                continue;
+            };
+            if input_contract.representation_compatible_with(output_contract) {
+                continue;
+            }
+            let versioned = declaration.contract.as_ref().is_some_and(|contract| {
+                !contract.id.trim().is_empty() && !contract.version.trim().is_empty()
+            });
+            if !versioned {
+                analysis.errors.push(format!(
+                    "pipeline.workflow component '{component}' changes state '{cell}' \
+                     representation from input '{}' to output '{output_port}' without a \
+                     versioned component contract; declare the conversion protocol id and \
+                     version",
+                    alias.input
+                ));
+            }
+        }
+    }
+
     fn walk_sequence(
         workflow: &WorkflowSpec,
         steps: &[WorkflowStep],
@@ -511,8 +603,14 @@ fn analyze_state_flow(workflow: &WorkflowSpec) -> StateFlowAnalysis {
                 walk_sequence(workflow, steps, flow, analysis, provenance)
             }
             WorkflowStep::Invoke {
-                component, outputs, ..
+                component,
+                inputs,
+                outputs,
+                ..
             } => {
+                validate_state_representation_transition(
+                    workflow, component, inputs, outputs, &flow, analysis,
+                );
                 for (cell, writer) in invoke_writers(workflow, component, outputs) {
                     flow.insert(
                         cell,
@@ -824,6 +922,83 @@ mod tests {
             .workflow
     }
 
+    fn split_representation_workflow() -> WorkflowSpec {
+        serde_yaml::from_str(
+            r#"
+manifest: {}
+inputs:
+  seed:
+    contract: { dtype: float32, shape: [batch, width] }
+    role: { kind: opaque }
+    source: { kind: application, name: seed }
+outputs: {}
+components:
+  first:
+    implementation: { kind: binding }
+    ports:
+      inputs:
+        state: { dtype: float32, shape: [batch, width] }
+      outputs:
+        state: { dtype: float32, shape: [batch, width] }
+  convert:
+    implementation: { kind: binding }
+    contract: { id: test.state-conversion, version: "1" }
+    ports:
+      inputs:
+        state: { dtype: float32, shape: [batch, width] }
+      outputs:
+        state: { dtype: float16, shape: [batch, width] }
+  last:
+    implementation: { kind: binding }
+    ports:
+      inputs:
+        state: { dtype: float16, shape: [batch, width] }
+      outputs:
+        state: { dtype: float16, shape: [batch, width] }
+state:
+  memory:
+    contract: { dtype: float32, shape: [batch, width] }
+    scope: session
+    initializer: seed
+    recurrence: { kind: invariant }
+    management: runtime
+    release_boundary: session
+    service_group: memory
+steps:
+  - kind: invoke
+    component: first
+    inputs: { state: memory }
+    outputs: { state: first.next }
+  - kind: invoke
+    component: convert
+    inputs: { state: first.next }
+    outputs: { state: converted.next }
+  - kind: invoke
+    component: last
+    inputs: { state: converted.next }
+    outputs: { state: last.next }
+serving:
+  active: active
+  done: done
+  accepted_len: accepted_len
+  state_service:
+    groups:
+      memory:
+        kind: recurrent
+        layout: bw
+        update: { kind: replace }
+        ports:
+          first:
+            memory: { input: state, output: state }
+          convert:
+            memory: { input: state, output: state }
+          last:
+            memory: { input: state, output: state }
+"#,
+        )
+        .expect("split representation workflow")
+    }
+
     #[test]
     fn one_plan_covers_external_and_loop_carried_state() {
         let external = workflow(include_str!(
@@ -947,6 +1122,108 @@ mod tests {
                 .iter()
                 .any(|error| error.contains("cyclic initialization path")),
             "{errors:?}"
+        );
+
+        let mut missing_writer = workflow(include_str!(
+            "../../../examples/inference_metadata/catalogue/16-linear-attention-recurrent.yaml"
+        ));
+        missing_writer
+            .state
+            .get_mut("linear_accumulator")
+            .expect("fixture declares accumulator")
+            .scope = WorkflowStateScope::Session;
+        missing_writer
+            .serving
+            .as_mut()
+            .expect("fixture declares state service")
+            .state_service
+            .groups
+            .get_mut("linear_accumulator")
+            .expect("fixture declares state group")
+            .ports
+            .get_mut("model")
+            .expect("fixture declares state ports")
+            .get_mut("linear_accumulator")
+            .expect("fixture declares accumulator port")
+            .output = Some("missing_output".to_string());
+        let errors = validate_state_plan(&missing_writer, &resolve_state_plan(&missing_writer));
+        assert!(
+            errors.iter().any(|error| {
+                error.contains("linear_accumulator")
+                    && error.contains("missing_output")
+                    && error.contains("writer")
+                    && error.contains("invocation binding")
+            }),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn split_state_representation_requires_explicit_versioned_conversion() {
+        let workflow = split_representation_workflow();
+        let errors = validate_state_plan(&workflow, &resolve_state_plan(&workflow));
+        assert!(
+            errors.iter().all(|error| !error.contains("representation")),
+            "{errors:?}"
+        );
+
+        let mut unversioned = workflow.clone();
+        unversioned
+            .components
+            .get_mut("convert")
+            .expect("fixture declares converter")
+            .contract = None;
+        let errors = validate_state_plan(&unversioned, &resolve_state_plan(&unversioned));
+        assert!(
+            errors.iter().any(|error| {
+                error.contains("convert")
+                    && error.contains("changes state 'memory' representation")
+                    && error.contains("versioned component contract")
+            }),
+            "{errors:?}"
+        );
+
+        let mut missing = workflow;
+        missing.steps.remove(1);
+        let WorkflowStep::Invoke { inputs, .. } =
+            missing.steps.get_mut(1).expect("last reader remains")
+        else {
+            panic!("last step is an invocation");
+        };
+        inputs.insert("state".to_string(), "first.next".to_string());
+        let errors = validate_state_plan(&missing, &resolve_state_plan(&missing));
+        assert!(
+            errors.iter().any(|error| {
+                error.contains("state 'memory'")
+                    && error.contains("first.next")
+                    && error.contains("last:state")
+                    && error.contains("explicit typed, versioned conversion")
+            }),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn resolved_state_plan_is_invariant_to_component_map_reordering() {
+        let workflow = split_representation_workflow();
+        let mut reordered = workflow.clone();
+        reordered.components = std::mem::take(&mut reordered.components)
+            .into_iter()
+            .rev()
+            .collect();
+        let group = reordered
+            .serving
+            .as_mut()
+            .expect("fixture declares serving")
+            .state_service
+            .groups
+            .get_mut("memory")
+            .expect("fixture declares memory group");
+        group.ports = std::mem::take(&mut group.ports).into_iter().rev().collect();
+
+        assert_eq!(
+            resolve_state_plan(&workflow),
+            resolve_state_plan(&reordered)
         );
     }
 

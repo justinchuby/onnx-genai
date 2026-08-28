@@ -45,6 +45,9 @@ pub(crate) struct ActiveGenerate {
     pub(crate) budget_cap: Option<GenerationBudgetCap>,
     pub(crate) step: usize,
     pub(crate) rng: SamplingRng,
+    /// A stop reached by authored loop setup before the first scheduled body
+    /// iteration.
+    pub(crate) setup_finish: Option<crate::FinishReason>,
 }
 
 pub(crate) struct DraftModel {
