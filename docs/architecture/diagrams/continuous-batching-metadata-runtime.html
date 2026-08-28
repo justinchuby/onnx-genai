@@ -19,6 +19,10 @@
       --green-pale: #ddf4e8;
       --red: #c23b4a;
       --red-pale: #fce4e6;
+      --staged: #94467c;
+      --staged-pale: #fae9f5;
+      --optional: #66519a;
+      --optional-pale: #edeafd;
       --ink: #183047;
       --muted: #526577;
       --line: #bed0e1;
@@ -37,7 +41,7 @@
     }
     a { color: var(--blue); font-weight: 650; }
     a:hover { color: var(--navy); }
-    a:focus-visible, button:focus-visible, input:focus-visible, summary:focus-visible {
+    a:focus-visible, button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-visible {
       outline: 3px solid #f4b942;
       outline-offset: 3px;
     }
@@ -418,12 +422,534 @@
       color: var(--muted);
       font-size: .88rem;
     }
+    .sr-only {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+      border: 0;
+    }
+    .visual-legend {
+      position: sticky;
+      z-index: 2;
+      top: .6rem;
+      margin: 0 0 2rem;
+      padding: 1.1rem 1.2rem;
+      border: 1px solid #9fb8ce;
+      border-left: .45rem solid var(--navy);
+      border-radius: .8rem;
+      background: rgb(255 255 255 / 96%);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(8px);
+    }
+    .visual-legend h2 { margin: 0 0 .25rem; font-size: 1.28rem; }
+    .visual-legend > p { margin-bottom: .85rem; color: var(--muted); font-size: .9rem; }
+    .legend-grid {
+      display: grid;
+      grid-template-columns: 1.2fr 1.15fr 1fr;
+      gap: .8rem 1.25rem;
+    }
+    .legend-group { min-width: 0; }
+    .legend-group h3 {
+      margin: 0 0 .35rem;
+      color: var(--navy);
+      font-size: .78rem;
+      letter-spacing: .06em;
+      text-transform: uppercase;
+    }
+    .legend-list {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: .3rem .6rem;
+      margin: 0;
+      padding: 0;
+      list-style: none;
+      font-size: .78rem;
+    }
+    .legend-item { display: flex; gap: .35rem; align-items: center; min-width: 0; }
+    .legend-swatch {
+      width: .78rem;
+      height: .78rem;
+      flex: 0 0 auto;
+      border: 1px solid rgb(12 39 66 / 28%);
+      border-radius: .18rem;
+    }
+    .legend-swatch.metadata { background: var(--purple); }
+    .legend-swatch.runtime { background: var(--amber); }
+    .legend-swatch.state { background: var(--blue); }
+    .legend-swatch.staged { background: var(--staged); }
+    .legend-swatch.committed { background: var(--green); }
+    .legend-swatch.abort { background: var(--red); }
+    .legend-swatch.optional { background: var(--optional); }
+    .legend-symbol {
+      width: 1.25rem;
+      height: 1.25rem;
+      flex: 0 0 auto;
+      color: var(--navy);
+    }
+    .line-key { display: grid; gap: .36rem; font-size: .8rem; }
+    .line-sample {
+      display: inline-block;
+      width: 2.5rem;
+      margin-right: .35rem;
+      border-top: 3px solid var(--blue);
+      vertical-align: middle;
+    }
+    .line-sample.dashed { border-top-style: dashed; border-color: var(--amber); }
+    .line-sample.dotted { border-top-style: dotted; border-color: var(--red); }
+    .line-sample.pulse {
+      border-color: var(--purple);
+      box-shadow: 0 0 0 0 rgb(110 77 163 / 35%);
+    }
+    .phase-key { display: flex; flex-wrap: wrap; gap: .32rem; }
+    .phase-badge {
+      display: inline-block;
+      padding: .14rem .38rem;
+      border-radius: .3rem;
+      color: var(--navy-dark);
+      background: var(--blue-pale);
+      font-size: .7rem;
+      font-weight: 850;
+      letter-spacing: .03em;
+      text-transform: uppercase;
+    }
+    .phase-badge.once { background: var(--purple-pale); color: #472a70; }
+    .phase-badge.request { background: #e8f0f8; color: #173e61; }
+    .phase-badge.iteration { background: var(--amber-pale); color: #754700; }
+    .phase-badge.row { background: var(--green-pale); color: #0c5a3d; }
+    .phase-badge.post { background: var(--staged-pale); color: #72235f; }
+    .legend-note {
+      margin: .55rem 0 0;
+      padding-top: .55rem;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      font-size: .81rem;
+    }
+    .motion-panel {
+      margin: 1.2rem 0;
+      padding: 1rem;
+      border: 1px solid var(--line);
+      border-radius: .7rem;
+      background: var(--panel);
+    }
+    .motion-controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: .5rem;
+      align-items: center;
+      margin: 1rem 0 .85rem;
+    }
+    .motion-controls button { min-height: 2.2rem; }
+    .motion-controls button[disabled] {
+      border-color: var(--line);
+      color: #7a8996;
+      background: #eef2f6;
+      cursor: not-allowed;
+    }
+    .motion-controls label {
+      display: inline-flex;
+      gap: .35rem;
+      align-items: center;
+      min-height: 2.2rem;
+      color: var(--navy);
+      font-size: .88rem;
+      font-weight: 750;
+    }
+    .motion-controls select {
+      min-height: 2.2rem;
+      border: 1px solid var(--navy);
+      border-radius: .35rem;
+      color: var(--navy);
+      background: #fff;
+      font: inherit;
+      font-weight: 700;
+    }
+    .motion-status {
+      flex: 1 1 18rem;
+      margin: 0;
+      padding: .5rem .65rem;
+      border-left: 3px solid var(--purple);
+      color: #3f315f;
+      background: var(--purple-pale);
+      font-size: .88rem;
+      font-weight: 700;
+    }
+    .flow-rail {
+      display: grid;
+      grid-template-columns: repeat(11, minmax(6.5rem, 1fr));
+      gap: .42rem;
+      overflow-x: auto;
+      padding: .3rem .1rem .75rem;
+      scroll-snap-type: x proximity;
+    }
+    .flow-node {
+      position: relative;
+      min-height: 7.1rem;
+      padding: .55rem;
+      border: 1px solid var(--line);
+      border-radius: .55rem;
+      color: var(--muted);
+      background: #fff;
+      scroll-snap-align: start;
+      font-size: .76rem;
+    }
+    .flow-node::after {
+      position: absolute;
+      z-index: 0;
+      top: 50%;
+      left: calc(100% + .04rem);
+      width: .35rem;
+      border-top: 2px solid var(--blue);
+      content: "";
+    }
+    .flow-node:last-child::after { display: none; }
+    .flow-node strong { position: relative; z-index: 1; display: block; color: var(--navy); font-size: .79rem; }
+    .flow-node .phase-badge { margin-bottom: .35rem; }
+    .flow-node.is-current {
+      z-index: 1;
+      border-color: var(--purple);
+      color: #362557;
+      background: var(--purple-pale);
+      box-shadow: 0 0 0 .22rem rgb(110 77 163 / 15%);
+    }
+    .flow-rail.motion-run .flow-node.is-current { animation: current-pulse 1.05s ease-out 2; }
+    .flow-rail.motion-run .flow-node.is-current::after { animation: flow-link .72s ease-out both; }
+    .flow-node.is-past { border-color: #9ecab6; background: var(--green-pale); }
+    .flow-node.is-current::after { border-color: var(--purple); }
+    .trace-item {
+      transition: border-color .22s ease, box-shadow .22s ease, background-color .22s ease;
+    }
+    .trace-item.is-current {
+      border-color: var(--purple);
+      background: #fdfbff;
+      box-shadow: 0 0 0 .25rem rgb(110 77 163 / 15%), var(--shadow);
+    }
+    .trace.motion-run .trace-item.is-current { animation: current-pulse 1.05s ease-out 2; }
+    .trace-item.is-past { border-color: #9ecab6; }
+    .trace-item.is-current h3 { color: var(--purple); }
+    .decision-animation {
+      margin: 1rem 0;
+      padding: .9rem;
+      border: 1px solid var(--line);
+      border-radius: .65rem;
+      background: #fff;
+    }
+    .decision-animation > p { margin: 0 0 .65rem; color: #472a70; font-size: .88rem; font-weight: 800; }
+    .decision-path {
+      display: grid;
+      grid-template-columns: minmax(7rem, 1fr) minmax(9rem, 1.2fr) minmax(8rem, 1fr);
+      gap: .75rem;
+      align-items: center;
+    }
+    .path-row-stack, .forward-stack { display: grid; gap: .35rem; }
+    .path-row, .forward, .semantic-rejoin {
+      min-height: 2rem;
+      padding: .35rem .5rem;
+      border: 1px solid var(--line);
+      border-radius: .35rem;
+      background: var(--blue-pale);
+      color: #173e61;
+      font-size: .78rem;
+      font-weight: 800;
+      text-align: center;
+    }
+    .forward { background: var(--amber-pale); color: #754700; }
+    .forward.shared { border-width: 2px; }
+    .forward.isolated { display: none; }
+    .semantic-rejoin {
+      border-color: #9ecab6;
+      background: var(--green-pale);
+      color: #0c5a3d;
+    }
+    .decision-animation[data-path="isolated"] .forward.shared { display: none; }
+    .decision-animation[data-path="isolated"] .forward.isolated { display: block; }
+    .decision-animation[data-path="fail"] .forward-stack { opacity: .5; }
+    .decision-animation[data-path="fail"] .semantic-rejoin { border-color: #e0adb5; background: var(--red-pale); color: #852c3b; }
+    .decision-animation.motion-run[data-path="shared"] .path-row {
+      animation: converge .8s cubic-bezier(.2, .8, .2, 1) both;
+    }
+    .decision-animation.motion-run[data-path="isolated"] .path-row:nth-child(1) { animation: split-up .72s ease-out both; }
+    .decision-animation.motion-run[data-path="isolated"] .path-row:nth-child(2) { animation: split-down .72s ease-out both; }
+    .decision-animation.motion-run .semantic-rejoin { animation: current-pulse .9s ease-out .55s 1 both; }
+    .simulator .result { grid-template-columns: auto 1fr; }
+    .trace-controls { margin-bottom: .25rem; }
+    .trace-controls .motion-status { flex-basis: 22rem; }
+    .animation-section .section-intro { max-width: 88ch; }
+    .rowplan-board, .transaction-board, .setup-board {
+      overflow: hidden;
+      padding: 1rem;
+      border: 1px solid var(--line);
+      border-radius: .7rem;
+      background: #fff;
+    }
+    .mapping-callout {
+      margin: 0 0 .85rem;
+      padding: .65rem .8rem;
+      border-left: 4px solid var(--purple);
+      background: var(--purple-pale);
+      color: #3f315f;
+      font-weight: 750;
+    }
+    .rowplan-columns {
+      display: grid;
+      grid-template-columns: minmax(12rem, 1fr) auto minmax(17rem, 1.45fr);
+      gap: .85rem;
+      align-items: stretch;
+    }
+    .logical-side, .destination-side {
+      padding: .75rem;
+      border: 1px solid var(--line);
+      border-radius: .55rem;
+    }
+    .logical-side h3, .destination-side h3 { margin: 0 0 .55rem; color: var(--navy); font-size: .92rem; }
+    .logical-rows, .destination-rows { display: grid; gap: .4rem; }
+    .logical-row, .destination-row {
+      padding: .42rem .5rem;
+      border: 1px solid var(--line);
+      border-radius: .35rem;
+      background: var(--blue-pale);
+      color: #173e61;
+      font-size: .81rem;
+      font-weight: 750;
+    }
+    .logical-row.skip { border-style: dashed; color: var(--muted); background: var(--panel); }
+    .rowplan-map-arrow {
+      align-self: center;
+      color: var(--purple);
+      font-size: 1.6rem;
+      font-weight: 900;
+    }
+    .carrier-list { display: grid; gap: .45rem; margin-top: .9rem; }
+    .carrier-track {
+      display: grid;
+      grid-template-columns: minmax(8rem, .75fr) minmax(10rem, 1.2fr) auto minmax(15rem, 1.5fr);
+      gap: .45rem;
+      align-items: center;
+      padding: .55rem;
+      border: 1px solid var(--line);
+      border-radius: .45rem;
+      background: var(--panel);
+      font-size: .8rem;
+    }
+    .carrier-name { color: var(--navy); font-weight: 850; }
+    .carrier-source { color: #173e61; }
+    .carrier-arrow { color: var(--purple); font-size: 1.1rem; font-weight: 900; }
+    .carrier-destination { color: #0c5a3d; font-weight: 750; }
+    .rowplan-demo[data-stage="source"] .carrier-destination { color: var(--muted); }
+    .rowplan-demo[data-stage="source"] .logical-row[data-source="2"] { border-color: var(--purple); }
+    .rowplan-demo[data-stage="gather"] .logical-row[data-source="2"],
+    .rowplan-demo[data-stage="execute"] .logical-row[data-source="2"],
+    .rowplan-demo[data-stage="scatter"] .logical-row[data-source="2"] {
+      border-color: var(--purple);
+      background: var(--purple-pale);
+      box-shadow: 0 0 0 .18rem rgb(110 77 163 / 13%);
+    }
+    .rowplan-demo.motion-run[data-stage="gather"] .carrier-arrow,
+    .rowplan-demo.motion-run[data-stage="execute"] .carrier-arrow {
+      animation: carrier-move .72s ease-out both;
+    }
+    .rowplan-demo[data-stage="scatter"] .destination-row { border-color: var(--green); background: var(--green-pale); }
+    .scatter-result {
+      margin: .85rem 0 0;
+      padding: .65rem .8rem;
+      border: 1px dotted var(--green);
+      background: var(--green-pale);
+      color: #0c5a3d;
+      font-size: .86rem;
+      font-weight: 750;
+    }
+    .transaction-board { position: relative; }
+    .transaction-key {
+      display: flex;
+      flex-wrap: wrap;
+      gap: .45rem 1rem;
+      margin: 0 0 .8rem;
+      color: var(--muted);
+      font-size: .8rem;
+    }
+    .transaction-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: .7rem;
+    }
+    .transaction-row {
+      position: relative;
+      min-height: 15.7rem;
+      padding: .8rem;
+      border: 1px solid var(--line);
+      border-top: 4px solid var(--blue);
+      border-radius: .55rem;
+      background: var(--panel);
+    }
+    .transaction-row.cancelled { border-top-color: var(--red); }
+    .transaction-row.eos { border-top-color: var(--green); }
+    .transaction-row h3 { margin: 0 0 .35rem; color: var(--navy); font-size: .95rem; }
+    .transaction-row p { margin: .25rem 0; color: var(--muted); font-size: .78rem; }
+    .state-cell, .journal-cell, .outcome-cell {
+      margin-top: .45rem;
+      padding: .45rem .5rem;
+      border: 1px solid var(--blue);
+      border-radius: .35rem;
+      background: var(--blue-pale);
+      color: #173e61;
+      font-size: .78rem;
+      font-weight: 750;
+    }
+    .journal-cell { border-color: var(--staged); background: var(--staged-pale); color: #72235f; }
+    .outcome-cell { display: none; border-color: var(--green); background: var(--green-pale); color: #0c5a3d; }
+    .transaction-row.cancelled .outcome-cell { border-color: var(--red); background: var(--red-pale); color: #852c3b; }
+    .transport-boundary {
+      display: grid;
+      place-items: center;
+      min-height: 1.35rem;
+      margin-top: .45rem;
+      border: 0;
+      border-top: 3px solid var(--navy);
+      color: var(--navy-dark);
+      font-size: .68rem;
+      font-weight: 900;
+      letter-spacing: .04em;
+      text-transform: uppercase;
+    }
+    .published-cell {
+      display: none;
+      margin-top: .45rem;
+      padding: .4rem .5rem;
+      border: 1px solid var(--green);
+      border-radius: .35rem;
+      background: var(--green-pale);
+      color: #0c5a3d;
+      font-size: .78rem;
+      font-weight: 800;
+    }
+    .transaction-demo[data-stage="baseline"] .journal-cell,
+    .transaction-demo[data-stage="baseline"] .transport-boundary,
+    .transaction-demo[data-stage="baseline"] .published-cell { display: none; }
+    .transaction-demo[data-stage="staged"] .outcome-cell,
+    .transaction-demo[data-stage="staged"] .published-cell { display: none; }
+    .transaction-demo[data-stage="commit"] .outcome-cell,
+    .transaction-demo[data-stage="release"] .outcome-cell { display: block; }
+    .transaction-demo[data-stage="commit"] .published-cell,
+    .transaction-demo[data-stage="release"] .published-cell { display: block; }
+    .transaction-demo[data-stage="commit"] .cancelled .published-cell,
+    .transaction-demo[data-stage="release"] .cancelled .published-cell { display: none; }
+    .transaction-demo.motion-run[data-stage="commit"] .published-cell { animation: publish-after-commit .7s ease-out both; }
+    .slot-reuse {
+      display: none;
+      margin-top: .75rem;
+      padding: .7rem;
+      border: 2px dotted var(--green);
+      border-radius: .45rem;
+      background: #fff;
+      color: #0c5a3d;
+      font-size: .85rem;
+      font-weight: 750;
+    }
+    .transaction-demo[data-stage="release"] .slot-reuse { display: block; }
+    .setup-board { position: relative; }
+    .setup-track {
+      display: grid;
+      grid-template-columns: repeat(6, minmax(8rem, 1fr));
+      gap: .45rem;
+      overflow-x: auto;
+      padding-bottom: .55rem;
+    }
+    .setup-node {
+      position: relative;
+      min-height: 7.65rem;
+      padding: .65rem;
+      border: 1px solid var(--line);
+      border-radius: .5rem;
+      background: var(--panel);
+      color: var(--muted);
+      font-size: .79rem;
+    }
+    .setup-node::after {
+      position: absolute;
+      top: 50%;
+      left: calc(100% + .04rem);
+      width: .36rem;
+      border-top: 2px solid var(--blue);
+      content: "";
+    }
+    .setup-node:last-child::after { display: none; }
+    .setup-node h3 { margin: 0 0 .28rem; color: var(--navy); font-size: .9rem; }
+    .setup-node p { margin: 0; font-size: .76rem; }
+    .setup-node.optional {
+      border-style: dashed;
+      border-color: var(--optional);
+      background: var(--optional-pale);
+    }
+    .setup-demo[data-graph="false"] .setup-node.optional {
+      border-style: dotted;
+      opacity: .62;
+    }
+    .setup-node.is-active {
+      border-color: var(--purple);
+      background: var(--purple-pale);
+      box-shadow: 0 0 0 .2rem rgb(110 77 163 / 14%);
+    }
+    .setup-demo.motion-run .setup-node.is-active { animation: current-pulse 1.05s ease-out 2; }
+    .setup-node.is-past { border-color: #9ecab6; background: var(--green-pale); }
+    .setup-node.optional.is-active { border-color: var(--optional); background: var(--optional-pale); }
+    .setup-note {
+      margin: .8rem 0 0;
+      padding: .7rem .8rem;
+      border-left: 4px dashed var(--optional);
+      background: var(--optional-pale);
+      color: #44366e;
+      font-size: .86rem;
+    }
+    .print-only { display: none; }
+    body.reduce-motion *, body.reduce-motion *::before, body.reduce-motion *::after {
+      scroll-behavior: auto !important;
+      transition: none !important;
+      animation: none !important;
+    }
+    @keyframes current-pulse {
+      0% { box-shadow: 0 0 0 0 rgb(110 77 163 / 32%); }
+      100% { box-shadow: 0 0 0 .52rem rgb(110 77 163 / 0%); }
+    }
+    @keyframes converge {
+      0% { transform: translateX(-1.4rem); opacity: .4; }
+      100% { transform: translateX(0); opacity: 1; }
+    }
+    @keyframes split-up {
+      0% { transform: translateY(.6rem); opacity: .45; }
+      100% { transform: translateY(0); opacity: 1; }
+    }
+    @keyframes split-down {
+      0% { transform: translateY(-.6rem); opacity: .45; }
+      100% { transform: translateY(0); opacity: 1; }
+    }
+    @keyframes carrier-move {
+      0% { transform: translateX(-.55rem); opacity: .35; }
+      100% { transform: translateX(0); opacity: 1; }
+    }
+    @keyframes flow-link {
+      0% { opacity: .2; transform: scaleX(.1); transform-origin: left; }
+      100% { opacity: 1; transform: scaleX(1); transform-origin: left; }
+    }
+    @keyframes publish-after-commit {
+      0% { transform: translateY(-.45rem); opacity: .2; }
+      100% { transform: translateY(0); opacity: 1; }
+    }
     @media (max-width: 900px) {
       .grid-3, .glossary { grid-template-columns: 1fr; }
       .ownership { grid-template-columns: 1fr; }
       .ownership-arrow { justify-self: center; transform: rotate(90deg); }
       .choice-grid, .trace, .misconceptions { grid-template-columns: 1fr; }
       .decision-track { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .legend-grid, .transaction-grid { grid-template-columns: 1fr; }
+      .rowplan-columns { grid-template-columns: 1fr; }
+      .rowplan-map-arrow { justify-self: center; transform: rotate(90deg); }
+      .decision-path { grid-template-columns: 1fr; }
+      .path-row-stack { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+      .forward-stack { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+      .forward.shared { grid-column: 1 / -1; }
     }
     @media (max-width: 620px) {
       .shell { width: min(100% - 1.3rem, 1220px); }
@@ -433,14 +959,37 @@
       .grid-2 { grid-template-columns: 1fr; }
       .decision-track { grid-template-columns: 1fr; }
       .trace-item { min-height: auto; }
+      .visual-legend { position: static; }
+      .legend-list { grid-template-columns: 1fr; }
+      .motion-controls { align-items: stretch; }
+      .motion-controls label { justify-content: space-between; }
+      .motion-status { flex-basis: 100%; }
+      .carrier-track { grid-template-columns: 1fr; gap: .22rem; }
+      .carrier-arrow { transform: rotate(90deg); }
+      .path-row-stack, .forward-stack { grid-template-columns: 1fr; }
     }
     @media (prefers-reduced-motion: reduce) {
       *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; animation: none !important; }
     }
+    @media (forced-colors: active) {
+      .visual-legend, .flow-node, .trace-item, .decision-animation, .rowplan-board, .transaction-board, .setup-board,
+      .logical-row, .destination-row, .carrier-track, .transaction-row, .state-cell, .journal-cell, .outcome-cell,
+      .published-cell, .setup-node {
+        border-color: CanvasText;
+        forced-color-adjust: auto;
+      }
+      .flow-node.is-current, .trace-item.is-current, .setup-node.is-active { outline: 3px solid Highlight; outline-offset: 2px; }
+    }
     @media print {
       body { background: #fff; font-size: 11pt; }
-      .skip-link, nav, .preset-row { display: none; }
+      .skip-link, nav, .preset-row, .motion-controls { display: none; }
       .card, .code-card, .simulator, .trace-item, .callout { box-shadow: none; }
+      .visual-legend { position: static; backdrop-filter: none; }
+      .flow-rail, .setup-track { overflow: visible; }
+      .flow-node, .setup-node, .trace-item { break-inside: avoid; }
+      .transaction-demo .journal-cell, .transaction-demo .transport-boundary, .transaction-demo .outcome-cell,
+      .transaction-demo .published-cell, .transaction-demo .slot-reuse { display: block !important; }
+      .print-only { display: block; }
       section { break-inside: avoid; }
       a { color: var(--navy); text-decoration: none; }
     }
@@ -470,6 +1019,8 @@
         <a href="#metadata">Metadata examples</a>
         <a href="#simulator">Decision simulator</a>
         <a href="#trace">Runtime trace</a>
+        <a href="#rowplan-animation">RowPlan motion</a>
+        <a href="#transaction-animation">Row transactions</a>
         <a href="#authors">Author checklist</a>
         <a href="#matrix">Decision matrix</a>
         <a href="#sources">Sources</a>
@@ -478,6 +1029,53 @@
   </header>
 
   <main id="main-content" class="shell">
+    <aside class="visual-legend" aria-labelledby="visual-legend-title">
+      <h2 id="visual-legend-title">How to read the interactive diagrams</h2>
+      <p>This key remains visible while you explore. Every animation changes a documented semantic state; it never adds a scheduler rule to package metadata.</p>
+      <div class="legend-grid">
+        <div class="legend-group">
+          <h3>Colors</h3>
+          <ul class="legend-list">
+            <li class="legend-item"><span class="legend-swatch metadata" aria-hidden="true"></span><span>Core metadata / conformance</span></li>
+            <li class="legend-item"><span class="legend-swatch runtime" aria-hidden="true"></span><span>Runtime policy</span></li>
+            <li class="legend-item"><span class="legend-swatch state" aria-hidden="true"></span><span>Semantic state</span></li>
+            <li class="legend-item"><span class="legend-swatch staged" aria-hidden="true"></span><span>Provisional / staged output</span></li>
+            <li class="legend-item"><span class="legend-swatch committed" aria-hidden="true"></span><span>Committed output</span></li>
+            <li class="legend-item"><span class="legend-swatch abort" aria-hidden="true"></span><span>Abort / error</span></li>
+            <li class="legend-item"><span class="legend-swatch optional" aria-hidden="true"></span><span>Optional optimization</span></li>
+          </ul>
+        </div>
+        <div class="legend-group">
+          <h3>Shapes</h3>
+          <ul class="legend-list">
+            <li class="legend-item"><svg class="legend-symbol" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M7 9h10M7 14h6" stroke="currentColor" stroke-width="2"/></svg><span>Package</span></li>
+            <li class="legend-item"><svg class="legend-symbol" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8" fill="none" stroke="currentColor" stroke-width="2"/><path d="M9 12h6M12 9v6" stroke="currentColor" stroke-width="2"/></svg><span>Logical row</span></li>
+            <li class="legend-item"><svg class="legend-symbol" viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="3" width="14" height="18" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M8 8h8M8 12h8M8 16h8" stroke="currentColor" stroke-width="2"/></svg><span>Physical slot</span></li>
+            <li class="legend-item"><svg class="legend-symbol" viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="7" width="16" height="10" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M8 10h8M8 14h5" stroke="currentColor" stroke-width="2"/></svg><span>State cell</span></li>
+            <li class="legend-item"><svg class="legend-symbol" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 3h8l4 4v14H6z" fill="none" stroke="currentColor" stroke-width="2"/><path d="M14 3v5h4M9 13h6M9 17h6" stroke="currentColor" stroke-width="2"/></svg><span>Output journal</span></li>
+            <li class="legend-item"><svg class="legend-symbol" viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 8 4v10l-8 4-8-4V7z" fill="none" stroke="currentColor" stroke-width="2"/><circle cx="12" cy="12" r="2" fill="currentColor"/></svg><span>Graph / component</span></li>
+            <li class="legend-item"><svg class="legend-symbol" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v18" stroke="currentColor" stroke-width="3"/><path d="M5 8h5M14 16h5" stroke="currentColor" stroke-width="2"/></svg><span>Transport boundary</span></li>
+          </ul>
+        </div>
+        <div class="legend-group">
+          <h3>Lines and phases</h3>
+          <div class="line-key">
+            <span><i class="line-sample" aria-hidden="true"></i>Solid: semantic dataflow</span>
+            <span><i class="line-sample dashed" aria-hidden="true"></i>Dashed: runtime choice / optimization</span>
+            <span><i class="line-sample dotted" aria-hidden="true"></i>Dotted: rollback / storage reuse</span>
+            <span><i class="line-sample pulse" aria-hidden="true"></i>One brief pulse: current execution</span>
+          </div>
+          <div class="phase-key" aria-label="Phase badge meanings">
+            <span class="phase-badge once">one-time</span>
+            <span class="phase-badge request">per request</span>
+            <span class="phase-badge iteration">per iteration</span>
+            <span class="phase-badge row">per row</span>
+            <span class="phase-badge post">post-commit</span>
+          </div>
+        </div>
+      </div>
+      <p class="legend-note"><strong>Logical row</strong> means request-visible semantic ownership. <strong>Physical slot</strong> means reusable runtime-private storage. A RowPlan selects positions; it never gives metadata a request ID or a slot identity.</p>
+    </aside>
     <section id="three-lenses" aria-labelledby="three-lenses-title">
       <p class="eyebrow">The essential split</p>
       <h2 id="three-lenses-title">One semantic contract, three owners</h2>
@@ -645,6 +1243,23 @@
           <div class="decision-node" data-node="compatibility"><strong>Compatibility</strong>Live rows fit now</div>
           <div class="decision-node" data-node="execute"><strong>Execution</strong>Choose a safe path</div>
         </div>
+        <div id="decision-animation" class="decision-animation" data-path="shared" aria-label="Animated execution arrangement">
+          <p>Metadata says <strong>CAN</strong>. Runtime decides <strong>WHETHER / WHEN</strong>; both valid paths rejoin at the same per-row semantic result and commit boundary.</p>
+          <div class="decision-path">
+            <div class="path-row-stack" aria-label="Compatible logical rows">
+              <div class="path-row">Logical row L0</div>
+              <div class="path-row">Logical row L1</div>
+              <div class="path-row">Logical row L2</div>
+            </div>
+            <div class="forward-stack" aria-label="Runtime-selected forward path">
+              <div class="forward shared">One shared forward</div>
+              <div class="forward isolated">Isolated forward L0</div>
+              <div class="forward isolated">Isolated forward L1</div>
+              <div class="forward isolated">Isolated forward L2</div>
+            </div>
+            <div class="semantic-rejoin">Equivalent row-local semantic result<br>→ independent commit</div>
+          </div>
+        </div>
         <div id="simulation-result" class="result" role="status" aria-live="polite" aria-atomic="true">
           <div class="result-icon" aria-hidden="true">✓</div>
           <div>
@@ -660,63 +1275,94 @@
       <p class="eyebrow">Conceptual code trace</p>
       <h2 id="trace-title">From package load to row-local completion</h2>
       <p class="section-intro">This timeline gives ownership and ordering, not a claim that every backend has the same implementation. The <code>RowPlan</code> is transient and positional: destination row <em>i</em> selects a source position. It may reorder, shrink, or repeat a position; it never carries a request ID or physical slot.</p>
+      <div class="motion-panel">
+        <div id="lifecycle-controls" class="motion-controls trace-controls" aria-label="Lifecycle animation controls">
+          <button id="lifecycle-play" type="button" aria-pressed="false">Play</button>
+          <button id="lifecycle-previous" type="button">Previous</button>
+          <button id="lifecycle-next" type="button">Next</button>
+          <button id="lifecycle-reset" type="button">Reset</button>
+          <label for="lifecycle-speed">Speed
+            <select id="lifecycle-speed">
+              <option value="0.5">0.5×</option>
+              <option value="1" selected>1×</option>
+              <option value="2">2×</option>
+            </select>
+          </label>
+          <button id="reduce-motion" type="button" aria-pressed="false">Reduce motion: off</button>
+          <p id="lifecycle-status" class="motion-status" role="status" aria-live="polite" aria-atomic="true">Step 0 of 10 · One-time · Parse package metadata and resolve portable plans.</p>
+        </div>
+        <p class="section-intro">Play never starts automatically. Use the buttons—or Left/Right, Home, and End while this control group has focus—to examine a deterministic flow one phase at a time.</p>
+        <div id="lifecycle-flow" class="flow-rail" role="list" aria-label="Animated lifecycle data and control flow">
+          <div class="flow-node" data-flow-step="0" role="listitem"><span class="phase-badge once">one-time</span><strong>Parse metadata</strong>Schema, version, row and companion contracts.</div>
+          <div class="flow-node" data-flow-step="1" role="listitem"><span class="phase-badge once">one-time</span><strong>Preflight</strong>Reject a true unsupported semantic requirement before mutation.</div>
+          <div class="flow-node" data-flow-step="2" role="listitem"><span class="phase-badge request">per request</span><strong>Request / loop setup</strong>Prepare once; capture its committed baseline.</div>
+          <div class="flow-node" data-flow-step="3" role="listitem"><span class="phase-badge iteration">per iteration</span><strong>Choose path</strong>Runtime selects shared or isolated work now.</div>
+          <div class="flow-node" data-flow-step="4" role="listitem"><span class="phase-badge iteration">per iteration</span><strong>RowPlan</strong>Positionally reorder, duplicate, or shrink live rows.</div>
+          <div class="flow-node" data-flow-step="5" role="listitem"><span class="phase-badge iteration">per iteration</span><strong>Allocate / gather / transfer</strong>Move every companion; optional graph capture may apply.</div>
+          <div class="flow-node" data-flow-step="6" role="listitem"><span class="phase-badge iteration">per iteration</span><strong>Execute</strong>One shared forward or valid isolated forwards.</div>
+          <div class="flow-node" data-flow-step="7" role="listitem"><span class="phase-badge iteration">per iteration</span><strong>Scatter / stage</strong>Return state and journals to logical ownership.</div>
+          <div class="flow-node" data-flow-step="8" role="listitem"><span class="phase-badge row">per row</span><strong>Commit / abort</strong>Commit one row; restore a failed row's S3 baseline.</div>
+          <div class="flow-node" data-flow-step="9" role="listitem"><span class="phase-badge post">post-commit</span><strong>Release / backfill</strong>Publish then clear ownership; reuse storage only cleanly.</div>
+          <div class="flow-node" data-flow-step="10" role="listitem"><span class="phase-badge request">per request</span><strong>Multi-turn continuation</strong>Continue from committed semantic state.</div>
+        </div>
+      </div>
       <div class="timeline-key" aria-label="Timeline work categories">
         <span>One-time / per-request setup</span>
         <span class="iteration">Per batch iteration</span>
         <span class="completion">Completion / recovery</span>
       </div>
-      <ol class="trace">
-        <li class="trace-item">
+      <ol id="lifecycle-trace" class="trace">
+        <li class="trace-item" data-lifecycle-step="0">
           <span class="label metadata">0 · load once</span>
           <h3>Parse, version, and resolve plans</h3>
           <p>Parse metadata, check schema/version, validate contracts, and resolve generalized state, output, effect, and loop plans. A package cannot be accepted by guessing hidden semantics.</p>
         </li>
-        <li class="trace-item">
+        <li class="trace-item" data-lifecycle-step="1">
           <span class="label metadata">1 · preflight</span>
           <h3>Admit before mutation</h3>
           <p>Validate axes, carriers, companion closure, inactive-row semantics, and backend requirements. A true unsupported semantic requirement fails before allocation or mutation; lack of shared optimization capability does not.</p>
         </li>
-        <li class="trace-item">
+        <li class="trace-item" data-lifecycle-step="2">
           <span class="label package">2 · per request</span>
           <h3>Prepare one request exactly once</h3>
           <p>Preprocess prompt/media, capture the S3 committed baseline, initialize or restore semantic state, and reserve state/output journals. Run the authored <code>loop.setup</code> exactly once at loop entry—not “only when it is empty.”</p>
         </li>
-        <li class="trace-item iteration">
+        <li class="trace-item iteration" data-lifecycle-step="3">
           <span class="label runtime">3 · policy</span>
           <h3>Form compatible live rows</h3>
           <p>The runtime schedules compatible work and chooses shared or isolated execution according to backend capability, workload, resources, latency/performance policy, and current compatibility.</p>
         </li>
-        <li class="trace-item iteration">
+        <li class="trace-item iteration" data-lifecycle-step="4">
           <span class="label runtime">4 · transient plan</span>
           <h3>Build one canonical RowPlan</h3>
           <p>Map logical rows to selected source positions. The plan supports reorder, duplicate, and shrink. Immutable prepared inputs remain authoritative, so retry/abort never depends on a partially rewritten working buffer.</p>
         </li>
-        <li class="trace-item iteration">
+        <li class="trace-item iteration" data-lifecycle-step="5">
           <span class="label runtime">5 · movement</span>
           <h3>Gather and move every carrier once</h3>
           <p>Allocate destination views/buffers; select row-scoped input, state, effect, output, RNG, and constraint carriers exactly once; apply the same plan to companions; transfer explicitly to device. Capture/replay is optional and only when eligible.</p>
         </li>
-        <li class="trace-item iteration">
+        <li class="trace-item iteration" data-lifecycle-step="6">
           <span class="label package">6 · forward</span>
           <h3>Execute shared or isolated</h3>
           <p>Run one shared forward or one isolated forward per row. Inactive rows obey their declared neutral/freeze behavior, or are absent from an exact active-row invocation. No other row’s state or output may change.</p>
         </li>
-        <li class="trace-item iteration">
+        <li class="trace-item iteration" data-lifecycle-step="7">
           <span class="label runtime">7 · provisional results</span>
           <h3>Scatter, update, and stage</h3>
           <p>Map outputs and state updates back to logical rows. Stage effects and S4 output publications in per-row journals; do not expose an uncommitted token, media result, or effect to transport.</p>
         </li>
-        <li class="trace-item completion">
+        <li class="trace-item completion" data-lifecycle-step="8">
           <span class="label commit">8 · row transaction</span>
           <h3>Commit or abort independently</h3>
           <p>Via S3, successful rows commit. A failed or cancelled row restores its own committed baseline and discards provisional S4 work. Healthy sibling rows remain eligible to continue.</p>
         </li>
-        <li class="trace-item completion">
+        <li class="trace-item completion" data-lifecycle-step="9">
           <span class="label runtime">9 · lifecycle policy</span>
           <h3>Emit, release, and optionally backfill</h3>
           <p>Publish committed results to transport, release EOS/completed rows, clear ownership, then optionally admit new work or reuse storage. Backfill and slot reuse are runtime policy only.</p>
         </li>
-        <li class="trace-item completion">
+        <li class="trace-item completion" data-lifecycle-step="10">
           <span class="label package">10 · next turn</span>
           <h3>Continue from semantic state</h3>
           <p>A multi-turn request reuses committed semantic state. A prefix cache may accelerate reconstruction, but it is a separate optimization—not session identity, request identity, or proof of batching.</p>
@@ -726,6 +1372,128 @@
         <summary>Why “gather every carrier exactly once” matters</summary>
         <p>Applying different permutations to an attention mask, position input, RNG state, grammar constraint, LoRA selection, K/V state, or emitted output is a silent cross-request corruption bug. A canonical row plan gives every row-scoped carrier the same positional basis; preflight verifies extents before a partial move.</p>
       </details>
+    </section>
+
+    <section id="rowplan-animation" class="animation-section" aria-labelledby="rowplan-animation-title">
+      <p class="eyebrow">Positional movement, not request identity</p>
+      <h2 id="rowplan-animation-title">RowPlan moves every companion together</h2>
+      <p class="section-intro">This concrete selected-row example uses <code>RowPlan = [2, 2, 0]</code>. It reorders source row 2 before source row 0, duplicates row 2 with defined clone/fork behavior, and shrinks the current live selection by leaving source row 1 out. It does not make a physical slot part of metadata.</p>
+      <div id="rowplan-demo" class="rowplan-demo" data-stage="source">
+        <div class="motion-controls" aria-label="RowPlan animation controls">
+          <button id="rowplan-play" type="button" aria-pressed="false">Play mapping</button>
+          <button id="rowplan-previous" type="button">Previous</button>
+          <button id="rowplan-next" type="button">Next</button>
+          <button id="rowplan-reset" type="button">Reset</button>
+          <p id="rowplan-status" class="motion-status" role="status" aria-live="polite" aria-atomic="true">Stage 0 of 3 · Source logical rows are authoritative.</p>
+        </div>
+        <div class="rowplan-board">
+          <p class="mapping-callout"><strong>One plan, four carrier classes:</strong> the same positional selection is applied once to request inputs, semantic state, RNG / constraints, and effects / output journals.</p>
+          <div class="rowplan-columns">
+            <div class="logical-side">
+              <h3>Source logical rows</h3>
+              <div class="logical-rows">
+                <div class="logical-row" data-source="0">L0 · prompt A · committed state A</div>
+                <div class="logical-row skip" data-source="1">L1 · prompt B · not selected (shrink)</div>
+                <div class="logical-row" data-source="2">L2 · prompt C · committed state C</div>
+              </div>
+            </div>
+            <div class="rowplan-map-arrow" aria-hidden="true">→</div>
+            <div class="destination-side">
+              <h3>Destination live rows from <code>[2, 2, 0]</code></h3>
+              <div class="destination-rows">
+                <div class="destination-row">D0 ← L2 · first selected copy</div>
+                <div class="destination-row">D1 ← L2 · clone / fork copy</div>
+                <div class="destination-row">D2 ← L0 · reordered copy</div>
+              </div>
+            </div>
+          </div>
+          <div class="carrier-list" aria-label="Companion carriers sharing RowPlan 2, 2, 0">
+            <div class="carrier-track"><span class="carrier-name">Request inputs</span><span class="carrier-source">L0 A · L1 B · L2 C</span><span class="carrier-arrow" aria-hidden="true">→</span><span class="carrier-destination">D0 C · D1 C clone · D2 A</span></div>
+            <div class="carrier-track"><span class="carrier-name">Semantic state</span><span class="carrier-source">L0 S3-A · L1 S3-B · L2 S3-C</span><span class="carrier-arrow" aria-hidden="true">→</span><span class="carrier-destination">D0 S3-C · D1 S3-C clone · D2 S3-A</span></div>
+            <div class="carrier-track"><span class="carrier-name">RNG / constraints</span><span class="carrier-source">L0 R-A · L1 R-B · L2 R-C</span><span class="carrier-arrow" aria-hidden="true">→</span><span class="carrier-destination">D0 R-C · D1 R-C clone · D2 R-A</span></div>
+            <div class="carrier-track"><span class="carrier-name">Effects / output journals</span><span class="carrier-source">L0 J-A · L1 J-B · L2 J-C</span><span class="carrier-arrow" aria-hidden="true">→</span><span class="carrier-destination">D0 J-C · D1 J-C clone · D2 J-A</span></div>
+          </div>
+          <p class="scatter-result">Scatter returns results to logical ownership: D0 → L2, D1 → defined fork L2′, D2 → L0. L1 remains untouched because it was not selected. No carrier receives a different permutation.</p>
+        </div>
+        <p class="print-only"><strong>Static sequence:</strong> source logical rows → gather all four carrier classes by <code>[2, 2, 0]</code> → execute → scatter results to L2, defined fork L2′, and L0.</p>
+      </div>
+    </section>
+
+    <section id="transaction-animation" class="animation-section" aria-labelledby="transaction-animation-title">
+      <p class="eyebrow">Per-row atomic turn</p>
+      <h2 id="transaction-animation-title">Staged output crosses transport only after each row commits</h2>
+      <p class="section-intro">Three concurrent live rows can reach different outcomes without leaking state or output. The boundary is per logical row: an abort restores that row’s S3 baseline, while healthy siblings commit independently. A completed physical slot becomes reusable storage only after ownership is cleared.</p>
+      <div id="transaction-demo" class="transaction-demo" data-stage="baseline">
+        <div class="motion-controls" aria-label="Per-row transaction animation controls">
+          <button id="transaction-play" type="button" aria-pressed="false">Play transaction</button>
+          <button id="transaction-previous" type="button">Previous</button>
+          <button id="transaction-next" type="button">Next</button>
+          <button id="transaction-reset" type="button">Reset</button>
+          <p id="transaction-status" class="motion-status" role="status" aria-live="polite" aria-atomic="true">Stage 0 of 3 · Each live row starts from its own committed S3 baseline.</p>
+        </div>
+        <div class="transaction-board">
+          <p class="transaction-key"><span class="phase-badge row">per row</span> S3 is committed semantic state. S4 journals are provisional. The solid line is the transport boundary; the dotted outline is safe storage reuse.</p>
+          <div class="transaction-grid">
+            <article class="transaction-row">
+              <h3>Logical L0 · physical slot S0</h3>
+              <p>Healthy row continues after its own turn.</p>
+              <div class="state-cell">S3 baseline: sequence 10</div>
+              <div class="journal-cell">S4 journal: token 41 and event staged</div>
+              <div class="transport-boundary">Transport boundary · blocked while staged</div>
+              <div class="published-cell">Committed token 41 / event → transport</div>
+              <div class="outcome-cell">COMMIT · S3 advances to sequence 11</div>
+            </article>
+            <article class="transaction-row cancelled">
+              <h3>Logical L1 · physical slot S1</h3>
+              <p>Cancellation affects this row alone.</p>
+              <div class="state-cell">S3 baseline: sequence 31</div>
+              <div class="journal-cell">S4 journal: token 77 and event staged</div>
+              <div class="transport-boundary">Transport boundary · blocked while staged</div>
+              <div class="published-cell">No publication: journal discarded</div>
+              <div class="outcome-cell">ABORT · discard S4; restore S3 sequence 31</div>
+            </article>
+            <article class="transaction-row eos">
+              <h3>Logical L2 · physical slot S2</h3>
+              <p>Healthy row commits, reaches EOS, then releases.</p>
+              <div class="state-cell">S3 baseline: sequence 4</div>
+              <div class="journal-cell">S4 journal: token 52 and EOS staged</div>
+              <div class="transport-boundary">Transport boundary · blocked while staged</div>
+              <div class="published-cell">Committed token 52 / EOS → transport</div>
+              <div class="outcome-cell">COMMIT · EOS makes release eligible</div>
+            </article>
+          </div>
+          <div class="slot-reuse">Post-commit only: L2 releases and clears S2 (dotted reuse boundary). A new logical L3 may occupy S2 with a <strong>fresh baseline</strong>; it inherits neither L2 state nor its journal.</div>
+        </div>
+        <p class="print-only"><strong>Static sequence:</strong> baseline → staged journals blocked at transport → L0/L2 commit and publish while L1 aborts and restores S3 → L2 releases; L3 may reuse clean S2.</p>
+      </div>
+    </section>
+
+    <section id="setup-animation" class="animation-section" aria-labelledby="setup-animation-title">
+      <p class="eyebrow">Runtime memory and movement</p>
+      <h2 id="setup-animation-title">Reserve, gather, transfer, execute, then scatter</h2>
+      <p class="section-intro">These are runtime mechanics around the semantic contract. Allocation and transfer are explicit; graph capture is shown because it can optimize a stable execution shape, not because metadata requires capture or a particular backend strategy.</p>
+      <div id="setup-demo" class="setup-demo" data-stage="reserve" data-graph="true">
+        <div class="motion-controls" aria-label="Memory and setup animation controls">
+          <button id="setup-play" type="button" aria-pressed="false">Play setup</button>
+          <button id="setup-previous" type="button">Previous</button>
+          <button id="setup-next" type="button">Next</button>
+          <button id="setup-reset" type="button">Reset</button>
+          <label class="choice"><input id="setup-graph" type="checkbox" checked> Show optional graph capture / replay</label>
+          <p id="setup-status" class="motion-status" role="status" aria-live="polite" aria-atomic="true">Stage 0 of 5 · Reserve capacity under runtime policy.</p>
+        </div>
+        <div class="setup-board">
+          <div class="setup-track" aria-label="Memory setup stages">
+            <article class="setup-node" data-setup-step="0"><span class="phase-badge request">per request</span><h3>Reserve</h3><p>Admit under runtime capacity policy; logical ownership remains separate from storage.</p></article>
+            <article class="setup-node" data-setup-step="1"><span class="phase-badge iteration">per iteration</span><h3>Allocate + gather</h3><p>Allocate destination views and gather every selected companion by the RowPlan.</p></article>
+            <article class="setup-node" data-setup-step="2"><span class="phase-badge iteration">per iteration</span><h3>Host → device</h3><p>Transfer the gathered carrier set explicitly to the execution device.</p></article>
+            <article class="setup-node optional" data-setup-step="3"><span class="phase-badge iteration">optional</span><h3>Capture / replay graph</h3><p>Eligible runtime optimization; direct execution remains valid when skipped.</p></article>
+            <article class="setup-node" data-setup-step="4"><span class="phase-badge iteration">per iteration</span><h3>Execute</h3><p>Run the selected shared or isolated forward while preserving row-local semantics.</p></article>
+            <article class="setup-node" data-setup-step="5"><span class="phase-badge iteration">per iteration</span><h3>Scatter + stage</h3><p>Return state/output to logical rows; journal effects until the per-row commit.</p></article>
+          </div>
+          <p class="setup-note"><strong>Graph capture/replay is optional:</strong> it is a runtime optimization chosen only when eligible. Metadata declares portable legality and ABI facts; it does not require graph capture, reserve a slot, or dictate a transfer policy.</p>
+        </div>
+        <p class="print-only"><strong>Static sequence:</strong> reserve → allocate/gather → explicit host-to-device transfer → optional graph capture/replay or direct execute → execute → scatter/stage.</p>
+      </div>
     </section>
 
     <section id="authors" aria-labelledby="authors-title">
@@ -843,10 +1611,155 @@
   <script>
     (() => {
       "use strict";
+      const byId = id => document.getElementById(id);
+      const clamp = (value, maximum) => Math.max(0, Math.min(value, maximum));
+      const reduceMotionButton = byId("reduce-motion");
+      const systemReducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
+      let explicitlyReducedMotion = false;
+      const isReducedMotion = () => explicitlyReducedMotion || systemReducedMotion.matches;
+      const restartMotion = roots => {
+        roots.forEach(root => root.classList.remove("motion-run"));
+        if (isReducedMotion()) return;
+        roots.forEach(root => {
+          void root.offsetWidth;
+          root.classList.add("motion-run");
+        });
+      };
+
+      const lifecycleFrames = [
+        ["One-time", "Parse package metadata and resolve portable plans."],
+        ["One-time", "Preflight validates row semantics before allocation or mutation."],
+        ["Per request", "Prepare the request and run loop.setup exactly once."],
+        ["Per iteration", "Runtime chooses a shared or isolated path for live rows now."],
+        ["Per iteration", "Build the transient positional RowPlan."],
+        ["Per iteration", "Allocate, gather companions, transfer, and optionally capture."],
+        ["Per iteration", "Execute one shared forward or valid isolated forwards."],
+        ["Per iteration", "Scatter state and stage output/effects in per-row journals."],
+        ["Per row", "Commit a successful row or abort and restore its S3 baseline."],
+        ["Post-commit", "Publish, release, clear ownership, and optionally backfill."],
+        ["Per request", "Continue a multi-turn request from committed semantic state."]
+      ];
+      const lifecycleFlow = byId("lifecycle-flow");
+      const lifecycleTrace = byId("lifecycle-trace");
+      const lifecycleStatus = byId("lifecycle-status");
+      const lifecyclePlay = byId("lifecycle-play");
+      const lifecyclePrevious = byId("lifecycle-previous");
+      const lifecycleNext = byId("lifecycle-next");
+      const lifecycleReset = byId("lifecycle-reset");
+      const lifecycleSpeed = byId("lifecycle-speed");
+      const lifecycleItems = [...document.querySelectorAll("[data-lifecycle-step]")];
+      const lifecycleNodes = [...document.querySelectorAll("[data-flow-step]")];
+      let lifecycleIndex = 0;
+      let lifecycleTimer = null;
+      let lifecyclePlaying = false;
+
+      const stopLifecycle = () => {
+        if (lifecycleTimer !== null) {
+          window.clearTimeout(lifecycleTimer);
+          lifecycleTimer = null;
+        }
+        lifecyclePlaying = false;
+        lifecyclePlay.textContent = "Play";
+        lifecyclePlay.setAttribute("aria-pressed", "false");
+      };
+      const renderLifecycle = (animate = false) => {
+        lifecycleItems.forEach(item => {
+          const itemIndex = Number(item.dataset.lifecycleStep);
+          item.classList.toggle("is-current", itemIndex === lifecycleIndex);
+          item.classList.toggle("is-past", itemIndex < lifecycleIndex);
+        });
+        lifecycleNodes.forEach(node => {
+          const nodeIndex = Number(node.dataset.flowStep);
+          node.classList.toggle("is-current", nodeIndex === lifecycleIndex);
+          node.classList.toggle("is-past", nodeIndex < lifecycleIndex);
+        });
+        const [phase, detail] = lifecycleFrames[lifecycleIndex];
+        lifecycleStatus.textContent = `Step ${lifecycleIndex} of ${lifecycleFrames.length - 1} · ${phase} · ${detail}`;
+        lifecyclePrevious.disabled = lifecycleIndex === 0;
+        lifecycleNext.disabled = lifecycleIndex === lifecycleFrames.length - 1;
+        if (animate) restartMotion([lifecycleFlow, lifecycleTrace]);
+      };
+      const setLifecycle = (index, animate = true) => {
+        lifecycleIndex = clamp(index, lifecycleFrames.length - 1);
+        renderLifecycle(animate);
+      };
+      const scheduleLifecycle = () => {
+        if (!lifecyclePlaying) return;
+        if (lifecycleIndex >= lifecycleFrames.length - 1) {
+          stopLifecycle();
+          lifecycleStatus.textContent = `${lifecycleStatus.textContent} Playback complete.`;
+          return;
+        }
+        lifecycleTimer = window.setTimeout(() => {
+          lifecycleTimer = null;
+          setLifecycle(lifecycleIndex + 1);
+          scheduleLifecycle();
+        }, Math.round(1600 / Number(lifecycleSpeed.value)));
+      };
+      const toggleLifecycle = () => {
+        if (lifecyclePlaying) {
+          stopLifecycle();
+          return;
+        }
+        if (isReducedMotion()) {
+          setLifecycle(lifecycleFrames.length - 1, false);
+          lifecycleStatus.textContent = `${lifecycleStatus.textContent} Reduced motion advances playback without transitions.`;
+          return;
+        }
+        if (lifecycleIndex >= lifecycleFrames.length - 1) setLifecycle(0);
+        lifecyclePlaying = true;
+        lifecyclePlay.textContent = "Pause";
+        lifecyclePlay.setAttribute("aria-pressed", "true");
+        restartMotion([lifecycleFlow, lifecycleTrace]);
+        scheduleLifecycle();
+      };
+      lifecyclePlay.addEventListener("click", toggleLifecycle);
+      lifecyclePrevious.addEventListener("click", () => {
+        stopLifecycle();
+        setLifecycle(lifecycleIndex - 1);
+      });
+      lifecycleNext.addEventListener("click", () => {
+        stopLifecycle();
+        setLifecycle(lifecycleIndex + 1);
+      });
+      lifecycleReset.addEventListener("click", () => {
+        stopLifecycle();
+        setLifecycle(0);
+      });
+      lifecycleSpeed.addEventListener("change", () => {
+        if (lifecyclePlaying) {
+          stopLifecycle();
+          lifecyclePlaying = true;
+          lifecyclePlay.textContent = "Pause";
+          lifecyclePlay.setAttribute("aria-pressed", "true");
+          scheduleLifecycle();
+        }
+      });
+      byId("lifecycle-controls").addEventListener("keydown", event => {
+        const keyActions = {
+          ArrowLeft: () => lifecyclePrevious.click(),
+          ArrowRight: () => lifecycleNext.click(),
+          Home: () => {
+            stopLifecycle();
+            setLifecycle(0);
+          },
+          End: () => {
+            stopLifecycle();
+            setLifecycle(lifecycleFrames.length - 1);
+          }
+        };
+        if (keyActions[event.key]) {
+          event.preventDefault();
+          keyActions[event.key]();
+        }
+      });
+
       const form = document.getElementById("path-form");
       const result = document.getElementById("simulation-result");
       const presets = document.querySelectorAll("[data-preset]");
       const nodes = document.querySelectorAll("[data-node]");
+      const decisionAnimation = byId("decision-animation");
+      const decisionCaption = decisionAnimation.querySelector("p");
 
       const selected = name => new FormData(form).get(name);
 
@@ -859,7 +1772,7 @@
         nodes.forEach(node => node.classList.toggle("active", active.includes(node.dataset.node)));
       };
 
-      const showResult = (kind, title, detail, activeNodes) => {
+      const showResult = (kind, title, detail, activeNodes, animate) => {
         result.className = `result ${kind}`;
         result.replaceChildren();
         const icon = document.createElement("div");
@@ -874,9 +1787,15 @@
         copy.append(heading, paragraph);
         result.append(icon, copy);
         paintNodes(activeNodes);
+        const path = kind || "shared";
+        decisionAnimation.dataset.path = path;
+        decisionCaption.textContent = path === "fail"
+          ? "A required participant is unsupported even in isolation: reject before mutation; do not invent a shared path."
+          : "Metadata says CAN. Runtime decides WHETHER / WHEN; both valid paths rejoin at the same per-row semantic result and commit boundary.";
+        if (animate) restartMotion([decisionAnimation]);
       };
 
-      const update = () => {
+      const update = (animate = true) => {
         const metadata = selected("metadata");
         const backend = selected("backend");
         const policy = selected("policy");
@@ -888,7 +1807,8 @@
             "",
             "Shared live-row path",
             "The runtime may form a compatible live batch, apply one RowPlan to all row-scoped carriers, run a shared forward, then scatter and commit each logical row independently.",
-            ["metadata", "backend", "compatibility", "execute"]
+            ["metadata", "backend", "compatibility", "execute"],
+            animate
           );
         } else if (isolated === "valid") {
           const reason = metadata !== "valid"
@@ -902,14 +1822,16 @@
             "isolated",
             "Valid isolated path",
             `${reason} Each request executes with the same declared state, effect, and output semantics.`,
-            metadata === "valid" ? ["metadata", "execute"] : ["execute"]
+            metadata === "valid" ? ["metadata", "execute"] : ["execute"],
+            animate
           );
         } else {
           showResult(
             "fail",
             "Fail before mutation",
             "A required semantic participant cannot execute even in isolation. This is a true contract failure—not a reason to encode scheduler policy or slot identity in metadata.",
-            []
+            [],
+            animate
           );
         }
       };
@@ -943,7 +1865,198 @@
         update();
       });
       presets.forEach(button => button.addEventListener("click", () => applyPreset(button.dataset.preset)));
-      update();
+      update(false);
+
+      const steppers = [];
+      const createStepper = ({
+        rootId, playId, previousId, nextId, resetId, statusId, stages, describe, playLabel,
+        activeSelector, activeAttribute
+      }) => {
+        const root = byId(rootId);
+        const play = byId(playId);
+        const previous = byId(previousId);
+        const next = byId(nextId);
+        const reset = byId(resetId);
+        const status = byId(statusId);
+        const stageItems = activeSelector ? [...root.querySelectorAll(activeSelector)] : [];
+        let index = 0;
+        let playing = false;
+        let timer = null;
+        const stop = () => {
+          if (timer !== null) {
+            window.clearTimeout(timer);
+            timer = null;
+          }
+          playing = false;
+          play.textContent = playLabel;
+          play.setAttribute("aria-pressed", "false");
+        };
+        const render = (animate = false) => {
+          root.dataset.stage = stages[index];
+          stageItems.forEach(item => {
+            const itemIndex = Number(item.dataset[activeAttribute]);
+            item.classList.toggle("is-active", itemIndex === index);
+            item.classList.toggle("is-past", itemIndex < index);
+          });
+          status.textContent = `Stage ${index} of ${stages.length - 1} · ${describe(index)}`;
+          previous.disabled = index === 0;
+          next.disabled = index === stages.length - 1;
+          if (animate) restartMotion([root]);
+        };
+        const set = (value, animate = true) => {
+          index = clamp(value, stages.length - 1);
+          render(animate);
+        };
+        const schedule = () => {
+          if (!playing) return;
+          if (index >= stages.length - 1) {
+            stop();
+            status.textContent = `${status.textContent} Playback complete.`;
+            return;
+          }
+          timer = window.setTimeout(() => {
+            timer = null;
+            set(index + 1);
+            schedule();
+          }, 1450);
+        };
+        const toggle = () => {
+          if (playing) {
+            stop();
+            return;
+          }
+          if (isReducedMotion()) {
+            set(stages.length - 1, false);
+            status.textContent = `${status.textContent} Reduced motion advances playback without transitions.`;
+            return;
+          }
+          if (index >= stages.length - 1) set(0);
+          playing = true;
+          play.textContent = `Pause ${playLabel.toLowerCase()}`;
+          play.setAttribute("aria-pressed", "true");
+          restartMotion([root]);
+          schedule();
+        };
+        play.addEventListener("click", toggle);
+        previous.addEventListener("click", () => {
+          stop();
+          set(index - 1);
+        });
+        next.addEventListener("click", () => {
+          stop();
+          set(index + 1);
+        });
+        reset.addEventListener("click", () => {
+          stop();
+          set(0);
+        });
+        [play, previous, next, reset].forEach(control => control.addEventListener("keydown", event => {
+          if (event.key === "Home" || event.key === "End") {
+            event.preventDefault();
+            stop();
+            set(event.key === "Home" ? 0 : stages.length - 1);
+          }
+        }));
+        render(false);
+        const api = { stop, render: () => render(false) };
+        steppers.push(api);
+        return api;
+      };
+
+      createStepper({
+        rootId: "rowplan-demo",
+        playId: "rowplan-play",
+        previousId: "rowplan-previous",
+        nextId: "rowplan-next",
+        resetId: "rowplan-reset",
+        statusId: "rowplan-status",
+        stages: ["source", "gather", "execute", "scatter"],
+        playLabel: "Play mapping",
+        describe: index => [
+          "Source logical rows are authoritative.",
+          "Gather all four carrier classes by one positional plan: [2, 2, 0].",
+          "Destination live rows execute with the gathered companion closure.",
+          "Scatter results back to L2, defined fork L2′, and L0; L1 remains untouched."
+        ][index]
+      });
+      createStepper({
+        rootId: "transaction-demo",
+        playId: "transaction-play",
+        previousId: "transaction-previous",
+        nextId: "transaction-next",
+        resetId: "transaction-reset",
+        statusId: "transaction-status",
+        stages: ["baseline", "staged", "commit", "release"],
+        playLabel: "Play transaction",
+        describe: index => [
+          "Each live row starts from its own committed S3 baseline.",
+          "All tokens and events are staged in S4 journals; transport remains blocked.",
+          "L0 and L2 commit and publish; cancelled L1 discards S4 and restores S3.",
+          "L2 reaches EOS, clears S2, and permits clean backfill without state inheritance."
+        ][index]
+      });
+      const setupStepper = createStepper({
+        rootId: "setup-demo",
+        playId: "setup-play",
+        previousId: "setup-previous",
+        nextId: "setup-next",
+        resetId: "setup-reset",
+        statusId: "setup-status",
+        stages: ["reserve", "gather", "transfer", "graph", "execute", "scatter"],
+        playLabel: "Play setup",
+        activeSelector: "[data-setup-step]",
+        activeAttribute: "setupStep",
+        describe: index => {
+          const graphEnabled = byId("setup-graph").checked;
+          const descriptions = [
+            "Reserve capacity under runtime policy.",
+            "Allocate destination views and gather the entire companion closure.",
+            "Transfer gathered values explicitly from host to device.",
+            graphEnabled
+              ? "Use eligible optional graph capture/replay as a runtime optimization."
+              : "Skip graph capture; direct execution remains semantically valid.",
+            "Run the selected shared or isolated forward.",
+            "Scatter state/output to logical rows and stage effects until commit."
+          ];
+          return descriptions[index];
+        }
+      });
+      byId("setup-graph").addEventListener("change", event => {
+        byId("setup-demo").dataset.graph = String(event.target.checked);
+        setupStepper.render();
+      });
+
+      const stopAllPlayback = () => {
+        stopLifecycle();
+        steppers.forEach(stepper => stepper.stop());
+      };
+      const renderAllWithoutMotion = () => {
+        renderLifecycle(false);
+        steppers.forEach(stepper => stepper.render());
+        decisionAnimation.classList.remove("motion-run");
+      };
+      const updateReducedMotionControl = () => {
+        document.body.classList.toggle("reduce-motion", explicitlyReducedMotion);
+        reduceMotionButton.setAttribute("aria-pressed", String(explicitlyReducedMotion));
+        reduceMotionButton.textContent = `Reduce motion: ${explicitlyReducedMotion ? "on" : "off"}`;
+      };
+      reduceMotionButton.addEventListener("click", () => {
+        explicitlyReducedMotion = !explicitlyReducedMotion;
+        stopAllPlayback();
+        updateReducedMotionControl();
+        renderAllWithoutMotion();
+      });
+      const handleSystemMotionChange = () => {
+        if (systemReducedMotion.matches) stopAllPlayback();
+        renderAllWithoutMotion();
+      };
+      if (systemReducedMotion.addEventListener) {
+        systemReducedMotion.addEventListener("change", handleSystemMotionChange);
+      } else {
+        systemReducedMotion.addListener(handleSystemMotionChange);
+      }
+      updateReducedMotionControl();
+      renderLifecycle(false);
     })();
   </script>
 </body>
