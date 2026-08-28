@@ -511,6 +511,18 @@ mod tests {
         .map_err(Into::into)
     }
 
+    fn generated_tokens(tokenizer: &Tokenizer, text: &str) -> anyhow::Result<Vec<TokenId>> {
+        let tokens = tokenizer.encode(text)?;
+        Ok(tokens
+            .into_iter()
+            .filter(|token| {
+                tokenizer
+                    .decode(&[*token])
+                    .is_ok_and(|piece| !piece.is_empty())
+            })
+            .collect())
+    }
+
     #[test]
     fn sampled_fastpath_error_falls_back_to_seeded_host_sampling() -> anyhow::Result<()> {
         let canonical = canonical_runtime();
@@ -802,10 +814,10 @@ mod tests {
     -> anyhow::Result<()> {
         let tokenizer = tool_protocol_tokenizer()?;
         let envelope = r#"<tool_call>{"name":"weather","arguments":{"city":"Paris"}}</tool_call>"#;
-        let mut tokens = tokenizer.encode(envelope)?;
+        let mut tokens = generated_tokens(&tokenizer, envelope)?;
         assert_eq!(tokenizer.decode(&tokens)?, envelope);
         let envelope_len = tokens.len();
-        tokens.push(tokenizer.encode("x")?[0]);
+        tokens.push(generated_tokens(&tokenizer, "x")?[0]);
         let options = GenerateOptions {
             max_new_tokens: tokens.len(),
             greedy: true,
@@ -852,7 +864,7 @@ mod tests {
     #[test]
     fn production_generation_host_aborts_policy_failure_without_callback() -> anyhow::Result<()> {
         let tokenizer = tool_protocol_tokenizer()?;
-        let tokens = tokenizer.encode("ordinary assistant text")?;
+        let tokens = generated_tokens(&tokenizer, "ordinary assistant text")?;
         assert_eq!(tokenizer.decode(&tokens)?, "ordinary assistant text");
         let options = GenerateOptions {
             max_new_tokens: tokens.len(),
@@ -898,7 +910,7 @@ mod tests {
     fn tool_call_callback_failure_is_post_commit_and_not_replayed() -> anyhow::Result<()> {
         let tokenizer = tool_protocol_tokenizer()?;
         let envelope = r#"<tool_call>{"name":"weather","arguments":{"city":"Paris"}}</tool_call>"#;
-        let tokens = tokenizer.encode(envelope)?;
+        let tokens = generated_tokens(&tokenizer, envelope)?;
         let options = GenerateOptions {
             max_new_tokens: tokens.len() + 1,
             greedy: true,
@@ -908,7 +920,7 @@ mod tests {
         };
         let chain = build_processor_chain(&options, None, false)?;
         let mut scripted = tokens.clone();
-        scripted.push(tokenizer.encode("x")?[0]);
+        scripted.push(generated_tokens(&tokenizer, "x")?[0]);
         let mut backend = MockBackend::with_logits(
             false,
             SampledOutcome::HardError,
