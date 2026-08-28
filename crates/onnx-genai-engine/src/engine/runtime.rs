@@ -1493,6 +1493,29 @@ impl Engine {
         }
     }
 
+    /// Generate through the ordinary Engine surface with a request-scoped
+    /// cancellation authority and transaction checkpoints.
+    pub fn generate_with_control_callbacks(
+        &mut self,
+        request: GenerateRequest,
+        control: crate::pipeline::GenerationControl,
+        admission_callback: Option<&mut dyn FnMut()>,
+        token_callback: Option<&mut GenerateTokenCallback<'_>>,
+    ) -> anyhow::Result<GenerateResult> {
+        if self.holds_decode_core() {
+            return Err(crate::pipeline::GenerationControlUnsupported {
+                operation: "Engine::generate_with_control_callbacks",
+                runtime: "the fused decode backend",
+            }
+            .into());
+        }
+        self.generate_with_pipeline_callbacks(
+            crate::pipeline::PipelineGenerateRequest::new(request).with_generation_control(control),
+            admission_callback,
+            token_callback,
+        )
+    }
+
     /// Generate text in a persistent session, reusing the session's accumulated KV state.
     pub fn generate_in_session(
         &mut self,
@@ -1544,6 +1567,31 @@ impl Engine {
             request,
             Priority::Normal,
             None,
+            admission_callback,
+            token_callback,
+        )
+    }
+
+    /// Continue an interpreted workflow session with request-scoped
+    /// cancellation and transaction checkpoints.
+    pub fn generate_in_session_with_control_callbacks(
+        &mut self,
+        session_id: SessionId,
+        request: GenerateRequest,
+        control: crate::pipeline::GenerationControl,
+        admission_callback: Option<&mut dyn FnMut()>,
+        token_callback: Option<&mut GenerateTokenCallback<'_>>,
+    ) -> anyhow::Result<GenerateResult> {
+        if self.holds_decode_core() {
+            return Err(crate::pipeline::GenerationControlUnsupported {
+                operation: "Engine::generate_in_session_with_control_callbacks",
+                runtime: "the fused decode backend",
+            }
+            .into());
+        }
+        self.generate_in_workflow_session(
+            session_id,
+            crate::pipeline::PipelineGenerateRequest::new(request).with_generation_control(control),
             admission_callback,
             token_callback,
         )

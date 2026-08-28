@@ -288,6 +288,9 @@ pub(crate) struct WorkerRuntimeState {
     /// This worker is thread-bound, so the execution plan can take the journal
     /// immediately without a second synchronization protocol.
     pub(crate) last_output_publications: RefCell<Vec<WorkflowOutputPublication>>,
+    /// DFlash execution evidence is staged with the turn and becomes visible
+    /// only after the same semantic commit as state and output.
+    pub(crate) last_dflash_block_traces: RefCell<Vec<super::speculative::DFlashBlockTrace>>,
     /// Sessions with a pass in flight, for leases declared `policy: exclusive`.
     ///
     /// Two turns of one conversation that both read the history before either
@@ -349,6 +352,7 @@ impl Default for WorkerRuntimeState {
             session_effects: RefCell::new(HashMap::new()),
             session_outputs: RefCell::new(HashMap::new()),
             last_output_publications: RefCell::new(Vec::new()),
+            last_dflash_block_traces: RefCell::new(Vec::new()),
             session_leases: RefCell::new(HashSet::new()),
             session_turn_versions: RefCell::new(HashMap::new()),
             iteration_runtimes: RefCell::new(BTreeMap::new()),
