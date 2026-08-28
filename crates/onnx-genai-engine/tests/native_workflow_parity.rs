@@ -284,7 +284,6 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: {}
-      capabilities: [workflow_ssa, typed_emit]
     inputs:
       logits:
         contract: { dtype: float32, shape: [batch, vocabulary] }
@@ -352,9 +351,6 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: {}
-      capabilities:
-        [workflow_ssa, typed_emit,
-         nested_control_flow, session_state_lease, linear_effects]
     inputs:
       initial: { contract: { dtype: int64, shape: [] }, role: { kind: opaque },
                  source: { kind: application, name: initial }, required: true }
@@ -476,7 +472,6 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: {}
-      capabilities: [workflow_ssa, typed_emit]
     inputs:
       input:
         contract: { dtype: int64, shape: [4] }

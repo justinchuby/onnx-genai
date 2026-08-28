@@ -90,8 +90,8 @@ Generation-side design: [`SCHEDULING.md`](genai/SCHEDULING.md),
 [`MODEL_PACKAGE.md`](genai/MODEL_PACKAGE.md),
 [`INFERENCE_METADATA_DECISIONS.md`](genai/INFERENCE_METADATA_DECISIONS.md)
 (normative metadata specification),
-[`RUNTIME_CAPABILITY_CATALOGUE.md`](genai/RUNTIME_CAPABILITY_CATALOGUE.md)
-(synchronized reader admission vocabulary),
+[`METADATA_EXTENSION_REGISTRY.md`](genai/METADATA_EXTENSION_REGISTRY.md)
+(generated optional semantic-extension registry and core-conformance guide),
 [`ENCODER_BATCHING.md`](genai/ENCODER_BATCHING.md)
 (generic component batching for image, video, audio, and text encoders — the
 metadata surface is implemented and runtime grouping remains open:

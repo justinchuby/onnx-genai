@@ -2505,7 +2505,6 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: {}
-      capabilities: [workflow_ssa, typed_emit]
     inputs:
       rows:
         contract:

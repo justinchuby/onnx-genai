@@ -1676,7 +1676,7 @@ fn lease_bound_session(
     sessions
         .acquire(binding, client_id)
         .map(Some)
-        .map_err(package_capability_failure)
+        .map_err(package_execution_failure)
 }
 
 /// Refuse a session id that names a conversation inside a *different* model.
@@ -1788,7 +1788,7 @@ async fn get_or_create_session(
         ensure_session_belongs_to_model(handle, &binding, client_id)?;
         return sessions
             .acquire(binding, client_id)
-            .map_err(package_capability_failure);
+            .map_err(package_execution_failure);
     }
 
     let opened = handle
@@ -1802,7 +1802,7 @@ async fn get_or_create_session(
     // from the moment it exists, whichever way the claim below resolves.
     let lease = sessions
         .acquire(binding.clone(), client_id)
-        .map_err(package_capability_failure)?;
+        .map_err(package_execution_failure)?;
     // Claim decides; a caller that lost the race, and a caller the registry
     // refused outright, both close the session they opened rather than leaving
     // it to accumulate a conversation nobody will read.
@@ -1812,7 +1812,7 @@ async fn get_or_create_session(
             ensure_session_belongs_to_model(handle, &existing, client_id)?;
             sessions
                 .acquire(existing, client_id)
-                .map_err(package_capability_failure)
+                .map_err(package_execution_failure)
         }
         Ok(crate::session::SessionClaim::Claimed { evicted }) => {
             close_evicted_session(&state.registry, evicted).await?;

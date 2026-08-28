@@ -411,10 +411,7 @@ fn metadata(geometry: Geometry) -> String {
 schema_version: v1.4
 pipeline:
   workflow:
-    manifest:
-      capabilities:
-        [workflow_ssa, typed_emit, serving_service_contract, input_presence,
-         session_state_lease, token_context]
+    manifest: {{}}
     inputs:
       token_ids:
         contract:

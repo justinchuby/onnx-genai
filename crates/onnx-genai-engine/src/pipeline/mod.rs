@@ -337,7 +337,7 @@ mod dflash_constructor_admission_tests {
     }
 
     fn assert_not_dflash_refusal(error: anyhow::Error) {
-        assert!(crate::engine::package_capability_error(&error).is_none());
+        assert!(crate::engine::package_execution_error(&error).is_none());
     }
 
     #[test]
@@ -1100,12 +1100,10 @@ impl WorkflowRuntime {
     pub(crate) fn reject_dflash_raw_execution(&self, operation: &str) -> anyhow::Result<()> {
         self.require_execution_admitted()?;
         if self.is_dflash() {
-            return Err(
-                crate::engine::PackageCapabilityError::DFlashRawWorkflowApi {
-                    operation: operation.to_string(),
-                }
-                .into(),
-            );
+            return Err(crate::engine::PackageExecutionError::DFlashRawWorkflowApi {
+                operation: operation.to_string(),
+            }
+            .into());
         }
         Ok(())
     }
@@ -2134,8 +2132,7 @@ opset_import { domain: "" version: 13 }
                 r#"
 pipeline:
   workflow:
-    manifest:
-      capabilities: [workflow_ssa, typed_emit]
+    manifest: {}
     inputs:
       logits:
         contract: {{ dtype: float32, shape: [{BATCH}, {VOCAB}] }}
@@ -2923,8 +2920,8 @@ mod state_split_contracts {
             anyhow::bail!("a second holder of an exclusive lease must be refused");
         };
         assert!(matches!(
-            refused.downcast_ref::<crate::engine::PackageCapabilityError>(),
-            Some(crate::engine::PackageCapabilityError::ExclusiveLeaseConflict { session })
+            refused.downcast_ref::<crate::engine::PackageExecutionError>(),
+            Some(crate::engine::PackageExecutionError::ExclusiveLeaseConflict { session })
                 if session == "session-a"
         ));
         // A different conversation is not blocked by this one.

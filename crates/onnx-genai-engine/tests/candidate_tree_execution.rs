@@ -8,8 +8,8 @@ use onnx_genai_engine::pipeline::{
 };
 use onnx_genai_engine::{
     Engine, EngineConfig, FinishReason, GenerateOptions, GeneratePrompt, GenerateRequest,
-    GenerationBoundary, GenerationControl, PackageCapabilityError, PipelineGenerateRequest,
-    SessionForkError, SessionPosition, package_capability_error,
+    GenerationBoundary, GenerationControl, PackageExecutionError, PipelineGenerateRequest,
+    SessionForkError, SessionPosition, package_execution_error,
 };
 use rand::rngs::StdRng;
 use rand::{Rng as _, SeedableRng as _};
@@ -18,8 +18,7 @@ const PARENT_METADATA: &str = r#"
 schema_version: v1.6
 pipeline:
   workflow:
-    manifest:
-      capabilities: [workflow_ssa, serving_service_contract, canonical_speculation, session_state_lease]
+    manifest: {}
     inputs:
       request.tokens:
         contract: {dtype: int64, shape: [batch, sequence], batch_layout: {kind: request_aligned, axis: 0}}
@@ -272,8 +271,7 @@ const ANCESTOR_METADATA: &str = r#"
 schema_version: v1.6
 pipeline:
   workflow:
-    manifest:
-      capabilities: [workflow_ssa, serving_service_contract, canonical_speculation, session_state_lease]
+    manifest: {}
     inputs:
       prompt:
         contract: {dtype: int64, shape: [batch, sequence], batch_layout: {kind: request_aligned, axis: 0}}
@@ -587,8 +585,8 @@ fn assert_preload_candidate_refusal(
         Engine::from_dir(root, EngineConfig::default()),
         "candidate-tree composition must fail before component loading",
     );
-    let reason = match package_capability_error(&error) {
-        Some(PackageCapabilityError::CandidateTreeExecutionUnavailable { reason, .. }) => reason,
+    let reason = match package_execution_error(&error) {
+        Some(PackageExecutionError::CandidateTreeExecutionUnavailable { reason, .. }) => reason,
         other => panic!("expected typed pre-load candidate-tree refusal, got {other:?}: {error:#}"),
     };
     for fragment in expected {
@@ -1182,8 +1180,8 @@ fn raw_pipeline_apis_typed_refuse_before_candidate_components_run() -> anyhow::R
         ),
     ] {
         assert!(matches!(
-            package_capability_error(&error),
-            Some(PackageCapabilityError::CandidateTreeRawWorkflowApi {
+            package_execution_error(&error),
+            Some(PackageExecutionError::CandidateTreeRawWorkflowApi {
                 operation: actual
             }) if actual == operation
         ));

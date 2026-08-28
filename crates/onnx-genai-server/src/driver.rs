@@ -237,7 +237,7 @@ pub(crate) enum DriverFailureKind {
     /// The caller asked the loaded package for something it cannot serve as
     /// asked. Carried as the engine's own type so a status code never depends
     /// on the wording of a message.
-    PackageCapability(onnx_genai_engine::PackageCapabilityError),
+    PackageExecution(onnx_genai_engine::PackageExecutionError),
 }
 
 #[derive(Debug, Clone)]
@@ -284,7 +284,7 @@ impl DriverFailure {
                 )
             )
         });
-        let capability = onnx_genai_engine::package_capability_error(error);
+        let capability = onnx_genai_engine::package_execution_error(error);
         Self {
             // Anyhow's Display shows only the outermost context, which for a
             // decode failure is the generic "forward pass failed" wrapper. The
@@ -298,7 +298,7 @@ impl DriverFailure {
                 None => format!("{error:#}"),
             },
             kind: match (capability, memory_overload) {
-                (Some(capability), _) => DriverFailureKind::PackageCapability(capability),
+                (Some(capability), _) => DriverFailureKind::PackageExecution(capability),
                 (None, true) => DriverFailureKind::MemoryOverload,
                 (None, false) => DriverFailureKind::Internal,
             },

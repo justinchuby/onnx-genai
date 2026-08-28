@@ -56,8 +56,7 @@ model:
       replicated: [router, shared_expert]
 pipeline:
   workflow:
-    manifest:
-      capabilities: [workflow_ssa, typed_emit, serving_service_contract]
+    manifest: {}
     inputs:
       request.active:
         contract: {dtype: bool, shape: [batch], batch_layout: {kind: request_aligned, axis: 0}}

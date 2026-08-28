@@ -8,11 +8,11 @@ use std::collections::BTreeMap;
 
 use onnx_genai_metadata::{
     BatchLayout, ComponentContract, ComponentImplementation, InferenceMetadata, PaddedDimension,
-    PortRole, RuntimeCapabilities, RuntimeInputRole, SemanticInputRole, ShapeRecurrence,
-    StateCheckpointContract, StateGroupCapabilities, StateKind, StatePortAlias, StateSemanticRole,
-    StateUpdate, TensorContract, TensorDimension, WorkflowComponent, WorkflowInput,
-    WorkflowInputSource, WorkflowStateScope, WorkflowStep, classify_session_state,
-    resolve_state_plan, validate_metadata, validate_structure_and_capabilities,
+    PortRole, RuntimeInputRole, SemanticInputRole, ShapeRecurrence, StateCheckpointContract,
+    StateGroupCapabilities, StateKind, StatePortAlias, StateSemanticRole, StateUpdate,
+    TensorContract, TensorDimension, WorkflowComponent, WorkflowInput, WorkflowInputSource,
+    WorkflowStateScope, WorkflowStep, classify_session_state, resolve_state_plan,
+    validate_metadata,
 };
 
 const TOKEN_CONTEXT_CONTRACT: &str = "onnx-genai.token-context";
@@ -41,14 +41,6 @@ fn fixture() -> InferenceMetadata {
         .as_mut()
         .expect("catalogue fixture has pipeline")
         .workflow;
-    workflow
-        .manifest
-        .capabilities
-        .insert("session_state_lease".to_string());
-    workflow
-        .manifest
-        .capabilities
-        .insert("token_context".to_string());
     workflow
         .inputs
         .get_mut("request.hidden_states")
@@ -350,39 +342,6 @@ fn token_context_requires_new_reader_and_runtime_admission() {
                 && error.contains("silently ignoring")
         }),
         "{errors:#?}"
-    );
-
-    let mut missing_manifest = fixture();
-    missing_manifest
-        .pipeline
-        .as_mut()
-        .expect("pipeline")
-        .workflow
-        .manifest
-        .capabilities
-        .remove("token_context");
-    let errors =
-        validate_metadata(&missing_manifest).expect_err("the semantic capability is required");
-    assert!(
-        errors.iter().any(|error| {
-            error.contains("manifest.capabilities")
-                && error.contains("missing used capability 'token_context'")
-        }),
-        "{errors:#?}"
-    );
-
-    let mut runtime = RuntimeCapabilities::default();
-    runtime
-        .supported
-        .retain(|capability| capability != "token_context");
-    let report = validate_structure_and_capabilities(&fixture(), &runtime);
-    assert!(report.structural.is_empty(), "{:#?}", report.structural);
-    assert!(
-        report
-            .unsupported_capabilities
-            .contains(&"token_context".to_string()),
-        "{:#?}",
-        report.unsupported_capabilities
     );
 }
 

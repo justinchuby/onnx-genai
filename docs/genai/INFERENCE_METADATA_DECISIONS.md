@@ -140,7 +140,6 @@ tokenizer, or adapter bytes must not require rewriting the semantic contract.
 
 ```yaml
 schema_version: v1          # required
-required_capabilities: []   # capabilities the reader must implement
 model: {...}                # package-wide baked facts (attention geometry, vocab, MoE, sharding)
 quantization: {...}         # model-weight quantization intent
 pipeline: {workflow: {...}} # the executable workflow: the only graph ABI
@@ -155,10 +154,10 @@ hardware_requirements: {...}
 
 `schema_version` versions the workflow syntax together with the rest of the
 document. The workflow manifest therefore carries only facts that are not
-already authoritative elsewhere, such as adapter ABI versions and declared
-capabilities. It does not repeat a workflow `ir_version`, and it does not copy
-ONNX opset imports: every ONNX artifact carries its own exact domain/version
-map, including the case where different components use different opsets.
+already authoritative elsewhere, such as adapter ABI versions. It does not
+repeat a workflow `ir_version`, core conformance flags, or ONNX opset imports:
+every ONNX artifact carries its own exact domain/version map, including the case
+where different components use different opsets.
 
 `pipeline.workflow` is the **sole serialized expression of a package's
 executable graph ABI**, for every package, including one that ships a single
@@ -240,8 +239,8 @@ Metadata has five different naming classes. They are not interchangeable:
 | **Reserved schema field** | This specification and generated JSON Schema. | `pipeline`, `workflow`, `inputs`, `contract`, `dtype`, `state`, `recurrence`, `special_tokens`. | Unknown keys fail because typed core objects deny unknown fields. A producer cannot add `workflow.my_option` or `contract.vendor_hint`. |
 | **Package-local identifier/reference** | The package author, within the map or scope that owns it. | Keys under `workflow.inputs`, `outputs`, `components`, `state`, `effects`, `serving.state_service.groups`, `profiles`, adapter artifacts, and branch cases; SSA value names; component and state-group references. | The spelling is author-defined, but every reference must resolve, names must be unique in their scope, and the runtime must not infer semantics from the spelling. |
 | **Artifact-defined name** | The referenced artifact. | ONNX input/output and initializer names used by component ports, invoke bindings, optional inputs, state aliases, and adapter targets. | Must match the artifact exactly. It is not a portable semantic vocabulary and must never be guessed from a model family. |
-| **Extensible semantic identifier** | A registered producer/runtime extension, normally owner-qualified and versioned. | Capability strings, adapter ABI keys, component contract IDs, adapter application/loader IDs, checkpoint adapter IDs, constraint dialects, profile kinds, and extensible operation/vocabulary strings. | Built-ins have normative semantics. Unknown extensions may parse where the schema declares an extension branch, but execution must fail closed unless the runtime implements that exact identifier/version. |
-| **Ordinary data value** | Package contents or request contract. | Artifact locations, source URIs, revisions, symbolic dimension labels, provenance labels, and numeric bounds. | Treated as data under the surrounding reserved field; it does not create a new schema field or runtime capability. |
+| **Extensible semantic identifier** | A registered producer/runtime extension, normally owner-qualified and versioned. | Adapter ABI keys, component contract IDs, adapter application/loader IDs, checkpoint adapter IDs, constraint dialects, profile kinds, and extensible operation/vocabulary strings. | Built-ins have normative semantics. Unknown extensions may parse where the schema declares an extension branch, but execution must fail closed unless the runtime implements that exact identifier/version. |
+| **Ordinary data value** | Package contents or request contract. | Artifact locations, source URIs, revisions, symbolic dimension labels, provenance labels, and numeric bounds. | Treated as data under the surrounding reserved field; it does not create a new schema field or an optimization policy. |
 
 Two rules prevent ambiguity:
 
@@ -273,21 +272,27 @@ This is the only ignorable surface. Unknown *core* fields still fail. A strict
 reader can therefore load a package that carries a newer optional profile
 without either guessing or refusing.
 
-### 4.3a Capability admission
+### 4.3a Core conformance and extension admission
 
-A capability identifier names versioned semantic behavior required for correct
-execution. It is not a model name, implementation preference, deployment policy,
-or feature-enable request. Required identifiers and versions **MUST** be selected
-exactly; an unsupported or ambiguous requirement **MUST** fail before execution.
+`schema_version` selects core reader conformance. A reader that accepts a
+version **MUST** implement its typed SSA/dataflow, shape/rank, state,
+transaction, output, and validation semantics. These are not capability flags:
+the package **MUST NOT** redundantly advertise or negotiate them.
 
-Requirements that follow from workflow structure **MUST** be derived rather than
-duplicated as manually authored flags. Extension identifiers are permitted only
-on declared extension surfaces and remain fail-closed. Component contracts,
-adapter ABIs, and state bounds keep their own identities and do not become
-capabilities merely because a runtime implements them.
+An independently implemented optional semantic module is declared only at its
+typed identity/version surface (for example `package.tool_protocol`, a component
+contract or adapter ABI, a checkpoint adapter, or `speculative`). The reader
+**MUST** select that exact pair or fail before execution; names, model families,
+backends, and fallback guesses never select one. The generated
+[`METADATA_EXTENSION_REGISTRY.md`](METADATA_EXTENSION_REGISTRY.md) lists every
+built-in extension, schema floor, declaration surface, admission consumer, and
+support status.
 
-Output publication is governed by the declared output protocol and ordinary
-`emit`; it has no separate streaming or transport-delivery capability.
+Output publication is core output-protocol conformance governed by a declared
+output family and ordinary `emit`; it has no separate streaming or transport
+capability. Continuous batching, graph capture, scheduling, placement, storage
+tiering, budgets, and kernels are runtime policy: when semantics permit, the
+runtime may decline them and use a generic or isolated path.
 
 ### 4.4 Semantic identity
 
@@ -1650,8 +1655,7 @@ specification.
 schema_version: v1
 pipeline:
   workflow:
-    manifest:
-      capabilities: [workflow_ssa, typed_emit]
+    manifest: {}
     effects:
       decode:
         retry: idempotent

@@ -13,8 +13,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use onnx_genai_engine::pipeline::speculative::DFlashGenerationCancelled;
 use onnx_genai_engine::{
     Engine, EngineConfig, GenerateOptions, GeneratePrompt, GenerateRequest, GenerationBoundary,
-    GenerationControl, PackageCapabilityError, PipelineGenerateRequest, SessionForkError,
-    SessionPosition, package_capability_error,
+    GenerationControl, PackageExecutionError, PipelineGenerateRequest, SessionForkError,
+    SessionPosition, package_execution_error,
 };
 use onnx_genai_ort::{DataType, Environment, Session, SessionOptions, Value};
 use rand::rngs::StdRng;
@@ -388,8 +388,7 @@ package:
       eos_token_id: [3]
 pipeline:
   workflow:
-    manifest:
-      capabilities: [workflow_ssa, typed_emit, serving_service_contract, session_state_lease, dflash_flat_block]
+    manifest: {{}}
     inputs:
       request.tokens:
         contract: {{ dtype: int64, shape: [batch, sequence], batch_layout: {{ kind: request_aligned, axis: 0 }} }}
@@ -885,32 +884,32 @@ fn every_raw_workflow_api_typed_refuses_before_dflash_component_execution() -> a
         ),
     ] {
         assert!(matches!(
-            package_capability_error(&error),
-            Some(PackageCapabilityError::DFlashRawWorkflowApi { operation: actual })
+            package_execution_error(&error),
+            Some(PackageExecutionError::DFlashRawWorkflowApi { operation: actual })
                 if actual == operation
         ));
     }
     {
         let error = expect_error(engine.prepare_pipeline(pipeline_request()));
         assert!(matches!(
-            package_capability_error(&error),
-            Some(PackageCapabilityError::DFlashRawWorkflowApi { operation })
+            package_execution_error(&error),
+            Some(PackageExecutionError::DFlashRawWorkflowApi { operation })
                 if operation == "Engine::prepare_pipeline"
         ));
     }
     {
         let error = expect_error(engine.models());
         assert!(matches!(
-            package_capability_error(&error),
-            Some(PackageCapabilityError::DFlashRawWorkflowApi { operation })
+            package_execution_error(&error),
+            Some(PackageExecutionError::DFlashRawWorkflowApi { operation })
                 if operation == "Engine::models"
         ));
     }
     {
         let error = expect_error(engine.prepare_workflow_execution(pipeline_request()));
         assert!(matches!(
-            package_capability_error(&error),
-            Some(PackageCapabilityError::DFlashRawWorkflowApi { operation })
+            package_execution_error(&error),
+            Some(PackageExecutionError::DFlashRawWorkflowApi { operation })
                 if operation == "Engine::prepare_workflow_execution"
         ));
     }
@@ -1730,8 +1729,8 @@ fn selector_convolution_v2_stays_a_typed_pre_mutation_refusal() -> anyhow::Resul
         Err(error) => error,
     };
     assert!(matches!(
-        package_capability_error(&error),
-        Some(PackageCapabilityError::DFlashExecutionUnavailable { version, .. }) if version == "2"
+        package_execution_error(&error),
+        Some(PackageExecutionError::DFlashExecutionUnavailable { version, .. }) if version == "2"
     ));
     Ok(())
 }

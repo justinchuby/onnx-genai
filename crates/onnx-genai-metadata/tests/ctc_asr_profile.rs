@@ -80,7 +80,6 @@ pipeline:
   workflow:
     manifest:
       adapter_abis: { onnx-genai.audio-preprocess: "1" }
-      capabilities: [workflow_ssa, typed_emit]
     inputs:
       request.audio:
         contract: { dtype: uint8, shape: [encoded_bytes] }
@@ -334,8 +333,7 @@ fn audio_adapter_without_preprocessing_audio_metadata_is_rejected() {
     let document = r#"
 pipeline:
   workflow:
-    manifest:
-      capabilities: [workflow_ssa]
+    manifest: {}
     inputs:
       request.audio:
         contract: { dtype: uint8, shape: [encoded_bytes] }
@@ -378,8 +376,7 @@ preprocessing:
         contract: { dtype: float32, shape: [batch, samples] }
 pipeline:
   workflow:
-    manifest:
-      capabilities: [workflow_ssa]
+    manifest: {}
     inputs:
       request.audio:
         contract: { dtype: uint8, shape: [encoded_bytes] }

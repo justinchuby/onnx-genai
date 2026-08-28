@@ -390,8 +390,7 @@ model:
   artifacts: []
 pipeline:
   workflow:
-    manifest:
-      capabilities: []
+    manifest: {{}}
     inputs: {}
     outputs:
       audio:
@@ -435,8 +434,7 @@ model:
   artifacts: []
 pipeline:
   workflow:
-    manifest:
-      capabilities: []
+    manifest: {{}}
     inputs: {{}}
     outputs:
       alpha:

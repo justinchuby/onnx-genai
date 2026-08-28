@@ -477,9 +477,9 @@ fn a_conversation_is_refused_past_the_bound_it_declares() -> anyhow::Result<()> 
         .generate_in_session(session, tokens(&[5, 7], 2))
         .expect_err("a turn past the declared bound must be refused");
     let capability =
-        onnx_genai_engine::package_capability_error(&refused).expect("the refusal is typed");
+        onnx_genai_engine::package_execution_error(&refused).expect("the refusal is typed");
     match capability {
-        onnx_genai_engine::PackageCapabilityError::ConversationOverBound {
+        onnx_genai_engine::PackageExecutionError::ConversationOverBound {
             cell,
             requested,
             bound,
@@ -775,12 +775,12 @@ fn a_failed_turn_releases_its_lease_and_its_reservation() -> anyhow::Result<()> 
     let refused = engine
         .generate_in_session(session, tokens(&[5, 7], 2))
         .expect_err("a turn past the declared bound must be refused");
-    let capability = onnx_genai_engine::package_capability_error(&refused)
+    let capability = onnx_genai_engine::package_execution_error(&refused)
         .expect("the refusal is typed, so a front end never reads its wording");
     assert!(
         matches!(
             capability,
-            onnx_genai_engine::PackageCapabilityError::ConversationOverBound { bound: 6, .. }
+            onnx_genai_engine::PackageExecutionError::ConversationOverBound { bound: 6, .. }
         ),
         "{capability:?}"
     );
@@ -806,7 +806,7 @@ fn a_failed_turn_releases_its_lease_and_its_reservation() -> anyhow::Result<()> 
 /// is different: the same request succeeds once the turn in flight finishes.
 #[test]
 fn a_busy_session_is_a_retryable_capability_refusal() {
-    let busy = onnx_genai_engine::PackageCapabilityError::ExclusiveLeaseConflict {
+    let busy = onnx_genai_engine::PackageExecutionError::ExclusiveLeaseConflict {
         session: "shared".to_string(),
     };
     assert!(busy.is_retryable());
@@ -814,8 +814,8 @@ fn a_busy_session_is_a_retryable_capability_refusal() {
 
     let error: anyhow::Error = busy.into();
     assert!(matches!(
-        onnx_genai_engine::package_capability_error(&error),
-        Some(onnx_genai_engine::PackageCapabilityError::ExclusiveLeaseConflict { .. })
+        onnx_genai_engine::package_execution_error(&error),
+        Some(onnx_genai_engine::PackageExecutionError::ExclusiveLeaseConflict { .. })
     ));
 }
 

@@ -5778,19 +5778,18 @@ async fn a_cancelled_client_does_not_leak_its_session_lease() {
 /// edit collapsing them onto one code.
 #[test]
 fn capability_refusals_map_to_the_status_their_variant_means() {
-    use onnx_genai_engine::PackageCapabilityError;
+    use onnx_genai_engine::PackageExecutionError;
 
     let no_state = crate::driver::DriverFailure::from_engine_error(&anyhow::Error::from(
-        PackageCapabilityError::NoSessionState,
+        PackageExecutionError::NoSessionState,
     ));
     let response = crate::routes::generation_failure(no_state);
     assert_eq!(response.status, StatusCode::CONFLICT);
     assert_eq!(response.kind, "conflict_error");
 
     let dflash = crate::driver::DriverFailure::from_engine_error(&anyhow::Error::from(
-        PackageCapabilityError::DFlashExecutionUnavailable {
+        PackageExecutionError::DFlashExecutionUnavailable {
             version: "1".to_string(),
-            capability: onnx_genai_metadata::capabilities::DFLASH_FLAT_BLOCK.to_string(),
         },
     ));
     let response = crate::routes::generation_failure(dflash);
@@ -5799,7 +5798,7 @@ fn capability_refusals_map_to_the_status_their_variant_means() {
     assert!(response.message.contains("onnx-genai.dflash-flat-block@1"));
 
     let candidate_tree = crate::driver::DriverFailure::from_engine_error(&anyhow::Error::from(
-        PackageCapabilityError::CandidateTreeExecutionUnavailable {
+        PackageExecutionError::CandidateTreeExecutionUnavailable {
             version: "2".to_string(),
             reason: "unsupported verifier ABI".to_string(),
         },
@@ -5810,7 +5809,7 @@ fn capability_refusals_map_to_the_status_their_variant_means() {
     assert!(response.message.contains("onnx-genai.speculative@2"));
 
     let dflash_raw = crate::driver::DriverFailure::from_engine_error(&anyhow::Error::from(
-        PackageCapabilityError::DFlashRawWorkflowApi {
+        PackageExecutionError::DFlashRawWorkflowApi {
             operation: "run_pipeline".to_string(),
         },
     ));
@@ -5820,7 +5819,7 @@ fn capability_refusals_map_to_the_status_their_variant_means() {
     assert!(response.message.contains("run_pipeline"));
 
     let busy = crate::driver::DriverFailure::from_engine_error(&anyhow::Error::from(
-        PackageCapabilityError::ExclusiveLeaseConflict {
+        PackageExecutionError::ExclusiveLeaseConflict {
             session: "shared".to_string(),
         },
     ));
@@ -5831,7 +5830,7 @@ fn capability_refusals_map_to_the_status_their_variant_means() {
     assert!(response.message.contains("shared"));
 
     let over_bound = crate::driver::DriverFailure::from_engine_error(&anyhow::Error::from(
-        PackageCapabilityError::ConversationOverBound {
+        PackageExecutionError::ConversationOverBound {
             cell: "conversation".to_string(),
             requested: 12,
             bound: 6,
@@ -5842,7 +5841,7 @@ fn capability_refusals_map_to_the_status_their_variant_means() {
     assert_eq!(response.kind, "invalid_request_error");
     assert_eq!(
         response.message,
-        PackageCapabilityError::ConversationOverBound {
+        PackageExecutionError::ConversationOverBound {
             cell: "conversation".to_string(),
             requested: 12,
             bound: 6,
