@@ -173,6 +173,43 @@ fn assert_parity_with(
     Ok(native)
 }
 
+/// Compare retained SSA values that intentionally remain private rather than
+/// being declared as portable workflow outputs.
+fn assert_retained_parity_with(
+    root: &Path,
+    build_native: impl Fn(&Path) -> anyhow::Result<Engine>,
+    request: impl Fn() -> anyhow::Result<PipelineGenerateRequest>,
+    values: &[&str],
+) -> anyhow::Result<Engine> {
+    let mut ort = ort_engine(root)?;
+    let mut native = build_native(root)?;
+    let ort_values = ort.run_pipeline_retained(request()?)?;
+    let native_values = native.run_pipeline_retained(request()?)?;
+    for value in values {
+        let ort_value = ort_values
+            .get(*value)
+            .unwrap_or_else(|| panic!("ORT run missing retained value '{value}'"));
+        let native_value = native_values
+            .get(*value)
+            .unwrap_or_else(|| panic!("native run missing retained value '{value}'"));
+        assert_values_match(value, ort_value, native_value)?;
+    }
+    assert!(
+        ort.native_component_run_count().is_none(),
+        "ORT engine must not hold native sessions"
+    );
+    assert!(
+        native.models()?.sessions.is_empty(),
+        "native backend must build zero ORT sessions, found {}",
+        native.models()?.sessions.len()
+    );
+    assert!(
+        native.native_component_run_count().unwrap_or(0) > 0,
+        "native engine must have executed native component sessions"
+    );
+    Ok(native)
+}
+
 /// Like [`assert_parity`], but compares the aggregate structured value for one
 /// semantic output role. This is what request-aligned ragged token outputs use:
 /// the workflow publishes per-row tensors and the runtime derives the semantic
@@ -620,8 +657,9 @@ fn diffusion_loop_parity() -> anyhow::Result<()> {
 #[test]
 fn static_cache_autoregressive_parity() -> anyhow::Result<()> {
     let root = fixture("static_cache");
-    assert_parity(
+    assert_retained_parity_with(
         &root,
+        native_engine,
         || static_cache_request(2),
         &["cache_lengths", "write_indices", "key_cache", "value_cache"],
     )?;
@@ -936,10 +974,10 @@ fn native_cuda_device_resident_multicomponent() -> anyhow::Result<()> {
 
     // Two decode steps: the decoder is re-invoked with the KV cache it produced
     // on the previous step. On the device path that KV never leaves the device.
-    // `assert_parity_with` runs the SAME package on ORT and native (pinned to
-    // CUDA here) and asserts every listed output matches, then returns the
-    // native engine.
-    let native = assert_parity_with(
+    // The retained parity helper runs the SAME package on ORT and native
+    // (pinned to CUDA here) and compares the private recurring state without
+    // declaring it as portable workflow output.
+    let native = assert_retained_parity_with(
         &root,
         native_cuda_engine,
         || static_cache_request(2),
