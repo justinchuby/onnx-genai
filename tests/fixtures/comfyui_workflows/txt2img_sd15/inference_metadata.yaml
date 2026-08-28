@@ -1,4 +1,4 @@
-schema_version: v1
+schema_version: v1.5
 pipeline:
   workflow:
     manifest:
@@ -140,6 +140,8 @@ pipeline:
             kind: request_aligned
             axis: 0
         role: image
+        family:
+          kind: materialized
         value_range: negative_one_to_one
         stage: pre_adapter
       latent:
@@ -154,6 +156,8 @@ pipeline:
             kind: request_aligned
             axis: 0
         role: tensor
+        family:
+          kind: materialized
         stage: pre_adapter
     components:
       diffusion_schedule:

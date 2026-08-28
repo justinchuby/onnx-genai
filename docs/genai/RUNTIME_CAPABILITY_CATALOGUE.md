@@ -34,7 +34,6 @@ admission identifiers drift. Extension identifiers remain open and namespaced.
 | `nested_control_flow` |
 | `loop_induction_values` |
 | `typed_emit` |
-| `streaming_emit` |
 | `emit_valid_length` |
 | `input_presence` |
 | `explicit_transfer` |

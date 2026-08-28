@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 
+use super::output::OutputPublicationJournal;
 use super::runtime_state::{GraphCaptureId, PassId};
 use super::turn_transaction::{
     TurnAbortReason, TurnPublicationMode, TurnStateBaseline, TurnTransaction,
@@ -795,6 +796,7 @@ impl WorkflowRuntime {
         &self,
         mut values: PipelineTensors,
         row_outputs: BTreeMap<String, Vec<String>>,
+        publications: Vec<WorkflowOutputPublication>,
     ) -> PipelineOutputs {
         let mut outputs = PipelineTensors::new();
         for output in self.plan.workflow.outputs.keys() {
@@ -821,6 +823,7 @@ impl WorkflowRuntime {
         PipelineOutputs {
             tensors: outputs,
             rows: row_outputs,
+            publications,
         }
     }
     /// Why the last generation stopped.
@@ -1208,12 +1211,19 @@ impl<'a> WorkflowExecutionPlan<'a> {
 
     /// Execute the already-bound workflow and retain its input slots for replay.
     pub fn execute(&mut self) -> anyhow::Result<PipelineTensors> {
-        self.execute_outputs().map(PipelineOutputs::into_tensors)
+        let outputs = self.execute_outputs()?;
+        let (tensors, publications) = outputs.into_tensors_and_publications();
+        *self.engine.worker.last_output_publications.borrow_mut() = publications;
+        Ok(tensors)
     }
 
     pub fn execute_outputs(&mut self) -> anyhow::Result<PipelineOutputs> {
         let (values, row_outputs) = self.execute_retained()?;
-        Ok(self.engine.package_outputs(values, row_outputs))
+        let publications =
+            std::mem::take(&mut *self.engine.worker.last_output_publications.borrow_mut());
+        Ok(self
+            .engine
+            .package_outputs(values, row_outputs, publications))
     }
 
     /// Execute the workflow and keep every SSA value the pass produced.
@@ -1257,6 +1267,7 @@ impl<'a> WorkflowExecutionPlan<'a> {
         ) -> anyhow::Result<()>,
     ) -> anyhow::Result<(PipelineTensors, BTreeMap<String, Vec<String>>)> {
         let engine = self.engine;
+        engine.worker.last_output_publications.borrow_mut().clear();
         // One named owner for everything this pass alone holds (§3.3): its id
         // and the telemetry it accumulates. Both end with the pass.
         let mut pass = engine.begin_pass(self.max_iterations_only);
@@ -1413,6 +1424,12 @@ impl<'a> WorkflowExecutionPlan<'a> {
             )
         };
         let mut transaction = transaction?;
+        let output_baselines = transaction.output_baselines()?;
+        let mut publication_journal = Some(OutputPublicationJournal::new(
+            transaction.id(),
+            workflow,
+            output_baselines,
+        )?);
         if let Some(session_id) = self.session_id.as_ref() {
             for (cell, carrier) in session_state.carried() {
                 let resolved = state_plan.cell(cell).with_context(|| {
@@ -1498,6 +1515,7 @@ impl<'a> WorkflowExecutionPlan<'a> {
             &mut emit_counts,
             &mut final_state_refs,
             &self.component_overrides,
+            &mut publication_journal,
             &mut pass.telemetry,
             host,
         );
@@ -1620,8 +1638,9 @@ impl<'a> WorkflowExecutionPlan<'a> {
                 transaction.stage_state(resolved.identity.clone(), value);
             }
             transaction.stage_effects();
-            for (output, publications) in &pass.telemetry.output_publications {
-                transaction.stage_output(output, *publications);
+            if let Some(journal) = publication_journal.as_mut() {
+                journal.finalize_on_commit()?;
+                transaction.stage_outputs(journal.committed_states()?);
             }
             let mut session_state = engine.worker.session_state.borrow_mut();
             let mut session_effects = engine.worker.session_effects.borrow_mut();
@@ -1644,6 +1663,9 @@ impl<'a> WorkflowExecutionPlan<'a> {
             *version = version.saturating_add(1);
         }
         let row_outputs = std::mem::take(&mut pass.telemetry.row_outputs);
+        *engine.worker.last_output_publications.borrow_mut() = publication_journal
+            .map(OutputPublicationJournal::take)
+            .unwrap_or_default();
         engine.publish_workflow_telemetry(pass.telemetry);
         Ok((values, row_outputs))
     }
@@ -1769,6 +1791,7 @@ impl WorkflowRuntime {
         emit_counts: &mut HashMap<String, usize>,
         final_state_refs: &mut HashMap<String, String>,
         component_overrides: &HashMap<String, String>,
+        publication_journal: &mut Option<OutputPublicationJournal>,
         telemetry: &mut WorkflowRunTelemetry,
         host: &mut Option<&mut dyn WorkflowNodeHost>,
     ) -> anyhow::Result<()> {
@@ -1785,6 +1808,7 @@ impl WorkflowRuntime {
                         emit_counts,
                         final_state_refs,
                         component_overrides,
+                        publication_journal,
                         telemetry,
                         host,
                     )?;
@@ -2144,6 +2168,7 @@ impl WorkflowRuntime {
                     emit_counts,
                     final_state_refs,
                     component_overrides,
+                    publication_journal,
                     telemetry,
                     host,
                 )?;
@@ -2159,6 +2184,7 @@ impl WorkflowRuntime {
                         emit_counts,
                         final_state_refs,
                         component_overrides,
+                        publication_journal,
                         telemetry,
                         host,
                     )? {
@@ -2205,6 +2231,7 @@ impl WorkflowRuntime {
                     emit_counts,
                     &mut branch_state_refs,
                     component_overrides,
+                    publication_journal,
                     telemetry,
                     host,
                 )?;
@@ -2274,11 +2301,45 @@ impl WorkflowRuntime {
                 when,
                 valid_length,
                 output,
+                stream,
                 mode,
                 axis,
                 ..
             } => {
                 let emit_started = std::time::Instant::now();
+                if let Some(journal) = publication_journal.as_ref() {
+                    journal
+                        .validate_emit(output, stream.as_deref(), mode)
+                        .with_context(|| {
+                            format!(
+                                "workflow emit {mode:?} at output '{output}' cannot enter its \
+                             declared output protocol"
+                            )
+                        })?;
+                }
+                if matches!(mode, WorkflowEmitMode::Retract | WorkflowEmitMode::Finalize) {
+                    anyhow::ensure!(
+                        value.is_empty(),
+                        "workflow emit {mode:?} at output '{output}' stream '{}' names value \
+                         '{value}', but this operation is payloadless; remove the value before \
+                         execution",
+                        stream.as_deref().unwrap_or(output)
+                    );
+                    if let Some(journal) = publication_journal.as_mut() {
+                        journal
+                            .publish(output, stream.as_deref(), mode, None)
+                            .with_context(|| {
+                                format!(
+                                    "workflow emit {mode:?} at output '{output}' cannot publish \
+                                     its typed revision envelope"
+                                )
+                            })?;
+                    }
+                    telemetry.emit_events += 1;
+                    telemetry.record_output_publication(output);
+                    telemetry.record_stage("emit", emit_started.elapsed().as_nanos());
+                    return Ok(());
+                }
                 if let Some(when) = when {
                     self.materialize_workflow_value(values, when)?;
                 }
@@ -2337,7 +2398,7 @@ impl WorkflowRuntime {
                         .request_axis()
                         .is_some()
                 {
-                    emit_workflow_rows(
+                    emit_workflow_rows_with_publications(
                         values,
                         &tensor,
                         value,
@@ -2348,6 +2409,8 @@ impl WorkflowRuntime {
                         lengths.as_deref(),
                         *axis,
                         emit_counts,
+                        stream.as_deref(),
+                        publication_journal,
                         telemetry,
                         symbols,
                         dynamic_symbols,
@@ -2395,6 +2458,21 @@ impl WorkflowRuntime {
                     symbols,
                     dynamic_symbols,
                 )?;
+                if let Some(journal) = publication_journal.as_mut() {
+                    journal
+                        .publish(
+                            output,
+                            stream.as_deref(),
+                            mode,
+                            Some(clone_value(&emitted)?),
+                        )
+                        .with_context(|| {
+                            format!(
+                                "workflow emit {mode:?} at output '{output}' cannot publish its \
+                                 output envelope"
+                            )
+                        })?;
+                }
                 match mode {
                     WorkflowEmitMode::Replace => {
                         values.insert(output.clone(), emitted);
@@ -2412,6 +2490,9 @@ impl WorkflowRuntime {
                         values.insert(format!("{output}.{index}"), clone_value(&emitted)?);
                         *index += 1;
                         values.insert(output.clone(), emitted);
+                    }
+                    WorkflowEmitMode::Retract | WorkflowEmitMode::Finalize => {
+                        unreachable!("control publication returned before reading a payload")
                     }
                 }
                 telemetry.record_stage("emit", emit_started.elapsed().as_nanos());
@@ -2447,6 +2528,7 @@ impl WorkflowRuntime {
                         emit_counts,
                         final_state_refs,
                         component_overrides,
+                        publication_journal,
                         telemetry,
                         host,
                     )?;
@@ -5245,6 +5327,7 @@ fn slice_workflow_prefix(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn emit_workflow_rows(
     values: &mut PipelineTensors,
     tensor: &Value,
@@ -5256,6 +5339,43 @@ fn emit_workflow_rows(
     lengths: Option<&[usize]>,
     axis: Option<usize>,
     emit_counts: &mut HashMap<String, usize>,
+    telemetry: &mut WorkflowRunTelemetry,
+    symbols: &HashMap<String, i64>,
+    dynamic_symbols: &std::collections::HashSet<String>,
+) -> anyhow::Result<()> {
+    emit_workflow_rows_with_publications(
+        values,
+        tensor,
+        value_name,
+        output,
+        output_contract,
+        mode,
+        guards,
+        lengths,
+        axis,
+        emit_counts,
+        None,
+        &mut None,
+        telemetry,
+        symbols,
+        dynamic_symbols,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_workflow_rows_with_publications(
+    values: &mut PipelineTensors,
+    tensor: &Value,
+    value_name: &str,
+    output: &str,
+    output_contract: &onnx_genai_metadata::TensorContract,
+    mode: &WorkflowEmitMode,
+    guards: Option<&[bool]>,
+    lengths: Option<&[usize]>,
+    axis: Option<usize>,
+    emit_counts: &mut HashMap<String, usize>,
+    stream: Option<&str>,
+    publication_journal: &mut Option<OutputPublicationJournal>,
     telemetry: &mut WorkflowRunTelemetry,
     symbols: &HashMap<String, i64>,
     dynamic_symbols: &std::collections::HashSet<String>,
@@ -5299,6 +5419,16 @@ fn emit_workflow_rows(
             &mut row_symbols,
             dynamic_symbols,
         )?;
+        if let Some(journal) = publication_journal.as_mut() {
+            journal
+                .publish(output, stream, mode, Some(clone_value(&emitted)?))
+                .with_context(|| {
+                    format!(
+                        "workflow row {row} emit {mode:?} at output '{output}' cannot publish \
+                         its output envelope"
+                    )
+                })?;
+        }
         if telemetry.first_emit_ns.is_none() {
             telemetry.first_emit_ns = telemetry
                 .started
@@ -5326,6 +5456,9 @@ fn emit_workflow_rows(
                 values.insert(format!("{row_output}.{index}"), clone_value(&emitted)?);
                 *index += 1;
                 values.insert(row_output, emitted);
+            }
+            WorkflowEmitMode::Retract | WorkflowEmitMode::Finalize => {
+                unreachable!("control publication does not emit rows")
             }
         }
     }
@@ -6615,6 +6748,7 @@ steps:
             &mut HashMap::new(),
             &mut HashMap::new(),
             &HashMap::new(),
+            &mut None,
             &mut WorkflowRunTelemetry::default(),
             host,
         )
@@ -7071,6 +7205,41 @@ steps:
         assert_eq!(lifecycle.setup_runs, 1);
         assert_eq!(lifecycle.body_runs, 2);
         Ok(())
+    }
+
+    #[test]
+    fn per_token_cursor_declines_typed_revisions_before_starting_a_turn() {
+        let mut workflow = lifecycle_workflow();
+        workflow.outputs.insert(
+            "answer".to_string(),
+            onnx_genai_metadata::WorkflowOutput {
+                contract: serde_yaml::from_str("{ dtype: int64, shape: [sequence] }")
+                    .expect("revision output contract"),
+                role: onnx_genai_metadata::WorkflowOutputRole::Tensor,
+                family: onnx_genai_metadata::WorkflowOutputFamily::Revisions {
+                    version: TYPED_REVISION_PROTOCOL_VERSION.to_string(),
+                },
+                value_range: None,
+                stage: onnx_genai_metadata::OutputStage::PreAdapter,
+                media: None,
+            },
+        );
+        let runtime = test_runtime(workflow);
+        let error = match WorkflowGenerationCursor::start(
+            &runtime,
+            lifecycle_request(1, 2),
+            &["test.loop.lifecycle"],
+            &mut None,
+        ) {
+            Ok(_) => panic!("the specialized cursor must decline typed revision publication"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("typed revision output publication needs the generic turn transaction"),
+            "{error:#}"
+        );
     }
 
     #[test]
@@ -7814,6 +7983,7 @@ impl WorkflowRuntime {
         emit_counts: &mut HashMap<String, usize>,
         final_state_refs: &mut HashMap<String, String>,
         component_overrides: &HashMap<String, String>,
+        publication_journal: &mut Option<OutputPublicationJournal>,
         telemetry: &mut WorkflowRunTelemetry,
         host: &mut Option<&mut dyn WorkflowNodeHost>,
     ) -> anyhow::Result<usize> {
@@ -7835,6 +8005,7 @@ impl WorkflowRuntime {
             emit_counts,
             final_state_refs,
             component_overrides,
+            publication_journal,
             telemetry,
             host,
         )?;
@@ -7919,6 +8090,7 @@ impl WorkflowRuntime {
         emit_counts: &mut HashMap<String, usize>,
         final_state_refs: &mut HashMap<String, String>,
         component_overrides: &HashMap<String, String>,
+        publication_journal: &mut Option<OutputPublicationJournal>,
         telemetry: &mut WorkflowRunTelemetry,
         host: &mut Option<&mut dyn WorkflowNodeHost>,
     ) -> anyhow::Result<bool> {
@@ -7992,6 +8164,7 @@ impl WorkflowRuntime {
             emit_counts,
             final_state_refs,
             component_overrides,
+            publication_journal,
             telemetry,
             host,
         )?;
@@ -8078,6 +8251,7 @@ pub(crate) struct WorkflowGenerationCursor {
     emit_counts: HashMap<String, usize>,
     final_state_refs: HashMap<String, String>,
     component_overrides: HashMap<String, String>,
+    publication_journal: Option<OutputPublicationJournal>,
     telemetry: WorkflowRunTelemetry,
     limit: usize,
     index: usize,
@@ -8128,6 +8302,16 @@ impl WorkflowGenerationCursor {
                 "session-scoped workflow state is published when a pass completes",
             ));
         }
+        if runtime.plan.workflow.outputs.values().any(|output| {
+            matches!(
+                output.family,
+                onnx_genai_metadata::WorkflowOutputFamily::Revisions { .. }
+            )
+        }) {
+            return Err(PerTokenCursorIneligible::new(
+                "typed revision output publication needs the generic turn transaction",
+            ));
+        }
         let loop_node = sole_generation_loop(&runtime.plan.compiled_workflow.graph)
             .map_err(|_| PerTokenCursorIneligible::new("the root is not one generation loop"))?;
         validate_per_token_suspend_boundaries(loop_node, &runtime.plan.workflow)?;
@@ -8164,6 +8348,7 @@ impl WorkflowGenerationCursor {
             &mut emit_counts,
             &mut final_state_refs,
             &component_overrides,
+            &mut None,
             &mut telemetry,
             host,
         )?;
@@ -8175,6 +8360,7 @@ impl WorkflowGenerationCursor {
             emit_counts,
             final_state_refs,
             component_overrides,
+            publication_journal: None,
             telemetry,
             limit,
             index: 0,
@@ -8203,6 +8389,7 @@ impl WorkflowGenerationCursor {
             &mut self.emit_counts,
             &mut self.final_state_refs,
             &self.component_overrides,
+            &mut self.publication_journal,
             &mut self.telemetry,
             host,
         )?;
@@ -8243,7 +8430,8 @@ impl WorkflowGenerationCursor {
             return Ok(Vec::new());
         };
         let values = clone_pipeline_tensors(&self.values)?;
-        let outputs = runtime.package_outputs(values, self.telemetry.row_outputs.clone());
+        let outputs =
+            runtime.package_outputs(values, self.telemetry.row_outputs.clone(), Vec::new());
         let rows = outputs.rows(&output);
         let Some(value) = outputs
             .aggregate(&output)
@@ -8277,7 +8465,8 @@ impl WorkflowGenerationCursor {
             return Ok(Vec::new());
         };
         let values = clone_pipeline_tensors(&self.values)?;
-        let outputs = runtime.package_outputs(values, self.telemetry.row_outputs.clone());
+        let outputs =
+            runtime.package_outputs(values, self.telemetry.row_outputs.clone(), Vec::new());
         let rows = outputs.rows(&output);
         if rows.is_empty() {
             return Ok(outputs

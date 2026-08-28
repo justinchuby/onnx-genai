@@ -599,17 +599,10 @@ pub(crate) fn run_declared_generation(
     mut core: Option<&mut dyn GenerationCore>,
     mut callback: Option<&mut GenerateTokenCallback<'_>>,
 ) -> anyhow::Result<GenerateResult> {
-    // The generic interpreter currently exposes only commit-only output
-    // publication. A callback is an irrevocable external sink, so accepting it
-    // would make a callback failure a post-commit abort. Refuse it before the
-    // turn begins until S4 supplies transaction-addressable revisions.
-    if callback.is_some() {
-        anyhow::bail!(
-            "this workflow uses commit_only output publication and cannot stream to a \
-             non-retractable callback; consume the committed result or declare a typed \
-             provisional revision sink"
-        );
-    }
+    // Commit-only output is delivered to callbacks below, after the workflow
+    // turn has committed. A disconnected or backpressured consumer is then a
+    // delivery error only; it cannot retract state or output that belongs to a
+    // successful semantic transaction.
     let hosted: &[&str] = match core.as_deref() {
         Some(core) => core.hosted_contracts(),
         None => &[],
@@ -636,7 +629,7 @@ pub(crate) fn run_declared_generation(
                 Ok(())
             },
         )?;
-        runtime.package_outputs(values, row_outputs)
+        runtime.package_outputs(values, row_outputs, Vec::new())
     };
 
     let output = runtime

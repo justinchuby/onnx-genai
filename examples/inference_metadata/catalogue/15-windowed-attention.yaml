@@ -111,6 +111,7 @@ pipeline:
             kind: request_aligned
             axis: 0
         role: tensor
+        family: { kind: materialized }
         stage: pre_adapter
       streaming_output:
         contract:
@@ -123,6 +124,7 @@ pipeline:
             kind: request_aligned
             axis: 0
         role: tensor
+        family: { kind: materialized }
         stage: pre_adapter
     components:
       non_streaming_local_attention:

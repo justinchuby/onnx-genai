@@ -36,6 +36,7 @@ use onnx_genai_ort::PipelineModels;
 
 use crate::{EngineDecodeBackend, MemoryStrategyPlan};
 
+use super::WorkflowOutputPublication;
 use super::islands::ExecutionIsland;
 use super::speculative::EmbeddingTable;
 use super::turn_transaction::CommittedOutputState;
@@ -281,7 +282,12 @@ pub(crate) struct WorkerRuntimeState {
     pub(crate) session_effects: RefCell<HashMap<(String, String), u64>>,
     /// Durable output heads, cursors, lineage and closure facts. Output values
     /// stay pass-local until the enclosing transaction commits.
-    pub(crate) session_outputs: RefCell<HashMap<(String, String), CommittedOutputState>>,
+    pub(crate) session_outputs:
+        RefCell<HashMap<(String, String, super::OutputStreamId), CommittedOutputState>>,
+    /// Ordered transport-neutral publications from the last committed pass.
+    /// This worker is thread-bound, so the execution plan can take the journal
+    /// immediately without a second synchronization protocol.
+    pub(crate) last_output_publications: RefCell<Vec<WorkflowOutputPublication>>,
     /// Sessions with a pass in flight, for leases declared `policy: exclusive`.
     ///
     /// Two turns of one conversation that both read the history before either
@@ -342,6 +348,7 @@ impl Default for WorkerRuntimeState {
             session_state: RefCell::new(HashMap::new()),
             session_effects: RefCell::new(HashMap::new()),
             session_outputs: RefCell::new(HashMap::new()),
+            last_output_publications: RefCell::new(Vec::new()),
             session_leases: RefCell::new(HashSet::new()),
             session_turn_versions: RefCell::new(HashMap::new()),
             iteration_runtimes: RefCell::new(BTreeMap::new()),

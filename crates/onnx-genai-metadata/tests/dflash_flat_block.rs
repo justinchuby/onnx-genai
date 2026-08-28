@@ -100,6 +100,7 @@ pipeline:
       target_logits:
         contract: {{ dtype: float32, shape: [batch, verify, 13], batch_layout: {{ kind: request_aligned, axis: 0 }} }}
         role: tensor
+        family: {{ kind: materialized }}
         stage: pre_adapter
     components:
       termination_policy:

@@ -126,6 +126,93 @@ fn a_newer_document_is_refused_by_version_rather_than_by_the_first_field_it_uses
 }
 
 #[test]
+fn output_protocol_families_are_required_by_the_version_that_introduced_them() {
+    let without_family = r#"
+schema_version: "v1.5"
+pipeline:
+  workflow:
+    manifest: { capabilities: [workflow_ssa, typed_emit] }
+    outputs:
+      answer:
+        contract: { dtype: int64, shape: [sequence] }
+        role: tensor
+        stage: pre_adapter
+    components: {}
+    steps: []
+"#;
+    let error = parse_metadata(without_family, Some("yaml"))
+        .expect_err("v1.5 output protocol must name an output family");
+    assert!(
+        error
+            .to_string()
+            .contains("outputs.answer is missing required `family`"),
+        "{error}"
+    );
+
+    let unsupported_revision_version = without_family.replace(
+        "stage: pre_adapter",
+        "family: { kind: revisions, version: \"2\" }\n        stage: pre_adapter",
+    );
+    let metadata =
+        parse_metadata(&unsupported_revision_version, Some("yaml")).expect("typed document parses");
+    let errors = validate_metadata(&metadata).expect_err("unknown revision version is refused");
+    assert!(
+        errors
+            .join("\n")
+            .contains("outputs.answer.family.version is '2'"),
+        "{errors:#?}"
+    );
+}
+
+#[test]
+fn output_family_rejects_an_illegal_emit_at_its_authored_site() {
+    let document = r#"
+schema_version: "v1.5"
+pipeline:
+  workflow:
+    manifest: { capabilities: [workflow_ssa, typed_emit] }
+    outputs:
+      answer:
+        contract: { dtype: int64, shape: [sequence] }
+        role: tensor
+        family: { kind: materialized }
+        stage: pre_adapter
+    components: {}
+    steps:
+      - kind: emit
+        value: produced
+        output: answer
+        mode: event
+"#;
+    let metadata = parse_metadata(document, Some("yaml")).expect("document parses");
+    let errors = validate_metadata(&metadata).expect_err("event is not materialized");
+    let reported = errors.join("\n");
+    assert!(
+        reported.contains("pipeline.workflow.steps[0] selects Event for output 'answer'"),
+        "{reported}"
+    );
+}
+
+#[test]
+fn retired_streaming_emit_is_rejected_with_output_family_migration_guidance() {
+    let document = r#"
+pipeline:
+  workflow:
+    manifest: { capabilities: [workflow_ssa, typed_emit, streaming_emit] }
+    components: {}
+    steps: []
+"#;
+    let error = parse_metadata(document, Some("yaml"))
+        .expect_err("retired streaming capability has no parallel authority");
+    let reported = error.to_string();
+    assert!(
+        reported.contains("retired capability `streaming_emit`")
+            && reported.contains("canonical `family`"),
+        "{reported}"
+    );
+}
+
+#[test]
 fn a_different_major_version_is_a_different_contract() {
     let error = parse_metadata(&with_version(PLAIN, Some("2.0")), Some("yaml"))
         .expect_err("2.0 is a different contract");

@@ -162,6 +162,18 @@ impl Engine {
         self.workflow_runtime_mut().run_pipeline_outputs(request)
     }
 
+    /// Take the ordered workflow publications produced by the most recently
+    /// committed generation on this engine worker.
+    ///
+    /// Publications are installed only after semantic commit. Transport
+    /// delivery can therefore fail without rolling back the committed turn.
+    pub fn take_committed_workflow_publications(
+        &mut self,
+    ) -> Vec<crate::pipeline::WorkflowOutputPublication> {
+        self.workflow_runtime_mut()
+            .take_committed_output_publications()
+    }
+
     pub fn run_pipeline_retained(
         &mut self,
         request: PipelineGenerateRequest,
@@ -570,6 +582,7 @@ mod tests {
         let mut engine = refused_engine()?;
         let before_runs = engine.workflow_performance_diagnostic().runs;
         let before_sessions = engine.sessions.len();
+        let before_outputs = engine.workflow.output_publication_state_for_test();
         let mut admitted = false;
         let mut published = false;
         let mut on_admitted = || admitted = true;
@@ -658,6 +671,11 @@ mod tests {
         assert!(!published, "refusal must precede output callback");
         assert_eq!(engine.sessions.len(), before_sessions);
         assert_eq!(engine.workflow_performance_diagnostic().runs, before_runs);
+        assert_eq!(
+            engine.workflow.output_publication_state_for_test(),
+            before_outputs,
+            "DFlash refusal must precede S4 output stream/transaction creation"
+        );
         Ok(())
     }
 }
