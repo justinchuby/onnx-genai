@@ -2041,6 +2041,7 @@ dependencies = [
  "onnx-runtime-session",
  "onnx-runtime-tracer",
  "prost",
+ "serde",
  "serde_json",
  "tokenizers",
  "tokio",

@@ -59,6 +59,10 @@ Native steady runs also print the resolved memory strategy, CUDA graph
 capture/replay counters, weight-residency activity, and committed VMM physical
 bytes so an over-budget run cannot be mistaken for a full-resident one.
 
+For the deterministic native-CUDA FreeToken residency OFF/ON byte harness,
+machine-readable schema, accounting boundaries, and full-size command shapes,
+see [`docs/benchmarks/FREETOKEN_BYTE_AB.md`](../../docs/benchmarks/FREETOKEN_BYTE_AB.md).
+
 ```bash
 cargo run --release -p onnx-genai-bench \
   --features native-cuda,ort-cuda \

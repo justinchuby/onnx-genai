@@ -5,6 +5,12 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
+#[cfg(feature = "native-cuda")]
+use onnx_genai_bench::freetoken_byte_ab::{
+    ContractStatus, FreeTokenMetrics, FreeTokenRunReport, Metric, NATIVE_CUDA_BINARY_MARKER,
+    PolicyControl, RUN_SCHEMA,
+};
+use onnx_genai_bench::freetoken_byte_ab::{ResidencyArm, WarmupRecord};
 use onnx_genai_bench::{fixture_path, synthetic_decoder};
 use onnx_genai_engine::logits::{
     MinPProcessor, RepetitionPenaltyProcessor, TemperatureProcessor, TopKProcessor, TopPProcessor,
@@ -18,6 +24,10 @@ use onnx_genai_engine::{
 use onnx_genai_metadata::{DecoderAbi, KvOwnership, SequenceInputKind};
 use onnx_genai_ort::{DataType, Tokenizer, Value, available_execution_providers, profile};
 use onnx_runtime_session::InferenceSession;
+
+#[cfg(feature = "native-cuda")]
+#[used]
+static FREETOKEN_NATIVE_CUDA_MARKER: &str = NATIVE_CUDA_BINARY_MARKER;
 
 /// Honor `ONNX_GENAI_VRAM_LIMIT` in the profiler, mirroring the server CLI.
 ///
@@ -38,7 +48,7 @@ fn apply_vram_limit_env(config: &mut EngineConfig) -> Result<()> {
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum ExecutionProvider {
     Cpu,
     Cuda,
@@ -117,6 +127,11 @@ struct Args {
     tokens: usize,
     #[arg(long, default_value_t = 1)]
     warmups: usize,
+    /// Minimum wall-clock time spent repeatedly generating before counters are
+    /// reset. FreeToken OFF/ON runs require at least 8 seconds so an idle A100
+    /// is not measured while its clocks are still ramping.
+    #[arg(long, default_value_t = 0.0)]
+    warmup_seconds: f64,
     #[arg(long, default_value_t = 1)]
     runs: usize,
     /// Time steady decode from token callbacks, excluding the first N emitted
@@ -192,6 +207,19 @@ struct Args {
     /// paired benchmarks avoid tokenizer round-trip drift.
     #[arg(long, value_name = "JSON_FILE")]
     prompt_ids: Option<PathBuf>,
+    /// Write the self-describing FreeToken byte-accounting run record to this
+    /// file. Requires --steady --ep cuda --backend native and a native-cuda
+    /// build. The record rejects ORT results and labels unavailable
+    /// expert-specific attribution rather than estimating it.
+    #[arg(long, value_name = "JSON_FILE")]
+    freetoken_report_json: Option<PathBuf>,
+    /// OFF or ON arm recorded in --freetoken-report-json.
+    #[arg(long, value_enum, requires = "freetoken_report_json")]
+    freetoken_arm: Option<ResidencyArm>,
+    /// Environment variable whose concrete value distinguishes the OFF and ON
+    /// arms. The report records the value observed by this process.
+    #[arg(long, requires = "freetoken_report_json")]
+    freetoken_policy_env: Option<String>,
     /// Encoded image supplied as the optional `request.image` workflow input.
     #[arg(long)]
     image: Option<PathBuf>,
@@ -654,15 +682,18 @@ fn init_prompt_ids(args: &Args) -> Result<()> {
 }
 
 fn request(args: &Args, tokens: usize) -> GenerateRequest {
-    if let Some(ids) = PROMPT_IDS.get() {
+    let mut request = if let Some(ids) = PROMPT_IDS.get() {
         let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(ids.clone()));
         request.options.max_new_tokens = tokens;
         request.options.stop_on_eos = false;
         apply_sampling_options(&mut request.options, args);
         apply_speculative_options(&mut request.options, args);
-        return request;
-    }
-    request_with_prompt(args, tokens, &args.prompt)
+        request
+    } else {
+        request_with_prompt(args, tokens, &args.prompt)
+    };
+    request.options.cold_start = args.no_prefix_cache;
+    request
 }
 
 fn request_with_prompt(args: &Args, tokens: usize, prompt: &str) -> GenerateRequest {
@@ -758,6 +789,89 @@ fn validate_backend(args: &Args) -> Result<()> {
         bail!("--backend {} requires --steady", args.backend.as_str());
     }
     Ok(())
+}
+
+#[cfg(not(feature = "native-cuda"))]
+fn validate_freetoken_report_args(args: &Args) -> Result<()> {
+    if !args.warmup_seconds.is_finite() || args.warmup_seconds < 0.0 {
+        bail!("--warmup-seconds must be finite and non-negative");
+    }
+    if args.freetoken_report_json.is_none() {
+        return Ok(());
+    }
+    bail!(
+        "--freetoken-report-json requires `--features native-cuda`; \
+         bench-native/ort-cuda binaries are not valid byte-accounting instruments"
+    )
+}
+
+#[cfg(feature = "native-cuda")]
+fn validate_freetoken_report_args(args: &Args) -> Result<()> {
+    if !args.warmup_seconds.is_finite() || args.warmup_seconds < 0.0 {
+        bail!("--warmup-seconds must be finite and non-negative");
+    }
+    if args.freetoken_report_json.is_none() {
+        return Ok(());
+    }
+    if !args.steady
+        || args.synthetic
+        || args.pipeline
+        || args.ep != ExecutionProvider::Cuda
+        || args.backend != DecodeBackend::Native
+    {
+        bail!(
+            "--freetoken-report-json requires a real model with \
+             --steady --ep cuda --backend native"
+        );
+    }
+    if args.freetoken_arm.is_none() || args.freetoken_policy_env.is_none() {
+        bail!(
+            "--freetoken-report-json requires --freetoken-arm and \
+             --freetoken-policy-env"
+        );
+    }
+    if sampling_enabled(args) || args.speculative != SpeculativeArg::None {
+        bail!(
+            "--freetoken-report-json requires deterministic greedy M=1 decode \
+             (sampling and speculation must be off)"
+        );
+    }
+    Ok(())
+}
+
+fn run_steady_warmup(args: &Args, engine: &mut Engine) -> Result<WarmupRecord> {
+    let started = Instant::now();
+    let mut generations = 0u64;
+    for _ in 0..args.warmups {
+        std::hint::black_box(
+            engine
+                .generate(request(args, args.tokens))
+                .context("steady warmup generation")?,
+        );
+        generations += 1;
+    }
+    let minimum = Duration::from_secs_f64(args.warmup_seconds);
+    while started.elapsed() < minimum {
+        std::hint::black_box(
+            engine
+                .generate(request(args, args.tokens))
+                .context("steady timed warmup generation")?,
+        );
+        generations += 1;
+    }
+    let actual_seconds = started.elapsed().as_secs_f64();
+    if generations > 0 {
+        println!(
+            "steady_warmup: generations={generations} requested_seconds={:.3} \
+             actual_seconds={actual_seconds:.3}",
+            args.warmup_seconds
+        );
+    }
+    Ok(WarmupRecord {
+        requested_seconds: args.warmup_seconds,
+        actual_seconds,
+        generations,
+    })
 }
 
 fn print_backend_label(backend: DecodeBackend) {
@@ -1173,6 +1287,344 @@ fn print_vmm_observability(engine: &Engine) {
             stats.unaccounted_committed_bytes
         );
     }
+}
+
+#[cfg(feature = "native-cuda")]
+fn freetoken_prompt_tokens(args: &Args, model_dir: &Path) -> Result<Vec<u32>> {
+    if let Some(ids) = PROMPT_IDS.get() {
+        return Ok(ids.clone());
+    }
+    let tokenizer_path = tokenizer_file(model_dir);
+    let tokenizer = Tokenizer::from_file(&tokenizer_path).with_context(|| {
+        format!(
+            "load tokenizer for FreeToken report: {}",
+            tokenizer_path.display()
+        )
+    })?;
+    tokenizer
+        .encode(&args.prompt)
+        .context("tokenize prompt for FreeToken report")
+}
+
+#[cfg(feature = "native-cuda")]
+#[allow(clippy::too_many_arguments)]
+fn write_freetoken_run_report(
+    args: &Args,
+    model_dir: &Path,
+    prompt_token_ids: Vec<u32>,
+    generated_token_ids: Vec<u32>,
+    emitted_tokens: u64,
+    warmup: WarmupRecord,
+    engine: &Engine,
+    cuda_before: Option<&onnx_genai_engine::native_decode::CudaKvDebugStats>,
+    prefills_ms: Vec<f64>,
+    decode_ms_per_token: Vec<f64>,
+    throughputs: Vec<f64>,
+) -> Result<()> {
+    let Some(path) = args.freetoken_report_json.as_ref() else {
+        return Ok(());
+    };
+    let arm = args
+        .freetoken_arm
+        .context("--freetoken-arm is required for the report")?;
+    let policy_env = args
+        .freetoken_policy_env
+        .as_ref()
+        .context("--freetoken-policy-env is required for the report")?;
+    let policy_value = std::env::var(policy_env)
+        .with_context(|| format!("FreeToken policy environment variable {policy_env} is unset"))?;
+
+    let expert_unavailable = "origin/main has no production route-to-residency attribution: \
+        QMoE route telemetry is not armed/collected by the executor and the process-global \
+        offload counters do not distinguish expert from dense weights";
+    let phase_unavailable = "the current process-global weight counters are reset around the \
+        measured generation window but have no prefill/decode or per-layer dimensions";
+    let offload = onnx_runtime_ep_cuda::global_offload_stats();
+    let plan = engine.memory_strategy_plan();
+    let resources = engine.resource_snapshot();
+    let cuda = engine.native_cuda_debug_stats();
+    let vmm = engine.vmm_arena_stats();
+    let emitted = emitted_tokens.max(1) as f64;
+    let metric_u64 = |value: Option<u64>, unit: &str, boundary: &str, reason: &str| {
+        value.map_or_else(
+            || Metric::unavailable(unit, boundary, reason),
+            |value| Metric::available(value, unit, boundary),
+        )
+    };
+
+    let graph_lifetime = "native decode session lifetime, including warm-up; read after all \
+        measured generate calls returned";
+    let graph_window = "session counter delta from immediately after warm-up/counter reset to \
+        after all measured generate calls returned";
+    let cuda_captures = cuda.as_ref().map(|stats| stats.graph.captures);
+    let cuda_replays = cuda.as_ref().map(|stats| stats.graph.replays);
+    let cuda_fallbacks = cuda.as_ref().map(|stats| stats.graph.fallbacks);
+    let measured_captures = cuda
+        .as_ref()
+        .zip(cuda_before)
+        .map(|(after, before)| after.graph.captures.saturating_sub(before.graph.captures));
+    let measured_replays = cuda
+        .as_ref()
+        .zip(cuda_before)
+        .map(|(after, before)| after.graph.replays.saturating_sub(before.graph.replays));
+    let measured_fallbacks = cuda
+        .as_ref()
+        .zip(cuda_before)
+        .map(|(after, before)| after.graph.fallbacks.saturating_sub(before.graph.fallbacks));
+
+    let vmm_boundary = "engine VMM arena authority snapshot while the engine is alive, after all \
+        measured generate calls returned; peak covers this fresh process's arena lifetime";
+    let mut report = FreeTokenRunReport {
+        schema: RUN_SCHEMA.to_string(),
+        binary_marker: FREETOKEN_NATIVE_CUDA_MARKER.to_string(),
+        backend: "native-cuda".to_string(),
+        arm,
+        policy_control: PolicyControl {
+            environment_variable: policy_env.clone(),
+            value: policy_value,
+        },
+        model_path: model_dir.display().to_string(),
+        prompt_token_ids,
+        requested_output_tokens: args.tokens as u64,
+        emitted_tokens,
+        measured_generations: args.runs as u64,
+        decode_skip_tokens: args.decode_skip as u64,
+        generated_token_ids,
+        measurement_scope:
+            "fresh-process native-cuda counters reset after warm-up; one or more complete \
+             measured generations (prefill plus decode)"
+                .to_string(),
+        warmup,
+        metrics: FreeTokenMetrics {
+            selected_expert_logical_bytes: Metric::unavailable(
+                "bytes",
+                "sum of canonical logical bytes for experts selected by actual routes",
+                expert_unavailable,
+            ),
+            gpu_resident_expert_hit_bytes: Metric::unavailable(
+                "bytes",
+                "selected expert bytes served from device residency without a host transfer",
+                expert_unavailable,
+            ),
+            host_to_device_expert_page_in_bytes: Metric::unavailable(
+                "bytes",
+                "selected expert bytes accounted by completed/on-demand or enqueued/prefetch H2D",
+                expert_unavailable,
+            ),
+            cpu_served_expert_bytes: Metric::unavailable(
+                "bytes",
+                "selected expert bytes executed by a CPU expert kernel",
+                "origin/main has no CPU-served expert branch in native CUDA decode",
+            ),
+            expert_page_ins: Metric::unavailable(
+                "count",
+                "expert-only residency misses that entered the H2D page-in path",
+                expert_unavailable,
+            ),
+            expert_byte_hit_rate: Metric::unavailable(
+                "ratio",
+                "expert resident hit bytes divided by all selected expert bytes",
+                expert_unavailable,
+            ),
+            expert_bytes_per_emitted_token: Metric::unavailable(
+                "bytes/token",
+                "selected expert logical/served bytes divided by emitted tokens",
+                expert_unavailable,
+            ),
+            prefill_expert_bytes_by_layer: Metric::unavailable(
+                "bytes",
+                "per-layer expert bytes attributed only to prefill",
+                phase_unavailable,
+            ),
+            decode_expert_bytes_by_layer: Metric::unavailable(
+                "bytes",
+                "per-layer expert bytes attributed only to decode",
+                phase_unavailable,
+            ),
+            model_weight_layout_bytes: Metric::available(
+                plan.total_weight_bytes,
+                "bytes",
+                "memory planner sum of model weight storage bytes at engine load; analytical \
+                 layout input, never physical HBM traffic",
+            ),
+            weight_gpu_resident_hit_bytes: Metric::available(
+                offload.hit_bytes,
+                "bytes",
+                "process-global GLOBAL_HIT_BYTES reset after warm-up and incremented when any \
+                 lazy weight lookup is served from residency; includes dense and expert weights",
+            ),
+            weight_h2d_accounted_bytes: Metric::available(
+                offload.htod_bytes,
+                "bytes",
+                "process-global GLOBAL_HTOD_BYTES reset after warm-up; synchronous and measured \
+                 on-demand paths add after copy completion, async prefetch adds after enqueue \
+                 even if later discarded; canonical payload bytes, not bus transactions",
+            ),
+            weight_zero_copy_host_read_bytes: Metric::available(
+                offload.zero_copy_bytes,
+                "bytes",
+                "process-global bytes read in place from host-mapped weight pages after warm-up; \
+                 these are GPU host-link reads, not H2D copies",
+            ),
+            weight_page_ins: Metric::available(
+                offload.page_ins,
+                "count",
+                "process-global lazy-weight page-in decisions in the post-warm-up measurement \
+                 window; includes dense and expert weights",
+            ),
+            weight_cache_hits: Metric::available(
+                offload.hits,
+                "count",
+                "process-global lazy-weight residency hits in the post-warm-up measurement \
+                 window; includes dense and expert weights",
+            ),
+            weight_vram_byte_hit_rate: offload.zero_copy_byte_hit_rate().map_or_else(
+                || {
+                    Metric::unavailable(
+                        "ratio",
+                        "hit_bytes / (hit_bytes + h2d_bytes + zero_copy_bytes)",
+                        "no lazy weight bytes were requested in the measurement window",
+                    )
+                },
+                |rate| {
+                    Metric::available(
+                        rate,
+                        "ratio",
+                        "process-global byte-weighted VRAM residency rate after warm-up; \
+                         host-mapped zero-copy reads are misses, not hits",
+                    )
+                },
+            ),
+            weight_h2d_bytes_per_emitted_token: Metric::available(
+                offload.htod_bytes as f64 / emitted,
+                "bytes/token",
+                "GLOBAL_HTOD_BYTES in the post-warm-up complete-generation window divided by \
+                 all emitted tokens from those generations; includes prefill and decode",
+            ),
+            weight_host_link_bytes_per_emitted_token: Metric::available(
+                offload.htod_bytes.saturating_add(offload.zero_copy_bytes) as f64 / emitted,
+                "bytes/token",
+                "(GLOBAL_HTOD_BYTES + GLOBAL_ZERO_COPY_BYTES) after warm-up divided by emitted \
+                 tokens; combines copied payload bytes and in-place host reads without calling \
+                 either measured physical PCIe transactions",
+            ),
+            cuda_graph_captures: metric_u64(
+                cuda_captures,
+                "count",
+                graph_lifetime,
+                "native CUDA graph diagnostics are unavailable",
+            ),
+            cuda_graph_replays: metric_u64(
+                cuda_replays,
+                "count",
+                graph_lifetime,
+                "native CUDA graph diagnostics are unavailable",
+            ),
+            cuda_graph_fallbacks: metric_u64(
+                cuda_fallbacks,
+                "count",
+                graph_lifetime,
+                "native CUDA graph diagnostics are unavailable",
+            ),
+            measured_cuda_graph_captures: metric_u64(
+                measured_captures,
+                "count",
+                graph_window,
+                "native CUDA graph diagnostics or pre-window snapshot are unavailable",
+            ),
+            measured_cuda_graph_replays: metric_u64(
+                measured_replays,
+                "count",
+                graph_window,
+                "native CUDA graph diagnostics or pre-window snapshot are unavailable",
+            ),
+            measured_cuda_graph_fallbacks: metric_u64(
+                measured_fallbacks,
+                "count",
+                graph_window,
+                "native CUDA graph diagnostics or pre-window snapshot are unavailable",
+            ),
+            peak_committed_physical_bytes: metric_u64(
+                vmm.as_ref().map(|stats| stats.peak_committed_bytes),
+                "bytes",
+                vmm_boundary,
+                "engine exposes no VMM arena authority",
+            ),
+            managed_limit_bytes: Metric::available(
+                resources.vram.limit,
+                "bytes",
+                "live device-memory ceiling from the engine resource governor snapshot after \
+                 measured generation",
+            ),
+            oversubscribed_bytes: Metric::available(
+                engine.device_oversubscribed_bytes(),
+                "bytes",
+                "engine device governor oversubscription snapshot after measured generation",
+            ),
+            ref_underflows: metric_u64(
+                vmm.as_ref().map(|stats| stats.ref_underflows),
+                "count",
+                vmm_boundary,
+                "engine exposes no VMM arena authority",
+            ),
+            byte_underflows: metric_u64(
+                vmm.as_ref().map(|stats| stats.byte_underflows),
+                "count",
+                vmm_boundary,
+                "engine exposes no VMM arena authority",
+            ),
+            unaccounted_committed_bytes: metric_u64(
+                vmm.as_ref().map(|stats| stats.unaccounted_committed_bytes),
+                "bytes",
+                vmm_boundary,
+                "engine exposes no VMM arena authority",
+            ),
+            wall_clock_prefill_milliseconds: Metric::available(
+                prefills_ms,
+                "milliseconds",
+                "host wall clock from generate call start to first token callback; corroborative \
+                 only and not a CUDA copy duration",
+            ),
+            wall_clock_decode_milliseconds_per_token: Metric::available(
+                decode_ms_per_token,
+                "milliseconds/token",
+                "host callback interval after decode_skip divided by decoded tokens; \
+                 corroborative only on a proven idle GPU",
+            ),
+            wall_clock_decode_tokens_per_second: Metric::available(
+                throughputs,
+                "tokens/second",
+                "reciprocal host callback decode interval; corroborative only on a proven idle \
+                 GPU with at least three paired trials",
+            ),
+        },
+        contract: ContractStatus::default(),
+    };
+    report.refresh_contract();
+
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create FreeToken report directory {}", parent.display()))?;
+    }
+    let json = serde_json::to_vec_pretty(&report).context("serialize FreeToken run report")?;
+    std::fs::write(path, json)
+        .with_context(|| format!("write FreeToken run report {}", path.display()))?;
+    println!(
+        "freetoken_byte_report: path={} contract_passed={} errors={}",
+        path.display(),
+        report.contract.passed,
+        report.contract.errors.len()
+    );
+    if !report.contract.passed {
+        bail!(
+            "FreeToken byte-accounting run contract failed: {}",
+            report.contract.errors.join("; ")
+        );
+    }
+    Ok(())
 }
 
 fn configure_ort_provider(args: &Args) -> Result<()> {
@@ -3137,13 +3589,15 @@ fn run_steady(args: &Args, model_dir: &Path, device: NativeDecodeDevice) -> Resu
     }
     print_memory_observability(&engine);
 
-    for _ in 0..args.warmups {
-        std::hint::black_box(
-            engine
-                .generate(request(args, args.tokens))
-                .context("steady warmup generation")?,
-        );
-    }
+    #[cfg(feature = "native-cuda")]
+    let freetoken_prompt_token_ids = if args.freetoken_report_json.is_some() {
+        Some(freetoken_prompt_tokens(args, model_dir)?)
+    } else {
+        None
+    };
+    let warmup = run_steady_warmup(args, &mut engine)?;
+    #[cfg(not(feature = "native-cuda"))]
+    let _ = &warmup;
     profile::reset();
     onnx_runtime_session::reset_exec_phase_profile();
     onnx_runtime_session::reset_dense_prefetch_gap_stats();
@@ -3200,18 +3654,21 @@ fn run_steady(args: &Args, model_dir: &Path, device: NativeDecodeDevice) -> Resu
         throughputs.push(tok_per_s);
     }
 
+    let mut prefills_for_median = prefills_ms.clone();
+    let mut decode_for_median = decode_ms_per_token.clone();
+    let mut throughputs_for_median = throughputs.clone();
     println!(
         "steady_median: backend={} prefill={:.3} ms decode={:.3} ms/token throughput={:.2} tok/s \
          (runs={} warmups={} decode_skip={})",
         args.backend.as_str(),
-        median(&mut prefills_ms),
-        median(&mut decode_ms_per_token),
-        median(&mut throughputs),
+        median(&mut prefills_for_median),
+        median(&mut decode_for_median),
+        median(&mut throughputs_for_median),
         args.runs,
         args.warmups,
         args.decode_skip
     );
-    if let Some(tokens) = reference_tokens {
+    if let Some(tokens) = &reference_tokens {
         println!("generated_token_ids: {tokens:?}");
     }
     if args.speculative != SpeculativeArg::None {
@@ -3227,6 +3684,22 @@ fn run_steady(args: &Args, model_dir: &Path, device: NativeDecodeDevice) -> Resu
     print_cuda_observability(&engine, cuda_before.as_ref());
     print_weight_offload_observability(generated as u64);
     print_vmm_observability(&engine);
+    #[cfg(feature = "native-cuda")]
+    if args.freetoken_report_json.is_some() {
+        write_freetoken_run_report(
+            args,
+            model_dir,
+            freetoken_prompt_token_ids.context("FreeToken prompt ids were not resolved")?,
+            reference_tokens.context("measured generation produced no token stream")?,
+            generated as u64,
+            warmup,
+            &engine,
+            cuda_before.as_ref(),
+            prefills_ms,
+            decode_ms_per_token,
+            throughputs,
+        )?;
+    }
     if profile::enabled() {
         println!("{}", profile::report(generated as u64));
     }
@@ -3632,6 +4105,7 @@ fn main() -> Result<()> {
             .with_context(|| format!("failed to read --prompt-file {}", path.display()))?;
     }
     validate_backend(&args)?;
+    validate_freetoken_report_args(&args)?;
     init_prompt_ids(&args)?;
     eprintln!(
         "profile_native: WEIGHT_OFFLOAD_BYTE_AWARE={:?} WEIGHT_OFFLOAD_EVICT_ORDER={:?} \
@@ -3999,6 +4473,7 @@ mod tests {
         let default = Args::try_parse_from(["profile_native", "--synthetic"]).unwrap();
         assert_eq!(default.backend, DecodeBackend::Native);
         assert_eq!(default.decode_precision, DecodePrecisionArg::Model);
+        assert_eq!(default.warmup_seconds, 0.0);
 
         for (value, expected) in [
             ("native", DecodeBackend::Native),
@@ -4009,6 +4484,61 @@ mod tests {
                 .unwrap();
             assert_eq!(args.backend, expected);
         }
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn freetoken_report_requires_deterministic_native_cuda_steady_mode() {
+        let valid = Args::try_parse_from([
+            "profile_native",
+            "--model",
+            "unused",
+            "--steady",
+            "--ep",
+            "cuda",
+            "--backend",
+            "native",
+            "--freetoken-report-json",
+            "target/report.json",
+            "--freetoken-arm",
+            "off",
+            "--freetoken-policy-env",
+            "POLICY",
+        ])
+        .unwrap();
+        validate_freetoken_report_args(&valid).unwrap();
+
+        let sampled = Args {
+            temperature: 0.8,
+            ..valid
+        };
+        let error = validate_freetoken_report_args(&sampled)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("deterministic greedy"), "{error}");
+    }
+
+    #[test]
+    fn rejects_negative_warmup_seconds() {
+        let args =
+            Args::try_parse_from(["profile_native", "--synthetic", "--warmup-seconds=-1"]).unwrap();
+        let error = validate_freetoken_report_args(&args)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("finite and non-negative"), "{error}");
+    }
+
+    #[test]
+    fn no_prefix_cache_forces_a_cold_steady_request() {
+        let args = Args::try_parse_from([
+            "profile_native",
+            "--model",
+            "unused",
+            "--steady",
+            "--no-prefix-cache",
+        ])
+        .unwrap();
+        assert!(request(&args, 2).options.cold_start);
     }
 
     #[test]
