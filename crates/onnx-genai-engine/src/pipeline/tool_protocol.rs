@@ -34,7 +34,8 @@ impl GenerationStopReason {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StagedOutputObservation {
     Continue,
-    ToolCallsReady(Vec<ToolCall>),
+    CompleteSoFar(Vec<ToolCall>),
+    TerminalComplete(Vec<ToolCall>),
 }
 
 /// An output protocol failure observed before semantic turn commit.
@@ -139,8 +140,8 @@ impl ToolCallStagedOutputObserver {
     /// Observe a text chunk already canonicalized by the generation runtime.
     ///
     /// This is useful to a host whose generation unit is text rather than one
-    /// token. Complete is terminal for the current turn; incomplete deliberately
-    /// remains nonterminal until more staged output or [`Self::finish`].
+    /// token. A complete envelope remains nonterminal because both supported v1
+    /// protocols allow another adjacent call and declare no sequence marker.
     pub fn observe_text(
         &mut self,
         chunk: &str,
@@ -177,11 +178,23 @@ impl ToolCallStagedOutputObserver {
 
     /// Validate the terminal boundary. Only an unfinished envelope fails here;
     /// ordinary text remains a valid no-call completion.
-    pub fn finish(&self, boundary: &'static str) -> Result<(), StagedOutputObservationError> {
+    pub fn finish(
+        &mut self,
+        boundary: &'static str,
+    ) -> Result<StagedOutputObservation, StagedOutputObservationError> {
         let outcome = self.stream.clone().finish(self.protocol);
         match &outcome {
-            ToolParseOutcome::NoCall | ToolParseOutcome::Complete(_) => {
-                self.validate_policy(&outcome, boundary)
+            ToolParseOutcome::NoCall => {
+                self.validate_policy(&outcome, boundary)?;
+                Ok(StagedOutputObservation::Continue)
+            }
+            ToolParseOutcome::TerminalComplete(calls) => {
+                self.validate_policy(&outcome, boundary)?;
+                self.terminal = Some(calls.clone());
+                Ok(StagedOutputObservation::TerminalComplete(calls.clone()))
+            }
+            ToolParseOutcome::CompleteSoFar(_) => {
+                unreachable!("finish marks complete calls terminal")
             }
             ToolParseOutcome::Incomplete => {
                 let (identity, version) = self.protocol.declaration();
@@ -242,9 +255,11 @@ impl ToolCallStagedOutputObserver {
             ToolParseOutcome::NoCall | ToolParseOutcome::Incomplete => {
                 Ok(StagedOutputObservation::Continue)
             }
-            ToolParseOutcome::Complete(calls) => {
-                self.terminal = Some(calls.clone());
-                Ok(StagedOutputObservation::ToolCallsReady(calls))
+            ToolParseOutcome::CompleteSoFar(calls) => {
+                Ok(StagedOutputObservation::CompleteSoFar(calls))
+            }
+            ToolParseOutcome::TerminalComplete(_) => {
+                unreachable!("incremental parsing cannot invent a terminal boundary")
             }
             ToolParseOutcome::Malformed(reason) => {
                 let (identity, version) = self.protocol.declaration();
@@ -278,7 +293,10 @@ impl ToolCallStagedOutputObserver {
             (ToolCallPolicy::Specific { function }, ToolParseOutcome::NoCall) => Some(format!(
                 "the model produced no tool call, but function {function:?} was required"
             )),
-            (ToolCallPolicy::Specific { function }, ToolParseOutcome::Complete(calls)) => {
+            (
+                ToolCallPolicy::Specific { function },
+                ToolParseOutcome::CompleteSoFar(calls) | ToolParseOutcome::TerminalComplete(calls),
+            ) => {
                 let observed = calls
                     .iter()
                     .map(|call| call.name.as_str())
@@ -335,21 +353,21 @@ mod tests {
     }
 
     #[test]
-    fn completed_single_and_multiple_calls_are_normal_stops_without_publication() {
+    fn complete_calls_are_pending_until_an_independent_terminal_boundary() {
         let mut observer =
             ToolCallStagedOutputObserver::new(protocol("tagged-json"), ToolCallPolicy::Auto);
-        let StagedOutputObservation::ToolCallsReady(calls) = observer
+        let StagedOutputObservation::CompleteSoFar(calls) = observer
             .observe_text(r#"<tool_call>{"name":"read","arguments":{}}</tool_call>"#)
             .unwrap()
         else {
-            panic!("complete envelope must stop normally");
+            panic!("complete envelope must remain pending");
         };
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "read");
+        assert!(observer.stop_reason().is_none());
         assert!(matches!(
-            observer.stop_reason(),
-            Some(GenerationStopReason::ToolCallsReady(ref calls))
-                if calls.len() == 1
+            observer.finish("EOS boundary").unwrap(),
+            StagedOutputObservation::TerminalComplete(ref calls) if calls.len() == 1
         ));
         assert_eq!(
             observer.stop_reason().unwrap().finish_reason(),
@@ -358,7 +376,7 @@ mod tests {
 
         let mut observer =
             ToolCallStagedOutputObserver::new(protocol("tagged-json"), ToolCallPolicy::Auto);
-        let StagedOutputObservation::ToolCallsReady(calls) = observer
+        let StagedOutputObservation::CompleteSoFar(calls) = observer
             .observe_text(concat!(
                 r#"<tool_call>{"name":"read","arguments":{}}</tool_call>"#,
                 "\n",
@@ -366,10 +384,13 @@ mod tests {
             ))
             .unwrap()
         else {
-            panic!("complete envelope sequence must stop normally");
+            panic!("complete envelope sequence must remain pending");
         };
         assert_eq!(calls.len(), 2);
-        assert!(observer.finish("semantic commit").is_ok());
+        assert!(matches!(
+            observer.finish("semantic commit").unwrap(),
+            StagedOutputObservation::TerminalComplete(ref calls) if calls.len() == 2
+        ));
     }
 
     #[test]
@@ -388,7 +409,7 @@ mod tests {
             ToolCallStagedOutputObserver::new(protocol("tagged-json"), ToolCallPolicy::Auto);
         assert!(matches!(
             observer.observe_text(r#"<tool_call>{"name":"read","arguments":{}}</tool_call>"#),
-            Ok(StagedOutputObservation::ToolCallsReady(_))
+            Ok(StagedOutputObservation::CompleteSoFar(_))
         ));
         assert!(matches!(
             observer.observe_text("not a tool envelope"),
@@ -408,7 +429,7 @@ mod tests {
             StagedOutputObservation::Continue
         );
         observer.abort_turn();
-        let StagedOutputObservation::ToolCallsReady(calls) = observer
+        let StagedOutputObservation::CompleteSoFar(calls) = observer
             .observe_text(r#"<tool_call>{"name":"write","arguments":{}}</tool_call>"#)
             .unwrap()
         else {
@@ -424,11 +445,11 @@ mod tests {
         observer.begin_turn();
         assert!(matches!(
             observer.observe_text(r#"<tool_call>{"name":"read","arguments":{}}</tool_call>"#),
-            Ok(StagedOutputObservation::ToolCallsReady(_))
+            Ok(StagedOutputObservation::CompleteSoFar(_))
         ));
         observer.abort_turn();
         assert!(observer.stop_reason().is_none());
-        let StagedOutputObservation::ToolCallsReady(calls) = observer
+        let StagedOutputObservation::CompleteSoFar(calls) = observer
             .observe_text(r#"<tool_call>{"name":"write","arguments":{}}</tool_call>"#)
             .unwrap()
         else {
@@ -507,6 +528,33 @@ mod tests {
                 expected
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn complete_so_far_never_requests_host_stop_before_finish() -> anyhow::Result<()> {
+        let mut observer =
+            ToolCallStagedOutputObserver::new(protocol("tagged-json"), ToolCallPolicy::Auto);
+        for chunk in [
+            r#"<tool_call>{"name":"read","arguments":{}}</tool_call>"#,
+            "\n<tool_call>",
+            r#"{"name":"write","arguments":{}}</tool_call>"#,
+        ] {
+            observer.observe_text(chunk)?;
+            assert!(
+                observer.stop_reason().is_none(),
+                "a chunk boundary cannot terminate a v1 call sequence"
+            );
+        }
+        assert!(matches!(
+            observer.finish("committed EOS").unwrap(),
+            StagedOutputObservation::TerminalComplete(ref calls)
+                if calls.iter().map(|call| call.name.as_str()).eq(["read", "write"])
+        ));
+        assert!(matches!(
+            observer.stop_reason(),
+            Some(GenerationStopReason::ToolCallsReady(ref calls)) if calls.len() == 2
+        ));
         Ok(())
     }
 }

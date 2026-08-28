@@ -33,8 +33,11 @@ pub enum ToolParseOutcome {
     NoCall,
     /// An opening envelope appeared but cannot yet be decided.
     Incomplete,
-    /// The complete envelope is valid and contains these calls.
-    Complete(Vec<ToolCall>),
+    /// One or more complete envelopes have been parsed, but this v1 protocol
+    /// has no sequence terminator, so more adjacent calls may still follow.
+    CompleteSoFar(Vec<ToolCall>),
+    /// The independent generation boundary ended a valid envelope sequence.
+    TerminalComplete(Vec<ToolCall>),
     /// The envelope is complete enough to reject, with an actionable reason.
     Malformed(String),
 }
@@ -78,7 +81,9 @@ impl ToolProtocol {
     ) -> Option<ToolProtocolError> {
         let (identity, version) = self.declaration();
         match outcome {
-            ToolParseOutcome::NoCall | ToolParseOutcome::Complete(_) => None,
+            ToolParseOutcome::NoCall
+            | ToolParseOutcome::CompleteSoFar(_)
+            | ToolParseOutcome::TerminalComplete(_) => None,
             ToolParseOutcome::Incomplete => Some(ToolProtocolError(format!(
                 "declared tool protocol {identity}@{version} produced an incomplete envelope at the {boundary}; the opening envelope reached end of output"
             ))),
@@ -140,7 +145,10 @@ impl ToolCallStream {
         if let Some(error) = self.terminal_error {
             return ToolParseOutcome::Malformed(error);
         }
-        protocol.parse(&self.input)
+        match protocol.parse(&self.input) {
+            ToolParseOutcome::CompleteSoFar(calls) => ToolParseOutcome::TerminalComplete(calls),
+            outcome => outcome,
+        }
     }
 }
 
@@ -397,7 +405,7 @@ fn values_to_calls(protocol: &str, values: Vec<serde_json::Value>) -> ToolParseO
             arguments,
         });
     }
-    ToolParseOutcome::Complete(calls)
+    ToolParseOutcome::CompleteSoFar(calls)
 }
 
 #[cfg(test)]
@@ -492,7 +500,7 @@ mod tests {
         );
         assert!(matches!(
             stream.push(protocol, r#"lib.rs"}}</tool_call>"#),
-            ToolParseOutcome::Complete(_)
+            ToolParseOutcome::CompleteSoFar(_)
         ));
 
         let mut malformed = ToolCallStream::default();
@@ -533,7 +541,7 @@ mod tests {
         }
         assert!(matches!(
             tagged.parse(r#"<tool_call>{"name":"read","arguments":{}}</tool_call>"#),
-            ToolParseOutcome::Complete(_)
+            ToolParseOutcome::CompleteSoFar(_)
         ));
 
         let atem = protocol("atem-xml");
@@ -551,13 +559,83 @@ mod tests {
             "\n",
             r#"<tool_call>{"id":"two","name":"write","parameters":{"path":"x"}}</tool_call>"#
         );
-        let ToolParseOutcome::Complete(calls) = protocol.parse(input) else {
+        let ToolParseOutcome::CompleteSoFar(calls) = protocol.parse(input) else {
             panic!("multiple calls must parse");
         };
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[1].name, "write");
         assert!(matches!(
             protocol.parse(&"x".repeat(MAX_TOOL_PAYLOAD_BYTES + 1)),
+            ToolParseOutcome::Malformed(message) if message.contains("byte protocol limit")
+        ));
+    }
+
+    #[test]
+    fn adjacent_calls_are_chunk_independent_and_only_finish_makes_them_terminal() {
+        for (identity, envelope) in [
+            (
+                "tagged-json",
+                r#"<tool_call>{"name":"read","arguments":{}}</tool_call>"#,
+            ),
+            ("atem-xml", r#"<atem:invoke name="read"></atem:invoke>"#),
+        ] {
+            let protocol = protocol(identity);
+            let input = format!("{envelope}\n{envelope}\t{envelope}");
+            let mut stream = ToolCallStream::default();
+            for character in input.chars() {
+                stream.push(protocol, &character.to_string());
+            }
+            assert!(matches!(
+                protocol.parse(&input),
+                ToolParseOutcome::CompleteSoFar(ref calls) if calls.len() == 3
+            ));
+            assert!(matches!(
+                stream.finish(protocol),
+                ToolParseOutcome::TerminalComplete(ref calls) if calls.len() == 3
+            ));
+        }
+    }
+
+    #[test]
+    fn a_complete_envelope_followed_by_a_partial_one_stays_incomplete() {
+        for (identity, complete, partial) in [
+            (
+                "tagged-json",
+                r#"<tool_call>{"name":"read","arguments":{}}</tool_call>"#,
+                "<tool_call>",
+            ),
+            (
+                "atem-xml",
+                r#"<atem:invoke name="read"></atem:invoke>"#,
+                "<atem:invoke",
+            ),
+        ] {
+            let protocol = protocol(identity);
+            let mut stream = ToolCallStream::default();
+            assert!(matches!(
+                stream.push(protocol, complete),
+                ToolParseOutcome::CompleteSoFar(ref calls) if calls.len() == 1
+            ));
+            assert_eq!(stream.push(protocol, partial), ToolParseOutcome::Incomplete);
+            assert_eq!(stream.finish(protocol), ToolParseOutcome::Incomplete);
+        }
+    }
+
+    #[test]
+    fn stream_byte_limit_covers_the_whole_pending_call_sequence() {
+        let protocol = protocol("tagged-json");
+        let envelope = r#"<tool_call>{"name":"read","arguments":{}}</tool_call>"#;
+        let mut stream = ToolCallStream::default();
+        assert!(matches!(
+            stream.push(protocol, envelope),
+            ToolParseOutcome::CompleteSoFar(ref calls) if calls.len() == 1
+        ));
+        assert!(matches!(
+            stream.push(protocol, &" ".repeat(MAX_TOOL_PAYLOAD_BYTES - envelope.len())),
+            ToolParseOutcome::CompleteSoFar(ref calls) if calls.len() == 1
+        ));
+        assert!(matches!(
+            stream.push(protocol, " "),
             ToolParseOutcome::Malformed(message) if message.contains("byte protocol limit")
         ));
     }

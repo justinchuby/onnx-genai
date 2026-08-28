@@ -576,10 +576,13 @@ impl<B: DecodeLoopBackend + ?Sized> WorkflowNodeHost for GenerationNodeHost<'_, 
     }
 
     fn before_turn_commit(&mut self, _turn: &super::TurnTransaction) -> anyhow::Result<()> {
-        if let Some(observer) = self.staged_output_observer.as_deref() {
-            observer
+        if let Some(observer) = self.staged_output_observer.as_deref_mut()
+            && let StagedOutputObservation::TerminalComplete(calls) = observer
                 .finish("semantic commit")
-                .context("validate staged generated tool protocol before semantic commit")?;
+                .context("validate staged generated tool protocol before semantic commit")?
+        {
+            self.loop_stop = Some(GenerationStopReason::ToolCallsReady(calls));
+            self.finish = Some(FinishReason::ToolCalls);
         }
         Ok(())
     }
@@ -610,13 +613,9 @@ impl<B: DecodeLoopBackend + ?Sized> WorkflowNodeHost for GenerationNodeHost<'_, 
         let Some(observer) = self.staged_output_observer.as_deref_mut() else {
             return Ok(());
         };
-        if let StagedOutputObservation::ToolCallsReady(calls) = observer
+        observer
             .observe_tokens(self.tokenizer, tokens)
-            .context("observe staged generated output before output publication")?
-        {
-            self.loop_stop = Some(GenerationStopReason::ToolCallsReady(calls));
-            self.finish = Some(FinishReason::ToolCalls);
-        }
+            .context("observe staged generated output before output publication")?;
         Ok(())
     }
 
@@ -691,7 +690,8 @@ impl WorkflowNodeHost for StagedOutputObserverHost<'_> {
     fn before_turn_commit(&mut self, _turn: &super::TurnTransaction) -> anyhow::Result<()> {
         self.observer
             .finish("semantic commit")
-            .context("validate staged generated tool protocol before semantic commit")
+            .context("validate staged generated tool protocol before semantic commit")?;
+        Ok(())
     }
 
     fn turn_committed(&mut self, _outcome: super::TurnTransactionOutcome) {
@@ -980,29 +980,34 @@ pub(crate) fn generate_with_decode_core_and_staged_observer<B: DecodeLoopBackend
     state: &mut DecodeLoopState,
     prompt_tokens: &[crate::TokenId],
     request: GenerationRequest<'_>,
-    staged_output_observer: Option<&mut ToolCallStagedOutputObserver>,
+    mut staged_output_observer: Option<&mut ToolCallStagedOutputObserver>,
     callback: Option<&mut GenerateTokenCallback<'_>>,
 ) -> anyhow::Result<GenerateResult> {
     // A prompt that already fills the context cannot take a step. Refusing
     // before the plan binds anything keeps the refusal free of partial state.
     if reached_context_limit(backend.context_len(), request.max_context) {
         ensure_constrained_finish(request.options, &state.generated_text, FinishReason::Length)?;
-        if let Some(observer) = staged_output_observer.as_deref() {
+        let tool_calls = if let Some(observer) = staged_output_observer.as_deref_mut() {
             observer
                 .finish("context-limit boundary")
                 .context("validate generated tool protocol before returning")?;
-        }
+            observer.committed_calls()
+        } else {
+            Vec::new()
+        };
+        let finish_reason = if tool_calls.is_empty() {
+            FinishReason::Length
+        } else {
+            FinishReason::ToolCalls
+        };
         let mut result = finish_result(
             request.tokenizer,
             &state.generated_tokens,
-            FinishReason::Length,
+            finish_reason,
             state.prefix_cache_hit_len,
             state.logprobs.as_deref(),
         )?;
-        result.tool_calls = staged_output_observer
-            .as_deref()
-            .map(ToolCallStagedOutputObserver::committed_calls)
-            .unwrap_or_default();
+        result.tool_calls = tool_calls;
         return Ok(result);
     }
     state.generated_tokens.reserve(

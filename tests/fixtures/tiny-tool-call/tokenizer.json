@@ -122,7 +122,7 @@
       "tok17": 17,
       "tok18": 18,
       "tok19": 19,
-      "tok20": 20,
+      "<tool_call>{\"name\":\"weather\",\"arguments\":{\"city\":\"Berlin\"}}</tool_call>": 20,
       "tok21": 21,
       "tok23": 23,
       "tok24": 24,

@@ -810,14 +810,13 @@ mod tests {
     }
 
     #[test]
-    fn production_generation_host_stops_and_publishes_only_committed_tool_calls()
+    fn production_generation_host_waits_for_boundary_and_commits_every_adjacent_call()
     -> anyhow::Result<()> {
         let tokenizer = tool_protocol_tokenizer()?;
         let envelope = r#"<tool_call>{"name":"weather","arguments":{"city":"Paris"}}</tool_call>"#;
-        let mut tokens = generated_tokens(&tokenizer, envelope)?;
-        assert_eq!(tokenizer.decode(&tokens)?, envelope);
-        let envelope_len = tokens.len();
-        tokens.push(generated_tokens(&tokenizer, "x")?[0]);
+        let one_call = generated_tokens(&tokenizer, envelope)?;
+        let tokens = [one_call.as_slice(), one_call.as_slice()].concat();
+        assert_eq!(tokenizer.decode(&tokens)?, format!("{envelope} {envelope}"));
         let options = GenerateOptions {
             max_new_tokens: tokens.len(),
             greedy: true,
@@ -852,11 +851,14 @@ mod tests {
         )?;
 
         assert_eq!(result.finish_reason, FinishReason::ToolCalls);
-        assert_eq!(result.token_ids.len(), envelope_len);
-        assert_eq!(backend.next_logits, envelope_len);
+        assert_eq!(result.token_ids, tokens);
+        assert_eq!(backend.next_logits, 2);
         assert_eq!(delivered, result.token_ids);
-        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(result.tool_calls.len(), 2);
         assert_eq!(result.tool_calls[0].name, "weather");
+        assert_eq!(result.tool_calls[1].name, "weather");
+        assert_eq!(result.tool_calls[0].id, "call_0");
+        assert_eq!(result.tool_calls[1].id, "call_1");
         assert_eq!(result.tool_calls[0].arguments, r#"{"city":"Paris"}"#);
         Ok(())
     }
@@ -912,20 +914,15 @@ mod tests {
         let envelope = r#"<tool_call>{"name":"weather","arguments":{"city":"Paris"}}</tool_call>"#;
         let tokens = generated_tokens(&tokenizer, envelope)?;
         let options = GenerateOptions {
-            max_new_tokens: tokens.len() + 1,
+            max_new_tokens: tokens.len(),
             greedy: true,
             temperature: 0.0,
             stop_on_eos: false,
             ..Default::default()
         };
         let chain = build_processor_chain(&options, None, false)?;
-        let mut scripted = tokens.clone();
-        scripted.push(generated_tokens(&tokenizer, "x")?[0]);
-        let mut backend = MockBackend::with_logits(
-            false,
-            SampledOutcome::HardError,
-            logits_for_tokens(&scripted),
-        );
+        let mut backend =
+            MockBackend::with_logits(false, SampledOutcome::HardError, logits_for_tokens(&tokens));
         let mut state = DecodeLoopState::new(0, options.seed, None);
         let mut observer = tagged_json_observer(crate::ToolCallPolicy::Auto);
         let mut deliveries = 0;

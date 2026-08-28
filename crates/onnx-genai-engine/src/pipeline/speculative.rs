@@ -1027,7 +1027,7 @@ impl WorkflowRuntime {
             .max_context
             .is_some_and(|limit| prompt_tokens.len() >= limit)
         {
-            if let Some(observer) = staged_output_observer.as_deref() {
+            if let Some(observer) = staged_output_observer.as_deref_mut() {
                 observer
                     .finish("candidate-tree context-limit boundary")
                     .context("validate generated tool protocol before returning")?;
@@ -1188,26 +1188,18 @@ impl WorkflowRuntime {
                 let tokenizer = tokenizer.context(
                     "candidate-tree tool-call observation requires the package tokenizer",
                 )?;
-                if matches!(
-                    observer
-                        .observe_tokens(tokenizer, &committed)
-                        .map_err(|error| {
-                            let _ = transaction.abort(super::TurnAbortReason::ExecutionFailure);
-                            anyhow::Error::new(error).context(
-                                "candidate-tree staged tool-call observation failed before commit",
-                            )
-                        })?,
-                    super::StagedOutputObservation::ToolCallsReady(_)
-                ) {
-                    finish_reason = FinishReason::ToolCalls;
-                }
+                observer
+                    .observe_tokens(tokenizer, &committed)
+                    .map_err(|error| {
+                        let _ = transaction.abort(super::TurnAbortReason::ExecutionFailure);
+                        anyhow::Error::new(error).context(
+                            "candidate-tree staged tool-call observation failed before commit",
+                        )
+                    })?;
             }
             blocks = blocks.saturating_add(1);
             last_tree = Some(tree);
-            if matches!(
-                finish_reason,
-                FinishReason::EosToken | FinishReason::ToolCalls
-            ) {
+            if finish_reason == FinishReason::EosToken {
                 break;
             }
         }
@@ -1338,14 +1330,19 @@ impl WorkflowRuntime {
             })
             .collect::<Result<Vec<_>, _>>()
             .context("decode candidate-tree token events before semantic commit")?;
-        if let Some(observer) = staged_output_observer.as_deref() {
-            observer
-                .finish("candidate-tree semantic commit")
-                .map_err(|error| {
-                    let _ = transaction.abort(super::TurnAbortReason::ExecutionFailure);
-                    anyhow::Error::new(error)
-                        .context("validate candidate-tree tool protocol before semantic commit")
-                })?;
+        if let Some(observer) = staged_output_observer.as_deref_mut()
+            && matches!(
+                observer
+                    .finish("candidate-tree semantic commit")
+                    .map_err(|error| {
+                        let _ = transaction.abort(super::TurnAbortReason::ExecutionFailure);
+                        anyhow::Error::new(error)
+                            .context("validate candidate-tree tool protocol before semantic commit")
+                    })?,
+                super::StagedOutputObservation::TerminalComplete(_)
+            )
+        {
+            finish_reason = FinishReason::ToolCalls;
         }
 
         match control.begin_commit() {
@@ -2031,7 +2028,7 @@ impl WorkflowRuntime {
             .max_context
             .is_some_and(|limit| initial_tokens.len() >= limit)
         {
-            if let Some(observer) = staged_output_observer.as_deref() {
+            if let Some(observer) = staged_output_observer.as_deref_mut() {
                 observer
                     .finish("DFlash context-limit boundary")
                     .context("validate generated tool protocol before returning")?;
@@ -2270,24 +2267,16 @@ impl WorkflowRuntime {
             if let Some(observer) = staged_output_observer.as_deref_mut() {
                 let tokenizer = tokenizer
                     .context("DFlash tool-call observation requires the package tokenizer")?;
-                if matches!(
-                    observer
-                        .observe_tokens(tokenizer, &observed_tokens)
-                        .map_err(|error| {
-                            let _ = turn.abort(super::TurnAbortReason::ExecutionFailure);
-                            anyhow::Error::new(error)
-                                .context("DFlash staged tool-call observation failed before commit")
-                        })?,
-                    super::StagedOutputObservation::ToolCallsReady(_)
-                ) {
-                    finish_reason = FinishReason::ToolCalls;
-                }
+                observer
+                    .observe_tokens(tokenizer, &observed_tokens)
+                    .map_err(|error| {
+                        let _ = turn.abort(super::TurnAbortReason::ExecutionFailure);
+                        anyhow::Error::new(error)
+                            .context("DFlash staged tool-call observation failed before commit")
+                    })?;
             }
             staged_contract_executions = staged_contract_executions.saturating_add(1);
-            if matches!(
-                finish_reason,
-                FinishReason::EosToken | FinishReason::ToolCalls
-            ) {
+            if finish_reason == FinishReason::EosToken {
                 break;
             }
         }
@@ -2296,12 +2285,17 @@ impl WorkflowRuntime {
             .map(|tokenizer| tokenizer.decode(&generated))
             .transpose()?
             .unwrap_or_default();
-        if let Some(observer) = staged_output_observer.as_deref() {
-            observer.finish("DFlash semantic commit").map_err(|error| {
-                let _ = turn.abort(super::TurnAbortReason::ExecutionFailure);
-                anyhow::Error::new(error)
-                    .context("validate DFlash tool protocol before semantic commit")
-            })?;
+        if let Some(observer) = staged_output_observer.as_deref_mut()
+            && matches!(
+                observer.finish("DFlash semantic commit").map_err(|error| {
+                    let _ = turn.abort(super::TurnAbortReason::ExecutionFailure);
+                    anyhow::Error::new(error)
+                        .context("validate DFlash tool protocol before semantic commit")
+                })?,
+                super::StagedOutputObservation::TerminalComplete(_)
+            )
+        {
+            finish_reason = FinishReason::ToolCalls;
         }
         match control.begin_commit() {
             Ok(true) => {}

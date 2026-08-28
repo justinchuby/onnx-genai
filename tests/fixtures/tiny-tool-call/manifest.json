@@ -13,6 +13,6 @@
   "head_dim": 8,
   "files": {
     "model.onnx.textproto": 75291,
-    "tokenizer.json": 2263
+    "tokenizer.json": 2695
   }
 }

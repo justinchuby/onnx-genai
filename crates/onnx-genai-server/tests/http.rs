@@ -1365,7 +1365,7 @@ async fn tool_request_without_package_declaration_fails_before_generation() {
 }
 
 #[tokio::test]
-async fn buffered_and_sse_routes_serialize_the_same_committed_tool_call() {
+async fn buffered_and_sse_routes_commit_all_adjacent_model_generated_calls() {
     let body = json!({
         "model": "tiny-tool-call",
         "messages": [{"role": "user", "content": "hello"}],
@@ -1377,7 +1377,7 @@ async fn buffered_and_sse_routes_serialize_the_same_committed_tool_call() {
             }
         }],
         "tool_choice": "auto",
-        "max_tokens": 4
+        "max_tokens": 3
     });
     let buffered = post_json(
         fixture_app("tiny-tool-call").await,
@@ -1405,6 +1405,11 @@ async fn buffered_and_sse_routes_serialize_the_same_committed_tool_call() {
         choice["message"]["tool_calls"][0]["function"]["arguments"],
         r#"{"city":"Paris"}"#
     );
+    assert_eq!(choice["message"]["tool_calls"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        choice["message"]["tool_calls"][2]["function"]["arguments"],
+        r#"{"city":"Berlin"}"#
+    );
 
     let mut streamed_body = body;
     streamed_body["stream"] = Value::Bool(true);
@@ -1429,6 +1434,10 @@ async fn buffered_and_sse_routes_serialize_the_same_committed_tool_call() {
     assert!(streamed.contains("\"name\":\"weather\""), "{streamed}");
     assert!(
         streamed.contains("\\\"city\\\":\\\"Paris\\\""),
+        "{streamed}"
+    );
+    assert!(
+        streamed.contains("\\\"city\\\":\\\"Berlin\\\""),
         "{streamed}"
     );
     assert!(!streamed.contains("<tool_call>"), "{streamed}");
