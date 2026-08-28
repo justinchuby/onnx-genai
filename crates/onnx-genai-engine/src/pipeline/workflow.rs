@@ -1318,8 +1318,9 @@ impl<'a> WorkflowExecutionPlan<'a> {
             _ => None,
         };
         if let Some(session_id) = self.session_id.as_ref() {
+            let row_selection = workflow_row_selection(workflow, &values)?;
             for (cell, carrier) in session_state.carried() {
-                let Some(value) = engine
+                let Some(mut value) = engine
                     .worker
                     .session_state
                     .borrow()
@@ -1329,6 +1330,34 @@ impl<'a> WorkflowExecutionPlan<'a> {
                 else {
                     continue;
                 };
+                if let Some(selection) = row_selection.as_deref() {
+                    let state = workflow
+                        .state
+                        .get(cell)
+                        .expect("a classified cell is declared");
+                    let axis = state
+                        .contract
+                        .batch_layout
+                        .request_axis()
+                        .with_context(|| {
+                            format!(
+                                "session state '{cell}' cannot follow row selection because its \
+                             contract has no request-aligned batch axis"
+                            )
+                        })?;
+                    anyhow::ensure!(
+                        axis == 0,
+                        "session state '{cell}' cannot follow row selection on batch axis {axis}; \
+                         this runtime's resident gather supports axis 0"
+                    );
+                    let selection = selection
+                        .iter()
+                        .map(|&row| i64::try_from(row).context("row index exceeds i64"))
+                        .collect::<anyhow::Result<Vec<_>>>()?;
+                    value = super::device_ops::tensor_ops_for(&value)?
+                        .gather_rows(&value, &selection)
+                        .with_context(|| format!("failed to compact session state '{cell}'"))?;
+                }
                 match carrier {
                     // A loop reads its lease where it seeds the carry.
                     onnx_genai_metadata::SessionStateCarrier::LoopCarry => {
@@ -2149,7 +2178,24 @@ impl WorkflowRuntime {
                     let source = values
                         .get(value)
                         .with_context(|| format!("workflow emit value '{value}' is unavailable"))?;
-                    if source.is_host_resident()? && self.plan.movable_emit_values.contains(value) {
+                    let is_final_state_writer = self
+                        .plan
+                        .compiled_workflow
+                        .state_plan
+                        .cells()
+                        .map(|(_, state)| state)
+                        .filter_map(|state| state.final_writer.as_ref())
+                        .any(|writer| {
+                            matches!(
+                                writer,
+                                onnx_genai_metadata::StateFinalWriter::Writer(writer)
+                                    if writer.binding == *value
+                            )
+                        });
+                    if source.is_host_resident()?
+                        && self.plan.movable_emit_values.contains(value)
+                        && !is_final_state_writer
+                    {
                         values.remove(value).with_context(|| {
                             format!("workflow emit value '{value}' is unavailable")
                         })?
@@ -6704,17 +6750,17 @@ steps:
 manifest: {}
 inputs:
   seed:
-    contract: { dtype: int64, rank: 1, shape: [1] }
+    contract: { dtype: int64, shape: [1] }
     role: { kind: opaque }
     source: { kind: application, name: seed }
   keep_running:
-    contract: { dtype: bool, rank: 0, shape: [] }
+    contract: { dtype: bool, shape: [] }
     role: { kind: opaque }
     source: { kind: literal }
     required: false
     default: true
   one_iteration:
-    contract: { dtype: int64, rank: 0, shape: [] }
+    contract: { dtype: int64, shape: [] }
     role: { kind: opaque }
     source: { kind: literal }
     required: false
@@ -6726,20 +6772,20 @@ components:
     contract: { id: test.state.advance, version: "1" }
     ports:
       inputs:
-        state: { dtype: int64, rank: 1, shape: [1] }
+        state: { dtype: int64, shape: [1] }
       outputs:
-        state: { dtype: int64, rank: 1, shape: [1] }
+        state: { dtype: int64, shape: [1] }
   decode:
     implementation: { kind: binding }
     contract: { id: test.state.advance, version: "1" }
     ports:
       inputs:
-        state: { dtype: int64, rank: 1, shape: [1] }
+        state: { dtype: int64, shape: [1] }
       outputs:
-        state: { dtype: int64, rank: 1, shape: [1] }
+        state: { dtype: int64, shape: [1] }
 state:
   accumulator:
-    contract: { dtype: int64, rank: 1, shape: [1] }
+    contract: { dtype: int64, shape: [1] }
     scope: session
     initializer: seed
     recurrence: { kind: invariant }
@@ -6851,29 +6897,29 @@ steps:
 manifest: {}
 inputs:
   state:
-    contract: { dtype: int64, rank: 1, shape: [1] }
+    contract: { dtype: int64, shape: [1] }
     role: { kind: opaque }
     source: { kind: application, name: state }
   choose:
-    contract: { dtype: int64, rank: 0, shape: [] }
+    contract: { dtype: int64, shape: [] }
     role: { kind: opaque }
     source: { kind: application, name: choose }
   add_zero:
-    contract: { dtype: int64, rank: 0, shape: [] }
+    contract: { dtype: int64, shape: [] }
     role: { kind: opaque }
     source: { kind: application, name: add_zero }
   add_ten:
-    contract: { dtype: int64, rank: 0, shape: [] }
+    contract: { dtype: int64, shape: [] }
     role: { kind: opaque }
     source: { kind: application, name: add_ten }
   active:
-    contract: { dtype: bool, rank: 0, shape: [] }
+    contract: { dtype: bool, shape: [] }
     role: { kind: opaque }
     source: { kind: literal }
     required: false
     default: true
   done:
-    contract: { dtype: bool, rank: 0, shape: [] }
+    contract: { dtype: bool, shape: [] }
     role: { kind: opaque }
     source: { kind: literal }
     required: false
@@ -6885,13 +6931,13 @@ components:
     contract: { id: test.state.branch_advance, version: "1" }
     ports:
       inputs:
-        state: { dtype: int64, rank: 1, shape: [1] }
-        increment: { dtype: int64, rank: 0, shape: [] }
+        state: { dtype: int64, shape: [1] }
+        increment: { dtype: int64, shape: [] }
       outputs:
-        state: { dtype: int64, rank: 1, shape: [1] }
+        state: { dtype: int64, shape: [1] }
 state:
   accumulator:
-    contract: { dtype: int64, rank: 1, shape: [1] }
+    contract: { dtype: int64, shape: [1] }
     scope: session
     initializer: state
     recurrence: { kind: invariant }

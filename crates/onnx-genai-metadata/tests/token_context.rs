@@ -1,20 +1,18 @@
-//! Conformance coverage for graph-internal, stateful token-context features.
+//! Admission coverage for graph-internal, stateful token-context features.
 //!
-//! The first fixture preserves the public Qwen3.8 Flash Next geometry that is
-//! relevant to this ABI: eight hashes for each of bigrams and trigrams, whose
-//! values are injected after the first decoder layer. Its lookup tables and
-//! projected width are intentionally tiny reference vectors, not model weights.
-//! The second fixture changes every structural parameter that this test can
-//! change without changing the generic state/port path.
+//! Executable numerical and lifecycle conformance lives in the engine's
+//! `token_context_workflow` test; this file exercises only the portable
+//! contract, semantic provenance, schema-version, and capability gates.
 
 use std::collections::BTreeMap;
 
 use onnx_genai_metadata::{
     BatchLayout, ComponentContract, ComponentImplementation, InferenceMetadata, PaddedDimension,
-    PortRole, RuntimeInputRole, SemanticInputRole, ShapeRecurrence, StateCheckpointContract,
-    StateGroupCapabilities, StateKind, StatePortAlias, StateUpdate, TensorContract,
-    TensorDimension, WorkflowInput, WorkflowInputSource, WorkflowStateScope,
-    classify_session_state, resolve_state_plan, validate_metadata,
+    PortRole, RuntimeCapabilities, RuntimeInputRole, SemanticInputRole, ShapeRecurrence,
+    StateCheckpointContract, StateGroupCapabilities, StateKind, StatePortAlias, StateUpdate,
+    TensorContract, TensorDimension, WorkflowComponent, WorkflowInput, WorkflowInputSource,
+    WorkflowStateScope, WorkflowStep, classify_session_state, resolve_state_plan,
+    validate_metadata, validate_structure_and_capabilities,
 };
 
 const TOKEN_CONTEXT_CONTRACT: &str = "onnx-genai.token-context";
@@ -22,13 +20,10 @@ const TOKEN_CONTEXT_CONTRACT: &str = "onnx-genai.token-context";
 fn contract(dtype: &str, shape: &[&str]) -> TensorContract {
     TensorContract {
         dtype: dtype.to_string(),
-        rank: shape.len(),
-        shape: Some(
-            shape
-                .iter()
-                .map(|dimension| TensorDimension::Symbol((*dimension).to_string()))
-                .collect(),
-        ),
+        shape: shape
+            .iter()
+            .map(|dimension| TensorDimension::Symbol((*dimension).to_string()))
+            .collect(),
         optional: false,
         batch_layout: BatchLayout::RequestAligned { axis: 0 },
         padding: Vec::new(),
@@ -40,6 +35,7 @@ fn fixture() -> InferenceMetadata {
         "../../../examples/inference_metadata/catalogue/17-causal-convolution-recurrent.yaml"
     ))
     .expect("causal-convolution catalogue fixture parses");
+    metadata.schema_version = Some("v1.4".to_string());
     let workflow = &mut metadata
         .pipeline
         .as_mut()
@@ -49,6 +45,10 @@ fn fixture() -> InferenceMetadata {
         .manifest
         .capabilities
         .insert("session_state_lease".to_string());
+    workflow
+        .manifest
+        .capabilities
+        .insert("token_context".to_string());
     workflow
         .inputs
         .get_mut("request.hidden_states")
@@ -80,11 +80,11 @@ fn fixture() -> InferenceMetadata {
         .inputs
         .remove("hidden_states")
         .expect("model has hidden-state input");
-    embeds.shape = Some(vec![
+    embeds.shape = vec![
         TensorDimension::Symbol("batch".to_string()),
         TensorDimension::Symbol("sequence".to_string()),
         TensorDimension::Symbol("hidden".to_string()),
-    ]);
+    ];
     model
         .ports
         .inputs
@@ -170,7 +170,7 @@ fn fixture() -> InferenceMetadata {
     token_group.layout = "bt".to_string();
     token_group.update = Some(StateUpdate::Replace);
     token_group.capabilities = StateGroupCapabilities {
-        rollback_positions: Some(4),
+        rollback_positions: None,
         snapshot: true,
         fork: true,
         cascade: Default::default(),
@@ -199,7 +199,7 @@ fn fixture() -> InferenceMetadata {
         .get_mut("causal_conv_history")
         .expect("convolution state group exists")
         .capabilities = StateGroupCapabilities {
-        rollback_positions: Some(4),
+        rollback_positions: None,
         snapshot: true,
         fork: true,
         cascade: Default::default(),
@@ -249,6 +249,118 @@ fn fixture() -> InferenceMetadata {
 }
 
 #[test]
+fn token_context_requires_new_reader_and_runtime_admission() {
+    let mut old = fixture();
+    old.schema_version = Some("v1.3".to_string());
+    let errors = validate_metadata(&old).expect_err("a v1.3 reader contract cannot carry S12");
+    assert!(
+        errors.iter().any(|error| {
+            error.contains("onnx-genai.token-context")
+                && error.contains("schema version v1.4")
+                && error.contains("silently ignoring")
+        }),
+        "{errors:#?}"
+    );
+
+    let mut missing_manifest = fixture();
+    missing_manifest
+        .pipeline
+        .as_mut()
+        .expect("pipeline")
+        .workflow
+        .manifest
+        .capabilities
+        .remove("token_context");
+    let errors =
+        validate_metadata(&missing_manifest).expect_err("the semantic capability is required");
+    assert!(
+        errors.iter().any(|error| {
+            error.contains("manifest.capabilities")
+                && error.contains("missing used capability 'token_context'")
+        }),
+        "{errors:#?}"
+    );
+
+    let mut runtime = RuntimeCapabilities::default();
+    runtime
+        .supported
+        .retain(|capability| capability != "token_context");
+    let report = validate_structure_and_capabilities(&fixture(), &runtime);
+    assert!(report.structural.is_empty(), "{:#?}", report.structural);
+    assert!(
+        report
+            .unsupported_capabilities
+            .contains(&"token_context".to_string()),
+        "{:#?}",
+        report.unsupported_capabilities
+    );
+}
+
+#[test]
+fn token_context_invoke_rejects_shape_compatible_position_id_provenance() {
+    let mut metadata = fixture();
+    let workflow = &mut metadata.pipeline.as_mut().expect("pipeline").workflow;
+    workflow.components.insert(
+        "position_source".to_string(),
+        WorkflowComponent {
+            implementation: ComponentImplementation::Binding,
+            ports: onnx_genai_metadata::ComponentPorts {
+                inputs: BTreeMap::from([(
+                    "value".to_string(),
+                    contract("int64", &["batch", "sequence"]),
+                )]),
+                outputs: BTreeMap::from([(
+                    "position_ids".to_string(),
+                    contract("int64", &["batch", "sequence"]),
+                )]),
+                roles: BTreeMap::from([("position_ids".to_string(), PortRole::PositionIds)]),
+            },
+            contract: None,
+            application_overridable: false,
+            effects: Vec::new(),
+            row_scope: None,
+            cache_affects_state: Default::default(),
+            batch_capacity: None,
+        },
+    );
+    workflow.steps.insert(
+        0,
+        WorkflowStep::Invoke {
+            component: "position_source".to_string(),
+            inputs: BTreeMap::from([("value".to_string(), "request.token_ids".to_string())]),
+            outputs: BTreeMap::from([(
+                "position_ids".to_string(),
+                "derived.position_ids".to_string(),
+            )]),
+        },
+    );
+    let model_invoke = workflow
+        .steps
+        .iter_mut()
+        .find_map(|step| match step {
+            WorkflowStep::Invoke {
+                component, inputs, ..
+            } if component == "model" => Some(inputs),
+            _ => None,
+        })
+        .expect("model invoke");
+    model_invoke.insert("token_ids".to_string(), "derived.position_ids".to_string());
+
+    let errors = validate_metadata(&metadata)
+        .expect_err("shape-compatible position IDs are not token identity");
+    assert!(
+        errors.iter().any(|error| {
+            error.contains("token-context component 'model'")
+                && error.contains("token_ids port 'token_ids'")
+                && error.contains("derived.position_ids")
+                && error.contains("position_ids")
+                && error.contains("cannot distinguish token identity from position IDs")
+        }),
+        "{errors:#?}"
+    );
+}
+
+#[test]
 fn graph_internal_token_context_uses_generic_ports_and_state_groups() {
     let metadata = fixture();
     validate_metadata(&metadata).expect("token-context fixture validates");
@@ -287,21 +399,7 @@ fn graph_internal_token_context_uses_generic_ports_and_state_groups() {
         assert_eq!(
             carriers.carrier(history),
             Some(onnx_genai_metadata::SessionStateCarrier::StateServiceGroup),
-            "{history} uses the S10 state-service carrier for restore, row compaction, and \
-             speculative rollback"
-        );
-        assert_eq!(
-            workflow
-                .serving
-                .as_ref()
-                .expect("serving")
-                .state_service
-                .groups
-                .get(history)
-                .expect("history group")
-                .capabilities
-                .rollback_positions,
-            Some(4)
+            "{history} uses the S10 state-service carrier for typed restore and commit"
         );
     }
 
@@ -345,10 +443,10 @@ fn token_context_rejects_missing_or_mismatched_companions_before_execution() {
         .inputs
         .get_mut("token_ids")
         .expect("token ids")
-        .shape = Some(vec![
+        .shape = vec![
         TensorDimension::Symbol("batch".to_string()),
         TensorDimension::Symbol("different_sequence".to_string()),
-    ]);
+    ];
     let errors = validate_metadata(&mismatched).expect_err("mismatched geometry is rejected");
     assert!(
         errors
@@ -412,248 +510,4 @@ fn token_context_rejects_missing_or_mismatched_companions_before_execution() {
             .any(|error| error.contains("must be an ONNX component")),
         "{errors:#?}"
     );
-}
-
-#[derive(Clone)]
-struct ContextGeometry {
-    orders: Vec<usize>,
-    hash_heads: usize,
-    table_sizes: Vec<u64>,
-    feature_width: usize,
-    convolution: Vec<f64>,
-    dilation: usize,
-    gated_injection: bool,
-    eos: i64,
-}
-
-#[derive(Clone, Default)]
-struct ContextState {
-    token_history: Vec<i64>,
-    convolution_history: Vec<Vec<f64>>,
-}
-
-fn hash_ngram(tokens: &[i64], head: usize, table_size: u64) -> u64 {
-    tokens.iter().fold(
-        0x9e37_79b9_u64 ^ (head as u64).wrapping_mul(0x85eb_ca6b),
-        |hash, token| {
-            hash.wrapping_mul(0x1000_0000_01b3)
-                .wrapping_add(*token as u64)
-        },
-    ) % table_size
-}
-
-fn lookup(head: usize, index: u64, lane: usize) -> f64 {
-    ((index
-        .wrapping_mul(17)
-        .wrapping_add((head as u64).wrapping_mul(31))
-        .wrapping_add((lane as u64).wrapping_mul(13))
-        % 101) as f64
-        - 50.0)
-        / 64.0
-}
-
-fn token_context_step(
-    geometry: &ContextGeometry,
-    state: &mut ContextState,
-    token: i64,
-    base: &[f64],
-) -> Vec<f64> {
-    assert_eq!(base.len(), geometry.feature_width);
-    let history_len = geometry.orders.iter().copied().max().unwrap_or(1) - 1;
-    let mut projected = vec![0.0; geometry.feature_width];
-    for (order_index, &order) in geometry.orders.iter().enumerate() {
-        let needed_history = order - 1;
-        let mut ngram = vec![0; needed_history.saturating_sub(state.token_history.len())];
-        ngram.extend(
-            state.token_history[state.token_history.len().saturating_sub(needed_history)..]
-                .iter()
-                .copied(),
-        );
-        ngram.push(token);
-        for head in 0..geometry.hash_heads {
-            let table = geometry.table_sizes[(order_index + head) % geometry.table_sizes.len()];
-            let index = hash_ngram(&ngram, head, table);
-            for (lane, value) in projected.iter_mut().enumerate() {
-                *value += lookup(head, index, lane) / geometry.hash_heads as f64;
-            }
-        }
-    }
-    let mut convolved = vec![0.0; geometry.feature_width];
-    for (tap, weight) in geometry.convolution.iter().enumerate() {
-        let distance = tap * geometry.dilation;
-        let source = if distance == 0 {
-            Some(&projected)
-        } else {
-            state.convolution_history.iter().rev().nth(distance - 1)
-        };
-        let Some(source) = source else {
-            continue;
-        };
-        for (output, input) in convolved.iter_mut().zip(source) {
-            *output += weight * input;
-        }
-    }
-    state.token_history.push(token);
-    state
-        .token_history
-        .drain(..state.token_history.len().saturating_sub(history_len));
-    state.convolution_history.push(projected.clone());
-    let convolution_history_len = (geometry.convolution.len() - 1) * geometry.dilation;
-    state.convolution_history.drain(
-        ..state
-            .convolution_history
-            .len()
-            .saturating_sub(convolution_history_len),
-    );
-    if token == geometry.eos {
-        state.token_history.clear();
-        state.convolution_history.clear();
-    }
-    base.iter()
-        .zip(convolved)
-        .zip(projected)
-        .map(|((base, convolution), projection)| {
-            let gate = 1.0 / (1.0 + (-projection).exp());
-            base + if geometry.gated_injection {
-                gate * convolution
-            } else {
-                convolution
-            }
-        })
-        .collect()
-}
-
-fn run(
-    geometry: &ContextGeometry,
-    chunks: &[&[i64]],
-    bases: &[Vec<f64>],
-) -> (Vec<Vec<f64>>, ContextState) {
-    let mut state = ContextState::default();
-    let mut output = Vec::new();
-    let mut base = bases.iter();
-    for chunk in chunks {
-        for token in *chunk {
-            output.push(token_context_step(
-                geometry,
-                &mut state,
-                *token,
-                base.next().expect("one base vector per token"),
-            ));
-        }
-    }
-    (output, state)
-}
-
-const QWEN_CONFIG_DERIVED_REFERENCE: [[f64; 3]; 5] = [
-    [
-        0.0326519011683161,
-        0.1966631835289126,
-        0.239_298_516_870_579,
-    ],
-    [0.2827337261570716, 0.3593935013823889, 0.5386143673779539],
-    [0.5487833938102045, 0.6271187612564469, 0.6994257791766749],
-    [
-        1.037_654_537_684_801,
-        1.1698281494872536,
-        1.1100500962510207,
-    ],
-    [1.1524213454607968, 1.2547488046864723, 1.4019607543557262],
-];
-
-fn assert_features_eq(left: &[Vec<f64>], right: &[Vec<f64>]) {
-    assert_eq!(left.len(), right.len());
-    for (left, right) in left.iter().zip(right) {
-        assert_eq!(left.len(), right.len());
-        for (left, right) in left.iter().zip(right) {
-            assert!(
-                (left - right).abs() < 1e-12,
-                "feature mismatch: {left} != {right}"
-            );
-        }
-    }
-}
-
-#[test]
-fn token_context_full_chunked_and_decode_boundaries_are_equivalent() {
-    let qwen_config_derived = ContextGeometry {
-        // Qwen3.8 Flash Next uses eight raw-token bigram and eight trigram
-        // hashes. The small tables/width below are reference vectors only.
-        orders: vec![2, 3],
-        hash_heads: 8,
-        table_sizes: vec![31, 37, 41],
-        feature_width: 3,
-        convolution: vec![0.5, -0.25, 0.125],
-        dilation: 1,
-        gated_injection: true,
-        eos: 2,
-    };
-    let synthetic_alternate = ContextGeometry {
-        orders: vec![3, 4],
-        hash_heads: 3,
-        table_sizes: vec![7, 11, 13, 17],
-        feature_width: 4,
-        convolution: vec![0.75, -0.5],
-        dilation: 2,
-        gated_injection: false,
-        eos: 9,
-    };
-
-    for (fixture_index, (geometry, tokens, bases)) in [
-        (
-            &qwen_config_derived,
-            vec![5, 7, 11, 2, 13],
-            vec![
-                vec![0.0, 0.1, 0.2],
-                vec![0.3, 0.4, 0.5],
-                vec![0.6, 0.7, 0.8],
-                vec![0.9, 1.0, 1.1],
-                vec![1.2, 1.3, 1.4],
-            ],
-        ),
-        (
-            &synthetic_alternate,
-            vec![3, 5, 7, 9, 11],
-            vec![
-                vec![0.0, 0.1, 0.2, 0.3],
-                vec![0.4, 0.5, 0.6, 0.7],
-                vec![0.8, 0.9, 1.0, 1.1],
-                vec![1.2, 1.3, 1.4, 1.5],
-                vec![1.6, 1.7, 1.8, 1.9],
-            ],
-        ),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let (full, full_state) = run(geometry, &[&tokens], &bases);
-        let (chunked, chunked_state) = run(
-            geometry,
-            &[&tokens[..2], &tokens[2..4], &tokens[4..]],
-            &bases,
-        );
-        let (decoded, decoded_state) = run(
-            geometry,
-            &tokens.iter().map(std::slice::from_ref).collect::<Vec<_>>(),
-            &bases,
-        );
-        assert_features_eq(&full, &chunked);
-        assert_features_eq(&full, &decoded);
-        if fixture_index == 0 {
-            let expected = QWEN_CONFIG_DERIVED_REFERENCE
-                .iter()
-                .map(|row| row.to_vec())
-                .collect::<Vec<_>>();
-            assert_features_eq(&full, &expected);
-        }
-        assert_eq!(full_state.token_history, chunked_state.token_history);
-        assert_eq!(full_state.token_history, decoded_state.token_history);
-        assert_eq!(
-            full_state.convolution_history,
-            chunked_state.convolution_history
-        );
-        assert_eq!(
-            full_state.convolution_history,
-            decoded_state.convolution_history
-        );
-    }
 }

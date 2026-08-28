@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use onnx_genai_metadata::capabilities;
 
 #[test]
-fn normative_document_catalogues_every_builtin_capability() {
-    let document = include_str!("../../../docs/genai/INFERENCE_METADATA_DECISIONS.md");
+fn runtime_catalogue_lists_every_builtin_capability() {
+    let document = include_str!("../../../docs/genai/RUNTIME_CAPABILITY_CATALOGUE.md");
     let catalogue = document
         .split_once("<!-- capability-catalogue:start -->")
         .expect("capability catalogue start marker")
@@ -42,7 +42,7 @@ fn normative_document_catalogues_every_builtin_capability() {
     );
     assert_eq!(
         documented, builtin,
-        "update the normative capability catalogue when the built-in vocabulary changes"
+        "update the runtime capability catalogue when the built-in vocabulary changes"
     );
 }
 

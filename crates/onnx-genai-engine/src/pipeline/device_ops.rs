@@ -151,13 +151,11 @@ pub(crate) trait ResidentTensorOps {
         len: usize,
     ) -> anyhow::Result<Value>;
 
-    /// Row-gather `table[id]` for each id, into a `[ids.len(), hidden]` value.
+    /// Gather `value[index]` along axis zero and preserve every trailing axis.
     ///
-    /// `table` is a rank-2 `[vocab, hidden]` value in this residency. An id
-    /// outside the table is an error rather than a clamp onto row 0: a proposer
-    /// that drafted an id the table cannot embed has left the declared
-    /// vocabulary, and silently embedding row 0 would hide that.
-    fn gather_rows(&self, table: &Value, ids: &[i64]) -> anyhow::Result<Value>;
+    /// An index outside axis zero is an error rather than a clamp onto row 0.
+    /// This serves both embedding lookup and request-row compaction.
+    fn gather_rows(&self, value: &Value, indices: &[i64]) -> anyhow::Result<Value>;
 
     /// Write `src` into `dst[.., feature_offset .. feature_offset + src_width]`
     /// in place, where `src_width` is `src`'s trailing extent.
@@ -308,27 +306,34 @@ fn rows_and_width(value: &Value, role: &str) -> anyhow::Result<(usize, usize)> {
     Ok((value.numel() / width, width))
 }
 
-/// Validate a `[vocab, hidden]` gather table and the ids being gathered.
-fn gather_plan(table: &Value, ids: &[i64]) -> anyhow::Result<(usize, usize)> {
+/// Validate an axis-zero gather and return `(rows, row_width, output_shape)`.
+fn gather_plan(table: &Value, ids: &[i64]) -> anyhow::Result<(usize, usize, Vec<i64>)> {
     let shape = table.shape();
     anyhow::ensure!(
-        shape.len() == 2,
-        "a gather table must be a rank-2 [vocab, hidden] matrix, found shape {shape:?}"
+        !shape.is_empty(),
+        "an axis-zero gather requires rank at least one, found scalar shape {shape:?}"
     );
-    let vocab = usize::try_from(shape[0]).context("negative vocabulary extent")?;
-    let hidden = usize::try_from(shape[1]).context("negative hidden extent")?;
+    let rows = usize::try_from(shape[0]).context("negative row extent")?;
+    let row_width = shape[1..].iter().try_fold(1usize, |width, extent| {
+        let extent = usize::try_from(*extent).context("negative trailing extent")?;
+        width
+            .checked_mul(extent)
+            .context("gather row width overflows usize")
+    })?;
     anyhow::ensure!(
-        vocab > 0 && hidden > 0,
-        "a gather table must have a non-empty [vocab, hidden] shape, found {shape:?}"
+        rows > 0 && row_width > 0,
+        "an axis-zero gather requires non-empty rows, found shape {shape:?}"
     );
     for id in ids {
-        let index = usize::try_from(*id).ok().filter(|index| *index < vocab);
+        let index = usize::try_from(*id).ok().filter(|index| *index < rows);
         anyhow::ensure!(
             index.is_some(),
-            "token id {id} has no row in a [{vocab}, {hidden}] gather table"
+            "row index {id} has no row in a tensor with shape {shape:?}"
         );
     }
-    Ok((vocab, hidden))
+    let mut output_shape = shape.to_vec();
+    output_shape[0] = i64::try_from(ids.len()).context("gathered row count exceeds i64")?;
+    Ok((rows, row_width, output_shape))
 }
 
 /// Validate a scatter and return `(rows, dst_width, src_width)`.
@@ -442,18 +447,14 @@ impl ResidentTensorOps for HostTensorOps {
 
     fn gather_rows(&self, table: &Value, ids: &[i64]) -> anyhow::Result<Value> {
         self.ensure_host(table, "gather table")?;
-        let (_, hidden) = gather_plan(table, ids)?;
+        let (_, row_width, shape) = gather_plan(table, ids)?;
         let element = table.dtype().size_of();
         let bytes = table.as_raw_bytes()?;
-        let mut gathered = Vec::with_capacity(ids.len() * hidden * element);
+        let mut gathered = Vec::with_capacity(ids.len() * row_width * element);
         for id in ids {
-            let start = (*id as usize) * hidden * element;
-            gathered.extend_from_slice(&bytes[start..start + hidden * element]);
+            let start = (*id as usize) * row_width * element;
+            gathered.extend_from_slice(&bytes[start..start + row_width * element]);
         }
-        let shape = [
-            i64::try_from(ids.len()).context("gathered row count exceeds i64")?,
-            i64::try_from(hidden).context("gathered row width exceeds i64")?,
-        ];
         Value::from_raw_bytes(gathered, &shape, table.dtype())
             .map_err(|error| anyhow::anyhow!("failed to materialize gathered rows: {error}"))
     }
@@ -685,19 +686,15 @@ impl ResidentTensorOps for CudaTensorOps {
 
     fn gather_rows(&self, table: &Value, ids: &[i64]) -> anyhow::Result<Value> {
         self.ensure_device(table, "gather table")?;
-        let (_, hidden) = gather_plan(table, ids)?;
+        let (_, row_width, shape) = gather_plan(table, ids)?;
         let element = table.dtype().size_of();
-        let shape = [
-            i64::try_from(ids.len()).context("gathered row count exceeds i64")?,
-            i64::try_from(hidden).context("gathered row width exceeds i64")?,
-        ];
         if ids.is_empty() {
             return HostTensorOps.zeros(&shape, table.dtype());
         }
         let gathered = self.zeroed_unfenced(&shape, table.dtype())?;
         let table_base = table.data_ptr_addr()?;
         let gathered_base = gathered.data_ptr_addr()?;
-        let row_bytes = hidden * element;
+        let row_bytes = row_width * element;
         for (row, id) in ids.iter().enumerate() {
             self.copy(
                 gathered_base + row * row_bytes,
@@ -871,7 +868,19 @@ mod tests {
         Ok(())
     }
 
-    /// An id outside the table is an error, not a clamp onto row 0.
+    #[test]
+    fn host_gather_rows_preserves_trailing_state_geometry() -> anyhow::Result<()> {
+        let table = Value::from_slice_i64(&(0..24).collect::<Vec<_>>(), &[3, 2, 4])?;
+        let gathered = HostTensorOps.gather_rows(&table, &[2, 0])?;
+        assert_eq!(gathered.shape(), &[2, 2, 4]);
+        assert_eq!(
+            gathered.to_vec_i64()?,
+            [16, 17, 18, 19, 20, 21, 22, 23, 0, 1, 2, 3, 4, 5, 6, 7]
+        );
+        Ok(())
+    }
+
+    /// An index outside the tensor is an error, not a clamp onto row 0.
     #[test]
     fn a_gather_id_outside_the_table_is_an_error() -> anyhow::Result<()> {
         let table = Value::from_slice_f32(&[0.0, 1.0, 2.0, 3.0], &[2, 2])?;
@@ -879,7 +888,7 @@ mod tests {
             panic!("an out-of-range id must be rejected");
         };
         let message = error.to_string();
-        assert!(message.contains("token id 2"), "{message}");
+        assert!(message.contains("row index 2"), "{message}");
         assert!(message.contains("[2, 2]"), "{message}");
         assert!(
             HostTensorOps.gather_rows(&table, &[-1]).is_err(),
