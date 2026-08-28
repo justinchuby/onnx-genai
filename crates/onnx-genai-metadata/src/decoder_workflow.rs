@@ -1036,21 +1036,34 @@ impl Builder {
         if pairs.is_empty() {
             return;
         }
+        let declared = abi.state_groups.iter().find(|candidate| {
+            candidate.name == group
+                && candidate.kind == kind
+                && candidate.ports.len() == pairs.len()
+                && candidate
+                    .ports
+                    .iter()
+                    .zip(pairs)
+                    .all(|(port, (input, output))| port.input == *input && port.output == *output)
+        });
         let mut aliases = BTreeMap::new();
         for (index, (input, output)) in pairs.iter().enumerate() {
-            let (role, layer) = if keyed_by_role {
-                // Self- and cross-attention pair as (key, value) per layer,
-                // which is the order every producer emits and the order the
-                // recognizer rebuilds pairs in.
-                let role = if index % 2 == 0 {
-                    StatePortRole::Key
+            let (role, layer) =
+                if let Some(port) = declared.and_then(|group| group.ports.get(index)) {
+                    (port.role, port.layer.unwrap_or(index))
+                } else if keyed_by_role {
+                    // Self- and cross-attention pair as (key, value) per layer,
+                    // which is the order every producer emits and the order the
+                    // recognizer rebuilds pairs in.
+                    let role = if index % 2 == 0 {
+                        StatePortRole::Key
+                    } else {
+                        StatePortRole::Value
+                    };
+                    (Some(role), index / 2)
                 } else {
-                    StatePortRole::Value
+                    (None, index)
                 };
-                (Some(role), index / 2)
-            } else {
-                (None, index)
-            };
             let cell = format!("{group}.{index:04}");
             let cell_contract = self.state_port(&pairs[index].0);
             self.state.insert(
@@ -1098,16 +1111,20 @@ impl Builder {
         if let Some((first, _)) = pairs.first() {
             self.seed_state_input(self.state_port(first));
         }
-        let update = (kind == StateKind::FullAttention)
-            .then(|| static_update(abi))
-            .flatten();
+        let update = declared.and_then(|group| group.update.clone()).or_else(|| {
+            (kind == StateKind::FullAttention)
+                .then(|| static_update(abi))
+                .flatten()
+        });
         let logical_lengths = update.is_some().then(|| LENGTHS_CELL.to_string());
         self.groups.insert(
             group.to_string(),
             StateGroupContract {
                 kind,
-                properties: None,
-                sequence_axis: (kind != StateKind::Recurrent).then_some(2),
+                properties: declared.and_then(|group| group.properties.clone()),
+                sequence_axis: declared
+                    .map(|group| group.sequence_axis)
+                    .unwrap_or_else(|| (kind != StateKind::Recurrent).then_some(2)),
                 layout: layout_name(abi),
                 logical_lengths,
                 aliasing: if kind == StateKind::FullAttention {
@@ -1122,12 +1139,14 @@ impl Builder {
                     prefix_reusable: true,
                     evictable_prefix: true,
                 },
-                capabilities: crate::schema::StateGroupCapabilities {
-                    rollback_positions: None,
-                    snapshot: true,
-                    fork: true,
-                    cascade: BTreeSet::new(),
-                },
+                capabilities: declared
+                    .map(|group| group.capabilities.clone())
+                    .unwrap_or_else(|| crate::schema::StateGroupCapabilities {
+                        rollback_positions: None,
+                        snapshot: true,
+                        fork: true,
+                        cascade: BTreeSet::new(),
+                    }),
                 checkpoint: None,
             },
         );
