@@ -36,10 +36,6 @@ fn package_without_conversation(root: &Path) -> anyhow::Result<()> {
         .expect("workflow declares state")
         .remove(serde_yaml::Value::String("conversation".into()))
         .expect("the fixture declares a conversation");
-    let capabilities = document["pipeline"]["workflow"]["manifest"]["capabilities"]
-        .as_sequence_mut()
-        .expect("the manifest declares capabilities");
-    capabilities.retain(|capability| capability.as_str() != Some("session_state_lease"));
     std::fs::write(&metadata, serde_yaml::to_string(&document)?)?;
     Ok(())
 }
