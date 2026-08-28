@@ -258,6 +258,6 @@
 <text x="1377.0" y="976.0" text-anchor="start" dominant-baseline="middle" font-family="Inter,Arial,sans-serif" font-size="11" font-weight="500" fill="#5C6B7A">solid = declared flow</text>
 <text x="1562.0" y="976.0" text-anchor="start" dominant-baseline="middle" font-family="Inter,Arial,sans-serif" font-size="11" font-weight="500" fill="#5C6B7A">dashed = runtime optimization</text>
 <text x="1787.0" y="976.0" text-anchor="start" dominant-baseline="middle" font-family="Inter,Arial,sans-serif" font-size="11" font-weight="500" fill="#5C6B7A">dotted = admission</text>
-<text x="48.0" y="1020.0" text-anchor="start" dominant-baseline="middle" font-family="Inter,Arial,sans-serif" font-size="11" font-weight="500" fill="#5C6B7A">Publication contract names the protocol family. Emit operations may append, replace, retract, or finalize within that declared protocol.</text>
+<text x="48.0" y="1020.0" text-anchor="start" dominant-baseline="middle" font-family="Inter,Arial,sans-serif" font-size="11" font-weight="500" fill="#5C6B7A">Emit publishes to a declared workflow output (transport-neutral). Turn commit finalizes outputs; revision streams may close early with optional finalize.</text>
 <text x="48.0" y="1038.0" text-anchor="start" dominant-baseline="middle" font-family="Inter,Arial,sans-serif" font-size="11" font-weight="500" fill="#C23B4A">No network/SSE/WebSocket transport is represented as metadata.</text>
 </svg>

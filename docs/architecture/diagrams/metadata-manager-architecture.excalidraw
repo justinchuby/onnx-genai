@@ -7627,11 +7627,11 @@
       "locked": false,
       "fontSize": 11,
       "fontFamily": 2,
-      "text": "Publication contract names the protocol family. Emit operations may append, replace, retract, or finalize within that declared protocol.",
+      "text": "Emit publishes to a declared workflow output (transport-neutral). Turn commit finalizes outputs; revision streams may close early with optional finalize.",
       "textAlign": "left",
       "verticalAlign": "middle",
       "containerId": null,
-      "originalText": "Publication contract names the protocol family. Emit operations may append, replace, retract, or finalize within that declared protocol.",
+      "originalText": "Emit publishes to a declared workflow output (transport-neutral). Turn commit finalizes outputs; revision streams may close early with optional finalize.",
       "autoResize": true,
       "lineHeight": 1.25
     },
