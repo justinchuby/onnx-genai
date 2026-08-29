@@ -3,7 +3,9 @@
 
 The checked-in ONNX graph is the deterministic tiny-llm graph. This tokenizer
 maps its fixed output tokens to two tagged-json calls and then an ordinary
-answer, making the HTTP request → calls → results → answer path hermetic.
+answer, making the HTTP request → calls → results → answer path hermetic. It
+also retains deterministic observer-only tokens used by the engine protocol
+boundary tests.
 """
 
 from __future__ import annotations
@@ -30,13 +32,17 @@ def tokenizer() -> Tokenizer:
         '<tool_call>{"id":"call_weather","name":"weather","arguments":{"city":"Paris"}}</tool_call>': 5,
         "Results accepted.": 7,
         '<tool_call>{"id":"call_time","name":"time","arguments":{"timezone":"UTC"}}</tool_call>': 15,
+        '<tool_call>{"name":"weather","arguments":{"city":"Paris"}}</tool_call>': 22,
         "<tool-eos>": 26,
+        "ordinary": 27,
+        "assistant": 28,
+        "text": 29,
     }
     vocab.update(
         {
             f"unused-{index}": index
             for index in range(4, 32)
-            if index not in {4, 5, 7, 15, 26}
+            if index not in {4, 5, 7, 15, 22, 26, 27, 28, 29}
         }
     )
     result = Tokenizer(WordLevel(vocab=vocab, unk_token="<unk>"))
@@ -46,7 +52,7 @@ def tokenizer() -> Tokenizer:
         pair="<bos> $A <eos> $B:1 <eos>:1",
         special_tokens=[("<bos>", 2), ("<eos>", 3)],
     )
-    result.add_special_tokens(["<tool-eos>"])
+    result.add_special_tokens(["<bos>", "<eos>", "<tool-eos>"])
     return result
 
 
