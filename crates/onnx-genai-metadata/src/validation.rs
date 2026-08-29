@@ -278,6 +278,14 @@ fn validate_output_protocol_version(
     else {
         return;
     };
+    if let Err(error) = crate::version::gate_feature_field(
+        version,
+        crate::version::SchemaFeature::PublicationMode,
+        "pipeline.workflow.publication_mode",
+        workflow.publication_mode_authored,
+    ) {
+        errors.push(error);
+    }
     for (name, output) in &workflow.outputs {
         if let Err(error) = crate::version::gate_feature_field(
             version,

@@ -7564,6 +7564,7 @@ steps:
         let mut workflow = lifecycle_workflow();
         workflow.publication_mode =
             onnx_genai_metadata::WorkflowPublicationMode::ProvisionalRevisions;
+        workflow.publication_mode_authored = true;
         workflow.outputs.insert(
             "answer".to_string(),
             onnx_genai_metadata::WorkflowOutput {

@@ -19,8 +19,9 @@
 //! arbitrates.
 
 use onnx_genai_metadata::{
-    INITIAL_SCHEMA_VERSION, SCHEMA_VERSION, SUPPORTED_SCHEMA_VERSION, WorkflowOutputFamily,
-    WorkflowPublicationMode, parse_metadata, parse_metadata_json, validate_metadata, version,
+    INITIAL_SCHEMA_VERSION, InferenceMetadata, SCHEMA_VERSION, SUPPORTED_SCHEMA_VERSION,
+    WorkflowOutputFamily, WorkflowPublicationMode, parse_metadata, parse_metadata_json,
+    validate_metadata, version,
 };
 
 /// The smallest document that says nothing new.
@@ -314,6 +315,24 @@ fn publication_mode_has_an_exact_v1_7_boundary() {
     );
 
     let older = with_version(&provisional, Some("v1.6"));
+    let typed_older: InferenceMetadata =
+        serde_yaml::from_str(&older).expect("typed serde accepts before semantic validation");
+    assert!(
+        typed_older
+            .pipeline
+            .as_ref()
+            .expect("pipeline")
+            .workflow
+            .publication_mode_authored
+    );
+    let errors = validate_metadata(&typed_older)
+        .expect_err("direct typed validation must reject a v1.7 field in v1.6");
+    assert!(
+        errors
+            .join("\n")
+            .contains("pipeline.workflow.publication_mode is not legal"),
+        "{errors:#?}"
+    );
     let error = parse_metadata(&older, Some("yaml"))
         .expect_err("v1.6 must reject the later publication mode");
     assert!(
@@ -324,6 +343,24 @@ fn publication_mode_has_an_exact_v1_7_boundary() {
     );
 
     let missing = with_version(&revision_output, Some("v1.7"));
+    let typed_missing: InferenceMetadata =
+        serde_yaml::from_str(&missing).expect("compatibility default remains deserializable");
+    assert!(
+        !typed_missing
+            .pipeline
+            .as_ref()
+            .expect("pipeline")
+            .workflow
+            .publication_mode_authored
+    );
+    let errors = validate_metadata(&typed_missing)
+        .expect_err("direct typed validation must require publication_mode in v1.7");
+    assert!(
+        errors
+            .join("\n")
+            .contains("pipeline.workflow.publication_mode is required"),
+        "{errors:#?}"
+    );
     let error =
         parse_metadata(&missing, Some("yaml")).expect_err("v1.7 must require an explicit mode");
     assert!(
@@ -333,14 +370,36 @@ fn publication_mode_has_an_exact_v1_7_boundary() {
 
     let metadata = parse_metadata(&with_version(&provisional, Some("v1.7")), Some("yaml"))
         .expect("v1.7 provisional workflow parses");
+    let workflow = &metadata.pipeline.as_ref().expect("pipeline").workflow;
     assert_eq!(
-        metadata
-            .pipeline
-            .expect("pipeline")
-            .workflow
-            .publication_mode,
+        workflow.publication_mode,
         WorkflowPublicationMode::ProvisionalRevisions
     );
+    assert!(workflow.publication_mode_authored);
+    let serialized = serde_yaml::to_string(workflow).expect("authored mode serializes");
+    assert!(
+        serialized.contains("publication_mode: provisional_revisions"),
+        "{serialized}"
+    );
+    let reparsed: onnx_genai_metadata::WorkflowSpec =
+        serde_yaml::from_str(&serialized).expect("authored mode round-trips");
+    assert_eq!(&reparsed, workflow);
+
+    let commit_only = revision_output.replace(
+        "manifest: {}",
+        "manifest: {}\n    publication_mode: commit_only",
+    );
+    let commit_only = parse_metadata(&with_version(&commit_only, Some("v1.7")), Some("yaml"))
+        .expect("an explicitly authored commit-only mode parses");
+    let workflow = &commit_only.pipeline.as_ref().expect("pipeline").workflow;
+    let serialized = serde_yaml::to_string(workflow).expect("authored default serializes");
+    assert!(
+        serialized.contains("publication_mode: commit_only"),
+        "{serialized}"
+    );
+    let reparsed: onnx_genai_metadata::WorkflowSpec =
+        serde_yaml::from_str(&serialized).expect("authored default round-trips");
+    assert_eq!(&reparsed, workflow);
 }
 
 #[test]
