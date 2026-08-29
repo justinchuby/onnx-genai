@@ -514,7 +514,7 @@ pub fn decoder_workflow(
             adapter_abis: BTreeMap::new(),
         },
         publication_mode: crate::schema::WorkflowPublicationMode::CommitOnly,
-        publication_mode_authored: false,
+        publication_mode_authored: true,
         inputs: builder.inputs,
         outputs: BTreeMap::from([(
             TOKENS_OUTPUT.to_string(),
@@ -1606,6 +1606,10 @@ mod tests {
         let workflow = decoder_workflow(&dense(), "model.onnx", &DecoderFacts::default())
             .expect("dense decoder converts");
         let text = serde_yaml::to_string(&workflow).expect("the workflow serializes");
+        assert!(
+            text.contains("publication_mode: commit_only"),
+            "current-schema emitters must author the v1.7-required publication mode: {text}"
+        );
         let parsed: WorkflowSpec =
             serde_yaml::from_str(&text).expect("the emitted workflow must satisfy its own schema");
         assert_eq!(parsed, workflow);
