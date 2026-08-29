@@ -250,8 +250,10 @@ pub enum DeviceGraphCaptureResult {
     NotCapturable(CaptureDeclineReport),
 }
 
+// Boxing the executed variant would allocate on every warmed device-bound run.
+#[allow(clippy::large_enum_variant)]
 pub(super) enum ScopedRunResult {
-    Executed(Vec<Option<SessionOutput>>),
+    Executed(ScopedOutputs),
     NotCapturable(CaptureDeclineReport),
 }
 

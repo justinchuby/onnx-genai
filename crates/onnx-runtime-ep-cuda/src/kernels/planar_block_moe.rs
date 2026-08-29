@@ -64,7 +64,7 @@ use std::sync::{Arc, OnceLock};
 
 use cudarc::driver::sys::CUdeviceptr;
 use cudarc::driver::{LaunchConfig, PushKernelArg};
-use onnx_runtime_ep_api::{DeviceBuffer, EpError, ExecutionProvider, Result};
+use onnx_runtime_ep_api::{DeviceBuffer, DeviceGraphResource, EpError, ExecutionProvider, Result};
 use onnx_runtime_ep_cpu::kernels::moe::{Activation, validate_moe_activation_attributes};
 use onnx_runtime_ep_cpu::kernels::planar_block_quant::{
     FP4_MICROSCALE_BLOCK as CPU_FP4_MICROSCALE_BLOCK, PlanarBankIdentity, PlanarBlockFormat,
@@ -744,6 +744,13 @@ pub struct AdmittedPlanarMoe {
 }
 
 impl AdmittedPlanarMoe {
+    /// Immutable ownership token that must be supplied before graph capture.
+    pub fn device_graph_resource(&self) -> DeviceGraphResource {
+        DeviceGraphResource::new(Arc::as_ptr(&self.banks) as usize, Arc::clone(&self.banks))
+    }
+}
+
+impl AdmittedPlanarMoe {
     pub fn dims(&self) -> &PlanarMoeDims {
         &self.dims
     }
@@ -1194,9 +1201,8 @@ pub fn launch_planar_moe(
 ) -> Result<()> {
     let ptrs = validate_planar_moe_buffers(admission, buffers)?;
     let runtime = admission.provider.runtime();
-    runtime.retain_active_graph_resource(
+    runtime.require_registered_address_capture(
         Arc::as_ptr(&admission.banks) as usize,
-        &admission.banks,
         "planar MoE projection banks",
     )?;
     let dims = admission.dims();

@@ -599,6 +599,52 @@ impl<T: Any> KernelType for T {
     }
 }
 
+/// Immutable owner retained by an installed device graph.
+///
+/// Kernels return these owners before capture begins so address-bearing
+/// resources are pinned before any CUDA node can embed their pointers.
+#[derive(Clone)]
+pub struct DeviceGraphResource {
+    identity: usize,
+    owner: Arc<dyn Any + Send + Sync>,
+}
+
+impl DeviceGraphResource {
+    pub fn new<T>(identity: usize, owner: Arc<T>) -> Self
+    where
+        T: Any + Send + Sync,
+    {
+        Self { identity, owner }
+    }
+
+    pub fn identity(&self) -> usize {
+        self.identity
+    }
+
+    pub fn owner(&self) -> &Arc<dyn Any + Send + Sync> {
+        &self.owner
+    }
+}
+
+/// One coarse phase's production BlockQuantizedMoE traffic projection.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct BlockQuantizedMoeTraffic {
+    /// Bytes uploaded once while admitting immutable whole projection banks.
+    pub uploaded_whole_bank_bytes: u64,
+    /// Device bytes committed for those whole projection banks.
+    pub committed_whole_bank_bytes: u64,
+    /// Logical route demand, including repeated expert selections.
+    pub logical_route_demand_bytes: u64,
+    /// Extent of distinct experts selected in the phase.
+    pub unique_selected_expert_bytes: u64,
+    /// Measured physical DRAM bytes, when a hardware counter supplies them.
+    pub physical_dram_bytes: Option<u64>,
+    /// Expert page-ins performed by a residency implementation.
+    pub page_ins: u64,
+    /// Byte-weighted hit rate, when expert-indexed residency is active.
+    pub byte_hit_rate: Option<f64>,
+}
+
 /// A kernel ready to execute a specific op with specific shapes (§4.2).
 pub trait Kernel: Send + KernelType {
     /// Tell the kernel which positional inputs are immutable graph constants.
@@ -649,6 +695,37 @@ pub trait Kernel: Send + KernelType {
     fn constant_input_override(&self, input_idx: usize) -> Option<TensorView<'_>> {
         let _ = input_idx;
         None
+    }
+
+    /// Immutable owners whose addresses the next device-graph capture may
+    /// embed. Called before capture starts; warmed execution never registers
+    /// resources with the graph lifecycle.
+    fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
+        Vec::new()
+    }
+
+    /// Arm production BlockQuantizedMoE route traffic for this kernel.
+    ///
+    /// Returns `true` when the kernel participates. Session APIs call this only
+    /// under exclusive request ownership and before capture.
+    fn arm_block_quantized_moe_traffic(&mut self, request_id: u32) -> Result<bool> {
+        let _ = request_id;
+        Ok(false)
+    }
+
+    /// Reset the current BlockQuantizedMoE accumulation phase in place.
+    fn reset_block_quantized_moe_traffic(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Snapshot the current BlockQuantizedMoE phase.
+    fn snapshot_block_quantized_moe_traffic(&self) -> Result<Option<BlockQuantizedMoeTraffic>> {
+        Ok(None)
+    }
+
+    /// Disarm BlockQuantizedMoE traffic after dependent graphs are retired.
+    fn disarm_block_quantized_moe_traffic(&mut self) -> Result<()> {
+        Ok(())
     }
 
     /// Tell the kernel whether all of this node's outputs have fully-static

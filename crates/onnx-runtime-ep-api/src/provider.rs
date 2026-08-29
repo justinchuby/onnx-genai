@@ -1409,6 +1409,11 @@ pub trait ExecutionProvider: Send + Sync {
         Ok(())
     }
 
+    /// Whether top-level execution defers validation until a host-visible read.
+    fn defers_device_validation(&self) -> bool {
+        false
+    }
+
     /// Read (without clearing) any latching device-side validation error as a
     /// raw violation bitmask (zero when none). The compatibility name predates
     /// deferred eager validation; EPs without device validation report no error.

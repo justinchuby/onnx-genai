@@ -22,14 +22,14 @@
 use std::borrow::Cow;
 use std::cell::Cell;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 
+use arc_swap::ArcSwapOption;
 use cudarc::driver::LaunchConfig;
 use cudarc::driver::sys::CUdeviceptr;
 use onnx_runtime_ep_api::{
-    EpError, ExecutionProvider, Kernel, KernelConstantInput, KernelFactory, Result,
-    SealedDeviceAllocation, TensorBacking, TensorMetadata, TensorMut, TensorView,
+    DeviceGraphResource, EpError, ExecutionProvider, Kernel, KernelConstantInput, KernelFactory,
+    Result, SealedDeviceAllocation, TensorBacking, TensorMetadata, TensorMut, TensorView,
     WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
 };
 use onnx_runtime_ep_cpu::kernels::moe::{
@@ -45,6 +45,8 @@ use crate::kernels::expert_route_telemetry::{
 };
 use crate::provider::CudaExecutionProvider;
 use crate::runtime::{CudaRuntime, RawCudaFunction, cuptr};
+
+pub use onnx_runtime_ep_api::BlockQuantizedMoeTraffic;
 
 const OP: &str = "BlockQuantizedMoE";
 const DOMAIN: &str = onnx_runtime_ir::RUNTIME_DOMAIN;
@@ -534,22 +536,6 @@ pub enum BlockQuantizedMoeResidency {
     WholeProjectionBank,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct BlockQuantizedMoeTraffic {
-    /// One-time immutable whole-bank extent uploaded at admission.
-    pub uploaded_whole_bank_bytes: u64,
-    /// Logical projection bytes demanded by all routes, including multiplicity.
-    pub logical_route_demand_bytes: u64,
-    /// Projection bytes belonging to the distinct selected experts.
-    pub unique_selected_expert_bytes: u64,
-    /// Physical DRAM traffic is absent unless supplied by hardware counters.
-    pub physical_dram_bytes: Option<u64>,
-    /// No selected-expert pager is wired in this slice.
-    pub page_ins: usize,
-    /// No residency cache participates, so hit rate is intentionally absent.
-    pub byte_hit_rate: Option<f64>,
-}
-
 struct AdmittedProjectionBank {
     allocation: Arc<dyn SealedDeviceAllocation>,
     identity: BlockQuantizedMoeBankIdentity,
@@ -644,6 +630,7 @@ impl AdmittedBlockQuantizedMoeBanks {
             .ok_or_else(|| error("unique selected-expert byte count overflow"))?;
         Ok(BlockQuantizedMoeTraffic {
             uploaded_whole_bank_bytes: uploaded_whole_bank_bytes as u64,
+            committed_whole_bank_bytes: uploaded_whole_bank_bytes as u64,
             logical_route_demand_bytes: logical_route_demand_bytes as u64,
             unique_selected_expert_bytes: unique_selected_expert_bytes as u64,
             physical_dram_bytes: None,
@@ -1351,14 +1338,10 @@ impl BlockQuantizedMoEFactory {
             formats,
             geometry,
             launches,
-            banks: None,
-            telemetry: Mutex::new(None),
-            telemetry_bitmap: AtomicU64::new(0),
-            telemetry_header: AtomicU64::new(0),
-            telemetry_experts: AtomicUsize::new(0),
+            shared: None,
             uploaded_whole_bank_bytes: 0,
+            committed_whole_bank_bytes: 0,
             bytes_per_expert: 0,
-            logical_route_demand_bytes: AtomicU64::new(0),
         })
     }
 }
@@ -1476,19 +1459,38 @@ pub struct BlockQuantizedMoEKernel {
     formats: ProjectionFormats,
     geometry: PreparedMoeGeometry,
     launches: PreparedMoeLaunches,
-    banks: Option<Arc<AdmittedBlockQuantizedMoeBankSet>>,
-    /// Inert, default-disabled route telemetry (issue #1810 Slice 7A). `None`
-    /// unless explicitly armed via
-    /// [`BlockQuantizedMoEKernel::arm_route_telemetry`]; while `None` the route
-    /// kernel receives null telemetry pointers and produces byte-identical
-    /// outputs.
-    telemetry: Mutex<Option<ArmedTelemetry>>,
-    telemetry_bitmap: AtomicU64,
-    telemetry_header: AtomicU64,
-    telemetry_experts: AtomicUsize,
+    shared: Option<Arc<BlockQuantizedMoeSharedState>>,
     uploaded_whole_bank_bytes: u64,
+    committed_whole_bank_bytes: u64,
     bytes_per_expert: u64,
-    logical_route_demand_bytes: AtomicU64,
+}
+
+struct BlockQuantizedMoeSharedState {
+    banks: Arc<AdmittedBlockQuantizedMoeBankSet>,
+    telemetry: ArcSwapOption<OwnedBlockQuantizedMoeTelemetry>,
+}
+
+struct OwnedBlockQuantizedMoeTelemetry {
+    record: ArmedTelemetry,
+    runtime: Arc<CudaRuntime>,
+}
+
+impl OwnedBlockQuantizedMoeTelemetry {
+    fn arm(
+        runtime: &Arc<CudaRuntime>,
+        config: RouteTelemetryConfig,
+    ) -> std::result::Result<Self, TelemetryUnsupported> {
+        Ok(Self {
+            record: ArmedTelemetry::arm(runtime, config)?,
+            runtime: Arc::clone(runtime),
+        })
+    }
+}
+
+impl Drop for OwnedBlockQuantizedMoeTelemetry {
+    fn drop(&mut self) {
+        self.record.free(&self.runtime);
+    }
 }
 
 impl BlockQuantizedMoEKernel {
@@ -1517,151 +1519,107 @@ impl BlockQuantizedMoEKernel {
             })
             .ok_or_else(|| error("per-expert projection byte count overflow"))?;
         self.uploaded_whole_bank_bytes = total as u64;
+        self.committed_whole_bank_bytes = total as u64;
         self.bytes_per_expert = per_expert as u64;
-        self.banks = Some(banks);
+        self.shared = Some(Arc::new(BlockQuantizedMoeSharedState {
+            banks,
+            telemetry: ArcSwapOption::empty(),
+        }));
         Ok(())
     }
 
-    /// Arm inert route telemetry (issue #1810 Slice 7A). Allocates the
-    /// persistent stable-VA record through the existing runtime allocator,
-    /// stamps request/device identity, and opens the first accumulation window
-    /// (`epoch = 1`); subsequent executions whose expert count matches
-    /// `config.num_experts` accumulate their routes into the current window via
-    /// the fused route-kernel marks. The window advances only at
-    /// [`reset_route_telemetry_boundary`](Self::reset_route_telemetry_boundary).
-    /// Returns a typed [`TelemetryUnsupported`] on a device mismatch or
-    /// unsupported property, in which case telemetry stays disabled and ordinary
-    /// inference is unaffected. Session/kernel-scoped, crate-internal/test only
-    /// and default-off.
-    ///
-    /// Caveat: re-arming (or [`disarm_route_telemetry`](Self::disarm_route_telemetry))
-    /// frees the previous record's device buffers, whose pointers an
-    /// instantiated CUDA graph bakes into its nodes; the caller MUST
-    /// `reset_graph` any capture that referenced the old record before
-    /// re-arming or disarming. Every current caller does so, and there is no
-    /// production caller.
+    fn shared(&self) -> Result<&Arc<BlockQuantizedMoeSharedState>> {
+        self.shared
+            .as_ref()
+            .ok_or_else(|| error("BlockQuantizedMoE projection banks were not admitted"))
+    }
+
     #[doc(hidden)]
     pub fn arm_route_telemetry(
-        &self,
+        &mut self,
         config: RouteTelemetryConfig,
     ) -> std::result::Result<(), TelemetryUnsupported> {
-        let experts = config.num_experts;
-        let armed = ArmedTelemetry::arm(&self.runtime, config)?;
-        let bitmap = armed.bitmap_ptr();
-        let header = armed.header_ptr();
-        let mut telemetry = self
-            .telemetry
-            .lock()
-            .expect("cuda_ep BQMoE telemetry poisoned");
-        self.telemetry_bitmap.store(0, Ordering::Release);
-        self.telemetry_header.store(0, Ordering::Release);
-        self.telemetry_experts.store(0, Ordering::Release);
-        if let Some(previous) = telemetry.take() {
-            previous.free(&self.runtime);
+        if self.runtime.has_graph_executable().unwrap_or(false)
+            || self
+                .runtime
+                .has_graph_executable_in(onnx_runtime_ep_api::DeviceGraphSlot::Verify)
+                .unwrap_or(false)
+        {
+            return Err(TelemetryUnsupported::GraphInstalled);
         }
-        *telemetry = Some(armed);
-        self.telemetry_experts.store(experts, Ordering::Release);
-        self.telemetry_header.store(header, Ordering::Release);
-        self.telemetry_bitmap.store(bitmap, Ordering::Release);
+        let shared = self.shared.as_ref().ok_or_else(|| {
+            TelemetryUnsupported::Alloc("projection banks are not admitted".into())
+        })?;
+        let armed = Arc::new(OwnedBlockQuantizedMoeTelemetry::arm(&self.runtime, config)?);
+        shared.telemetry.store(Some(armed));
         Ok(())
     }
 
-    /// Disarm and release any armed route-telemetry record. Idempotent. The
-    /// caller must first `reset_graph` any capture that referenced the record —
-    /// see [`arm_route_telemetry`](Self::arm_route_telemetry).
     #[doc(hidden)]
-    pub fn disarm_route_telemetry(&self) {
-        self.telemetry_bitmap.store(0, Ordering::Release);
-        self.telemetry_header.store(0, Ordering::Release);
-        self.telemetry_experts.store(0, Ordering::Release);
-        let mut telemetry = self
-            .telemetry
-            .lock()
-            .expect("cuda_ep BQMoE telemetry poisoned");
-        if let Some(previous) = telemetry.take() {
-            previous.free(&self.runtime);
+    pub fn disarm_route_telemetry(&mut self) -> Result<()> {
+        if self.runtime.has_graph_executable()?
+            || self
+                .runtime
+                .has_graph_executable_in(onnx_runtime_ep_api::DeviceGraphSlot::Verify)?
+        {
+            return Err(error(
+                "cannot disarm BlockQuantizedMoE traffic while a device graph is installed",
+            ));
         }
+        self.shared()?.telemetry.store(None);
+        Ok(())
     }
 
-    /// Advance route telemetry to the next accumulation window at an explicit
-    /// **coarse safe boundary** (issue #1810 Slice 7A; design §2.3/§3). The
-    /// *only* place the epoch advances and the record is re-zeroed — the
-    /// execute path never resets it, so eager calls in a window accumulate the
-    /// routed-expert union and in-range count with a fixed epoch. Rejected
-    /// (returns `Err`) while the EP stream is capturing; otherwise drains prior
-    /// stream work through `drain_for_unmap` before re-stamping the header on the
-    /// host. No-op (`Ok`) when disarmed. Allocates nothing, moves no pointer.
-    /// Crate-internal / test-only; no production boundary-policy caller yet.
     #[doc(hidden)]
-    pub fn reset_route_telemetry_boundary(&self) -> Result<()> {
-        let mut telemetry = self
-            .telemetry
-            .lock()
-            .expect("cuda_ep BQMoE telemetry poisoned");
-        match telemetry.as_mut() {
-            Some(armed) => armed.reset_boundary(&self.runtime),
-            None => Ok(()),
+    pub fn reset_route_telemetry_boundary(&mut self) -> Result<()> {
+        if let Some(armed) = self.shared()?.telemetry.load_full() {
+            armed.record.reset_boundary(&self.runtime)?;
         }
+        Ok(())
     }
 
-    /// Copy the current telemetry record to the host (test/observability only —
-    /// not the production CONSUME path; self-synchronizes). Returns `None` when
-    /// telemetry is not armed.
     #[doc(hidden)]
     pub fn route_telemetry_snapshot(&self) -> Result<Option<TelemetrySnapshot>> {
-        let telemetry = self
+        self.shared()?
             .telemetry
-            .lock()
-            .expect("cuda_ep BQMoE telemetry poisoned");
-        match telemetry.as_ref() {
-            Some(armed) => Ok(Some(armed.snapshot(&self.runtime)?)),
-            None => Ok(None),
-        }
+            .load_full()
+            .map(|armed| armed.record.snapshot(&self.runtime))
+            .transpose()
     }
 
-    /// Total device bytes held by the armed telemetry record (teardown /
-    /// accounting tests); `0` when disarmed.
     #[doc(hidden)]
     pub fn route_telemetry_footprint_bytes(&self) -> usize {
-        self.telemetry
-            .lock()
-            .expect("cuda_ep BQMoE telemetry poisoned")
+        self.shared
             .as_ref()
-            .map_or(0, ArmedTelemetry::footprint_bytes)
+            .and_then(|shared| shared.telemetry.load_full())
+            .map_or(0, |armed| armed.record.footprint_bytes())
     }
 
-    /// Stable device VA of the armed telemetry bitmap (isolation / accounting
-    /// tests); `None` when disarmed.
     #[doc(hidden)]
     pub fn route_telemetry_bitmap_addr(&self) -> Option<u64> {
-        self.telemetry
-            .lock()
-            .expect("cuda_ep BQMoE telemetry poisoned")
+        self.shared
             .as_ref()
-            .map(ArmedTelemetry::bitmap_addr)
+            .and_then(|shared| shared.telemetry.load_full())
+            .map(|armed| armed.record.bitmap_addr())
     }
 
-    /// Snapshot the cumulative production traffic quantities. Physical DRAM
-    /// bytes remain absent without a hardware-counter measurement.
     #[doc(hidden)]
     pub fn production_traffic_snapshot(&self) -> Result<BlockQuantizedMoeTraffic> {
-        let telemetry = self.route_telemetry_snapshot()?;
-        let (logical_route_demand_bytes, unique_experts) = if let Some(snapshot) = telemetry {
-            let logical = self
-                .bytes_per_expert
-                .checked_mul(u64::from(snapshot.count()))
-                .ok_or_else(|| error("logical route-demand byte count overflow"))?;
-            let unique = snapshot
-                .bitmap
-                .iter()
-                .map(|word| word.count_ones() as usize)
-                .sum();
-            (logical, unique)
-        } else {
-            (self.logical_route_demand_bytes.load(Ordering::Acquire), 0)
-        };
+        let telemetry = self
+            .route_telemetry_snapshot()?
+            .ok_or_else(|| error("BlockQuantizedMoE traffic is not armed"))?;
+        let logical_route_demand_bytes = self
+            .bytes_per_expert
+            .checked_mul(u64::from(telemetry.count()))
+            .ok_or_else(|| error("logical route-demand byte count overflow"))?;
+        let unique_experts: usize = telemetry
+            .bitmap
+            .iter()
+            .map(|word| word.count_ones() as usize)
+            .sum();
         Ok(BlockQuantizedMoeTraffic {
             uploaded_whole_bank_bytes: self.uploaded_whole_bank_bytes,
+            committed_whole_bank_bytes: self.committed_whole_bank_bytes,
             logical_route_demand_bytes,
             unique_selected_expert_bytes: self
                 .bytes_per_expert
@@ -1804,29 +1762,6 @@ impl BlockQuantizedMoEKernel {
             bank,
             bias: bias.map(tensor_ptr).unwrap_or(0),
         })
-    }
-
-    fn retain_banks_for_capture(
-        &self,
-        banks: &Arc<AdmittedBlockQuantizedMoeBankSet>,
-    ) -> Result<()> {
-        self.runtime.retain_active_graph_resource(
-            Arc::as_ptr(banks) as usize,
-            banks,
-            "BlockQuantizedMoE projection banks",
-        )
-    }
-}
-
-impl Drop for BlockQuantizedMoEKernel {
-    fn drop(&mut self) {
-        // Release any armed route-telemetry record (issue #1810 Slice 7A).
-        // `free` drains in-flight launches before returning the buffers.
-        if let Ok(telemetry) = self.telemetry.get_mut()
-            && let Some(armed) = telemetry.take()
-        {
-            armed.free(&self.runtime);
-        }
     }
 }
 
@@ -1989,7 +1924,7 @@ impl Kernel for BlockQuantizedMoEKernel {
         constants: &[Option<KernelConstantInput<'_>>],
         provider: &dyn ExecutionProvider,
     ) -> Result<()> {
-        if self.banks.is_some() {
+        if self.shared.is_some() {
             return Err(error("immutable projection banks were already admitted"));
         }
         if provider.device_id() != onnx_runtime_ir::DeviceId::cuda(self.runtime.ordinal())
@@ -2056,24 +1991,54 @@ impl Kernel for BlockQuantizedMoEKernel {
     }
 
     fn shareable_constant_state(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
-        self.banks
+        self.shared
             .as_ref()
-            .map(|banks| Arc::clone(banks) as Arc<dyn std::any::Any + Send + Sync>)
+            .map(|shared| Arc::clone(shared) as Arc<dyn std::any::Any + Send + Sync>)
     }
 
     fn adopt_shareable_constant_state(
         &mut self,
         state: Arc<dyn std::any::Any + Send + Sync>,
     ) -> Result<bool> {
-        let Ok(banks) = Arc::downcast::<AdmittedBlockQuantizedMoeBankSet>(state) else {
+        let Ok(shared) = Arc::downcast::<BlockQuantizedMoeSharedState>(state) else {
             return Ok(false);
         };
-        self.install_banks(banks)?;
+        self.validate_admitted_bank_set(&shared.banks)?;
+        let total = shared
+            .banks
+            .fc1
+            .total_bytes
+            .checked_add(shared.banks.fc2.total_bytes)
+            .and_then(|bytes| {
+                shared
+                    .banks
+                    .fc3
+                    .as_ref()
+                    .map_or(Some(bytes), |fc3| bytes.checked_add(fc3.total_bytes))
+            })
+            .ok_or_else(|| error("uploaded whole-bank byte count overflow"))?;
+        let per_expert = shared
+            .banks
+            .fc1
+            .bytes_per_expert
+            .checked_add(shared.banks.fc2.bytes_per_expert)
+            .and_then(|bytes| {
+                shared
+                    .banks
+                    .fc3
+                    .as_ref()
+                    .map_or(Some(bytes), |fc3| bytes.checked_add(fc3.bytes_per_expert))
+            })
+            .ok_or_else(|| error("per-expert projection byte count overflow"))?;
+        self.uploaded_whole_bank_bytes = total as u64;
+        self.committed_whole_bank_bytes = total as u64;
+        self.bytes_per_expert = per_expert as u64;
+        self.shared = Some(shared);
         Ok(true)
     }
 
     fn constant_input_override(&self, input_idx: usize) -> Option<TensorView<'_>> {
-        let banks = self.banks.as_ref()?;
+        let banks = &self.shared.as_ref()?.banks;
         let bank = match input_idx {
             2 => &banks.fc1,
             4 => &banks.fc2,
@@ -2093,6 +2058,54 @@ impl Kernel for BlockQuantizedMoEKernel {
                 allocation: bank.allocation.allocation_identity(),
             }),
         )
+    }
+
+    fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
+        let Some(shared) = self.shared.as_ref() else {
+            return Vec::new();
+        };
+        let mut resources = Vec::with_capacity(2);
+        resources.push(DeviceGraphResource::new(
+            Arc::as_ptr(&shared.banks) as usize,
+            Arc::clone(&shared.banks),
+        ));
+        if let Some(telemetry) = shared.telemetry.load_full() {
+            resources.push(DeviceGraphResource::new(
+                Arc::as_ptr(&telemetry) as usize,
+                telemetry,
+            ));
+        }
+        resources
+    }
+
+    fn arm_block_quantized_moe_traffic(&mut self, request_id: u32) -> Result<bool> {
+        self.arm_route_telemetry(RouteTelemetryConfig {
+            request_id,
+            device_id: self.runtime.ordinal(),
+            num_experts: self.geometry.experts,
+        })
+        .map_err(|error| EpError::KernelFailed(error.to_string()))?;
+        Ok(true)
+    }
+
+    fn reset_block_quantized_moe_traffic(&mut self) -> Result<()> {
+        self.reset_route_telemetry_boundary()
+    }
+
+    fn snapshot_block_quantized_moe_traffic(&self) -> Result<Option<BlockQuantizedMoeTraffic>> {
+        if self
+            .shared
+            .as_ref()
+            .and_then(|shared| shared.telemetry.load_full())
+            .is_none()
+        {
+            return Ok(None);
+        }
+        self.production_traffic_snapshot().map(Some)
+    }
+
+    fn disarm_block_quantized_moe_traffic(&mut self) -> Result<()> {
+        self.disarm_route_telemetry()
     }
 
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
@@ -2147,10 +2160,8 @@ impl Kernel for BlockQuantizedMoEKernel {
                 outputs.len()
             )));
         }
-        let banks = self
-            .banks
-            .as_ref()
-            .ok_or_else(|| error("BlockQuantizedMoE projection banks were not admitted"))?;
+        let shared = self.shared()?;
+        let banks = &shared.banks;
         self.validate_admitted_bank_set(banks)?;
         for (index, (input, expected)) in inputs
             .iter()
@@ -2250,39 +2261,27 @@ impl Kernel for BlockQuantizedMoEKernel {
         let activated = ptr(4);
         let route_output = ptr(5);
 
-        // Inert route telemetry (issue #1810 Slice 7A). When armed for this
-        // expert count, hand the stable-VA record pointers to the fused route
-        // kernel so its `atomicOr`/`atomicAdd` marks accumulate this call's
-        // routes into the *current window* (union bitmap + saturating count).
-        // There is deliberately **no reset/epoch launch here** — the window and
-        // its epoch advance only at an explicit `reset_route_telemetry_boundary`
-        // (design §2.3/§3), so consecutive eager calls accumulate rather than
-        // resetting per call. When disarmed — or armed for a different capacity —
-        // the pointers are null and the route kernel is byte-identical; a
-        // capacity mismatch leaves telemetry inert for this call and never fails
-        // inference. The mutex is released before any launch, so graph capture
-        // records only device work.
-        let telemetry_matches =
-            self.telemetry_experts.load(Ordering::Acquire) == self.geometry.experts;
-        let (telemetry_bitmap, telemetry_header) = if telemetry_matches {
-            (
-                self.telemetry_bitmap.load(Ordering::Acquire),
-                self.telemetry_header.load(Ordering::Acquire),
-            )
+        let telemetry = shared.telemetry.load();
+        let (telemetry_bitmap, telemetry_header) = if telemetry
+            .as_ref()
+            .is_some_and(|owner| owner.record.matches_experts(self.geometry.experts))
+        {
+            let owner = telemetry.as_ref().expect("checked above");
+            (owner.record.bitmap_ptr(), owner.record.header_ptr())
         } else {
             (0, 0)
         };
 
-        let logical_bytes = self
-            .bytes_per_expert
-            .checked_mul(self.geometry.routes as u64)
-            .ok_or_else(|| error("logical route-demand byte count overflow"))?;
-        self.logical_route_demand_bytes
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |total| {
-                total.checked_add(logical_bytes)
-            })
-            .map_err(|_| error("cumulative logical route-demand byte count overflow"))?;
-        self.retain_banks_for_capture(banks)?;
+        self.runtime.require_registered_address_capture(
+            Arc::as_ptr(&shared.banks) as usize,
+            "BlockQuantizedMoE projection banks",
+        )?;
+        if let Some(owner) = telemetry.as_ref() {
+            self.runtime.require_registered_address_capture(
+                Arc::as_ptr(owner) as usize,
+                "BlockQuantizedMoE traffic record",
+            )?;
+        }
         self.launch_route(
             &inputs[1],
             router_weights,

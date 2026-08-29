@@ -55,8 +55,10 @@ use onnx_runtime_ep_api::{
     TensorMetadata, TensorMut, TensorView, WeightHandle, WorkspaceAllocation, WorkspaceLifetime,
     WorkspaceRequirement, WorkspaceView, lazy_weight_candidates,
 };
+use smallvec::SmallVec;
 
 type OptionalTensorSpecs = Vec<Option<(DataType, Vec<usize>)>>;
+type ScopedOutputs = SmallVec<[Option<SessionOutput>; 16]>;
 use onnx_runtime_ep_cpu::CpuExecutionProvider;
 use onnx_runtime_ep_cpu::strided::view_in_bounds;
 use onnx_runtime_ir::Attribute;

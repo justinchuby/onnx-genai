@@ -2,11 +2,57 @@ use super::*;
 use onnx_runtime_ep_api::{
     ExecutionProviderCapabilities, ExternalMmapRegion, MmapRegionSource, WeightHandleError,
 };
+use smallvec::SmallVec;
 
 /// Per-input-slot result of the strided-input materialization gate: `Some` with
 /// the gathered contiguous bytes and their strides when a private temp was
 /// needed for that slot, `None` when the input was used in place.
 type MaterializedInputs = Vec<Option<(Vec<u8>, Vec<i64>)>>;
+
+fn refill_contiguous_strides(strides: &mut Vec<i64>, shape: &[usize]) {
+    strides.clear();
+    strides.resize(shape.len(), 0);
+    let mut stride = 1_i64;
+    for (axis, &dim) in shape.iter().enumerate().rev() {
+        strides[axis] = stride;
+        stride = stride.saturating_mul(dim as i64);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn refill_in_info(
+    info: &mut InInfo,
+    present: bool,
+    dtype: DataType,
+    shape: &[usize],
+    strides: Option<&[i64]>,
+    byte_offset: usize,
+    base_ptr: *const std::ffi::c_void,
+    device: onnx_runtime_ir::DeviceId,
+    backing: TensorBacking,
+    root_len: usize,
+    lazy_unresolved: bool,
+    prepared_unresolved: bool,
+) {
+    info.present = present;
+    info.dtype = dtype;
+    info.shape.clear();
+    info.shape.extend_from_slice(shape);
+    match strides {
+        Some(strides) => {
+            info.strides.clear();
+            info.strides.extend_from_slice(strides);
+        }
+        None => refill_contiguous_strides(&mut info.strides, shape),
+    }
+    info.byte_offset = byte_offset;
+    info.base_ptr = base_ptr as usize;
+    info.device = device;
+    info.backing = backing;
+    info.root_len = root_len;
+    info.lazy_unresolved = lazy_unresolved;
+    info.prepared_unresolved = prepared_unresolved;
+}
 
 /// Whether GroupQueryAttention with capacity-bound (persistently bound, aliased
 /// in-place) present-KV outputs sizes its present shape from the host-known
@@ -471,7 +517,9 @@ impl Executor {
         // Resolve every output's concrete shape: static elementwise broadcast,
         // then data-dependent just-in-time sizing, then the Attention present-KV
         // capacity widening. Mutates `resolved`; returns the final shapes.
+        let output_shape_scratch = std::mem::take(&mut self.scratch_output_shapes);
         let output_shapes = self.resolve_node_outputs(
+            output_shape_scratch,
             node_id,
             inputs,
             outputs,
@@ -488,7 +536,9 @@ impl Executor {
         // bounds-check it while only shared borrows of `self` are live. Lazy
         // weights the EP can page are uploaded here and bound as normal device
         // views; ones it declines stay absent and are flagged `lazy_unresolved`.
-        let in_infos = self.build_input_bindings(
+        let input_info_scratch = std::mem::take(&mut self.scratch_input_infos);
+        let (in_infos, _paged_weights) = self.build_input_bindings(
+            input_info_scratch,
             pi,
             inputs,
             input_dtypes,
@@ -535,7 +585,7 @@ impl Executor {
 
         // Build the (possibly strided) input views once; they feed both the
         // view-output probe and, on the compute path, the kernel itself.
-        let mut views: Vec<TensorView> = Vec::with_capacity(in_infos.len());
+        let mut views: SmallVec<[TensorView; 16]> = SmallVec::new();
         for info in &in_infos {
             if !info.present {
                 views.push(TensorView::absent(info.dtype));
@@ -543,7 +593,7 @@ impl Executor {
             }
             views.push(
                 TensorView::new(
-                    DevicePtr(info.base_ptr),
+                    DevicePtr(info.base_ptr as *const std::ffi::c_void),
                     info.dtype,
                     &info.shape,
                     &info.strides,
@@ -631,6 +681,8 @@ impl Executor {
             }
             drop(views);
             ctx.install_view_outputs(node, inputs, outputs, output_dtypes, resolved, specs)?;
+            self.scratch_input_infos = in_infos;
+            self.scratch_output_shapes = output_shapes;
             return Ok(());
         }
 
@@ -678,12 +730,13 @@ impl Executor {
         // Auto-materialization gate: strided (view) inputs feeding a kernel that
         // does not accept them on that slot are gathered into private contiguous
         // temps. Temps must outlive the views that borrow them.
-        let mat = materialize_strided_inputs(kernel, &in_infos, node)?;
+        let materialized_scratch = std::mem::take(&mut self.scratch_materialized_inputs);
+        let mat = materialize_strided_inputs(kernel, &in_infos, node, materialized_scratch)?;
 
         // Rebuild input views, swapping any materialized slot to its contiguous
         // temp (offset 0, contiguous strides over the fresh buffer).
         drop(views);
-        let mut views: Vec<TensorView> = Vec::with_capacity(in_infos.len());
+        let mut views: SmallVec<[TensorView; 16]> = SmallVec::new();
         for (i, info) in in_infos.iter().enumerate() {
             if !info.present {
                 views.push(TensorView::absent(info.dtype));
@@ -699,7 +752,7 @@ impl Executor {
                 )),
                 None => views.push(
                     TensorView::new(
-                        DevicePtr(info.base_ptr),
+                        DevicePtr(info.base_ptr as *const std::ffi::c_void),
                         info.dtype,
                         &info.shape,
                         &info.strides,
@@ -723,10 +776,12 @@ impl Executor {
 
         // Take output buffers out so they can be borrowed `&mut` disjointly from
         // the input reads (SSA guarantees outputs are disjoint from inputs).
-        let out_strides: Vec<Vec<i64>> = output_shapes
-            .iter()
-            .map(|s| compute_contiguous_strides(s))
-            .collect();
+        let mut out_strides = std::mem::take(&mut self.scratch_output_strides);
+        out_strides.resize_with(output_shapes.len(), Vec::new);
+        out_strides.truncate(output_shapes.len());
+        for (strides, shape) in out_strides.iter_mut().zip(&output_shapes) {
+            refill_contiguous_strides(strides, shape);
+        }
         let (out_bufs, mut outs) = ctx.build_output_bindings(
             outputs,
             &output_shapes,
@@ -746,6 +801,12 @@ impl Executor {
             &mut outs,
             out_bufs,
         )?;
+        drop(outs);
+        drop(views);
+        self.scratch_input_infos = in_infos;
+        self.scratch_output_shapes = output_shapes;
+        self.scratch_output_strides = out_strides;
+        self.scratch_materialized_inputs = mat;
         Ok(())
     }
 
@@ -759,6 +820,7 @@ impl Executor {
     #[allow(clippy::too_many_arguments)]
     fn resolve_node_outputs(
         &self,
+        mut output_shapes: Vec<Vec<usize>>,
         node_id: NodeId,
         inputs: &[Option<ValueId>],
         outputs: &[ValueId],
@@ -893,8 +955,12 @@ impl Executor {
                 resolved.insert(ovid, out_shapes[oi].clone());
             }
         }
-        let mut output_shapes: Vec<Vec<usize>> =
-            outputs.iter().map(|v| resolved[v].clone()).collect();
+        output_shapes.resize_with(outputs.len(), Vec::new);
+        output_shapes.truncate(outputs.len());
+        for (shape, output) in output_shapes.iter_mut().zip(outputs) {
+            shape.clear();
+            shape.extend_from_slice(&resolved[output]);
+        }
         // Fixed-capacity KV for the default-domain Attention op, and for a
         // decomposed attention's plain-`Concat` KV-cache append (see
         // `geometry::is_kv_cache_growth_concat`). Both present outputs are
@@ -943,7 +1009,8 @@ impl Executor {
                                 .zip(output_shapes[oi].get(2))
                                 .is_some_and(|(&physical, &logical)| physical >= logical))
                     {
-                        output_shapes[oi] = value.shape.clone();
+                        output_shapes[oi].clear();
+                        output_shapes[oi].extend_from_slice(&value.shape);
                     }
                 }
             } else if is_kv_cache_growth_concat(&self.graph, node)
@@ -1012,6 +1079,7 @@ impl Executor {
     #[allow(clippy::too_many_arguments)]
     fn build_input_bindings(
         &self,
+        mut in_infos: Vec<InInfo>,
         pi: usize,
         inputs: &[Option<ValueId>],
         input_dtypes: &[DataType],
@@ -1019,25 +1087,43 @@ impl Executor {
         external: &ExternalBindings,
         accepts_lazy_weights: bool,
         capabilities: &ExecutionProviderCapabilities,
-    ) -> Result<Vec<InInfo>> {
-        let mut in_infos: Vec<InInfo> = Vec::with_capacity(inputs.len());
+    ) -> Result<(
+        Vec<InInfo>,
+        SmallVec<[onnx_runtime_ep_api::PagedWeight; 16]>,
+    )> {
+        let mut paged_weights = SmallVec::new();
+        in_infos.resize_with(inputs.len(), || InInfo {
+            present: false,
+            dtype: DataType::Float32,
+            shape: Vec::new(),
+            strides: Vec::new(),
+            byte_offset: 0,
+            base_ptr: 0,
+            device: self.ep.device_id(),
+            backing: TensorBacking::Opaque,
+            root_len: 0,
+            lazy_unresolved: false,
+            prepared_unresolved: false,
+        });
+        in_infos.truncate(inputs.len());
         let _build_inputs_span = phase_span!("exec_kernel.build_inputs");
         for (i, slot) in inputs.iter().enumerate() {
+            let info = &mut in_infos[i];
             let Some(vid) = *slot else {
-                in_infos.push(InInfo {
-                    present: false,
-                    dtype: input_dtypes[i],
-                    shape: Vec::new(),
-                    strides: Vec::new(),
-                    byte_offset: 0,
-                    base_ptr: std::ptr::null(),
-                    device: self.ep.device_id(),
-                    backing: TensorBacking::Opaque,
-                    root_len: 0,
-                    lazy_unresolved: false,
-                    prepared_unresolved: false,
-                    paged: None,
-                });
+                refill_in_info(
+                    info,
+                    false,
+                    input_dtypes[i],
+                    &[],
+                    Some(&[]),
+                    0,
+                    std::ptr::null(),
+                    self.ep.device_id(),
+                    TensorBacking::Opaque,
+                    0,
+                    false,
+                    false,
+                );
                 continue;
             };
             if let Some(value) = external
@@ -1045,53 +1131,52 @@ impl Executor {
                 .get(&vid)
                 .or_else(|| external.outputs.get(&vid))
             {
-                let strides = compute_contiguous_strides(&value.shape);
-                view_bounds(&value.shape, &strides, 0, value.dtype, value.len)?;
-                in_infos.push(InInfo {
-                    present: true,
-                    dtype: value.dtype,
-                    shape: value.shape.clone(),
-                    strides,
-                    byte_offset: 0,
-                    base_ptr: value.ptr.cast_const(),
-                    device: value.device,
-                    backing: TensorBacking::Opaque,
-                    root_len: value.len,
-                    lazy_unresolved: false,
-                    prepared_unresolved: false,
-                    paged: None,
-                });
+                refill_in_info(
+                    info,
+                    true,
+                    value.dtype,
+                    &value.shape,
+                    None,
+                    0,
+                    value.ptr as *const std::ffi::c_void,
+                    value.device,
+                    TensorBacking::Opaque,
+                    value.len,
+                    false,
+                    false,
+                );
+                view_bounds(&info.shape, &info.strides, 0, value.dtype, value.len)?;
                 continue;
             }
             // A tensor input backed by a shared sequence element (SequenceAt
             // output) owns no DeviceBuffer: read its possibly-strided view
             // directly over the immutable shared allocation.
             if let Some(elem) = self.seq_elem_values.get(&vid) {
-                let shape = input_shapes[i].clone();
-                let strides = elem.layout.resolved_strides(&shape);
+                let shape = &input_shapes[i];
+                let strides = elem.layout.resolved_strides(shape);
                 let root_len = elem.root_len();
                 let base_ptr = elem.as_ptr();
                 view_bounds(
-                    &shape,
+                    shape,
                     &strides,
                     elem.byte_offset(),
                     input_dtypes[i],
                     root_len,
                 )?;
-                in_infos.push(InInfo {
-                    present: true,
-                    dtype: input_dtypes[i],
+                refill_in_info(
+                    info,
+                    true,
+                    input_dtypes[i],
                     shape,
-                    strides,
-                    byte_offset: elem.byte_offset(),
+                    Some(&strides),
+                    elem.byte_offset(),
                     base_ptr,
-                    device: elem.device(),
-                    backing: TensorBacking::Opaque,
+                    elem.device(),
+                    TensorBacking::Opaque,
                     root_len,
-                    lazy_unresolved: false,
-                    prepared_unresolved: false,
-                    paged: None,
-                });
+                    false,
+                    false,
+                );
                 continue;
             }
             if accepts_lazy_weights
@@ -1118,38 +1203,40 @@ impl Executor {
                             let nodes_between = pi.saturating_sub(issued_at);
                             record_dense_prefetch_gap(nodes_between as u64);
                         }
-                        let shape = input_shapes[i].clone();
-                        let strides = compute_contiguous_strides(&shape);
-                        in_infos.push(InInfo {
-                            present: true,
-                            dtype: input_dtypes[i],
-                            shape,
-                            strides,
-                            byte_offset: 0,
-                            base_ptr: paged.device_ptr(),
-                            device: paged.device(),
-                            backing: TensorBacking::Opaque,
-                            root_len: paged.len(),
-                            lazy_unresolved: false,
-                            prepared_unresolved: false,
-                            paged: Some(paged),
-                        });
+                        let root_len = paged.len();
+                        let base_ptr = paged.device_ptr();
+                        let device = paged.device();
+                        refill_in_info(
+                            info,
+                            true,
+                            input_dtypes[i],
+                            &input_shapes[i],
+                            None,
+                            0,
+                            base_ptr,
+                            device,
+                            TensorBacking::Opaque,
+                            root_len,
+                            false,
+                            false,
+                        );
+                        paged_weights.push(paged);
                     }
                     None => {
-                        in_infos.push(InInfo {
-                            present: false,
-                            dtype: input_dtypes[i],
-                            shape: input_shapes[i].clone(),
-                            strides: compute_contiguous_strides(&input_shapes[i]),
-                            byte_offset: 0,
-                            base_ptr: std::ptr::null(),
-                            device: self.ep.device_id(),
-                            backing: TensorBacking::Opaque,
-                            root_len: 0,
-                            lazy_unresolved: true,
-                            prepared_unresolved: false,
-                            paged: None,
-                        });
+                        refill_in_info(
+                            info,
+                            false,
+                            input_dtypes[i],
+                            &input_shapes[i],
+                            None,
+                            0,
+                            std::ptr::null(),
+                            self.ep.device_id(),
+                            TensorBacking::Opaque,
+                            0,
+                            true,
+                            false,
+                        );
                     }
                 }
                 continue;
@@ -1160,20 +1247,20 @@ impl Executor {
                     .prepares_immutable_constant(self.graph.node(self.plan[pi].node_id), i)
                 && !self.buffers.contains_key(&vid)
             {
-                in_infos.push(InInfo {
-                    present: true,
-                    dtype: input_dtypes[i],
-                    shape: input_shapes[i].clone(),
-                    strides: compute_contiguous_strides(&input_shapes[i]),
-                    byte_offset: 0,
-                    base_ptr: std::ptr::null(),
-                    device: self.ep.device_id(),
-                    backing: TensorBacking::Opaque,
-                    root_len: 0,
-                    lazy_unresolved: false,
-                    prepared_unresolved: true,
-                    paged: None,
-                });
+                refill_in_info(
+                    info,
+                    true,
+                    input_dtypes[i],
+                    &input_shapes[i],
+                    None,
+                    0,
+                    std::ptr::null(),
+                    self.ep.device_id(),
+                    TensorBacking::Opaque,
+                    0,
+                    false,
+                    true,
+                );
                 continue;
             }
             let root = self.root_of(vid);
@@ -1182,15 +1269,10 @@ impl Executor {
             })?;
             let root_len = buf.len();
             let base_ptr = buf.as_ptr();
-            let (shape, strides, byte_offset) = match self.views.get(&vid) {
-                Some(view) => (view.shape.clone(), view.strides.clone(), view.byte_offset),
-                None => {
-                    let shape = input_shapes[i].clone();
-                    let strides = compute_contiguous_strides(&shape);
-                    (shape, strides, 0)
-                }
-            };
-            view_bounds(&shape, &strides, byte_offset, input_dtypes[i], root_len)?;
+            let view = self.views.get(&vid);
+            let shape = view.map_or(input_shapes[i].as_slice(), |view| view.shape.as_slice());
+            let strides = view.map(|view| view.strides.as_slice());
+            let byte_offset = view.map_or(0, |view| view.byte_offset);
             let backing = self
                 .graph
                 .initializers
@@ -1205,23 +1287,30 @@ impl Executor {
                     })
                 })
                 .unwrap_or(TensorBacking::Opaque);
-            in_infos.push(InInfo {
-                present: true,
-                dtype: input_dtypes[i],
+            refill_in_info(
+                info,
+                true,
+                input_dtypes[i],
                 shape,
                 strides,
                 byte_offset,
                 base_ptr,
-                device: buf.device(),
+                buf.device(),
                 backing,
                 root_len,
-                lazy_unresolved: false,
-                prepared_unresolved: false,
-                paged: None,
-            });
+                false,
+                false,
+            );
+            view_bounds(
+                &info.shape,
+                &info.strides,
+                byte_offset,
+                input_dtypes[i],
+                root_len,
+            )?;
         }
         drop(_build_inputs_span);
-        Ok(in_infos)
+        Ok((in_infos, paged_weights))
     }
 
     /// Read the integer *values* of input `vid` as `i64`, materializing a view
@@ -1356,6 +1445,8 @@ struct OutBacking {
     device: onnx_runtime_ir::DeviceId,
 }
 
+type OutputBindings<'a> = (SmallVec<[OutBacking; 8]>, SmallVec<[TensorMut<'a>; 8]>);
+
 /// Auto-materialization gate: a strided (view) input feeding a kernel that does
 /// not accept strided input on that slot is gathered into a private contiguous
 /// temp so contiguous-assuming kernels stay correct. Returns, per input slot,
@@ -1365,16 +1456,18 @@ fn materialize_strided_inputs(
     kernel: &dyn Kernel,
     in_infos: &[InInfo],
     node: &Node,
+    mut mat: MaterializedInputs,
 ) -> Result<MaterializedInputs> {
-    let mut mat: Vec<Option<(Vec<u8>, Vec<i64>)>> = Vec::with_capacity(in_infos.len());
+    mat.resize_with(in_infos.len(), || None);
+    mat.truncate(in_infos.len());
     for (i, info) in in_infos.iter().enumerate() {
         if !info.present {
-            mat.push(None);
+            mat[i] = None;
             continue;
         }
         let contiguous = onnx_runtime_ir::is_contiguous(&info.shape, &info.strides);
         if contiguous || kernel.supports_strided_input(i) {
-            mat.push(None);
+            mat[i] = None;
             continue;
         }
         if !info.device.is_host_accessible() {
@@ -1397,7 +1490,7 @@ fn materialize_strided_inputs(
         let src = unsafe { std::slice::from_raw_parts(info.base_ptr as *const u8, info.root_len) };
         let gathered = gather_view(src, &info.shape, &info.strides, info.byte_offset, esize);
         let strides = compute_contiguous_strides(&info.shape);
-        mat.push(Some((gathered, strides)));
+        mat[i] = Some((gathered, strides));
     }
     Ok(mat)
 }
@@ -1623,14 +1716,14 @@ impl KernelDispatchContext<'_> {
         out_strides: &'o [Vec<i64>],
         output_dtypes: &[DataType],
         external: &ExternalBindings,
-    ) -> Result<(Vec<OutBacking>, Vec<TensorMut<'o>>)> {
-        let mut out_bufs: Vec<OutBacking> = Vec::with_capacity(outputs.len());
+    ) -> Result<OutputBindings<'o>> {
+        let mut out_bufs: SmallVec<[OutBacking; 8]> = SmallVec::new();
         for &vid in outputs {
             if let Some(value) = external.outputs.get(&vid) {
                 out_bufs.push(OutBacking {
                     vid,
                     internal: None,
-                    ptr: value.ptr,
+                    ptr: value.ptr as *mut std::ffi::c_void,
                     len: value.len,
                     device: value.device,
                 });
@@ -1648,7 +1741,7 @@ impl KernelDispatchContext<'_> {
                 });
             }
         }
-        let mut outs: Vec<TensorMut> = Vec::with_capacity(out_bufs.len());
+        let mut outs = SmallVec::new();
         for (i, backing) in out_bufs.iter_mut().enumerate() {
             view_bounds(
                 &output_shapes[i],
@@ -1682,8 +1775,8 @@ impl KernelDispatchContext<'_> {
         capabilities: &ExecutionProviderCapabilities,
         has_lazy_inputs: bool,
         views: &[TensorView],
-        outs: &mut Vec<TensorMut>,
-        out_bufs: Vec<OutBacking>,
+        outs: &mut [TensorMut],
+        out_bufs: SmallVec<[OutBacking; 8]>,
     ) -> Result<()> {
         let kernel_inputs = has_lazy_inputs.then(|| {
             inputs
@@ -1743,10 +1836,10 @@ impl KernelDispatchContext<'_> {
 
         let execution = {
             let _s = phase_span!("exec_kernel.compute");
-            let metadata = views
+            let metadata: SmallVec<[TensorMetadata<'_>; 16]> = views
                 .iter()
                 .map(|view| TensorMetadata::new(view.dtype, view.shape, !view.is_absent()))
-                .collect::<Vec<_>>();
+                .collect();
             let requirement = kernel.workspace_requirement_for_execution(views, &metadata)?;
             let prepared = match requirement.lifetime {
                 WorkspaceLifetime::SessionPersistent => &mut *self.persistent_workspace,

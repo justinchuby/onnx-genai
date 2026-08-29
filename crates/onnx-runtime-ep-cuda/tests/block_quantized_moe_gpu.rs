@@ -1983,7 +1983,7 @@ mod route_telemetry {
             let mut inputs = build_inputs(&config, 0xA11CE ^ rows as u64);
             inputs[1] = Some(shifted_router(&config, 0));
 
-            let kernel = build_kernel(&ep, &config, &inputs);
+            let mut kernel = build_kernel(&ep, &config, &inputs);
             let off = exec_eager(&ep, &kernel, &config, &inputs).unwrap();
             assert!(kernel.route_telemetry_snapshot().unwrap().is_none());
 
@@ -2015,7 +2015,7 @@ mod route_telemetry {
             let router = shifted_router(&config, 0);
             inputs[1] = Some(router.clone());
 
-            let kernel = build_kernel(&ep, &config, &inputs);
+            let mut kernel = build_kernel(&ep, &config, &inputs);
             kernel
                 .arm_route_telemetry(RouteTelemetryConfig {
                     request_id: 7,
@@ -2049,7 +2049,7 @@ mod route_telemetry {
         let ep = require_cuda();
         let config = telemetry_config(4);
         let mut inputs = build_inputs(&config, 0xC0FFEE);
-        let kernel = build_kernel(&ep, &config, &inputs);
+        let mut kernel = build_kernel(&ep, &config, &inputs);
         kernel
             .arm_route_telemetry(RouteTelemetryConfig {
                 request_id: 3,
@@ -2123,7 +2123,7 @@ mod route_telemetry {
         let config = telemetry_config(4);
         let mut inputs = build_inputs(&config, 0xB0);
         inputs[1] = Some(shifted_router(&config, 0));
-        let kernel = build_kernel(&ep, &config, &inputs);
+        let mut kernel = build_kernel(&ep, &config, &inputs);
         kernel
             .arm_route_telemetry(RouteTelemetryConfig {
                 request_id: 9,
@@ -2175,7 +2175,7 @@ mod route_telemetry {
             let router = shifted_router(&config, 1);
             inputs[1] = Some(router.clone());
 
-            let kernel = build_kernel(&ep, &config, &inputs);
+            let mut kernel = build_kernel(&ep, &config, &inputs);
             kernel
                 .arm_route_telemetry(RouteTelemetryConfig {
                     request_id: 300 + rows as u32,
@@ -2211,7 +2211,7 @@ mod route_telemetry {
         let ep = require_cuda();
         let config = telemetry_config(2);
         let inputs = build_inputs(&config, 0xD00D);
-        let kernel = build_kernel(&ep, &config, &inputs);
+        let mut kernel = build_kernel(&ep, &config, &inputs);
 
         let wrong_device = ordinal(&ep).wrapping_add(1);
         let error = kernel
@@ -2239,7 +2239,7 @@ mod route_telemetry {
         let config = telemetry_config(2);
         let mut inputs = build_inputs(&config, 0xFEED);
         inputs[1] = Some(shifted_router(&config, 0));
-        let kernel = build_kernel(&ep, &config, &inputs);
+        let mut kernel = build_kernel(&ep, &config, &inputs);
 
         kernel
             .arm_route_telemetry(RouteTelemetryConfig {
@@ -2268,8 +2268,8 @@ mod route_telemetry {
         let mut inputs = build_inputs(&config, 0x5EED);
         inputs[1] = Some(shifted_router(&config, 0));
 
-        let kernel_a = build_kernel(&ep, &config, &inputs);
-        let kernel_b = build_kernel(&ep, &config, &inputs);
+        let mut kernel_a = build_kernel(&ep, &config, &inputs);
+        let mut kernel_b = build_kernel(&ep, &config, &inputs);
         kernel_a
             .arm_route_telemetry(RouteTelemetryConfig {
                 request_id: 100,
@@ -2301,7 +2301,7 @@ mod route_telemetry {
         assert_eq!(snap_b.header[H_REQUEST], 200);
         assert_eq!(snap_a.header[H_DEVICE], ordinal(&ep));
 
-        kernel_a.disarm_route_telemetry();
+        kernel_a.disarm_route_telemetry().unwrap();
         assert_eq!(kernel_a.route_telemetry_footprint_bytes(), 0);
         assert!(kernel_a.route_telemetry_snapshot().unwrap().is_none());
         let out = exec_eager(&ep, &kernel_a, &config, &inputs).unwrap();

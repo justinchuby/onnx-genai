@@ -756,9 +756,27 @@ impl DeviceIoBinding {
     }
 
     pub fn read_bytes_into(&mut self, bytes: &mut [u8]) -> Result<()> {
-        self.allocator.copy_to_host(self.buffer(), bytes)?;
+        if bytes.is_empty() {
+            self.allocator.sync()?;
+        } else {
+            self.allocator.copy_to_host(self.buffer(), bytes)?;
+        }
+        self.check_and_reset_device_validation()?;
         self.transfer_stats.host_download_calls += 1;
         self.transfer_stats.host_download_bytes += bytes.len() as u64;
+        Ok(())
+    }
+
+    fn check_and_reset_device_validation(&self) -> Result<()> {
+        let flags = self.allocator.check_device_capture_error()?;
+        self.allocator.reset_device_validation_error()?;
+        if flags != 0 {
+            return Err(onnx_runtime_ep_api::EpError::KernelFailed(format!(
+                "{}: device validation failed (flags=0x{flags:x})",
+                self.allocator.name()
+            ))
+            .into());
+        }
         Ok(())
     }
 
@@ -784,6 +802,8 @@ impl DeviceIoBinding {
         }
         let mut bytes = vec![0; byte_len];
         if byte_len == 0 {
+            self.allocator.sync()?;
+            self.check_and_reset_device_validation()?;
             return Ok(bytes);
         }
         // SAFETY: the offset range is checked inside the live allocation above;
@@ -797,6 +817,7 @@ impl DeviceIoBinding {
             )
         };
         self.allocator.copy_to_host(&alias, &mut bytes)?;
+        self.check_and_reset_device_validation()?;
         self.transfer_stats.host_download_calls += 1;
         self.transfer_stats.host_download_bytes += bytes.len() as u64;
         Ok(bytes)

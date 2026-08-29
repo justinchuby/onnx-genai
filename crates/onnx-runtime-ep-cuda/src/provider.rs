@@ -3836,6 +3836,10 @@ impl ExecutionProvider for CudaExecutionProvider {
         self.runtime.reset_capture_error()
     }
 
+    fn defers_device_validation(&self) -> bool {
+        self.runtime.eager_sync_deferred()
+    }
+
     fn has_device_graph_in(&self, slot: DeviceGraphSlot) -> Result<bool> {
         // The CUDA EP owns one `CudaGraphLifecycle` per slot whose segments can be
         // reset out-of-band (kernel-variant eviction retires kernels baked into a

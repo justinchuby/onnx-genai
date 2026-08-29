@@ -10,14 +10,15 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
+use arc_swap::ArcSwapOption;
 use cudarc::driver::sys::{
     CUdevice_attribute, CUdeviceptr, CUfunction, CUfunction_attribute_enum, CUmodule,
 };
 use cudarc::driver::{CudaContext, CudaEvent, CudaFunction, CudaModule, CudaStream, LaunchConfig};
 
-use onnx_runtime_ep_api::DeviceGraphSlot;
 use onnx_runtime_ep_api::EpError;
 use onnx_runtime_ep_api::Kernel;
+use onnx_runtime_ep_api::{DeviceGraphResource, DeviceGraphSlot};
 use onnx_runtime_ep_api::{RawDeviceAllocationSiteStats, Result};
 
 use crate::blas::CublasLt;
@@ -549,6 +550,9 @@ pub struct CudaRuntime {
     copy_stream: Arc<CudaStream>,
     graph: CudaGraphLifecycle,
     verify_graph: CudaGraphLifecycle,
+    registered_capture_active: AtomicBool,
+    unregistered_capture_active: AtomicBool,
+    active_capture_resource_ids: ArcSwapOption<Vec<usize>>,
     blas: CublasLt,
     cudnn: CudnnBackend,
     ordinal: u32,
@@ -819,6 +823,9 @@ impl CudaRuntime {
             copy_stream,
             graph,
             verify_graph,
+            registered_capture_active: AtomicBool::new(false),
+            unregistered_capture_active: AtomicBool::new(false),
+            active_capture_resource_ids: ArcSwapOption::empty(),
             blas,
             cudnn,
             ordinal,
@@ -922,20 +929,34 @@ impl CudaRuntime {
 
     /// Begin capture on the EP stream after auditing the complete kernel sequence.
     pub fn begin_graph_capture(&self, kernels: &[&dyn Kernel]) -> Result<()> {
+        self.begin_graph_capture_with_resources(kernels, Vec::new())
+    }
+
+    /// Begin capture with additional immutable address owners.
+    pub fn begin_graph_capture_with_resources(
+        &self,
+        kernels: &[&dyn Kernel],
+        mut resources: Vec<DeviceGraphResource>,
+    ) -> Result<()> {
         crate::capture::require_subgraph_graph_capturable(kernels)?;
-        self.graph.begin()
+        resources.extend(
+            kernels
+                .iter()
+                .flat_map(|kernel| kernel.device_graph_resources()),
+        );
+        self.begin_graph_capture_resources_in(DeviceGraphSlot::Primary, resources)
     }
 
     /// End stream capture and install the instantiated graph executable.
     pub fn end_graph_capture(&self) -> Result<()> {
-        self.graph.end()
+        self.end_graph_capture_in(DeviceGraphSlot::Primary)
     }
 
     /// Abort an in-progress stream capture, discarding any half-recorded graph
     /// and returning the lifecycle to idle so a subsequent [`reset_graph`]
     /// succeeds. Used on the error path of segmented capture.
     pub fn abort_graph_capture(&self) -> Result<()> {
-        self.graph.abort()
+        self.abort_graph_capture_in(DeviceGraphSlot::Primary)
     }
 
     /// Launch the installed graph executable on the same EP stream.
@@ -993,9 +1014,19 @@ impl CudaRuntime {
     /// Clear the latching capture-error word back to the un-poisoned state.
     /// Invoked at session request boundaries and on graph reset / re-capture.
     pub fn reset_capture_error(&self) -> Result<()> {
+        self.bind()?;
         // SAFETY: `capture_error` is a live four-byte device allocation owned by
-        // this runtime for its whole lifetime.
-        unsafe { self.htod(&0_u32.to_ne_bytes(), self.capture_error) }
+        // this runtime for its whole lifetime. The stream-ordered clear executes
+        // before subsequently submitted eager or captured kernels.
+        unsafe {
+            cudarc::driver::result::memset_d8_async(
+                self.capture_error,
+                0,
+                std::mem::size_of::<u32>(),
+                self.stream.cu_stream(),
+            )
+        }
+        .map_err(|error| driver_err("clear CUDA validation latch", error))
     }
 
     /// Driver-reported capture status for the EP stream.
@@ -1021,17 +1052,65 @@ impl CudaRuntime {
         kernels: &[&dyn Kernel],
     ) -> Result<()> {
         crate::capture::require_subgraph_graph_capturable(kernels)?;
-        self.graph_slot(slot).begin()
+        let resources = kernels
+            .iter()
+            .flat_map(|kernel| kernel.device_graph_resources())
+            .collect();
+        self.begin_graph_capture_resources_in(slot, resources)
+    }
+
+    /// Slot-aware capture with additional immutable address owners.
+    pub fn begin_graph_capture_with_resources_in(
+        &self,
+        slot: DeviceGraphSlot,
+        kernels: &[&dyn Kernel],
+        mut resources: Vec<DeviceGraphResource>,
+    ) -> Result<()> {
+        crate::capture::require_subgraph_graph_capturable(kernels)?;
+        resources.extend(
+            kernels
+                .iter()
+                .flat_map(|kernel| kernel.device_graph_resources()),
+        );
+        self.begin_graph_capture_resources_in(slot, resources)
+    }
+
+    fn begin_graph_capture_resources_in(
+        &self,
+        slot: DeviceGraphSlot,
+        mut resources: Vec<DeviceGraphResource>,
+    ) -> Result<()> {
+        resources.sort_unstable_by_key(DeviceGraphResource::identity);
+        resources.dedup_by_key(|resource| resource.identity());
+        let resource_ids = Arc::new(
+            resources
+                .iter()
+                .map(DeviceGraphResource::identity)
+                .collect(),
+        );
+        self.graph_slot(slot).begin(resources)?;
+        self.active_capture_resource_ids.store(Some(resource_ids));
+        self.registered_capture_active
+            .store(true, Ordering::Release);
+        Ok(())
     }
 
     /// Slot-aware [`end_graph_capture`](Self::end_graph_capture).
     pub fn end_graph_capture_in(&self, slot: DeviceGraphSlot) -> Result<()> {
-        self.graph_slot(slot).end()
+        let result = self.graph_slot(slot).end();
+        self.registered_capture_active
+            .store(false, Ordering::Release);
+        self.active_capture_resource_ids.store(None);
+        result
     }
 
     /// Slot-aware [`abort_graph_capture`](Self::abort_graph_capture).
     pub fn abort_graph_capture_in(&self, slot: DeviceGraphSlot) -> Result<()> {
-        self.graph_slot(slot).abort()
+        let result = self.graph_slot(slot).abort();
+        self.registered_capture_active
+            .store(false, Ordering::Release);
+        self.active_capture_resource_ids.store(None);
+        result
     }
 
     /// Slot-aware [`replay_graph`](Self::replay_graph).
@@ -1059,36 +1138,6 @@ impl CudaRuntime {
         self.graph_slot(slot).has_executable()
     }
 
-    /// Strongly retain a sealed resource in the graph capture currently active
-    /// on this runtime's stream.
-    ///
-    /// Eager launches are unchanged and retain nothing. If the CUDA stream is
-    /// capturing but neither runtime-owned graph slot is the active ownership
-    /// sink, fail before an address-bearing kernel is launched; an externally
-    /// initiated capture must not embed an allocation the runtime cannot pin.
-    pub(crate) fn retain_active_graph_resource<T>(
-        &self,
-        identity: usize,
-        owner: &Arc<T>,
-        label: &str,
-    ) -> Result<()>
-    where
-        T: Send + Sync + 'static,
-    {
-        if !self.is_capturing()? {
-            return Ok(());
-        }
-        if self.graph.retain_capture_resource(identity, owner)?
-            || self.verify_graph.retain_capture_resource(identity, owner)?
-        {
-            return Ok(());
-        }
-        Err(EpError::KernelFailed(format!(
-            "cuda_ep: active CUDA graph capture has no registered ownership sink for sealed \
-             {label}; refusing to embed its device addresses"
-        )))
-    }
-
     /// Start capture directly on the stream without installing a lifecycle
     /// ownership sink. Test-only proof that sealed launches fail closed rather
     /// than embedding addresses in an externally owned graph.
@@ -1098,7 +1147,10 @@ impl CudaRuntime {
             .begin_capture(
                 cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
             )
-            .map_err(|error| driver_err("begin unregistered CUDA graph capture", error))
+            .map_err(|error| driver_err("begin unregistered CUDA graph capture", error))?;
+        self.unregistered_capture_active
+            .store(true, Ordering::Release);
+        Ok(())
     }
 
     /// End and destroy the raw test capture started above.
@@ -1112,13 +1164,17 @@ impl CudaRuntime {
             cudarc::driver::result::stream::end_capture(self.stream.cu_stream())
                 .map_err(|error| driver_err("end unregistered CUDA graph capture", error))?
         };
-        if !graph.is_null() {
+        let result = if !graph.is_null() {
             // SAFETY: no executable was instantiated; this helper exclusively
             // owns the fresh raw graph handle.
             unsafe { cudarc::driver::result::graph::destroy(graph) }
-                .map_err(|error| driver_err("destroy unregistered CUDA graph", error))?;
-        }
-        Ok(())
+                .map_err(|error| driver_err("destroy unregistered CUDA graph", error))
+        } else {
+            Ok(())
+        };
+        self.unregistered_capture_active
+            .store(false, Ordering::Release);
+        result
     }
 
     /// Snapshot explicit device allocation/free calls made through this runtime.
@@ -1713,6 +1769,45 @@ impl CudaRuntime {
             != cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE)
     }
 
+    pub(crate) fn require_registered_address_capture(
+        &self,
+        identity: usize,
+        label: &str,
+    ) -> Result<()> {
+        if self.unregistered_capture_active.load(Ordering::Acquire)
+            && !self.registered_capture_active.load(Ordering::Acquire)
+        {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep: active CUDA graph capture has no registered ownership token for \
+                 sealed {label}; refusing to embed its device addresses"
+            )));
+        }
+        if self.registered_capture_active.load(Ordering::Acquire)
+            && !self
+                .active_capture_resource_ids
+                .load()
+                .as_ref()
+                .is_some_and(|ids| ids.contains(&identity))
+        {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep: active CUDA graph capture did not retain the ownership token for \
+                  sealed {label}; refusing to embed its device addresses"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Number of CUDA graph lifecycle mutex acquisitions by this runtime.
+    pub fn graph_lifecycle_lock_acquisition_count(&self) -> u64 {
+        self.graph.lock_acquisition_count() + self.verify_graph.lock_acquisition_count()
+    }
+
+    /// Positive control for graph-lifecycle lock instrumentation.
+    #[doc(hidden)]
+    pub fn test_acquire_graph_lifecycle_lock(&self) -> Result<()> {
+        self.graph.test_acquire_lock()
+    }
+
     /// This runtime's process-unique identity. See [`Self::runtime_id`].
     pub(crate) fn runtime_id(&self) -> u64 {
         self.runtime_id
@@ -1982,12 +2077,17 @@ impl CudaRuntime {
         // SAFETY: bound context; `dst` covers `src.len()` bytes per the contract.
         unsafe { cudarc::driver::result::memcpy_htod_sync(dst, src) }
             .map_err(|e| driver_err("cuMemcpyHtoD", e))?;
-        self.context.default_stream().synchronize().map_err(|e| {
-            driver_err(
-                "cuStreamSynchronize(default) after synchronous cuMemcpyHtoD",
-                e,
-            )
-        })?;
+        // SAFETY: a null CUstream selects the current context's legacy default
+        // stream. Calling the raw API avoids constructing an allocating Arc
+        // wrapper on every request-boundary validation reset.
+        unsafe { cudarc::driver::result::stream::synchronize(std::ptr::null_mut()) }.map_err(
+            |e| {
+                driver_err(
+                    "cuStreamSynchronize(default) after synchronous cuMemcpyHtoD",
+                    e,
+                )
+            },
+        )?;
         self.host_to_device_copies.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }

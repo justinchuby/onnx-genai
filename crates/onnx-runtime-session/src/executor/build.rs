@@ -922,6 +922,7 @@ impl Executor {
 
         let (sequence_values, control_flow_output_values) =
             Self::classify_special_values(&graph, &order);
+        let all_value_ids = value_shapes.keys().copied().collect();
 
         // 3) Build the structural per-node plan.
         let capabilities = ep.capabilities();
@@ -980,6 +981,13 @@ impl Executor {
             execution_provider_fallback_report,
             trace: TraceContext::noop(),
             scratch_input_shapes: Vec::new(),
+            scratch_input_infos: Vec::new(),
+            scratch_output_shapes: Vec::new(),
+            scratch_output_strides: Vec::new(),
+            scratch_materialized_inputs: Vec::new(),
+            scratch_external_bindings: ExternalBindings::default(),
+            scratch_resolved_shapes: HashMap::new(),
+            all_value_ids,
             decode_memo_enabled: decode_memo_env_enabled(),
             decode_memo_verify: cfg!(debug_assertions) || decode_memo_verify_env_enabled(),
             decode_memo: None,
@@ -1804,6 +1812,34 @@ impl Executor {
         resolved
     }
 
+    /// Refill a previously resolved shape map without rebuilding its buckets or
+    /// each value's dimension vector.
+    pub(super) fn resolve_soft_reuse(
+        &self,
+        bindings: &HashMap<SymbolId, usize>,
+        mut resolved: HashMap<ValueId, Vec<usize>>,
+    ) -> HashMap<ValueId, Vec<usize>> {
+        resolved.retain(|vid, _| self.value_shapes.contains_key(vid));
+        for (&vid, shape) in &self.value_shapes {
+            let mut remove = false;
+            match resolved.entry(vid) {
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    remove = !substitute_into(shape, bindings, entry.get_mut());
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let mut dims = Vec::with_capacity(shape.len());
+                    if substitute_into(shape, bindings, &mut dims) {
+                        entry.insert(dims);
+                    }
+                }
+            }
+            if remove {
+                resolved.remove(&vid);
+            }
+        }
+        resolved
+    }
+
     /// F5 Stage 1: resolve every value's concrete shape for a memo-eligible
     /// eager step, replaying the length-invariant partition through the
     /// [`DecodePlanMemo`] when the step is plan-identical to the memoized one,
@@ -2171,9 +2207,25 @@ impl Executor {
         resolved: &HashMap<ValueId, Vec<usize>>,
         excluded: &HashSet<ValueId>,
     ) -> Result<()> {
-        let vids: Vec<ValueId> = self.value_shapes.keys().copied().collect();
-        for vid in vids {
-            if self.graph.initializers.contains_key(&vid) || excluded.contains(&vid) {
+        self.size_buffers_filtered(resolved, |vid| excluded.contains(&vid))
+    }
+
+    pub(super) fn size_buffers_excluding_slice(
+        &mut self,
+        resolved: &HashMap<ValueId, Vec<usize>>,
+        excluded: &[ValueId],
+    ) -> Result<()> {
+        self.size_buffers_filtered(resolved, |vid| excluded.contains(&vid))
+    }
+
+    fn size_buffers_filtered(
+        &mut self,
+        resolved: &HashMap<ValueId, Vec<usize>>,
+        excluded: impl Fn(ValueId) -> bool,
+    ) -> Result<()> {
+        for index in 0..self.all_value_ids.len() {
+            let vid = self.all_value_ids[index];
+            if self.graph.initializers.contains_key(&vid) || excluded(vid) {
                 continue;
             }
             // Sequence-typed values own no tensor buffer (their list lives in
@@ -2182,10 +2234,10 @@ impl Executor {
                 continue;
             }
             let dtype = self.value_dtypes[&vid];
-            let Some(dims) = resolved.get(&vid).cloned() else {
+            let Some(dims) = resolved.get(&vid) else {
                 continue;
             };
-            self.ensure_buffer(vid, dtype, &dims)?;
+            self.ensure_buffer(vid, dtype, dims)?;
         }
         Ok(())
     }

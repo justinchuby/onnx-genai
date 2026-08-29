@@ -952,7 +952,7 @@ impl Executor {
         &mut self,
         inputs: &[(&str, &Tensor)],
         bindings: &mut [DeviceIoBinding],
-    ) -> Result<Vec<Option<Tensor>>> {
+    ) -> Result<crate::DeviceBindingOutputs> {
         if self.heterogeneous.is_some() {
             return Err(heterogeneous_api_error(
                 "execution with persistent device bindings/state",
@@ -960,6 +960,7 @@ impl Executor {
         }
         let external = self.prepare_external_bindings(bindings)?;
         let result = self.run_scoped(inputs, &HashMap::new(), &external);
+        self.scratch_external_bindings = external;
         self.release_step_workspace()?;
         result?
             .into_iter()
@@ -974,6 +975,26 @@ impl Executor {
             .collect()
     }
 
+    pub(crate) fn arm_block_quantized_moe_traffic(&mut self, request_id: u32) -> Result<usize> {
+        self.reset_device_graph()?;
+        self.cache.arm_block_quantized_moe_traffic(request_id)
+    }
+
+    pub(crate) fn reset_block_quantized_moe_traffic(&mut self) -> Result<()> {
+        self.cache.reset_block_quantized_moe_traffic()
+    }
+
+    pub(crate) fn snapshot_block_quantized_moe_traffic(
+        &self,
+    ) -> Result<onnx_runtime_ep_api::BlockQuantizedMoeTraffic> {
+        self.cache.snapshot_block_quantized_moe_traffic()
+    }
+
+    pub(crate) fn disarm_block_quantized_moe_traffic(&mut self) -> Result<()> {
+        self.reset_device_graph()?;
+        self.cache.disarm_block_quantized_moe_traffic()
+    }
+
     pub(crate) fn try_capture_with_device_bindings(
         &mut self,
         inputs: &[(&str, &Tensor)],
@@ -986,6 +1007,7 @@ impl Executor {
         }
         let external = self.prepare_external_bindings(bindings)?;
         let result = self.run_scoped_mode(inputs, &HashMap::new(), &external, RunMode::Capture);
+        self.scratch_external_bindings = external;
         self.release_step_workspace()?;
         match result? {
             ScopedRunResult::Executed(outputs) => {
@@ -1023,9 +1045,7 @@ impl Executor {
                 "mixed-provider device-graph replay",
             ));
         }
-        let external = self.prepare_external_bindings(bindings)?;
-        let signature = Self::binding_signature(bindings);
-        if self.cap().device_graph_signature.as_ref() != Some(&signature) {
+        if !self.bindings_match_graph_signature(bindings) {
             self.reset_device_graph()?;
             return Err(SessionError::Internal(
                 "device graph replay bindings changed shape, address, or I/O identity; graph was invalidated"
@@ -1060,7 +1080,9 @@ impl Executor {
             self.ep.replay_device_graph_in(self.graph_slot)?;
             return Ok(true);
         }
+        let external = self.prepare_external_bindings(bindings)?;
         let result = self.run_scoped_mode(&[], &HashMap::new(), &external, RunMode::Replay);
+        self.scratch_external_bindings = external;
         self.release_step_workspace()?;
         match result? {
             // `run_scoped_mode` clears `capture_schedule` when a branch flip
@@ -1209,11 +1231,29 @@ impl Executor {
             .collect()
     }
 
+    fn bindings_match_graph_signature(&self, bindings: &[DeviceIoBinding]) -> bool {
+        self.cap()
+            .device_graph_signature
+            .as_deref()
+            .is_some_and(|signature| {
+                signature.len() == bindings.len()
+                    && signature.iter().zip(bindings).all(|(expected, binding)| {
+                        expected.input_name == binding.input_name()
+                            && expected.binds_input == binding.binds_input()
+                            && expected.output_name.as_deref() == binding.output_name()
+                            && expected.dtype == binding.dtype
+                            && expected.physical_shape == binding.physical_shape()
+                            && expected.device_ptr == binding.device_ptr() as usize
+                    })
+            })
+    }
+
     pub(super) fn prepare_external_bindings(
-        &self,
+        &mut self,
         bindings: &mut [DeviceIoBinding],
     ) -> Result<ExternalBindings> {
-        self.prepare_external_bindings_mode(bindings, false)
+        let external = std::mem::take(&mut self.scratch_external_bindings);
+        self.refill_external_bindings(external, bindings, false)
     }
 
     /// As [`Self::prepare_external_bindings`], but when `plan_capacity` is set the
@@ -1238,11 +1278,54 @@ impl Executor {
         bindings: &mut [DeviceIoBinding],
         plan_capacity: bool,
     ) -> Result<ExternalBindings> {
-        let mut external = ExternalBindings::default();
-        for binding in bindings {
-            let input_name = binding.input_name().to_string();
+        self.refill_external_bindings(ExternalBindings::default(), bindings, plan_capacity)
+    }
+
+    fn refill_external_bindings(
+        &self,
+        mut external: ExternalBindings,
+        bindings: &mut [DeviceIoBinding],
+        plan_capacity: bool,
+    ) -> Result<ExternalBindings> {
+        external.inputs.retain(|vid, _| {
+            self.graph.value(*vid).name.as_deref().is_some_and(|name| {
+                bindings
+                    .iter()
+                    .any(|binding| binding.binds_input() && binding.input_name() == name)
+            })
+        });
+        external.outputs.retain(|vid, _| {
+            self.graph.value(*vid).name.as_deref().is_some_and(|name| {
+                bindings
+                    .iter()
+                    .any(|binding| binding.output_name() == Some(name))
+            })
+        });
+        for index in 0..bindings.len() {
+            for prior in &bindings[..index] {
+                if bindings[index].binds_input()
+                    && prior.binds_input()
+                    && bindings[index].input_name() == prior.input_name()
+                {
+                    return Err(SessionError::Internal(format!(
+                        "duplicate device input binding '{}'",
+                        bindings[index].input_name()
+                    )));
+                }
+                if let Some(output) = bindings[index].output_name()
+                    && prior.output_name() == Some(output)
+                {
+                    return Err(SessionError::Internal(format!(
+                        "duplicate device output binding '{output}'"
+                    )));
+                }
+            }
+        }
+        for binding in bindings.iter_mut() {
+            let ptr = binding.buffer_mut().as_mut_ptr();
+            let input_name = binding.input_name();
             let bind_input = binding.binds_input();
-            let output_name = binding.output_name().map(str::to_string);
+            let output_name = binding.output_name();
             let dtype = binding.dtype;
             let len = binding.buffer().len();
             let alignment = binding.buffer().alignment();
@@ -1254,37 +1337,42 @@ impl Executor {
                 )));
             }
             let physical_shape = binding.physical_shape();
-            let required = required_binding_bytes(dtype, physical_shape, &input_name)?;
+            let required = required_binding_bytes(dtype, physical_shape, input_name)?;
             if required > len {
                 return Err(SessionError::Internal(format!(
                     "device binding '{input_name}' needs {required} bytes for {physical_shape:?}, allocation has {len}"
                 )));
             }
-            let ptr = binding.buffer_mut().as_mut_ptr();
             if bind_input {
-                let input_vid = *self.input_index.get(&input_name).ok_or_else(|| {
+                let input_vid = *self.input_index.get(input_name).ok_or_else(|| {
                     SessionError::InputNotFound {
-                        name: input_name.clone(),
+                        name: input_name.to_string(),
                     }
                 })?;
-                let value = ExternalValue {
-                    dtype,
-                    shape: if plan_capacity {
-                        binding.physical_shape().to_vec()
-                    } else {
-                        binding.kernel_input_shape().to_vec()
-                    },
-                    accepts_subshape: false,
-                    ptr,
-                    len,
-                    alignment,
-                    device,
-                };
-                if external.inputs.insert(input_vid, value).is_some() {
-                    return Err(SessionError::Internal(format!(
-                        "duplicate device input binding '{input_name}'"
-                    )));
-                }
+                let value = external
+                    .inputs
+                    .entry(input_vid)
+                    .or_insert_with(|| ExternalValue {
+                        dtype,
+                        shape: Vec::new(),
+                        accepts_subshape: false,
+                        ptr: ptr as usize,
+                        len,
+                        alignment,
+                        device,
+                    });
+                value.dtype = dtype;
+                value.shape.clear();
+                value.shape.extend_from_slice(if plan_capacity {
+                    binding.physical_shape()
+                } else {
+                    binding.kernel_input_shape()
+                });
+                value.accepts_subshape = false;
+                value.ptr = ptr as usize;
+                value.len = len;
+                value.alignment = alignment;
+                value.device = device;
             }
             if let Some(output_name) = output_name {
                 let output_vid = self
@@ -1292,9 +1380,7 @@ impl Executor {
                     .outputs
                     .iter()
                     .copied()
-                    .find(|&vid| {
-                        self.graph.value(vid).name.as_deref() == Some(output_name.as_str())
-                    })
+                    .find(|&vid| self.graph.value(vid).name.as_deref() == Some(output_name))
                     .ok_or_else(|| {
                         SessionError::Internal(format!(
                             "device binding output not found: {output_name}"
@@ -1310,26 +1396,32 @@ impl Executor {
                 }
                 if self.value_dtypes[&output_vid] != dtype {
                     return Err(SessionError::DtypeMismatch {
-                        name: output_name.clone(),
+                        name: output_name.to_string(),
                         expected: format!("{:?}", self.value_dtypes[&output_vid]),
                         got: format!("{dtype:?}"),
                     });
                 }
-                let value = ExternalValue {
-                    dtype,
-                    shape: binding.physical_shape().to_vec(),
-                    accepts_subshape: bind_input
-                        && binding.logical_shape() != binding.physical_shape(),
-                    ptr,
-                    len,
-                    alignment,
-                    device,
-                };
-                if external.outputs.insert(output_vid, value).is_some() {
-                    return Err(SessionError::Internal(format!(
-                        "duplicate device output binding '{output_name}'"
-                    )));
-                }
+                let value = external
+                    .outputs
+                    .entry(output_vid)
+                    .or_insert_with(|| ExternalValue {
+                        dtype,
+                        shape: Vec::new(),
+                        accepts_subshape: false,
+                        ptr: ptr as usize,
+                        len,
+                        alignment,
+                        device,
+                    });
+                value.dtype = dtype;
+                value.shape.clear();
+                value.shape.extend_from_slice(binding.physical_shape());
+                value.accepts_subshape =
+                    bind_input && binding.logical_shape() != binding.physical_shape();
+                value.ptr = ptr as usize;
+                value.len = len;
+                value.alignment = alignment;
+                value.device = device;
             }
         }
         Ok(external)

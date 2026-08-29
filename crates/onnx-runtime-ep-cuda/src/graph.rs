@@ -1,27 +1,18 @@
 //! Serialized ownership for the CUDA graph captured on an EP runtime stream.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::ThreadId;
 
+use arc_swap::ArcSwapOption;
 use cudarc::driver::sys::{
     CUgraph, CUgraphExec, CUgraphInstantiate_flags, CUstreamCaptureMode, CUstreamCaptureStatus,
 };
 use cudarc::driver::{CudaStream, result};
 use onnx_runtime_cuda_memory::capture_gate::CaptureExclusion;
-use onnx_runtime_ep_api::{EpError, Result};
+use onnx_runtime_ep_api::{DeviceGraphResource, EpError, Result};
 
 use crate::error::driver_err;
-
-trait CapturedResource: Send + Sync {}
-
-impl<T> CapturedResource for T where T: Send + Sync {}
-
-/// One strongly owned resource whose address or contents were embedded in a
-/// captured graph segment.
-struct GraphResource {
-    identity: usize,
-    _owner: Arc<dyn CapturedResource>,
-}
 
 /// Whether the lifecycle is currently recording a segment, and on which thread.
 enum CaptureState {
@@ -38,14 +29,14 @@ struct CapturedGraph {
     graph_exec: CUgraphExec,
     stream: Arc<CudaStream>,
     /// Dropped only after `graph_exec` and `graph` are destroyed by `Drop`.
-    resources: Vec<GraphResource>,
+    resources: Vec<DeviceGraphResource>,
 }
 
 impl CapturedGraph {
     fn end_capture(
         stream: &Arc<CudaStream>,
         flags: CUgraphInstantiate_flags,
-        resources: Vec<GraphResource>,
+        resources: Vec<DeviceGraphResource>,
     ) -> std::result::Result<Option<Self>, cudarc::driver::DriverError> {
         stream.context().bind_to_thread()?;
         // SAFETY: this lifecycle holds the state mutex and `stream` is currently
@@ -81,18 +72,25 @@ impl CapturedGraph {
 
     fn upload(&self) -> std::result::Result<(), cudarc::driver::DriverError> {
         self.stream.context().bind_to_thread()?;
-        // SAFETY: this wrapper owns `graph_exec`, and the lifecycle mutex
-        // serializes access on its owning stream.
+        // SAFETY: this wrapper owns `graph_exec`, which has not been published
+        // for replay yet, and uploads it on its owning stream.
         unsafe { result::graph::upload(self.graph_exec, self.stream.cu_stream()) }
     }
 
     fn launch(&self) -> std::result::Result<(), cudarc::driver::DriverError> {
         self.stream.context().bind_to_thread()?;
-        // SAFETY: this wrapper owns `graph_exec`, and the lifecycle mutex
-        // serializes access on its owning stream.
+        // SAFETY: the executable is immutable after publication and every
+        // launch is submitted to its one owning stream.
         unsafe { result::graph::launch(self.graph_exec, self.stream.cu_stream()) }
     }
 }
+
+// SAFETY: after publication a captured graph is immutable. CUDA graph launches
+// are submitted to the one owned stream, whose ordering serializes execution;
+// ArcSwap keeps the handles alive across concurrent reset/invalidation.
+unsafe impl Send for CapturedGraph {}
+// SAFETY: same immutable-publication and stream-ordering invariant as `Send`.
+unsafe impl Sync for CapturedGraph {}
 
 impl Drop for CapturedGraph {
     fn drop(&mut self) {
@@ -123,10 +121,9 @@ impl Drop for CapturedGraph {
 
 /// Owns the captured graph segments installed on one EP runtime stream.
 ///
-/// `CapturedGraph` is intentionally neither `Send` nor `Sync`. CUDA permits graph
-/// objects to cross threads only when every access is externally serialized.
-/// This wrapper enforces that rule with one mutex and never exposes a graph
-/// handle or performs graph work without holding its guard.
+/// Capture mutation stays behind the lifecycle mutex. Completed executables are
+/// immutable and atomically published for allocation- and mutex-free replay on
+/// their single owning stream.
 ///
 /// A whole-subgraph capture installs exactly one segment. Segmented capture —
 /// used when only parts of a claimed subgraph are device-graph capturable —
@@ -136,6 +133,12 @@ impl Drop for CapturedGraph {
 pub(crate) struct CudaGraphLifecycle {
     stream: Arc<CudaStream>,
     state: Mutex<LifecycleState>,
+    replay: ArcSwapOption<ReplaySet>,
+    lock_acquisitions: AtomicU64,
+}
+
+struct ReplaySet {
+    segments: Vec<Arc<CapturedGraph>>,
 }
 
 /// The capture flag and the ordered list of installed segment executables.
@@ -148,15 +151,14 @@ struct LifecycleState {
     /// Resources provisionally retained by the active capture. On successful
     /// instantiation these move into exactly one `CapturedGraph`; abort/failure
     /// drops them after the half-recorded graph is destroyed.
-    capture_resources: Vec<GraphResource>,
-    segments: Vec<CapturedGraph>,
+    capture_resources: Vec<DeviceGraphResource>,
+    segments: Vec<Arc<CapturedGraph>>,
 }
 
-// SAFETY: all access to the non-Send/non-Sync `CapturedGraph` handles is
-// confined to `state`, every method holds that mutex for the complete CUDA graph
-// API call, and every segment launches on its single owning `stream`.
+// SAFETY: capture mutation is serialized through `state`; published executables
+// are immutable and every segment launches on its single owning `stream`.
 unsafe impl Send for CudaGraphLifecycle {}
-// SAFETY: the same serialized-access invariant covers shared references.
+// SAFETY: the same mutation/publication invariant covers shared references.
 unsafe impl Sync for CudaGraphLifecycle {}
 
 impl CudaGraphLifecycle {
@@ -169,19 +171,26 @@ impl CudaGraphLifecycle {
                 capture_resources: Vec::new(),
                 segments: Vec::new(),
             }),
+            replay: ArcSwapOption::empty(),
+            lock_acquisitions: AtomicU64::new(0),
         }
     }
 
     fn lock(&self) -> Result<MutexGuard<'_, LifecycleState>> {
+        self.lock_acquisitions.fetch_add(1, Ordering::Relaxed);
         self.state.lock().map_err(|_| {
             EpError::KernelFailed("cuda_ep: CUDA graph lifecycle lock was poisoned".into())
         })
     }
 
+    pub(crate) fn lock_acquisition_count(&self) -> u64 {
+        self.lock_acquisitions.load(Ordering::Relaxed)
+    }
+
     /// Begin recording a new segment. Additional segments may be captured while
     /// earlier ones are already installed (segmented capture); only a second
     /// concurrent capture is rejected.
-    pub(crate) fn begin(&self) -> Result<()> {
+    pub(crate) fn begin(&self, resources: Vec<DeviceGraphResource>) -> Result<()> {
         let mut state = self.lock()?;
         match state.capture {
             CaptureState::Idle => {}
@@ -196,6 +205,15 @@ impl CudaGraphLifecycle {
             state.capture_resources.is_empty(),
             "idle CUDA graph lifecycle retained provisional resources"
         );
+        for resource in resources {
+            if !state
+                .capture_resources
+                .iter()
+                .any(|existing| existing.identity() == resource.identity())
+            {
+                state.capture_resources.push(resource);
+            }
+        }
 
         // Acquire *before* `cuStreamBeginCapture`: taking it afterwards leaves a
         // window in which the capture is live and unprotected. THREAD_LOCAL mode
@@ -203,9 +221,13 @@ impl CudaGraphLifecycle {
         // device-wide synchronization anywhere in the process invalidates this
         // capture.
         let exclusion = CaptureExclusion::acquire();
-        self.stream
+        if let Err(error) = self
+            .stream
             .begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
-            .map_err(|error| driver_err("begin CUDA graph stream capture", error))?;
+        {
+            state.capture_resources.clear();
+            return Err(driver_err("begin CUDA graph stream capture", error));
+        }
         state.capture = CaptureState::Capturing(std::thread::current().id());
         state.exclusion = Some(exclusion);
         Ok(())
@@ -239,34 +261,39 @@ impl CudaGraphLifecycle {
         // local, it drops at every exit from this function and never earlier.
         let _exclusion = state.exclusion.take();
         let resources = std::mem::take(&mut state.capture_resources);
-        let graph = CapturedGraph::end_capture(
-            &self.stream,
-            CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_USE_NODE_PRIORITY,
-            resources,
-        )
-        .map_err(|error| driver_err("end and instantiate CUDA graph capture", error))?
-        .ok_or_else(|| {
-            EpError::KernelFailed(
-                "cuda_ep: CUDA graph capture ended without producing a graph".into(),
+        let graph = Arc::new(
+            CapturedGraph::end_capture(
+                &self.stream,
+                CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_USE_NODE_PRIORITY,
+                resources,
             )
-        })?;
+            .map_err(|error| driver_err("end and instantiate CUDA graph capture", error))?
+            .ok_or_else(|| {
+                EpError::KernelFailed(
+                    "cuda_ep: CUDA graph capture ended without producing a graph".into(),
+                )
+            })?,
+        );
         graph
             .upload()
             .map_err(|error| driver_err("upload CUDA graph executable", error))?;
         state.segments.push(graph);
+        self.replay.store(Some(Arc::new(ReplaySet {
+            segments: state.segments.clone(),
+        })));
         Ok(())
     }
 
     /// Replay every installed segment in capture order. For a whole-subgraph
     /// capture this is the single installed graph.
     pub(crate) fn replay(&self) -> Result<()> {
-        let state = self.lock()?;
-        if state.segments.is_empty() {
+        let replay = self.replay.load();
+        let Some(replay) = replay.as_ref() else {
             return Err(EpError::KernelFailed(
                 "cuda_ep: cannot replay CUDA graph because no executable is installed".into(),
             ));
-        }
-        for graph in &state.segments {
+        };
+        for graph in &replay.segments {
             graph
                 .launch()
                 .map_err(|error| driver_err("launch CUDA graph executable", error))?;
@@ -278,11 +305,11 @@ impl CudaGraphLifecycle {
     /// executor drives this per segment, running the non-capturable seam nodes
     /// eagerly between replays.
     pub(crate) fn replay_segment(&self, index: usize) -> Result<()> {
-        let state = self.lock()?;
-        let graph = state.segments.get(index).ok_or_else(|| {
+        let replay = self.replay.load();
+        let graph = replay.as_ref().and_then(|set| set.segments.get(index)).ok_or_else(|| {
             EpError::KernelFailed(format!(
                 "cuda_ep: cannot replay CUDA graph segment {index}; only {} segment(s) installed",
-                state.segments.len()
+                replay.as_ref().map_or(0, |set| set.segments.len())
             ))
         })?;
         graph
@@ -338,43 +365,6 @@ impl CudaGraphLifecycle {
         Ok(())
     }
 
-    /// Retain `owner` in the active capture on this lifecycle.
-    ///
-    /// Returns `false` when this slot is idle so the runtime can try its other
-    /// graph slot. A capture owned by another thread is a hard error: CUDA's
-    /// thread-local capture cannot safely accept launches or resources there.
-    pub(crate) fn retain_capture_resource<T>(&self, identity: usize, owner: &Arc<T>) -> Result<bool>
-    where
-        T: Send + Sync + 'static,
-    {
-        let mut state = self.lock()?;
-        match state.capture {
-            CaptureState::Idle => return Ok(false),
-            CaptureState::Capturing(capture_owner)
-                if capture_owner == std::thread::current().id() => {}
-            CaptureState::Capturing(_) => {
-                return Err(EpError::KernelFailed(
-                    "cuda_ep: CUDA graph capture resource registration must occur on the thread \
-                     that began the thread-local capture"
-                        .into(),
-                ));
-            }
-        }
-        if state
-            .capture_resources
-            .iter()
-            .any(|resource| resource.identity == identity)
-        {
-            return Ok(true);
-        }
-        let owner: Arc<dyn CapturedResource> = owner.clone();
-        state.capture_resources.push(GraphResource {
-            identity,
-            _owner: owner,
-        });
-        Ok(true)
-    }
-
     pub(crate) fn reset(&self) -> Result<bool> {
         let mut state = self.lock()?;
         if matches!(state.capture, CaptureState::Capturing(_)) {
@@ -386,16 +376,25 @@ impl CudaGraphLifecycle {
         }
         let had_graph = !state.segments.is_empty();
         state.segments.clear();
+        self.replay.store(None);
         Ok(had_graph)
     }
 
     pub(crate) fn has_executable(&self) -> Result<bool> {
-        Ok(!self.lock()?.segments.is_empty())
+        Ok(self
+            .replay
+            .load()
+            .as_ref()
+            .is_some_and(|set| !set.segments.is_empty()))
     }
 
     /// Number of installed segment executables (1 for a whole-subgraph capture).
     pub(crate) fn segment_count(&self) -> Result<usize> {
-        Ok(self.lock()?.segments.len())
+        Ok(self
+            .replay
+            .load()
+            .as_ref()
+            .map_or(0, |set| set.segments.len()))
     }
 
     /// Whether exactly one whole-subgraph segment is installed.
@@ -410,7 +409,11 @@ impl CudaGraphLifecycle {
     // Kept for the planned WP4 retained-graph verification path.
     #[allow(dead_code)]
     pub(crate) fn holds_single_capture(&self) -> Result<bool> {
-        Ok(self.lock()?.segments.len() == 1)
+        Ok(self
+            .replay
+            .load()
+            .as_ref()
+            .is_some_and(|set| set.segments.len() == 1))
     }
 
     pub(crate) fn capture_status(&self) -> Result<CUstreamCaptureStatus> {
@@ -418,6 +421,11 @@ impl CudaGraphLifecycle {
         self.stream
             .capture_status()
             .map_err(|error| driver_err("query CUDA graph capture status", error))
+    }
+
+    pub(crate) fn test_acquire_lock(&self) -> Result<()> {
+        drop(self.lock()?);
+        Ok(())
     }
 }
 
@@ -1028,14 +1036,14 @@ extern "C" __global__ void add_one(const float* x, float* y, unsigned long long 
         assert!(!lifecycle.holds_single_capture().unwrap());
 
         // One whole-subgraph segment satisfies the option (c) retain invariant.
-        lifecycle.begin().unwrap();
+        lifecycle.begin(Vec::new()).unwrap();
         launch_add_one(&runtime, &function, input_ptr, output_ptr, n);
         lifecycle.end().unwrap();
         assert!(lifecycle.holds_single_capture().unwrap());
         assert_eq!(lifecycle.segment_count().unwrap(), 1);
 
         // A second appended segment (segmented capture) breaks the invariant.
-        lifecycle.begin().unwrap();
+        lifecycle.begin(Vec::new()).unwrap();
         launch_add_one(&runtime, &function, output_ptr, input_ptr, n);
         lifecycle.end().unwrap();
         assert!(!lifecycle.holds_single_capture().unwrap());

@@ -449,10 +449,19 @@ Its `no_residency_traffic` control reports one-time full-bank load bytes and
 unique selected-expert projection bytes, with `page_ins=0` and
 `byte_hit_rate=None` until the expert-indexed paging dependency lands.
 
+Production observation uses
+`InferenceSession::observe_block_quantized_moe_traffic`. The returned observer
+holds an exclusive mutable session borrow, owns the request identity and phase
+boundary, and resets or snapshots the same stable device record used by eager
+launches and captured replay. Graph capture retains that record and the sealed
+banks before recording begins; observer finish/drop retires the graph before
+disarming the record, so reconfiguration cannot race an enqueue or free storage
+still referenced by a graph.
+
 ### 6.1 A100 production-path validation
 
-On 2026-08-27, the opt-in checkpoint proof ran each mixed pair separately on an
-idle physical A100, pinned with `CUDA_VISIBLE_DEVICES=6` and
+On 2026-08-27, the R3 opt-in checkpoint proof ran all four mixed pairs on an
+idle physical A100, pinned with `CUDA_VISIBLE_DEVICES=4` and
 `ONNX_GENAI_CUDA_DEVICE=0`. It mmap-read the official UD-IQ1_S shards in place,
 then exercised the production `Executor`/device-binding path with all three
 independent gate/up/down banks, gated SiLU, `H=6144`, `I=2048`, and top-8
@@ -482,8 +491,9 @@ low and high IDs have equal byte quantities. `physical_dram_bytes=None`,
 `page_ins=0`, and `byte_hit_rate=None` remain the honest no-residency values.
 The warmed eager/captured-replay falsifier also observes zero host allocations,
 format parses, layout builds, H2D copies, device allocations, and forced
-operator synchronizations. Base `aa417ad372e6c0c1d2df154ceb236ab1c3bea73e`
-refuses these nodes, so no base latency or speedup claim is made.
+operator synchronizations or graph-lifecycle lock acquisitions. Base
+`aa417ad372e6c0c1d2df154ceb236ab1c3bea73e` refuses these nodes, so no base
+latency or speedup claim is made.
 
 ---
 

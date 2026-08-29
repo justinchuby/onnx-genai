@@ -1,4 +1,5 @@
 use super::*;
+use smallvec::SmallVec;
 
 struct Stage2RunState {
     plan: Option<DecodeViewPlan>,
@@ -27,7 +28,7 @@ impl Executor {
         inputs: &[(&str, &Tensor)],
         outer_scope: &HashMap<String, Tensor>,
         external: &ExternalBindings,
-    ) -> Result<Vec<Option<SessionOutput>>> {
+    ) -> Result<ScopedOutputs> {
         match self.run_scoped_mode(inputs, outer_scope, external, RunMode::Eager)? {
             ScopedRunResult::Executed(outputs) => Ok(outputs),
             ScopedRunResult::NotCapturable(_) => unreachable!("eager runs are always executed"),
@@ -107,9 +108,18 @@ impl Executor {
         let validation = if nested {
             Ok(())
         } else {
-            self.finish_device_validation()
+            let defer_until_binding_read = !self.graph.outputs.is_empty()
+                && self
+                    .graph
+                    .outputs
+                    .iter()
+                    .all(|output| external.outputs.contains_key(output));
+            self.finish_device_validation(defer_until_binding_read)
         };
         let unbound = self.unbind_borrowed_inputs();
+        if !decode_memo_eligible {
+            self.scratch_resolved_shapes = resolved;
+        }
         match (outcome, validation, unbound) {
             (_, Err(e), _) => Err(e),
             (Err(e), _, _) => Err(e),
@@ -118,7 +128,15 @@ impl Executor {
         }
     }
 
-    fn finish_device_validation(&self) -> Result<()> {
+    fn finish_device_validation(&self, defer_until_binding_read: bool) -> Result<()> {
+        if defer_until_binding_read && self.ep.defers_device_validation() {
+            self.ep.consume_route_residency_at_boundary()?;
+            return Ok(());
+        }
+        self.finish_device_validation_boundary()
+    }
+
+    pub(crate) fn finish_device_validation_boundary(&self) -> Result<()> {
         // This is the one request-level host boundary for deferred eager work
         // and for captured replay. The CUDA EP's explicit sync is unconditional,
         // so the latch read observes every kernel from this request.
@@ -298,13 +316,12 @@ impl Executor {
         }
 
         // Every required input must be supplied.
-        let mut provided: HashSet<ValueId> = inputs
-            .iter()
-            .filter_map(|(name, _)| self.input_index.get(*name).copied())
-            .collect();
-        provided.extend(external.inputs.keys().copied());
         for &vid in &self.required_inputs {
-            if !provided.contains(&vid) {
+            let provided = external.inputs.contains_key(&vid)
+                || inputs
+                    .iter()
+                    .any(|(name, _)| self.input_index.get(*name) == Some(&vid));
+            if !provided {
                 let name = self
                     .graph
                     .value(vid)
@@ -345,7 +362,8 @@ impl Executor {
             if self.decode_memo_enabled && !nested {
                 self.decode_memo_ineligible_count += 1;
             }
-            let mut resolved = self.resolve_soft(bindings);
+            let scratch = std::mem::take(&mut self.scratch_resolved_shapes);
+            let mut resolved = self.resolve_soft_reuse(bindings, scratch);
             if mode != RunMode::Eager {
                 // Persistent bindings seed the kernel-visible geometry selected by
                 // their input/output contracts. Seed only unresolved values:
@@ -447,12 +465,12 @@ impl Executor {
         resolved: &HashMap<ValueId, Vec<usize>>,
         stage2_excluded: Option<&HashSet<ValueId>>,
     ) -> Result<()> {
-        let external_values = external
-            .inputs
-            .keys()
-            .chain(external.outputs.keys())
-            .copied()
-            .collect::<HashSet<_>>();
+        let mut external_values: SmallVec<[ValueId; 16]> = SmallVec::new();
+        for &vid in external.inputs.keys().chain(external.outputs.keys()) {
+            if !external_values.contains(&vid) {
+                external_values.push(vid);
+            }
+        }
         for &vid in &external_values {
             // A producer-less value bound only as an external *output* (a bare
             // initializer, or a value `ConstantFolding` collapsed to one
@@ -494,12 +512,12 @@ impl Executor {
                 // invariant partition (variant/JIT/external) — the invariant
                 // buffers are reused untouched from the rebuild step.
                 Some(invariant) => {
-                    let mut excluded = external_values.clone();
+                    let mut excluded = external_values.iter().copied().collect::<HashSet<_>>();
                     excluded.extend(invariant.iter().copied());
                     self.size_buffers_excluding(resolved, &excluded)?;
                 }
                 None => {
-                    self.size_buffers_excluding(resolved, &external_values)?;
+                    self.size_buffers_excluding_slice(resolved, &external_values)?;
                 }
             }
         }
@@ -700,8 +718,16 @@ impl Executor {
                 // ~600-entry resolved map every token would be pure waste and
                 // would defeat the memo's allocation amortization.
                 if !decode_memo_eligible {
-                    self.cap_mut().capture_warm_shapes = resolved.clone();
-                    self.cap_mut().capture_warm_signature = Some(external.capture_signature());
+                    let cap = self.cap_mut();
+                    cap.capture_warm_shapes
+                        .retain(|vid, _| resolved.contains_key(vid));
+                    for (&vid, shape) in resolved.iter() {
+                        let stored = cap.capture_warm_shapes.entry(vid).or_default();
+                        stored.clear();
+                        stored.extend_from_slice(shape);
+                    }
+                    let signature = cap.capture_warm_signature.get_or_insert_with(Vec::new);
+                    external.refill_capture_signature(signature);
                 }
             }
             RunMode::Capture => {
@@ -875,10 +901,10 @@ impl Executor {
         } else {
             "run_scoped.collect_outputs.top"
         });
-        let mut results = Vec::with_capacity(self.graph.outputs.len());
+        let mut results = ScopedOutputs::new();
         let mut host_output_bytes = 0usize;
-        let output_vids: Vec<ValueId> = self.graph.outputs.clone();
-        for vid in output_vids {
+        for output_index in 0..self.graph.outputs.len() {
+            let vid = self.graph.outputs[output_index];
             if let Some(ext) = external.outputs.get(&vid) {
                 // A graph output with no producing node (e.g. a bare
                 // initializer, or a value `ConstantFolding` collapsed to one

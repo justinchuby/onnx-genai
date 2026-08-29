@@ -772,6 +772,7 @@ pub(crate) struct KernelCache {
     /// Entries dropped by the per-node bound.
     pub(super) evictions: u64,
     pub(super) prebind_hits: AtomicU64,
+    block_quantized_moe_traffic_request: Option<u32>,
 }
 
 /// How many shape variants of one node the cache keeps (issue #1362).
@@ -813,6 +814,110 @@ fn variants_per_node() -> usize {
 }
 
 impl KernelCache {
+    pub(super) fn arm_block_quantized_moe_traffic(&mut self, request_id: u32) -> Result<usize> {
+        let mut visited = HashSet::new();
+        let mut armed = 0;
+        let mut failure = None;
+        for (key, kernel) in &mut self.entries {
+            if visited.insert(key.node) {
+                match kernel.arm_block_quantized_moe_traffic(request_id) {
+                    Ok(true) => armed += 1,
+                    Ok(false) => {}
+                    Err(error) => {
+                        failure = Some(error);
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some(error) = failure {
+            let mut rollback = HashSet::new();
+            for (key, kernel) in &mut self.entries {
+                if rollback.insert(key.node) {
+                    let _ = kernel.disarm_block_quantized_moe_traffic();
+                }
+            }
+            return Err(error.into());
+        }
+        self.block_quantized_moe_traffic_request = (armed != 0).then_some(request_id);
+        Ok(armed)
+    }
+
+    pub(super) fn reset_block_quantized_moe_traffic(&mut self) -> Result<()> {
+        let mut visited = HashSet::new();
+        for (key, kernel) in &mut self.entries {
+            if visited.insert(key.node) {
+                kernel.reset_block_quantized_moe_traffic()?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn snapshot_block_quantized_moe_traffic(
+        &self,
+    ) -> Result<onnx_runtime_ep_api::BlockQuantizedMoeTraffic> {
+        let mut visited = HashSet::new();
+        let mut total = onnx_runtime_ep_api::BlockQuantizedMoeTraffic::default();
+        let mut physical_dram_bytes = 0_u64;
+        let mut physical_complete = true;
+        let mut observed = false;
+        for (key, kernel) in &self.entries {
+            if !visited.insert(key.node) {
+                continue;
+            }
+            let Some(snapshot) = kernel.snapshot_block_quantized_moe_traffic()? else {
+                continue;
+            };
+            observed = true;
+            total.uploaded_whole_bank_bytes = total
+                .uploaded_whole_bank_bytes
+                .checked_add(snapshot.uploaded_whole_bank_bytes)
+                .ok_or_else(|| SessionError::Internal("uploaded BQMoE bytes overflow".into()))?;
+            total.committed_whole_bank_bytes = total
+                .committed_whole_bank_bytes
+                .checked_add(snapshot.committed_whole_bank_bytes)
+                .ok_or_else(|| SessionError::Internal("committed BQMoE bytes overflow".into()))?;
+            total.logical_route_demand_bytes = total
+                .logical_route_demand_bytes
+                .checked_add(snapshot.logical_route_demand_bytes)
+                .ok_or_else(|| SessionError::Internal("logical BQMoE bytes overflow".into()))?;
+            total.unique_selected_expert_bytes = total
+                .unique_selected_expert_bytes
+                .checked_add(snapshot.unique_selected_expert_bytes)
+                .ok_or_else(|| SessionError::Internal("unique BQMoE bytes overflow".into()))?;
+            total.page_ins = total
+                .page_ins
+                .checked_add(snapshot.page_ins)
+                .ok_or_else(|| SessionError::Internal("BQMoE page-ins overflow".into()))?;
+            match snapshot.physical_dram_bytes {
+                Some(bytes) => {
+                    physical_dram_bytes =
+                        physical_dram_bytes.checked_add(bytes).ok_or_else(|| {
+                            SessionError::Internal("physical BQMoE bytes overflow".into())
+                        })?;
+                }
+                None => physical_complete = false,
+            }
+        }
+        total.physical_dram_bytes = (observed && physical_complete).then_some(physical_dram_bytes);
+        total.byte_hit_rate = total.physical_dram_bytes.and_then(|physical| {
+            (total.logical_route_demand_bytes != 0)
+                .then(|| 1.0 - (physical as f64 / total.logical_route_demand_bytes as f64).min(1.0))
+        });
+        Ok(total)
+    }
+
+    pub(super) fn disarm_block_quantized_moe_traffic(&mut self) -> Result<()> {
+        let mut visited = HashSet::new();
+        for (key, kernel) in &mut self.entries {
+            if visited.insert(key.node) {
+                kernel.disarm_block_quantized_moe_traffic()?;
+            }
+        }
+        self.block_quantized_moe_traffic_request = None;
+        Ok(())
+    }
+
     /// Next logical tick.
     fn tick(&self) -> u64 {
         self.clock.fetch_add(1, Ordering::Relaxed)
@@ -986,6 +1091,9 @@ impl KernelCache {
             };
             if !adopted {
                 kernel.prepare_constant_inputs(constant_values, ep)?;
+            }
+            if !adopted && let Some(request_id) = self.block_quantized_moe_traffic_request {
+                kernel.arm_block_quantized_moe_traffic(request_id)?;
             }
             kernel.set_capture_seq_independent(capture_seq_independent);
             self.entries.insert(key.clone(), kernel);

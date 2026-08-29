@@ -61,6 +61,7 @@
 
 use cudarc::driver::sys::CUdeviceptr;
 use onnx_runtime_ep_api::{EpError, Result};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::runtime::CudaRuntime;
 
@@ -192,6 +193,8 @@ pub enum TelemetryUnsupported {
     ZeroExperts,
     /// The device buffer could not be allocated (message carried for the log).
     Alloc(String),
+    /// Reconfiguration would invalidate pointers embedded in an installed graph.
+    GraphInstalled,
 }
 
 impl std::fmt::Display for TelemetryUnsupported {
@@ -203,6 +206,10 @@ impl std::fmt::Display for TelemetryUnsupported {
             ),
             Self::ZeroExperts => write!(f, "route telemetry requires num_experts > 0"),
             Self::Alloc(message) => write!(f, "route telemetry buffer alloc failed: {message}"),
+            Self::GraphInstalled => write!(
+                f,
+                "route telemetry must be configured before device-graph capture"
+            ),
         }
     }
 }
@@ -229,7 +236,7 @@ pub(crate) struct ArmedTelemetry {
     /// Host-side window/epoch counter. Stamped into `header[H_EPOCH]` at arm
     /// (window 1) and at every `reset_boundary`; held fixed for the whole
     /// window. There is no device epoch counter and no reset kernel.
-    epoch: u32,
+    epoch: AtomicU32,
     bitmap_bytes: usize,
 }
 
@@ -280,7 +287,7 @@ impl ArmedTelemetry {
             bitmap,
             header,
             // Arm opens window 1. `reset_boundary` bumps this to 2, 3, ...
-            epoch: 1,
+            epoch: AtomicU32::new(1),
             bitmap_bytes,
         };
         // Open the first window: stamp identity + epoch 1 and zero the record.
@@ -296,8 +303,14 @@ impl ArmedTelemetry {
     /// `htod`; only ever called at arm or at an explicit boundary, never on the
     /// execute/replay path and never during capture.
     fn open_window(&self, runtime: &CudaRuntime) -> Result<()> {
-        let header_words: [u32; HEADER_LEN] =
-            [self.epoch, self.request_id, self.device_id, 0, 0, 0];
+        let header_words: [u32; HEADER_LEN] = [
+            self.epoch.load(Ordering::Relaxed),
+            self.request_id,
+            self.device_id,
+            0,
+            0,
+            0,
+        ];
         let mut header_bytes = [0u8; HEADER_BYTES];
         for (word, chunk) in header_words.iter().zip(header_bytes.chunks_exact_mut(4)) {
             chunk.copy_from_slice(&word.to_ne_bytes());
@@ -329,8 +342,8 @@ impl ArmedTelemetry {
     ///   `drain_for_unmap` drain authority, so the host zeroing can never race a
     ///   route kernel still accumulating into the record.
     ///
-    /// It allocates nothing, moves no pointer, and touches no PMM/VMM/cache.
-    pub(crate) fn reset_boundary(&mut self, runtime: &CudaRuntime) -> Result<()> {
+    /// It moves no pointer and touches no PMM/VMM/cache.
+    pub(crate) fn reset_boundary(&self, runtime: &CudaRuntime) -> Result<()> {
         if runtime.is_capturing()? {
             return Err(EpError::KernelFailed(
                 "cuda_ep: route telemetry boundary reset is illegal during graph capture/replay \
@@ -341,7 +354,7 @@ impl ArmedTelemetry {
         // Order the reset after all prior EP-stream work (the fused marks of the
         // window being closed) using the existing drain authority.
         runtime.drain_for_unmap()?;
-        self.epoch = self.epoch.wrapping_add(1);
+        self.epoch.fetch_add(1, Ordering::Relaxed);
         self.open_window(runtime)
     }
 

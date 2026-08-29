@@ -53,6 +53,7 @@ onnx-runtime-quantization = { workspace = true }
 thiserror = { workspace = true }
 half = { workspace = true }
 libloading = { workspace = true }
+arc-swap = { workspace = true }
 # Canonical CUDA runtime (`cudart`) library-name table lives here, shared with
 # `onnx-genai-ort` so the two loaders can never drift (issue #1180). The table
 # is platform data independent of which CUDA API version the bindings target, so

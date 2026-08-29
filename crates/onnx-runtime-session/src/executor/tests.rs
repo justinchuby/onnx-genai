@@ -1,3 +1,7 @@
+#[cfg(feature = "gpu-tests")]
+use std::alloc::{GlobalAlloc, Layout, System};
+#[cfg(feature = "gpu-tests")]
+use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use onnx_runtime_ep_api::{
@@ -7,6 +11,74 @@ use onnx_runtime_ep_api::{
 use onnx_runtime_memory_governor::MemoryRole;
 
 use super::*;
+
+#[cfg(feature = "gpu-tests")]
+struct CountingAllocator;
+
+#[cfg(feature = "gpu-tests")]
+thread_local! {
+    static COUNT_HOST_ALLOCATIONS: Cell<bool> = const { Cell::new(false) };
+    static HOST_ALLOCATION_COUNT: Cell<u64> = const { Cell::new(0) };
+    static HOST_ALLOCATION_SIZES: Cell<[usize; 8]> = const { Cell::new([0; 8]) };
+}
+
+#[cfg(feature = "gpu-tests")]
+unsafe impl GlobalAlloc for CountingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        COUNT_HOST_ALLOCATIONS.with(|enabled| {
+            if enabled.get() {
+                HOST_ALLOCATION_COUNT.with(|count| {
+                    let index = count.get() as usize;
+                    count.set(count.get() + 1);
+                    HOST_ALLOCATION_SIZES.with(|sizes| {
+                        let mut values = sizes.get();
+                        if index < values.len() {
+                            values[index] = layout.size();
+                            sizes.set(values);
+                        }
+                    });
+                });
+            }
+        });
+        unsafe { System.alloc(layout) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe { System.dealloc(ptr, layout) }
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        COUNT_HOST_ALLOCATIONS.with(|enabled| {
+            if enabled.get() {
+                HOST_ALLOCATION_COUNT.with(|count| count.set(count.get() + 1));
+            }
+        });
+        unsafe { System.alloc_zeroed(layout) }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        COUNT_HOST_ALLOCATIONS.with(|enabled| {
+            if enabled.get() {
+                HOST_ALLOCATION_COUNT.with(|count| count.set(count.get() + 1));
+            }
+        });
+        unsafe { System.realloc(ptr, layout, new_size) }
+    }
+}
+
+#[global_allocator]
+#[cfg(feature = "gpu-tests")]
+static TEST_ALLOCATOR: CountingAllocator = CountingAllocator;
+
+#[cfg(feature = "gpu-tests")]
+fn count_host_allocations<T>(operation: impl FnOnce() -> T) -> (T, u64) {
+    HOST_ALLOCATION_COUNT.with(|count| count.set(0));
+    HOST_ALLOCATION_SIZES.with(|sizes| sizes.set([0; 8]));
+    COUNT_HOST_ALLOCATIONS.with(|enabled| enabled.set(true));
+    let result = operation();
+    COUNT_HOST_ALLOCATIONS.with(|enabled| enabled.set(false));
+    (result, HOST_ALLOCATION_COUNT.with(Cell::get))
+}
 
 struct DeferredValidationKernel {
     fail_next: Arc<AtomicBool>,
@@ -152,6 +224,11 @@ impl ExecutionProvider for DeferredValidationEp {
         self.cpu.copy_async(src, dst, size)
     }
 
+    fn copy_to_host(&self, src: &DeviceBuffer, dst: &mut [u8]) -> onnx_runtime_ep_api::Result<()> {
+        self.sync()?;
+        self.cpu.copy_to_host(src, dst)
+    }
+
     fn sync(&self) -> onnx_runtime_ep_api::Result<()> {
         self.synchronized_executions
             .store(self.executions.load(Ordering::Relaxed), Ordering::Relaxed);
@@ -167,6 +244,10 @@ impl ExecutionProvider for DeferredValidationEp {
         }
         self.validation_latch.store(0, Ordering::Relaxed);
         Ok(())
+    }
+
+    fn defers_device_validation(&self) -> bool {
+        true
     }
 
     fn check_device_capture_error(&self) -> onnx_runtime_ep_api::Result<u32> {
@@ -247,6 +328,63 @@ fn deferred_device_validation_is_request_local_and_checked_after_sync() {
         4,
         "each request must reset the latch before execution and after checking it"
     );
+}
+
+#[test]
+fn device_bound_validation_is_deferred_until_a_partial_host_read() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let input = graph.create_named_value("input", DataType::Float32, static_shape([2]));
+    graph.add_input(input);
+    let output = graph.create_named_value("output", DataType::Float32, static_shape([2]));
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "DeferredValidation",
+        vec![Some(input)],
+        vec![output],
+    ));
+    graph.add_output(output);
+
+    let ep = Arc::new(DeferredValidationEp::new());
+    let mut executor = Executor::build(
+        graph,
+        Arc::new(WeightStore::new()),
+        Arc::clone(&ep) as Arc<dyn ExecutionProvider>,
+    )
+    .unwrap();
+    let mut bindings = vec![
+        executor
+            .allocate_device_binding("input".into(), None, DataType::Float32, vec![2], vec![2])
+            .unwrap(),
+        executor
+            .allocate_device_output_binding("output".into(), DataType::Float32, vec![2], vec![2])
+            .unwrap(),
+    ];
+    bindings[0]
+        .write_bytes(
+            0,
+            &[3.0f32, 7.0]
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+
+    let outputs = executor
+        .run_with_device_bindings(&[], &mut bindings)
+        .unwrap();
+    assert_eq!(outputs.len(), 1);
+    assert!(outputs[0].is_none());
+    assert_eq!(ep.synchronized_executions.load(Ordering::Relaxed), 0);
+    let error = bindings[1].read_bytes_range(0, 4).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("device validation failed (flags=0x40)"),
+        "the partial binding read must surface the deferred validation failure: {error}"
+    );
+    assert_eq!(ep.synchronized_executions.load(Ordering::Relaxed), 1);
+    assert_eq!(ep.resets.load(Ordering::Relaxed), 2);
 }
 
 #[test]
@@ -1478,7 +1616,7 @@ fn capture_shapes_seed_unresolved_external_values_without_overwriting_resolved_s
         dtype: DataType::Float32,
         shape,
         accepts_subshape: false,
-        ptr: std::ptr::null_mut(),
+        ptr: 0,
         len: 0,
         alignment: 1,
         device: onnx_runtime_ir::DeviceId::cpu(),
@@ -5438,8 +5576,8 @@ fn sealed_bqmoe_executes_through_production_session_path() {
     let after_transfers = runtime.transfer_counts();
     assert_eq!(
         after_transfers.host_to_device - transfers.host_to_device,
-        4,
-        "only the two host boundary inputs across capture/replay may upload"
+        2,
+        "only the two host boundary inputs may upload"
     );
     assert_eq!(
         after_transfers.async_host_to_device, transfers.async_host_to_device,
@@ -5460,6 +5598,224 @@ fn sealed_bqmoe_executes_through_production_session_path() {
             "output {index}: actual={actual} repeat={repeat} expected={expected}"
         );
     }
+
+    let mut bindings = vec![
+        executor
+            .allocate_device_binding(
+                "x".into(),
+                None,
+                DataType::Float32,
+                vec![1, 32],
+                vec![1, 32],
+            )
+            .unwrap(),
+        executor
+            .allocate_device_binding(
+                "router".into(),
+                None,
+                DataType::Float32,
+                vec![1, 2],
+                vec![1, 2],
+            )
+            .unwrap(),
+        executor
+            .allocate_device_output_binding(
+                "output".into(),
+                DataType::Float32,
+                vec![1, 32],
+                vec![1, 32],
+            )
+            .unwrap(),
+    ];
+    let input_bytes = input_values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect::<Vec<_>>();
+    let router_bytes = [3.0f32, 1.0]
+        .into_iter()
+        .flat_map(f32::to_le_bytes)
+        .collect::<Vec<_>>();
+    bindings[0].write_bytes(0, &input_bytes).unwrap();
+    bindings[1].write_bytes(0, &router_bytes).unwrap();
+    executor
+        .run_with_device_bindings(&[], &mut bindings)
+        .unwrap();
+    let (_, positive_allocations) = count_host_allocations(|| vec![0u8; 1]);
+    assert!(positive_allocations > 0, "host-allocation falsifier");
+    let lock_before = runtime.graph_lifecycle_lock_acquisition_count();
+    runtime.test_acquire_graph_lifecycle_lock().unwrap();
+    assert!(
+        runtime.graph_lifecycle_lock_acquisition_count() > lock_before,
+        "graph-lock falsifier"
+    );
+    let allocations = runtime.allocation_counts();
+    let transfers = runtime.transfer_counts();
+    let synchronizations = runtime.forced_synchronization_count();
+    let preparation = onnx_runtime_ep_cuda::block_quantized_moe_preparation_counts();
+    let locks = runtime.graph_lifecycle_lock_acquisition_count();
+    let (warmed, host_allocations) =
+        count_host_allocations(|| executor.run_with_device_bindings(&[], &mut bindings));
+    warmed.unwrap();
+    assert_eq!(
+        host_allocations,
+        0,
+        "warmed production Executor allocations: {:?}",
+        HOST_ALLOCATION_SIZES.with(Cell::get)
+    );
+    assert_eq!(runtime.allocation_counts(), allocations);
+    assert_eq!(runtime.transfer_counts(), transfers);
+    assert_eq!(runtime.forced_synchronization_count(), synchronizations);
+    assert_eq!(
+        onnx_runtime_ep_cuda::block_quantized_moe_preparation_counts(),
+        preparation
+    );
+    assert_eq!(
+        runtime.graph_lifecycle_lock_acquisition_count(),
+        locks,
+        "warmed production Executor graph locks"
+    );
+
+    assert!(matches!(
+        executor
+            .try_capture_with_device_bindings(&[], &mut bindings)
+            .unwrap(),
+        DeviceGraphCaptureResult::Captured(_)
+    ));
+    let allocations = runtime.allocation_counts();
+    let transfers = runtime.transfer_counts();
+    let synchronizations = runtime.forced_synchronization_count();
+    let preparation = onnx_runtime_ep_cuda::block_quantized_moe_preparation_counts();
+    let locks = runtime.graph_lifecycle_lock_acquisition_count();
+    let (replayed, host_allocations) =
+        count_host_allocations(|| executor.replay_device_graph(&mut bindings));
+    assert!(replayed.unwrap());
+    assert_eq!(
+        host_allocations,
+        0,
+        "production graph replay allocations: {:?}",
+        HOST_ALLOCATION_SIZES.with(Cell::get)
+    );
+    assert_eq!(runtime.allocation_counts(), allocations);
+    assert_eq!(runtime.transfer_counts(), transfers);
+    assert_eq!(runtime.forced_synchronization_count(), synchronizations);
+    assert_eq!(
+        onnx_runtime_ep_cuda::block_quantized_moe_preparation_counts(),
+        preparation
+    );
+    assert_eq!(
+        runtime.graph_lifecycle_lock_acquisition_count(),
+        locks,
+        "production graph replay lifecycle locks"
+    );
+}
+
+#[cfg(feature = "gpu-tests")]
+#[test]
+fn sealed_bqmoe_supported_observer_accumulates_eager_and_replay() {
+    use onnx_runtime_ep_cuda::CudaExecutionProvider;
+
+    const BANK_BYTES: u64 = 6_528;
+    const ROUTE_BYTES: u64 = 6_528;
+
+    let cuda = Arc::new(CudaExecutionProvider::new_default().unwrap());
+    let mut session = crate::InferenceSession::from_graph_with_provider(
+        sealed_bqmoe_session_graph(),
+        Arc::new(WeightStore::new()),
+        std::path::Path::new("."),
+        cuda,
+    )
+    .unwrap();
+    let mut bindings = vec![
+        session
+            .allocate_device_binding(
+                "x",
+                None::<String>,
+                DataType::Float32,
+                vec![1, 32],
+                vec![1, 32],
+            )
+            .unwrap(),
+        session
+            .allocate_device_binding(
+                "router",
+                None::<String>,
+                DataType::Float32,
+                vec![1, 2],
+                vec![1, 2],
+            )
+            .unwrap(),
+        session
+            .allocate_device_output_binding("output", DataType::Float32, vec![1, 32], vec![1, 32])
+            .unwrap(),
+    ];
+    let input = (0..32)
+        .flat_map(|index| ((index as f32 - 15.5) / 16.0).to_le_bytes())
+        .collect::<Vec<_>>();
+    let router = [3.0f32, 1.0]
+        .into_iter()
+        .flat_map(f32::to_le_bytes)
+        .collect::<Vec<_>>();
+    bindings[0].write_bytes(0, &input).unwrap();
+    bindings[1].write_bytes(0, &router).unwrap();
+    session
+        .run_with_device_bindings(&[], &mut bindings)
+        .unwrap();
+
+    let mut observer = session
+        .observe_block_quantized_moe_traffic(crate::BlockQuantizedMoeTrafficConfig {
+            request_id: 77,
+        })
+        .unwrap();
+    let load = observer.snapshot().unwrap();
+    assert_eq!(load.phase, crate::BlockQuantizedMoeTrafficPhase::Load);
+    assert_eq!(load.request_id, 77);
+    assert_eq!(load.traffic.uploaded_whole_bank_bytes, BANK_BYTES);
+    assert_eq!(load.traffic.committed_whole_bank_bytes, BANK_BYTES);
+    assert_eq!(load.traffic.logical_route_demand_bytes, 0);
+    assert_eq!(load.traffic.unique_selected_expert_bytes, 0);
+    assert_eq!(load.traffic.physical_dram_bytes, None);
+    assert_eq!(load.traffic.page_ins, 0);
+    assert_eq!(load.traffic.byte_hit_rate, None);
+
+    observer
+        .reset_phase(crate::BlockQuantizedMoeTrafficPhase::Decode)
+        .unwrap();
+    observer
+        .run_with_device_bindings(&[], &mut bindings)
+        .unwrap();
+    let eager = observer.snapshot().unwrap();
+    assert_eq!(eager.phase, crate::BlockQuantizedMoeTrafficPhase::Decode);
+    assert_eq!(eager.traffic.logical_route_demand_bytes, ROUTE_BYTES);
+    assert_eq!(eager.traffic.unique_selected_expert_bytes, ROUTE_BYTES);
+
+    observer
+        .reset_phase(crate::BlockQuantizedMoeTrafficPhase::Decode)
+        .unwrap();
+    assert!(matches!(
+        observer
+            .try_capture_with_device_bindings(&[], &mut bindings)
+            .unwrap(),
+        DeviceGraphCaptureResult::Captured(_)
+    ));
+    observer
+        .reset_phase(crate::BlockQuantizedMoeTrafficPhase::Decode)
+        .unwrap();
+    assert!(observer.replay_device_graph(&mut bindings).unwrap());
+    let replay = observer.snapshot().unwrap();
+    assert_eq!(replay.traffic.logical_route_demand_bytes, ROUTE_BYTES);
+    assert_eq!(replay.traffic.unique_selected_expert_bytes, ROUTE_BYTES);
+    assert!(observer.replay_device_graph(&mut bindings).unwrap());
+    let repeated = observer.snapshot().unwrap();
+    assert_eq!(repeated.traffic.logical_route_demand_bytes, ROUTE_BYTES * 2);
+    assert_eq!(repeated.traffic.unique_selected_expert_bytes, ROUTE_BYTES);
+    drop(observer);
+    assert_eq!(session.captured_graph_segment_count(), 0);
+    let observer = session
+        .observe_block_quantized_moe_traffic(crate::BlockQuantizedMoeTrafficConfig {
+            request_id: 78,
+        })
+        .unwrap();
+    observer.finish().unwrap();
 }
 
 #[cfg(feature = "gpu-tests")]
@@ -5603,32 +5959,6 @@ fn glm52_real_gated_top8_runs_through_production_session_with_f64_oracle() {
 
     fn router_rows<const ROWS: usize>(routes: [&[usize; K]; ROWS]) -> Vec<f32> {
         routes.into_iter().flat_map(router_for).collect()
-    }
-
-    fn bqmoe_kernel(
-        executor: &Executor,
-        rows: usize,
-    ) -> &onnx_runtime_ep_cuda::kernels::block_quantized_moe::BlockQuantizedMoEKernel {
-        executor
-            .cache
-            .entries
-            .iter()
-            .find_map(|(key, kernel)| {
-                (key.shapes.first().is_some_and(|shape| shape == &[rows, H]))
-                    .then(|| kernel.as_any().downcast_ref())
-                    .flatten()
-            })
-            .expect("production executor must cache BlockQuantizedMoE")
-    }
-
-    fn compile_rows(executor: &mut Executor, rows: usize) {
-        let input = *executor.input_index.get("x").unwrap();
-        let Dim::Symbolic(rows_symbol) = executor.graph.value(input).shape[0] else {
-            panic!("real checkpoint graph row axis must be symbolic");
-        };
-        let bound = HashMap::from([(rows_symbol, rows)]);
-        let resolved = executor.resolve_all(&bound).unwrap();
-        executor.compile_all(&resolved).unwrap();
     }
 
     fn f64_oracle(
@@ -5779,52 +6109,24 @@ fn glm52_real_gated_top8_runs_through_production_session_with_f64_oracle() {
         let oracle_store = Arc::clone(&store);
         let cuda = Arc::new(CudaExecutionProvider::new_default().unwrap());
         let runtime = Arc::clone(cuda.runtime());
-        let before_admission_transfers = runtime.transfer_counts();
         let dense_before = BLOCK_QUANT_MOE_DENSE_EXPANSIONS.load(Ordering::Relaxed);
-        let mut executor = Executor::build(graph, store, cuda.clone()).unwrap();
-        compile_rows(&mut executor, 2);
-        let after_admission_transfers = runtime.transfer_counts();
-        assert_eq!(
-            after_admission_transfers.host_to_device - before_admission_transfers.host_to_device,
-            3,
-            "{} must upload only the three sealed projection banks",
-            case.label
-        );
-        assert_eq!(
-            after_admission_transfers.async_host_to_device,
-            before_admission_transfers.async_host_to_device,
-            "{} sealed banks must not enter the paging transfer path",
-            case.label
-        );
-        bqmoe_kernel(&executor, 2)
-            .arm_route_telemetry(
-                onnx_runtime_ep_cuda::kernels::expert_route_telemetry::RouteTelemetryConfig {
-                    request_id: 1,
-                    device_id: runtime.ordinal(),
-                    num_experts: EXPERTS,
-                },
-            )
-            .unwrap();
-        let load_traffic = bqmoe_kernel(&executor, 2)
-            .production_traffic_snapshot()
-            .unwrap();
-        executor.warmup().unwrap();
-        let warmup_traffic = bqmoe_kernel(&executor, 2)
-            .production_traffic_snapshot()
-            .unwrap();
-        assert_eq!(
-            warmup_traffic, load_traffic,
-            "{} compile-only warmup must not create route demand",
-            case.label
-        );
+        let mut session =
+            crate::InferenceSession::from_graph_with_provider(graph, store, &root, cuda.clone())
+                .unwrap();
         let assert_traffic = |phase: &str,
-                              traffic: onnx_runtime_ep_cuda::BlockQuantizedMoeTraffic,
+                              traffic: onnx_runtime_ep_api::BlockQuantizedMoeTraffic,
                               routes: u64,
                               unique_experts: u64| {
             assert_eq!(
                 traffic.uploaded_whole_bank_bytes,
                 case.expected_per_expert * EXPERTS as u64,
                 "{} {phase} uploaded whole-bank extent",
+                case.label
+            );
+            assert_eq!(
+                traffic.committed_whole_bank_bytes,
+                case.expected_per_expert * EXPERTS as u64,
+                "{} {phase} committed whole-bank extent",
                 case.label
             );
             assert_eq!(
@@ -5843,34 +6145,28 @@ fn glm52_real_gated_top8_runs_through_production_session_with_f64_oracle() {
             assert_eq!(traffic.page_ins, 0);
             assert_eq!(traffic.byte_hit_rate, None);
         };
-        assert_traffic("load", load_traffic, 0, 0);
 
         let mut prefill_bindings = vec![
-            executor
+            session
                 .allocate_device_binding(
-                    "x".into(),
-                    None,
+                    "x",
+                    None::<String>,
                     DataType::Float32,
                     vec![2, H],
                     vec![2, H],
                 )
                 .unwrap(),
-            executor
+            session
                 .allocate_device_binding(
-                    "router".into(),
-                    None,
+                    "router",
+                    None::<String>,
                     DataType::Float32,
                     vec![2, EXPERTS],
                     vec![2, EXPERTS],
                 )
                 .unwrap(),
-            executor
-                .allocate_device_output_binding(
-                    "output".into(),
-                    DataType::Float32,
-                    vec![2, H],
-                    vec![2, H],
-                )
+            session
+                .allocate_device_output_binding("output", DataType::Float32, vec![2, H], vec![2, H])
                 .unwrap(),
         ];
         let prefill_input_bytes = (0..2)
@@ -5887,7 +6183,93 @@ fn glm52_real_gated_top8_runs_through_production_session_with_f64_oracle() {
         prefill_bindings[1]
             .write_bytes(0, &repeated_router_bytes)
             .unwrap();
-        executor
+        let mut bindings = vec![
+            session
+                .allocate_device_binding(
+                    "x",
+                    None::<String>,
+                    DataType::Float32,
+                    vec![1, H],
+                    vec![1, H],
+                )
+                .unwrap(),
+            session
+                .allocate_device_binding(
+                    "router",
+                    None::<String>,
+                    DataType::Float32,
+                    vec![1, EXPERTS],
+                    vec![1, EXPERTS],
+                )
+                .unwrap(),
+            session
+                .allocate_device_output_binding("output", DataType::Float32, vec![1, H], vec![1, H])
+                .unwrap(),
+        ];
+        let input_bytes = input_values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        let low_bytes = router_for(&low)
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        bindings[0].write_bytes(0, &input_bytes).unwrap();
+        bindings[1].write_bytes(0, &low_bytes).unwrap();
+
+        let before_admission_transfers = runtime.transfer_counts();
+        session
+            .run_with_device_bindings(&[], &mut prefill_bindings)
+            .unwrap();
+        session
+            .run_with_device_bindings(&[], &mut bindings)
+            .unwrap();
+        let after_admission_transfers = runtime.transfer_counts();
+        assert_eq!(
+            after_admission_transfers.host_to_device - before_admission_transfers.host_to_device,
+            3,
+            "{} must upload only the three sealed projection banks",
+            case.label
+        );
+        assert_eq!(
+            after_admission_transfers.async_host_to_device,
+            before_admission_transfers.async_host_to_device,
+            "{} sealed banks must not enter the paging transfer path",
+            case.label
+        );
+
+        let mut observer = session
+            .observe_block_quantized_moe_traffic(crate::BlockQuantizedMoeTrafficConfig {
+                request_id: 1,
+            })
+            .unwrap();
+        let load_snapshot = observer.snapshot().unwrap();
+        assert_eq!(load_snapshot.request_id, 1);
+        let load_traffic = load_snapshot.traffic;
+        assert_traffic("load", load_traffic, 0, 0);
+        observer
+            .reset_phase(crate::BlockQuantizedMoeTrafficPhase::Warmup)
+            .unwrap();
+        observer
+            .warmup(&[
+                crate::WarmupShape {
+                    input_name: "x".into(),
+                    shape: vec![2, H],
+                },
+                crate::WarmupShape {
+                    input_name: "router".into(),
+                    shape: vec![2, EXPERTS],
+                },
+            ])
+            .unwrap();
+        let warmup = observer.snapshot().unwrap();
+        assert_eq!(warmup.phase, crate::BlockQuantizedMoeTrafficPhase::Warmup);
+        let warmup_traffic = warmup.traffic;
+        assert_traffic("warmup", warmup_traffic, 0, 0);
+        observer
+            .reset_phase(crate::BlockQuantizedMoeTrafficPhase::Prefill)
+            .unwrap();
+        observer
             .run_with_device_bindings(&[], &mut prefill_bindings)
             .unwrap();
         let output_values = |binding: &mut DeviceIoBinding| {
@@ -5905,12 +6287,15 @@ fn glm52_real_gated_top8_runs_through_production_session_with_f64_oracle() {
             "{} repeated-route prefill rows must be deterministic",
             case.label
         );
-        let prefill_repeated_traffic = bqmoe_kernel(&executor, 2)
-            .production_traffic_snapshot()
-            .unwrap();
+        let repeated_snapshot = observer.snapshot().unwrap();
+        assert_eq!(
+            repeated_snapshot.phase,
+            crate::BlockQuantizedMoeTrafficPhase::Prefill
+        );
+        let prefill_repeated_traffic = repeated_snapshot.traffic;
         assert_traffic("prefill repeated", prefill_repeated_traffic, 16, 8);
-        bqmoe_kernel(&executor, 2)
-            .reset_route_telemetry_boundary()
+        observer
+            .reset_phase(crate::BlockQuantizedMoeTrafficPhase::Prefill)
             .unwrap();
         let broad_router_bytes = router_rows([&low, &high])
             .into_iter()
@@ -5919,7 +6304,7 @@ fn glm52_real_gated_top8_runs_through_production_session_with_f64_oracle() {
         prefill_bindings[1]
             .write_bytes(0, &broad_router_bytes)
             .unwrap();
-        executor
+        observer
             .run_with_device_bindings(&[], &mut prefill_bindings)
             .unwrap();
         let broad_prefill = output_values(&mut prefill_bindings[2]);
@@ -5929,9 +6314,7 @@ fn glm52_real_gated_top8_runs_through_production_session_with_f64_oracle() {
             "{} low-ID row must not depend on the other row's routes",
             case.label
         );
-        let prefill_broad_traffic = bqmoe_kernel(&executor, 2)
-            .production_traffic_snapshot()
-            .unwrap();
+        let prefill_broad_traffic = observer.snapshot().unwrap().traffic;
         assert_traffic("prefill broad", prefill_broad_traffic, 16, 16);
         assert_eq!(
             prefill_repeated_traffic.logical_route_demand_bytes,
@@ -5947,110 +6330,57 @@ fn glm52_real_gated_top8_runs_through_production_session_with_f64_oracle() {
         );
         drop(prefill_bindings);
 
-        compile_rows(&mut executor, 1);
-        bqmoe_kernel(&executor, 1)
-            .arm_route_telemetry(
-                onnx_runtime_ep_cuda::kernels::expert_route_telemetry::RouteTelemetryConfig {
-                    request_id: 2,
-                    device_id: runtime.ordinal(),
-                    num_experts: EXPERTS,
-                },
-            )
+        observer
+            .reset_phase(crate::BlockQuantizedMoeTrafficPhase::Decode)
             .unwrap();
-        let decode_load_traffic = bqmoe_kernel(&executor, 1)
-            .production_traffic_snapshot()
-            .unwrap();
+        let decode_load_traffic = observer.snapshot().unwrap().traffic;
         assert_traffic("decode load", decode_load_traffic, 0, 0);
         assert_eq!(
             decode_load_traffic.uploaded_whole_bank_bytes, load_traffic.uploaded_whole_bank_bytes,
             "{} decode shape must adopt the prefill shape's sealed banks",
             case.label
         );
-        let mut bindings = vec![
-            executor
-                .allocate_device_binding(
-                    "x".into(),
-                    None,
-                    DataType::Float32,
-                    vec![1, H],
-                    vec![1, H],
-                )
-                .unwrap(),
-            executor
-                .allocate_device_binding(
-                    "router".into(),
-                    None,
-                    DataType::Float32,
-                    vec![1, EXPERTS],
-                    vec![1, EXPERTS],
-                )
-                .unwrap(),
-            executor
-                .allocate_device_output_binding(
-                    "output".into(),
-                    DataType::Float32,
-                    vec![1, H],
-                    vec![1, H],
-                )
-                .unwrap(),
-        ];
-        let input_bytes = input_values
-            .iter()
-            .flat_map(|value| value.to_le_bytes())
-            .collect::<Vec<_>>();
-        let low_bytes = router_for(&low)
-            .into_iter()
-            .flat_map(f32::to_le_bytes)
-            .collect::<Vec<_>>();
-        bindings[0].write_bytes(0, &input_bytes).unwrap();
-        bindings[1].write_bytes(0, &low_bytes).unwrap();
-        executor
+        observer
             .run_with_device_bindings(&[], &mut bindings)
             .unwrap();
         let eager_low = output_values(&mut bindings[2]);
-        bqmoe_kernel(&executor, 1)
-            .reset_route_telemetry_boundary()
+        observer
+            .reset_phase(crate::BlockQuantizedMoeTrafficPhase::Decode)
             .unwrap();
-        let capture = executor
+        let capture = observer
             .try_capture_with_device_bindings(&[], &mut bindings)
             .unwrap();
         if !matches!(capture, DeviceGraphCaptureResult::Captured(_)) {
             panic!("{} production session capture was declined", case.label);
         }
-        bqmoe_kernel(&executor, 1)
-            .reset_route_telemetry_boundary()
+        observer
+            .reset_phase(crate::BlockQuantizedMoeTrafficPhase::Decode)
             .unwrap();
-        assert!(executor.replay_device_graph(&mut bindings).unwrap());
+        assert!(observer.replay_device_graph(&mut bindings).unwrap());
         let actual_low = output_values(&mut bindings[2]);
-        let decode_single_traffic = bqmoe_kernel(&executor, 1)
-            .production_traffic_snapshot()
-            .unwrap();
+        let decode_single_traffic = observer.snapshot().unwrap().traffic;
         assert_traffic("decode single", decode_single_traffic, 8, 8);
         assert_eq!(
             eager_low, actual_low,
             "{} eager/captured parity",
             case.label
         );
-        assert!(executor.replay_device_graph(&mut bindings).unwrap());
+        assert!(observer.replay_device_graph(&mut bindings).unwrap());
         let repeat_low = output_values(&mut bindings[2]);
-        let decode_repeated_traffic = bqmoe_kernel(&executor, 1)
-            .production_traffic_snapshot()
-            .unwrap();
+        let decode_repeated_traffic = observer.snapshot().unwrap().traffic;
         assert_traffic("decode repeated", decode_repeated_traffic, 16, 8);
-        bqmoe_kernel(&executor, 1)
-            .reset_route_telemetry_boundary()
+        observer
+            .reset_phase(crate::BlockQuantizedMoeTrafficPhase::Decode)
             .unwrap();
-        assert!(executor.replay_device_graph(&mut bindings).unwrap());
+        assert!(observer.replay_device_graph(&mut bindings).unwrap());
         let high_bytes = router_for(&high)
             .into_iter()
             .flat_map(f32::to_le_bytes)
             .collect::<Vec<_>>();
         bindings[1].write_bytes(0, &high_bytes).unwrap();
-        assert!(executor.replay_device_graph(&mut bindings).unwrap());
+        assert!(observer.replay_device_graph(&mut bindings).unwrap());
         let actual_high = output_values(&mut bindings[2]);
-        let decode_broad_traffic = bqmoe_kernel(&executor, 1)
-            .production_traffic_snapshot()
-            .unwrap();
+        let decode_broad_traffic = observer.snapshot().unwrap().traffic;
         assert_traffic("decode broad", decode_broad_traffic, 16, 16);
         assert_eq!(
             decode_repeated_traffic.logical_route_demand_bytes,
@@ -6142,9 +6472,10 @@ fn glm52_real_gated_top8_runs_through_production_session_with_f64_oracle() {
             decode_broad_traffic.logical_route_demand_bytes,
             decode_broad_traffic.unique_selected_expert_bytes,
         );
-        assert!(executor.reset_device_graph().unwrap());
+        assert!(observer.reset_device_graph().unwrap());
+        observer.finish().unwrap();
         drop(bindings);
-        drop(executor);
+        drop(session);
         runtime.synchronize().unwrap();
         cuda.wait_for_deferred_releases().unwrap();
     }
@@ -7703,7 +8034,7 @@ fn warm_decode_seeding_admits_previously_unresolved_capture_safe_node() {
             dtype: DataType::Int64,
             shape: vec![],
             accepts_subshape: false,
-            ptr: 0x1000 as *mut std::ffi::c_void,
+            ptr: 0x1000,
             len: 8,
             alignment: 8,
             device: onnx_runtime_ir::DeviceId::cpu(),
