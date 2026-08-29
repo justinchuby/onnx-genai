@@ -116,9 +116,12 @@ pub mod weight_paging;
 pub use capture::{require_subgraph_graph_capturable, subgraph_graph_capturable};
 pub use cufft::{CufftPlanCacheStats, cufft_plan_cache_stats};
 pub use dynamic_library::set_wheel_search_paths;
+#[cfg(feature = "gpu-tests")]
+pub use indexed_page_in::execute_indexed_multi_bank_page_in_with_partial_write_fault;
 pub use indexed_page_in::{
-    ExpertSlot, IndexedBankKind, IndexedCopyIdentity, IndexedExpertBank,
-    IndexedMultiBankPageInPlan, IndexedPageInAttribution, IndexedPageInAttributionStats,
+    ExpertSlot, IndexedBankKind, IndexedBankOwner, IndexedBankVisibility, IndexedCopyIdentity,
+    IndexedExpertBank, IndexedExpertBankSpec, IndexedMultiBankPageInPlan, IndexedPageInAttribution,
+    IndexedPageInAttributionStats, IndexedPageInError, IndexedPageInFailureDisposition,
     IndexedPageInPhase, IndexedPageInReceipt, ProjectionBankPair,
     execute_indexed_multi_bank_page_in, indexed_page_in_attribution_stats,
 };
@@ -173,6 +176,7 @@ pub use pinned_pool::{PinnedStagingPool, global_pinned_alloc_calls, global_pinne
 pub use provider::{
     CudaExecutionProvider, DEFAULT_DEVICE_OFFLOAD_BUDGET_BYTES, dynamic_kv_weight_lending_enabled,
 };
+pub use weight_paging::IndexedPageInBoundaryWitness;
 pub use weight_paging::{
     CudaResidencyStats, CudaWeightPage, CudaWeightPager, CudaWeightResidency, DeviceOffloadPolicy,
     EvictOrderProbe, GlobalOffloadStats, WEIGHT_OFFLOAD_ASYNC_PAGEIN_ENV,

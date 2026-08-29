@@ -33,14 +33,18 @@ use onnx_runtime_ir::{DataType, DeviceId};
 use onnx_runtime_memory_governor::{AllocationReleaseState, Tier, VirtualBacking};
 
 use crate::deferred_release::{
-    CudaDeferredReleaseQueue, DeferredActionOutcome, DeferredReleaseAction, RetainedOwnership,
+    CudaDeferredReleaseQueue, DeferredActionOutcome, DeferredReleaseAction,
+    DeferredReleaseBoundaryGuard, RetainedOwnership,
 };
 use crate::pinned_pool::{PinnedStagingPool, PooledStaging};
 use crate::prefill_double_buffer::{
     CudaPrefillError, CudaPrefillTransfer, LayerTicket, PrefillDoubleBuffer, PrefillLayerRequest,
     PrefillReject,
 };
-use crate::runtime::{CopyCompleted, CudaRuntime, FailedHtodCompletion, PinnedStaging, raw_ptr};
+use crate::runtime::{
+    CopyCompleted, CudaCoarseMutationGuard, CudaRuntime, FailedHtodCompletion, PinnedStaging,
+    ReplayCompletionWitness, raw_ptr,
+};
 
 /// Alignment for stable-VA weight slots (issue #716). The VMM arena rounds
 /// commits to the 2 MiB device granule (#776) regardless, so this only governs
@@ -99,6 +103,7 @@ static GLOBAL_HTOD_BYTES: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_INDEXED_PAGE_IN_BATCHES: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_INDEXED_PAGE_IN_ENTRIES: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_INDEXED_EXPERT_PAGE_INS: AtomicU64 = AtomicU64::new(0);
+static NEXT_RESIDENCY_ID: AtomicU64 = AtomicU64::new(1);
 // Host-blocking cuMemAlloc/cuMemFree spans for paged weight buffers.
 static GLOBAL_VRAM_ALLOC_NS: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_VRAM_FREE_NS: AtomicU64 = AtomicU64::new(0);
@@ -2726,6 +2731,10 @@ fn quarantine_in_flight_fill(ownership: Box<dyn Any + Send>) {
         .push(ownership);
 }
 
+pub(crate) fn quarantine_indexed_page_in(ownership: Box<dyn Any + Send>) {
+    quarantine_in_flight_fill(ownership);
+}
+
 #[cfg(test)]
 fn in_flight_fill_quarantine_count() -> usize {
     in_flight_fill_quarantine()
@@ -2784,6 +2793,7 @@ impl VmmAdmit {
 /// and reported non-blocking stream-wait enqueue time as copy waiting.
 pub struct CudaWeightResidency {
     runtime: Arc<CudaRuntime>,
+    residency_id: u64,
     /// The provider/context-owned queue every page's final release goes to.
     /// `None` until a provider installs one, in which case pages fall back to
     /// the inline compatibility release.
@@ -2825,6 +2835,7 @@ pub struct CudaWeightResidency {
     /// `routed_guards_active` so a resize fails closed while any dispatch
     /// still holds a proof that a region set stays resident.
     routed_guards_active: AtomicU64,
+    indexed_boundary: Mutex<IndexedBoundaryState>,
     /// Whether the whole-layer prefill double-buffer pipeline may be used for
     /// eligible `BlockQuantizedMoe` prefetch/page-in. Read once from
     /// [`PREFILL_DOUBLE_BUFFER_ENV`] at construction; when `false` the pipeline
@@ -2857,6 +2868,40 @@ pub struct RoutedResidencyGuard {
     residency: Arc<CudaWeightResidency>,
 }
 
+#[derive(Debug, Default)]
+struct IndexedBoundaryState {
+    generation: u64,
+    indexed_page_in_active: bool,
+}
+
+/// Authority-issued proof that replay completion and the PMM/VMM residency
+/// safe point were both valid for this residency generation.
+#[derive(Debug)]
+pub struct IndexedPageInBoundaryWitness {
+    residency_id: u64,
+    residency_generation: u64,
+    replay: ReplayCompletionWitness,
+    device_count: usize,
+}
+
+pub(crate) struct IndexedPageInAuthorityGuard<'a> {
+    residency: &'a CudaWeightResidency,
+    _runtime: CudaCoarseMutationGuard<'a>,
+    _deferred: DeferredReleaseBoundaryGuard<'a>,
+}
+
+impl Drop for IndexedPageInAuthorityGuard<'_> {
+    fn drop(&mut self) {
+        let mut boundary = self
+            .residency
+            .indexed_boundary
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        boundary.indexed_page_in_active = false;
+        boundary.generation = boundary.generation.wrapping_add(1);
+    }
+}
+
 impl RoutedResidencyGuard {
     /// The typed proof this guard keeps alive.
     pub fn proof(&self) -> &onnx_runtime_ep_api::RoutedResidencyProof {
@@ -2872,9 +2917,15 @@ impl onnx_runtime_ep_api::RoutedResidencyGuardHandle for RoutedResidencyGuard {
 
 impl Drop for RoutedResidencyGuard {
     fn drop(&mut self) {
+        let mut boundary = self
+            .residency
+            .indexed_boundary
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.residency
             .routed_guards_active
             .fetch_sub(1, Ordering::SeqCst);
+        boundary.generation = boundary.generation.wrapping_add(1);
     }
 }
 
@@ -3316,6 +3367,14 @@ fn eviction_for_boundary(
 }
 
 impl CudaWeightResidency {
+    pub(crate) fn indexed_authority_id(&self) -> u64 {
+        self.residency_id
+    }
+
+    pub(crate) fn runtime_for_indexed_page_in(&self) -> &CudaRuntime {
+        &self.runtime
+    }
+
     /// Build a residency cache with an explicit VRAM `budget_bytes`. This
     /// constructor is synchronous by itself so tests can choose deliberately;
     /// [`DeviceOffloadPolicy::from_env`] supplies the runtime default.
@@ -3331,6 +3390,7 @@ impl CudaWeightResidency {
         runtime.set_weights_may_be_paged();
         Self {
             runtime: Arc::clone(&runtime),
+            residency_id: NEXT_RESIDENCY_ID.fetch_add(1, Ordering::Relaxed),
             queue: None,
             scan_resistant_dense: false,
             byte_aware: false,
@@ -3357,6 +3417,7 @@ impl CudaWeightResidency {
                 prefetch_stats: PrefetchStats::default(),
             }),
             routed_guards_active: AtomicU64::new(0),
+            indexed_boundary: Mutex::new(IndexedBoundaryState::default()),
             prefill_double_buffer_enabled: prefill_double_buffer_enabled(),
             prefill_pipeline: Mutex::new(None),
         }
@@ -3398,6 +3459,7 @@ impl CudaWeightResidency {
         replace_global_budget(0, lease.bytes());
         Ok(Self {
             runtime: Arc::clone(&runtime),
+            residency_id: NEXT_RESIDENCY_ID.fetch_add(1, Ordering::Relaxed),
             queue: None,
             scan_resistant_dense: false,
             byte_aware: false,
@@ -3424,6 +3486,7 @@ impl CudaWeightResidency {
                 prefetch_stats: PrefetchStats::default(),
             }),
             routed_guards_active: AtomicU64::new(0),
+            indexed_boundary: Mutex::new(IndexedBoundaryState::default()),
             prefill_double_buffer_enabled: prefill_double_buffer_enabled(),
             prefill_pipeline: Mutex::new(None),
         })
@@ -3530,22 +3593,33 @@ impl CudaWeightResidency {
     /// cache: capture state comes from `runtime`, pending-deferred-release
     /// count comes from the installed provider queue (`0` when none is
     /// installed, matching `reclaim_mapped`'s own "no queue" refusal path),
-    /// and in-flight admission comes from the existing bookkeeping this
-    /// residency already tracks for the quarantine/no-progress paths.
+    /// and in-flight indexed admission comes from the same mutex-protected
+    /// boundary state that issues/revalidates page-in witnesses. Terminally
+    /// quarantined ownership is not "in flight" and therefore does not block a
+    /// retry into a fresh mapping.
     /// `multi_device` is always `true` when `device_count` is more than one:
     /// no existing barrier/authority in this codebase coordinates a resize
     /// across devices/TP, so a caller running under TP must pass its own
     /// device count and this fails closed rather than invent one.
     pub fn resize_safe_point(&self, device_count: usize) -> onnx_runtime_ep_api::ResizeSafePoint {
-        let capturing = self.runtime.is_capturing().unwrap_or(true);
+        let boundary = self
+            .indexed_boundary
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.resize_safe_point_locked(device_count, &boundary)
+    }
+
+    fn resize_safe_point_locked(
+        &self,
+        device_count: usize,
+        boundary: &IndexedBoundaryState,
+    ) -> onnx_runtime_ep_api::ResizeSafePoint {
+        let capturing = self.runtime.graph_work_in_flight();
         let pending_deferred_releases = self
             .queue
             .as_ref()
             .map_or(0, |queue| queue.pending() as u64);
-        let admission_in_flight = !in_flight_fill_quarantine()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_empty();
+        let admission_in_flight = boundary.indexed_page_in_active;
         onnx_runtime_ep_api::ResizeSafePoint {
             capturing,
             pending_deferred_releases,
@@ -3553,6 +3627,112 @@ impl CudaWeightResidency {
             multi_device: device_count > 1,
             routed_guards_active: self.routed_guards_active.load(Ordering::SeqCst),
         }
+    }
+
+    /// Observe the current replay-completion state without synchronizing.
+    ///
+    /// This is the non-blocking admission probe: an in-flight replay is a typed
+    /// rejection until [`Self::complete_indexed_page_in_boundary`] establishes
+    /// completion on the host timeline.
+    pub fn try_indexed_page_in_boundary(
+        &self,
+        device_count: usize,
+    ) -> onnx_runtime_ep_api::Result<IndexedPageInBoundaryWitness> {
+        let replay = self.runtime.try_replay_completion_witness()?;
+        self.issue_indexed_page_in_boundary(replay, device_count)
+    }
+
+    /// Complete every submitted graph replay and issue the PMM/VMM safe-boundary
+    /// witness consumed by fused indexed page-in.
+    pub fn complete_indexed_page_in_boundary(
+        &self,
+        device_count: usize,
+    ) -> onnx_runtime_ep_api::Result<IndexedPageInBoundaryWitness> {
+        let replay = self.runtime.complete_replay_boundary()?;
+        self.issue_indexed_page_in_boundary(replay, device_count)
+    }
+
+    fn issue_indexed_page_in_boundary(
+        &self,
+        replay: ReplayCompletionWitness,
+        device_count: usize,
+    ) -> onnx_runtime_ep_api::Result<IndexedPageInBoundaryWitness> {
+        if self.queue.is_none() {
+            return Err(onnx_runtime_ep_api::EpError::KernelFailed(
+                "indexed page-in requires the provider deferred-release authority".into(),
+            ));
+        }
+        let boundary = self.indexed_boundary.lock().map_err(|_| {
+            onnx_runtime_ep_api::EpError::KernelFailed(
+                "indexed page-in boundary lock poisoned".into(),
+            )
+        })?;
+        if let Some(reason) = self
+            .resize_safe_point_locked(device_count, &boundary)
+            .blocking_reason()
+        {
+            return Err(onnx_runtime_ep_api::EpError::KernelFailed(format!(
+                "indexed page-in safe boundary unavailable: {reason}"
+            )));
+        }
+        Ok(IndexedPageInBoundaryWitness {
+            residency_id: self.residency_id,
+            residency_generation: boundary.generation,
+            replay,
+            device_count,
+        })
+    }
+
+    pub(crate) fn begin_indexed_page_in(
+        &self,
+        witness: &IndexedPageInBoundaryWitness,
+    ) -> onnx_runtime_ep_api::Result<IndexedPageInAuthorityGuard<'_>> {
+        let mut boundary = self.indexed_boundary.lock().map_err(|_| {
+            onnx_runtime_ep_api::EpError::KernelFailed(
+                "indexed page-in boundary lock poisoned".into(),
+            )
+        })?;
+        if witness.residency_id != self.residency_id
+            || witness.residency_generation != boundary.generation
+        {
+            return Err(onnx_runtime_ep_api::EpError::KernelFailed(
+                "stale indexed page-in safe-boundary witness; residency state changed before \
+                 submission"
+                    .into(),
+            ));
+        }
+        let queue = self.queue.as_ref().ok_or_else(|| {
+            onnx_runtime_ep_api::EpError::KernelFailed(
+                "indexed page-in requires the provider deferred-release authority".into(),
+            )
+        })?;
+        let runtime = self.runtime.begin_coarse_mutation(&witness.replay)?;
+        let deferred = queue.acquire_idle_boundary().map_err(|reason| {
+            onnx_runtime_ep_api::EpError::KernelFailed(format!(
+                "indexed page-in safe-boundary revalidation failed: {reason}"
+            ))
+        })?;
+        if let Some(reason) = self
+            .resize_safe_point_locked(witness.device_count, &boundary)
+            .blocking_reason()
+        {
+            return Err(onnx_runtime_ep_api::EpError::KernelFailed(format!(
+                "indexed page-in safe-boundary revalidation failed: {reason}"
+            )));
+        }
+        boundary.indexed_page_in_active = true;
+        boundary.generation = boundary.generation.wrapping_add(1);
+        Ok(IndexedPageInAuthorityGuard {
+            residency: self,
+            _runtime: runtime,
+            _deferred: deferred,
+        })
+    }
+
+    pub(crate) fn lock_for_indexed_page_in(&self) -> impl Drop + '_ {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// #1810 Slice 5 — Apply a [`ResidencyPlan`] at the model-load coarse
@@ -3622,13 +3802,24 @@ impl CudaWeightResidency {
         self: &Arc<Self>,
         requirement: onnx_runtime_ep_api::RoutedResidencyRequirement,
         catalog: &onnx_runtime_loader::WeightRegionCatalog,
-    ) -> RoutedResidencyGuard {
+    ) -> onnx_runtime_ep_api::Result<RoutedResidencyGuard> {
+        let mut boundary = self.indexed_boundary.lock().map_err(|_| {
+            onnx_runtime_ep_api::EpError::KernelFailed(
+                "indexed page-in boundary lock poisoned".into(),
+            )
+        })?;
+        if boundary.indexed_page_in_active {
+            return Err(onnx_runtime_ep_api::EpError::KernelFailed(
+                "cannot acquire routed residency while indexed page-in is active".into(),
+            ));
+        }
         let proof = onnx_runtime_ep_api::prove_routed_residency(requirement, catalog);
         self.routed_guards_active.fetch_add(1, Ordering::SeqCst);
-        RoutedResidencyGuard {
+        boundary.generation = boundary.generation.wrapping_add(1);
+        Ok(RoutedResidencyGuard {
             proof,
             residency: Arc::clone(self),
-        }
+        })
     }
 
     /// Execute an accepted [`onnx_runtime_ep_api::ResidencyResizePlan`].
@@ -8658,10 +8849,12 @@ mod tests {
 
         assert!(residency.resize_safe_point(1).is_safe());
 
-        let guard = residency.acquire_routed_residency(
-            onnx_runtime_ep_api::RoutedResidencyRequirement::FusedRoutingUnknown,
-            &catalog,
-        );
+        let guard = residency
+            .acquire_routed_residency(
+                onnx_runtime_ep_api::RoutedResidencyRequirement::FusedRoutingUnknown,
+                &catalog,
+            )
+            .unwrap();
         assert_eq!(
             guard.proof().coverage(),
             &onnx_runtime_ep_api::RoutedResidencyCoverage::WholeBank {
@@ -8698,14 +8891,18 @@ mod tests {
         let residency = std::sync::Arc::new(CudaWeightResidency::new(runtime, 400));
         let catalog = expert_catalog(true);
 
-        let guard_a = residency.acquire_routed_residency(
-            onnx_runtime_ep_api::RoutedResidencyRequirement::FusedRoutingUnknown,
-            &catalog,
-        );
-        let guard_b = residency.acquire_routed_residency(
-            onnx_runtime_ep_api::RoutedResidencyRequirement::FusedRoutingUnknown,
-            &catalog,
-        );
+        let guard_a = residency
+            .acquire_routed_residency(
+                onnx_runtime_ep_api::RoutedResidencyRequirement::FusedRoutingUnknown,
+                &catalog,
+            )
+            .unwrap();
+        let guard_b = residency
+            .acquire_routed_residency(
+                onnx_runtime_ep_api::RoutedResidencyRequirement::FusedRoutingUnknown,
+                &catalog,
+            )
+            .unwrap();
         assert_eq!(residency.resize_safe_point(1).routed_guards_active, 2);
 
         drop(guard_a);
@@ -8732,10 +8929,14 @@ mod tests {
         let residency = std::sync::Arc::new(CudaWeightResidency::new(runtime, 400));
         let catalog = expert_catalog(false);
 
-        let guard = residency.acquire_routed_residency(
-            onnx_runtime_ep_api::RoutedResidencyRequirement::HostKnownExperts { experts: vec![0] },
-            &catalog,
-        );
+        let guard = residency
+            .acquire_routed_residency(
+                onnx_runtime_ep_api::RoutedResidencyRequirement::HostKnownExperts {
+                    experts: vec![0],
+                },
+                &catalog,
+            )
+            .unwrap();
         assert!(matches!(
             guard.proof().coverage(),
             onnx_runtime_ep_api::RoutedResidencyCoverage::WholeBank {
