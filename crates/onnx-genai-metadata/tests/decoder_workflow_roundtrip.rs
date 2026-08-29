@@ -11,8 +11,15 @@
 //! tensor than the package's author intended — the failure mode that a
 //! by-eye review of fourteen YAML files would never catch.
 
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
 
+use onnx_genai_metadata::schema::{
+    CompressedRecordFormat, CompressionRatio, StateGroupContract, StateGroupProperties, StateKind,
+    WorkflowComponent, WorkflowSpec,
+};
 use onnx_genai_metadata::{DecoderAbi, load_metadata, sole_decoder_component};
 
 /// Every single-decoder fixture this repository maintains.
@@ -54,6 +61,128 @@ fn abi_of(package: &Path) -> DecoderAbi {
             )
         })
         .clone()
+}
+
+fn state_group_semantics(
+    workflow: &WorkflowSpec,
+    component: &str,
+) -> BTreeMap<String, StateGroupContract> {
+    workflow
+        .serving
+        .as_ref()
+        .expect("decoder workflow must declare serving state")
+        .state_service
+        .groups
+        .iter()
+        .filter(|(_, group)| group.ports.contains_key(component))
+        .map(|(name, group)| {
+            let mut normalized = group.clone();
+            for aliases in normalized.ports.values_mut() {
+                *aliases = std::mem::take(aliases)
+                    .into_values()
+                    .map(|alias| (alias.input.clone(), alias))
+                    .collect();
+            }
+            (name.clone(), normalized)
+        })
+        .collect()
+}
+
+fn assert_heterogeneous_compressed_fixture(
+    package: &Path,
+    declaration: &WorkflowComponent,
+    groups: &BTreeMap<String, StateGroupContract>,
+) {
+    let fixture = package
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("fixture path has a UTF-8 name");
+    if !matches!(
+        fixture,
+        "tiny-deepseek-v4-csa" | "tiny-deepseek-v4-csa-schedule"
+    ) {
+        return;
+    }
+
+    for (record, carry) in [
+        ("compressed_records.0", "compressed_carries.0"),
+        ("compressed_records.1", "compressed_carries.1"),
+    ] {
+        assert_eq!(
+            groups.get(record).expect("fixture record group").layout,
+            "batch_record_feature",
+            "{}: {record} must retain its record layout",
+            package.display()
+        );
+        assert_eq!(
+            groups.get(carry).expect("fixture carry group").layout,
+            "batch_carry_slot_stream_feature",
+            "{}: {carry} must retain its carry layout",
+            package.display()
+        );
+    }
+    assert!(
+        groups
+            .values()
+            .all(|group| { !group.reuse.prefix_reusable && !group.reuse.evictable_prefix }),
+        "{}: compressed groups deliberately decline both reuse capabilities",
+        package.display()
+    );
+
+    for (name, ratio, format, dtype) in [
+        (
+            "compressed_records.0",
+            CompressionRatio::Ratio4,
+            CompressedRecordFormat::Fp8E4m3Block64,
+            "uint8",
+        ),
+        (
+            "compressed_records.1",
+            CompressionRatio::Ratio128,
+            CompressedRecordFormat::F32,
+            "float32",
+        ),
+    ] {
+        let group = groups.get(name).expect("fixture record group");
+        assert!(matches!(
+            &group.properties,
+            Some(StateGroupProperties::CompressedAttention {
+                ratio: declared_ratio,
+                record_format,
+                ..
+            }) if *declared_ratio == ratio && *record_format == format
+        ));
+        for alias in group
+            .ports
+            .get("decoder")
+            .expect("compressed group binds decoder")
+            .values()
+        {
+            assert_eq!(
+                declaration
+                    .ports
+                    .inputs
+                    .get(&alias.input)
+                    .expect("compressed input contract")
+                    .dtype,
+                dtype,
+                "{}: {name} input {} changed identity",
+                package.display(),
+                alias.input
+            );
+            assert_eq!(
+                declaration
+                    .ports
+                    .outputs
+                    .get(alias.output.as_ref().expect("read-write compressed output"))
+                    .expect("compressed output contract")
+                    .dtype,
+                dtype,
+                "{}: {name} output changed identity",
+                package.display()
+            );
+        }
+    }
 }
 
 /// Every converted package resolves its ABI from its workflow, and from nothing
@@ -110,6 +239,17 @@ fn rebuilding_each_package_reproduces_its_abi() {
         let workflow = &metadata.pipeline.as_ref().expect("workflow").workflow;
         let component = sole_decoder_component(workflow).expect("decoder");
         let declaration = &workflow.components[component];
+        let expected_groups = state_group_semantics(workflow, component);
+        let expected_compressed = expected_groups
+            .iter()
+            .filter(|(_, group)| group.kind == StateKind::CompressedAttention)
+            .map(|(name, group)| (name.clone(), group.clone()))
+            .collect();
+        assert_heterogeneous_compressed_fixture(
+            package.as_path(),
+            declaration,
+            &expected_compressed,
+        );
         let port_contracts = declaration
             .ports
             .inputs
@@ -155,6 +295,12 @@ fn rebuilding_each_package_reproduces_its_abi() {
             .workflow;
         let rebuilt_component = sole_decoder_component(rebuilt).expect("reemitted rebuilt decoder");
         let rebuilt_declaration = &rebuilt.components[rebuilt_component];
+        assert_eq!(
+            state_group_semantics(rebuilt, rebuilt_component),
+            expected_groups,
+            "{}: rebuild changed state-group semantics",
+            package.display()
+        );
         for group in &abi.state_groups {
             for port in &group.ports {
                 if let Some(expected) = declaration.ports.inputs.get(&port.input) {

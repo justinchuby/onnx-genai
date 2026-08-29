@@ -206,7 +206,9 @@ pub struct DecoderStateGroup {
     pub kind: StateKind,
     pub properties: Option<StateGroupProperties>,
     pub sequence_axis: Option<usize>,
+    pub layout: String,
     pub update: Option<StateUpdate>,
+    pub reuse: StateReuse,
     pub capabilities: StateGroupCapabilities,
     pub ports: Vec<DecoderStatePort>,
 }

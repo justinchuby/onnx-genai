@@ -297,7 +297,9 @@ pub fn decoder_abi(workflow: &WorkflowSpec, component: &str) -> Option<DecoderAb
                 kind: group.kind,
                 properties: group.properties.clone(),
                 sequence_axis: group.sequence_axis,
+                layout: group.layout.clone(),
                 update: group.update.clone(),
+                reuse: group.reuse,
                 capabilities: group.capabilities.clone(),
                 ports,
             })

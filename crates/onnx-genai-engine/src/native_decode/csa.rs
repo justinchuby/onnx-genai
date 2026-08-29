@@ -791,7 +791,14 @@ mod tests {
                 recurrence: CompressionRecurrence::Standard,
             }),
             sequence_axis: matches!(update, StateUpdate::Append).then_some(1),
+            layout: match &update {
+                StateUpdate::Append => "batch_record_feature",
+                StateUpdate::Replace => "batch_carry_slot_stream_feature",
+                StateUpdate::IndexedScatter { .. } => "batch_record_feature",
+            }
+            .to_string(),
             update: Some(update),
+            reuse: Default::default(),
             capabilities: StateGroupCapabilities::default(),
             ports: ports
                 .into_iter()

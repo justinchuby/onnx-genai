@@ -1114,7 +1114,9 @@ impl Builder {
                 sequence_axis: declared
                     .map(|group| group.sequence_axis)
                     .unwrap_or_else(|| (kind != StateKind::Recurrent).then_some(2)),
-                layout: layout_name(abi),
+                layout: declared
+                    .map(|group| group.layout.clone())
+                    .unwrap_or_else(|| layout_name(abi)),
                 logical_lengths,
                 aliasing: if kind == StateKind::FullAttention {
                     abi.aliasing.unwrap_or(StateAliasing::Forbidden)
@@ -1124,10 +1126,12 @@ impl Builder {
                 update,
                 ports: BTreeMap::from([(DECODER_COMPONENT.to_string(), aliases)]),
                 total_length: None,
-                reuse: crate::schema::StateReuse {
-                    prefix_reusable: true,
-                    evictable_prefix: true,
-                },
+                reuse: declared
+                    .map(|group| group.reuse)
+                    .unwrap_or(crate::schema::StateReuse {
+                        prefix_reusable: true,
+                        evictable_prefix: true,
+                    }),
                 capabilities: declared
                     .map(|group| group.capabilities.clone())
                     .unwrap_or_else(|| crate::schema::StateGroupCapabilities {
