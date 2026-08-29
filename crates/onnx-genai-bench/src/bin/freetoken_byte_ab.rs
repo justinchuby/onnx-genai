@@ -2,6 +2,7 @@ use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
@@ -56,12 +57,21 @@ struct Args {
     off_value: String,
     #[arg(long, default_value = "1")]
     on_value: String,
-    /// Optional explicit weight-residency cache budget.
+    /// Explicit weight-residency cache budget. Required: deterministic
+    /// miss/page-in/hit proof must not inherit an implicit machine default.
     #[arg(long)]
     device_budget_bytes: Option<u64>,
+    /// Explicit host-memory budget for HostNuma expert backing. Required so a
+    /// forced-cold transition cannot inherit a machine-dependent auto limit.
+    #[arg(long)]
+    host_budget_bytes: Option<u64>,
     /// Engine managed VRAM limit. `auto` resolves from the selected device.
     #[arg(long, default_value = "auto")]
     vram_limit: String,
+    /// Maximum allowed absolute decode-throughput drift when the first OFF
+    /// arm/shape is remeasured at the end of the sweep.
+    #[arg(long, default_value_t = 10.0)]
+    max_throughput_drift_percent: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -83,6 +93,8 @@ struct IdleProbe {
 struct Trial {
     pair_index: usize,
     arm: ResidencyArm,
+    child_succeeded: bool,
+    child_exit_status: String,
     idle_before: IdleProbe,
     run_report_path: String,
     stdout_log_path: String,
@@ -137,6 +149,15 @@ struct Comparison {
 }
 
 #[derive(Debug, Serialize)]
+struct ThroughputDrift {
+    initial_tokens_per_second: Option<f64>,
+    remeasured_tokens_per_second: Option<f64>,
+    absolute_percent: Option<f64>,
+    maximum_percent: f64,
+    within_limit: bool,
+}
+
+#[derive(Debug, Serialize)]
 struct Conditions {
     model_path: String,
     prompt: String,
@@ -151,7 +172,9 @@ struct Conditions {
     on_value: String,
     weight_offload_enabled_for_both_arms: bool,
     device_budget_bytes: Option<u64>,
+    host_budget_bytes: Option<u64>,
     vram_limit: String,
+    maximum_throughput_drift_percent: f64,
     wall_clock_is_corroborative_only: bool,
 }
 
@@ -167,6 +190,8 @@ struct AbReport {
     on: ArmSummary,
     comparison: Comparison,
     trials: Vec<Trial>,
+    first_arm_remeasurement: Trial,
+    throughput_drift: ThroughputDrift,
     contract: ContractStatus,
 }
 
@@ -291,25 +316,22 @@ fn idle_probe(device: u32) -> IdleProbe {
     }
 }
 
-fn write_output(
-    path: &Path,
-    output: &Output,
-    stdout_path: &Path,
-    stderr_path: &Path,
-) -> Result<()> {
+fn wait_for_idle_probe(device: u32) -> IdleProbe {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let probe = idle_probe(device);
+        if probe.exclusive_idle || Instant::now() >= deadline {
+            return probe;
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+fn write_output(output: &Output, stdout_path: &Path, stderr_path: &Path) -> Result<()> {
     std::fs::write(stdout_path, &output.stdout)
         .with_context(|| format!("write child stdout {}", stdout_path.display()))?;
     std::fs::write(stderr_path, &output.stderr)
         .with_context(|| format!("write child stderr {}", stderr_path.display()))?;
-    if !output.status.success() {
-        bail!(
-            "profile_native failed for {} (status {}); see {} and {}",
-            path.display(),
-            output.status,
-            stdout_path.display(),
-            stderr_path.display()
-        );
-    }
     Ok(())
 }
 
@@ -319,7 +341,7 @@ fn run_arm(
     pair_index: usize,
     arm: ResidencyArm,
 ) -> Result<Trial> {
-    let idle_before = idle_probe(args.device);
+    let idle_before = wait_for_idle_probe(args.device);
     eprintln!(
         "freetoken_byte_ab: pair={} arm={} idle={} utilization={:?} processes={}",
         pair_index,
@@ -336,6 +358,10 @@ fn run_arm(
         ResidencyArm::Off => &args.off_value,
         ResidencyArm::On => &args.on_value,
     };
+    if report_path.exists() {
+        std::fs::remove_file(&report_path)
+            .with_context(|| format!("remove stale child report {}", report_path.display()))?;
+    }
 
     let mut command = Command::new(profile_native);
     command
@@ -344,6 +370,7 @@ fn run_arm(
         .env("ONNX_GENAI_EP", "cuda")
         .env("ONNX_GENAI_CUDA_GRAPH", "1")
         .env("ONNX_GENAI_WEIGHT_OFFLOAD", "1")
+        .env("ONNX_GENAI_FREETOKEN_EXPERT_ACCOUNTING", "1")
         .env("ONNX_GENAI_VRAM_LIMIT", &args.vram_limit)
         .env(&args.policy_env, policy_value)
         .args([
@@ -392,11 +419,23 @@ fn run_arm(
             device_budget_bytes.to_string(),
         );
     }
+    if let Some(host_budget_bytes) = args.host_budget_bytes {
+        command.env("ONNX_GENAI_HOST_RAM_LIMIT", host_budget_bytes.to_string());
+    }
 
     let output = command
         .output()
         .with_context(|| format!("run profile_native {}", profile_native.display()))?;
-    write_output(&report_path, &output, &stdout_path, &stderr_path)?;
+    write_output(&output, &stdout_path, &stderr_path)?;
+    if !report_path.is_file() {
+        bail!(
+            "profile_native produced no report {} (status {}); see {} and {}",
+            report_path.display(),
+            output.status,
+            stdout_path.display(),
+            stderr_path.display()
+        );
+    }
     let report: FreeTokenRunReport = serde_json::from_slice(
         &std::fs::read(&report_path)
             .with_context(|| format!("read child report {}", report_path.display()))?,
@@ -405,6 +444,8 @@ fn run_arm(
     Ok(Trial {
         pair_index,
         arm,
+        child_succeeded: output.status.success(),
+        child_exit_status: output.status.to_string(),
         idle_before,
         run_report_path: report_path.display().to_string(),
         stdout_log_path: stdout_path.display().to_string(),
@@ -464,6 +505,15 @@ fn summary(trials: &[Trial], arm: ResidencyArm, include_wall_clock: bool) -> Arm
     }
 }
 
+fn throughput_drift_percent(initial: Option<f64>, remeasured: Option<f64>) -> Option<f64> {
+    initial
+        .zip(remeasured)
+        .filter(|(initial, remeasured)| {
+            initial.is_finite() && *initial > 0.0 && remeasured.is_finite()
+        })
+        .map(|(initial, remeasured)| ((remeasured - initial).abs() / initial) * 100.0)
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     if args.trials == 0 {
@@ -472,8 +522,23 @@ fn main() -> Result<()> {
     if args.tokens <= args.decode_skip {
         bail!("--tokens must be greater than --decode-skip");
     }
+    if args.device_budget_bytes.is_none_or(|bytes| bytes == 0) {
+        bail!(
+            "--device-budget-bytes must be explicitly greater than zero: the production expert \
+             miss/page-in/hit gate refuses an implicit or warm-cache-dependent residency budget"
+        );
+    }
+    if args.host_budget_bytes.is_none_or(|bytes| bytes == 0) {
+        bail!(
+            "--host-budget-bytes must be explicitly greater than zero: deterministic HostNuma \
+             expert backing refuses a machine-dependent automatic host limit"
+        );
+    }
     if !args.warmup_seconds.is_finite() || args.warmup_seconds < 0.0 {
         bail!("--warmup-seconds must be finite and non-negative");
+    }
+    if !args.max_throughput_drift_percent.is_finite() || args.max_throughput_drift_percent < 0.0 {
+        bail!("--max-throughput-drift-percent must be finite and non-negative");
     }
     if args.policy_env.is_empty()
         || args.policy_env.contains('=')
@@ -510,6 +575,16 @@ fn main() -> Result<()> {
     for pair_index in 1..=args.trials {
         let off = run_arm(&args, &profile_native, pair_index, ResidencyArm::Off)?;
         let on = run_arm(&args, &profile_native, pair_index, ResidencyArm::On)?;
+        for trial in [&off, &on] {
+            if !trial.child_succeeded {
+                errors.push(format!(
+                    "pair {pair_index} arm {} child exited {}; report retained for exact \
+                     fail-closed diagnostics",
+                    trial.arm.as_str(),
+                    trial.child_exit_status
+                ));
+            }
+        }
         if off.report.policy_control.value != args.off_value {
             errors.push(format!(
                 "pair {pair_index}: OFF process observed policy value {:?}, expected {:?}",
@@ -521,6 +596,17 @@ fn main() -> Result<()> {
                 "pair {pair_index}: ON process observed policy value {:?}, expected {:?}",
                 on.report.policy_control.value, args.on_value
             ));
+        }
+        for trial in [&off, &on] {
+            if trial.report.metrics.weight_residency_budget_bytes.value != args.device_budget_bytes
+            {
+                errors.push(format!(
+                    "pair {pair_index} arm {} resolved weight-residency budget {:?}, expected {:?}",
+                    trial.arm.as_str(),
+                    trial.report.metrics.weight_residency_budget_bytes.value,
+                    args.device_budget_bytes
+                ));
+            }
         }
         for error in validate_pair(&off.report, &on.report) {
             errors.push(format!("pair {pair_index}: {error}"));
@@ -541,11 +627,106 @@ fn main() -> Result<()> {
         trials.push(on);
     }
 
-    let all_idle = trials.iter().all(|trial| trial.idle_before.exclusive_idle);
-    let all_a100 = trials.iter().all(|trial| trial.idle_before.is_a100);
+    let first_arm_remeasurement =
+        run_arm(&args, &profile_native, args.trials + 1, ResidencyArm::Off)?;
+    if !first_arm_remeasurement.child_succeeded {
+        errors.push(format!(
+            "first-arm remeasurement child exited {}; report retained for exact fail-closed \
+             diagnostics",
+            first_arm_remeasurement.child_exit_status
+        ));
+    }
+    for error in onnx_genai_bench::freetoken_byte_ab::validate_run(&first_arm_remeasurement.report)
+    {
+        errors.push(format!("first-arm remeasurement: {error}"));
+    }
+    if first_arm_remeasurement.report.policy_control.value != args.off_value {
+        errors.push(format!(
+            "first-arm remeasurement observed policy value {:?}, expected {:?}",
+            first_arm_remeasurement.report.policy_control.value, args.off_value
+        ));
+    }
+    if first_arm_remeasurement
+        .report
+        .metrics
+        .weight_residency_budget_bytes
+        .value
+        != args.device_budget_bytes
+    {
+        errors.push(format!(
+            "first-arm remeasurement resolved weight-residency budget {:?}, expected {:?}",
+            first_arm_remeasurement
+                .report
+                .metrics
+                .weight_residency_budget_bytes
+                .value,
+            args.device_budget_bytes
+        ));
+    }
+    if reference_tokens.as_ref() != Some(&first_arm_remeasurement.report.generated_token_ids) {
+        errors.push(
+            "first-arm remeasurement token stream differs from the initial OFF arm".to_string(),
+        );
+    }
+    let initial_throughput = trials
+        .first()
+        .and_then(|trial| {
+            trial
+                .report
+                .metrics
+                .wall_clock_decode_tokens_per_second
+                .value
+                .as_ref()
+        })
+        .and_then(|values| values.first())
+        .copied();
+    let remeasured_throughput = first_arm_remeasurement
+        .report
+        .metrics
+        .wall_clock_decode_tokens_per_second
+        .value
+        .as_ref()
+        .and_then(|values| values.first())
+        .copied();
+    let throughput_drift_percent =
+        throughput_drift_percent(initial_throughput, remeasured_throughput);
+    let throughput_drift_within_limit =
+        throughput_drift_percent.is_some_and(|drift| drift <= args.max_throughput_drift_percent);
+    if !trials
+        .first()
+        .is_some_and(|trial| trial.idle_before.exclusive_idle)
+        || !first_arm_remeasurement.idle_before.exclusive_idle
+    {
+        errors.push(
+            "throughput drift gate requires the initial and final OFF probes to be exclusively idle"
+                .to_string(),
+        );
+    }
+    match throughput_drift_percent {
+        Some(drift) if drift > args.max_throughput_drift_percent => errors.push(format!(
+            "first OFF arm/shape throughput drift {drift:.3}% exceeds {:.3}%",
+            args.max_throughput_drift_percent
+        )),
+        None => errors
+            .push("first OFF arm/shape throughput drift is unavailable or non-finite".to_string()),
+        _ => {}
+    }
+    let throughput_drift = ThroughputDrift {
+        initial_tokens_per_second: initial_throughput,
+        remeasured_tokens_per_second: remeasured_throughput,
+        absolute_percent: throughput_drift_percent,
+        maximum_percent: args.max_throughput_drift_percent,
+        within_limit: throughput_drift_within_limit,
+    };
+
+    let all_idle = trials.iter().all(|trial| trial.idle_before.exclusive_idle)
+        && first_arm_remeasurement.idle_before.exclusive_idle;
+    let all_a100 = trials.iter().all(|trial| trial.idle_before.is_a100)
+        && first_arm_remeasurement.idle_before.is_a100;
     let all_warm = trials
         .iter()
-        .all(|trial| trial.report.warmup.actual_seconds >= 8.0);
+        .all(|trial| trial.report.warmup.actual_seconds >= 8.0)
+        && first_arm_remeasurement.report.warmup.actual_seconds >= 8.0;
     let wall_clock_eligible = args.trials >= 3 && all_warm && all_idle && all_a100;
     let wall_clock_ineligibility_reason = (!wall_clock_eligible).then(|| {
         let mut reasons = Vec::new();
@@ -574,12 +755,14 @@ fn main() -> Result<()> {
         .as_ref()
         .map(|distribution| distribution.median);
     let expert_metrics_available = trials.iter().all(|trial| {
-        trial
-            .report
-            .metrics
-            .selected_expert_logical_bytes
-            .value
-            .is_some()
+        trial.child_succeeded
+            && trial.report.contract.passed
+            && trial
+                .report
+                .metrics
+                .selected_expert_logical_bytes
+                .value
+                .is_some()
             && trial
                 .report
                 .metrics
@@ -599,6 +782,30 @@ fn main() -> Result<()> {
                 .report
                 .metrics
                 .expert_bytes_per_emitted_token
+                .value
+                .is_some()
+            && trial
+                .report
+                .metrics
+                .prefill_expert_bytes_by_layer
+                .value
+                .is_some()
+            && trial
+                .report
+                .metrics
+                .decode_expert_bytes_by_layer
+                .value
+                .is_some()
+            && trial
+                .report
+                .metrics
+                .expert_device_committed_bytes
+                .value
+                .is_some()
+            && trial
+                .report
+                .metrics
+                .expert_host_committed_bytes
                 .value
                 .is_some()
     });
@@ -641,7 +848,9 @@ fn main() -> Result<()> {
             on_value: args.on_value,
             weight_offload_enabled_for_both_arms: true,
             device_budget_bytes: args.device_budget_bytes,
+            host_budget_bytes: args.host_budget_bytes,
             vram_limit: args.vram_limit,
+            maximum_throughput_drift_percent: args.max_throughput_drift_percent,
             wall_clock_is_corroborative_only: true,
         },
         wall_clock_eligible,
@@ -650,6 +859,8 @@ fn main() -> Result<()> {
         on,
         comparison,
         trials,
+        first_arm_remeasurement,
+        throughput_drift,
         contract,
     };
     if let Some(parent) = args
@@ -716,5 +927,20 @@ mod tests {
         .expect("write present fixture");
         assert!(!binary_contains_marker(&absent).expect("scan absent fixture"));
         assert!(binary_contains_marker(&present).expect("scan present fixture"));
+    }
+
+    #[test]
+    fn throughput_drift_is_absolute_and_fail_closed() {
+        assert_eq!(
+            throughput_drift_percent(Some(100.0), Some(90.0)),
+            Some(10.0)
+        );
+        assert_eq!(
+            throughput_drift_percent(Some(100.0), Some(110.0)),
+            Some(10.0)
+        );
+        assert_eq!(throughput_drift_percent(Some(0.0), Some(1.0)), None);
+        assert_eq!(throughput_drift_percent(Some(f64::NAN), Some(1.0)), None);
+        assert_eq!(throughput_drift_percent(Some(1.0), None), None);
     }
 }

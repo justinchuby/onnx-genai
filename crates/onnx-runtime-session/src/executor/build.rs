@@ -1008,6 +1008,9 @@ impl Executor {
             workspace_preparation_required: false,
         };
 
+        exec.ep
+            .prepare_route_residency(&exec.graph, &exec.expert_region_candidates)?;
+
         // 5) Fully-static graphs are materialized eagerly (buffers + the whole
         //    "compiled plan" of kernels), so the first `run` sees only cache
         //    hits. Symbolic graphs cannot be sized until a `run` fixes their
@@ -2583,6 +2586,10 @@ impl Executor {
     /// context-cache model with compiled partitions spliced out.
     pub(crate) fn graph(&self) -> &Graph {
         &self.graph
+    }
+
+    pub(crate) fn execution_provider(&self) -> &dyn ExecutionProvider {
+        self.ep.as_ref()
     }
 
     pub(crate) fn execution_provider_fallback_report(

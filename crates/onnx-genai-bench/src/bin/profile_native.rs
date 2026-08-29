@@ -7,8 +7,8 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
 #[cfg(feature = "native-cuda")]
 use onnx_genai_bench::freetoken_byte_ab::{
-    ContractStatus, FreeTokenMetrics, FreeTokenRunReport, Metric, NATIVE_CUDA_BINARY_MARKER,
-    PolicyControl, RUN_SCHEMA,
+    ContractStatus, ExpertLayerMetric, FreeTokenMetrics, FreeTokenRunReport, Metric,
+    NATIVE_CUDA_BINARY_MARKER, PolicyControl, RUN_SCHEMA,
 };
 use onnx_genai_bench::freetoken_byte_ab::{ResidencyArm, WarmupRecord};
 use onnx_genai_bench::{fixture_path, synthetic_decoder};
@@ -23,6 +23,8 @@ use onnx_genai_engine::{
 };
 use onnx_genai_metadata::{DecoderAbi, KvOwnership, SequenceInputKind};
 use onnx_genai_ort::{DataType, Tokenizer, Value, available_execution_providers, profile};
+#[cfg(feature = "native-cuda")]
+use onnx_runtime_ep_api::{ExpertExecutionPhase, RouteResidencyInstallState};
 use onnx_runtime_session::InferenceSession;
 
 #[cfg(feature = "native-cuda")]
@@ -42,6 +44,15 @@ fn apply_vram_limit_env(config: &mut EngineConfig) -> Result<()> {
                 .map_err(|error| anyhow::anyhow!("invalid ONNX_GENAI_VRAM_LIMIT: {error}"))?;
             eprintln!("profile_native: ONNX_GENAI_VRAM_LIMIT -> vram_limit={limit:?}");
             config.limits.vram_limit = limit;
+        }
+        _ => {}
+    }
+    match std::env::var("ONNX_GENAI_HOST_RAM_LIMIT") {
+        Ok(raw) if !raw.trim().is_empty() => {
+            let limit = parse_resource_limit(raw.trim())
+                .map_err(|error| anyhow::anyhow!("invalid ONNX_GENAI_HOST_RAM_LIMIT: {error}"))?;
+            eprintln!("profile_native: ONNX_GENAI_HOST_RAM_LIMIT -> host_ram_limit={limit:?}");
+            config.limits.host_ram_limit = limit;
         }
         _ => {}
     }
@@ -1334,11 +1345,33 @@ fn write_freetoken_run_report(
     let policy_value = std::env::var(policy_env)
         .with_context(|| format!("FreeToken policy environment variable {policy_env} is unset"))?;
 
-    let expert_unavailable = "origin/main has no production route-to-residency attribution: \
-        QMoE route telemetry is not armed/collected by the executor and the process-global \
-        offload counters do not distinguish expert from dense weights";
-    let phase_unavailable = "the current process-global weight counters are reset around the \
-        measured generation window but have no prefill/decode or per-layer dimensions";
+    let expert = engine
+        .expert_residency_metrics()
+        .context("native CUDA engine exposed no completion-boundary expert residency metrics")?;
+    let install_state = match &expert.install_state {
+        RouteResidencyInstallState::NotAttempted => "NotAttempted",
+        RouteResidencyInstallState::GateDisabled => "GateDisabled",
+        RouteResidencyInstallState::OffloadDisabled => "OffloadDisabled",
+        RouteResidencyInstallState::Rejected(_) => "Rejected",
+        RouteResidencyInstallState::Installed { .. } => "Installed",
+    }
+    .to_string();
+    let layer_metrics = |phase| {
+        expert
+            .layers
+            .iter()
+            .filter(|layer| layer.phase == phase)
+            .map(|layer| ExpertLayerMetric {
+                node_id: layer.node_id.0,
+                node_name: layer.node_name.clone(),
+                selected_bytes: layer.selected_bytes,
+                gpu_hit_bytes: layer.gpu_hit_bytes,
+                h2d_bytes: layer.h2d_bytes,
+                cpu_served_bytes: layer.cpu_served_bytes,
+                page_ins: layer.page_ins,
+            })
+            .collect::<Vec<_>>()
+    };
     let offload = onnx_runtime_ep_cuda::global_offload_stats();
     let plan = engine.memory_strategy_plan();
     let resources = engine.resource_snapshot();
@@ -1396,56 +1429,130 @@ fn write_freetoken_run_report(
                 .to_string(),
         warmup,
         metrics: FreeTokenMetrics {
-            selected_expert_logical_bytes: Metric::unavailable(
-                "bytes",
-                "sum of canonical logical bytes for experts selected by actual routes",
-                expert_unavailable,
+            route_residency_install_state: Metric::available(
+                install_state,
+                "state",
+                "CUDA execution-provider production route-residency lifecycle state",
             ),
-            gpu_resident_expert_hit_bytes: Metric::unavailable(
-                "bytes",
-                "selected expert bytes served from device residency without a host transfer",
-                expert_unavailable,
-            ),
-            host_to_device_expert_page_in_bytes: Metric::unavailable(
-                "bytes",
-                "selected expert bytes accounted by completed/on-demand or enqueued/prefetch H2D",
-                expert_unavailable,
-            ),
-            cpu_served_expert_bytes: Metric::unavailable(
-                "bytes",
-                "selected expert bytes executed by a CPU expert kernel",
-                "origin/main has no CPU-served expert branch in native CUDA decode",
-            ),
-            expert_page_ins: Metric::unavailable(
+            route_residency_installs: Metric::available(
+                expert.installs,
                 "count",
-                "expert-only residency misses that entered the H2D page-in path",
-                expert_unavailable,
+                "production route-residency bindings installed by the CUDA execution provider",
             ),
-            expert_byte_hit_rate: Metric::unavailable(
+            route_residency_boundaries: Metric::available(
+                expert.boundaries,
+                "count",
+                "completion boundaries at which a production route window was consumed",
+            ),
+            route_residency_applied_boundaries: Metric::available(
+                expert.applied_boundaries,
+                "count",
+                "production route-residency boundaries that applied a routed hot set",
+            ),
+            route_residency_successful_applications: Metric::available(
+                expert.successful_applications,
+                "count",
+                "production boundary applications whose selected bytes reconciled after a \
+                 complete transition",
+            ),
+            route_residency_rejected_boundaries: Metric::available(
+                expert.rejected_boundaries,
+                "count",
+                "production route-residency boundaries rejected before successful application",
+            ),
+            selected_expert_logical_bytes: Metric::available(
+                expert.selected_bytes,
+                "bytes",
+                "canonical logical bytes selected by completed production routed-expert windows",
+            ),
+            gpu_resident_expert_hit_bytes: Metric::available(
+                expert.gpu_hit_bytes,
+                "bytes",
+                "selected expert bytes whose tracked physical backing was device-resident for \
+                 the completed kernel window",
+            ),
+            host_to_device_expert_page_in_bytes: Metric::available(
+                expert.h2d_bytes,
+                "bytes",
+                "expert-only host-to-device bytes published only after the content-preserving \
+                 physical transition completed successfully",
+            ),
+            cpu_served_expert_bytes: Metric::available(
+                expert.cpu_served_bytes,
+                "bytes",
+                "selected expert bytes whose physical backing was CPU/host NUMA for the \
+                 completed CUDA expert-kernel window",
+            ),
+            expert_page_ins: Metric::available(
+                expert.page_ins,
+                "count",
+                "expert-only host-to-device physical transitions completed at production \
+                 route-residency boundaries",
+            ),
+            expert_byte_hit_rate: Metric::available(
+                expert.gpu_hit_bytes as f64 / expert.selected_bytes.max(1) as f64,
                 "ratio",
-                "expert resident hit bytes divided by all selected expert bytes",
-                expert_unavailable,
+                "expert GPU-hit bytes divided by all selected expert logical bytes",
             ),
-            expert_bytes_per_emitted_token: Metric::unavailable(
+            expert_bytes_per_emitted_token: Metric::available(
+                expert.selected_bytes as f64 / emitted,
                 "bytes/token",
-                "selected expert logical/served bytes divided by emitted tokens",
-                expert_unavailable,
+                "selected expert logical bytes divided by emitted tokens",
             ),
-            prefill_expert_bytes_by_layer: Metric::unavailable(
+            prefill_expert_bytes_by_layer: Metric::available(
+                layer_metrics(ExpertExecutionPhase::Prefill),
                 "bytes",
-                "per-layer expert bytes attributed only to prefill",
-                phase_unavailable,
+                "completed expert-byte accounting attributed to production prefill kernels by \
+                 graph node",
             ),
-            decode_expert_bytes_by_layer: Metric::unavailable(
+            decode_expert_bytes_by_layer: Metric::available(
+                layer_metrics(ExpertExecutionPhase::Decode),
                 "bytes",
-                "per-layer expert bytes attributed only to decode",
-                phase_unavailable,
+                "completed expert-byte accounting attributed to production decode kernels by \
+                 graph node",
+            ),
+            expert_device_committed_bytes: Metric::available(
+                expert.device_committed_bytes,
+                "bytes",
+                "expert-only bytes whose tracked PMM/VMM physical backing is device memory at \
+                 the completion boundary",
+            ),
+            expert_host_committed_bytes: Metric::available(
+                expert.host_committed_bytes,
+                "bytes",
+                "expert-only bytes whose tracked PMM/VMM physical backing is host NUMA memory at \
+                 the completion boundary",
+            ),
+            expert_ref_underflows: Metric::available(
+                expert.ref_underflows,
+                "count",
+                "expert-only PMM/VMM reference-accounting underflows",
+            ),
+            expert_byte_underflows: Metric::available(
+                expert.byte_underflows,
+                "count",
+                "expert-only PMM/VMM byte-accounting underflows",
+            ),
+            expert_oversubscribed_bytes: Metric::available(
+                expert.oversubscribed_bytes,
+                "bytes",
+                "expert-only PMM/VMM oversubscribed physical bytes",
+            ),
+            expert_unaccounted_bytes: Metric::available(
+                expert.unaccounted_bytes,
+                "bytes",
+                "expert bytes that failed selected-service or physical-memory reconciliation",
             ),
             model_weight_layout_bytes: Metric::available(
                 plan.total_weight_bytes,
                 "bytes",
                 "memory planner sum of model weight storage bytes at engine load; analytical \
                  layout input, never physical HBM traffic",
+            ),
+            weight_residency_budget_bytes: Metric::available(
+                offload.budget_bytes,
+                "bytes",
+                "live CUDA weight-residency budget resolved from the explicit benchmark control",
             ),
             weight_gpu_resident_hit_bytes: Metric::available(
                 offload.hit_bytes,
@@ -3598,6 +3705,13 @@ fn run_steady(args: &Args, model_dir: &Path, device: NativeDecodeDevice) -> Resu
     let warmup = run_steady_warmup(args, &mut engine)?;
     #[cfg(not(feature = "native-cuda"))]
     let _ = &warmup;
+    #[cfg(feature = "native-cuda")]
+    if args.freetoken_report_json.is_some() {
+        let force_cold = matches!(args.freetoken_arm, Some(ResidencyArm::On));
+        engine
+            .reset_expert_residency_measurement(force_cold)
+            .context("prepare deterministic expert-residency measurement window")?;
+    }
     profile::reset();
     onnx_runtime_session::reset_exec_phase_profile();
     onnx_runtime_session::reset_dense_prefetch_gap_stats();

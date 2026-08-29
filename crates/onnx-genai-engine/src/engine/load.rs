@@ -1250,7 +1250,7 @@ impl Engine {
                     #[cfg(feature = "native-cuda")]
                     cuda_offload_policy,
                     #[cfg(feature = "native-cuda")]
-                    cuda_memory_governor: std::sync::Arc::new(governor.device_authority()),
+                    cuda_memory_governor: std::sync::Arc::new(governor.memory().clone()),
                     #[cfg(feature = "native-cuda")]
                     process_memory_manager: governor.process_memory_manager(),
                     io: metadata.decoder_io(),

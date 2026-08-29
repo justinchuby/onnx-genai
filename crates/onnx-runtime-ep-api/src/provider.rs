@@ -17,6 +17,68 @@ use crate::weight::ExecutionProviderCapabilities;
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct EpId(pub u32);
 
+/// Production route-residency install state.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum RouteResidencyInstallState {
+    #[default]
+    NotAttempted,
+    GateDisabled,
+    OffloadDisabled,
+    Rejected(String),
+    Installed {
+        banks: usize,
+    },
+}
+
+/// Shape-derived phase of one routed expert kernel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ExpertExecutionPhase {
+    Prefill,
+    Decode,
+}
+
+/// Completed expert-byte accounting for one graph layer and execution phase.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExpertLayerResidencyMetrics {
+    pub node_id: NodeId,
+    pub node_name: String,
+    pub phase: ExpertExecutionPhase,
+    pub selected_bytes: u64,
+    pub gpu_hit_bytes: u64,
+    pub h2d_bytes: u64,
+    pub cpu_served_bytes: u64,
+    pub page_ins: u64,
+}
+
+/// Authoritative, completion-boundary expert-residency metrics.
+///
+/// H2D bytes are added only after the content-preserving transition returns a
+/// completed success. CPU-served bytes identify selected expert ranges whose
+/// physical backing was host NUMA for the completed kernel window. A failed or
+/// partially rolled-back transition contributes neither success nor H2D bytes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExpertResidencyMetrics {
+    pub install_state: RouteResidencyInstallState,
+    pub installs: u64,
+    pub boundaries: u64,
+    pub applied_boundaries: u64,
+    pub successful_applications: u64,
+    pub rejected_boundaries: u64,
+    pub selected_bytes: u64,
+    pub gpu_hit_bytes: u64,
+    pub h2d_bytes: u64,
+    pub cpu_served_bytes: u64,
+    pub page_ins: u64,
+    pub device_committed_bytes: u64,
+    pub host_committed_bytes: u64,
+    pub ref_underflows: u64,
+    pub byte_underflows: u64,
+    pub oversubscribed_bytes: u64,
+    pub unaccounted_bytes: u64,
+    pub layers: Vec<ExpertLayerResidencyMetrics>,
+    pub last_reason: Option<String>,
+}
+
 /// Tie-break policy for [`ExecutionProvider::device_argmax`] when two or more
 /// logits share the maximum value.
 ///
@@ -1378,6 +1440,38 @@ pub trait ExecutionProvider: Send + Sync {
     /// consumes or resets anything, and surfaces a typed outcome to its own
     /// diagnostics rather than failing silently.
     fn consume_route_residency_at_boundary(&self) -> Result<()>;
+
+    /// Register the loaded graph's expert-region catalogs with the provider.
+    ///
+    /// Providers without routed expert residency keep the no-op default. CUDA
+    /// uses this once during executor construction, before any capture, then
+    /// binds the concrete kernel telemetry sources and VMM allocations lazily
+    /// when they exist.
+    fn prepare_route_residency(
+        &self,
+        _graph: &Graph,
+        _catalogs: &std::collections::HashMap<
+            onnx_runtime_ir::ValueId,
+            onnx_runtime_loader::WeightRegionCatalog,
+        >,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Reset completed route-residency accounting for a measurement window.
+    ///
+    /// When `force_cold` is true, a participating provider must first move the
+    /// bindable expert ranges to host physical backing at a safe boundary. This
+    /// makes the next real route a deterministic miss/page-in rather than
+    /// inheriting a vacuous warm cache.
+    fn reset_route_residency_measurement(&self, _force_cold: bool) -> Result<()> {
+        Ok(())
+    }
+
+    /// Snapshot authoritative completed expert-residency metrics.
+    fn expert_residency_metrics(&self) -> Option<ExpertResidencyMetrics> {
+        None
+    }
 
     /// Explicit device allocation/free counters, when the EP exposes them.
     fn device_allocation_counts(&self) -> Option<(u64, u64)> {

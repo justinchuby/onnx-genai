@@ -27,13 +27,14 @@
 
 use std::borrow::Cow;
 use std::ffi::c_void;
+use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use cudarc::driver::sys::CUdeviceptr;
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 use onnx_runtime_ep_api::{
-    EpError, Kernel, KernelFactory, Result, TensorMetadata, TensorMut, TensorView,
-    WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
+    CaptureSupport, EpError, ExpertExecutionPhase, Kernel, KernelFactory, Result, TensorMetadata,
+    TensorMut, TensorView, WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
 };
 use onnx_runtime_ep_cpu::kernels::moe::{
     Activation, DEFAULT_SWIGLU_LIMIT, validate_moe_activation_attributes,
@@ -46,6 +47,7 @@ use crate::kernels::block_quantized_matmul::{BlockFormat, decoder_prelude};
 use crate::kernels::expert_route_telemetry::{
     ArmedTelemetry, MARK_DEVICE_SRC, RouteTelemetryConfig, TelemetrySnapshot, TelemetryUnsupported,
 };
+use crate::route_residency::{RouteTelemetryRegistry, RouteTelemetrySource};
 use crate::runtime::{CudaRuntime, cuptr};
 
 const OP: &str = "BlockQuantizedMoE";
@@ -617,11 +619,107 @@ fn claim_format_attr(
 
 pub struct BlockQuantizedMoEFactory {
     pub runtime: Arc<CudaRuntime>,
+    pub route_sources: Option<Arc<RouteTelemetryRegistry>>,
 }
 
 impl KernelFactory for BlockQuantizedMoEFactory {
     fn create(&self, node: &Node, input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        Ok(Box::new(self.create_kernel(node, input_shapes)?))
+        let kernel = Arc::new(self.create_kernel(node, input_shapes)?);
+        let route_activation = if let Some(registry) = self.route_sources.as_ref()
+            && let Some(num_experts) = input_shapes.get(1).and_then(|shape| shape.get(1)).copied()
+        {
+            let config = RouteTelemetryConfig {
+                request_id: 1,
+                device_id: self.runtime.ordinal(),
+                num_experts,
+            };
+            if kernel.arm_route_telemetry(config).is_ok() {
+                Some(RouteSourceActivation {
+                    registry: Arc::clone(registry),
+                    node_id: node.id,
+                    node_name: node.name.clone(),
+                    phase: expert_phase(input_shapes.first()),
+                    expected_epoch: Arc::new(AtomicU32::new(1)),
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        Ok(Box::new(SharedBlockQuantizedMoEKernel {
+            kernel,
+            route_activation,
+        }))
+    }
+}
+
+fn expert_phase(input_shape: Option<&Vec<usize>>) -> ExpertExecutionPhase {
+    let rows = input_shape
+        .and_then(|shape| shape.split_last().map(|(_, prefix)| prefix))
+        .map(|prefix| prefix.iter().copied().product::<usize>())
+        .unwrap_or(1);
+    if rows > 1 {
+        ExpertExecutionPhase::Prefill
+    } else {
+        ExpertExecutionPhase::Decode
+    }
+}
+
+struct RouteSourceActivation {
+    registry: Arc<RouteTelemetryRegistry>,
+    node_id: onnx_runtime_ir::NodeId,
+    node_name: String,
+    phase: ExpertExecutionPhase,
+    expected_epoch: Arc<AtomicU32>,
+}
+
+struct SharedBlockQuantizedMoEKernel {
+    kernel: Arc<BlockQuantizedMoEKernel>,
+    route_activation: Option<RouteSourceActivation>,
+}
+
+impl Kernel for SharedBlockQuantizedMoEKernel {
+    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        self.activate_route_source();
+        self.kernel.execute(inputs, outputs)
+    }
+
+    fn workspace_requirement(&self, inputs: &[TensorMetadata<'_>]) -> Result<WorkspaceRequirement> {
+        self.kernel.workspace_requirement(inputs)
+    }
+
+    fn execute_with_workspace(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
+        self.activate_route_source();
+        self.kernel
+            .execute_with_workspace(inputs, outputs, workspace)
+    }
+
+    fn supports_strided_input(&self, input_idx: usize) -> bool {
+        self.kernel.supports_strided_input(input_idx)
+    }
+
+    fn capture_support(&self) -> CaptureSupport {
+        self.kernel.capture_support()
+    }
+}
+
+impl SharedBlockQuantizedMoEKernel {
+    fn activate_route_source(&self) {
+        if let Some(activation) = self.route_activation.as_ref() {
+            activation.registry.activate(
+                activation.node_id,
+                Arc::clone(&self.kernel) as Arc<dyn RouteTelemetrySource>,
+                activation.phase,
+                activation.node_name.clone(),
+                Arc::clone(&activation.expected_epoch),
+            );
+        }
     }
 }
 
@@ -847,6 +945,16 @@ impl Drop for BlockQuantizedMoEKernel {
         {
             armed.free(&self.runtime);
         }
+    }
+}
+
+impl RouteTelemetrySource for BlockQuantizedMoEKernel {
+    fn route_telemetry_snapshot(&self) -> Result<Option<TelemetrySnapshot>> {
+        BlockQuantizedMoEKernel::route_telemetry_snapshot(self)
+    }
+
+    fn reset_route_telemetry_boundary(&self) -> Result<()> {
+        BlockQuantizedMoEKernel::reset_route_telemetry_boundary(self)
     }
 }
 

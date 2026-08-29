@@ -831,6 +831,16 @@ impl NativeDecodeSession {
             .map(|state| state.debug_stats(&self.session))
     }
 
+    pub fn reset_expert_residency_measurement(&self, force_cold: bool) -> anyhow::Result<()> {
+        self.session
+            .reset_expert_residency_measurement(force_cold)
+            .map_err(anyhow::Error::from)
+    }
+
+    pub fn expert_residency_metrics(&self) -> Option<onnx_runtime_ep_api::ExpertResidencyMetrics> {
+        self.session.expert_residency_metrics()
+    }
+
     /// Number of captured device-graph segments installed by the most recent
     /// capture on the main decode graph slot (1 = whole-subgraph capture that
     /// reaches the zero-host-work replay fast path; >=2 = a segmented capture

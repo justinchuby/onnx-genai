@@ -52,6 +52,17 @@ const WEIGHT_SLOT_ALIGN: usize = 256;
 /// bounded so a stalled device becomes an explicit error rather than a hang.
 const DEFERRED_RELEASE_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 
+type RouteResidencyDeviceAuthorities = (
+    HashMap<onnx_runtime_ir::ValueId, crate::route_residency::RouteAllocationBinding>,
+    Arc<onnx_runtime_cuda_memory::virtual_memory::PhysicalHandlePool>,
+);
+
+type RouteResidencyAuthorities = (
+    HashMap<onnx_runtime_ir::ValueId, crate::route_residency::RouteAllocationBinding>,
+    Arc<onnx_runtime_cuda_memory::virtual_memory::PhysicalHandlePool>,
+    Arc<onnx_runtime_cuda_memory::virtual_memory::PhysicalHandlePool>,
+);
+
 /// Process-global weight-offload activity counters. These may be reset between
 /// benchmark measurement windows while caches remain alive.
 static GLOBAL_PAGE_INS: AtomicU64 = AtomicU64::new(0);
@@ -1512,6 +1523,7 @@ enum WeightAllocation {
     Vmm {
         allocator: Arc<crate::vmm_allocator::CudaVmmAllocator>,
         allowance: onnx_runtime_memory_governor::MappedAllowance,
+        allocation_align: usize,
         /// When `true`, this page occupies a per-key **stable virtual address
         /// slot** (issue #716). Its Drop unmaps the physical granules but KEEPS
         /// the reserved VA live so the next page-in of the same key reuses the
@@ -1652,6 +1664,7 @@ enum WeightReleaseAction {
         allowance: onnx_runtime_memory_governor::MappedAllowance,
         ptr: CUdeviceptr,
         len: usize,
+        allocation_align: usize,
     },
     /// A persistent stable-VA slot: the physical granules are decommitted and
     /// the address is kept for the captured graph that baked it.
@@ -1747,6 +1760,7 @@ impl WeightReleaseAction {
                 allowance,
                 ptr,
                 len,
+                allocation_align,
             } => {
                 let Some(ptr) = NonNull::new(ptr as *mut u8) else {
                     return DeferredActionOutcome::released(0);
@@ -1758,7 +1772,7 @@ impl WeightReleaseAction {
                         allocator.as_ref(),
                         ptr,
                         len,
-                        WEIGHT_SLOT_ALIGN,
+                        allocation_align,
                     )
                 };
                 match outcome {
@@ -1999,6 +2013,7 @@ impl CudaWeightPage {
             WeightAllocation::Vmm {
                 allocator,
                 allowance,
+                allocation_align,
                 stable_slot,
                 slot_state,
             } => {
@@ -2036,6 +2051,7 @@ impl CudaWeightPage {
                         allowance,
                         ptr: self.ptr,
                         len: self.len,
+                        allocation_align,
                     })
                 }
             }
@@ -2805,6 +2821,7 @@ pub struct CudaWeightResidency {
     /// a *staging* pipeline over the shared runtime/pool — it admits nothing to
     /// `inner.pages`, so it is not a second residency/cache authority.
     prefill_pipeline: Mutex<Option<PrefillPipeline>>,
+    route_host_pool: OnceLock<Arc<onnx_runtime_cuda_memory::virtual_memory::PhysicalHandlePool>>,
 }
 
 /// RAII handle for a live [`onnx_runtime_ep_api::RoutedResidencyProof`],
@@ -3282,6 +3299,10 @@ fn eviction_for_boundary(
 }
 
 impl CudaWeightResidency {
+    pub(crate) fn runtime(&self) -> &Arc<CudaRuntime> {
+        &self.runtime
+    }
+
     /// Build a residency cache with an explicit VRAM `budget_bytes`. This
     /// constructor is synchronous by itself so tests can choose deliberately;
     /// [`DeviceOffloadPolicy::from_env`] supplies the runtime default.
@@ -3325,6 +3346,7 @@ impl CudaWeightResidency {
             routed_guards_active: AtomicU64::new(0),
             prefill_double_buffer_enabled: prefill_double_buffer_enabled(),
             prefill_pipeline: Mutex::new(None),
+            route_host_pool: OnceLock::new(),
         }
     }
 
@@ -3392,7 +3414,110 @@ impl CudaWeightResidency {
             routed_guards_active: AtomicU64::new(0),
             prefill_double_buffer_enabled: prefill_double_buffer_enabled(),
             prefill_pipeline: Mutex::new(None),
+            route_host_pool: OnceLock::new(),
         })
+    }
+
+    /// Resolve production expert-bank allocation bindings and the two physical
+    /// pools used by content-preserving Device↔HostNuma transitions.
+    ///
+    /// Every binding points into this residency's existing shared VMM arena;
+    /// no per-value allocator or cache is created. Missing/non-retained values
+    /// fail closed so a route boundary can never partially bind a bank.
+    pub(crate) fn route_residency_authorities(
+        &self,
+        values: &[onnx_runtime_ir::ValueId],
+    ) -> std::result::Result<RouteResidencyAuthorities, String> {
+        let (bindings, device_pool) = self.route_residency_device_bindings(values)?;
+        let physical = self
+            .physical
+            .get()
+            .ok_or_else(|| "VMM physical admission is not installed".to_string())?;
+        let host_pool = if let Some(pool) = self.route_host_pool.get() {
+            Arc::clone(pool)
+        } else {
+            let capability = onnx_runtime_cuda_memory::capability::host_numa_capability(
+                self.runtime.ordinal() as i32,
+            )
+            .map_err(|error| error.to_string())?;
+            let (budget, _) = self.budget();
+            let pool =
+                onnx_runtime_cuda_memory::virtual_memory::PhysicalHandlePool::get_or_create_at_location(
+                    self.runtime.cuda_context(),
+                    self.runtime.ordinal() as i32,
+                    onnx_runtime_cuda_memory::virtual_memory::PhysicalLocation::HostNuma {
+                        node: capability.host_numa_id,
+                    },
+                    usize::try_from(budget)
+                        .unwrap_or(usize::MAX)
+                        .max(device_pool.granularity()),
+                    physical.governor.as_ref(),
+                    onnx_runtime_memory_governor::HolderId::new(1810),
+                    onnx_runtime_memory_governor::MemoryRole::Weights,
+                )
+                .map_err(|error| error.to_string())?;
+            let _ = self.route_host_pool.set(Arc::clone(&pool));
+            self.route_host_pool.get().map_or(pool, Arc::clone)
+        };
+        Ok((bindings, device_pool, host_pool))
+    }
+
+    pub(crate) fn route_residency_device_bindings(
+        &self,
+        values: &[onnx_runtime_ir::ValueId],
+    ) -> std::result::Result<RouteResidencyDeviceAuthorities, String> {
+        let physical = self
+            .physical
+            .get()
+            .ok_or_else(|| "VMM physical admission is not installed".to_string())?;
+        let device_pool = physical
+            .allocator
+            .physical_pool()
+            .ok_or_else(|| "production VMM allocator has no retained device pool".to_string())?;
+
+        let inner = self.lock();
+        let mut bindings = std::collections::HashMap::with_capacity(values.len());
+        for &value in values {
+            let key = u64::from(value.0);
+            let page = inner.pages.get(&key).ok_or_else(|| {
+                format!(
+                    "bank value {value:?} has a stable VMM slot but no live resident page; \
+                     refusing to infer physical backing from reserved VA"
+                )
+            })?;
+            let slot = inner
+                .slots
+                .get(&key)
+                .ok_or_else(|| format!("bank value {value:?} has no retained stable VMM slot"))?;
+            if page.device_ptr() as usize != slot.va as usize || page.len() != slot.len {
+                return Err(format!(
+                    "bank value {value:?} resident page does not match its stable VMM slot"
+                ));
+            }
+            if slot.state.status() != SlotStatus::Idle {
+                return Err(format!(
+                    "bank value {value:?} stable VMM slot is not idle ({:?})",
+                    slot.state.status()
+                ));
+            }
+            let ptr = std::ptr::NonNull::new(slot.va as *mut u8)
+                .ok_or_else(|| format!("bank value {value:?} has a null stable VA"))?;
+            let base_offset = physical
+                .allocator
+                .live_allocation_offset(ptr, slot.len)
+                .ok_or_else(|| {
+                    format!("bank value {value:?} stable slot is not a live VMM allocation")
+                })?;
+            bindings.insert(
+                value,
+                crate::route_residency::RouteAllocationBinding {
+                    allocator: Arc::clone(&physical.allocator),
+                    base_offset,
+                    allocation_bytes: slot.len,
+                },
+            );
+        }
+        Ok((bindings, device_pool))
     }
 
     /// Bytes this cache is entitled to, and whether that came from a governor.
@@ -4830,6 +4955,11 @@ impl CudaWeightResidency {
         // throwaway reservation; whether that becomes a persistent slot is
         // decided once admission classifies the page as retained vs bypassed.
         let reused_slot = inner.slots.get(&key).cloned();
+        let allocation_align = physical
+            .allocator
+            .physical_pool()
+            .map_or(WEIGHT_SLOT_ALIGN, |pool| pool.granularity())
+            .max(WEIGHT_SLOT_ALIGN);
         let ptr = match reused_slot.as_ref() {
             Some(slot) => {
                 // A key's byte size is fixed by the weight it names; a differing
@@ -4899,7 +5029,7 @@ impl CudaWeightResidency {
             }
             None => physical
                 .allocator
-                .allocate_committed(len, WEIGHT_SLOT_ALIGN, &[])
+                .allocate_committed(len, allocation_align, &[])
                 .map_err(|error| WeightHandleError::DeviceBinding(error.to_string()))?,
         };
 
@@ -4996,6 +5126,7 @@ impl CudaWeightResidency {
             allocation: WeightAllocation::Vmm {
                 allocator: Arc::clone(&physical.allocator),
                 allowance: allowance.clone(),
+                allocation_align,
                 stable_slot,
                 slot_state,
             },

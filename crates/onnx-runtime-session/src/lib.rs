@@ -1685,6 +1685,23 @@ impl InferenceSession {
         self.exec.max_lazy_weight_working_set_bytes()
     }
 
+    /// Reset authoritative expert-residency accounting after warm-up.
+    ///
+    /// `force_cold=true` moves every bindable expert range to host physical
+    /// backing first, so the next production route must observe a real miss and
+    /// completed page-in before subsequent routes can hit.
+    pub fn reset_expert_residency_measurement(&self, force_cold: bool) -> Result<()> {
+        self.exec
+            .execution_provider()
+            .reset_route_residency_measurement(force_cold)?;
+        Ok(())
+    }
+
+    /// Snapshot authoritative completed expert-residency metrics.
+    pub fn expert_residency_metrics(&self) -> Option<onnx_runtime_ep_api::ExpertResidencyMetrics> {
+        self.exec.execution_provider().expert_residency_metrics()
+    }
+
     pub fn device_id(&self) -> onnx_runtime_ir::DeviceId {
         self.exec.device_id()
     }

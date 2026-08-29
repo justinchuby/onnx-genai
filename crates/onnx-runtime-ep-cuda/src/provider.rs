@@ -62,12 +62,13 @@ use onnx_runtime_memory_governor::{
 use crate::deferred_release::{
     CudaDeferredReleaseQueue, CudaStreamFences, DEFAULT_DEFERRED_RELEASE_CAPACITY, ReleaseObserver,
 };
-use crate::kernels::build_cuda_registry_with_metrics;
+use crate::kernels::build_cuda_registry_with_observability;
 use crate::kernels::csa_checkpoint::CsaMetrics;
 use crate::optimizer::cuda_optimization_passes;
 use crate::route_residency::{
     RouteResidencyBoundary, RouteResidencyDiagnostics, RouteResidencyInstallOutcome,
-    build_route_residency_boundary,
+    RouteTelemetryRegistry, build_route_residency_boundaries_with_bindings,
+    build_route_residency_boundary, force_cold_route_residency_boundary,
 };
 use crate::runtime::{CudaRuntime, cuptr};
 use crate::weight_paging::{CudaWeightResidency, DeviceOffloadPolicy, PrefillRoute};
@@ -916,14 +917,20 @@ pub struct CudaExecutionProvider {
     /// The context-owned queue that performs every final device release after
     /// both stream tails.
     release_queue: Arc<CudaDeferredReleaseQueue>,
-    /// Slice-7C boundary consumer wiring. `route_boundary` binds one expert
-    /// bank's producer window source + residency authorities for the coarse
-    /// safe-boundary consumer; it is `None` in production today (the reachable
-    /// seam has no live per-session registration yet, exactly like the 7A/7B
-    /// producer/consumer shipped) and is installed only by the Slice-7C tests.
-    /// `route_diag` carries the typed outcome of every boundary.
-    route_boundary: Mutex<Option<Arc<RouteResidencyBoundary>>>,
+    /// Production boundary-consumer bindings, one per routed expert bank.
+    /// They are discovered from the loaded graph and live VMM slots after the
+    /// concrete shape-specific kernels execute. `route_diag` carries the typed
+    /// lifecycle and outcome of every boundary.
+    route_boundary: Mutex<Vec<Arc<RouteResidencyBoundary>>>,
+    route_sources: Arc<RouteTelemetryRegistry>,
+    route_preparation: Mutex<Option<RouteResidencyPreparation>>,
+    route_source_generation: AtomicU64,
     route_diag: Arc<RouteResidencyDiagnostics>,
+}
+
+struct RouteResidencyPreparation {
+    graph: Graph,
+    catalogs: std::collections::HashMap<ValueId, onnx_runtime_loader::WeightRegionCatalog>,
 }
 
 impl std::fmt::Debug for CudaExecutionProvider {
@@ -998,7 +1005,16 @@ impl CudaExecutionProvider {
             Some(governor) => CsaMetrics::with_governor(Arc::clone(governor)),
             None => CsaMetrics::default(),
         });
-        let registry = build_cuda_registry_with_metrics(runtime.clone(), csa_metrics.clone());
+        let route_sources = Arc::new(RouteTelemetryRegistry::default());
+        let route_sources_for_registry =
+            (crate::coarse_residency::coarse_residency_profile_enabled()
+                || crate::route_residency::expert_accounting_enabled())
+            .then(|| Arc::clone(&route_sources));
+        let registry = build_cuda_registry_with_observability(
+            runtime.clone(),
+            csa_metrics.clone(),
+            route_sources_for_registry,
+        );
         let auto_dynamic_lending = auto_dynamic_lending_for(
             governor.is_some(),
             &offload_policy,
@@ -1172,7 +1188,10 @@ impl CudaExecutionProvider {
             retired_memory_mechanisms: Vec::new(),
             retired_allocator_teardown: Vec::new(),
             release_queue,
-            route_boundary: Mutex::new(None),
+            route_boundary: Mutex::new(Vec::new()),
+            route_sources,
+            route_preparation: Mutex::new(None),
+            route_source_generation: AtomicU64::new(0),
             route_diag: Arc::new(RouteResidencyDiagnostics::default()),
         };
         if let Some(residency) = provider.residency.as_ref() {
@@ -1755,14 +1774,14 @@ impl CudaExecutionProvider {
     /// [`ExecutionProvider::consume_route_residency_at_boundary`] at
     /// `Executor::finish_device_validation`) will, *when the default-off gate is
     /// enabled*, snapshot → consume → reset this bank's window exactly once per
-    /// request boundary. Production has no live per-session registration yet, so
-    /// this is `#[doc(hidden)]` and used only by the Slice-7C wiring tests.
+    /// request boundary. This explicit installer remains for focused fault and
+    /// lifecycle tests; production uses automatic graph/source/slot discovery.
     #[doc(hidden)]
     pub fn install_route_residency_boundary(&self, boundary: Arc<RouteResidencyBoundary>) {
         *self
             .route_boundary
             .lock()
-            .expect("cuda_ep route-residency boundary poisoned") = Some(boundary);
+            .expect("cuda_ep route-residency boundary poisoned") = vec![boundary];
     }
 
     /// The typed reason/outcome surface for every route-residency boundary this
@@ -1770,6 +1789,158 @@ impl CudaExecutionProvider {
     /// read the counters and last reason from here.
     pub fn route_residency_diagnostics(&self) -> &Arc<RouteResidencyDiagnostics> {
         &self.route_diag
+    }
+
+    fn observe_gate_disabled_expert_routes(&self) -> Result<()> {
+        if !crate::route_residency::expert_accounting_enabled() {
+            return Ok(());
+        }
+        let preparation = self.route_preparation.lock().unwrap();
+        let Some(preparation) = preparation.as_ref() else {
+            return Ok(());
+        };
+        let (_, sources) = self.route_sources.snapshot();
+        for group in onnx_runtime_ep_api::expert_weight_groups(&preparation.graph) {
+            let Some(registered) = sources.get(&group.node) else {
+                self.route_diag.record_rejected(&format!(
+                    "gate-disabled observer has no telemetry source for {:?}",
+                    group.node
+                ));
+                continue;
+            };
+            let Some(snapshot) = registered.source.route_telemetry_snapshot()? else {
+                self.route_diag.record_rejected(&format!(
+                    "gate-disabled observer source for {:?} is disarmed",
+                    group.node
+                ));
+                continue;
+            };
+            let expected_epoch = registered.expected_epoch.load(Ordering::Acquire);
+            match crate::kernels::expert_route_telemetry::consume_and_validate(
+                &snapshot.header,
+                &snapshot.bitmap,
+                expected_epoch,
+                1,
+                self.device.index,
+            ) {
+                crate::kernels::expert_route_telemetry::RouteDecision::HotSet(_) => {
+                    let routed = snapshot.routed_experts();
+                    let selected = group
+                        .members
+                        .iter()
+                        .filter_map(|value| preparation.catalogs.get(value))
+                        .flat_map(|catalog| {
+                            routed.iter().filter_map(|&expert| {
+                                catalog
+                                    .relative_range(expert)
+                                    .map(|range| range.end.saturating_sub(range.start) as u64)
+                            })
+                        })
+                        .fold(0u64, u64::saturating_add);
+                    self.route_diag.record_observation(
+                        group.node,
+                        &registered.node_name,
+                        registered.phase,
+                        selected,
+                    );
+                    registered.source.reset_route_telemetry_boundary()?;
+                    registered.expected_epoch.fetch_add(1, Ordering::Release);
+                }
+                crate::kernels::expert_route_telemetry::RouteDecision::WholeBank(reason) => {
+                    self.route_diag.record_rejected(&reason);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_production_route_residency_bindings(&self) -> RouteResidencyInstallOutcome {
+        if !crate::coarse_residency::coarse_residency_profile_enabled() {
+            self.route_diag
+                .record_decline("coarse-residency gate disabled");
+            return RouteResidencyInstallOutcome::GateDisabled;
+        }
+        let Some(residency) = self.residency.as_ref() else {
+            self.route_diag
+                .record_decline("weight offload/coarse residency disabled");
+            return RouteResidencyInstallOutcome::OffloadDisabled;
+        };
+        let (source_generation, sources) = self.route_sources.snapshot();
+        if source_generation == self.route_source_generation.load(Ordering::Acquire)
+            && !self.route_boundary.lock().unwrap().is_empty()
+        {
+            let banks = self
+                .route_boundary
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|boundary| boundary.bank_value_count())
+                .sum();
+            return RouteResidencyInstallOutcome::Installed { banks };
+        }
+        let preparation = self.route_preparation.lock().unwrap();
+        let Some(preparation) = preparation.as_ref() else {
+            let reject = crate::route_residency::RouteResidencyBindingReject::NoExpertGroups;
+            self.route_diag
+                .record_decline("route residency was not prepared");
+            return RouteResidencyInstallOutcome::Rejected(reject);
+        };
+        let values = onnx_runtime_ep_api::expert_weight_groups(&preparation.graph)
+            .into_iter()
+            .flat_map(|group| group.members)
+            .collect::<Vec<_>>();
+        let (bindings, device_pool, host_pool) = match residency
+            .route_residency_authorities(&values)
+        {
+            Ok(authorities) => authorities,
+            Err(reason) => {
+                self.route_diag.record_decline(&reason);
+                let value = values.first().copied().unwrap_or(ValueId(u32::MAX));
+                return RouteResidencyInstallOutcome::Rejected(
+                    crate::route_residency::RouteResidencyBindingReject::MissingAllocator { value },
+                );
+            }
+        };
+        match build_route_residency_boundaries_with_bindings(
+            &preparation.graph,
+            Arc::clone(residency),
+            &sources,
+            &preparation.catalogs,
+            &bindings,
+            device_pool,
+            host_pool,
+            1,
+            self.device.index as i32,
+            1,
+            self.device.index,
+            1,
+        ) {
+            Ok(boundaries) => {
+                let previous = self.route_boundary.lock().unwrap().clone();
+                for boundary in &boundaries {
+                    if let Some(old) = previous
+                        .iter()
+                        .find(|candidate| candidate.node_id() == boundary.node_id())
+                    {
+                        boundary.inherit_tier_state(old);
+                    }
+                }
+                let banks = boundaries
+                    .iter()
+                    .map(RouteResidencyBoundary::bank_value_count)
+                    .sum();
+                *self.route_boundary.lock().unwrap() =
+                    boundaries.into_iter().map(Arc::new).collect();
+                self.route_source_generation
+                    .store(source_generation, Ordering::Release);
+                self.route_diag.record_install(banks);
+                RouteResidencyInstallOutcome::Installed { banks }
+            }
+            Err(reject) => {
+                self.route_diag.record_decline(&reject.reason());
+                RouteResidencyInstallOutcome::Rejected(reject)
+            }
+        }
     }
 
     /// Construct and install a production [`RouteResidencyBoundary`] from a
@@ -1862,12 +2033,52 @@ impl CudaExecutionProvider {
     /// source/residency/pool handles it held. Called at request/model teardown
     /// ([`ExecutionProvider::shutdown`]); idempotent and safe when nothing is
     /// installed (the default). After draining, the boundary consumer is inert
-    /// again until a new binding is installed.
-    pub fn drain_route_residency_boundary(&self) {
-        *self
-            .route_boundary
-            .lock()
-            .expect("cuda_ep route-residency boundary poisoned") = None;
+    /// again until a new binding is installed. Returns whether a binding was
+    /// present; production mixed-location bindings are synchronized and
+    /// restored to all-device backing before their handles are released.
+    pub fn drain_route_residency_boundary(&self) -> bool {
+        let boundaries = std::mem::take(
+            &mut *self
+                .route_boundary
+                .lock()
+                .expect("cuda_ep route-residency boundary poisoned"),
+        );
+        if boundaries.is_empty() {
+            return false;
+        }
+        if let Err(error) = self.runtime.drain_for_unmap() {
+            eprintln!(
+                "cuda_ep: WARNING: route-residency teardown could not establish a CUDA safe \
+                 point: {error}; retaining its authority handles"
+            );
+            std::mem::forget(boundaries);
+            return true;
+        }
+        if !self
+            .release_queue
+            .wait_until_idle(std::time::Duration::from_secs(30))
+        {
+            eprintln!(
+                "cuda_ep: WARNING: route-residency teardown timed out waiting for deferred \
+                 releases; retaining its authority handles"
+            );
+            std::mem::forget(boundaries);
+            return true;
+        }
+        for boundary in &boundaries {
+            if let Err(error) =
+                crate::route_residency::restore_device_route_residency_boundary(boundary)
+            {
+                eprintln!(
+                    "cuda_ep: WARNING: route-residency teardown could not restore the all-device \
+                     physical topology: {error}; retaining its authority handles rather than \
+                     returning host-NUMA handles through the device pool"
+                );
+                std::mem::forget(boundaries);
+                return true;
+            }
+        }
+        true
     }
 
     /// Test-only sibling of [`ExecutionProvider::consume_route_residency_at_boundary`]
@@ -1893,10 +2104,10 @@ impl CudaExecutionProvider {
                 .route_boundary
                 .lock()
                 .expect("cuda_ep route-residency boundary poisoned");
-            match guard.as_ref() {
-                Some(boundary) => Arc::clone(boundary),
-                None => return Ok(()),
-            }
+            let Some(boundary) = guard.first() else {
+                return Ok(());
+            };
+            Arc::clone(boundary)
         };
         crate::route_residency::run_route_residency_boundary_with_phase8_faults(
             &self.runtime,
@@ -2568,7 +2779,10 @@ impl ExecutionProvider for CudaExecutionProvider {
 
     /// Stop accepting provider-owned work and retire what this provider holds.
     ///
-    /// This deliberately does **not** wait and does not synchronize the device:
+    /// This normally does **not** wait. A production mixed-location route
+    /// binding is the exception: it must synchronize, restore every expert to
+    /// device backing, and settle those releases before the ordinary device
+    /// pool can own teardown again.
     ///
     /// * new provider-owned work is refused (`closed`), and the queue stops
     ///   accepting new requests;
@@ -2589,13 +2803,23 @@ impl ExecutionProvider for CudaExecutionProvider {
         // Drain any installed route-residency binding first, so the boundary
         // consumer is inert during teardown and the producer source/residency
         // handles it held are released before residency retirement.
-        self.drain_route_residency_boundary();
+        let had_route_residency = self.drain_route_residency_boundary();
         // Retire residency so every page it holds enqueues its release behind
         // the stream fences recorded at this moment. Releases already accepted
         // finish afterwards, because the queue's worker, the binding's
         // provider-context pin, and each request's own pins keep the CUDA
         // context and streams alive.
         self.retire_residency();
+        if had_route_residency
+            && !self
+                .release_queue
+                .wait_until_idle(std::time::Duration::from_secs(30))
+        {
+            eprintln!(
+                "cuda_ep: WARNING: route-residency teardown timed out settling restored expert \
+                 allocations before memory-context retirement"
+            );
+        }
         self.arm_memory_cleanup();
         // The queue is told to close *once drained*, not now: releases of memory
         // this provider already issued are ownership it is obliged to settle,
@@ -3785,25 +4009,182 @@ impl ExecutionProvider for CudaExecutionProvider {
     /// `sync()`, past capture/replay). Default-off and byte-identical: when the
     /// gate is disabled — the shipped default — this is a single env read with
     /// no lock, no snapshot, no allocation, no launch, and no telemetry reset.
-    /// When enabled but no boundary binding is installed (production today) it
-    /// is a lock + `None` check. Only when a binding is installed (the Slice-7C
-    /// tests) does it drive snapshot → consume → reset exactly once, recording
-    /// the typed outcome in [`route_residency_diagnostics`](Self::route_residency_diagnostics).
+    /// When enabled, it refreshes production bindings from the active
+    /// shape-specific telemetry sources and retained VMM slots, then drives
+    /// snapshot → consume → reset exactly once, recording the typed outcome in
+    /// [`route_residency_diagnostics`](Self::route_residency_diagnostics).
     fn consume_route_residency_at_boundary(&self) -> Result<()> {
         if !crate::coarse_residency::coarse_residency_profile_enabled() {
-            return Ok(());
+            return self.observe_gate_disabled_expert_routes();
         }
-        let boundary = {
+        match self.ensure_production_route_residency_bindings() {
+            RouteResidencyInstallOutcome::Installed { .. } => {}
+            RouteResidencyInstallOutcome::GateDisabled
+            | RouteResidencyInstallOutcome::OffloadDisabled
+            | RouteResidencyInstallOutcome::Rejected(_) => return Ok(()),
+        }
+        let boundaries = {
             let guard = self
                 .route_boundary
                 .lock()
                 .expect("cuda_ep route-residency boundary poisoned");
-            match guard.as_ref() {
-                Some(boundary) => Arc::clone(boundary),
-                None => return Ok(()),
-            }
+            guard.clone()
         };
-        crate::route_residency::run_route_residency_boundary(&boundary, &self.route_diag)
+        for boundary in boundaries {
+            crate::route_residency::run_route_residency_boundary(&boundary, &self.route_diag)?;
+        }
+        Ok(())
+    }
+
+    fn prepare_route_residency(
+        &self,
+        graph: &Graph,
+        catalogs: &std::collections::HashMap<ValueId, onnx_runtime_loader::WeightRegionCatalog>,
+    ) -> Result<()> {
+        if !crate::coarse_residency::coarse_residency_profile_enabled() {
+            self.route_diag
+                .record_decline("coarse-residency gate disabled");
+            if !crate::route_residency::expert_accounting_enabled() {
+                return Ok(());
+            }
+        }
+        if self.residency.is_none() {
+            self.route_diag
+                .record_decline("weight offload/coarse residency disabled");
+            return Ok(());
+        }
+        *self.route_preparation.lock().unwrap() = Some(RouteResidencyPreparation {
+            graph: graph.clone(),
+            catalogs: catalogs.clone(),
+        });
+        Ok(())
+    }
+
+    fn reset_route_residency_measurement(&self, force_cold: bool) -> Result<()> {
+        if !crate::coarse_residency::coarse_residency_profile_enabled() {
+            self.route_diag.reset_measurement();
+            return Ok(());
+        }
+        if !matches!(
+            self.ensure_production_route_residency_bindings(),
+            RouteResidencyInstallOutcome::Installed { .. }
+        ) {
+            return Err(EpError::KernelFailed(
+                "route-residency measurement reset requires an installed production binding"
+                    .to_string(),
+            ));
+        }
+        if force_cold {
+            let boundaries = self.route_boundary.lock().unwrap().clone();
+            for boundary in &boundaries {
+                force_cold_route_residency_boundary(boundary)?;
+            }
+        }
+        self.route_diag.reset_measurement();
+        Ok(())
+    }
+
+    fn expert_residency_metrics(&self) -> Option<onnx_runtime_ep_api::ExpertResidencyMetrics> {
+        let boundaries = self.route_boundary.lock().unwrap();
+        let mut device = 0u64;
+        let mut host = 0u64;
+        let mut poisoned = false;
+        let mut memory_reason = None;
+        for boundary in boundaries.iter() {
+            let (boundary_device, boundary_host) = boundary.committed_bytes();
+            device = device.saturating_add(boundary_device);
+            host = host.saturating_add(boundary_host);
+            poisoned |= boundary.tier_state_poisoned();
+        }
+        if boundaries.is_empty()
+            && crate::route_residency::expert_accounting_enabled()
+            && let Some(residency) = self.residency.as_ref()
+            && let Some(preparation) = self.route_preparation.lock().unwrap().as_ref()
+        {
+            let groups = onnx_runtime_ep_api::expert_weight_groups(&preparation.graph);
+            let values = groups
+                .iter()
+                .flat_map(|group| group.members.iter().copied())
+                .collect::<Vec<_>>();
+            match residency.route_residency_device_bindings(&values) {
+                Ok((bindings, pool)) => {
+                    let granularity = pool.granularity();
+                    let mut measured = 0u64;
+                    let mut valid = true;
+                    for value in values {
+                        let Some(binding) = bindings.get(&value) else {
+                            valid = false;
+                            memory_reason =
+                                Some(format!("expert value {value:?} has no VMM binding"));
+                            break;
+                        };
+                        let Some(catalog) = preparation.catalogs.get(&value) else {
+                            valid = false;
+                            memory_reason =
+                                Some(format!("expert value {value:?} has no region catalog"));
+                            break;
+                        };
+                        if binding.base_offset % granularity != 0 {
+                            valid = false;
+                            memory_reason = Some(format!(
+                                "expert value {value:?} allocation base {} is not aligned to \
+                                 VMM granularity {granularity}",
+                                binding.base_offset
+                            ));
+                            break;
+                        }
+                        for expert in 0..catalog.layout().experts {
+                            let Some(range) = catalog.relative_range(expert) else {
+                                valid = false;
+                                memory_reason = Some(format!(
+                                    "expert value {value:?} expert {expert} has no physical range"
+                                ));
+                                break;
+                            };
+                            let bytes = range.end.saturating_sub(range.start);
+                            if range.start % granularity != 0
+                                || bytes == 0
+                                || bytes % granularity != 0
+                                || range.end > binding.allocation_bytes
+                            {
+                                valid = false;
+                                memory_reason = Some(format!(
+                                    "expert value {value:?} expert {expert} range {}..{} does not \
+                                     reconcile with VMM granularity {granularity} and allocation \
+                                     size {}",
+                                    range.start, range.end, binding.allocation_bytes
+                                ));
+                                break;
+                            }
+                            measured = measured.saturating_add(bytes as u64);
+                        }
+                        if !valid {
+                            break;
+                        }
+                    }
+                    if valid {
+                        device = measured;
+                    }
+                }
+                Err(reason) => memory_reason = Some(reason),
+            }
+        }
+        let expert_oversubscribed = self.residency.as_ref().map_or(0, |residency| {
+            let (budget, _) = residency.budget();
+            device.saturating_sub(budget)
+        });
+        let mut snapshot = self
+            .route_diag
+            .snapshot(device, host, expert_oversubscribed);
+        if poisoned {
+            snapshot.unaccounted_bytes = snapshot
+                .unaccounted_bytes
+                .saturating_add(device.saturating_add(host));
+        }
+        if snapshot.last_reason.is_none() {
+            snapshot.last_reason = memory_reason;
+        }
+        Some(snapshot)
     }
 
     fn device_allocation_counts(&self) -> Option<(u64, u64)> {
@@ -4012,13 +4393,14 @@ impl ExecutionProvider for CudaExecutionProvider {
 }
 
 impl Drop for CudaExecutionProvider {
-    /// Initiate the same safe close as `shutdown`, without waiting.
+    /// Initiate the same safe close as `shutdown`.
     ///
     /// A provider that was dropped without an explicit shutdown must still stop
     /// accepting work and let its residency enqueue its page releases. It must
-    /// not wait for them: the queue's worker holds the queue, the CUDA context,
-    /// and every request's ownership, so pending releases complete after this
-    /// returns. Nothing here panics, synchronizes, or joins a thread.
+    /// normally need not wait for them: the queue's worker holds the queue, the
+    /// CUDA context, and every request's ownership. A mixed HostNuma/device
+    /// route binding is synchronized and restored first so incompatible
+    /// handles can never reach the ordinary device-pool disposal path.
     fn drop(&mut self) {
         self.closed.store(true, Ordering::Release);
         // Graph executables are the final owners of any sealed allocations whose
@@ -4027,9 +4409,30 @@ impl Drop for CudaExecutionProvider {
         // releases before provider teardown retires the allocator.
         let _ = self.runtime.reset_graph();
         let _ = self.runtime.reset_graph_in(DeviceGraphSlot::Verify);
-        // Residency is retired first so its pages can still enqueue, then the
+        // Route bindings retain the residency plus its VMM allocators and
+        // HostNuma pool. Drop those clones before retiring the provider's
+        // residency handle; otherwise the final residency/pool teardown runs
+        // only after this Drop implementation has closed the release queue and
+        // retired the memory context.
+        let had_route_residency = self.drain_route_residency_boundary();
+        self.route_sources.clear();
+        self.route_preparation
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        // Residency is retired while its pages can still enqueue, then the
         // queue is closed: nothing else can reach this provider afterwards.
         self.retire_residency();
+        if had_route_residency
+            && !self
+                .release_queue
+                .wait_until_idle(std::time::Duration::from_secs(30))
+        {
+            eprintln!(
+                "cuda_ep: WARNING: route-residency Drop timed out settling restored expert \
+                 allocations before memory-context retirement"
+            );
+        }
         self.arm_memory_cleanup();
         self.release_queue.close_after_drain();
         self.release_queue.poll();

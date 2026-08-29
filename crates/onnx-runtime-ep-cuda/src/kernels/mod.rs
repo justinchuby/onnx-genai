@@ -692,6 +692,14 @@ pub fn build_cuda_registry_with_metrics(
     runtime: Arc<CudaRuntime>,
     csa_metrics: Arc<csa_checkpoint::CsaMetrics>,
 ) -> OpRegistry {
+    build_cuda_registry_with_observability(runtime, csa_metrics, None)
+}
+
+pub(crate) fn build_cuda_registry_with_observability(
+    runtime: Arc<CudaRuntime>,
+    csa_metrics: Arc<csa_checkpoint::CsaMetrics>,
+    route_sources: Option<Arc<crate::route_residency::RouteTelemetryRegistry>>,
+) -> OpRegistry {
     let mut reg = OpRegistry::new();
 
     let fft_plans = Arc::new(crate::cufft::CufftPlanCache::default());
@@ -1136,6 +1144,7 @@ pub fn build_cuda_registry_with_metrics(
         OpKey::new("QMoE", "com.microsoft", 1),
         Box::new(qmoe::QMoEFactory {
             runtime: runtime.clone(),
+            route_sources: route_sources.clone(),
         }),
     );
     reg.register(
@@ -1148,6 +1157,7 @@ pub fn build_cuda_registry_with_metrics(
         OpKey::new("BlockQuantizedMoE", "pkg.nxrt", 1),
         Box::new(block_quantized_moe::BlockQuantizedMoEFactory {
             runtime: runtime.clone(),
+            route_sources,
         }),
     );
     reg.register(

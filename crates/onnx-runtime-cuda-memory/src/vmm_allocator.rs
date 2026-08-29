@@ -1228,6 +1228,22 @@ impl CudaVmmAllocator {
         (arena.spans.committed, arena.spans.capacity())
     }
 
+    /// Retained device physical-handle pool backing this allocator, when
+    /// production pooling is enabled.
+    pub fn physical_pool(&self) -> Option<Arc<PhysicalHandlePool>> {
+        self.backing.physical_pool().cloned()
+    }
+
+    /// Resolve a live allocation's byte offset within the allocator's reserved
+    /// address space. Returns `None` for a foreign pointer or size mismatch.
+    pub fn live_allocation_offset(&self, ptr: NonNull<u8>, bytes: usize) -> Option<usize> {
+        let arena = self.lock();
+        let base = <CudaVirtualBacking as VirtualBacking>::base(&arena.reservation);
+        let offset = (ptr.as_ptr() as usize).checked_sub(base)?;
+        let live = arena.spans.live.get(&offset)?;
+        (live.len == bytes).then_some(offset)
+    }
+
     /// The [`DeviceKey`] this allocator's arena is bound to. Used by callers
     /// that hold several allocators keyed by an unrelated identifier (e.g.
     /// `ValueId`) to verify they all belong to the same physical device

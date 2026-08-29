@@ -3787,6 +3787,7 @@ mod route_telemetry {
             .collect();
         let factory = QMoEFactory {
             runtime: ep.runtime().clone(),
+            route_sources: None,
         };
         factory
             .create_kernel(model.graph.node(node), &concrete_shapes)
@@ -4548,6 +4549,7 @@ mod route_telemetry {
                 .collect();
             let factory = QMoEFactory {
                 runtime: ep.runtime().clone(),
+                route_sources: None,
             };
             let kernel = factory
                 .create_kernel(model.graph.node(node), &concrete_shapes)

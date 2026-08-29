@@ -1096,6 +1096,23 @@ impl Engine {
             .and_then(crate::native_decode::NativeDecodeSession::cuda_kv_debug_stats)
     }
 
+    /// Reset completed expert-residency accounting after warm-up.
+    #[cfg(feature = "native-backend")]
+    pub fn reset_expert_residency_measurement(&self, force_cold: bool) -> anyhow::Result<()> {
+        self.native_session
+            .as_ref()
+            .context("expert residency requires a native decode session")?
+            .reset_expert_residency_measurement(force_cold)
+    }
+
+    /// Authoritative completed expert-residency metrics.
+    #[cfg(feature = "native-backend")]
+    pub fn expert_residency_metrics(&self) -> Option<onnx_runtime_ep_api::ExpertResidencyMetrics> {
+        self.native_session
+            .as_ref()
+            .and_then(crate::native_decode::NativeDecodeSession::expert_residency_metrics)
+    }
+
     /// Mutable access to the engine-owned native decode session, if any.
     ///
     /// Exposed so measurement harnesses can drive the batch-N decode entry

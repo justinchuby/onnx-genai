@@ -498,13 +498,15 @@ impl EngineResourceGovernor {
                 })?;
         }
         #[cfg(feature = "native-backend")]
-        // A host-cache lease is a standing claim on RAM. Take it only when the
-        // offload path can actually admit experts; otherwise a disabled cache
-        // would consume the host tier before recurrent state or host KV get a
-        // chance to fit.
+        // A host-cache lease is a standing claim on RAM. The CUDA provider does
+        // not consume this CPU-EP cache; its VMM HostNuma pool leases the same
+        // tier directly. Reserving both would let the unused cache consume the
+        // entire host budget before the production residency path can page out
+        // one expert granule.
         let weight_offload_host_budget =
-            if std::env::var_os(onnx_runtime_ep_cpu::WEIGHT_OFFLOAD_ENV)
-                .is_some_and(|value| value == "1")
+            if !matches!(domain, Some(DeviceCompatibilityDomain::Cuda(_)))
+                && std::env::var_os(onnx_runtime_ep_cpu::WEIGHT_OFFLOAD_ENV)
+                    .is_some_and(|value| value == "1")
             {
                 snapshot.resolved_limits.host_ram_bytes
             } else {

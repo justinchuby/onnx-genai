@@ -1,134 +1,186 @@
 #![cfg(feature = "native-cuda")]
 
-use onnx_runtime_ep_api::{
-    ExternalMmapRegion, LazyWeight, LazyWeightBoundary, MmapRegionSource, ResidentWeight,
-    WeightHandleError,
+use std::path::{Path, PathBuf};
+
+use onnx_genai_engine::{
+    Engine, EngineConfig, EngineDecodeBackend, GeneratePrompt, GenerateRequest, NativeDecodeDevice,
+    ResourceLimit,
 };
-use onnx_runtime_ep_cuda::runtime::cuptr;
-use onnx_runtime_ir::DataType;
+use onnx_runtime_ep_api::RouteResidencyInstallState;
 
-const BANK_BYTES: usize = 4096;
-
-struct TinyQmoeMmap {
-    bytes: Vec<u8>,
+struct EnvGuard {
+    name: &'static str,
+    previous: Option<std::ffi::OsString>,
 }
 
-impl MmapRegionSource for TinyQmoeMmap {
-    fn region_bytes(&self, region: &ExternalMmapRegion) -> Result<&[u8], WeightHandleError> {
-        if region.mapping_id != 1759 {
-            return Err(WeightHandleError::DeviceBinding(
-                "unexpected tiny-QMoE mapping".to_string(),
-            ));
+impl EnvGuard {
+    fn set(name: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+        let previous = std::env::var_os(name);
+        // SAFETY: this integration test contains one test and therefore has no
+        // same-process peer reading these benchmark-only environment controls.
+        unsafe { std::env::set_var(name, value) };
+        Self { name, previous }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: see `set`; restoration happens before this one-test process exits.
+        unsafe {
+            if let Some(previous) = self.previous.take() {
+                std::env::set_var(self.name, previous);
+            } else {
+                std::env::remove_var(self.name);
+            }
         }
-        let end = region
-            .offset
-            .checked_add(region.len)
-            .ok_or_else(|| WeightHandleError::DeviceBinding("region overflow".to_string()))?;
-        self.bytes
-            .get(region.offset..end)
-            .ok_or_else(|| WeightHandleError::DeviceBinding("region out of bounds".to_string()))
     }
 }
 
-fn tiny_qmoe_banks() -> (TinyQmoeMmap, Vec<LazyWeight>) {
-    let banks = (0..2)
-        .map(|bank| {
-            (0..BANK_BYTES)
-                .map(|index| ((bank * 61 + index * 17) & 0xff) as u8)
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
-    let mut bytes = Vec::with_capacity(BANK_BYTES * banks.len());
-    let mut weights = Vec::with_capacity(banks.len());
-    for bank in banks {
-        let offset = bytes.len();
-        bytes.extend_from_slice(&bank);
-        let region = ExternalMmapRegion {
-            mapping_id: 1759,
-            offset,
-            len: bank.len(),
-        };
-        let materialized = bank;
-        weights.push(
-            LazyWeight::new(
-                LazyWeightBoundary::QMoe,
-                DataType::Uint8,
-                vec![2, BANK_BYTES / 2],
-                vec![region],
-                move || {
-                    ResidentWeight::new(
-                        DataType::Uint8,
-                        vec![2, BANK_BYTES / 2],
-                        materialized.clone(),
-                    )
-                },
-            )
-            .expect("valid tiny-QMoE bank"),
+fn fixture_dir() -> Option<PathBuf> {
+    let Some(dir) = std::env::var_os("FREETOKEN_TINY_QMOE_NATIVE_CUDA_DIR").map(PathBuf::from)
+    else {
+        eprintln!(
+            "skipping production FreeToken lifecycle proof: set \
+             FREETOKEN_TINY_QMOE_NATIVE_CUDA_DIR to an external-data, VMM-granule-padded QMoE \
+             native model directory"
         );
+        return None;
+    };
+    let missing = ["model.onnx", "inference_metadata.yaml", "tokenizer.json"]
+        .into_iter()
+        .filter(|name| !dir.join(name).is_file())
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        Some(dir)
+    } else {
+        eprintln!(
+            "skipping production FreeToken lifecycle proof: {} is missing {}",
+            dir.display(),
+            missing.join(", ")
+        );
+        None
     }
-    (TinyQmoeMmap { bytes }, weights)
+}
+
+fn engine(dir: &Path) -> anyhow::Result<Engine> {
+    let host_budget = std::env::var("FREETOKEN_TINY_QMOE_HOST_BYTES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1024_u64 * 1024 * 1024);
+    Engine::from_dir(
+        dir,
+        EngineConfig {
+            decode_backend: EngineDecodeBackend::Native,
+            native_device: Some(NativeDecodeDevice::Cuda { index: Some(0) }),
+            limits: onnx_genai_engine::ResourceLimits {
+                host_ram_limit: ResourceLimit::Bytes(host_budget),
+                ..onnx_genai_engine::ResourceLimits::default()
+            },
+            ..EngineConfig::default()
+        },
+    )
+}
+
+fn generate(engine: &mut Engine, tokens: usize) -> anyhow::Result<Vec<u32>> {
+    let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![3]));
+    request.options.max_new_tokens = tokens;
+    request.options.temperature = 0.0;
+    request.options.greedy = true;
+    request.options.stop_on_eos = false;
+    Ok(engine.generate(request)?.token_ids)
 }
 
 #[test]
-fn tiny_qmoe_records_a_real_page_in_and_a_resident_hit() -> anyhow::Result<()> {
-    let ep = match onnx_runtime_ep_cuda::CudaExecutionProvider::new(0) {
-        Ok(ep) => ep,
-        Err(error) => {
-            eprintln!("skipping tiny-QMoE byte-counter fixture: CUDA unavailable: {error}");
-            return Ok(());
-        }
+fn tiny_qmoe_production_generation_proves_gate_miss_page_in_then_hit() -> anyhow::Result<()> {
+    let Some(dir) = fixture_dir() else {
+        return Ok(());
+    };
+    if let Err(error) = onnx_runtime_ep_cuda::CudaExecutionProvider::new(0) {
+        eprintln!("skipping production FreeToken lifecycle proof: CUDA unavailable: {error}");
+        return Ok(());
+    }
+
+    let budget = std::env::var("FREETOKEN_TINY_QMOE_DEVICE_BYTES")
+        .unwrap_or_else(|_| (1024_u64 * 1024 * 1024).to_string());
+    let _offload = EnvGuard::set("ONNX_GENAI_WEIGHT_OFFLOAD", "1");
+    let _accounting = EnvGuard::set("ONNX_GENAI_FREETOKEN_EXPERT_ACCOUNTING", "1");
+    let _budget = EnvGuard::set("ONNX_GENAI_WEIGHT_OFFLOAD_DEVICE_BYTES", budget);
+    let _graph = EnvGuard::set("ONNX_GENAI_CUDA_GRAPH", "1");
+
+    let off_tokens = {
+        let _gate = EnvGuard::set("ONNX_GENAI_WEIGHT_OFFLOAD_COARSE_RESIDENCY_ENABLE", "0");
+        let mut off = engine(&dir)?;
+        let _ = generate(&mut off, 4)?;
+        off.reset_expert_residency_measurement(false)?;
+        let tokens = generate(&mut off, 8)?;
+        let metrics = off
+            .expert_residency_metrics()
+            .expect("native CUDA exposes expert residency metrics");
+        eprintln!(
+            "FreeToken OFF production metrics: {metrics:?}; offload={:?}",
+            onnx_runtime_ep_cuda::global_offload_stats()
+        );
+        assert_eq!(
+            metrics.install_state,
+            RouteResidencyInstallState::GateDisabled
+        );
+        assert_eq!(metrics.boundaries, 0);
+        assert_eq!(metrics.successful_applications, 0);
+        assert!(metrics.selected_bytes > 0);
+        assert_eq!(metrics.selected_bytes, metrics.gpu_hit_bytes);
+        assert_eq!(metrics.h2d_bytes, 0);
+        assert_eq!(metrics.cpu_served_bytes, 0);
+        assert!(
+            metrics.device_committed_bytes + metrics.host_committed_bytes > 0,
+            "OFF must still report authoritative expert physical memory"
+        );
+        tokens
     };
 
-    // Current main does not yet route production QMoE expert banks through the
-    // residency caller. Exercise the existing QMoE-boundary cache API directly
-    // instead of pretending engine counters observed traffic they did not: a
-    // one-bank budget forces bank 0 miss, bank 0 hit, then bank 1 miss + eviction.
-    onnx_runtime_ep_cuda::reset_global_offload_stats();
-    let (mmap, banks) = tiny_qmoe_banks();
-    let residency = ep.weight_residency(BANK_BYTES as u64);
-    let first = residency.resident(0, &banks[0], &mmap)?;
-    let mut first_bytes = vec![0u8; BANK_BYTES];
-    // SAFETY: `first` owns exactly BANK_BYTES readable device bytes.
-    unsafe {
-        ep.runtime()
-            .dtoh(&mut first_bytes, cuptr(first.device_ptr()))?
+    let on_tokens = {
+        let _gate = EnvGuard::set("ONNX_GENAI_WEIGHT_OFFLOAD_COARSE_RESIDENCY_ENABLE", "1");
+        let mut on = engine(&dir)?;
+        let _ = generate(&mut on, 4)?;
+        on.reset_expert_residency_measurement(true)?;
+        let tokens = generate(&mut on, 8)?;
+        let metrics = on
+            .expert_residency_metrics()
+            .expect("native CUDA exposes expert residency metrics");
+        eprintln!("FreeToken ON production metrics: {metrics:?}");
+        assert!(matches!(
+            metrics.install_state,
+            RouteResidencyInstallState::Installed { .. }
+        ));
+        assert!(metrics.boundaries > 0);
+        assert_eq!(metrics.boundaries, metrics.applied_boundaries);
+        assert_eq!(metrics.boundaries, metrics.successful_applications);
+        assert!(metrics.cpu_served_bytes > 0, "forced-cold miss was vacuous");
+        assert_eq!(metrics.cpu_served_bytes, metrics.h2d_bytes);
+        assert!(metrics.page_ins > 0, "forced-cold page-in was vacuous");
+        assert!(metrics.gpu_hit_bytes > 0, "post-page-in hit was vacuous");
+        assert_eq!(
+            metrics.selected_bytes,
+            metrics.gpu_hit_bytes + metrics.cpu_served_bytes
+        );
+        assert_eq!(metrics.ref_underflows, 0);
+        assert_eq!(metrics.byte_underflows, 0);
+        assert_eq!(metrics.oversubscribed_bytes, 0);
+        assert_eq!(metrics.unaccounted_bytes, 0);
+        let graph = on
+            .native_cuda_debug_stats()
+            .expect("native CUDA exposes graph diagnostics")
+            .graph;
+        assert!(
+            graph.captures > 0,
+            "production CUDA graph capture was vacuous"
+        );
+        assert_eq!(graph.fallbacks, 0);
+        tokens
     };
-    assert_eq!(first_bytes, mmap.bytes[..BANK_BYTES]);
 
-    let hit = residency.resident(0, &banks[0], &mmap)?;
     assert_eq!(
-        hit.device_ptr(),
-        first.device_ptr(),
-        "a hit must reuse the resident bank's device binding"
-    );
-    drop(first);
-    drop(hit);
-
-    let second = residency.resident(1, &banks[1], &mmap)?;
-    let mut second_bytes = vec![0u8; BANK_BYTES];
-    // SAFETY: `second` owns exactly BANK_BYTES readable device bytes.
-    unsafe {
-        ep.runtime()
-            .dtoh(&mut second_bytes, cuptr(second.device_ptr()))?
-    };
-    assert_eq!(second_bytes, mmap.bytes[BANK_BYTES..]);
-    let offload = onnx_runtime_ep_cuda::global_offload_stats();
-
-    assert_eq!(offload.page_ins, 2, "two cold bank accesses: {offload:?}");
-    assert_eq!(offload.hits, 1, "one repeated bank access: {offload:?}");
-    assert_eq!(offload.htod_bytes, (BANK_BYTES * 2) as u64);
-    assert_eq!(offload.hit_bytes, BANK_BYTES as u64);
-    assert_eq!(
-        offload.evictions, 1,
-        "one-bank budget must evict: {offload:?}"
-    );
-    let byte_hit_rate = offload
-        .zero_copy_byte_hit_rate()
-        .expect("the fixture requested weight bytes");
-    assert_eq!(
-        byte_hit_rate,
-        1.0 / 3.0,
-        "one equal-sized hit plus two misses must produce an exact 1/3 byte-hit rate"
+        off_tokens, on_tokens,
+        "OFF/ON production generation token IDs must be byte-identical"
     );
     Ok(())
 }

@@ -70,15 +70,13 @@
 //! → `reset_route_telemetry_boundary` (before any new work), so a consumed
 //! window is never re-consumed and the next window starts empty.
 //!
-//! # Production status (honest)
+//! # Production status
 //!
-//! Like `coarse_residency::apply_residency_plan_at_boundary` when it shipped
-//! (Slice 5), this consumer has **no live decode-loop call site yet**: wiring
-//! it into a running session's request boundary is the next slice. It ships
-//! here as the production seam — reachable, default-off, and proven by the
-//! GPU tests in `tests/route_residency_consume_gpu.rs` — so the telemetry the
-//! producer already accumulates has a real, tested consumer to drive the
-//! #1854 transition.
+//! The session executor invokes this consumer after its synchronized device
+//! validation boundary. The CUDA provider discovers each expert bank from the
+//! loaded graph, activates the exact shape-specific telemetry source on kernel
+//! execution, and binds retained shared-arena VMM slots without introducing a
+//! second allocator. The shipped gate remains default-off.
 //!
 //! [`TelemetrySnapshot`]: crate::kernels::expert_route_telemetry::TelemetrySnapshot
 //! [`consume_and_validate`]: crate::kernels::expert_route_telemetry::consume_and_validate
@@ -91,23 +89,40 @@
 //! [`COARSE_RESIDENCY_ENABLE_ENV`]: crate::coarse_residency::COARSE_RESIDENCY_ENABLE_ENV
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use onnx_runtime_cuda_memory::virtual_memory::PhysicalHandlePool;
+use onnx_runtime_cuda_memory::virtual_memory::PhysicalLocation;
 use onnx_runtime_cuda_memory::vmm_allocator::CudaVmmAllocator;
 use onnx_runtime_ep_api::{
-    ExpertWeightGroup, LazyWeightBoundary, ResidencyPlan, Result, StaticProfileResidencyPolicy,
-    expert_weight_groups, plan_residency,
+    ExpertExecutionPhase, ExpertLayerResidencyMetrics, ExpertResidencyMetrics, ExpertWeightGroup,
+    LazyWeightBoundary, ResidencyPlan, Result, RouteResidencyInstallState,
+    StaticProfileResidencyPolicy, expert_weight_groups, plan_residency,
 };
 use onnx_runtime_ir::{Graph, NodeId, ValueId};
 use onnx_runtime_loader::WeightRegionCatalog;
 
 use crate::coarse_residency::{BoundaryApplicationOutcome, coarse_residency_profile_enabled};
+use crate::granule_transition::{TransitionOutcome, transition_granule_range, verify_safe_point};
 use crate::kernels::expert_route_telemetry::{
     RouteDecision, TelemetrySnapshot, consume_and_validate,
 };
 use crate::weight_paging::CudaWeightResidency;
+
+pub const EXPERT_ACCOUNTING_ENABLE_ENV: &str = "ONNX_GENAI_FREETOKEN_EXPERT_ACCOUNTING";
+
+pub fn expert_accounting_enabled() -> bool {
+    matches!(
+        std::env::var(EXPERT_ACCOUNTING_ENABLE_ENV)
+            .ok()
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("1") | Some("true") | Some("on")
+    )
+}
 
 /// Outcome of consuming one completed coarse-boundary route-telemetry window.
 ///
@@ -425,6 +440,78 @@ pub trait RouteTelemetrySource: Send + Sync {
     fn reset_route_telemetry_boundary(&self) -> Result<()>;
 }
 
+/// One expert-bank value's live allocation inside the production shared VMM
+/// arena. Catalog ranges are value-relative; `base_offset` translates them to
+/// the allocator reservation without creating a second allocator authority.
+#[derive(Clone)]
+pub struct RouteAllocationBinding {
+    pub allocator: Arc<CudaVmmAllocator>,
+    pub base_offset: usize,
+    pub allocation_bytes: usize,
+}
+
+/// One concrete kernel source registered by the CUDA kernel factory.
+#[derive(Clone)]
+pub struct RegisteredRouteTelemetrySource {
+    pub source: Arc<dyn RouteTelemetrySource>,
+    pub phase: ExpertExecutionPhase,
+    pub node_name: String,
+    pub expected_epoch: Arc<AtomicU32>,
+}
+
+/// Provider-owned registry populated when concrete QMoE-family kernels are
+/// compiled. A monotonically increasing generation lets the boundary owner
+/// rebuild its bindings when a new shape variant replaces a source.
+#[derive(Default)]
+pub struct RouteTelemetryRegistry {
+    sources: Mutex<HashMap<NodeId, RegisteredRouteTelemetrySource>>,
+    generation: AtomicU64,
+}
+
+impl RouteTelemetryRegistry {
+    pub fn activate(
+        &self,
+        node: NodeId,
+        source: Arc<dyn RouteTelemetrySource>,
+        phase: ExpertExecutionPhase,
+        node_name: String,
+        expected_epoch: Arc<AtomicU32>,
+    ) {
+        let mut sources = self.sources.lock().unwrap();
+        let unchanged = sources.get(&node).is_some_and(|current| {
+            Arc::ptr_eq(&current.source, &source)
+                && current.phase == phase
+                && current.node_name == node_name
+        });
+        if unchanged {
+            return;
+        }
+        sources.insert(
+            node,
+            RegisteredRouteTelemetrySource {
+                source,
+                phase,
+                node_name,
+                expected_epoch,
+            },
+        );
+        drop(sources);
+        self.generation.fetch_add(1, Ordering::Release);
+    }
+
+    pub fn snapshot(&self) -> (u64, HashMap<NodeId, RegisteredRouteTelemetrySource>) {
+        (
+            self.generation.load(Ordering::Acquire),
+            self.sources.lock().unwrap().clone(),
+        )
+    }
+
+    pub fn clear(&self) {
+        self.sources.lock().unwrap().clear();
+        self.generation.fetch_add(1, Ordering::Release);
+    }
+}
+
 /// One expert bank's binding for the boundary consumer: the producer window
 /// source plus the exact residency + catalog/allocator/pool/expert-group
 /// arguments [`consume_route_window_at_boundary`] needs, and the boundary's own
@@ -445,6 +532,8 @@ pub struct RouteResidencyBoundary {
     boundary: LazyWeightBoundary,
     catalogs: HashMap<ValueId, WeightRegionCatalog>,
     allocators: HashMap<ValueId, Arc<CudaVmmAllocator>>,
+    allocation_offsets: HashMap<ValueId, usize>,
+    allocation_bytes: HashMap<ValueId, usize>,
     device_pool: Arc<PhysicalHandlePool>,
     host_pool: Arc<PhysicalHandlePool>,
     device_count: usize,
@@ -455,8 +544,13 @@ pub struct RouteResidencyBoundary {
     /// carry. Starts at the armed epoch and advances in lockstep with the
     /// producer's window each time a window is consumed and reset, so a record
     /// that failed to advance (an older epoch) is caught as stale.
-    expected_epoch: AtomicU32,
+    expected_epoch: Arc<AtomicU32>,
     expert_groups: Vec<ExpertWeightGroup>,
+    node_id: NodeId,
+    node_name: String,
+    phase: ExpertExecutionPhase,
+    tiers: Mutex<HashMap<(ValueId, usize), PhysicalLocation>>,
+    tier_state_poisoned: AtomicBool,
 }
 
 impl RouteResidencyBoundary {
@@ -480,6 +574,23 @@ impl RouteResidencyBoundary {
         initial_epoch: u32,
         expert_groups: Vec<ExpertWeightGroup>,
     ) -> Self {
+        let node_id = expert_groups
+            .first()
+            .map(|group| group.node)
+            .unwrap_or(NodeId(u32::MAX));
+        let tiers = catalogs
+            .iter()
+            .flat_map(|(&value, catalog)| {
+                (0..catalog.layout().experts).map(move |expert| {
+                    (
+                        (value, expert),
+                        PhysicalLocation::Device {
+                            ordinal: device_ordinal,
+                        },
+                    )
+                })
+            })
+            .collect();
         Self {
             source,
             residency,
@@ -487,14 +598,92 @@ impl RouteResidencyBoundary {
             boundary,
             catalogs,
             allocators,
+            allocation_offsets: HashMap::new(),
+            allocation_bytes: HashMap::new(),
             device_pool,
             host_pool,
             device_count,
             device_ordinal,
             expected_request,
             expected_device,
-            expected_epoch: AtomicU32::new(initial_epoch),
+            expected_epoch: Arc::new(AtomicU32::new(initial_epoch)),
             expert_groups,
+            node_id,
+            node_name: String::new(),
+            phase: ExpertExecutionPhase::Decode,
+            tiers: Mutex::new(tiers),
+            tier_state_poisoned: AtomicBool::new(false),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_bindings(
+        source: Arc<dyn RouteTelemetrySource>,
+        residency: Arc<CudaWeightResidency>,
+        bank_values: Vec<ValueId>,
+        boundary: LazyWeightBoundary,
+        catalogs: HashMap<ValueId, WeightRegionCatalog>,
+        bindings: HashMap<ValueId, RouteAllocationBinding>,
+        device_pool: Arc<PhysicalHandlePool>,
+        host_pool: Arc<PhysicalHandlePool>,
+        device_count: usize,
+        device_ordinal: i32,
+        expected_request: u32,
+        expected_device: u32,
+        initial_epoch: u32,
+        expert_groups: Vec<ExpertWeightGroup>,
+    ) -> Self {
+        let node_id = expert_groups
+            .first()
+            .map(|group| group.node)
+            .unwrap_or(NodeId(u32::MAX));
+        let allocators = bindings
+            .iter()
+            .map(|(&value, binding)| (value, Arc::clone(&binding.allocator)))
+            .collect();
+        let allocation_offsets = bindings
+            .iter()
+            .map(|(&value, binding)| (value, binding.base_offset))
+            .collect();
+        let allocation_bytes = bindings
+            .iter()
+            .map(|(&value, binding)| (value, binding.allocation_bytes))
+            .collect();
+        let tiers = catalogs
+            .iter()
+            .flat_map(|(&value, catalog)| {
+                (0..catalog.layout().experts).map(move |expert| {
+                    (
+                        (value, expert),
+                        PhysicalLocation::Device {
+                            ordinal: device_ordinal,
+                        },
+                    )
+                })
+            })
+            .collect();
+        Self {
+            source,
+            residency,
+            bank_values,
+            boundary,
+            catalogs,
+            allocators,
+            allocation_offsets,
+            allocation_bytes,
+            device_pool,
+            host_pool,
+            device_count,
+            device_ordinal,
+            expected_request,
+            expected_device,
+            expected_epoch: Arc::new(AtomicU32::new(initial_epoch)),
+            expert_groups,
+            node_id,
+            node_name: String::new(),
+            phase: ExpertExecutionPhase::Decode,
+            tiers: Mutex::new(tiers),
+            tier_state_poisoned: AtomicBool::new(false),
         }
     }
 
@@ -510,6 +699,508 @@ impl RouteResidencyBoundary {
     fn advance_epoch(&self) {
         self.expected_epoch.fetch_add(1, Ordering::Relaxed);
     }
+
+    pub(crate) fn committed_bytes(&self) -> (u64, u64) {
+        let tiers = self.tiers.lock().unwrap();
+        let mut device = 0u64;
+        let mut host = 0u64;
+        for (&(value, expert), &location) in tiers.iter() {
+            let Some(range) = self.catalogs[&value].relative_range(expert) else {
+                continue;
+            };
+            let bytes = range.end.saturating_sub(range.start) as u64;
+            match location {
+                PhysicalLocation::Device { .. } => device = device.saturating_add(bytes),
+                PhysicalLocation::HostNuma { .. } => host = host.saturating_add(bytes),
+            }
+        }
+        (device, host)
+    }
+
+    pub(crate) fn tier_state_poisoned(&self) -> bool {
+        self.tier_state_poisoned.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn inherit_tier_state(&self, previous: &RouteResidencyBoundary) {
+        if self.node_id != previous.node_id {
+            return;
+        }
+        *self.tiers.lock().unwrap() = previous.tiers.lock().unwrap().clone();
+        self.tier_state_poisoned.store(
+            previous.tier_state_poisoned.load(Ordering::Acquire),
+            Ordering::Release,
+        );
+    }
+
+    pub(crate) fn node_id(&self) -> NodeId {
+        self.node_id
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_route_residency_boundaries_with_bindings(
+    graph: &Graph,
+    residency: Arc<CudaWeightResidency>,
+    sources: &HashMap<NodeId, RegisteredRouteTelemetrySource>,
+    catalogs: &HashMap<ValueId, WeightRegionCatalog>,
+    bindings: &HashMap<ValueId, RouteAllocationBinding>,
+    device_pool: Arc<PhysicalHandlePool>,
+    host_pool: Arc<PhysicalHandlePool>,
+    device_count: usize,
+    device_ordinal: i32,
+    expected_request: u32,
+    expected_device: u32,
+    initial_epoch: u32,
+) -> std::result::Result<Vec<RouteResidencyBoundary>, RouteResidencyBindingReject> {
+    let groups = expert_weight_groups(graph);
+    if groups.is_empty() {
+        return Err(RouteResidencyBindingReject::NoExpertGroups);
+    }
+    let mut boundaries = Vec::with_capacity(groups.len());
+    for group in groups {
+        let registered = sources
+            .get(&group.node)
+            .ok_or(RouteResidencyBindingReject::NoTelemetrySource { node: group.node })?;
+        let mut group_catalogs = HashMap::with_capacity(group.members.len());
+        let mut group_bindings = HashMap::with_capacity(group.members.len());
+        for &value in &group.members {
+            let catalog = catalogs
+                .get(&value)
+                .cloned()
+                .ok_or(RouteResidencyBindingReject::MissingCatalog { value })?;
+            let binding = bindings
+                .get(&value)
+                .cloned()
+                .ok_or(RouteResidencyBindingReject::MissingAllocator { value })?;
+            group_catalogs.insert(value, catalog);
+            group_bindings.insert(value, binding);
+        }
+        let mut boundary = RouteResidencyBoundary::new_with_bindings(
+            Arc::clone(&registered.source),
+            Arc::clone(&residency),
+            group.members.clone(),
+            group.boundary,
+            group_catalogs,
+            group_bindings,
+            Arc::clone(&device_pool),
+            Arc::clone(&host_pool),
+            device_count,
+            device_ordinal,
+            expected_request,
+            expected_device,
+            initial_epoch,
+            vec![group],
+        );
+        boundary.node_name = registered.node_name.clone();
+        boundary.phase = registered.phase;
+        boundary.expected_epoch = Arc::clone(&registered.expected_epoch);
+        boundaries.push(boundary);
+    }
+    Ok(boundaries)
+}
+
+struct TrackedApplication {
+    outcome: BoundaryApplicationOutcome,
+    h2d_bytes: u64,
+    page_ins: u64,
+    completed: bool,
+    ref_underflows: u64,
+    byte_underflows: u64,
+    unaccounted_bytes: u64,
+}
+
+#[derive(Clone, Copy)]
+struct CompletedTransition {
+    value: ValueId,
+    expert: usize,
+    offset: usize,
+    len: usize,
+    old: PhysicalLocation,
+    new: PhysicalLocation,
+}
+
+fn apply_tracked_route_plan(
+    binding: &RouteResidencyBoundary,
+    routed_experts: &[usize],
+) -> TrackedApplication {
+    let before = onnx_runtime_cuda_memory::vmm_allocator::global_vmm_stats();
+    let mut tracked = apply_tracked_route_plan_inner(binding, routed_experts);
+    let after = onnx_runtime_cuda_memory::vmm_allocator::global_vmm_stats();
+    tracked.ref_underflows = after.ref_underflows.saturating_sub(before.ref_underflows);
+    tracked.byte_underflows = after.byte_underflows.saturating_sub(before.byte_underflows);
+    tracked.unaccounted_bytes = after
+        .unaccounted_committed_bytes
+        .saturating_sub(before.unaccounted_committed_bytes);
+    tracked
+}
+
+fn apply_tracked_route_plan_inner(
+    binding: &RouteResidencyBoundary,
+    routed_experts: &[usize],
+) -> TrackedApplication {
+    let mut outcome = BoundaryApplicationOutcome {
+        policy_name: "route_window",
+        values_inspected: binding.bank_values.len(),
+        ..BoundaryApplicationOutcome::default()
+    };
+    if binding.tier_state_poisoned.load(Ordering::Acquire) {
+        outcome.fallback_reason =
+            Some("expert tier state is poisoned after an incomplete rollback".to_string());
+        return TrackedApplication {
+            outcome,
+            h2d_bytes: 0,
+            page_ins: 0,
+            completed: false,
+            ref_underflows: 0,
+            byte_underflows: 0,
+            unaccounted_bytes: 0,
+        };
+    }
+
+    let verified =
+        match verify_safe_point(binding.residency.resize_safe_point(binding.device_count)) {
+            Ok(verified) => verified,
+            Err(reason) => {
+                outcome.fallback_reason = Some(format!("resize safe-point not clear: {reason}"));
+                return TrackedApplication {
+                    outcome,
+                    h2d_bytes: 0,
+                    page_ins: 0,
+                    completed: false,
+                    ref_underflows: 0,
+                    byte_underflows: 0,
+                    unaccounted_bytes: 0,
+                };
+            }
+        };
+    let granularity = binding
+        .device_pool
+        .granularity()
+        .max(binding.host_pool.granularity());
+    let routed = routed_experts
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
+    let host_location = binding.host_pool.location();
+    let device_location = binding.device_pool.location();
+    let tiers = binding.tiers.lock().unwrap();
+    let mut planned = Vec::new();
+    for &value in &binding.bank_values {
+        let Some(catalog) = binding.catalogs.get(&value) else {
+            outcome
+                .per_value_fallbacks
+                .push((value, "no catalog available".to_string()));
+            continue;
+        };
+        if !catalog.is_pageable() {
+            outcome
+                .per_value_fallbacks
+                .push((value, "catalog not pageable".to_string()));
+            continue;
+        }
+        let Some(&allocation_base) = binding.allocation_offsets.get(&value) else {
+            outcome
+                .per_value_fallbacks
+                .push((value, "no production allocation offset".to_string()));
+            continue;
+        };
+        if allocation_base % granularity != 0 {
+            outcome.per_value_fallbacks.push((
+                value,
+                format!(
+                    "production allocation base {allocation_base} is not granule-aligned \
+                     ({granularity})"
+                ),
+            ));
+            continue;
+        }
+        let Some(&allocation_bytes) = binding.allocation_bytes.get(&value) else {
+            outcome
+                .per_value_fallbacks
+                .push((value, "no production allocation size".to_string()));
+            continue;
+        };
+        for expert in 0..catalog.layout().experts {
+            let Some(range) = catalog.relative_range(expert) else {
+                outcome
+                    .per_value_fallbacks
+                    .push((value, format!("expert {expert} has no relative range")));
+                continue;
+            };
+            let len = range.end.saturating_sub(range.start);
+            if len == 0 {
+                continue;
+            }
+            if range.start % granularity != 0 || len % granularity != 0 {
+                outcome.per_value_fallbacks.push((
+                    value,
+                    format!(
+                        "expert {expert} range {}..{} is not granule-aligned ({granularity})",
+                        range.start, range.end
+                    ),
+                ));
+                continue;
+            }
+            if range.end > allocation_bytes {
+                outcome.per_value_fallbacks.push((
+                    value,
+                    format!(
+                        "expert {expert} range end {} exceeds allocation {allocation_bytes}",
+                        range.end
+                    ),
+                ));
+                continue;
+            }
+            let Some(offset) = allocation_base.checked_add(range.start) else {
+                outcome
+                    .per_value_fallbacks
+                    .push((value, format!("expert {expert} allocation offset overflow")));
+                continue;
+            };
+            let desired = if routed.contains(&expert) {
+                device_location
+            } else {
+                host_location
+            };
+            let current = tiers
+                .get(&(value, expert))
+                .copied()
+                .unwrap_or(device_location);
+            if current != desired {
+                planned.push(CompletedTransition {
+                    value,
+                    expert,
+                    offset,
+                    len,
+                    old: current,
+                    new: desired,
+                });
+            }
+            if routed.contains(&expert) {
+                outcome.hot_expert_count = outcome.hot_expert_count.saturating_add(1);
+            } else {
+                outcome.cold_expert_count = outcome.cold_expert_count.saturating_add(1);
+            }
+        }
+    }
+    drop(tiers);
+    if !outcome.per_value_fallbacks.is_empty() {
+        outcome.fallback_reason =
+            Some("expert bank validation failed; no partial application attempted".to_string());
+        return TrackedApplication {
+            outcome,
+            h2d_bytes: 0,
+            page_ins: 0,
+            completed: false,
+            ref_underflows: 0,
+            byte_underflows: 0,
+            unaccounted_bytes: 0,
+        };
+    }
+
+    let pools = |location: PhysicalLocation| {
+        if matches!(location, PhysicalLocation::Device { .. }) {
+            &binding.device_pool
+        } else {
+            &binding.host_pool
+        }
+    };
+    let mut committed = Vec::new();
+    for transition in &planned {
+        let allocator = &binding.allocators[&transition.value];
+        let result = allocator.with_reservation_mut(|reservation, backing| {
+            transition_granule_range(
+                binding.residency.runtime(),
+                reservation,
+                backing,
+                transition.offset,
+                transition.len,
+                transition.new,
+                pools(transition.old),
+                pools(transition.new),
+                &verified,
+                || binding.residency.resize_safe_point(binding.device_count),
+            )
+        });
+        match result {
+            TransitionOutcome::Committed {
+                granules,
+                new_owned_bytes,
+                old_released_bytes,
+            } => {
+                committed.push(*transition);
+                if granules.saturating_mul(granularity) != transition.len
+                    || new_owned_bytes > transition.len as u64
+                    || !new_owned_bytes.is_multiple_of(granularity as u64)
+                    || old_released_bytes != transition.len as u64
+                {
+                    outcome.failure_count = outcome.failure_count.saturating_add(1);
+                    outcome.fallback_reason = Some(format!(
+                        "transition physical-byte accounting mismatch: granules={granules}, \
+                         new={new_owned_bytes}, released={old_released_bytes}, expected={}; \
+                         newly owned bytes may be zero on a physical-pool hit",
+                        transition.len,
+                    ));
+                    break;
+                }
+            }
+            TransitionOutcome::Rejected { reason } => {
+                outcome.failure_count = outcome.failure_count.saturating_add(1);
+                outcome.fallback_reason = Some(format!("transition rejected: {reason}"));
+                break;
+            }
+            TransitionOutcome::RolledBack { fault } => {
+                outcome.failure_count = outcome.failure_count.saturating_add(1);
+                outcome.fallback_reason = Some(format!("transition rolled back: {fault:?}"));
+                break;
+            }
+            TransitionOutcome::Fatal {
+                transition_fault,
+                quarantined,
+                committed_count,
+                poisoned_range,
+                ..
+            } => {
+                binding.tier_state_poisoned.store(true, Ordering::Release);
+                outcome.failure_count = outcome.failure_count.saturating_add(1);
+                outcome
+                    .fatal_progress
+                    .push((transition.value, committed_count, poisoned_range));
+                outcome.quarantined.push((transition.value, quarantined));
+                outcome.fallback_reason = Some(format!("fatal transition: {transition_fault:?}"));
+                break;
+            }
+        }
+    }
+    if committed.len() != planned.len() {
+        let mut rollback_failed = false;
+        for transition in committed.iter().rev() {
+            let allocator = &binding.allocators[&transition.value];
+            let result = allocator.with_reservation_mut(|reservation, backing| {
+                transition_granule_range(
+                    binding.residency.runtime(),
+                    reservation,
+                    backing,
+                    transition.offset,
+                    transition.len,
+                    transition.old,
+                    pools(transition.new),
+                    pools(transition.old),
+                    &verified,
+                    || binding.residency.resize_safe_point(binding.device_count),
+                )
+            });
+            match result {
+                TransitionOutcome::Committed {
+                    granules,
+                    new_owned_bytes,
+                    old_released_bytes,
+                } if granules.saturating_mul(granularity) == transition.len
+                    && new_owned_bytes <= transition.len as u64
+                    && new_owned_bytes.is_multiple_of(granularity as u64)
+                    && old_released_bytes == transition.len as u64 =>
+                {
+                    outcome.rollback_count = outcome.rollback_count.saturating_add(1);
+                }
+                other => {
+                    rollback_failed = true;
+                    outcome
+                        .rollback_failures
+                        .push(crate::coarse_residency::RollbackFailure {
+                            value: transition.value,
+                            range: (transition.offset, transition.len),
+                            detail: format!("reverse transition failed: {other:?}"),
+                            committed_count: None,
+                            poisoned_range: None,
+                            quarantined: Vec::new(),
+                        });
+                }
+            }
+        }
+        if rollback_failed {
+            binding.tier_state_poisoned.store(true, Ordering::Release);
+        }
+        return TrackedApplication {
+            outcome,
+            h2d_bytes: 0,
+            page_ins: 0,
+            completed: false,
+            ref_underflows: 0,
+            byte_underflows: 0,
+            unaccounted_bytes: 0,
+        };
+    }
+
+    let mut h2d_bytes = 0u64;
+    let mut page_ins = 0u64;
+    let mut touched = std::collections::HashSet::new();
+    let mut tiers = binding.tiers.lock().unwrap();
+    for transition in committed {
+        tiers.insert((transition.value, transition.expert), transition.new);
+        touched.insert(transition.value);
+        match (transition.old, transition.new) {
+            (PhysicalLocation::HostNuma { .. }, PhysicalLocation::Device { .. }) => {
+                h2d_bytes = h2d_bytes.saturating_add(transition.len as u64);
+                page_ins = page_ins.saturating_add(1);
+            }
+            (PhysicalLocation::Device { .. }, PhysicalLocation::HostNuma { .. }) => {
+                outcome.device_bytes_released = outcome
+                    .device_bytes_released
+                    .saturating_add(transition.len as u64);
+                outcome.host_bytes_committed = outcome
+                    .host_bytes_committed
+                    .saturating_add(transition.len as u64);
+            }
+            _ => {}
+        }
+    }
+    outcome.values_touched = touched.len();
+    outcome.committed_values.extend(touched);
+    TrackedApplication {
+        outcome,
+        h2d_bytes,
+        page_ins,
+        completed: true,
+        ref_underflows: 0,
+        byte_underflows: 0,
+        unaccounted_bytes: 0,
+    }
+}
+
+fn selected_service_bytes(
+    binding: &RouteResidencyBoundary,
+    routed_experts: &[usize],
+) -> (u64, u64, u64) {
+    let routed = routed_experts
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
+    let tiers = binding.tiers.lock().unwrap();
+    let mut selected = 0u64;
+    let mut hits = 0u64;
+    let mut cpu_served = 0u64;
+    for &value in &binding.bank_values {
+        let Some(catalog) = binding.catalogs.get(&value) else {
+            continue;
+        };
+        for &expert in &routed {
+            let Some(range) = catalog.relative_range(expert) else {
+                continue;
+            };
+            let bytes = range.end.saturating_sub(range.start) as u64;
+            selected = selected.saturating_add(bytes);
+            match tiers
+                .get(&(value, expert))
+                .copied()
+                .unwrap_or(PhysicalLocation::Device {
+                    ordinal: binding.device_ordinal,
+                }) {
+                PhysicalLocation::Device { .. } => hits = hits.saturating_add(bytes),
+                PhysicalLocation::HostNuma { .. } => cpu_served = cpu_served.saturating_add(bytes),
+            }
+        }
+    }
+    (selected, hits, cpu_served)
 }
 
 /// Why a production route-residency binding could not be constructed from a
@@ -673,6 +1364,48 @@ pub fn build_route_residency_boundary(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn build_route_residency_boundary_with_bindings(
+    graph: &Graph,
+    residency: Arc<CudaWeightResidency>,
+    sources: &HashMap<NodeId, Arc<dyn RouteTelemetrySource>>,
+    catalogs: HashMap<ValueId, WeightRegionCatalog>,
+    bindings: HashMap<ValueId, RouteAllocationBinding>,
+    device_pool: Arc<PhysicalHandlePool>,
+    host_pool: Arc<PhysicalHandlePool>,
+    device_count: usize,
+    device_ordinal: i32,
+    expected_request: u32,
+    expected_device: u32,
+    initial_epoch: u32,
+) -> std::result::Result<RouteResidencyBoundary, RouteResidencyBindingReject> {
+    let group = validate_route_residency_binding(
+        graph,
+        |node| sources.contains_key(&node),
+        |value| catalogs.contains_key(&value),
+        |value| bindings.contains_key(&value),
+    )?;
+    let source = Arc::clone(&sources[&group.node]);
+    let bank_values = group.members.clone();
+    let boundary = group.boundary;
+    Ok(RouteResidencyBoundary::new_with_bindings(
+        source,
+        residency,
+        bank_values,
+        boundary,
+        catalogs,
+        bindings,
+        device_pool,
+        host_pool,
+        device_count,
+        device_ordinal,
+        expected_request,
+        expected_device,
+        initial_epoch,
+        vec![group],
+    ))
+}
+
 /// Observability for the boundary consumer. Every boundary records its typed
 /// reason/outcome here — there is no silent success and no silent whole-bank
 /// (design-discipline "carry the reason"). Mirrors the crate's other EP-owned
@@ -689,6 +1422,17 @@ pub struct RouteResidencyDiagnostics {
     installs: AtomicU64,
     declines: AtomicU64,
     last_install_reason: Mutex<Option<String>>,
+    install_state: Mutex<RouteResidencyInstallState>,
+    successful_applications: AtomicU64,
+    selected_bytes: AtomicU64,
+    gpu_hit_bytes: AtomicU64,
+    h2d_bytes: AtomicU64,
+    cpu_served_bytes: AtomicU64,
+    page_ins: AtomicU64,
+    ref_underflows: AtomicU64,
+    byte_underflows: AtomicU64,
+    unaccounted_bytes: AtomicU64,
+    layers: Mutex<HashMap<(NodeId, ExpertExecutionPhase), ExpertLayerResidencyMetrics>>,
 }
 
 impl RouteResidencyDiagnostics {
@@ -750,20 +1494,174 @@ impl RouteResidencyDiagnostics {
     /// Record that a real binding was installed for `banks` bank values.
     pub(crate) fn record_install(&self, banks: usize) {
         self.installs.fetch_add(1, Ordering::Relaxed);
+        *self.install_state.lock().unwrap() = RouteResidencyInstallState::Installed { banks };
         self.set_install_reason(format!("installed binding over {banks} bank value(s)"));
     }
 
     /// Record that install fail-closed to no binding, carrying the reason.
     pub(crate) fn record_decline(&self, reason: &str) {
         self.declines.fetch_add(1, Ordering::Relaxed);
+        *self.install_state.lock().unwrap() = if reason.contains("gate disabled") {
+            RouteResidencyInstallState::GateDisabled
+        } else if reason.contains("offload") {
+            RouteResidencyInstallState::OffloadDisabled
+        } else {
+            RouteResidencyInstallState::Rejected(reason.to_string())
+        };
         self.set_install_reason(format!("declined: {reason}"));
+    }
+
+    fn record_completed(
+        &self,
+        binding: &RouteResidencyBoundary,
+        selected: u64,
+        hits: u64,
+        cpu_served: u64,
+        h2d: u64,
+        page_ins: u64,
+    ) {
+        self.selected_bytes.fetch_add(selected, Ordering::Relaxed);
+        self.gpu_hit_bytes.fetch_add(hits, Ordering::Relaxed);
+        self.cpu_served_bytes
+            .fetch_add(cpu_served, Ordering::Relaxed);
+        self.h2d_bytes.fetch_add(h2d, Ordering::Relaxed);
+        self.page_ins.fetch_add(page_ins, Ordering::Relaxed);
+        let reconciled = selected == hits.saturating_add(cpu_served) && cpu_served == h2d;
+        if reconciled {
+            self.successful_applications.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.unaccounted_bytes.fetch_add(
+                selected
+                    .abs_diff(hits.saturating_add(cpu_served))
+                    .saturating_add(cpu_served.abs_diff(h2d)),
+                Ordering::Relaxed,
+            );
+        }
+
+        let mut layers = self.layers.lock().unwrap();
+        let entry = layers
+            .entry((binding.node_id, binding.phase))
+            .or_insert_with(|| ExpertLayerResidencyMetrics {
+                node_id: binding.node_id,
+                node_name: binding.node_name.clone(),
+                phase: binding.phase,
+                selected_bytes: 0,
+                gpu_hit_bytes: 0,
+                h2d_bytes: 0,
+                cpu_served_bytes: 0,
+                page_ins: 0,
+            });
+        entry.selected_bytes = entry.selected_bytes.saturating_add(selected);
+        entry.gpu_hit_bytes = entry.gpu_hit_bytes.saturating_add(hits);
+        entry.h2d_bytes = entry.h2d_bytes.saturating_add(h2d);
+        entry.cpu_served_bytes = entry.cpu_served_bytes.saturating_add(cpu_served);
+        entry.page_ins = entry.page_ins.saturating_add(page_ins);
+    }
+
+    fn record_accounting_faults(&self, tracked: &TrackedApplication) {
+        self.ref_underflows
+            .fetch_add(tracked.ref_underflows, Ordering::Relaxed);
+        self.byte_underflows
+            .fetch_add(tracked.byte_underflows, Ordering::Relaxed);
+        self.unaccounted_bytes
+            .fetch_add(tracked.unaccounted_bytes, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_observation(
+        &self,
+        node_id: NodeId,
+        node_name: &str,
+        phase: ExpertExecutionPhase,
+        selected: u64,
+    ) {
+        self.selected_bytes.fetch_add(selected, Ordering::Relaxed);
+        self.gpu_hit_bytes.fetch_add(selected, Ordering::Relaxed);
+        let mut layers = self.layers.lock().unwrap();
+        let entry = layers
+            .entry((node_id, phase))
+            .or_insert_with(|| ExpertLayerResidencyMetrics {
+                node_id,
+                node_name: node_name.to_string(),
+                phase,
+                selected_bytes: 0,
+                gpu_hit_bytes: 0,
+                h2d_bytes: 0,
+                cpu_served_bytes: 0,
+                page_ins: 0,
+            });
+        entry.selected_bytes = entry.selected_bytes.saturating_add(selected);
+        entry.gpu_hit_bytes = entry.gpu_hit_bytes.saturating_add(selected);
+    }
+
+    pub fn reset_measurement(&self) {
+        self.boundaries.store(0, Ordering::Relaxed);
+        self.applied.store(0, Ordering::Relaxed);
+        self.rejected.store(0, Ordering::Relaxed);
+        self.whole_bank.store(0, Ordering::Relaxed);
+        self.empty.store(0, Ordering::Relaxed);
+        self.successful_applications.store(0, Ordering::Relaxed);
+        self.selected_bytes.store(0, Ordering::Relaxed);
+        self.gpu_hit_bytes.store(0, Ordering::Relaxed);
+        self.h2d_bytes.store(0, Ordering::Relaxed);
+        self.cpu_served_bytes.store(0, Ordering::Relaxed);
+        self.page_ins.store(0, Ordering::Relaxed);
+        self.ref_underflows.store(0, Ordering::Relaxed);
+        self.byte_underflows.store(0, Ordering::Relaxed);
+        self.unaccounted_bytes.store(0, Ordering::Relaxed);
+        self.layers.lock().unwrap().clear();
+        *self.last_reason.lock().unwrap() = None;
+    }
+
+    pub fn snapshot(
+        &self,
+        device_committed_bytes: u64,
+        host_committed_bytes: u64,
+        oversubscribed_bytes: u64,
+    ) -> ExpertResidencyMetrics {
+        let mut layers = self
+            .layers
+            .lock()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        layers.sort_by_key(|layer| {
+            (
+                layer.node_id.0,
+                match layer.phase {
+                    ExpertExecutionPhase::Prefill => 0u8,
+                    ExpertExecutionPhase::Decode => 1u8,
+                },
+            )
+        });
+        ExpertResidencyMetrics {
+            install_state: self.install_state.lock().unwrap().clone(),
+            installs: self.installs.load(Ordering::Relaxed),
+            boundaries: self.boundaries.load(Ordering::Relaxed),
+            applied_boundaries: self.applied.load(Ordering::Relaxed),
+            successful_applications: self.successful_applications.load(Ordering::Relaxed),
+            rejected_boundaries: self.rejected.load(Ordering::Relaxed),
+            selected_bytes: self.selected_bytes.load(Ordering::Relaxed),
+            gpu_hit_bytes: self.gpu_hit_bytes.load(Ordering::Relaxed),
+            h2d_bytes: self.h2d_bytes.load(Ordering::Relaxed),
+            cpu_served_bytes: self.cpu_served_bytes.load(Ordering::Relaxed),
+            page_ins: self.page_ins.load(Ordering::Relaxed),
+            device_committed_bytes,
+            host_committed_bytes,
+            ref_underflows: self.ref_underflows.load(Ordering::Relaxed),
+            byte_underflows: self.byte_underflows.load(Ordering::Relaxed),
+            oversubscribed_bytes,
+            unaccounted_bytes: self.unaccounted_bytes.load(Ordering::Relaxed),
+            layers,
+            last_reason: self.last_reason(),
+        }
     }
 
     fn set_reason(&self, reason: String) {
         *self.last_reason.lock().unwrap() = Some(reason);
     }
 
-    fn record_rejected(&self, reason: &str) {
+    pub(crate) fn record_rejected(&self, reason: &str) {
         self.rejected.fetch_add(1, Ordering::Relaxed);
         self.set_reason(format!("rejected: {reason}"));
     }
@@ -846,7 +1744,7 @@ pub fn run_route_residency_boundary(
         return Ok(());
     };
 
-    let outcome = consume_route_window_at_boundary(
+    let outcome = match prepare_route_window(
         &binding.residency,
         &snapshot,
         binding.expected_epoch(),
@@ -855,13 +1753,57 @@ pub fn run_route_residency_boundary(
         &binding.bank_values,
         binding.boundary,
         &binding.catalogs,
-        &binding.allocators,
-        &binding.device_pool,
-        &binding.host_pool,
         binding.device_count,
-        binding.device_ordinal,
-        &binding.expert_groups,
-    );
+    ) {
+        Prepared::Early(outcome) => outcome,
+        Prepared::Ready {
+            plan,
+            routed_experts,
+            epoch,
+            count,
+        } => {
+            let (selected, hits, cpu_served) = selected_service_bytes(binding, &routed_experts);
+            if binding.allocation_offsets.is_empty() {
+                let outcome = binding.residency.apply_coarse_residency_plan(
+                    &plan,
+                    &binding.catalogs,
+                    &binding.allocators,
+                    &binding.device_pool,
+                    &binding.host_pool,
+                    binding.device_count,
+                    binding.device_ordinal,
+                    &binding.expert_groups,
+                );
+                RouteWindowConsumeOutcome::Applied {
+                    routed_experts,
+                    epoch,
+                    count,
+                    outcome: Box::new(outcome),
+                }
+            } else {
+                let tracked = apply_tracked_route_plan(binding, &routed_experts);
+                diag.record_accounting_faults(&tracked);
+                if !tracked.completed {
+                    RouteWindowConsumeOutcome::WholeBank {
+                        reason: tracked.outcome.fallback_reason.unwrap_or_else(|| {
+                            "tracked route-residency application did not complete".to_string()
+                        }),
+                    }
+                } else {
+                    let outcome = tracked.outcome;
+                    let h2d_bytes = tracked.h2d_bytes;
+                    let page_ins = tracked.page_ins;
+                    diag.record_completed(binding, selected, hits, cpu_served, h2d_bytes, page_ins);
+                    RouteWindowConsumeOutcome::Applied {
+                        routed_experts,
+                        epoch,
+                        count,
+                        outcome: Box::new(outcome),
+                    }
+                }
+            }
+        }
+    };
 
     if window_was_consumed(&outcome) {
         binding.source.reset_route_telemetry_boundary()?;
@@ -869,6 +1811,56 @@ pub fn run_route_residency_boundary(
     }
 
     diag.record_outcome(&outcome);
+    Ok(())
+}
+
+/// Move every bindable expert range to host physical backing at a verified
+/// boundary, then open a fresh telemetry window. Used by deterministic
+/// measurement setup after warm-up so the next real route must page selected
+/// experts back to device before a later route can hit.
+pub fn force_cold_route_residency_boundary(binding: &RouteResidencyBoundary) -> Result<()> {
+    if binding.allocation_offsets.is_empty() {
+        return Err(onnx_runtime_ep_api::EpError::KernelFailed(
+            "force-cold requires production shared-arena allocation bindings".to_string(),
+        ));
+    }
+    let tracked = apply_tracked_route_plan(binding, &[]);
+    if !tracked.completed {
+        return Err(onnx_runtime_ep_api::EpError::KernelFailed(format!(
+            "force-cold expert residency failed closed: {:?}",
+            tracked.outcome.fallback_reason
+        )));
+    }
+    binding.source.reset_route_telemetry_boundary()?;
+    binding.advance_epoch();
+    Ok(())
+}
+
+/// Restore every production expert granule to device physical backing before
+/// the shared arena is destroyed.
+///
+/// A mixed-location reservation cannot be handed to the arena's ordinary
+/// device-pool disposal path: host-NUMA handles belong to a distinct physical
+/// pool and governor tier. Teardown therefore restores the original all-device
+/// topology while both pools and the CUDA context are still live.
+pub fn restore_device_route_residency_boundary(binding: &RouteResidencyBoundary) -> Result<()> {
+    if binding.allocation_offsets.is_empty() {
+        return Ok(());
+    }
+    let experts = binding
+        .catalogs
+        .values()
+        .map(|catalog| catalog.layout().experts)
+        .max()
+        .unwrap_or(0);
+    let routed_experts = (0..experts).collect::<Vec<_>>();
+    let tracked = apply_tracked_route_plan(binding, &routed_experts);
+    if !tracked.completed {
+        return Err(onnx_runtime_ep_api::EpError::KernelFailed(format!(
+            "restore-device expert residency failed closed: {:?}",
+            tracked.outcome.fallback_reason
+        )));
+    }
     Ok(())
 }
 
@@ -947,11 +1939,32 @@ mod binding_tests {
     //! source/catalog/allocator maps. The successful *construction* (which does
     //! need a real residency/allocator) is proven by the GPU harness.
     use std::collections::HashSet;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
-    use onnx_runtime_ep_api::LazyWeightBoundary;
+    use onnx_runtime_ep_api::{ExpertExecutionPhase, LazyWeightBoundary};
     use onnx_runtime_ir::{DataType, Graph, NodeId, TensorData, ValueId, WeightRef, static_shape};
 
-    use super::{RouteResidencyBindingReject, validate_route_residency_binding};
+    use super::{
+        RouteResidencyBindingReject, RouteTelemetryRegistry, RouteTelemetrySource,
+        validate_route_residency_binding,
+    };
+
+    struct EmptySource;
+
+    impl RouteTelemetrySource for EmptySource {
+        fn route_telemetry_snapshot(
+            &self,
+        ) -> onnx_runtime_ep_api::Result<
+            Option<crate::kernels::expert_route_telemetry::TelemetrySnapshot>,
+        > {
+            Ok(None)
+        }
+
+        fn reset_route_telemetry_boundary(&self) -> onnx_runtime_ep_api::Result<()> {
+            Ok(())
+        }
+    }
 
     fn shape1(n: usize) -> onnx_runtime_ir::Shape {
         static_shape([n])
@@ -1104,5 +2117,51 @@ mod binding_tests {
         );
         let r = RouteResidencyBindingReject::MultipleBanksUnsupported { groups: 3 }.reason();
         assert!(r.contains('3'), "reason carries the group count: {r}");
+    }
+
+    #[test]
+    fn registry_generation_changes_only_when_execution_activates_a_new_source() {
+        let registry = RouteTelemetryRegistry::default();
+        let first = Arc::new(EmptySource);
+        let first_epoch = Arc::new(AtomicU32::new(3));
+        registry.activate(
+            NodeId(4),
+            Arc::clone(&first) as Arc<dyn RouteTelemetrySource>,
+            ExpertExecutionPhase::Prefill,
+            "moe".to_string(),
+            Arc::clone(&first_epoch),
+        );
+        let (generation, sources) = registry.snapshot();
+        assert_eq!(generation, 1);
+        assert_eq!(
+            sources[&NodeId(4)].expected_epoch.load(Ordering::Acquire),
+            3
+        );
+
+        registry.activate(
+            NodeId(4),
+            Arc::clone(&first) as Arc<dyn RouteTelemetrySource>,
+            ExpertExecutionPhase::Prefill,
+            "moe".to_string(),
+            Arc::clone(&first_epoch),
+        );
+        assert_eq!(registry.snapshot().0, generation);
+
+        let decode = Arc::new(EmptySource);
+        let decode_epoch = Arc::new(AtomicU32::new(7));
+        registry.activate(
+            NodeId(4),
+            decode as Arc<dyn RouteTelemetrySource>,
+            ExpertExecutionPhase::Decode,
+            "moe".to_string(),
+            Arc::clone(&decode_epoch),
+        );
+        let (next_generation, sources) = registry.snapshot();
+        assert_eq!(next_generation, generation + 1);
+        assert_eq!(sources[&NodeId(4)].phase, ExpertExecutionPhase::Decode);
+        assert_eq!(
+            sources[&NodeId(4)].expected_epoch.load(Ordering::Acquire),
+            7
+        );
     }
 }
