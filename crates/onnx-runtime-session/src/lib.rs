@@ -40,6 +40,7 @@ pub use executor::{
 };
 pub use onnx_runtime_ep_api::DeviceBuffer;
 pub use onnx_runtime_ep_api::DeviceGraphSlot;
+pub use onnx_runtime_ep_api::ExecutorResidencyTelemetry;
 pub use onnx_runtime_ep_api::WorkspaceRequirement;
 pub use onnx_runtime_loader::{
     EpContextDumpConfig, EpContextPartition, Model as EncoderModel, ModelMetadata,
@@ -1787,6 +1788,12 @@ impl InferenceSession {
     #[doc(hidden)]
     pub fn executor_instance_id(&self) -> onnx_runtime_ep_api::ExecutorInstanceId {
         self.exec.instance_id()
+    }
+
+    /// Snapshot residency, paging, and graph telemetry owned by this session's
+    /// primary executor.
+    pub fn residency_telemetry(&self) -> Option<ExecutorResidencyTelemetry> {
+        self.exec.residency_telemetry()
     }
 
     /// Export a `com.microsoft::EPContext` context-cache model for this session

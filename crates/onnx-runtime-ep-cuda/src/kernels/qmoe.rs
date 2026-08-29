@@ -1195,45 +1195,18 @@ impl FloatDtype {
 /// identity.
 #[derive(Default)]
 pub struct RouteTelemetrySourceRegistry {
-    compile_scope: Mutex<()>,
-    active_executor: AtomicU64,
     sources: Mutex<HashMap<ExecutorInstanceId, HashMap<NodeId, Arc<QMoERouteTelemetry>>>>,
 }
 
 impl RouteTelemetrySourceRegistry {
-    /// Run one factory lookup under an executor ownership scope.
-    pub(crate) fn with_executor_scope<T>(
+    fn source_for(
         &self,
         executor: ExecutorInstanceId,
-        f: impl FnOnce() -> T,
-    ) -> T {
-        let _gate = self
-            .compile_scope
-            .lock()
-            .expect("cuda_ep route-telemetry compile scope poisoned");
-        self.active_executor
-            .store(executor.get(), Ordering::Release);
-        struct Reset<'a>(&'a AtomicU64);
-        impl Drop for Reset<'_> {
-            fn drop(&mut self) {
-                self.0.store(0, Ordering::Release);
-            }
-        }
-        let _reset = Reset(&self.active_executor);
-        f()
-    }
-
-    fn source_for_current(
-        &self,
         node_id: NodeId,
         runtime: Arc<CudaRuntime>,
     ) -> Option<Arc<QMoERouteTelemetry>> {
         if !crate::coarse_residency::coarse_residency_profile_enabled() {
             return None;
-        }
-        let executor = ExecutorInstanceId::from_raw(self.active_executor.load(Ordering::Acquire));
-        if executor == ExecutorInstanceId::UNSCOPED {
-            return Some(Arc::new(QMoERouteTelemetry::new(runtime)));
         }
         let mut sources = self
             .sources
@@ -1297,13 +1270,6 @@ impl RouteTelemetrySourceRegistry {
             .expect("cuda_ep route-telemetry registry poisoned")
             .remove(&executor);
     }
-
-    pub(crate) fn clear(&self) {
-        self.sources
-            .lock()
-            .expect("cuda_ep route-telemetry registry poisoned")
-            .clear();
-    }
 }
 
 /// Trait-object wrapper retaining the concrete QMoE kernel in an `Arc`.
@@ -1332,15 +1298,25 @@ pub struct QMoEFactory {
 
 impl KernelFactory for QMoEFactory {
     fn create(&self, node: &Node, input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        let telemetry = self
-            .telemetry_registry
-            .source_for_current(node.id, Arc::clone(&self.runtime));
-        let kernel = Arc::new(self.create_kernel_with_telemetry(node, input_shapes, telemetry)?);
+        let kernel = Arc::new(self.create_kernel_with_telemetry(node, input_shapes, None)?);
         Ok(Box::new(SharedQMoEKernel(kernel)))
     }
 }
 
 impl QMoEFactory {
+    pub(crate) fn create_for_executor(
+        &self,
+        executor: ExecutorInstanceId,
+        node: &Node,
+        input_shapes: &[Vec<usize>],
+    ) -> Result<Box<dyn Kernel>> {
+        let telemetry =
+            self.telemetry_registry
+                .source_for(executor, node.id, Arc::clone(&self.runtime));
+        let kernel = Arc::new(self.create_kernel_with_telemetry(node, input_shapes, telemetry)?);
+        Ok(Box::new(SharedQMoEKernel(kernel)))
+    }
+
     /// Build a concrete [`QMoEKernel`]. This is the body of [`create`], exposed
     /// so route-telemetry tests (issue #1810 Slice 7A) can obtain the concrete
     /// kernel and call its `#[doc(hidden)]` arming API — the trait object
@@ -1785,6 +1761,11 @@ impl Kernel for QMoEKernel {
     /// this call's kernels still surfaces synchronously from `execute` itself
     /// under that debug flag, matching prior behavior.
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        if crate::coarse_residency::coarse_residency_profile_enabled() && self.telemetry.is_none() {
+            return Err(error(
+                "QMoE route telemetry requires an explicit executor scope when coarse residency is enabled",
+            ));
+        }
         if !(7..=21).contains(&inputs.len()) || outputs.len() != 1 {
             return Err(error(format!(
                 "expected 7 to 21 inputs and exactly 1 output, got {} inputs and {} outputs",

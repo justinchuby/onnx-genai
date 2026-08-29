@@ -49,7 +49,8 @@ use onnx_runtime_cuda_memory::vmm_allocator::{
     CUDA_PHYSICAL_HANDLE_POOL_BYTES_ENV, CudaVmmAllocator,
 };
 use onnx_runtime_ep_api::{
-    ExecutionProvider, ExpertWeightGroup, LazyWeightBoundary, Result, expert_weight_groups,
+    ExecutionProvider, ExecutorInstanceId, ExpertWeightGroup, LazyWeightBoundary, Result,
+    expert_weight_groups,
 };
 use onnx_runtime_ep_cuda::CudaExecutionProvider;
 use onnx_runtime_ep_cuda::coarse_residency::COARSE_RESIDENCY_ENABLE_ENV;
@@ -80,14 +81,16 @@ use onnx_runtime_memory_governor::{
 #[cfg(feature = "gpu-tests")]
 fn drive_boundary_with_faults(
     provider: &CudaExecutionProvider,
+    executor: ExecutorInstanceId,
     faults: HashMap<ValueId, Arc<DriverFaultPlan>>,
 ) -> Result<()> {
-    provider.consume_route_residency_at_boundary_with_phase8_faults(faults)
+    provider.consume_route_residency_at_boundary_with_phase8_faults(executor, faults)
 }
 
 #[cfg(not(feature = "gpu-tests"))]
 fn drive_boundary_with_faults(
     _provider: &CudaExecutionProvider,
+    _executor: ExecutorInstanceId,
     _faults: HashMap<ValueId, Arc<DriverFaultPlan>>,
 ) -> Result<()> {
     unreachable!("Phase-8 fault injection is only compiled under the gpu-tests feature");
@@ -357,6 +360,7 @@ fn boundary_disabled_gate_is_structural_no_op() {
         Some(p) => p,
         None => return,
     };
+    let executor = ExecutorInstanceId::fresh();
     let runtime = provider.runtime();
     let gran = match gran_or_skip() {
         Some(g) => g,
@@ -416,14 +420,14 @@ fn boundary_disabled_gate_is_structural_no_op() {
         1,
         Vec::new(),
     );
-    provider.install_route_residency_boundary(Arc::new(boundary));
+    provider.install_route_residency_boundary(executor, Arc::new(boundary));
 
     gate_off();
     provider
-        .consume_route_residency_at_boundary()
+        .consume_route_residency_at_boundary_for_executor(executor)
         .expect("disabled boundary must be Ok");
 
-    let diag = provider.route_residency_diagnostics();
+    let diag = provider.route_residency_diagnostics(executor);
     assert_eq!(
         diag.boundaries(),
         0,
@@ -464,6 +468,7 @@ fn boundary_applies_group_hot_set_and_advances_window() {
         Some(p) => p,
         None => return,
     };
+    let executor = ExecutorInstanceId::fresh();
     let runtime = provider.runtime();
     let gran = match gran_or_skip() {
         Some(g) => g,
@@ -547,14 +552,14 @@ fn boundary_applies_group_hot_set_and_advances_window() {
         1,
         groups,
     );
-    provider.install_route_residency_boundary(Arc::new(boundary));
+    provider.install_route_residency_boundary(executor, Arc::new(boundary));
 
     gate_on();
     // Boundary 1: consume the accumulated window and transition both members.
     provider
-        .consume_route_residency_at_boundary()
+        .consume_route_residency_at_boundary_for_executor(executor)
         .expect("boundary 1 Ok");
-    let diag = provider.route_residency_diagnostics();
+    let diag = provider.route_residency_diagnostics(executor);
     assert_eq!(diag.boundaries(), 1);
     assert_eq!(diag.applied(), 1, "the routed union must be applied");
     assert_eq!(
@@ -576,7 +581,7 @@ fn boundary_applies_group_hot_set_and_advances_window() {
     // Boundary 2: the window was advanced, so this boundary sees an empty window
     // and does nothing (no second reset, no allocator change).
     provider
-        .consume_route_residency_at_boundary()
+        .consume_route_residency_at_boundary_for_executor(executor)
         .expect("boundary 2 Ok");
     assert_eq!(diag.boundaries(), 2);
     assert_eq!(
@@ -604,6 +609,190 @@ fn boundary_applies_group_hot_set_and_advances_window() {
     println!("group hot-set applied atomically, window advanced, next window empty ✓");
 }
 
+#[test]
+#[ignore = "requires idle CUDA device; CUDA_VISIBLE_DEVICES=<idle> --ignored"]
+fn shared_provider_scopes_physical_route_counters_and_teardown() {
+    let _guard = GPU_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let provider = match provider_or_skip("shared scopes") {
+        Some(provider) => provider,
+        None => return,
+    };
+    let first = ExecutorInstanceId::fresh();
+    let second = ExecutorInstanceId::fresh();
+    let missing = ExecutorInstanceId::fresh();
+    let runtime = provider.runtime();
+    let gran = match gran_or_skip() {
+        Some(gran) => gran,
+        None => return,
+    };
+    let n_experts = 4;
+    let total_bytes = n_experts * gran;
+    let pool_bytes = total_bytes * 12;
+    let governor = make_governor(pool_bytes as u64, pool_bytes as u64);
+    let (first_allocator, _) = build_precommitted_allocator(
+        &provider,
+        n_experts,
+        gran,
+        pool_bytes,
+        governor,
+        HolderId::new(138),
+    );
+    let (second_allocator, _) = build_precommitted_allocator(
+        &provider,
+        n_experts,
+        gran,
+        pool_bytes,
+        governor,
+        HolderId::new(139),
+    );
+    let pools = match make_pools(&provider, pool_bytes, governor) {
+        Some(pools) => pools,
+        None => return,
+    };
+    let residency = Arc::new(CudaWeightResidency::new(
+        Arc::clone(runtime),
+        pool_bytes as u64,
+    ));
+    let first_value = ValueId(1380);
+    let second_value = ValueId(1390);
+    let first_source = WindowSource::with_window(window_snapshot(
+        &[&[0]],
+        n_experts,
+        1,
+        31,
+        runtime.ordinal(),
+    ));
+    let second_source = WindowSource::with_window(window_snapshot(
+        &[&[2]],
+        n_experts,
+        1,
+        32,
+        runtime.ordinal(),
+    ));
+
+    for (executor, value, allocator, source, request) in [
+        (
+            first,
+            first_value,
+            Arc::clone(&first_allocator),
+            Arc::clone(&first_source),
+            31,
+        ),
+        (
+            second,
+            second_value,
+            Arc::clone(&second_allocator),
+            Arc::clone(&second_source),
+            32,
+        ),
+    ] {
+        let mut catalogs = HashMap::new();
+        catalogs.insert(value, make_aligned_catalog(n_experts, gran, 0));
+        let mut allocators = HashMap::new();
+        allocators.insert(value, allocator);
+        provider.install_route_residency_boundary(
+            executor,
+            Arc::new(RouteResidencyBoundary::new(
+                source as Arc<dyn RouteTelemetrySource>,
+                Arc::clone(&residency),
+                vec![value],
+                LazyWeightBoundary::QMoe,
+                catalogs,
+                allocators,
+                Arc::clone(&pools.device_pool),
+                Arc::clone(&pools.host_pool),
+                1,
+                0,
+                request,
+                runtime.ordinal(),
+                1,
+                Vec::new(),
+            )),
+        );
+    }
+
+    gate_on();
+    let unscoped_error = provider
+        .consume_route_residency_at_boundary()
+        .expect_err("unscoped route consumption must fail closed");
+    assert!(
+        unscoped_error
+            .to_string()
+            .contains("explicit executor scope")
+    );
+    let missing_error = provider
+        .consume_route_residency_at_boundary_for_executor(missing)
+        .expect_err("an unknown executor scope must fail closed");
+    assert!(missing_error.to_string().contains("no lifecycle state"));
+
+    provider
+        .consume_route_residency_at_boundary_for_executor(first)
+        .expect("first executor boundary");
+    let first_after_consume = provider.executor_residency_telemetry(first).unwrap();
+    let second_before_consume = provider.executor_residency_telemetry(second).unwrap();
+    assert_eq!(first_after_consume.route_boundaries, 1);
+    assert_eq!(first_after_consume.route_applied, 1);
+    assert!(first_after_consume.expert_device_bytes_released > 0);
+    assert!(first_after_consume.expert_host_bytes_committed > 0);
+    assert_eq!(second_before_consume.route_boundaries, 0);
+    assert_eq!(second_before_consume.expert_device_bytes_released, 0);
+    assert_eq!(second_before_consume.expert_host_bytes_committed, 0);
+    assert_eq!(first_source.reset_calls(), 1);
+    assert_eq!(second_source.reset_calls(), 0);
+
+    provider
+        .consume_route_residency_at_boundary_for_executor(second)
+        .expect("second executor boundary");
+    let first_before_drain = provider.executor_residency_telemetry(first).unwrap();
+    let second_before_drain = provider.executor_residency_telemetry(second).unwrap();
+    assert_eq!(first_before_drain, first_after_consume);
+    assert_eq!(second_before_drain.route_boundaries, 1);
+    assert_eq!(second_before_drain.route_applied, 1);
+    assert!(second_before_drain.expert_device_bytes_released > 0);
+    assert!(second_before_drain.expert_host_bytes_committed > 0);
+
+    provider
+        .drain_route_residency_boundary(first)
+        .expect("first executor drain");
+    let stale_error = provider
+        .consume_route_residency_at_boundary_for_executor(first)
+        .expect_err("drained executor scope must reject late completion");
+    assert!(stale_error.to_string().contains("drained"));
+
+    second_source.push(window_snapshot(
+        &[&[1]],
+        n_experts,
+        2,
+        32,
+        runtime.ordinal(),
+    ));
+    provider
+        .consume_route_residency_at_boundary_for_executor(second)
+        .expect("surviving executor boundary");
+    let first_after_drain = provider.executor_residency_telemetry(first).unwrap();
+    let second_after_continue = provider.executor_residency_telemetry(second).unwrap();
+    assert!(first_after_drain.drained);
+    assert_eq!(
+        first_after_drain.expert_device_bytes_released,
+        first_before_drain.expert_device_bytes_released
+    );
+    assert_eq!(
+        first_after_drain.expert_host_bytes_committed,
+        first_before_drain.expert_host_bytes_committed
+    );
+    assert_eq!(second_after_continue.route_boundaries, 2);
+    assert_eq!(second_after_continue.route_applied, 2);
+    assert!(
+        second_after_continue.expert_device_bytes_released
+            >= second_before_drain.expert_device_bytes_released
+    );
+    assert!(!second_after_continue.drained);
+    provider
+        .drain_route_residency_boundary(second)
+        .expect("second executor drain");
+    gate_off();
+}
+
 // ---------------------------------------------------------------------------
 // Test 3: an unsafe boundary is rejected *before* the snapshot dtoh and before
 // any reset. Two independent unsafe conditions, both through the production
@@ -620,6 +809,7 @@ fn boundary_unsafe_point_rejects_before_consume_and_reset() {
         Some(p) => p,
         None => return,
     };
+    let executor = ExecutorInstanceId::fresh();
     let runtime = provider.runtime();
     let gran = match gran_or_skip() {
         Some(g) => g,
@@ -676,15 +866,15 @@ fn boundary_unsafe_point_rejects_before_consume_and_reset() {
             1,
             Vec::new(),
         );
-        provider.install_route_residency_boundary(Arc::new(boundary));
+        provider.install_route_residency_boundary(executor, Arc::new(boundary));
 
         gate_on();
         provider
-            .consume_route_residency_at_boundary()
+            .consume_route_residency_at_boundary_for_executor(executor)
             .expect("reject is Ok, not Err");
         gate_off();
 
-        let diag = provider.route_residency_diagnostics();
+        let diag = provider.route_residency_diagnostics(executor);
         assert_eq!(diag.boundaries(), 1);
         assert_eq!(diag.rejected(), 1, "multi-device must reject");
         assert_eq!(
@@ -731,16 +921,16 @@ fn boundary_unsafe_point_rejects_before_consume_and_reset() {
             1,
             Vec::new(),
         );
-        provider.install_route_residency_boundary(Arc::new(boundary));
+        provider.install_route_residency_boundary(executor, Arc::new(boundary));
 
         gate_on();
         runtime.begin_graph_capture(&[]).expect("begin capture");
-        let result = provider.consume_route_residency_at_boundary();
+        let result = provider.consume_route_residency_at_boundary_for_executor(executor);
         runtime.abort_graph_capture().expect("abort capture");
         gate_off();
         result.expect("reject is Ok, not Err");
 
-        let diag = provider.route_residency_diagnostics();
+        let diag = provider.route_residency_diagnostics(executor);
         assert_eq!(diag.boundaries(), 2);
         assert_eq!(diag.rejected(), 2, "active capture must reject");
         assert_eq!(source.snapshot_calls(), 0, "no snapshot during capture");
@@ -772,6 +962,7 @@ fn boundary_defective_windows_fail_closed() {
         Some(p) => p,
         None => return,
     };
+    let executor = ExecutorInstanceId::fresh();
     let runtime = provider.runtime();
     let gran = match gran_or_skip() {
         Some(g) => g,
@@ -859,13 +1050,13 @@ fn boundary_defective_windows_fail_closed() {
             initial_epoch,
             Vec::new(),
         );
-        provider.install_route_residency_boundary(Arc::new(boundary));
+        provider.install_route_residency_boundary(executor, Arc::new(boundary));
 
         provider
-            .consume_route_residency_at_boundary()
+            .consume_route_residency_at_boundary_for_executor(executor)
             .expect("fail-closed boundary is Ok");
         expected_whole_bank += 1;
-        let diag = provider.route_residency_diagnostics();
+        let diag = provider.route_residency_diagnostics(executor);
         assert_eq!(
             diag.whole_bank(),
             expected_whole_bank,
@@ -910,6 +1101,7 @@ fn boundary_injected_fault_rolls_back_through_caller() {
         Some(p) => p,
         None => return,
     };
+    let executor = ExecutorInstanceId::fresh();
     let runtime = provider.runtime();
     let gran = match gran_or_skip() {
         Some(g) => g,
@@ -979,7 +1171,7 @@ fn boundary_injected_fault_rolls_back_through_caller() {
         1,
         Vec::new(),
     );
-    provider.install_route_residency_boundary(Arc::new(boundary));
+    provider.install_route_residency_boundary(executor, Arc::new(boundary));
 
     let mut phase8_faults: HashMap<ValueId, Arc<DriverFaultPlan>> = HashMap::new();
     phase8_faults.insert(
@@ -988,10 +1180,10 @@ fn boundary_injected_fault_rolls_back_through_caller() {
     );
 
     gate_on();
-    drive_boundary_with_faults(&provider, phase8_faults).expect("fault boundary is Ok");
+    drive_boundary_with_faults(&provider, executor, phase8_faults).expect("fault boundary is Ok");
     gate_off();
 
-    let diag = provider.route_residency_diagnostics();
+    let diag = provider.route_residency_diagnostics(executor);
     assert_eq!(diag.boundaries(), 1);
     assert_eq!(
         diag.applied(),
@@ -1171,6 +1363,7 @@ fn builder_assembles_firing_binding_from_graph_banks() {
         Some(p) => p,
         None => return,
     };
+    let executor = ExecutorInstanceId::fresh();
     let runtime = provider.runtime();
     let gran = match gran_or_skip() {
         Some(g) => g,
@@ -1231,21 +1424,21 @@ fn builder_assembles_firing_binding_from_graph_banks() {
         2,
         "binding covers exactly the two discovered banks"
     );
-    provider.install_route_residency_boundary(Arc::new(binding));
+    provider.install_route_residency_boundary(executor, Arc::new(binding));
 
     gate_on();
     // Boundary 1: the discovered banks transition atomically to the routed set.
     provider
-        .consume_route_residency_at_boundary()
+        .consume_route_residency_at_boundary_for_executor(executor)
         .expect("boundary 1 Ok");
-    let diag = provider.route_residency_diagnostics();
+    let diag = provider.route_residency_diagnostics(executor);
     assert_eq!(diag.applied(), 1, "the routed union is applied once");
     assert_eq!(source.snapshot_calls(), 1, "one snapshot per boundary");
     assert_eq!(source.reset_calls(), 1, "consumed window advanced once");
 
     // Boundary 2: the window advanced, so the next boundary is empty.
     provider
-        .consume_route_residency_at_boundary()
+        .consume_route_residency_at_boundary_for_executor(executor)
         .expect("boundary 2 Ok");
     assert_eq!(diag.empty(), 1, "next window empty after the reset");
     assert_eq!(source.snapshot_calls(), 2);
@@ -1266,10 +1459,12 @@ fn builder_assembles_firing_binding_from_graph_banks() {
 
     // Draining removes the binding: the consumer is inert again.
     gate_on();
-    provider.drain_route_residency_boundary();
     provider
-        .consume_route_residency_at_boundary()
-        .expect("drained boundary Ok");
+        .drain_route_residency_boundary(executor)
+        .expect("route boundary drain");
+    provider
+        .consume_route_residency_at_boundary_for_executor(executor)
+        .expect_err("drained scope must reject consumption");
     assert_eq!(
         source.snapshot_calls(),
         2,
@@ -1296,6 +1491,7 @@ fn try_install_fail_closed_installs_nothing() {
         Some(p) => p,
         None => return,
     };
+    let executor = ExecutorInstanceId::fresh();
     let gran = match gran_or_skip() {
         Some(g) => g,
         None => return,
@@ -1314,11 +1510,12 @@ fn try_install_fail_closed_installs_nothing() {
         WindowSource::with_window(window_snapshot(&[&[0]], n_experts, 1, 5, 0))
             as Arc<dyn RouteTelemetrySource>,
     );
-    let diag = provider.route_residency_diagnostics();
+    let diag = provider.route_residency_diagnostics(executor);
 
     // Gate on, but this EP has no coarse-residency authority -> OffloadDisabled.
     gate_on();
     let outcome = provider.try_install_route_residency_binding(
+        executor,
         &graph,
         &sources,
         HashMap::new(),
@@ -1332,13 +1529,14 @@ fn try_install_fail_closed_installs_nothing() {
     assert_eq!(diag.declines(), 1, "offload-disabled decline recorded");
     // Nothing installed: a gate-on boundary runs no consumer.
     provider
-        .consume_route_residency_at_boundary()
+        .consume_route_residency_at_boundary_for_executor(executor)
         .expect("no-binding boundary Ok");
     assert_eq!(diag.boundaries(), 0, "no binding was installed");
 
     // Gate off -> GateDisabled before any discovery/allocation.
     gate_off();
     let outcome = provider.try_install_route_residency_binding(
+        executor,
         &graph,
         &sources,
         HashMap::new(),
@@ -1388,9 +1586,10 @@ fn try_install_on_offload_authority_installs_and_fires() {
             return;
         }
     };
+    let executor = ExecutorInstanceId::fresh();
     let runtime = provider.runtime();
     let governor = make_governor(pool_bytes as u64, pool_bytes as u64);
-    let diag = provider.route_residency_diagnostics();
+    let diag = provider.route_residency_diagnostics(executor);
 
     // A dense-only graph is a typed reject that installs nothing.
     let dense = dense_only_graph();
@@ -1401,6 +1600,7 @@ fn try_install_on_offload_authority_installs_and_fires() {
     };
     gate_on();
     let rejected = provider.try_install_route_residency_binding(
+        executor,
         &dense,
         &empty_sources,
         HashMap::new(),
@@ -1416,7 +1616,7 @@ fn try_install_on_offload_authority_installs_and_fires() {
     );
     assert_eq!(diag.installs(), 0, "reject installs nothing");
     provider
-        .consume_route_residency_at_boundary()
+        .consume_route_residency_at_boundary_for_executor(executor)
         .expect("post-reject boundary Ok");
     assert_eq!(diag.boundaries(), 0, "no binding installed after reject");
 
@@ -1427,6 +1627,7 @@ fn try_install_on_offload_authority_installs_and_fires() {
         &provider, node, fc1, fc2, n_experts, gran, pool_bytes, governor, request, 160,
     );
     let installed = provider.try_install_route_residency_binding(
+        executor,
         &graph,
         &sources,
         catalogs,
@@ -1445,7 +1646,7 @@ fn try_install_on_offload_authority_installs_and_fires() {
 
     // The *installed* binding fires through the executor's trait method.
     provider
-        .consume_route_residency_at_boundary()
+        .consume_route_residency_at_boundary_for_executor(executor)
         .expect("installed boundary Ok");
     assert_eq!(diag.applied(), 1, "the installed binding applied a hot-set");
     assert_eq!(
@@ -1460,10 +1661,12 @@ fn try_install_on_offload_authority_installs_and_fires() {
     );
 
     // Teardown drains the binding (mirrors `shutdown`).
-    provider.drain_route_residency_boundary();
     provider
-        .consume_route_residency_at_boundary()
-        .expect("drained boundary Ok");
+        .drain_route_residency_boundary(executor)
+        .expect("route boundary drain");
+    provider
+        .consume_route_residency_at_boundary_for_executor(executor)
+        .expect_err("drained scope must reject consumption");
     assert_eq!(
         source.snapshot_calls(),
         1,
@@ -1498,6 +1701,7 @@ fn boundary_host_overhead_on_vs_off() {
         Some(p) => p,
         None => return,
     };
+    let executor = ExecutorInstanceId::fresh();
     let runtime = provider.runtime();
     let gran = match gran_or_skip() {
         Some(g) => g,
@@ -1541,7 +1745,7 @@ fn boundary_host_overhead_on_vs_off() {
     .expect("binding");
     assert_eq!(bindings.len(), 1);
     let binding = bindings.remove(0);
-    provider.install_route_residency_boundary(Arc::new(binding));
+    provider.install_route_residency_boundary(executor, Arc::new(binding));
 
     let sample = |gate_enabled: bool| -> f64 {
         if gate_enabled {
@@ -1552,7 +1756,7 @@ fn boundary_host_overhead_on_vs_off() {
         // Warm up (clock ramp) before timing.
         for _ in 0..64 {
             provider
-                .consume_route_residency_at_boundary()
+                .consume_route_residency_at_boundary_for_executor(executor)
                 .expect("warm");
         }
         let mut samples = Vec::new();
@@ -1561,7 +1765,7 @@ fn boundary_host_overhead_on_vs_off() {
             let start = Instant::now();
             for _ in 0..iters {
                 provider
-                    .consume_route_residency_at_boundary()
+                    .consume_route_residency_at_boundary_for_executor(executor)
                     .expect("timed");
             }
             samples.push(start.elapsed().as_nanos() as f64 / f64::from(iters));

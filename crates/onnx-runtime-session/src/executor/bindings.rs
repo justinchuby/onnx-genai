@@ -1025,6 +1025,7 @@ impl Executor {
             self.ep.as_ref(),
             self.instance_id,
             &self.graph,
+            &self.finalized_expert_banks,
         )?;
         let external = self.prepare_external_bindings(bindings)?;
         let signature = Self::binding_signature(bindings);
@@ -1045,7 +1046,10 @@ impl Executor {
         // hard-error ("no executable is installed"); detect it and report an
         // invalidation so the caller re-warms and re-captures, exactly as it does
         // for a control-flow branch flip.
-        if !self.ep.has_device_graph_in(self.graph_slot)? {
+        if !self
+            .ep
+            .has_device_graph_for_executor(self.instance_id, self.graph_slot)?
+        {
             self.reset_device_graph()?;
             return Ok(false);
         }
@@ -1060,7 +1064,8 @@ impl Executor {
             .as_ref()
             .is_none_or(CaptureSchedule::is_single_graph);
         if single_graph {
-            self.ep.replay_device_graph_in(self.graph_slot)?;
+            self.ep
+                .replay_device_graph_for_executor(self.instance_id, self.graph_slot)?;
             return Ok(true);
         }
         let result = self.run_scoped_mode(&[], &HashMap::new(), &external, RunMode::Replay);
@@ -1087,7 +1092,9 @@ impl Executor {
         cap.capture_schedule = None;
         cap.capture_cf_shapes.clear();
         cap.capture_warm_seeded.clear();
-        Ok(self.ep.reset_device_graph_in(self.graph_slot)?)
+        Ok(self
+            .ep
+            .reset_device_graph_for_executor(self.instance_id, self.graph_slot)?)
     }
 
     /// Which of the EP's captured-graph slots this executor drives.

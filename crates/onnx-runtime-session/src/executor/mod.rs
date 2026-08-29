@@ -51,11 +51,12 @@ use std::time::{Duration, Instant};
 use onnx_runtime_ep_api::{
     CaptureRegionShapeStatus, DeviceBuffer, DeviceGraphSlot, DevicePtr, DevicePtrMut, EpError,
     ExecutionProvider, ExecutorArtifactFinalization, ExecutorArtifactPending,
-    ExecutorArtifactReadinessEpoch, ExecutorInstanceId, ExternalMmapRegion, FinalizedExpertBank,
-    FinalizedExpertWeight, Kernel, KernelInput, KernelMatch, LazyWeight, LazyWeightBoundary,
-    ResidentWeight, StructuralCaptureDecline, TensorBacking, TensorMetadata, TensorMut, TensorView,
-    WeightHandle, WorkspaceAllocation, WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
-    expert_weight_groups, lazy_weight_candidates,
+    ExecutorArtifactReadinessEpoch, ExecutorInstanceId, ExecutorResidencyTelemetry,
+    ExternalMmapRegion, FinalizedExpertBank, FinalizedExpertWeight, Kernel, KernelInput,
+    KernelMatch, LazyWeight, LazyWeightBoundary, ResidentWeight, StructuralCaptureDecline,
+    TensorBacking, TensorMetadata, TensorMut, TensorView, WeightHandle, WorkspaceAllocation,
+    WorkspaceLifetime, WorkspaceRequirement, WorkspaceView, expert_weight_groups,
+    lazy_weight_candidates,
 };
 
 type OptionalTensorSpecs = Vec<Option<(DataType, Vec<usize>)>>;
@@ -755,7 +756,12 @@ impl Drop for Executor {
         // Drain only this executor's provider-owned artifacts before its
         // buffers/kernels are torn down. Sibling/MTP executors may share the same
         // EP and must retain their own producers and boundary state.
-        self.ep.drain_executor_artifacts(self.instance_id);
+        if let Err(error) = self.ep.drain_executor_artifacts(self.instance_id) {
+            eprintln!(
+                "session: executor {} provider-artifact teardown was quarantined: {error}",
+                self.instance_id.get()
+            );
+        }
         // Evict the global weight-transpose cache to prevent address-reuse
         // staleness: if a subsequently loaded model's mmap recycles a virtual
         // address, the cache must not serve the old model's transposed weights.
@@ -765,7 +771,9 @@ impl Drop for Executor {
         // mmap recycles an address for a same-shaped weight must not inherit this
         // model's packed buffers.
         onnx_runtime_ep_cpu::kernels::matmul_nbits::clear_mlas_packed_caches();
-        let _ = self.ep.reset_device_graph_in(self.graph_slot);
+        let _ = self
+            .ep
+            .reset_device_graph_for_executor(self.instance_id, self.graph_slot);
         self.cap_mut().device_graph_signature = None;
         // Free every buffer via the owning EP (DeviceBuffer has no Drop).
         for (_, buf) in self.buffers.drain() {

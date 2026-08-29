@@ -749,7 +749,9 @@ impl Executor {
                     ) {
                         Ok(_) => break 'capture schedule,
                         Err(error) => {
-                            let _ = self.ep.reset_device_graph_in(self.graph_slot);
+                            let _ = self
+                                .ep
+                                .reset_device_graph_for_executor(self.instance_id, self.graph_slot);
                             // Quarantine the op-type that aborted recording and
                             // retry, unless we already quarantined it (no
                             // progress), hit the attempt bound, or cannot
@@ -798,7 +800,9 @@ impl Executor {
                     .map(|(vid, seeded)| (*vid, seeded.clone()))
                 {
                     let current = resolved.get(&vid).cloned();
-                    let _ = self.ep.reset_device_graph_in(self.graph_slot);
+                    let _ = self
+                        .ep
+                        .reset_device_graph_for_executor(self.instance_id, self.graph_slot);
                     let cap = self.cap_mut();
                     cap.capture_schedule = None;
                     cap.capture_segmentation.clear();
@@ -859,7 +863,8 @@ impl Executor {
                     cap.capture_segmentation.clear();
                     cap.capture_cf_shapes.clear();
                     cap.device_graph_signature = None;
-                    self.ep.reset_device_graph_in(self.graph_slot)?;
+                    self.ep
+                        .reset_device_graph_for_executor(self.instance_id, self.graph_slot)?;
                 }
             }
         }

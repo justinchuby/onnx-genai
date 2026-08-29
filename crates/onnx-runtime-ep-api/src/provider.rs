@@ -1,6 +1,7 @@
 //! The [`ExecutionProvider`] trait and its supporting types (§4.1).
 
 use std::ffi::c_void;
+use std::num::NonZeroU64;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -26,31 +27,44 @@ pub struct EpId(pub u32);
 /// lifetime follows an executor use this identity instead of graph-local
 /// [`NodeId`]s, which collide across sibling executors.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct ExecutorInstanceId(u64);
+pub struct ExecutorInstanceId(NonZeroU64);
 
 impl ExecutorInstanceId {
-    /// Reserved identity for direct provider tests and callers that do not own a
-    /// session executor.
-    pub const UNSCOPED: Self = Self(0);
-
     /// Allocate a process-unique executor identity.
     pub fn fresh() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(1);
         let id = NEXT.fetch_add(1, Ordering::Relaxed);
-        assert_ne!(id, u64::MAX, "executor instance id space exhausted");
-        Self(id)
+        assert!(
+            id < u64::MAX,
+            "executor instance id space exhausted before identity reuse"
+        );
+        Self(NonZeroU64::new(id).expect("executor identity starts at one"))
     }
 
     /// Stable numeric representation for provider-owned maps and diagnostics.
     pub fn get(self) -> u64 {
-        self.0
+        self.0.get()
     }
+}
 
-    /// Reconstitute an identity stored in provider-owned atomic state.
-    #[doc(hidden)]
-    pub const fn from_raw(id: u64) -> Self {
-        Self(id)
-    }
+/// Executor-scoped residency and device-graph telemetry.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExecutorResidencyTelemetry {
+    pub route_boundaries: u64,
+    pub route_applied: u64,
+    pub expert_device_bytes_released: u64,
+    pub expert_host_bytes_committed: u64,
+    pub quarantined_blocks: u64,
+    pub graph_captures: u64,
+    pub graph_replays: u64,
+    pub graph_fallbacks: u64,
+    pub weight_page_ins: u64,
+    pub weight_hits: u64,
+    pub weight_evictions: u64,
+    pub weight_committed_bytes: u64,
+    pub weight_prefetch_fallbacks: u64,
+    pub drained: bool,
+    pub quarantined: bool,
 }
 
 /// Monotonic executor-local epoch for concrete kernel/producer readiness.
@@ -1484,6 +1498,66 @@ pub trait ExecutionProvider: Send + Sync {
         Ok(true)
     }
 
+    /// Executor-scoped graph capture. Shared providers override this to bind
+    /// mutable graph lifecycle state to exactly one executor.
+    fn begin_device_graph_capture_for_executor(
+        &self,
+        _executor: ExecutorInstanceId,
+        slot: DeviceGraphSlot,
+        kernels: &[&dyn Kernel],
+    ) -> Result<()> {
+        self.begin_device_graph_capture_in(slot, kernels)
+    }
+
+    fn end_device_graph_capture_for_executor(
+        &self,
+        _executor: ExecutorInstanceId,
+        slot: DeviceGraphSlot,
+    ) -> Result<()> {
+        self.end_device_graph_capture_in(slot)
+    }
+
+    fn abort_device_graph_capture_for_executor(
+        &self,
+        _executor: ExecutorInstanceId,
+        slot: DeviceGraphSlot,
+    ) -> Result<()> {
+        self.abort_device_graph_capture_in(slot)
+    }
+
+    fn replay_device_graph_for_executor(
+        &self,
+        _executor: ExecutorInstanceId,
+        slot: DeviceGraphSlot,
+    ) -> Result<()> {
+        self.replay_device_graph_in(slot)
+    }
+
+    fn replay_device_graph_segment_for_executor(
+        &self,
+        _executor: ExecutorInstanceId,
+        slot: DeviceGraphSlot,
+        index: usize,
+    ) -> Result<()> {
+        self.replay_device_graph_segment_in(slot, index)
+    }
+
+    fn reset_device_graph_for_executor(
+        &self,
+        _executor: ExecutorInstanceId,
+        slot: DeviceGraphSlot,
+    ) -> Result<bool> {
+        self.reset_device_graph_in(slot)
+    }
+
+    fn has_device_graph_for_executor(
+        &self,
+        _executor: ExecutorInstanceId,
+        slot: DeviceGraphSlot,
+    ) -> Result<bool> {
+        self.has_device_graph_in(slot)
+    }
+
     /// Clear the provider's latching device-side validation error.
     ///
     /// Session executors call this at top-level request boundaries. Implementations
@@ -1576,7 +1650,17 @@ pub trait ExecutionProvider: Send + Sync {
     /// The default is a no-op. Participating providers must make this
     /// idempotent and must not clear producer/boundary state owned by sibling
     /// executors sharing the same provider.
-    fn drain_executor_artifacts(&self, _executor: ExecutorInstanceId) {}
+    fn drain_executor_artifacts(&self, _executor: ExecutorInstanceId) -> Result<()> {
+        Ok(())
+    }
+
+    /// Snapshot telemetry owned exclusively by `executor`.
+    fn executor_residency_telemetry(
+        &self,
+        _executor: ExecutorInstanceId,
+    ) -> Option<ExecutorResidencyTelemetry> {
+        None
+    }
 
     /// Explicit device allocation/free counters, when the EP exposes them.
     fn device_allocation_counts(&self) -> Option<(u64, u64)> {

@@ -2,9 +2,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use onnx_runtime_ep_api::{
-    ExecutionProvider, ExecutorArtifactFinalization, ExecutorInstanceId, ExternalMmapRegion,
-    FinalizedExpertBank, FinalizedExpertWeight, LazyWeight, LazyWeightBoundary, ResidentWeight,
-    expert_weight_groups,
+    ExecutionProvider, ExecutorArtifactFinalization, ExecutorArtifactPending,
+    ExecutorArtifactReadinessEpoch, ExecutorInstanceId, ExternalMmapRegion, FinalizedExpertBank,
+    FinalizedExpertWeight, LazyWeight, LazyWeightBoundary, ResidentWeight, expert_weight_groups,
 };
 use onnx_runtime_ep_cuda::CudaExecutionProvider;
 use onnx_runtime_ep_cuda::coarse_residency::COARSE_RESIDENCY_ENABLE_ENV;
@@ -59,6 +59,23 @@ fn provider_or_skip(label: &str) -> Option<CudaExecutionProvider> {
             None
         }
     }
+}
+
+fn finalize(
+    provider: &CudaExecutionProvider,
+    executor: ExecutorInstanceId,
+    graph: &Graph,
+    readiness_epoch: u64,
+    banks: &[FinalizedExpertBank],
+) -> ExecutorArtifactFinalization {
+    provider
+        .finalize_executor_artifacts(
+            executor,
+            graph,
+            banks,
+            ExecutorArtifactReadinessEpoch::new(readiness_epoch),
+        )
+        .expect("executor artifact finalization")
 }
 
 fn external_initializer(graph: &mut Graph, name: &str, dtype: DataType, offset: usize) -> ValueId {
@@ -204,11 +221,11 @@ fn real_producer_installs_executor_scoped_banks_once() {
     let _second_kernel = compile_real_qmoe(&provider, second, &graph, node);
 
     assert_eq!(
-        provider.finalize_executor_artifacts(first, &graph, std::slice::from_ref(&bank)),
+        finalize(&provider, first, &graph, 1, std::slice::from_ref(&bank)),
         ExecutorArtifactFinalization::Complete
     );
     assert_eq!(
-        provider.finalize_executor_artifacts(second, &graph, std::slice::from_ref(&bank)),
+        finalize(&provider, second, &graph, 1, std::slice::from_ref(&bank)),
         ExecutorArtifactFinalization::Complete
     );
     for executor in [first, second] {
@@ -263,7 +280,7 @@ fn real_producer_installs_executor_scoped_banks_once() {
         .get_kernel_for_executor(first, graph.node(node), &[vec![2, 4]], 1)
         .expect("dynamic specialization");
     assert_eq!(
-        provider.finalize_executor_artifacts(first, &graph, std::slice::from_ref(&bank)),
+        finalize(&provider, first, &graph, 2, std::slice::from_ref(&bank)),
         ExecutorArtifactFinalization::Complete
     );
     assert_eq!(
@@ -273,15 +290,36 @@ fn real_producer_installs_executor_scoped_banks_once() {
         1
     );
 
-    provider.drain_executor_artifacts(first);
-    provider.drain_executor_artifacts(first);
+    provider
+        .drain_executor_artifacts(first)
+        .expect("first executor drain");
+    let stale_finalization = provider
+        .finalize_executor_artifacts(
+            first,
+            &graph,
+            std::slice::from_ref(&bank),
+            ExecutorArtifactReadinessEpoch::new(3),
+        )
+        .expect_err("a drained executor must reject late finalization");
+    assert!(stale_finalization.to_string().contains("already drained"));
+    let stale_kernel =
+        match provider.get_kernel_for_executor(first, graph.node(node), &[vec![3, 4]], 1) {
+            Ok(_) => panic!("a drained executor must reject late kernel publication"),
+            Err(error) => error,
+        };
+    assert!(stale_kernel.to_string().contains("already drained"));
+    provider
+        .drain_executor_artifacts(first)
+        .expect("idempotent first executor drain");
     assert_eq!(provider.residency().unwrap().route_reservation_count(), 1);
     assert!(provider.route_residency_scopes().contains(&second));
     assert_eq!(
         provider.route_residency_executor_status(first).drain_calls,
         1
     );
-    provider.drain_executor_artifacts(second);
+    provider
+        .drain_executor_artifacts(second)
+        .expect("second executor drain");
 }
 
 #[test]
@@ -297,13 +335,23 @@ fn readiness_absence_is_pending_and_concurrent_finalize_is_idempotent() {
     let graph = Arc::new(graph);
     let bank = Arc::new(bank);
     let executor = ExecutorInstanceId::fresh();
-    let declines = provider.route_residency_diagnostics().declines();
+    let declines = provider.route_residency_diagnostics(executor).declines();
+    assert!(matches!(
+        finalize(
+            &provider,
+            executor,
+            &graph,
+            0,
+            std::slice::from_ref(bank.as_ref())
+        ),
+        ExecutorArtifactFinalization::Pending(ExecutorArtifactPending::ProducerUnavailable {
+            node: pending_node
+        }) if pending_node == node
+    ));
     assert_eq!(
-        provider
-            .finalize_executor_artifacts(executor, &graph, std::slice::from_ref(bank.as_ref()),),
-        ExecutorArtifactFinalization::Pending
+        provider.route_residency_diagnostics(executor).declines(),
+        declines
     );
-    assert_eq!(provider.route_residency_diagnostics().declines(), declines);
     assert_eq!(provider.residency().unwrap().route_reservation_count(), 0);
     let _kernel = compile_real_qmoe(&provider, executor, &graph, node);
 
@@ -314,9 +362,11 @@ fn readiness_absence_is_pending_and_concurrent_finalize_is_idempotent() {
             let bank = Arc::clone(&bank);
             scope.spawn(move || {
                 assert_eq!(
-                    provider.finalize_executor_artifacts(
+                    finalize(
+                        &provider,
                         executor,
                         &graph,
+                        1,
                         std::slice::from_ref(bank.as_ref()),
                     ),
                     ExecutorArtifactFinalization::Complete
@@ -332,7 +382,9 @@ fn readiness_absence_is_pending_and_concurrent_finalize_is_idempotent() {
         "one pending attempt plus one serialized install"
     );
     assert_eq!(provider.residency().unwrap().route_reservation_count(), 1);
-    provider.drain_executor_artifacts(executor);
+    provider
+        .drain_executor_artifacts(executor)
+        .expect("executor drain");
 }
 
 #[test]
@@ -348,14 +400,16 @@ fn default_off_retains_allocates_and_registers_nothing() {
     let _kernel = compile_real_qmoe(&provider, executor, &graph, node);
     assert!(!provider.wants_finalized_route_residency_banks());
     assert_eq!(
-        provider.finalize_executor_artifacts(executor, &graph, &[bank]),
+        finalize(&provider, executor, &graph, 1, &[bank]),
         ExecutorArtifactFinalization::Complete
     );
-    assert_eq!(provider.route_residency_diagnostics().installs(), 0);
-    assert_eq!(provider.route_residency_diagnostics().declines(), 0);
+    assert_eq!(provider.route_residency_diagnostics(executor).installs(), 0);
+    assert_eq!(provider.route_residency_diagnostics(executor).declines(), 0);
     assert_eq!(provider.residency().unwrap().route_reservation_count(), 0);
     assert!(provider.route_residency_scopes().is_empty());
-    provider.drain_executor_artifacts(executor);
+    provider
+        .drain_executor_artifacts(executor)
+        .expect("executor drain");
 }
 
 #[test]
@@ -373,7 +427,7 @@ fn bqmoe_without_real_telemetry_and_catalog_contract_typed_declines() {
     let executor = ExecutorInstanceId::fresh();
 
     assert_eq!(
-        provider.finalize_executor_artifacts(executor, &graph, &[bank]),
+        finalize(&provider, executor, &graph, 0, &[bank]),
         ExecutorArtifactFinalization::Complete
     );
     let outcome = provider.route_residency_executor_status(executor).outcome;
@@ -390,7 +444,9 @@ fn bqmoe_without_real_telemetry_and_catalog_contract_typed_declines() {
         "unexpected BQMoE outcome: {outcome:?}"
     );
     assert_eq!(provider.residency().unwrap().route_reservation_count(), 0);
-    provider.drain_executor_artifacts(executor);
+    provider
+        .drain_executor_artifacts(executor)
+        .expect("executor drain");
 }
 
 #[test]
@@ -407,7 +463,7 @@ fn overlapping_external_bank_properties_decline_before_reservation() {
     let _kernel = compile_real_qmoe(&provider, executor, &graph, node);
 
     assert_eq!(
-        provider.finalize_executor_artifacts(executor, &graph, &[bank]),
+        finalize(&provider, executor, &graph, 1, &[bank]),
         ExecutorArtifactFinalization::Complete
     );
     assert!(matches!(
@@ -419,5 +475,7 @@ fn overlapping_external_bank_properties_decline_before_reservation() {
         ))
     ));
     assert_eq!(provider.residency().unwrap().route_reservation_count(), 0);
-    provider.drain_executor_artifacts(executor);
+    provider
+        .drain_executor_artifacts(executor)
+        .expect("executor drain");
 }

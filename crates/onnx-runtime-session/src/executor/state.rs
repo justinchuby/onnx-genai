@@ -64,7 +64,7 @@ pub(crate) struct SlotCaptureState {
 enum ProviderArtifactOutcome {
     Unfinalized,
     Pending(ExecutorArtifactPending),
-    Failed(String),
+    Failed(Arc<EpError>),
     Complete,
 }
 
@@ -104,9 +104,10 @@ impl ProviderArtifactReadiness {
         ep: &dyn ExecutionProvider,
         executor: ExecutorInstanceId,
         graph: &Graph,
+        finalized_banks: &[FinalizedExpertBank],
     ) -> Result<()> {
         if self.needs_finalization() {
-            match ep.finalize_executor_artifacts(executor, graph, self.epoch) {
+            match ep.finalize_executor_artifacts(executor, graph, finalized_banks, self.epoch) {
                 Ok(ExecutorArtifactFinalization::Complete) => {
                     self.outcome = ProviderArtifactOutcome::Complete;
                 }
@@ -114,7 +115,7 @@ impl ProviderArtifactReadiness {
                     self.outcome = ProviderArtifactOutcome::Pending(pending);
                 }
                 Err(error) => {
-                    self.outcome = ProviderArtifactOutcome::Failed(error.to_string());
+                    self.outcome = ProviderArtifactOutcome::Failed(Arc::new(error));
                 }
             }
         }
@@ -150,7 +151,7 @@ impl ProviderArtifactReadiness {
                     provider: provider.to_string(),
                     executor: executor.get(),
                     readiness_epoch: self.epoch.get(),
-                    reason: reason.clone(),
+                    reason: reason.to_string(),
                 })
             }
         }

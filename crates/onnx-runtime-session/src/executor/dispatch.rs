@@ -328,7 +328,11 @@ impl Executor {
                     RunMode::Capture => {
                         {
                             let kernels = self.collect_segment_kernels(seg, resolved)?;
-                            ep.begin_device_graph_capture_in(self.graph_slot, &kernels)?;
+                            ep.begin_device_graph_capture_for_executor(
+                                self.instance_id,
+                                self.graph_slot,
+                                &kernels,
+                            )?;
                         }
                         // Any early return (`?`) while recording this segment
                         // must end the stream capture before it propagates —
@@ -337,8 +341,11 @@ impl Executor {
                         // is rejected while capturing). The guard aborts the
                         // capture on drop; `disarm()` hands off to the normal
                         // `end_device_graph_capture()` on the success path.
-                        let mut capture_guard =
-                            SegmentCaptureGuard::arm(ep.as_ref(), self.graph_slot);
+                        let mut capture_guard = SegmentCaptureGuard::arm(
+                            ep.as_ref(),
+                            self.instance_id,
+                            self.graph_slot,
+                        );
                         for pi in seg.start..seg.end {
                             let node_id = self.plan[pi].node_id;
                             if let Err(error) = self.exec_plan_node(
@@ -357,17 +364,28 @@ impl Executor {
                             }
                         }
                         capture_guard.disarm();
-                        ep.end_device_graph_capture_in(self.graph_slot)?;
+                        ep.end_device_graph_capture_for_executor(
+                            self.instance_id,
+                            self.graph_slot,
+                        )?;
                         // Capture is closed: syncs are legal again. Free any
                         // view-owner buffers that `install_view_outputs` parked
                         // while recording (freeing mid-capture is rejected).
                         for old in self.capture_deferred_frees.drain(..) {
                             ep.deallocate(old)?;
                         }
-                        ep.replay_device_graph_segment_in(self.graph_slot, seg.graph_index)?;
+                        ep.replay_device_graph_segment_for_executor(
+                            self.instance_id,
+                            self.graph_slot,
+                            seg.graph_index,
+                        )?;
                     }
                     RunMode::Replay => {
-                        ep.replay_device_graph_segment_in(self.graph_slot, seg.graph_index)?;
+                        ep.replay_device_graph_segment_for_executor(
+                            self.instance_id,
+                            self.graph_slot,
+                            seg.graph_index,
+                        )?;
                     }
                     RunMode::Eager => {
                         unreachable!("eager runs never build a segment schedule")
@@ -513,6 +531,7 @@ impl Executor {
         let cache = &mut self.cache;
         let kernel_bindings = &mut self.kernel_bindings;
         let provider_artifact_readiness = &mut self.provider_artifact_readiness;
+        let finalized_expert_banks = &self.finalized_expert_banks;
         let capture_growing = &self.capture_growing_symbols;
         let mut ctx = KernelDispatchContext {
             executor: self.instance_id,
@@ -631,7 +650,12 @@ impl Executor {
         // during runtime shape resolution. If lookup above created that
         // specialization, the cache publication chokepoint invalidated the
         // authority. Finalize it now, while no kernel work has been enqueued.
-        provider_artifact_readiness.finalize_if_needed(ep.as_ref(), instance_id, ctx.graph)?;
+        provider_artifact_readiness.finalize_if_needed(
+            ep.as_ref(),
+            instance_id,
+            ctx.graph,
+            finalized_expert_banks,
+        )?;
         // --- Zero-copy view fast path ---------------------------------------
         // Ask the kernel whether its outputs are strided views over its inputs
         // (a layout/movement op such as Slice). If so, record view metadata

@@ -1378,7 +1378,7 @@ mod binding_tests {
     fn missing_block_quantized_moe_producer_is_terminally_unsupported() {
         let mut graph = Graph::new();
         let (node, _) = block_quantized_moe_node(&mut graph);
-        let err = validate_route_residency_binding(&graph, |_| false, always_v, always_v)
+        let err = validate_route_residency_bindings(&graph, |_| false, always_v, always_v)
             .expect_err("BlockQuantizedMoE has no deferred producer");
         assert_eq!(
             err,

@@ -14,8 +14,8 @@ use std::sync::{
 use onnx_runtime_ep_api::{
     CaptureSupport, DeviceBuffer, EpConfig, EpError, ExecutionProvider,
     ExecutorArtifactFinalization, ExecutorArtifactPending, ExecutorArtifactReadinessEpoch,
-    ExecutorInstanceId, Fence, Kernel, KernelMatch, Result as EpResult, TensorMetadata, TensorMut,
-    TensorView, ViewOutput, WorkspaceRequirement,
+    ExecutorInstanceId, ExecutorResidencyTelemetry, Fence, Kernel, KernelMatch, Result as EpResult,
+    TensorMetadata, TensorMut, TensorView, ViewOutput, WorkspaceRequirement,
 };
 use onnx_runtime_ep_cpu::CpuExecutionProvider;
 use onnx_runtime_ir::{
@@ -408,13 +408,37 @@ impl ExecutionProvider for HostDownloadCountingEp {
         }
     }
 
-    fn drain_executor_artifacts(&self, executor: ExecutorInstanceId) {
+    fn drain_executor_artifacts(&self, executor: ExecutorInstanceId) -> EpResult<()> {
         *self
             .route_drains
             .lock()
             .unwrap()
             .entry(executor)
             .or_default() += 1;
+        Ok(())
+    }
+
+    fn executor_residency_telemetry(
+        &self,
+        executor: ExecutorInstanceId,
+    ) -> Option<ExecutorResidencyTelemetry> {
+        Some(ExecutorResidencyTelemetry {
+            route_applied: *self
+                .route_terminal_outcomes
+                .lock()
+                .unwrap()
+                .get(&executor)
+                .unwrap_or(&0) as u64,
+            drained: self
+                .route_drains
+                .lock()
+                .unwrap()
+                .get(&executor)
+                .copied()
+                .unwrap_or(0)
+                > 0,
+            ..ExecutorResidencyTelemetry::default()
+        })
     }
 
     fn name(&self) -> &str {
@@ -2866,6 +2890,20 @@ fn shared_provider_concurrent_pending_executors_finalize_and_drain_independently
     assert_eq!(scoped_count(&terminal_outcomes, second_id), 1);
     assert_eq!(scoped_count(&executions, first_id), 1);
     assert_eq!(scoped_count(&executions, second_id), 1);
+    assert_eq!(
+        first
+            .residency_telemetry()
+            .expect("first executor telemetry")
+            .route_applied,
+        1
+    );
+    assert_eq!(
+        second
+            .residency_telemetry()
+            .expect("second executor telemetry")
+            .route_applied,
+        1
+    );
 
     drop(first);
     assert_eq!(scoped_count(&drains, first_id), 1);

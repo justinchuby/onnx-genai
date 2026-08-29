@@ -802,7 +802,12 @@ impl KernelCache {
     /// workspace this eviction is about to free, and replaying it afterwards
     /// would read freed device memory. Resetting is what the device-binding drop
     /// path already does for the same reason.
-    fn evict_surplus_variants(&mut self, node: u32, ep: &dyn ExecutionProvider) {
+    fn evict_surplus_variants(
+        &mut self,
+        node: u32,
+        executor: ExecutorInstanceId,
+        ep: &dyn ExecutionProvider,
+    ) {
         let bound = variants_per_node();
         let mut variants = self
             .entries
@@ -827,8 +832,8 @@ impl KernelCache {
         // (M=1 decode) and Verify (M=K speculative) slots here — resetting an
         // empty slot is a cheap no-op. This keeps the eviction path slot-correct
         // without threading the caller's active slot through the whole cache API.
-        let _ = ep.reset_device_graph_in(DeviceGraphSlot::Primary);
-        let _ = ep.reset_device_graph_in(DeviceGraphSlot::Verify);
+        let _ = ep.reset_device_graph_for_executor(executor, DeviceGraphSlot::Primary);
+        let _ = ep.reset_device_graph_for_executor(executor, DeviceGraphSlot::Verify);
         for (_, key) in variants.into_iter().take(surplus) {
             self.entries.remove(&key);
             self.last_used.remove(&key);
@@ -949,7 +954,7 @@ impl KernelCache {
             // not in selected callers, so build preflight, binding preparation,
             // and runtime dispatch cannot disagree about readiness.
             artifact_readiness.advance_to(ExecutorArtifactReadinessEpoch::new(self.misses));
-            self.evict_surplus_variants(key.node, ep);
+            self.evict_surplus_variants(key.node, executor, ep);
         }
         self.touch(&key);
         #[cfg(test)]
