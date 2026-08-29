@@ -33,6 +33,8 @@ fn converted_packages() -> Vec<PathBuf> {
         "tests/fixtures/tiny-deepseek-v2-qmoe-attention",
         "tests/fixtures/tiny-glm52-qmoe-indexshare",
         "crates/onnx-genai-engine/tests/fixtures/model-package-cpu/cpu",
+        "crates/onnx-genai-engine/tests/fixtures/tiny-deepseek-v4-csa",
+        "crates/onnx-genai-engine/tests/fixtures/tiny-deepseek-v4-csa-schedule",
     ]
     .iter()
     .map(|relative| root.join(relative))
@@ -125,9 +127,61 @@ fn rebuilding_each_package_reproduces_its_abi() {
             },
         )
         .unwrap_or_else(|error| panic!("{}: its own ABI must rebuild: {error}", package.display()));
+        let rendered = serde_yaml::to_string(&rebuilt).unwrap_or_else(|error| {
+            panic!("{}: rebuild must serialize: {error}", package.display())
+        });
+        let reemitted = serde_yaml::from_str(&rendered).unwrap_or_else(|error| {
+            panic!(
+                "{}: serialized rebuild must parse as a workflow: {error}",
+                package.display()
+            )
+        });
+        let mut rebuilt_metadata = onnx_genai_metadata::schema::InferenceMetadata::default();
+        rebuilt_metadata.pipeline = Some(onnx_genai_metadata::schema::PipelineSpec {
+            workflow: reemitted,
+        });
+        onnx_genai_metadata::validation::validate_metadata(&rebuilt_metadata).unwrap_or_else(
+            |errors| {
+                panic!(
+                    "{}: rebuilt workflow must satisfy the production validator: {errors:#?}",
+                    package.display()
+                )
+            },
+        );
+        let rebuilt = &rebuilt_metadata
+            .pipeline
+            .as_ref()
+            .expect("pipeline")
+            .workflow;
+        let rebuilt_component = sole_decoder_component(rebuilt).expect("reemitted rebuilt decoder");
+        let rebuilt_declaration = &rebuilt.components[rebuilt_component];
+        for group in &abi.state_groups {
+            for port in &group.ports {
+                if let Some(expected) = declaration.ports.inputs.get(&port.input) {
+                    assert_eq!(
+                        rebuilt_declaration.ports.inputs.get(&port.input),
+                        Some(expected),
+                        "{}: rebuild changed physical input contract for {}.{}",
+                        package.display(),
+                        group.name,
+                        port.input
+                    );
+                }
+                if let Some(expected) = declaration.ports.outputs.get(&port.output) {
+                    assert_eq!(
+                        rebuilt_declaration.ports.outputs.get(&port.output),
+                        Some(expected),
+                        "{}: rebuild changed physical output contract for {}.{}",
+                        package.display(),
+                        group.name,
+                        port.output
+                    );
+                }
+            }
+        }
         let read_back = onnx_genai_metadata::decoder_abi(
-            &rebuilt,
-            sole_decoder_component(&rebuilt).expect("rebuilt decoder"),
+            rebuilt,
+            sole_decoder_component(rebuilt).expect("rebuilt decoder"),
         )
         .expect("rebuilt workflow must be readable");
 
