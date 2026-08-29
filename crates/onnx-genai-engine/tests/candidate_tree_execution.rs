@@ -11,8 +11,9 @@ use onnx_genai_engine::{
     GenerationBoundary, GenerationControl, PackageExecutionError, PipelineGenerateRequest,
     SessionForkError, SessionPosition, ToolCallPolicy, package_execution_error,
 };
+use proptest::prelude::*;
+use rand::SeedableRng as _;
 use rand::rngs::StdRng;
-use rand::{Rng as _, SeedableRng as _};
 
 const PARENT_METADATA: &str = r#"
 schema_version: v1.6
@@ -1240,10 +1241,12 @@ fn composed_candidate_tree_runs_setup_branches_effects_and_all_outputs() -> anyh
     let publications = engine.take_committed_workflow_publications();
     let names = publications
         .iter()
-        .map(|publication| match publication {
+        .filter_map(|publication| match publication {
             WorkflowOutputPublication::Materialized { output, .. }
-            | WorkflowOutputPublication::Event { output, .. } => output.as_str(),
-            WorkflowOutputPublication::Revision(envelope) => envelope.output.as_str(),
+            | WorkflowOutputPublication::Event { output, .. } => Some(output.as_str()),
+            WorkflowOutputPublication::Revision(envelope) => Some(envelope.output.as_str()),
+            WorkflowOutputPublication::TransactionCommitted { .. }
+            | WorkflowOutputPublication::AbortToBaseline { .. } => None,
         })
         .collect::<Vec<_>>();
     assert_eq!(
@@ -1728,6 +1731,8 @@ fn token_output_identity_is_selected_by_role_not_by_name() -> anyhow::Result<()>
             WorkflowOutputPublication::Revision(envelope) => {
                 envelope.output == "generated_ids"
             }
+            WorkflowOutputPublication::TransactionCommitted { .. }
+            | WorkflowOutputPublication::AbortToBaseline { .. } => true,
         }
     ));
     Ok(())
@@ -2650,6 +2655,38 @@ fn revision_fixture_finalizes_after_committed_token_appends() -> anyhow::Result<
     assert_eq!(finalize.operation, TypedRevisionOperation::Finalize);
     assert_eq!(finalize.finality, OutputFinality::Final);
     Ok(())
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 16,
+        .. ProptestConfig::default()
+    })]
+
+    /// Candidate-tree execution shares the generic transaction authority. It
+    /// must refuse a provisional contract before a specialized host that lacks
+    /// a typed reconciliation transport can mutate its candidate state.
+    #[test]
+    fn candidate_tree_provisional_mode_refuses_before_mutation(max_new_tokens in 1usize..4) {
+        let root = ancestor_package().expect("candidate-tree fixture");
+        replace_metadata(&root, |metadata| {
+            metadata.replacen(
+                "schema_version: v1.6\npipeline:\n  workflow:\n",
+                "schema_version: v1.7\npipeline:\n  workflow:\n    publication_mode: provisional_revisions\n",
+                1,
+            )
+        }).expect("write provisional candidate-tree metadata");
+        let mut engine = Engine::from_dir(&root, EngineConfig::default())
+            .expect("revision-only candidate-tree workflow loads");
+        let error = match engine.generate(greedy_request(max_new_tokens)) {
+            Ok(_) => panic!("candidate-tree host cannot publish provisional revisions"),
+            Err(error) => error,
+        };
+        let has_transport_refusal =
+            format!("{error:#}").contains("has no typed revision/commit/abort transport");
+        prop_assert!(has_transport_refusal);
+        prop_assert!(engine.take_committed_workflow_publications().is_empty());
+    }
 }
 
 #[test]

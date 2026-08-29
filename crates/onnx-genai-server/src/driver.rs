@@ -3918,6 +3918,7 @@ mod driver_delivery_tests {
                     transaction: onnx_genai_engine::pipeline::TurnTransactionId(3),
                     baseline: onnx_genai_engine::pipeline::TurnBaselineId(3),
                     reason: onnx_genai_engine::pipeline::TurnAbortReason::ExecutionFailure,
+                    streams: Vec::new(),
                 },
                 error: "injected later execution failure".to_string(),
             }],
