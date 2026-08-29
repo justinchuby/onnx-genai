@@ -513,6 +513,8 @@ pub fn decoder_workflow(
         manifest: WorkflowManifest {
             adapter_abis: BTreeMap::new(),
         },
+        publication_mode: crate::schema::WorkflowPublicationMode::CommitOnly,
+        publication_mode_authored: false,
         inputs: builder.inputs,
         outputs: BTreeMap::from([(
             TOKENS_OUTPUT.to_string(),
