@@ -327,19 +327,25 @@ fn publication_mode_has_an_exact_v1_7_boundary() {
     );
     let errors = validate_metadata(&typed_older)
         .expect_err("direct typed validation must reject a v1.7 field in v1.6");
-    assert!(
+    let expected = "pipeline.workflow.publication_mode is not legal in authored schema version \
+                    v1.6; `pipeline.workflow.publication_mode` begins and is required in schema \
+                    version v1.7. Remove `pipeline.workflow.publication_mode` to keep a pre-v1.7 \
+                    document, or upgrade `schema_version` to \"v1.7\" and author a valid mode \
+                    (`commit_only` or `provisional_revisions`)";
+    assert_eq!(
         errors
-            .join("\n")
-            .contains("pipeline.workflow.publication_mode is not legal"),
-        "{errors:#?}"
+            .iter()
+            .filter(|error| error.as_str() == expected)
+            .count(),
+        1,
+        "typed validation must report the canonical diagnostic exactly once: {errors:#?}"
     );
     let error = parse_metadata(&older, Some("yaml"))
         .expect_err("v1.6 must reject the later publication mode");
-    assert!(
-        error
-            .to_string()
-            .contains("pipeline.workflow.publication_mode"),
-        "{error}"
+    assert_eq!(
+        error.to_string(),
+        format!("Parse error: {expected}"),
+        "the parser path must preserve the exact actionable migration"
     );
 
     let missing = with_version(&revision_output, Some("v1.7"));

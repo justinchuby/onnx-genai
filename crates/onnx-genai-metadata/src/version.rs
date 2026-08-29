@@ -120,13 +120,22 @@ pub fn gate_feature_use(
     if version >= required {
         return Ok(());
     }
-    Err(format!(
-        "{path} is not legal in authored schema version {version}; {} require minimum schema \
-         version {required}. Remove the v1.5-only declaration to retain legacy output semantics, \
-         or migrate/re-emit the package with `schema_version: \"{required}\"` and explicit output \
-         families",
-        feature.description()
-    ))
+    match feature {
+        SchemaFeature::OutputProtocols => Err(format!(
+            "{path} is not legal in authored schema version {version}; {} require minimum schema \
+             version {required}. Remove the v1.5-only declaration to retain legacy output \
+             semantics, or migrate/re-emit the package with `schema_version: \"{required}\"` and \
+             explicit output families",
+            feature.description()
+        )),
+        SchemaFeature::PublicationMode => Err(format!(
+            "{path} is not legal in authored schema version {version}; \
+             `pipeline.workflow.publication_mode` begins and is required in schema version \
+             {required}. Remove `pipeline.workflow.publication_mode` to keep a pre-{required} \
+             document, or upgrade `schema_version` to \"{required}\" and author a valid mode \
+             (`commit_only` or `provisional_revisions`)"
+        )),
+    }
 }
 
 /// Bidirectional gate for a field that became mandatory when its feature was
@@ -342,12 +351,13 @@ mod tests {
             true,
         )
         .expect_err("older schema cannot opt into a later field");
-        assert!(
-            below.contains(path)
-                && below.contains("v1.4")
-                && below.contains("v1.5")
-                && below.contains("migrate/re-emit"),
-            "{below}"
+        assert_eq!(
+            below,
+            "pipeline.workflow.outputs.answer.family is not legal in authored schema version \
+             v1.4; workflow output families, logical streams, and typed revision operations \
+             require minimum schema version v1.5. Remove the v1.5-only declaration to retain \
+             legacy output semantics, or migrate/re-emit the package with `schema_version: \
+             \"v1.5\"` and explicit output families"
         );
 
         let missing = gate_feature_field(
@@ -387,9 +397,13 @@ mod tests {
             true,
         )
         .expect_err("v1.6 cannot opt into the v1.7 field");
-        assert!(
-            below.contains(path) && below.contains("minimum schema version v1.7"),
-            "{below}"
+        assert_eq!(
+            below,
+            "pipeline.workflow.publication_mode is not legal in authored schema version v1.6; \
+             `pipeline.workflow.publication_mode` begins and is required in schema version v1.7. \
+             Remove `pipeline.workflow.publication_mode` to keep a pre-v1.7 document, or upgrade \
+             `schema_version` to \"v1.7\" and author a valid mode (`commit_only` or \
+             `provisional_revisions`)"
         );
         let missing = gate_feature_field(
             SchemaVersion::new(1, 7),

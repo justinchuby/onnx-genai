@@ -1116,7 +1116,31 @@ mod tests {
                 })
                 .collect(),
             components: Default::default(),
-            state: Default::default(),
+            state: BTreeMap::from([(
+                "memory".to_string(),
+                onnx_genai_metadata::WorkflowStateCell {
+                    contract: serde_yaml::from_str("{ dtype: int64, shape: [sequence] }")
+                        .expect("state contract"),
+                    class: onnx_genai_metadata::WorkflowStateClass::Semantic,
+                    scope: onnx_genai_metadata::WorkflowStateScope::Session,
+                    initializer: "prompt".to_string(),
+                    recurrence: onnx_genai_metadata::ShapeRecurrence::Invariant,
+                    management: onnx_genai_metadata::StateManagement::Runtime,
+                    release_boundary: Some(onnx_genai_metadata::StateReleaseBoundary::Session),
+                    service_group: None,
+                    session: Some(onnx_genai_metadata::SessionLeaseContract {
+                        policy: onnx_genai_metadata::SessionMutationPolicy::Exclusive,
+                        ttl_seconds: None,
+                        optimistic_metadata_version: false,
+                        continuation: Some(
+                            onnx_genai_metadata::SessionContinuation::PromptPrefix {
+                                prompt_input: "prompt".to_string(),
+                                tokens_output: "answer".to_string(),
+                            },
+                        ),
+                    }),
+                },
+            )]),
             effects: Default::default(),
             serving: None,
             steps: Default::default(),
@@ -1155,7 +1179,7 @@ mod tests {
             .collect()
     }
 
-    #[derive(Debug, Clone, Copy)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum TransactionTestOperation {
         Emit,
         Replace,
@@ -1178,7 +1202,7 @@ mod tests {
         }
     }
 
-    #[derive(Debug, Clone, Copy)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     struct TransactionTestAction {
         output: u8,
         stream: u8,
@@ -1195,14 +1219,14 @@ mod tests {
         }
     }
 
-    #[derive(Debug, Clone, Copy)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum TransactionTestStep {
         Output(TransactionTestAction),
         Commit,
         Abort,
     }
 
-    fn transaction_action_strategy() -> impl Strategy<Value = TransactionTestAction> {
+    fn transaction_output_action_strategy() -> impl Strategy<Value = TransactionTestAction> {
         (
             0u8..2,
             0u8..2,
@@ -1222,6 +1246,48 @@ mod tests {
                     payload,
                 },
             )
+    }
+
+    fn transaction_action_strategy() -> impl Strategy<Value = TransactionTestStep> {
+        prop_oneof![
+            8 => transaction_output_action_strategy().prop_map(TransactionTestStep::Output),
+            1 => Just(TransactionTestStep::Commit),
+            1 => Just(TransactionTestStep::Abort),
+        ]
+    }
+
+    fn transaction_trace_strategy() -> impl Strategy<Value = Vec<TransactionTestStep>> {
+        (
+            prop::collection::vec(transaction_output_action_strategy(), 0..32),
+            prop_oneof![
+                Just(TransactionTestStep::Commit),
+                Just(TransactionTestStep::Abort)
+            ],
+            prop::collection::vec(transaction_action_strategy(), 0..8),
+        )
+            .prop_map(|(prefix, terminal, suffix)| {
+                // The first terminal owns the outcome. A generated suffix plus
+                // the opposite terminal and an output prove later actions are
+                // ignored, while still shrinking to a minimal terminal trace.
+                let mut trace = prefix
+                    .into_iter()
+                    .map(TransactionTestStep::Output)
+                    .collect::<Vec<_>>();
+                trace.push(terminal);
+                trace.extend(suffix);
+                trace.push(match terminal {
+                    TransactionTestStep::Commit => TransactionTestStep::Abort,
+                    TransactionTestStep::Abort => TransactionTestStep::Commit,
+                    TransactionTestStep::Output(_) => unreachable!("the generated terminal"),
+                });
+                trace.push(TransactionTestStep::Output(TransactionTestAction {
+                    output: 1,
+                    stream: 0,
+                    operation: TransactionTestOperation::Emit,
+                    payload: 73,
+                }));
+                trace
+            })
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1288,6 +1354,23 @@ mod tests {
         .collect()
     }
 
+    fn reference_transaction_baselines() -> BTreeMap<(String, OutputStreamId), ReferenceStream> {
+        let mut baselines = reference_streams();
+        for output in ["answer", "tool"] {
+            baselines.insert(
+                (output.to_string(), OutputStreamId(output.to_string())),
+                ReferenceStream {
+                    head: 0,
+                    cursor: 0,
+                    lineage: 0,
+                    closed: false,
+                    payload: None,
+                },
+            );
+        }
+        baselines
+    }
+
     fn session_output_state(reference: &ReferenceStream) -> CommittedOutputState {
         CommittedOutputState {
             head: reference.head,
@@ -1330,11 +1413,20 @@ mod tests {
         assert_eq!(&actual, expected);
     }
 
-    #[derive(Debug, PartialEq, Eq)]
+    #[derive(Debug, Clone, PartialEq, Eq)]
     struct DurableMapFingerprint {
         states: Vec<(String, String, Vec<i64>)>,
         effects: Vec<(String, String, u64)>,
         outputs: Vec<CommittedStateFingerprint>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct TerminalSnapshot {
+        expected: BTreeMap<(String, OutputStreamId), ReferenceStream>,
+        durable: DurableMapFingerprint,
+        journal: Vec<CommittedStateFingerprint>,
+        publication_count: usize,
+        provisional_delivery_cursor: usize,
     }
 
     fn map_fingerprints(
@@ -1384,12 +1476,17 @@ mod tests {
     }
 
     fn exercise_transaction_sequence(
-        generated: &[TransactionTestAction],
+        generated: &[TransactionTestStep],
         publication_mode: onnx_genai_metadata::WorkflowPublicationMode,
-        terminal: TransactionTestStep,
     ) {
-        let commit = matches!(terminal, TransactionTestStep::Commit);
         let workflow = revision_workflow(publication_mode);
+        let state_plan = onnx_genai_metadata::resolve_state_plan(&workflow);
+        assert!(
+            state_plan
+                .cell("memory")
+                .is_some_and(|cell| cell.transaction.required && cell.final_writer.is_some()),
+            "the property must admit a real semantic session-state participant"
+        );
         let mut expected = reference_streams();
         let mut session_states = std::collections::HashMap::from([
             (("session".to_string(), "memory".to_string()), value(7)),
@@ -1426,9 +1523,9 @@ mod tests {
             map_fingerprints(&session_states, &session_effects, &session_outputs);
         let mode = TurnPublicationMode::from(publication_mode);
         let mut turn = TurnTransaction::admit(
-            TurnTransactionId(if commit { 71 } else { 72 }),
+            TurnTransactionId(71),
             Some("session"),
-            &onnx_genai_metadata::ResolvedStatePlan::default(),
+            &state_plan,
             ["grammar".to_string()],
             ["answer".to_string(), "tool".to_string()],
             &session_states,
@@ -1437,6 +1534,17 @@ mod tests {
             mode,
         )
         .expect("non-empty transaction admits");
+        let Some(crate::pipeline::TurnStateBaseline::Present(baseline_state)) =
+            turn.baseline_state("memory")
+        else {
+            panic!("the admitted transaction must snapshot the non-empty state baseline");
+        };
+        assert_eq!(
+            baseline_state
+                .to_vec_i64()
+                .expect("baseline state is inspectable"),
+            vec![7]
+        );
         let mut journal = OutputPublicationJournal::new_with_publication_mode(
             turn.id(),
             &workflow,
@@ -1445,6 +1553,11 @@ mod tests {
         )
         .expect("revision journal admits");
         assert_journal_matches(&journal, &expected);
+        turn.stage_state(
+            onnx_genai_metadata::StateIdentity("memory".to_string()),
+            value(8),
+        );
+        turn.stage_effects();
 
         let required_actions = [
             TransactionTestAction {
@@ -1485,274 +1598,343 @@ mod tests {
             },
         ];
 
-        let mut sequence = required_actions
+        let sequence = required_actions
             .iter()
-            .chain(generated)
             .copied()
             .map(TransactionTestStep::Output)
+            .chain(generated.iter().copied())
             .collect::<Vec<_>>();
-        sequence.push(terminal);
-        let mut observed_terminal = None;
+        let mut terminal_outcome = None;
+        let mut terminal_snapshot: Option<TerminalSnapshot> = None;
+        let mut ignored_after_terminal = 0usize;
         for step in sequence {
-            let TransactionTestStep::Output(action) = step else {
-                observed_terminal = Some(step);
-                break;
-            };
-            let (output, stream) = action.identity();
-            let identity = (output.to_string(), OutputStreamId(stream.to_string()));
-            let mut next = expected[&identity].clone();
-            let accepted = next.apply(action.operation, action.payload);
-            let before = committed_state_fingerprint(
-                journal
-                    .committed_states()
-                    .expect("pre-operation journal state"),
-            );
-            let result = journal.publish(
-                output,
-                Some(stream),
-                &action.operation.mode(),
-                action
-                    .operation
-                    .carries_payload()
-                    .then(|| value(action.payload)),
-            );
-            assert_eq!(
-                result.is_ok(),
-                accepted,
-                "{action:?} disagreed with the independent stream model: {result:?}"
-            );
-            if accepted {
-                expected.insert(identity, next);
-            } else {
+            if let Some(snapshot) = &terminal_snapshot {
+                ignored_after_terminal += 1;
+                assert_eq!(
+                    &expected, &snapshot.expected,
+                    "the independent model must ignore every post-terminal action"
+                );
+                assert_eq!(
+                    map_fingerprints(&session_states, &session_effects, &session_outputs),
+                    snapshot.durable,
+                    "post-terminal {step:?} mutated durable state"
+                );
                 assert_eq!(
                     committed_state_fingerprint(
                         journal
                             .committed_states()
-                            .expect("rejected operation leaves state inspectable")
+                            .expect("post-terminal journal remains inspectable")
                     ),
-                    before,
-                    "rejected {action:?} partially advanced a stream"
+                    snapshot.journal,
+                    "post-terminal {step:?} mutated output state"
                 );
+                assert_eq!(journal.publications.len(), snapshot.publication_count);
+                assert_eq!(
+                    journal.provisional_delivery_cursor,
+                    snapshot.provisional_delivery_cursor
+                );
+                continue;
             }
-            assert_journal_matches(&journal, &expected);
-            let pending = journal
-                .take_pending_provisionals()
-                .expect("provisional delivery is cloneable");
-            if publication_mode
-                == onnx_genai_metadata::WorkflowPublicationMode::ProvisionalRevisions
-                && accepted
-            {
-                assert_eq!(pending.len(), 1);
-                let WorkflowOutputPublication::Revision(envelope) = &pending[0] else {
-                    panic!("pre-commit publication was not a typed revision");
-                };
-                assert_eq!(envelope.finality, OutputFinality::Provisional);
-            } else {
-                assert!(pending.is_empty());
-            }
-            assert_eq!(
-                map_fingerprints(&session_states, &session_effects, &session_outputs),
-                durable_baseline,
-                "staged output escaped before the transaction outcome"
-            );
-        }
-        assert!(matches!(
-            observed_terminal,
-            Some(TransactionTestStep::Commit) | Some(TransactionTestStep::Abort)
-        ));
-        turn.stage_state(
-            onnx_genai_metadata::StateIdentity("memory".to_string()),
-            value(8),
-        );
-        turn.stage_effects();
 
-        if commit {
-            let open_streams = expected.values().filter(|stream| !stream.closed).count();
-            journal
-                .finalize_on_commit()
-                .expect("commit finalizes every open stream");
-            for stream in expected.values_mut() {
-                stream.finalize();
-            }
-            assert_journal_matches(&journal, &expected);
-            let pending_finalizes = journal
-                .take_pending_provisionals()
-                .expect("commit finalizes are cloneable");
-            if publication_mode
-                == onnx_genai_metadata::WorkflowPublicationMode::ProvisionalRevisions
-            {
-                assert_eq!(pending_finalizes.len(), open_streams);
-                assert!(pending_finalizes.iter().all(|publication| matches!(
-                    publication,
-                    WorkflowOutputPublication::Revision(TypedRevisionEnvelope {
-                        operation: TypedRevisionOperation::Finalize,
-                        finality: OutputFinality::Provisional,
-                        ..
-                    })
-                )));
-            } else {
-                assert!(pending_finalizes.is_empty());
-            }
-            turn.stage_outputs(
-                journal
-                    .committed_states()
-                    .expect("committed output write set"),
-            );
-            let outcome = turn
-                .commit(
-                    &mut session_states,
-                    &mut session_effects,
-                    &mut session_outputs,
-                )
-                .expect("real transaction commit succeeds");
-            assert_eq!(
-                outcome,
-                TurnTransactionOutcome::Committed {
-                    transaction: TurnTransactionId(71),
-                    baseline: TurnBaselineId(71),
+            match step {
+                TransactionTestStep::Output(action) => {
+                    let (output, stream) = action.identity();
+                    let identity = (output.to_string(), OutputStreamId(stream.to_string()));
+                    let mut next = expected[&identity].clone();
+                    let accepted = next.apply(action.operation, action.payload);
+                    let before = committed_state_fingerprint(
+                        journal
+                            .committed_states()
+                            .expect("pre-operation journal state"),
+                    );
+                    let result = journal.publish(
+                        output,
+                        Some(stream),
+                        &action.operation.mode(),
+                        action
+                            .operation
+                            .carries_payload()
+                            .then(|| value(action.payload)),
+                    );
+                    assert_eq!(
+                        result.is_ok(),
+                        accepted,
+                        "{action:?} disagreed with the independent stream model: {result:?}"
+                    );
+                    if accepted {
+                        expected.insert(identity, next);
+                    } else {
+                        assert_eq!(
+                            committed_state_fingerprint(
+                                journal
+                                    .committed_states()
+                                    .expect("rejected operation leaves state inspectable")
+                            ),
+                            before,
+                            "rejected {action:?} partially advanced a stream"
+                        );
+                    }
+                    assert_journal_matches(&journal, &expected);
+                    turn.stage_outputs(
+                        journal.committed_states().expect("staged output write set"),
+                    );
+                    let pending = journal
+                        .take_pending_provisionals()
+                        .expect("provisional delivery is cloneable");
+                    if publication_mode
+                        == onnx_genai_metadata::WorkflowPublicationMode::ProvisionalRevisions
+                        && accepted
+                    {
+                        assert_eq!(pending.len(), 1);
+                        let WorkflowOutputPublication::Revision(envelope) = &pending[0] else {
+                            panic!("pre-commit publication was not a typed revision");
+                        };
+                        assert_eq!(envelope.finality, OutputFinality::Provisional);
+                    } else {
+                        assert!(pending.is_empty());
+                    }
+                    assert_eq!(
+                        map_fingerprints(&session_states, &session_effects, &session_outputs),
+                        durable_baseline,
+                        "staged writes escaped before the transaction outcome"
+                    );
                 }
-            );
-            journal.record_commit(&outcome);
-            let publications = journal.take();
-            match publication_mode {
-                onnx_genai_metadata::WorkflowPublicationMode::CommitOnly => {
-                    assert!(publications.iter().all(|publication| matches!(
-                        publication,
-                        WorkflowOutputPublication::Revision(TypedRevisionEnvelope {
-                            finality: OutputFinality::Final,
-                            ..
-                        })
-                    )));
-                }
-                onnx_genai_metadata::WorkflowPublicationMode::ProvisionalRevisions => {
-                    assert!(publications[..publications.len() - 1].iter().all(
-                        |publication| matches!(
+                TransactionTestStep::Commit => {
+                    let open_streams = expected.values().filter(|stream| !stream.closed).count();
+                    journal
+                        .finalize_on_commit()
+                        .expect("commit finalizes every open stream");
+                    for stream in expected.values_mut() {
+                        stream.finalize();
+                    }
+                    assert_journal_matches(&journal, &expected);
+                    let pending_finalizes = journal
+                        .take_pending_provisionals()
+                        .expect("commit finalizes are cloneable");
+                    if publication_mode
+                        == onnx_genai_metadata::WorkflowPublicationMode::ProvisionalRevisions
+                    {
+                        assert_eq!(pending_finalizes.len(), open_streams);
+                        assert!(pending_finalizes.iter().all(|publication| matches!(
                             publication,
                             WorkflowOutputPublication::Revision(TypedRevisionEnvelope {
+                                operation: TypedRevisionOperation::Finalize,
                                 finality: OutputFinality::Provisional,
                                 ..
                             })
+                        )));
+                    } else {
+                        assert!(pending_finalizes.is_empty());
+                    }
+                    turn.stage_outputs(
+                        journal
+                            .committed_states()
+                            .expect("committed output write set"),
+                    );
+                    let outcome = turn
+                        .commit(
+                            &mut session_states,
+                            &mut session_effects,
+                            &mut session_outputs,
                         )
-                    ));
-                    assert!(matches!(
-                        publications.last(),
-                        Some(WorkflowOutputPublication::TransactionCommitted {
+                        .expect("real transaction commit succeeds");
+                    assert_eq!(
+                        outcome,
+                        TurnTransactionOutcome::Committed {
                             transaction: TurnTransactionId(71),
                             baseline: TurnBaselineId(71),
-                        })
+                        }
+                    );
+                    journal.record_commit(&outcome);
+                    terminal_outcome = Some(outcome);
+                }
+                TransactionTestStep::Abort => {
+                    let outcome = turn.abort(TurnAbortReason::Cancellation);
+                    assert!(matches!(
+                        outcome,
+                        TurnTransactionOutcome::AbortToBaseline {
+                            transaction: TurnTransactionId(71),
+                            baseline: TurnBaselineId(71),
+                            reason: TurnAbortReason::Cancellation,
+                            ..
+                        }
                     ));
+                    terminal_outcome = Some(outcome);
                 }
             }
-            assert_eq!(
-                session_states[&("session".to_string(), "memory".to_string())]
-                    .to_vec_i64()
-                    .expect("committed state"),
-                vec![8]
-            );
-            assert_eq!(
-                session_states[&("other".to_string(), "memory".to_string())]
-                    .to_vec_i64()
-                    .expect("isolated state"),
-                vec![99]
-            );
-            assert_eq!(
-                session_effects[&("session".to_string(), "grammar".to_string())],
-                5
-            );
-            assert_eq!(
-                session_effects[&("other".to_string(), "grammar".to_string())],
-                9
-            );
-            for ((output, stream), reference) in &expected {
-                let state =
-                    &session_outputs[&("session".to_string(), output.clone(), stream.clone())];
+
+            if terminal_outcome.is_some() {
+                terminal_snapshot = Some(TerminalSnapshot {
+                    expected: expected.clone(),
+                    durable: map_fingerprints(&session_states, &session_effects, &session_outputs),
+                    journal: committed_state_fingerprint(
+                        journal
+                            .committed_states()
+                            .expect("terminal journal remains inspectable"),
+                    ),
+                    publication_count: journal.publications.len(),
+                    provisional_delivery_cursor: journal.provisional_delivery_cursor,
+                });
+            }
+        }
+
+        assert!(
+            ignored_after_terminal >= 2,
+            "the generated trace must exercise ignored output and terminal actions"
+        );
+        let outcome = terminal_outcome.expect("every generated trace contains a terminal action");
+        match outcome {
+            TurnTransactionOutcome::Committed {
+                transaction,
+                baseline,
+            } => {
+                assert_eq!(transaction, TurnTransactionId(71));
+                assert_eq!(baseline, TurnBaselineId(71));
+                let publications = journal.take();
+                match publication_mode {
+                    onnx_genai_metadata::WorkflowPublicationMode::CommitOnly => {
+                        assert!(publications.iter().all(|publication| matches!(
+                            publication,
+                            WorkflowOutputPublication::Revision(TypedRevisionEnvelope {
+                                finality: OutputFinality::Final,
+                                ..
+                            })
+                        )));
+                    }
+                    onnx_genai_metadata::WorkflowPublicationMode::ProvisionalRevisions => {
+                        assert!(publications[..publications.len() - 1].iter().all(
+                            |publication| matches!(
+                                publication,
+                                WorkflowOutputPublication::Revision(TypedRevisionEnvelope {
+                                    finality: OutputFinality::Provisional,
+                                    ..
+                                })
+                            )
+                        ));
+                        assert!(matches!(
+                            publications.last(),
+                            Some(WorkflowOutputPublication::TransactionCommitted {
+                                transaction: TurnTransactionId(71),
+                                baseline: TurnBaselineId(71),
+                            })
+                        ));
+                    }
+                }
+                assert_ne!(
+                    map_fingerprints(&session_states, &session_effects, &session_outputs),
+                    durable_baseline,
+                    "commit must mutate the admitted session's complete write set"
+                );
+                assert_eq!(
+                    session_states[&("session".to_string(), "memory".to_string())]
+                        .to_vec_i64()
+                        .expect("committed state"),
+                    vec![8]
+                );
+                assert_eq!(
+                    session_states[&("other".to_string(), "memory".to_string())]
+                        .to_vec_i64()
+                        .expect("isolated state"),
+                    vec![99]
+                );
+                assert_eq!(
+                    session_effects[&("session".to_string(), "grammar".to_string())],
+                    5
+                );
+                assert_eq!(
+                    session_effects[&("other".to_string(), "grammar".to_string())],
+                    9
+                );
+                for ((output, stream), reference) in &expected {
+                    let state =
+                        &session_outputs[&("session".to_string(), output.clone(), stream.clone())];
+                    assert_eq!(
+                        (
+                            state.head,
+                            state.cursor,
+                            state.lineage,
+                            state.closed,
+                            state
+                                .payload
+                                .as_ref()
+                                .map(|payload| payload.to_vec_i64().expect("committed payload")[0]),
+                        ),
+                        (
+                            reference.head,
+                            reference.cursor,
+                            reference.lineage,
+                            reference.closed,
+                            reference.payload,
+                        )
+                    );
+                }
+                let isolated = &session_outputs[&(
+                    "other".to_string(),
+                    "answer".to_string(),
+                    OutputStreamId("left".to_string()),
+                )];
                 assert_eq!(
                     (
-                        state.head,
-                        state.cursor,
-                        state.lineage,
-                        state.closed,
-                        state
+                        isolated.head,
+                        isolated.cursor,
+                        isolated.lineage,
+                        isolated.closed,
+                        isolated
                             .payload
                             .as_ref()
-                            .map(|payload| payload.to_vec_i64().expect("committed payload")[0]),
+                            .expect("isolated payload")
+                            .to_vec_i64()
+                            .expect("isolated payload"),
                     ),
-                    (
-                        reference.head,
-                        reference.cursor,
-                        reference.lineage,
-                        reference.closed,
-                        reference.payload,
-                    )
+                    (9, 9, 9, false, vec![99])
                 );
             }
-            let isolated = &session_outputs[&(
-                "other".to_string(),
-                "answer".to_string(),
-                OutputStreamId("left".to_string()),
-            )];
-            assert_eq!(
-                (
-                    isolated.head,
-                    isolated.cursor,
-                    isolated.lineage,
-                    isolated.closed,
-                    isolated
-                        .payload
-                        .as_ref()
-                        .expect("isolated payload")
-                        .to_vec_i64()
-                        .expect("isolated payload"),
-                ),
-                (9, 9, 9, false, vec![99])
-            );
-        } else {
-            turn.stage_outputs(
-                journal
-                    .committed_states()
-                    .expect("aborted output write set remains staged"),
-            );
-            let outcome = journal.abort_outcome(&turn, TurnAbortReason::Cancellation);
-            let TurnTransactionOutcome::AbortToBaseline {
+            TurnTransactionOutcome::AbortToBaseline {
                 transaction,
                 baseline,
                 reason,
                 streams,
-            } = &outcome
-            else {
-                panic!("abort must be a typed baseline outcome");
-            };
-            assert_eq!(*transaction, TurnTransactionId(72));
-            assert_eq!(*baseline, TurnBaselineId(72));
-            assert_eq!(*reason, TurnAbortReason::Cancellation);
-            let baseline_by_stream = reference_streams();
-            assert_eq!(streams.len(), baseline_by_stream.len());
-            for stream in streams {
-                let expected = &baseline_by_stream[&(stream.output.clone(), stream.stream.clone())];
+            } => {
+                assert_eq!(transaction, TurnTransactionId(71));
+                assert_eq!(baseline, TurnBaselineId(71));
+                assert_eq!(reason, TurnAbortReason::Cancellation);
+                let baseline_by_stream = reference_transaction_baselines();
+                assert_eq!(streams.len(), baseline_by_stream.len());
+                for stream in &streams {
+                    let expected =
+                        &baseline_by_stream[&(stream.output.clone(), stream.stream.clone())];
+                    assert_eq!(
+                        (stream.head, stream.sequence, stream.lineage, stream.closed),
+                        (
+                            expected.head,
+                            expected.cursor,
+                            expected.lineage,
+                            expected.closed,
+                        )
+                    );
+                }
+                assert!(matches!(
+                    WorkflowOutputPublication::from_transaction_outcome(
+                        &TurnTransactionOutcome::AbortToBaseline {
+                            transaction,
+                            baseline,
+                            reason,
+                            streams,
+                        }
+                    ),
+                    WorkflowOutputPublication::AbortToBaseline {
+                        transaction: TurnTransactionId(71),
+                        baseline: TurnBaselineId(71),
+                        reason: TurnAbortReason::Cancellation,
+                        ..
+                    }
+                ));
                 assert_eq!(
-                    (stream.head, stream.sequence, stream.lineage, stream.closed,),
-                    (
-                        expected.head,
-                        expected.cursor,
-                        expected.lineage,
-                        expected.closed,
-                    )
+                    map_fingerprints(&session_states, &session_effects, &session_outputs),
+                    durable_baseline,
+                    "real abort must preserve the exact non-empty state/effect/output baseline"
                 );
             }
-            assert!(matches!(
-                WorkflowOutputPublication::from_transaction_outcome(&outcome),
-                WorkflowOutputPublication::AbortToBaseline {
-                    transaction: TurnTransactionId(72),
-                    baseline: TurnBaselineId(72),
-                    reason: TurnAbortReason::Cancellation,
-                    ..
-                }
-            ));
-            assert_eq!(
-                map_fingerprints(&session_states, &session_effects, &session_outputs),
-                durable_baseline,
-                "abort must restore the exact non-empty durable baseline atomically"
-            );
         }
     }
 
@@ -2406,6 +2588,55 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn journal_abort_reconciles_a_stream_created_after_admission() -> Result<()> {
+        let workflow =
+            revision_workflow(onnx_genai_metadata::WorkflowPublicationMode::ProvisionalRevisions);
+        let turn = TurnTransaction::admit(
+            TurnTransactionId(91),
+            None,
+            &onnx_genai_metadata::ResolvedStatePlan::default(),
+            std::iter::empty::<String>(),
+            ["answer".to_string()],
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            TurnPublicationMode::ProvisionalRevisions,
+        )
+        .expect("turn admits");
+        let mut journal = OutputPublicationJournal::new_with_publication_mode(
+            turn.id(),
+            &workflow,
+            turn.output_baselines()?,
+            TurnPublicationMode::ProvisionalRevisions,
+        )?;
+        journal.publish(
+            "answer",
+            Some("dynamic"),
+            &WorkflowEmitMode::Append,
+            Some(value(5)),
+        )?;
+
+        let TurnTransactionOutcome::AbortToBaseline { streams, .. } =
+            journal.abort_outcome(&turn, TurnAbortReason::ExecutionFailure)
+        else {
+            unreachable!("journal abort is a typed transaction outcome");
+        };
+        assert!(
+            streams.iter().any(|baseline| baseline
+                == &OutputStreamBaseline {
+                    output: "answer".to_string(),
+                    stream: OutputStreamId("dynamic".to_string()),
+                    head: 0,
+                    sequence: 0,
+                    lineage: 0,
+                    closed: false,
+                }),
+            "a dynamically introduced stream must reconcile to its empty admission baseline"
+        );
+        Ok(())
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig {
             cases: 128,
@@ -2416,22 +2647,13 @@ mod tests {
         /// cursor, lineage, closure, finality, and the terminal outcome.
         #[test]
         fn revision_transactions_preserve_stream_isolation_and_baselines(
-            actions in prop::collection::vec(transaction_action_strategy(), 0..40),
+            trace in transaction_trace_strategy(),
         ) {
             for publication_mode in [
                 onnx_genai_metadata::WorkflowPublicationMode::CommitOnly,
                 onnx_genai_metadata::WorkflowPublicationMode::ProvisionalRevisions,
             ] {
-                exercise_transaction_sequence(
-                    &actions,
-                    publication_mode,
-                    TransactionTestStep::Abort,
-                );
-                exercise_transaction_sequence(
-                    &actions,
-                    publication_mode,
-                    TransactionTestStep::Commit,
-                );
+                exercise_transaction_sequence(&trace, publication_mode);
             }
         }
 
