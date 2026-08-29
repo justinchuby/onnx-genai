@@ -529,6 +529,32 @@ enum OutputProtocolFamily {
     Declared(WorkflowOutputFamily),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputPublicationJournalResolution {
+    Committed,
+    Aborted,
+}
+
+impl std::fmt::Display for OutputPublicationJournalResolution {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Committed => formatter.write_str("committed"),
+            Self::Aborted => formatter.write_str("aborted"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "output publication journal for transaction {transaction:?} is already {resolution}; \
+     cannot {operation}. Admit a new turn before publishing or resolving more output"
+)]
+struct OutputPublicationJournalResolutionError {
+    transaction: TurnTransactionId,
+    resolution: OutputPublicationJournalResolution,
+    operation: &'static str,
+}
+
 pub(crate) struct OutputPublicationJournal {
     transaction: TurnTransactionId,
     publication_mode: TurnPublicationMode,
@@ -539,6 +565,7 @@ pub(crate) struct OutputPublicationJournal {
     materialized: BTreeMap<(String, OutputStreamId), CommittedOutputState>,
     publications: Vec<WorkflowOutputPublication>,
     provisional_delivery_cursor: usize,
+    resolution: Option<OutputPublicationJournalResolution>,
 }
 
 impl OutputPublicationJournal {
@@ -713,7 +740,22 @@ impl OutputPublicationJournal {
             materialized,
             publications: Vec::new(),
             provisional_delivery_cursor: 0,
+            resolution: None,
         })
+    }
+
+    fn ensure_open(
+        &self,
+        operation: &'static str,
+    ) -> std::result::Result<(), OutputPublicationJournalResolutionError> {
+        match self.resolution {
+            None => Ok(()),
+            Some(resolution) => Err(OutputPublicationJournalResolutionError {
+                transaction: self.transaction,
+                resolution,
+                operation,
+            }),
+        }
     }
 
     /// Validate the declared operation before evaluation moves or materializes
@@ -726,6 +768,7 @@ impl OutputPublicationJournal {
         stream: Option<&str>,
         mode: &WorkflowEmitMode,
     ) -> Result<()> {
+        self.ensure_open("validate an output emission")?;
         let family = self
             .outputs
             .get(output)
@@ -895,6 +938,7 @@ impl OutputPublicationJournal {
         operation: TypedRevisionOperation,
         payload: Option<Value>,
     ) -> Result<()> {
+        self.ensure_open("stage a typed revision")?;
         let state = self.revisions.state(output, &stream);
         let sequence = state.sequence.checked_add(1).with_context(|| {
             format!(
@@ -949,6 +993,7 @@ impl OutputPublicationJournal {
     /// revision stream receives its default close before the caller exposes the
     /// committed journal.
     pub(crate) fn finalize_on_commit(&mut self) -> Result<()> {
+        self.ensure_open("stage commit finalization")?;
         let open = self
             .revisions
             .streams
@@ -979,16 +1024,33 @@ impl OutputPublicationJournal {
 
     /// Record the committed transaction after its state/effect/output writes
     /// succeed. This record is the finality authority for provisional output.
-    pub(crate) fn record_commit(&mut self, outcome: &TurnTransactionOutcome) {
+    pub(crate) fn record_commit(&mut self, outcome: &TurnTransactionOutcome) -> Result<()> {
+        self.ensure_open("record a committed transaction")?;
+        let TurnTransactionOutcome::Committed { transaction, .. } = outcome else {
+            bail!(
+                "output publication journal for transaction {:?} cannot record a commit from \
+                 abort outcome {outcome:?}",
+                self.transaction
+            );
+        };
+        ensure!(
+            *transaction == self.transaction,
+            "output publication journal for transaction {:?} cannot record commit outcome for \
+             transaction {transaction:?}",
+            self.transaction
+        );
         if self.publication_mode == TurnPublicationMode::ProvisionalRevisions {
             self.publications
                 .push(WorkflowOutputPublication::from_transaction_outcome(outcome));
         }
+        self.resolution = Some(OutputPublicationJournalResolution::Committed);
+        Ok(())
     }
 
     /// Take the not-yet-delivered provisional publications in authored order.
     /// A commit-only journal never exposes this pre-commit view.
     pub(crate) fn take_pending_provisionals(&mut self) -> Result<Vec<WorkflowOutputPublication>> {
+        self.ensure_open("deliver provisional publications")?;
         if self.publication_mode != TurnPublicationMode::ProvisionalRevisions {
             return Ok(Vec::new());
         }
@@ -1004,10 +1066,18 @@ impl OutputPublicationJournal {
     /// touched-stream set. The transaction remains the authority for baseline
     /// cursors, while the journal knows dynamically named streams.
     pub(crate) fn abort_outcome(
-        &self,
-        turn: &super::TurnTransaction,
+        &mut self,
+        turn: &mut super::TurnTransaction,
         reason: TurnAbortReason,
-    ) -> TurnTransactionOutcome {
+    ) -> Result<TurnTransactionOutcome> {
+        self.ensure_open("abort to the admitted output baseline")?;
+        ensure!(
+            turn.id() == self.transaction,
+            "output publication journal for transaction {:?} cannot abort turn {:?}; pass the \
+             transaction that admitted this journal",
+            self.transaction,
+            turn.id()
+        );
         let streams = self
             .revision_payloads
             .keys()
@@ -1016,7 +1086,15 @@ impl OutputPublicationJournal {
             .chain(self.materialized.keys())
             .cloned()
             .collect::<std::collections::BTreeSet<_>>();
-        turn.abort_for_streams(reason, streams)
+        let outcome = turn.abort_for_streams(reason, streams)?;
+        if self.publication_mode == TurnPublicationMode::ProvisionalRevisions {
+            self.publications
+                .push(WorkflowOutputPublication::from_transaction_outcome(
+                    &outcome,
+                ));
+        }
+        self.resolution = Some(OutputPublicationJournalResolution::Aborted);
+        Ok(outcome)
     }
 
     pub(crate) fn committed_states(
@@ -1179,6 +1257,55 @@ mod tests {
             .collect()
     }
 
+    fn assert_journal_resolution_error(
+        error: &anyhow::Error,
+        resolution: OutputPublicationJournalResolution,
+        operation: &'static str,
+    ) {
+        let error = error
+            .downcast_ref::<OutputPublicationJournalResolutionError>()
+            .expect("journal misuse returns its typed terminal-resolution error");
+        assert_eq!(
+            error,
+            &OutputPublicationJournalResolutionError {
+                transaction: TurnTransactionId(71),
+                resolution,
+                operation,
+            }
+        );
+        assert!(
+            error.to_string().contains("Admit a new turn"),
+            "terminal diagnostic must tell the caller how to recover: {error}"
+        );
+    }
+
+    fn assert_turn_resolution_error(
+        error: crate::pipeline::TurnTransactionResolutionError,
+        resolution: OutputPublicationJournalResolution,
+        operation: &'static str,
+    ) {
+        let resolution = match resolution {
+            OutputPublicationJournalResolution::Committed => {
+                crate::pipeline::TurnTransactionResolution::Committed
+            }
+            OutputPublicationJournalResolution::Aborted => {
+                crate::pipeline::TurnTransactionResolution::Aborted
+            }
+        };
+        assert_eq!(
+            error,
+            crate::pipeline::TurnTransactionResolutionError {
+                transaction: TurnTransactionId(71),
+                resolution,
+                operation,
+            }
+        );
+        assert!(
+            error.to_string().contains("Admit a new turn"),
+            "terminal diagnostic must tell the caller how to recover: {error}"
+        );
+    }
+
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum TransactionTestOperation {
         Emit,
@@ -1266,15 +1393,16 @@ mod tests {
             prop::collection::vec(transaction_action_strategy(), 0..8),
         )
             .prop_map(|(prefix, terminal, suffix)| {
-                // The first terminal owns the outcome. A generated suffix plus
-                // the opposite terminal and an output prove later actions are
-                // ignored, while still shrinking to a minimal terminal trace.
+                // The first terminal owns the outcome. Execute a generated
+                // suffix, the repeated terminal, the opposite terminal, and an
+                // output so shrinking cannot remove any misuse class.
                 let mut trace = prefix
                     .into_iter()
                     .map(TransactionTestStep::Output)
                     .collect::<Vec<_>>();
                 trace.push(terminal);
                 trace.extend(suffix);
+                trace.push(terminal);
                 trace.push(match terminal {
                     TransactionTestStep::Commit => TransactionTestStep::Abort,
                     TransactionTestStep::Abort => TransactionTestStep::Commit,
@@ -1352,23 +1480,6 @@ mod tests {
             )
         })
         .collect()
-    }
-
-    fn reference_transaction_baselines() -> BTreeMap<(String, OutputStreamId), ReferenceStream> {
-        let mut baselines = reference_streams();
-        for output in ["answer", "tool"] {
-            baselines.insert(
-                (output.to_string(), OutputStreamId(output.to_string())),
-                ReferenceStream {
-                    head: 0,
-                    cursor: 0,
-                    lineage: 0,
-                    closed: false,
-                    payload: None,
-                },
-            );
-        }
-        baselines
     }
 
     fn session_output_state(reference: &ReferenceStream) -> CommittedOutputState {
@@ -1556,8 +1667,10 @@ mod tests {
         turn.stage_state(
             onnx_genai_metadata::StateIdentity("memory".to_string()),
             value(8),
-        );
-        turn.stage_effects();
+        )
+        .expect("pre-terminal state staging succeeds");
+        turn.stage_effects()
+            .expect("pre-terminal effect staging succeeds");
 
         let required_actions = [
             TransactionTestAction {
@@ -1606,13 +1719,120 @@ mod tests {
             .collect::<Vec<_>>();
         let mut terminal_outcome = None;
         let mut terminal_snapshot: Option<TerminalSnapshot> = None;
-        let mut ignored_after_terminal = 0usize;
+        let mut executed_after_terminal = 0usize;
         for step in sequence {
             if let Some(snapshot) = &terminal_snapshot {
-                ignored_after_terminal += 1;
+                executed_after_terminal += 1;
+                let resolution = match terminal_outcome
+                    .as_ref()
+                    .expect("a terminal snapshot has an outcome")
+                {
+                    TurnTransactionOutcome::Committed { .. } => {
+                        OutputPublicationJournalResolution::Committed
+                    }
+                    TurnTransactionOutcome::AbortToBaseline { .. } => {
+                        OutputPublicationJournalResolution::Aborted
+                    }
+                };
+                match step {
+                    TransactionTestStep::Output(action) => {
+                        let (output, stream) = action.identity();
+                        let error = journal
+                            .publish(
+                                output,
+                                Some(stream),
+                                &action.operation.mode(),
+                                action
+                                    .operation
+                                    .carries_payload()
+                                    .then(|| value(action.payload)),
+                            )
+                            .expect_err("post-terminal output publication must fail closed");
+                        assert_journal_resolution_error(
+                            &error,
+                            resolution,
+                            "validate an output emission",
+                        );
+                        assert_turn_resolution_error(
+                            turn.stage_state(
+                                onnx_genai_metadata::StateIdentity("memory".to_string()),
+                                value(action.payload),
+                            )
+                            .expect_err("post-terminal state staging must fail closed"),
+                            resolution,
+                            "stage semantic state",
+                        );
+                        assert_turn_resolution_error(
+                            turn.stage_outputs(
+                                journal
+                                    .committed_states()
+                                    .expect("post-terminal journal remains inspectable"),
+                            )
+                            .expect_err("post-terminal output staging must fail closed"),
+                            resolution,
+                            "stage output publication state",
+                        );
+                        assert_turn_resolution_error(
+                            turn.stage_effects()
+                                .expect_err("post-terminal effect staging must fail closed"),
+                            resolution,
+                            "stage effect cursors",
+                        );
+                    }
+                    TransactionTestStep::Commit => {
+                        let error = journal
+                            .finalize_on_commit()
+                            .expect_err("post-terminal finalize-on-commit must fail closed");
+                        assert_journal_resolution_error(
+                            &error,
+                            resolution,
+                            "stage commit finalization",
+                        );
+                        let error = turn
+                            .commit(
+                                &mut session_states,
+                                &mut session_effects,
+                                &mut session_outputs,
+                            )
+                            .expect_err("post-terminal commit must fail closed");
+                        let crate::pipeline::TurnTransactionCommitError::Resolved(error) = error
+                        else {
+                            panic!("post-terminal commit returned a non-resolution error");
+                        };
+                        assert_turn_resolution_error(error, resolution, "commit durable state");
+                        let error = journal
+                            .record_commit(
+                                terminal_outcome
+                                    .as_ref()
+                                    .expect("a terminal snapshot has an outcome"),
+                            )
+                            .expect_err("repeated journal commit must fail closed");
+                        assert_journal_resolution_error(
+                            &error,
+                            resolution,
+                            "record a committed transaction",
+                        );
+                    }
+                    TransactionTestStep::Abort => {
+                        let error = journal
+                            .abort_outcome(&mut turn, TurnAbortReason::Cancellation)
+                            .expect_err("post-terminal journal abort must fail closed");
+                        assert_journal_resolution_error(
+                            &error,
+                            resolution,
+                            "abort to the admitted output baseline",
+                        );
+                        assert_turn_resolution_error(
+                            turn.abort(TurnAbortReason::Cancellation)
+                                .expect_err("post-terminal turn abort must fail closed"),
+                            resolution,
+                            "abort to the admitted baseline",
+                        );
+                    }
+                }
                 assert_eq!(
                     &expected, &snapshot.expected,
-                    "the independent model must ignore every post-terminal action"
+                    "the independent model must remain unchanged after rejected post-terminal action"
                 );
                 assert_eq!(
                     map_fingerprints(&session_states, &session_effects, &session_outputs),
@@ -1677,7 +1897,8 @@ mod tests {
                     assert_journal_matches(&journal, &expected);
                     turn.stage_outputs(
                         journal.committed_states().expect("staged output write set"),
-                    );
+                    )
+                    .expect("pre-terminal output staging succeeds");
                     let pending = journal
                         .take_pending_provisionals()
                         .expect("provisional delivery is cloneable");
@@ -1730,7 +1951,8 @@ mod tests {
                         journal
                             .committed_states()
                             .expect("committed output write set"),
-                    );
+                    )
+                    .expect("pre-terminal output staging succeeds");
                     let outcome = turn
                         .commit(
                             &mut session_states,
@@ -1745,11 +1967,15 @@ mod tests {
                             baseline: TurnBaselineId(71),
                         }
                     );
-                    journal.record_commit(&outcome);
+                    journal
+                        .record_commit(&outcome)
+                        .expect("the journal records exactly one commit");
                     terminal_outcome = Some(outcome);
                 }
                 TransactionTestStep::Abort => {
-                    let outcome = turn.abort(TurnAbortReason::Cancellation);
+                    let outcome = journal
+                        .abort_outcome(&mut turn, TurnAbortReason::Cancellation)
+                        .expect("the journal and turn record exactly one abort");
                     assert!(matches!(
                         outcome,
                         TurnTransactionOutcome::AbortToBaseline {
@@ -1779,8 +2005,8 @@ mod tests {
         }
 
         assert!(
-            ignored_after_terminal >= 2,
-            "the generated trace must exercise ignored output and terminal actions"
+            executed_after_terminal >= 3,
+            "the generated trace must execute rejected output and terminal actions"
         );
         let outcome = terminal_outcome.expect("every generated trace contains a terminal action");
         match outcome {
@@ -1818,6 +2044,17 @@ mod tests {
                                 baseline: TurnBaselineId(71),
                             })
                         ));
+                        assert_eq!(
+                            publications
+                                .iter()
+                                .filter(|publication| matches!(
+                                    publication,
+                                    WorkflowOutputPublication::TransactionCommitted { .. }
+                                        | WorkflowOutputPublication::AbortToBaseline { .. }
+                                ))
+                                .count(),
+                            1
+                        );
                     }
                 }
                 assert_ne!(
@@ -1898,7 +2135,7 @@ mod tests {
                 assert_eq!(transaction, TurnTransactionId(71));
                 assert_eq!(baseline, TurnBaselineId(71));
                 assert_eq!(reason, TurnAbortReason::Cancellation);
-                let baseline_by_stream = reference_transaction_baselines();
+                let baseline_by_stream = reference_streams();
                 assert_eq!(streams.len(), baseline_by_stream.len());
                 for stream in &streams {
                     let expected =
@@ -1934,6 +2171,38 @@ mod tests {
                     durable_baseline,
                     "real abort must preserve the exact non-empty state/effect/output baseline"
                 );
+                let publications = journal.take();
+                match publication_mode {
+                    onnx_genai_metadata::WorkflowPublicationMode::CommitOnly => {
+                        assert!(publications.iter().all(|publication| !matches!(
+                            publication,
+                            WorkflowOutputPublication::TransactionCommitted { .. }
+                                | WorkflowOutputPublication::AbortToBaseline { .. }
+                        )));
+                    }
+                    onnx_genai_metadata::WorkflowPublicationMode::ProvisionalRevisions => {
+                        assert!(matches!(
+                            publications.last(),
+                            Some(WorkflowOutputPublication::AbortToBaseline {
+                                transaction: TurnTransactionId(71),
+                                baseline: TurnBaselineId(71),
+                                reason: TurnAbortReason::Cancellation,
+                                ..
+                            })
+                        ));
+                        assert_eq!(
+                            publications
+                                .iter()
+                                .filter(|publication| matches!(
+                                    publication,
+                                    WorkflowOutputPublication::TransactionCommitted { .. }
+                                        | WorkflowOutputPublication::AbortToBaseline { .. }
+                                ))
+                                .count(),
+                            1
+                        );
+                    }
+                }
             }
         }
     }
@@ -2589,10 +2858,194 @@ mod tests {
     }
 
     #[test]
+    fn committed_journal_rejects_publication_finalization_and_repeated_outcomes() -> Result<()> {
+        let workflow =
+            revision_workflow(onnx_genai_metadata::WorkflowPublicationMode::ProvisionalRevisions);
+        let mut turn = TurnTransaction::admit(
+            TurnTransactionId(51),
+            None,
+            &onnx_genai_metadata::ResolvedStatePlan::default(),
+            std::iter::empty::<String>(),
+            ["answer".to_string(), "tool".to_string()],
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            TurnPublicationMode::ProvisionalRevisions,
+        )?;
+        let mut journal = OutputPublicationJournal::new_with_publication_mode(
+            turn.id(),
+            &workflow,
+            turn.output_baselines()?,
+            TurnPublicationMode::ProvisionalRevisions,
+        )?;
+        journal.publish(
+            "answer",
+            Some("dynamic"),
+            &WorkflowEmitMode::Append,
+            Some(value(5)),
+        )?;
+        journal.finalize_on_commit()?;
+        turn.stage_outputs(journal.committed_states()?)?;
+        let outcome = turn.commit(
+            &mut std::collections::HashMap::new(),
+            &mut std::collections::HashMap::new(),
+            &mut std::collections::HashMap::new(),
+        )?;
+        journal.record_commit(&outcome)?;
+        let snapshot = (
+            committed_state_fingerprint(journal.committed_states()?),
+            journal.publications.len(),
+            journal.provisional_delivery_cursor,
+        );
+
+        for error in [
+            journal
+                .publish(
+                    "answer",
+                    Some("dynamic"),
+                    &WorkflowEmitMode::Replace,
+                    Some(value(6)),
+                )
+                .expect_err("commit must close publication"),
+            journal
+                .finalize_on_commit()
+                .expect_err("commit must close finalization"),
+            journal
+                .record_commit(&outcome)
+                .expect_err("commit must close repeated terminal records"),
+            journal
+                .take_pending_provisionals()
+                .expect_err("commit must close provisional delivery"),
+            journal
+                .abort_outcome(&mut turn, TurnAbortReason::Cancellation)
+                .expect_err("commit must close abort"),
+        ] {
+            let error = error
+                .downcast_ref::<OutputPublicationJournalResolutionError>()
+                .expect("journal misuse returns a typed resolution error");
+            assert_eq!(error.transaction, TurnTransactionId(51));
+            assert_eq!(
+                error.resolution,
+                OutputPublicationJournalResolution::Committed
+            );
+            assert!(error.to_string().contains("Admit a new turn"));
+        }
+        assert_eq!(
+            (
+                committed_state_fingerprint(journal.committed_states()?),
+                journal.publications.len(),
+                journal.provisional_delivery_cursor,
+            ),
+            snapshot,
+            "post-commit journal misuse must leave every cursor, payload, and record unchanged"
+        );
+        assert_eq!(
+            journal
+                .publications
+                .iter()
+                .filter(|publication| matches!(
+                    publication,
+                    WorkflowOutputPublication::TransactionCommitted { .. }
+                        | WorkflowOutputPublication::AbortToBaseline { .. }
+                ))
+                .count(),
+            1,
+            "a committed journal must contain exactly one terminal outcome"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn aborted_journal_rejects_publication_commit_and_repeated_abort() -> Result<()> {
+        let workflow =
+            revision_workflow(onnx_genai_metadata::WorkflowPublicationMode::ProvisionalRevisions);
+        let mut turn = TurnTransaction::admit(
+            TurnTransactionId(52),
+            None,
+            &onnx_genai_metadata::ResolvedStatePlan::default(),
+            std::iter::empty::<String>(),
+            ["answer".to_string(), "tool".to_string()],
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            TurnPublicationMode::ProvisionalRevisions,
+        )?;
+        let mut journal = OutputPublicationJournal::new_with_publication_mode(
+            turn.id(),
+            &workflow,
+            turn.output_baselines()?,
+            TurnPublicationMode::ProvisionalRevisions,
+        )?;
+        journal.publish(
+            "answer",
+            Some("dynamic"),
+            &WorkflowEmitMode::Append,
+            Some(value(5)),
+        )?;
+        let outcome = journal.abort_outcome(&mut turn, TurnAbortReason::ExecutionFailure)?;
+        let snapshot = (
+            committed_state_fingerprint(journal.committed_states()?),
+            journal.publications.len(),
+            journal.provisional_delivery_cursor,
+        );
+
+        for error in [
+            journal
+                .publish("answer", Some("dynamic"), &WorkflowEmitMode::Finalize, None)
+                .expect_err("abort must close publication"),
+            journal
+                .finalize_on_commit()
+                .expect_err("abort must close commit finalization"),
+            journal
+                .record_commit(&outcome)
+                .expect_err("abort must close commit recording"),
+            journal
+                .take_pending_provisionals()
+                .expect_err("abort must close provisional delivery"),
+            journal
+                .abort_outcome(&mut turn, TurnAbortReason::Cancellation)
+                .expect_err("abort must close repeated abort"),
+        ] {
+            let error = error
+                .downcast_ref::<OutputPublicationJournalResolutionError>()
+                .expect("journal misuse returns a typed resolution error");
+            assert_eq!(error.transaction, TurnTransactionId(52));
+            assert_eq!(
+                error.resolution,
+                OutputPublicationJournalResolution::Aborted
+            );
+            assert!(error.to_string().contains("Admit a new turn"));
+        }
+        assert_eq!(
+            (
+                committed_state_fingerprint(journal.committed_states()?),
+                journal.publications.len(),
+                journal.provisional_delivery_cursor,
+            ),
+            snapshot,
+            "post-abort journal misuse must leave every cursor, payload, and record unchanged"
+        );
+        assert_eq!(
+            journal
+                .publications
+                .iter()
+                .filter(|publication| matches!(
+                    publication,
+                    WorkflowOutputPublication::TransactionCommitted { .. }
+                        | WorkflowOutputPublication::AbortToBaseline { .. }
+                ))
+                .count(),
+            1,
+            "an aborted journal must contain exactly one terminal outcome"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn journal_abort_reconciles_a_stream_created_after_admission() -> Result<()> {
         let workflow =
             revision_workflow(onnx_genai_metadata::WorkflowPublicationMode::ProvisionalRevisions);
-        let turn = TurnTransaction::admit(
+        let mut turn = TurnTransaction::admit(
             TurnTransactionId(91),
             None,
             &onnx_genai_metadata::ResolvedStatePlan::default(),
@@ -2618,7 +3071,7 @@ mod tests {
         )?;
 
         let TurnTransactionOutcome::AbortToBaseline { streams, .. } =
-            journal.abort_outcome(&turn, TurnAbortReason::ExecutionFailure)
+            journal.abort_outcome(&mut turn, TurnAbortReason::ExecutionFailure)?
         else {
             unreachable!("journal abort is a typed transaction outcome");
         };

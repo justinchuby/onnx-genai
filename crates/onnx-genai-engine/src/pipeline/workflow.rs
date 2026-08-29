@@ -1476,10 +1476,12 @@ impl<'a> WorkflowExecutionPlan<'a> {
             .as_deref_mut()
             .and_then(|host| host.begin_turn(&transaction).err());
         if let Some(error) = begin_error {
-            let outcome = publication_journal.as_ref().map_or_else(
-                || transaction.abort(TurnAbortReason::ExecutionFailure),
-                |journal| journal.abort_outcome(&transaction, TurnAbortReason::ExecutionFailure),
-            );
+            let outcome = abort_workflow_turn(
+                &mut publication_journal,
+                &mut transaction,
+                TurnAbortReason::ExecutionFailure,
+            )
+            .context("failed to resolve the workflow turn after begin_turn failed")?;
             publish_terminal_transaction_outcome(host, &outcome);
             if let Some(host) = host.as_deref_mut() {
                 host.turn_aborted(outcome);
@@ -1576,10 +1578,12 @@ impl<'a> WorkflowExecutionPlan<'a> {
             host,
         );
         if let Err(error) = result {
-            let outcome = publication_journal.as_ref().map_or_else(
-                || transaction.abort(TurnAbortReason::ExecutionFailure),
-                |journal| journal.abort_outcome(&transaction, TurnAbortReason::ExecutionFailure),
-            );
+            let outcome = abort_workflow_turn(
+                &mut publication_journal,
+                &mut transaction,
+                TurnAbortReason::ExecutionFailure,
+            )
+            .context("failed to resolve the workflow turn after execution failed")?;
             if let Some(host) = host.as_deref_mut() {
                 publish_terminal_transaction_outcome_to_host(host, &outcome);
                 host.turn_aborted(outcome);
@@ -1704,7 +1708,7 @@ impl<'a> WorkflowExecutionPlan<'a> {
                         })?)?
                     }
                 };
-                transaction.stage_state(resolved.identity.clone(), value);
+                transaction.stage_state(resolved.identity.clone(), value)?;
             }
             let mut advisory_updates = Vec::new();
             if let Some(session_id) = self.session_id.as_ref() {
@@ -1744,7 +1748,7 @@ impl<'a> WorkflowExecutionPlan<'a> {
                     ));
                 }
             }
-            transaction.stage_effects();
+            transaction.stage_effects()?;
             if publication_journal.is_some() {
                 let journal = publication_journal
                     .as_mut()
@@ -1754,7 +1758,7 @@ impl<'a> WorkflowExecutionPlan<'a> {
                 let journal = publication_journal
                     .as_ref()
                     .expect("publication delivery keeps the journal");
-                transaction.stage_outputs(journal.committed_states()?);
+                transaction.stage_outputs(journal.committed_states()?)?;
             }
             let mut session_state = engine.worker.session_state.borrow_mut();
             let mut session_effects = engine.worker.session_effects.borrow_mut();
@@ -1770,10 +1774,12 @@ impl<'a> WorkflowExecutionPlan<'a> {
         let commit_outcome = match staged_commit {
             Ok(outcome) => outcome,
             Err(error) => {
-                let outcome = publication_journal.as_ref().map_or_else(
-                    || transaction.abort(TurnAbortReason::CommitFailure),
-                    |journal| journal.abort_outcome(&transaction, TurnAbortReason::CommitFailure),
-                );
+                let outcome = abort_workflow_turn(
+                    &mut publication_journal,
+                    &mut transaction,
+                    TurnAbortReason::CommitFailure,
+                )
+                .context("failed to resolve the workflow turn after commit preparation failed")?;
                 if let Some(host) = host.as_deref_mut() {
                     publish_terminal_transaction_outcome_to_host(host, &outcome);
                     host.turn_aborted(outcome);
@@ -1788,14 +1794,14 @@ impl<'a> WorkflowExecutionPlan<'a> {
         }
         let row_outputs = std::mem::take(&mut pass.telemetry.row_outputs);
         if let Some(journal) = publication_journal.as_mut() {
-            journal.record_commit(&commit_outcome);
+            journal.record_commit(&commit_outcome)?;
         }
         publish_terminal_transaction_outcome(host, &commit_outcome);
         *engine.worker.last_output_publications.borrow_mut() = publication_journal
             .map(OutputPublicationJournal::take)
             .unwrap_or_default();
         if let Some(host) = host.as_deref_mut() {
-            host.turn_committed(transaction.committed());
+            host.turn_committed(commit_outcome.clone());
         }
         engine.publish_workflow_telemetry(pass.telemetry);
         Ok((values, row_outputs))
@@ -1990,6 +1996,17 @@ fn publish_pending_provisional_publications(
         return Ok(());
     }
     host.publish_provisional_output_publications(&publications)
+}
+
+fn abort_workflow_turn(
+    journal: &mut Option<OutputPublicationJournal>,
+    transaction: &mut TurnTransaction,
+    reason: TurnAbortReason,
+) -> anyhow::Result<TurnTransactionOutcome> {
+    match journal.as_mut() {
+        Some(journal) => journal.abort_outcome(transaction, reason),
+        None => Ok(transaction.abort(reason)?),
+    }
 }
 
 /// A terminal delivery failure cannot change the transaction decision already

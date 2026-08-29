@@ -68,7 +68,8 @@ pub(crate) use turn_transaction::TurnTransaction;
 pub use turn_transaction::{
     OutputPublicationBaseline, OutputStreamBaseline, TurnAbortReason, TurnBaselineId,
     TurnCommittedBaseline, TurnPublicationMode, TurnStateBaseline, TurnTransactionAdmissionError,
-    TurnTransactionId, TurnTransactionOutcome,
+    TurnTransactionCommitError, TurnTransactionId, TurnTransactionOutcome,
+    TurnTransactionResolution, TurnTransactionResolutionError,
 };
 pub use workflow::{
     MISSING_REQUIRED_INPUT, WorkflowExecutionPlan, WorkflowPerformanceDiagnostic,

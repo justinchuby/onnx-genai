@@ -678,7 +678,7 @@ impl<'a> ContinuousBatchManager<'a> {
             }
             return Err(error);
         }
-        for (row_index, row) in finished_rows {
+        for (row_index, mut row) in finished_rows {
             if let Err(error) = self.decode.deactivate_row(row_index) {
                 self.abort_detached_row(
                     row_index,
@@ -690,7 +690,7 @@ impl<'a> ContinuousBatchManager<'a> {
             }
             self.committed_per_row[row_index]
                 .extend(row.turn.staged_tokens.iter().copied().map(i64::from));
-            let _ = row.turn.authority.committed();
+            row.turn.authority.commit_runtime_participant()?;
             self.events.extend(row.turn.staged_events);
         }
         Ok(())
@@ -995,7 +995,7 @@ impl<'a> ContinuousBatchManager<'a> {
         let handle = row.handle;
         self.pending_output_rollbacks
             .push((row_index, row.turn.output_baseline));
-        let outcome = row.turn.authority.abort(reason);
+        let outcome = row.turn.authority.abort(reason)?;
         self.events.push_back(ContinuousBatchEvent::Aborted {
             handle,
             outcome,

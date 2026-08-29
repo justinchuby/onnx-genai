@@ -982,14 +982,7 @@ impl super::workflow::WorkflowNodeHost for CandidateTreeWorkflowHost<'_> {
     }
 
     fn begin_turn(&mut self, turn: &super::TurnTransaction) -> anyhow::Result<()> {
-        let super::TurnTransactionOutcome::Committed {
-            transaction,
-            baseline,
-        } = turn.committed()
-        else {
-            unreachable!("a newly admitted transaction is represented by its committed identity")
-        };
-        self.turn_identity = Some((transaction, baseline));
+        self.turn_identity = Some((turn.id(), turn.baseline_id()));
         if let Some(observer) = self.staged_output_observer.as_deref_mut() {
             observer.begin_turn();
         }
@@ -1000,7 +993,7 @@ impl super::workflow::WorkflowNodeHost for CandidateTreeWorkflowHost<'_> {
         self.observe(boundary)
     }
 
-    fn before_turn_commit(&mut self, turn: &super::TurnTransaction) -> anyhow::Result<()> {
+    fn before_turn_commit(&mut self, _turn: &super::TurnTransaction) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.pending.is_none(),
             "candidate-tree proposer at {} executed without its target at {}; the generic \
@@ -1042,7 +1035,7 @@ impl super::workflow::WorkflowNodeHost for CandidateTreeWorkflowHost<'_> {
             }
             Ok(false) => Err(anyhow::Error::new(CandidateTreeGenerationCancelled {
                 boundary: super::GenerationBoundary::BeforeSemanticCommit,
-                outcome: turn.abort(super::TurnAbortReason::Cancellation),
+                outcome: self.transaction_outcome(super::TurnAbortReason::Cancellation),
             })),
             Err(error) => {
                 Err(error.context("candidate-tree checkpoint failed before semantic commit"))
@@ -2363,7 +2356,7 @@ impl WorkflowRuntime {
                 budget_cap: None,
             });
         }
-        let turn = super::TurnTransaction::admit_runtime_participant(
+        let mut turn = super::TurnTransaction::admit_runtime_participant(
             self.worker.next_turn_transaction_id(),
         );
         if let Some(observer) = staged_output_observer.as_deref_mut() {
@@ -2428,7 +2421,7 @@ impl WorkflowRuntime {
             // transaction back to that complete baseline.
             let transaction = self.observe_dflash_block_checkpoint(
                 &control,
-                &turn,
+                &mut turn,
                 super::GenerationBoundary::BeforeProposer,
                 self.begin_dflash_state_transaction(&state)?,
                 &mut state,
@@ -2447,7 +2440,7 @@ impl WorkflowRuntime {
             };
             let transaction = self.observe_dflash_block_checkpoint(
                 &control,
-                &turn,
+                &mut turn,
                 super::GenerationBoundary::AfterProposer,
                 transaction,
                 &mut state,
@@ -2467,7 +2460,7 @@ impl WorkflowRuntime {
             }
             let transaction = self.observe_dflash_block_checkpoint(
                 &control,
-                &turn,
+                &mut turn,
                 super::GenerationBoundary::AfterVerifier,
                 transaction,
                 &mut state,
@@ -2536,7 +2529,7 @@ impl WorkflowRuntime {
             }
             let transaction = self.observe_dflash_block_checkpoint(
                 &control,
-                &turn,
+                &mut turn,
                 super::GenerationBoundary::BeforeAcceptedPrefixCommit,
                 transaction,
                 &mut state,
@@ -2620,9 +2613,10 @@ impl WorkflowRuntime {
         match control.begin_commit() {
             Ok(true) => {}
             Ok(false) => {
+                let outcome = turn.abort(super::TurnAbortReason::Cancellation)?;
                 return Err(anyhow::Error::new(DFlashGenerationCancelled {
                     boundary: super::GenerationBoundary::BeforeSemanticCommit,
-                    outcome: turn.abort(super::TurnAbortReason::Cancellation),
+                    outcome,
                 }));
             }
             Err(error) => {
@@ -2643,7 +2637,7 @@ impl WorkflowRuntime {
             );
         }
         *self.worker.last_dflash_block_traces.borrow_mut() = staged_block_traces;
-        let _ = turn.committed();
+        turn.commit_runtime_participant()?;
         if let Some(observer) = staged_output_observer.as_deref_mut() {
             observer.commit_turn();
         }
@@ -2698,7 +2692,7 @@ impl WorkflowRuntime {
     fn observe_dflash_block_checkpoint(
         &self,
         control: &super::GenerationControl,
-        turn: &super::TurnTransaction,
+        turn: &mut super::TurnTransaction,
         boundary: super::GenerationBoundary,
         transaction: DFlashStateTransaction,
         state: &mut PipelineTensors,
@@ -2711,9 +2705,10 @@ impl WorkflowRuntime {
                     state,
                     super::TurnAbortReason::Cancellation,
                 );
+                let outcome = turn.abort(super::TurnAbortReason::Cancellation)?;
                 Err(anyhow::Error::new(DFlashGenerationCancelled {
                     boundary,
-                    outcome: turn.abort(super::TurnAbortReason::Cancellation),
+                    outcome,
                 }))
             }
             Err(error) => {
@@ -3604,7 +3599,7 @@ impl WorkflowRuntime {
     /// decoder baseline.
     pub(crate) fn commit_dflash_state_transaction(
         &self,
-        transaction: DFlashStateTransaction,
+        mut transaction: DFlashStateTransaction,
         current: &mut PipelineTensors,
         proposal: &DFlashProposal,
         verified: &PipelineTensors,
@@ -3725,14 +3720,15 @@ impl WorkflowRuntime {
             };
             committed.insert(cell.clone(), accepted_value);
         }
+        let outcome = transaction.turn.commit_runtime_participant()?;
         *current = committed;
-        Ok(transaction.turn.committed())
+        Ok(outcome)
     }
 
     /// Abort a DFlash block to its complete admitted participant baseline.
     pub(crate) fn abort_dflash_state_transaction(
         &self,
-        transaction: DFlashStateTransaction,
+        mut transaction: DFlashStateTransaction,
         current: &mut PipelineTensors,
         reason: super::TurnAbortReason,
     ) -> anyhow::Result<super::TurnTransactionOutcome> {
@@ -3740,7 +3736,7 @@ impl WorkflowRuntime {
         for (cell, value) in transaction.baseline {
             current.insert(cell, value);
         }
-        Ok(transaction.turn.abort(reason))
+        Ok(transaction.turn.abort(reason)?)
     }
 
     /// Drive a chained speculative proposal through the interpreter's own
