@@ -155,9 +155,23 @@ __device__ __forceinline__ void route_telemetry_mark_row(
             route_telemetry_bitmap, route_telemetry_header, indices[slot], experts);
     }
     if (valid != 0u) {
-        unsigned int prev = atomicAdd(&route_telemetry_header[5], valid);
-        if (prev + valid < prev) {
-            atomicOr(&route_telemetry_header[3], 1u); // count saturated (overflow)
+        unsigned int* count = &route_telemetry_header[5];
+        unsigned int observed = atomicAdd(count, 0u);
+        for (;;) {
+            if (observed == 0xffffffffu) {
+                atomicOr(&route_telemetry_header[3], 1u);
+                break;
+            }
+            bool overflow = valid > 0xffffffffu - observed;
+            unsigned int desired = overflow ? 0xffffffffu : observed + valid;
+            unsigned int prior = atomicCAS(count, observed, desired);
+            if (prior == observed) {
+                if (overflow) {
+                    atomicOr(&route_telemetry_header[3], 1u);
+                }
+                break;
+            }
+            observed = prior;
         }
     }
 }
@@ -354,7 +368,15 @@ impl ArmedTelemetry {
         // Order the reset after all prior EP-stream work (the fused marks of the
         // window being closed) using the existing drain authority.
         runtime.drain_for_unmap()?;
-        self.epoch.fetch_add(1, Ordering::Relaxed);
+        self.epoch
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |epoch| {
+                epoch.checked_add(1)
+            })
+            .map_err(|_| {
+                EpError::KernelFailed(
+                    "cuda_ep: route telemetry epoch overflow; re-arm the observer".into(),
+                )
+            })?;
         self.open_window(runtime)
     }
 
@@ -412,6 +434,46 @@ impl ArmedTelemetry {
             bitmap,
             num_experts: self.num_experts,
         })
+    }
+
+    /// Read and validate the complete record against this immutable arming.
+    pub(crate) fn validated_snapshot(&self, runtime: &CudaRuntime) -> Result<TelemetrySnapshot> {
+        let snapshot = self.snapshot(runtime)?;
+        match consume_and_validate(
+            &snapshot.header,
+            &snapshot.bitmap,
+            self.epoch.load(Ordering::Acquire),
+            self.request_id,
+            self.device_id,
+            self.num_experts,
+        ) {
+            RouteDecision::HotSet(_) => Ok(snapshot),
+            RouteDecision::WholeBank(reason) => Err(EpError::KernelFailed(format!(
+                "cuda_ep: invalid BlockQuantizedMoE traffic record: {reason}"
+            ))),
+        }
+    }
+
+    #[cfg(feature = "gpu-tests")]
+    pub(crate) fn inject_header_word(
+        &self,
+        runtime: &CudaRuntime,
+        index: usize,
+        value: u32,
+    ) -> Result<()> {
+        if index >= HEADER_LEN {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep: telemetry test header index {index} is out of range"
+            )));
+        }
+        let byte_offset = index.checked_mul(4).ok_or_else(|| {
+            EpError::KernelFailed("cuda_ep: telemetry test header offset overflow".into())
+        })?;
+        let destination = self.header.checked_add(byte_offset as u64).ok_or_else(|| {
+            EpError::KernelFailed("cuda_ep: telemetry test header address overflow".into())
+        })?;
+        // SAFETY: `destination` names one u32 word within the live header.
+        unsafe { runtime.htod(&value.to_ne_bytes(), destination) }
     }
 
     /// Best-effort free. Drains in-flight launches first (a captured/eager route
@@ -511,7 +573,21 @@ pub fn consume_and_validate(
     expected_epoch: u32,
     expected_request: u32,
     expected_device: u32,
+    expected_num_experts: usize,
 ) -> RouteDecision {
+    if header.len() != HEADER_LEN {
+        return RouteDecision::WholeBank(format!(
+            "header length mismatch: record={} expected {HEADER_LEN}",
+            header.len()
+        ));
+    }
+    let expected_words = words_for(expected_num_experts);
+    if bitmap.len() != expected_words {
+        return RouteDecision::WholeBank(format!(
+            "bitmap length mismatch: record={} expected {expected_words}",
+            bitmap.len()
+        ));
+    }
     if header[H_POISON] != 0 {
         return RouteDecision::WholeBank("poison: out-of-range expert id observed".into());
     }
@@ -530,10 +606,30 @@ pub fn consume_and_validate(
             header[H_REQUEST]
         ));
     }
-    if header[H_EPOCH] < expected_epoch {
+    if header[H_EPOCH] != expected_epoch {
         return RouteDecision::WholeBank(format!(
-            "stale epoch: record epoch={} < boundary epoch {expected_epoch}",
+            "epoch mismatch: record epoch={} expected {expected_epoch}",
             header[H_EPOCH]
+        ));
+    }
+    if let Some(last) = bitmap.last() {
+        let valid_tail_bits = expected_num_experts % 32;
+        if valid_tail_bits != 0 && (*last >> valid_tail_bits) != 0 {
+            return RouteDecision::WholeBank(
+                "bitmap contains experts outside the armed capacity".into(),
+            );
+        }
+    }
+    let Some(unique) = bitmap
+        .iter()
+        .try_fold(0u32, |total, word| total.checked_add(word.count_ones()))
+    else {
+        return RouteDecision::WholeBank("unique expert count overflow".into());
+    };
+    let count = header[H_COUNT];
+    if count < unique || (count == 0 && unique != 0) {
+        return RouteDecision::WholeBank(format!(
+            "route count {count} is inconsistent with {unique} unique selected experts"
         ));
     }
     RouteDecision::HotSet(bitmap.to_vec())
@@ -590,16 +686,16 @@ mod tests {
         header[H_EPOCH] = 4;
         header[H_REQUEST] = 9;
         header[H_DEVICE] = 1;
+        header[H_COUNT] = 2;
         let bitmap = vec![0b1010u32];
         assert_eq!(
-            consume_and_validate(&header, &bitmap, 4, 9, 1),
+            consume_and_validate(&header, &bitmap, 4, 9, 1, 32),
             RouteDecision::HotSet(vec![0b1010u32])
         );
-        // A newer epoch than the boundary expected is still fresh (>=).
-        assert_eq!(
-            consume_and_validate(&header, &bitmap, 3, 9, 1),
-            RouteDecision::HotSet(vec![0b1010u32])
-        );
+        assert!(matches!(
+            consume_and_validate(&header, &bitmap, 3, 9, 1, 32),
+            RouteDecision::WholeBank(_)
+        ));
     }
 
     #[test]
@@ -609,6 +705,7 @@ mod tests {
             header[H_EPOCH] = epoch;
             header[H_REQUEST] = request;
             header[H_DEVICE] = device;
+            header[H_COUNT] = 1;
             header
         };
         let bitmap = vec![1u32];
@@ -616,32 +713,57 @@ mod tests {
         let mut poisoned = clean(4, 9, 1);
         poisoned[H_POISON] = 1;
         assert!(matches!(
-            consume_and_validate(&poisoned, &bitmap, 4, 9, 1),
+            consume_and_validate(&poisoned, &bitmap, 4, 9, 1, 32),
             RouteDecision::WholeBank(_)
         ));
 
         let mut overflowed = clean(4, 9, 1);
         overflowed[H_OVERFLOW] = 1;
         assert!(matches!(
-            consume_and_validate(&overflowed, &bitmap, 4, 9, 1),
+            consume_and_validate(&overflowed, &bitmap, 4, 9, 1, 32),
             RouteDecision::WholeBank(_)
         ));
 
         // Foreign device / request identity fails closed (isolation).
         assert!(matches!(
-            consume_and_validate(&clean(4, 9, 2), &bitmap, 4, 9, 1),
+            consume_and_validate(&clean(4, 9, 2), &bitmap, 4, 9, 1, 32),
             RouteDecision::WholeBank(_)
         ));
         assert!(matches!(
-            consume_and_validate(&clean(4, 8, 1), &bitmap, 4, 9, 1),
+            consume_and_validate(&clean(4, 8, 1), &bitmap, 4, 9, 1, 32),
             RouteDecision::WholeBank(_)
         ));
 
         // A stale epoch (record older than the boundary) fails closed.
         assert!(matches!(
-            consume_and_validate(&clean(2, 9, 1), &bitmap, 3, 9, 1),
+            consume_and_validate(&clean(2, 9, 1), &bitmap, 3, 9, 1, 32),
             RouteDecision::WholeBank(_)
         ));
+
+        let mut inconsistent_count = clean(4, 9, 1);
+        inconsistent_count[H_COUNT] = 0;
+        assert!(matches!(
+            consume_and_validate(&inconsistent_count, &bitmap, 4, 9, 1, 32),
+            RouteDecision::WholeBank(_)
+        ));
+        assert!(matches!(
+            consume_and_validate(&clean(4, 9, 1), &[1, 0], 4, 9, 1, 32),
+            RouteDecision::WholeBank(_)
+        ));
+        assert!(matches!(
+            consume_and_validate(&clean(4, 9, 1), &[1 << 31], 4, 9, 1, 17),
+            RouteDecision::WholeBank(_)
+        ));
+    }
+
+    #[test]
+    fn device_counter_uses_saturating_cas_not_wrapping_add() {
+        assert!(MARK_DEVICE_SRC.contains("atomicCAS(count, observed, desired)"));
+        assert!(MARK_DEVICE_SRC.contains("desired = overflow ? 0xffffffffu"));
+        assert!(
+            !MARK_DEVICE_SRC.contains("atomicAdd(&route_telemetry_header[5], valid)"),
+            "the production counter must never use a wrapping increment"
+        );
     }
 
     #[test]

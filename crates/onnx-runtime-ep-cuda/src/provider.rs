@@ -42,10 +42,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use onnx_runtime_ep_api::{
-    BoundBufferOwnership, Cost, DeviceBuffer, DeviceGraphSlot, DevicePtr, EpConfig, EpError,
-    ExecutionProvider, ExecutionProviderCapabilities, Fence, HostToDeviceCopier, Kernel,
-    KernelMatch, LazyWeight, OpRegistry, PagedWeight, Result, SealedDeviceAllocation,
-    WorkspaceAllocation, deny, structural_input_bytes,
+    BoundBufferOwnership, Cost, DeviceBuffer, DeviceGraphOwner, DeviceGraphSlot, DeviceGraphToken,
+    DevicePtr, EpConfig, EpError, ExecutionProvider, ExecutionProviderCapabilities, Fence,
+    HostToDeviceCopier, Kernel, KernelMatch, LazyWeight, OpRegistry, PagedWeight, Result,
+    SealedDeviceAllocation, WorkspaceAllocation, deny, structural_input_bytes,
 };
 use onnx_runtime_ir::{
     DataType, DeviceId, DeviceType, Graph, Node, NodeId, Shape, TensorLayout, ValueId,
@@ -3792,12 +3792,7 @@ impl ExecutionProvider for CudaExecutionProvider {
     }
 
     fn reset_device_graph(&self) -> Result<bool> {
-        // Graph invalidation (reset / rewind / KV-capacity or shape change /
-        // re-capture) is the explicit host reset point for the capture-error
-        // latch, so a fresh generation always starts un-poisoned.
-        let invalidated = self.runtime.reset_graph()?;
-        self.runtime.reset_capture_error()?;
-        Ok(invalidated)
+        self.runtime.reset_graph()
     }
 
     fn begin_device_graph_capture_in(
@@ -3825,11 +3820,54 @@ impl ExecutionProvider for CudaExecutionProvider {
     }
 
     fn reset_device_graph_in(&self, slot: DeviceGraphSlot) -> Result<bool> {
-        // Mirror `reset_device_graph`'s capture-error latch reset for whichever
-        // slot is torn down, so re-capture into that slot starts un-poisoned.
-        let invalidated = self.runtime.reset_graph_in(slot)?;
-        self.runtime.reset_capture_error()?;
-        Ok(invalidated)
+        self.runtime.reset_graph_in(slot)
+    }
+
+    fn begin_owned_device_graph_capture(
+        &self,
+        owner: DeviceGraphOwner,
+        slot: DeviceGraphSlot,
+        continuation: Option<DeviceGraphToken>,
+        kernels: &[&dyn Kernel],
+    ) -> Result<DeviceGraphToken> {
+        self.runtime
+            .begin_owned_graph_capture_in(owner, slot, continuation, kernels)
+    }
+
+    fn end_owned_device_graph_capture(&self, token: DeviceGraphToken) -> Result<()> {
+        self.runtime.end_owned_graph_capture(token)
+    }
+
+    fn abort_owned_device_graph_capture(&self, token: DeviceGraphToken) -> Result<()> {
+        self.runtime.abort_owned_graph_capture(token)
+    }
+
+    fn replay_owned_device_graph(&self, token: DeviceGraphToken) -> Result<()> {
+        self.runtime.replay_owned_graph(token)
+    }
+
+    fn replay_owned_device_graph_segment(
+        &self,
+        token: DeviceGraphToken,
+        index: usize,
+    ) -> Result<()> {
+        self.runtime.replay_owned_graph_segment(token, index)
+    }
+
+    fn reset_owned_device_graph(&self, token: DeviceGraphToken) -> Result<bool> {
+        self.runtime.reset_owned_graph(token)
+    }
+
+    fn retire_owned_device_graphs(&self, owner: DeviceGraphOwner) -> Result<()> {
+        self.runtime.retire_owned_graphs(owner)
+    }
+
+    fn has_owned_device_graph(&self, token: DeviceGraphToken) -> Result<bool> {
+        self.runtime.has_owned_graph(token)
+    }
+
+    fn begin_device_validation(&self) -> Result<()> {
+        self.runtime.begin_device_validation()
     }
 
     fn reset_device_validation_error(&self) -> Result<()> {
@@ -3850,6 +3888,10 @@ impl ExecutionProvider for CudaExecutionProvider {
 
     fn check_device_capture_error(&self) -> Result<u32> {
         self.runtime.check_capture_error()
+    }
+
+    fn consume_device_validation_error(&self) -> Result<u32> {
+        self.runtime.consume_device_validation()
     }
 
     /// Slice-7C: the coarse safe-boundary route-telemetry consumer, called once

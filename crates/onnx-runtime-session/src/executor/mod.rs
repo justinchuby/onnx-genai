@@ -49,11 +49,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use onnx_runtime_ep_api::{
-    CaptureRegionShapeStatus, DeviceBuffer, DeviceGraphSlot, DevicePtr, DevicePtrMut, EpError,
-    ExecutionProvider, ExternalMmapRegion, Kernel, KernelConstantInput, KernelInput, KernelMatch,
-    LazyWeight, LazyWeightBoundary, ResidentWeight, StructuralCaptureDecline, TensorBacking,
-    TensorMetadata, TensorMut, TensorView, WeightHandle, WorkspaceAllocation, WorkspaceLifetime,
-    WorkspaceRequirement, WorkspaceView, lazy_weight_candidates,
+    CaptureRegionShapeStatus, DeviceBuffer, DeviceGraphOwner, DeviceGraphSlot, DeviceGraphToken,
+    DevicePtr, DevicePtrMut, EpError, ExecutionProvider, ExternalMmapRegion, Kernel,
+    KernelConstantInput, KernelInput, KernelMatch, LazyWeight, LazyWeightBoundary, ResidentWeight,
+    StructuralCaptureDecline, TensorBacking, TensorMetadata, TensorMut, TensorView, WeightHandle,
+    WorkspaceAllocation, WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
+    lazy_weight_candidates,
 };
 use smallvec::SmallVec;
 
@@ -81,6 +82,50 @@ use crate::sequence::{
     ConcatPlan, SeqTensor, SequenceError, SequenceValue, SplitSpec, split_tensor, stack_new_axis,
 };
 use crate::tensor::{DeviceBindingSpec, DeviceIoBinding, SharedTensorBuffer, Tensor};
+
+pub(super) struct DeviceValidationSubmission {
+    ep: Arc<dyn ExecutionProvider>,
+    active: bool,
+}
+
+impl DeviceValidationSubmission {
+    pub(super) fn begin(ep: &Arc<dyn ExecutionProvider>) -> Result<Self> {
+        ep.begin_device_validation()?;
+        Ok(Self {
+            ep: Arc::clone(ep),
+            active: true,
+        })
+    }
+
+    pub(super) fn disarm(&mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for DeviceValidationSubmission {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let result = self
+            .ep
+            .sync()
+            .and_then(|()| self.ep.consume_device_validation_error());
+        match result {
+            Ok(0) => {}
+            Ok(flags) => eprintln!(
+                "[onnx-runtime-session] recovered device validation failure while unwinding: \
+                 provider={} flags=0x{flags:x}",
+                self.ep.name()
+            ),
+            Err(error) => eprintln!(
+                "[onnx-runtime-session] could not recover deferred device validation while \
+                 unwinding provider={}: {error}",
+                self.ep.name()
+            ),
+        }
+    }
+}
 
 fn profile_ops_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -761,24 +806,86 @@ impl Drop for Executor {
         // mmap recycles an address for a same-shaped weight must not inherit this
         // model's packed buffers.
         onnx_runtime_ep_cpu::kernels::matmul_nbits::clear_mlas_packed_caches();
-        let _ = self.ep.reset_device_graph_in(self.graph_slot);
-        self.cap_mut().device_graph_signature = None;
+        let mut safe_to_release = match self.ep.sync() {
+            Ok(()) => true,
+            Err(error) => {
+                eprintln!(
+                    "[onnx-runtime-session] executor drop could not synchronize deferred work: \
+                     {error}"
+                );
+                false
+            }
+        };
+        match self.ep.consume_device_validation_error() {
+            Ok(0) => {}
+            Ok(flags) => eprintln!(
+                "[onnx-runtime-session] executor drop consumed a deferred validation failure \
+                 (flags=0x{flags:x})"
+            ),
+            Err(error) => {
+                safe_to_release = false;
+                eprintln!(
+                    "[onnx-runtime-session] executor drop could not consume deferred validation: \
+                     {error}"
+                );
+            }
+        }
+        let mut graphs_reset = true;
+        for cap in &mut self.slot_capture {
+            if let Some(token) = cap.device_graph_token {
+                match self.ep.reset_owned_device_graph(token) {
+                    Ok(_) => cap.device_graph_token = None,
+                    Err(error) => {
+                        graphs_reset = false;
+                        safe_to_release = false;
+                        eprintln!(
+                            "[onnx-runtime-session] executor drop could not reset graph \
+                             {token:?}: {error}"
+                        );
+                    }
+                }
+            }
+            cap.device_graph_signature = None;
+        }
+        if graphs_reset && let Err(error) = self.ep.retire_owned_device_graphs(self.graph_owner) {
+            safe_to_release = false;
+            eprintln!(
+                "[onnx-runtime-session] executor drop could not retire graph owner {}: {error}",
+                self.graph_owner.get()
+            );
+        }
         // Free every buffer via the owning EP (DeviceBuffer has no Drop).
         for (_, buf) in self.buffers.drain() {
-            let _ = self.ep.deallocate(buf);
+            if safe_to_release {
+                let _ = self.ep.deallocate(buf);
+            } else {
+                drop(buf);
+            }
         }
         // An input buffer parked while its slot held a zero-copy borrow of the
         // caller's tensor is owned by this executor too. `unbind_borrowed_inputs`
         // returns them on every normal and error path, but a panic unwinding out
         // of a run drops the executor with them still parked.
         for (_, buf) in self.parked_input_buffers.drain(..) {
-            let _ = self.ep.deallocate(buf);
+            if safe_to_release {
+                let _ = self.ep.deallocate(buf);
+            } else {
+                drop(buf);
+            }
         }
         if let Some(workspace) = self.persistent_workspace.take() {
-            let _ = self.ep.deallocate_workspace(workspace.buffer);
+            if safe_to_release {
+                let _ = self.ep.deallocate_workspace(workspace.buffer);
+            } else {
+                drop(workspace);
+            }
         }
         if let Some(workspace) = self.step_workspace.take() {
-            let _ = self.ep.deallocate_workspace(workspace.buffer);
+            if safe_to_release {
+                let _ = self.ep.deallocate_workspace(workspace.buffer);
+            } else {
+                drop(workspace);
+            }
         }
         self.shared_buffers.clear();
     }

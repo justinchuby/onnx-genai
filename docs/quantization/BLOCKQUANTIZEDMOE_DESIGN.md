@@ -460,7 +460,7 @@ still referenced by a graph.
 
 ### 6.1 A100 production-path validation
 
-On 2026-08-27, the R3 opt-in checkpoint proof ran all four mixed pairs on an
+On 2026-08-27, the opt-in checkpoint proof ran all four mixed pairs on an
 idle physical A100, pinned with `CUDA_VISIBLE_DEVICES=4` and
 `ONNX_GENAI_CUDA_DEVICE=0`. It mmap-read the official UD-IQ1_S shards in place,
 then exercised the production `Executor`/device-binding path with all three
@@ -489,9 +489,14 @@ Counters are reported by phase and by meaning: one-time
 broad-unique controls have equal logical demand but different unique extent;
 low and high IDs have equal byte quantities. `physical_dram_bytes=None`,
 `page_ins=0`, and `byte_hit_rate=None` remain the honest no-residency values.
-The warmed eager/captured-replay falsifier also observes zero host allocations,
-format parses, layout builds, H2D copies, device allocations, and forced
-operator synchronizations or graph-lifecycle lock acquisitions. Base
+The no-work claim is deliberately narrow: after preparation, it brackets one
+successful fixed-shape, contiguous, fully device-bound production `Executor`
+run and one replay of that exact installed graph. Live positive controls first
+force and observe a host allocation, graph-lifecycle lock, CUDA allocation and
+free, H2D copy, forced synchronization, format parse, and workspace-layout
+build. Only then must the bracketed warmed run/replay show zero deltas for those
+same instruments. This is not an unconditional claim about all graphs, dynamic
+shapes, host-visible outputs, or telemetry boundaries. Base
 `aa417ad372e6c0c1d2df154ceb236ab1c3bea73e` refuses these nodes, so no base
 latency or speedup claim is made.
 

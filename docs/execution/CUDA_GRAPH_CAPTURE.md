@@ -22,11 +22,17 @@ continues eagerly without changing tokens. The current Qwen int4 decode graph
 still falls back because kernels including `MatMulNBits`, GQA, Gather, and
 broadcast elementwise operations are deliberately marked non-capturable.
 
-The installed executable is owned by the session CUDA runtime and is destroyed
-before its referenced buffers. Reset, rewind, multi-token/prefill shape changes,
-binding address/shape changes, and session drop invalidate it. A later
-generation warms and captures a fresh executable; a live executable is never
-reused across generations or incompatible bindings.
+Each installed executable is named by an immutable executor owner, graph slot,
+and monotonically increasing installation generation. Providers shared by
+multiple sessions therefore keep independent `Primary`/`Verify` graphs. Replay,
+liveness checks, reset, and invalidation require the exact token; physical
+capacity, logical shape, logical-shape exposure policy, address, or I/O identity
+changes invalidate replay. Reset first retires the published generation and
+waits only for readers already admitted to enqueue, so after reset returns no
+stale generation can be newly submitted. The warmed replay path uses atomics,
+not the capture/reset lifecycle mutex. Reset, rewind, multi-token/prefill shape
+changes, incompatible bindings, and session drop destroy graphs before their
+referenced buffers; repeated capture mints a fresh generation.
 
 ## Multi-component / routed decoders (step-inputs capture, default-on)
 

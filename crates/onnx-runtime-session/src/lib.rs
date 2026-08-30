@@ -974,6 +974,7 @@ pub struct BlockQuantizedMoeTrafficObserver<'a> {
 
 impl BlockQuantizedMoeTrafficObserver<'_> {
     pub fn reset_phase(&mut self, phase: BlockQuantizedMoeTrafficPhase) -> Result<()> {
+        self.session.exec.finish_device_validation_boundary()?;
         self.session.exec.reset_block_quantized_moe_traffic()?;
         self.phase = phase;
         Ok(())
@@ -986,6 +987,16 @@ impl BlockQuantizedMoeTrafficObserver<'_> {
             request_id: self.request_id,
             traffic: self.session.exec.snapshot_block_quantized_moe_traffic()?,
         })
+    }
+
+    #[cfg(feature = "gpu-tests")]
+    pub fn inject_fault_for_test(
+        &self,
+        fault: onnx_runtime_ep_cuda::kernels::block_quantized_moe::BlockQuantizedMoeTrafficFaultForTest,
+    ) -> Result<()> {
+        self.session
+            .exec
+            .inject_block_quantized_moe_traffic_fault_for_test(fault)
     }
 
     pub fn prepare_with_device_bindings(
@@ -1029,16 +1040,35 @@ impl BlockQuantizedMoeTrafficObserver<'_> {
     }
 
     pub fn finish(mut self) -> Result<()> {
-        self.session.exec.disarm_block_quantized_moe_traffic()?;
-        self.active = false;
-        Ok(())
+        self.cleanup()
+    }
+
+    fn cleanup(&mut self) -> Result<()> {
+        let validation = self.session.exec.finish_device_validation_boundary();
+        let disarm = self.session.exec.disarm_block_quantized_moe_traffic();
+        if disarm.is_ok() {
+            self.active = false;
+        }
+        match (validation, disarm) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Err(validation), Err(disarm)) => Err(SessionError::Internal(format!(
+                "BlockQuantizedMoE observer validation failed: {validation}; cleanup also failed: \
+                 {disarm}"
+            ))),
+        }
     }
 }
 
 impl Drop for BlockQuantizedMoeTrafficObserver<'_> {
     fn drop(&mut self) {
-        if self.active {
-            let _ = self.session.exec.disarm_block_quantized_moe_traffic();
+        if self.active
+            && let Err(error) = self.cleanup()
+        {
+            eprintln!(
+                "[onnx-runtime-session] BlockQuantizedMoE observer drop observed a cleanup \
+                 failure after attempting validation and graph-safe disarm: {error}"
+            );
         }
     }
 }
@@ -2082,6 +2112,7 @@ mod device_binding_tests {
         session
             .run_with_device_bindings(&[], &mut bindings)
             .unwrap();
+        assert_eq!(read_bound_f32(&mut bindings[1]), 7.0);
 
         input_write(&mut bindings[0], 11);
         assert!(matches!(
@@ -2168,6 +2199,7 @@ mod device_binding_tests {
         session
             .run_with_device_bindings(&[], &mut bindings)
             .unwrap();
+        assert_eq!(read_bound_f32(&mut bindings[1]), 7.0);
 
         // Capture into the Verify slot and replay with persistent I/O (no new
         // device allocations across the replay) — the same guarantees Primary has.

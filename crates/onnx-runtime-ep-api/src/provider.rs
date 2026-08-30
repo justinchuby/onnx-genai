@@ -3,6 +3,7 @@
 use std::ffi::c_void;
 use std::ptr::NonNull;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use onnx_runtime_ir::{
     DataType, DeviceId, DeviceType, Graph, GraphView, Node, NodeId, NodeIndex, Shape, TensorLayout,
@@ -89,6 +90,66 @@ impl DeviceGraphSlot {
             DeviceGraphSlot::Primary => 0,
             DeviceGraphSlot::Verify => 1,
         }
+    }
+}
+
+/// Immutable identity of one executor's device-graph namespace.
+///
+/// A provider may be shared by several sessions. The owner prevents one
+/// executor's `Primary` or `Verify` graph from naming another executor's slot.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct DeviceGraphOwner(u64);
+
+impl DeviceGraphOwner {
+    /// Mint a process-unique owner identity. Identities are never reused.
+    pub fn new() -> Self {
+        static NEXT_OWNER: AtomicU64 = AtomicU64::new(1);
+        Self(NEXT_OWNER.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// Stable process-local numeric identity.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl Default for DeviceGraphOwner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Exact identity of one installed device-graph generation.
+///
+/// All replay, liveness, reset, and invalidation operations require this token.
+/// Re-capture mints a new generation even for the same executor and slot.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct DeviceGraphToken {
+    owner: DeviceGraphOwner,
+    slot: DeviceGraphSlot,
+    generation: u64,
+}
+
+impl DeviceGraphToken {
+    /// Construct a provider-issued installation token.
+    pub const fn new(owner: DeviceGraphOwner, slot: DeviceGraphSlot, generation: u64) -> Self {
+        Self {
+            owner,
+            slot,
+            generation,
+        }
+    }
+
+    pub const fn owner(self) -> DeviceGraphOwner {
+        self.owner
+    }
+
+    pub const fn slot(self) -> DeviceGraphSlot {
+        self.slot
+    }
+
+    pub const fn generation(self) -> u64 {
+        self.generation
     }
 }
 
@@ -1400,6 +1461,70 @@ pub trait ExecutionProvider: Send + Sync {
         Ok(true)
     }
 
+    /// Begin capture in an executor-owned namespace and return the exact
+    /// installation token. `continuation` is supplied for later segments of the
+    /// same capture and must identify the already-installed generation.
+    fn begin_owned_device_graph_capture(
+        &self,
+        owner: DeviceGraphOwner,
+        slot: DeviceGraphSlot,
+        continuation: Option<DeviceGraphToken>,
+        kernels: &[&dyn Kernel],
+    ) -> Result<DeviceGraphToken> {
+        self.begin_device_graph_capture_in(slot, kernels)?;
+        Ok(continuation.unwrap_or_else(|| DeviceGraphToken::new(owner, slot, 1)))
+    }
+
+    /// End the active capture identified by `token`.
+    fn end_owned_device_graph_capture(&self, token: DeviceGraphToken) -> Result<()> {
+        self.end_device_graph_capture_in(token.slot())
+    }
+
+    /// Abort the active capture identified by `token`.
+    fn abort_owned_device_graph_capture(&self, token: DeviceGraphToken) -> Result<()> {
+        self.abort_device_graph_capture_in(token.slot())
+    }
+
+    /// Replay the exact installed graph generation identified by `token`.
+    fn replay_owned_device_graph(&self, token: DeviceGraphToken) -> Result<()> {
+        self.replay_device_graph_in(token.slot())
+    }
+
+    /// Replay one segment of the exact installed generation.
+    fn replay_owned_device_graph_segment(
+        &self,
+        token: DeviceGraphToken,
+        index: usize,
+    ) -> Result<()> {
+        self.replay_device_graph_segment_in(token.slot(), index)
+    }
+
+    /// Reset only the exact installed generation identified by `token`.
+    fn reset_owned_device_graph(&self, token: DeviceGraphToken) -> Result<bool> {
+        self.reset_device_graph_in(token.slot())
+    }
+
+    /// Retire empty graph-lifecycle slots for an executor owner at final drop.
+    ///
+    /// Ordinary reset deliberately retains the lifecycle so a repeated capture
+    /// cannot reuse an earlier installation generation.
+    fn retire_owned_device_graphs(&self, _owner: DeviceGraphOwner) -> Result<()> {
+        Ok(())
+    }
+
+    /// Whether the exact installed generation identified by `token` is live.
+    fn has_owned_device_graph(&self, token: DeviceGraphToken) -> Result<bool> {
+        self.has_device_graph_in(token.slot())
+    }
+
+    /// Begin one top-level device-validation generation.
+    ///
+    /// Providers with deferred validation may reject this call while a previous
+    /// generation remains unconsumed.
+    fn begin_device_validation(&self) -> Result<()> {
+        self.reset_device_validation_error()
+    }
+
     /// Clear the provider's latching device-side validation error.
     ///
     /// Session executors call this at top-level request boundaries. Implementations
@@ -1422,6 +1547,14 @@ pub trait ExecutionProvider: Send + Sync {
     /// kernels from the request have completed before this value is observed.
     fn check_device_capture_error(&self) -> Result<u32> {
         Ok(0)
+    }
+
+    /// Consume the current top-level device-validation generation after a host
+    /// synchronization boundary. The result is sticky until this succeeds.
+    fn consume_device_validation_error(&self) -> Result<u32> {
+        let flags = self.check_device_capture_error()?;
+        self.reset_device_validation_error()?;
+        Ok(flags)
     }
 
     /// Consume any completed coarse-boundary route-telemetry window and apply

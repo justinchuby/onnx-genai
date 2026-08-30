@@ -25,7 +25,7 @@
 
 use std::sync::{Arc, OnceLock};
 
-use onnx_runtime_ep_api::{DeviceBuffer, ExecutionProvider};
+use onnx_runtime_ep_api::{DeviceBuffer, DeviceGraphToken, ExecutionProvider};
 use onnx_runtime_ep_cpu::CpuExecutionProvider;
 use onnx_runtime_ir::{DataType, DeviceId, TensorLayout, checked_expected_bytes, read_vec_le};
 
@@ -334,6 +334,9 @@ pub struct DeviceIoBinding {
     buffer: Option<DeviceBuffer>,
     allocator: Arc<dyn ExecutionProvider>,
     transfer_stats: DeviceBindingTransferStats,
+    /// Most recent graph generation that captured this address. A stale token
+    /// cannot reset another executor's graph.
+    device_graph_token: Option<DeviceGraphToken>,
 }
 
 impl DeviceIoBinding {
@@ -395,6 +398,7 @@ impl DeviceIoBinding {
             buffer: Some(buffer),
             allocator,
             transfer_stats: DeviceBindingTransferStats::default(),
+            device_graph_token: None,
         })
     }
 
@@ -492,6 +496,7 @@ impl DeviceIoBinding {
             buffer: Some(buffer),
             allocator,
             transfer_stats: DeviceBindingTransferStats::default(),
+            device_graph_token: None,
         })
     }
 
@@ -554,6 +559,10 @@ impl DeviceIoBinding {
     /// [`exposes_logical_input_shape`]: Self::exposes_logical_input_shape
     pub fn mask_decode_freeze_safe(&self) -> bool {
         self.bind_input && self.decode_freeze_safe_mask
+    }
+
+    pub(crate) fn set_device_graph_token(&mut self, token: DeviceGraphToken) {
+        self.device_graph_token = Some(token);
     }
 
     pub fn set_logical_shape(&mut self, shape: Vec<usize>) -> Result<()> {
@@ -768,8 +777,7 @@ impl DeviceIoBinding {
     }
 
     fn check_and_reset_device_validation(&self) -> Result<()> {
-        let flags = self.allocator.check_device_capture_error()?;
-        self.allocator.reset_device_validation_error()?;
+        let flags = self.allocator.consume_device_validation_error()?;
         if flags != 0 {
             return Err(onnx_runtime_ep_api::EpError::KernelFailed(format!(
                 "{}: device validation failed (flags=0x{flags:x})",
@@ -986,8 +994,49 @@ impl std::fmt::Debug for DeviceIoBinding {
 impl Drop for DeviceIoBinding {
     fn drop(&mut self) {
         if let Some(buffer) = self.buffer.take() {
-            let _ = self.allocator.reset_device_graph();
-            let _ = self.allocator.deallocate(buffer);
+            let mut safe_to_release = true;
+            if let Err(error) = self.allocator.sync() {
+                safe_to_release = false;
+                eprintln!(
+                    "[onnx-runtime-session] device binding drop could not synchronize deferred \
+                     work before release: {error}"
+                );
+            }
+            match self.allocator.consume_device_validation_error() {
+                Ok(0) => {}
+                Ok(flags) => eprintln!(
+                    "[onnx-runtime-session] device binding drop consumed a deferred validation \
+                     failure (flags=0x{flags:x})"
+                ),
+                Err(error) => {
+                    safe_to_release = false;
+                    eprintln!(
+                        "[onnx-runtime-session] device binding drop could not consume deferred \
+                         validation: {error}"
+                    );
+                }
+            }
+            if let Some(token) = self.device_graph_token.take()
+                && let Err(error) = self.allocator.reset_owned_device_graph(token)
+            {
+                safe_to_release = false;
+                eprintln!(
+                    "[onnx-runtime-session] device binding drop could not retire its captured \
+                     graph generation: {error}"
+                );
+            }
+            if safe_to_release {
+                let _ = self.allocator.deallocate(buffer);
+            } else {
+                // `DeviceBuffer` has no freeing Drop. Retaining the allocation
+                // is safer than releasing storage that in-flight work or an
+                // unretired graph may still reference.
+                eprintln!(
+                    "[onnx-runtime-session] quarantining device binding allocation after failed \
+                     drop cleanup"
+                );
+                drop(buffer);
+            }
         }
     }
 }

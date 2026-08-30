@@ -371,10 +371,16 @@ impl Executor {
             if seg.captured {
                 match mode {
                     RunMode::Capture => {
-                        {
+                        let token = {
                             let kernels = self.collect_segment_kernels(seg, resolved)?;
-                            ep.begin_device_graph_capture_in(self.graph_slot, &kernels)?;
-                        }
+                            ep.begin_owned_device_graph_capture(
+                                self.graph_owner,
+                                self.graph_slot,
+                                self.cap().device_graph_token,
+                                &kernels,
+                            )?
+                        };
+                        self.cap_mut().device_graph_token = Some(token);
                         // Any early return (`?`) while recording this segment
                         // must end the stream capture before it propagates —
                         // otherwise the stream stays wedged in capture mode and
@@ -382,8 +388,7 @@ impl Executor {
                         // is rejected while capturing). The guard aborts the
                         // capture on drop; `disarm()` hands off to the normal
                         // `end_device_graph_capture()` on the success path.
-                        let mut capture_guard =
-                            SegmentCaptureGuard::arm(ep.as_ref(), self.graph_slot);
+                        let mut capture_guard = SegmentCaptureGuard::arm(ep.as_ref(), token);
                         for pi in seg.start..seg.end {
                             let node_id = self.plan[pi].node_id;
                             if let Err(error) = self.exec_plan_node(
@@ -402,17 +407,22 @@ impl Executor {
                             }
                         }
                         capture_guard.disarm();
-                        ep.end_device_graph_capture_in(self.graph_slot)?;
+                        ep.end_owned_device_graph_capture(token)?;
                         // Capture is closed: syncs are legal again. Free any
                         // view-owner buffers that `install_view_outputs` parked
                         // while recording (freeing mid-capture is rejected).
                         for old in self.capture_deferred_frees.drain(..) {
                             ep.deallocate(old)?;
                         }
-                        ep.replay_device_graph_segment_in(self.graph_slot, seg.graph_index)?;
+                        ep.replay_owned_device_graph_segment(token, seg.graph_index)?;
                     }
                     RunMode::Replay => {
-                        ep.replay_device_graph_segment_in(self.graph_slot, seg.graph_index)?;
+                        let token = self.cap().device_graph_token.ok_or_else(|| {
+                            SessionError::Internal(
+                                "segmented replay has no executor-owned graph token".into(),
+                            )
+                        })?;
+                        ep.replay_owned_device_graph_segment(token, seg.graph_index)?;
                     }
                     RunMode::Eager => {
                         unreachable!("eager runs never build a segment schedule")
@@ -553,6 +563,7 @@ impl Executor {
         let has_lazy_inputs = in_infos.iter().any(|info| info.lazy_unresolved);
 
         let ep = self.ep.clone();
+        let graph_tokens = std::array::from_fn(|index| self.slot_capture[index].device_graph_token);
 
         // Bind the mutated fields as disjoint borrows so `self` is never borrowed
         // whole while the kernel (from `cache`) and the buffers/views are held.
@@ -641,6 +652,7 @@ impl Executor {
                     opset,
                     node_capture_seq_independent(ctx.graph, node, capture_growing),
                     ep.as_ref(),
+                    graph_tokens,
                 )?;
                 kernel_bindings[pi] = Some(key);
             }

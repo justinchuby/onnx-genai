@@ -202,6 +202,7 @@ fn prepare_route_window(
         expected_epoch,
         expected_request,
         expected_device,
+        snapshot.num_experts,
     ) {
         RouteDecision::WholeBank(reason) => {
             return Prepared::Early(RouteWindowConsumeOutcome::WholeBank { reason });

@@ -907,6 +907,34 @@ impl KernelCache {
         Ok(total)
     }
 
+    #[cfg(feature = "gpu-tests")]
+    pub(super) fn inject_block_quantized_moe_traffic_fault_for_test(
+        &self,
+        fault: onnx_runtime_ep_cuda::kernels::block_quantized_moe::BlockQuantizedMoeTrafficFaultForTest,
+    ) -> Result<()> {
+        let mut visited = HashSet::new();
+        let mut injected = 0usize;
+        for (key, kernel) in &self.entries {
+            if !visited.insert(key.node) {
+                continue;
+            }
+            let Some(kernel) = kernel
+                .as_any()
+                .downcast_ref::<onnx_runtime_ep_cuda::kernels::block_quantized_moe::BlockQuantizedMoEKernel>()
+            else {
+                continue;
+            };
+            kernel.inject_route_telemetry_fault_for_test(fault)?;
+            injected += 1;
+        }
+        if injected == 0 {
+            return Err(SessionError::Internal(
+                "no CUDA BlockQuantizedMoE kernel was available for traffic fault injection".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub(super) fn disarm_block_quantized_moe_traffic(&mut self) -> Result<()> {
         let mut visited = HashSet::new();
         for (key, kernel) in &mut self.entries {
@@ -938,7 +966,12 @@ impl KernelCache {
     /// workspace this eviction is about to free, and replaying it afterwards
     /// would read freed device memory. Resetting is what the device-binding drop
     /// path already does for the same reason.
-    fn evict_surplus_variants(&mut self, node: u32, ep: &dyn ExecutionProvider) {
+    fn evict_surplus_variants(
+        &mut self,
+        node: u32,
+        ep: &dyn ExecutionProvider,
+        graph_tokens: [Option<DeviceGraphToken>; DeviceGraphSlot::COUNT],
+    ) -> Result<()> {
         let bound = variants_per_node();
         let mut variants = self
             .entries
@@ -954,7 +987,7 @@ impl KernelCache {
             })
             .collect::<Vec<_>>();
         if variants.len() <= bound {
-            return;
+            return Ok(());
         }
         variants.sort_by_key(|(used, _)| *used);
         let surplus = variants.len() - bound;
@@ -963,13 +996,15 @@ impl KernelCache {
         // (M=1 decode) and Verify (M=K speculative) slots here — resetting an
         // empty slot is a cheap no-op. This keeps the eviction path slot-correct
         // without threading the caller's active slot through the whole cache API.
-        let _ = ep.reset_device_graph_in(DeviceGraphSlot::Primary);
-        let _ = ep.reset_device_graph_in(DeviceGraphSlot::Verify);
+        for token in graph_tokens.into_iter().flatten() {
+            ep.reset_owned_device_graph(token)?;
+        }
         for (_, key) in variants.into_iter().take(surplus) {
             self.entries.remove(&key);
             self.last_used.remove(&key);
             self.evictions += 1;
         }
+        Ok(())
     }
 
     pub(super) fn stats(&self) -> CacheStats {
@@ -1031,6 +1066,7 @@ impl KernelCache {
         opset: u64,
         capture_seq_independent: bool,
         ep: &dyn ExecutionProvider,
+        graph_tokens: [Option<DeviceGraphToken>; DeviceGraphSlot::COUNT],
     ) -> Result<(&dyn onnx_runtime_ep_api::Kernel, KernelKey)> {
         let key = KernelKey {
             node: node_id.0,
@@ -1100,7 +1136,7 @@ impl KernelCache {
             self.last_used
                 .insert(key.clone(), AtomicU64::new(self.tick()));
             self.misses += 1;
-            self.evict_surplus_variants(key.node, ep);
+            self.evict_surplus_variants(key.node, ep, graph_tokens)?;
         }
         self.touch(&key);
         #[cfg(test)]

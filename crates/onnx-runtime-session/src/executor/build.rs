@@ -946,6 +946,7 @@ impl Executor {
             ep,
             heterogeneous: None,
             graph_slot: DeviceGraphSlot::Primary,
+            graph_owner: DeviceGraphOwner::new(),
             weight_handles,
             expert_region_candidates,
             residency_plan,
@@ -2303,6 +2304,8 @@ impl Executor {
             let opset = effective_opset(&self.graph, node);
             let seq_independent =
                 node_capture_seq_independent(&self.graph, node, &self.capture_growing_symbols);
+            let graph_tokens =
+                std::array::from_fn(|index| self.slot_capture[index].device_graph_token);
             let (_, key) = self.cache.get_or_create(
                 node_id,
                 node,
@@ -2313,6 +2316,7 @@ impl Executor {
                 opset,
                 seq_independent,
                 self.ep.as_ref(),
+                graph_tokens,
             )?;
             // Pre-populate the kernel binding so the first decode step already
             // hits the zero-alloc fast path for static-shape graphs.

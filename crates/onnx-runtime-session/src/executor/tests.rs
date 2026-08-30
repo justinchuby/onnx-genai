@@ -82,6 +82,7 @@ fn count_host_allocations<T>(operation: impl FnOnce() -> T) -> (T, u64) {
 
 struct DeferredValidationKernel {
     fail_next: Arc<AtomicBool>,
+    panic_next: Arc<AtomicBool>,
     validation_latch: Arc<AtomicU32>,
     executions: Arc<AtomicUsize>,
 }
@@ -111,6 +112,9 @@ impl Kernel for DeferredValidationKernel {
         if self.fail_next.swap(false, Ordering::Relaxed) {
             self.validation_latch.store(0x40, Ordering::Relaxed);
         }
+        if self.panic_next.swap(false, Ordering::Relaxed) {
+            panic!("forced deferred validation kernel panic");
+        }
         Ok(())
     }
 }
@@ -123,6 +127,10 @@ struct DeferredValidationEp {
     synchronized_executions: Arc<AtomicUsize>,
     resets: Arc<AtomicUsize>,
     reset_failure_at: Arc<AtomicUsize>,
+    validation_state: Arc<AtomicU8>,
+    panic_next: Arc<AtomicBool>,
+    graph_reset_failure: Arc<AtomicBool>,
+    graph_reset_calls: Arc<AtomicUsize>,
     route_boundary_calls: Arc<AtomicUsize>,
     route_boundary_before_sync: Arc<AtomicBool>,
 }
@@ -139,6 +147,10 @@ impl DeferredValidationEp {
             synchronized_executions: Arc::new(AtomicUsize::new(0)),
             resets: Arc::new(AtomicUsize::new(0)),
             reset_failure_at: Arc::new(AtomicUsize::new(0)),
+            validation_state: Arc::new(AtomicU8::new(0)),
+            panic_next: Arc::new(AtomicBool::new(false)),
+            graph_reset_failure: Arc::new(AtomicBool::new(false)),
+            graph_reset_calls: Arc::new(AtomicUsize::new(0)),
             route_boundary_calls: Arc::new(AtomicUsize::new(0)),
             route_boundary_before_sync: Arc::new(AtomicBool::new(false)),
         }
@@ -193,6 +205,7 @@ impl ExecutionProvider for DeferredValidationEp {
     ) -> onnx_runtime_ep_api::Result<Box<dyn Kernel>> {
         Ok(Box::new(DeferredValidationKernel {
             fail_next: Arc::clone(&self.fail_next),
+            panic_next: Arc::clone(&self.panic_next),
             validation_latch: Arc::clone(&self.validation_latch),
             executions: Arc::clone(&self.executions),
         }))
@@ -246,6 +259,19 @@ impl ExecutionProvider for DeferredValidationEp {
         Ok(())
     }
 
+    fn begin_device_validation(&self) -> onnx_runtime_ep_api::Result<()> {
+        self.validation_state
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| {
+                EpError::KernelFailed("previous deferred device validation is still pending".into())
+            })?;
+        if let Err(error) = self.reset_device_validation_error() {
+            self.validation_state.store(0, Ordering::Release);
+            return Err(error);
+        }
+        Ok(())
+    }
+
     fn defers_device_validation(&self) -> bool {
         true
     }
@@ -259,6 +285,47 @@ impl ExecutionProvider for DeferredValidationEp {
             ));
         }
         Ok(self.validation_latch.load(Ordering::Relaxed))
+    }
+
+    fn consume_device_validation_error(&self) -> onnx_runtime_ep_api::Result<u32> {
+        match self
+            .validation_state
+            .compare_exchange(1, 2, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => {}
+            Err(0) => return Ok(0),
+            Err(_) => {
+                return Err(EpError::KernelFailed(
+                    "device validation is already being consumed".into(),
+                ));
+            }
+        }
+        let result = self
+            .check_device_capture_error()
+            .and_then(|flags| self.reset_device_validation_error().map(|()| flags));
+        match result {
+            Ok(flags) => {
+                self.validation_state.store(0, Ordering::Release);
+                Ok(flags)
+            }
+            Err(error) => {
+                self.validation_state.store(1, Ordering::Release);
+                Err(error)
+            }
+        }
+    }
+
+    fn reset_owned_device_graph(
+        &self,
+        _token: onnx_runtime_ep_api::DeviceGraphToken,
+    ) -> onnx_runtime_ep_api::Result<bool> {
+        self.graph_reset_calls.fetch_add(1, Ordering::Relaxed);
+        if self.graph_reset_failure.load(Ordering::Relaxed) {
+            return Err(EpError::KernelFailed(
+                "forced device graph reset failure".into(),
+            ));
+        }
+        Ok(true)
     }
 
     fn consume_route_residency_at_boundary(&self) -> onnx_runtime_ep_api::Result<()> {
@@ -276,6 +343,48 @@ impl ExecutionProvider for DeferredValidationEp {
         self.route_boundary_calls.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
+}
+
+fn deferred_validation_bound_fixture() -> (Executor, Arc<DeferredValidationEp>, Vec<DeviceIoBinding>)
+{
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let input = graph.create_named_value("input", DataType::Float32, static_shape([2]));
+    graph.add_input(input);
+    let output = graph.create_named_value("output", DataType::Float32, static_shape([2]));
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "DeferredValidation",
+        vec![Some(input)],
+        vec![output],
+    ));
+    graph.add_output(output);
+
+    let ep = Arc::new(DeferredValidationEp::new());
+    let executor = Executor::build(
+        graph,
+        Arc::new(WeightStore::new()),
+        Arc::clone(&ep) as Arc<dyn ExecutionProvider>,
+    )
+    .unwrap();
+    let mut bindings = vec![
+        executor
+            .allocate_device_binding("input".into(), None, DataType::Float32, vec![2], vec![2])
+            .unwrap(),
+        executor
+            .allocate_device_output_binding("output".into(), DataType::Float32, vec![2], vec![2])
+            .unwrap(),
+    ];
+    bindings[0]
+        .write_bytes(
+            0,
+            &[3.0f32, 7.0]
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    (executor, ep, bindings)
 }
 
 #[test]
@@ -328,6 +437,102 @@ fn deferred_device_validation_is_request_local_and_checked_after_sync() {
         4,
         "each request must reset the latch before execution and after checking it"
     );
+}
+
+#[test]
+fn unconsumed_bound_failure_rejects_later_success_or_failure_without_erasure() {
+    for second_would_fail in [false, true] {
+        let (mut executor, ep, mut bindings) = deferred_validation_bound_fixture();
+
+        executor
+            .run_with_device_bindings(&[], &mut bindings)
+            .expect("bound run A submits asynchronously");
+        assert_eq!(ep.executions.load(Ordering::Relaxed), 1);
+
+        ep.fail_next.store(second_would_fail, Ordering::Relaxed);
+        let second = executor
+            .run_with_device_bindings(&[], &mut bindings)
+            .expect_err("run B must be rejected until run A is consumed");
+        assert!(
+            second
+                .to_string()
+                .contains("previous deferred device validation is still pending"),
+            "unexpected run-B refusal: {second}"
+        );
+        assert_eq!(
+            ep.executions.load(Ordering::Relaxed),
+            1,
+            "rejected run B must not execute, regardless of whether it would succeed or fail"
+        );
+
+        let first = bindings[1].read_bytes_range(0, 4).unwrap_err();
+        assert!(
+            first
+                .to_string()
+                .contains("device validation failed (flags=0x40)"),
+            "run A's sticky failure must remain observable after run B: {first}"
+        );
+        assert_eq!(ep.validation_state.load(Ordering::Acquire), 0);
+    }
+}
+
+#[test]
+fn panicking_bound_run_consumes_deferred_validation_before_reuse() {
+    let (mut executor, ep, mut bindings) = deferred_validation_bound_fixture();
+    ep.panic_next.store(true, Ordering::Relaxed);
+
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = executor.run_with_device_bindings(&[], &mut bindings);
+    }));
+    assert!(panic.is_err());
+    assert_eq!(
+        ep.validation_state.load(Ordering::Acquire),
+        0,
+        "the unwind guard must consume the pending generation"
+    );
+    assert_eq!(
+        ep.validation_latch.load(Ordering::Acquire),
+        0,
+        "the failing latch must be cleared only after it was observed during unwind"
+    );
+
+    ep.fail_next.store(false, Ordering::Relaxed);
+    executor
+        .run_with_device_bindings(&[], &mut bindings)
+        .expect("the executor must remain reusable after panic cleanup");
+    bindings[1]
+        .read_bytes_range(0, 4)
+        .expect("the healthy follow-up run must consume cleanly");
+}
+
+#[test]
+fn failed_graph_reset_preserves_the_exact_local_installation_token() {
+    let (mut executor, ep, _bindings) = deferred_validation_bound_fixture();
+    let token = onnx_runtime_ep_api::DeviceGraphToken::new(
+        executor.graph_owner,
+        DeviceGraphSlot::Primary,
+        7,
+    );
+    executor.cap_mut().device_graph_token = Some(token);
+    ep.graph_reset_failure.store(true, Ordering::Relaxed);
+
+    let error = executor.reset_device_graph().unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("forced device graph reset failure"),
+        "unexpected reset error: {error}"
+    );
+    assert_eq!(
+        executor.cap().device_graph_token,
+        Some(token),
+        "host state must retain the token until provider reset succeeds"
+    );
+
+    ep.graph_reset_failure.store(false, Ordering::Relaxed);
+    assert!(executor.reset_device_graph().unwrap());
+    assert_eq!(executor.cap().device_graph_token, None);
+    assert_eq!(ep.graph_reset_calls.load(Ordering::Relaxed), 2);
 }
 
 #[test]
@@ -5541,6 +5746,72 @@ fn sealed_bqmoe_session_graph() -> Graph {
 }
 
 #[cfg(feature = "gpu-tests")]
+fn sealed_bqmoe_cuda_session_for_provider(
+    cuda: Arc<onnx_runtime_ep_cuda::CudaExecutionProvider>,
+) -> (
+    crate::InferenceSession,
+    Vec<DeviceIoBinding>,
+    Arc<onnx_runtime_ep_cuda::runtime::CudaRuntime>,
+) {
+    let runtime = Arc::clone(cuda.runtime());
+    let mut session = crate::InferenceSession::from_graph_with_provider(
+        sealed_bqmoe_session_graph(),
+        Arc::new(WeightStore::new()),
+        std::path::Path::new("."),
+        cuda,
+    )
+    .unwrap();
+    let mut bindings = vec![
+        session
+            .allocate_device_binding(
+                "x",
+                None::<String>,
+                DataType::Float32,
+                vec![1, 32],
+                vec![1, 32],
+            )
+            .unwrap(),
+        session
+            .allocate_device_binding(
+                "router",
+                None::<String>,
+                DataType::Float32,
+                vec![1, 2],
+                vec![1, 2],
+            )
+            .unwrap(),
+        session
+            .allocate_device_output_binding("output", DataType::Float32, vec![1, 32], vec![1, 32])
+            .unwrap(),
+    ];
+    let input = (0..32)
+        .flat_map(|index| ((index as f32 - 15.5) / 16.0).to_le_bytes())
+        .collect::<Vec<_>>();
+    let router = [3.0f32, 1.0]
+        .into_iter()
+        .flat_map(f32::to_le_bytes)
+        .collect::<Vec<_>>();
+    bindings[0].write_bytes(0, &input).unwrap();
+    bindings[1].write_bytes(0, &router).unwrap();
+    session
+        .run_with_device_bindings(&[], &mut bindings)
+        .unwrap();
+    bindings[2].read_bytes_range(0, 4).unwrap();
+    (session, bindings, runtime)
+}
+
+#[cfg(feature = "gpu-tests")]
+fn sealed_bqmoe_cuda_session_fixture() -> (
+    crate::InferenceSession,
+    Vec<DeviceIoBinding>,
+    Arc<onnx_runtime_ep_cuda::runtime::CudaRuntime>,
+) {
+    sealed_bqmoe_cuda_session_for_provider(Arc::new(
+        onnx_runtime_ep_cuda::CudaExecutionProvider::new_default().unwrap(),
+    ))
+}
+
+#[cfg(feature = "gpu-tests")]
 #[test]
 fn sealed_bqmoe_executes_through_production_session_path() {
     use onnx_runtime_ep_cpu::kernels::block_quantized_moe::BLOCK_QUANT_MOE_DENSE_EXPANSIONS;
@@ -5640,6 +5911,7 @@ fn sealed_bqmoe_executes_through_production_session_path() {
     executor
         .run_with_device_bindings(&[], &mut bindings)
         .unwrap();
+    bindings[2].read_bytes_range(0, 4).unwrap();
     let (_, positive_allocations) = count_host_allocations(|| vec![0u8; 1]);
     assert!(positive_allocations > 0, "host-allocation falsifier");
     let lock_before = runtime.graph_lifecycle_lock_acquisition_count();
@@ -5648,6 +5920,63 @@ fn sealed_bqmoe_executes_through_production_session_path() {
         runtime.graph_lifecycle_lock_acquisition_count() > lock_before,
         "graph-lock falsifier"
     );
+    let alloc_before = runtime.allocation_counts();
+    let transfer_before = runtime.transfer_counts();
+    let sync_before = runtime.forced_synchronization_count();
+    let control_ptr = runtime.alloc_raw(4).unwrap();
+    assert!(
+        runtime.allocation_counts().allocations > alloc_before.allocations,
+        "CUDA allocation falsifier"
+    );
+    // SAFETY: `control_ptr` is a live four-byte allocation.
+    unsafe {
+        runtime.htod(&17u32.to_ne_bytes(), control_ptr).unwrap();
+    }
+    assert!(
+        runtime.transfer_counts().host_to_device > transfer_before.host_to_device,
+        "H2D transfer falsifier"
+    );
+    let mut control_value = [0u8; 4];
+    // SAFETY: both source and destination cover four bytes.
+    unsafe {
+        runtime.dtoh(&mut control_value, control_ptr).unwrap();
+    }
+    assert_eq!(u32::from_ne_bytes(control_value), 17);
+    assert!(
+        runtime.forced_synchronization_count() > sync_before,
+        "forced synchronization falsifier"
+    );
+    // SAFETY: `control_ptr` is still owned by this runtime and is freed once.
+    unsafe {
+        runtime.free_raw(control_ptr).unwrap();
+    }
+    runtime.test_drain_raw_pool();
+    assert!(
+        runtime.allocation_counts().frees > alloc_before.frees,
+        "CUDA free falsifier"
+    );
+
+    let preparation_before = onnx_runtime_ep_cuda::block_quantized_moe_preparation_counts();
+    let mut preparation_control = Executor::build(
+        sealed_bqmoe_session_graph(),
+        Arc::new(WeightStore::new()),
+        Arc::new(CudaExecutionProvider::new_default().unwrap()),
+    )
+    .unwrap();
+    preparation_control
+        .run(&[("x", &input), ("router", &router)])
+        .unwrap();
+    let preparation_after = onnx_runtime_ep_cuda::block_quantized_moe_preparation_counts();
+    assert!(
+        preparation_after.format_parse_calls > preparation_before.format_parse_calls,
+        "format-parse falsifier"
+    );
+    assert!(
+        preparation_after.workspace_layout_builds > preparation_before.workspace_layout_builds,
+        "workspace-layout falsifier"
+    );
+    drop(preparation_control);
+
     let allocations = runtime.allocation_counts();
     let transfers = runtime.transfer_counts();
     let synchronizations = runtime.forced_synchronization_count();
@@ -5674,6 +6003,7 @@ fn sealed_bqmoe_executes_through_production_session_path() {
         locks,
         "warmed production Executor graph locks"
     );
+    bindings[2].read_bytes_range(0, 4).unwrap();
 
     assert!(matches!(
         executor
@@ -5816,6 +6146,212 @@ fn sealed_bqmoe_supported_observer_accumulates_eager_and_replay() {
         })
         .unwrap();
     observer.finish().unwrap();
+}
+
+#[cfg(feature = "gpu-tests")]
+#[test]
+fn shared_provider_graphs_are_owner_scoped_repeatable_and_logical_shape_safe() {
+    use onnx_runtime_ep_cuda::CudaExecutionProvider;
+
+    let cuda = Arc::new(CudaExecutionProvider::new_default().unwrap());
+    let (mut first, mut first_bindings, _runtime) =
+        sealed_bqmoe_cuda_session_for_provider(Arc::clone(&cuda));
+    let (mut second, mut second_bindings, _runtime) =
+        sealed_bqmoe_cuda_session_for_provider(Arc::clone(&cuda));
+
+    assert!(matches!(
+        first
+            .try_capture_with_device_bindings(&[], &mut first_bindings)
+            .unwrap(),
+        DeviceGraphCaptureResult::Captured(_)
+    ));
+    let first_token = first.exec.cap().device_graph_token.unwrap();
+    assert!(matches!(
+        second
+            .try_capture_with_device_bindings(&[], &mut second_bindings)
+            .unwrap(),
+        DeviceGraphCaptureResult::Captured(_)
+    ));
+    let second_token = second.exec.cap().device_graph_token.unwrap();
+    assert_ne!(first_token.owner(), second_token.owner());
+
+    assert!(first.replay_device_graph(&mut first_bindings).unwrap());
+    first_bindings[2].read_bytes_range(0, 4).unwrap();
+    assert!(second.replay_device_graph(&mut second_bindings).unwrap());
+    second_bindings[2].read_bytes_range(0, 4).unwrap();
+
+    let wrong_owner = onnx_runtime_ep_api::DeviceGraphToken::new(
+        onnx_runtime_ep_api::DeviceGraphOwner::new(),
+        first_token.slot(),
+        first_token.generation(),
+    );
+    let error = cuda.replay_owned_device_graph(wrong_owner).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("retired executor-owned CUDA graph"),
+        "wrong-owner replay must fail closed: {error}"
+    );
+
+    assert!(matches!(
+        first
+            .try_capture_with_device_bindings(&[], &mut first_bindings)
+            .unwrap(),
+        DeviceGraphCaptureResult::Captured(_)
+    ));
+    let recaptured = first.exec.cap().device_graph_token.unwrap();
+    assert_eq!(recaptured.owner(), first_token.owner());
+    assert!(
+        recaptured.generation() > first_token.generation(),
+        "repeated capture must mint a new installation generation"
+    );
+    assert!(second.replay_device_graph(&mut second_bindings).unwrap());
+    second_bindings[2].read_bytes_range(0, 4).unwrap();
+
+    first_bindings[2].set_logical_shape(vec![1, 16]).unwrap();
+    let error = first.replay_device_graph(&mut first_bindings).unwrap_err();
+    assert!(
+        error.to_string().contains("logical/physical shape"),
+        "same-allocation logical shape change must invalidate replay: {error}"
+    );
+    assert_eq!(first.exec.cap().device_graph_token, None);
+
+    first_bindings[2].set_logical_shape(vec![1, 32]).unwrap();
+    assert!(matches!(
+        first
+            .try_capture_with_device_bindings(&[], &mut first_bindings)
+            .unwrap(),
+        DeviceGraphCaptureResult::Captured(_)
+    ));
+    assert!(first.replay_device_graph(&mut first_bindings).unwrap());
+    first_bindings[2].read_bytes_range(0, 4).unwrap();
+}
+
+#[cfg(feature = "gpu-tests")]
+#[test]
+fn supported_observer_rejects_every_corrupt_device_record_field() {
+    use onnx_runtime_ep_cuda::kernels::block_quantized_moe::BlockQuantizedMoeTrafficFaultForTest::{
+        ForeignRequest, Overflow, Poison, StaleEpoch, WrongDevice,
+    };
+
+    let (mut session, mut bindings, _runtime) = sealed_bqmoe_cuda_session_fixture();
+    let mut observer = session
+        .observe_block_quantized_moe_traffic(crate::BlockQuantizedMoeTrafficConfig {
+            request_id: 91,
+        })
+        .unwrap();
+
+    for (fault, expected) in [
+        (Poison, "poison"),
+        (Overflow, "overflow"),
+        (StaleEpoch, "epoch mismatch"),
+        (ForeignRequest, "request mismatch"),
+        (WrongDevice, "device mismatch"),
+    ] {
+        observer
+            .reset_phase(crate::BlockQuantizedMoeTrafficPhase::Decode)
+            .unwrap();
+        observer
+            .run_with_device_bindings(&[], &mut bindings)
+            .unwrap();
+        observer.inject_fault_for_test(fault).unwrap();
+        let error = observer.snapshot().unwrap_err();
+        assert!(
+            error.to_string().contains(expected),
+            "{fault:?} must fail through the public typed observer: {error}"
+        );
+    }
+
+    observer
+        .reset_phase(crate::BlockQuantizedMoeTrafficPhase::Decode)
+        .unwrap();
+    observer.finish().unwrap();
+}
+
+#[cfg(feature = "gpu-tests")]
+#[test]
+fn observer_reset_finish_drop_and_panic_consume_pending_validation() {
+    fn poison_validation(runtime: &onnx_runtime_ep_cuda::runtime::CudaRuntime) {
+        let flags = 0x40u32.to_ne_bytes();
+        // SAFETY: the runtime owns a live four-byte validation word for its
+        // lifetime; this GPU-test-only injection emulates an asynchronous
+        // kernel reporting a bounds violation after submission.
+        unsafe {
+            runtime.htod(&flags, runtime.capture_error_ptr()).unwrap();
+        }
+    }
+
+    let (mut session, mut bindings, runtime) = sealed_bqmoe_cuda_session_fixture();
+
+    let mut reset_observer = session
+        .observe_block_quantized_moe_traffic(crate::BlockQuantizedMoeTrafficConfig {
+            request_id: 101,
+        })
+        .unwrap();
+    reset_observer
+        .run_with_device_bindings(&[], &mut bindings)
+        .unwrap();
+    poison_validation(&runtime);
+    let reset_error = reset_observer
+        .reset_phase(crate::BlockQuantizedMoeTrafficPhase::Decode)
+        .unwrap_err();
+    assert!(reset_error.to_string().contains("flags=0x40"));
+    reset_observer
+        .reset_phase(crate::BlockQuantizedMoeTrafficPhase::Decode)
+        .unwrap();
+    reset_observer.finish().unwrap();
+
+    let mut finish_observer = session
+        .observe_block_quantized_moe_traffic(crate::BlockQuantizedMoeTrafficConfig {
+            request_id: 102,
+        })
+        .unwrap();
+    finish_observer
+        .run_with_device_bindings(&[], &mut bindings)
+        .unwrap();
+    poison_validation(&runtime);
+    let finish_error = finish_observer.finish().unwrap_err();
+    assert!(finish_error.to_string().contains("flags=0x40"));
+
+    {
+        let mut drop_observer = session
+            .observe_block_quantized_moe_traffic(crate::BlockQuantizedMoeTrafficConfig {
+                request_id: 103,
+            })
+            .unwrap();
+        drop_observer
+            .run_with_device_bindings(&[], &mut bindings)
+            .unwrap();
+        poison_validation(&runtime);
+    }
+
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut panic_observer = session
+            .observe_block_quantized_moe_traffic(crate::BlockQuantizedMoeTrafficConfig {
+                request_id: 104,
+            })
+            .unwrap();
+        panic_observer
+            .run_with_device_bindings(&[], &mut bindings)
+            .unwrap();
+        poison_validation(&runtime);
+        panic!("forced observer unwind");
+    }));
+    assert!(panic.is_err());
+
+    let mut healthy = session
+        .observe_block_quantized_moe_traffic(crate::BlockQuantizedMoeTrafficConfig {
+            request_id: 105,
+        })
+        .expect("drop and unwind cleanup must leave the session reusable");
+    healthy
+        .reset_phase(crate::BlockQuantizedMoeTrafficPhase::Decode)
+        .unwrap();
+    healthy
+        .run_with_device_bindings(&[], &mut bindings)
+        .unwrap();
+    healthy.snapshot().unwrap();
+    healthy.finish().unwrap();
 }
 
 #[cfg(feature = "gpu-tests")]
@@ -6221,6 +6757,7 @@ fn glm52_real_gated_top8_runs_through_production_session_with_f64_oracle() {
         session
             .run_with_device_bindings(&[], &mut prefill_bindings)
             .unwrap();
+        prefill_bindings[2].read_bytes_range(0, 4).unwrap();
         session
             .run_with_device_bindings(&[], &mut bindings)
             .unwrap();
@@ -6373,6 +6910,7 @@ fn glm52_real_gated_top8_runs_through_production_session_with_f64_oracle() {
             .reset_phase(crate::BlockQuantizedMoeTrafficPhase::Decode)
             .unwrap();
         assert!(observer.replay_device_graph(&mut bindings).unwrap());
+        let _ = output_values(&mut bindings[2]);
         let high_bytes = router_for(&high)
             .into_iter()
             .flat_map(f32::to_le_bytes)
@@ -6392,7 +6930,7 @@ fn glm52_real_gated_top8_runs_through_production_session_with_f64_oracle() {
         );
         assert_eq!(actual_low, repeat_low, "{} repeatability", case.label);
         assert!(
-            runtime.graph_segment_count().unwrap() > 0,
+            observer.session.captured_graph_segment_count() > 0,
             "{} must capture the production path",
             case.label
         );

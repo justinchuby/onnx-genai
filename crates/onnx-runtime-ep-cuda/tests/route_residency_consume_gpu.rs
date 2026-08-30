@@ -495,7 +495,8 @@ fn route_window_hot_set_transitions_cold_experts() {
             &snapshot.bitmap,
             1,
             request,
-            runtime.ordinal()
+            runtime.ordinal(),
+            n_experts,
         ),
         RouteDecision::HotSet(_)
     ));

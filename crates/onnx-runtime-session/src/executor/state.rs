@@ -12,6 +12,8 @@ use super::*;
 /// single-field layout.
 #[derive(Default)]
 pub(crate) struct SlotCaptureState {
+    /// Exact provider installation token for this executor/slot.
+    pub(super) device_graph_token: Option<DeviceGraphToken>,
     /// Binding signature (I/O name + dtype + physical shape + device ptr) the
     /// installed graph for this slot was captured under; a replay whose bindings
     /// differ retires the graph. `None` when no device graph is installed.
@@ -89,6 +91,9 @@ pub(crate) struct Executor {
     /// calls this executor makes route through this slot; defaulting to Primary
     /// keeps the field inert unless a caller explicitly retargets it.
     pub(super) graph_slot: DeviceGraphSlot,
+    /// Immutable namespace identity for every captured graph owned by this
+    /// executor. Sibling sessions sharing one provider receive distinct owners.
+    pub(super) graph_owner: DeviceGraphOwner,
     /// Lazy external initializers available only at the nxrt fused-MoE boundary.
     /// Stock EPs ignore this map and keep receiving the resident buffers below.
     pub(super) weight_handles: HashMap<ValueId, WeightHandle>,

@@ -61,13 +61,15 @@ impl Executor {
         }
         let _depth_guard = DepthGuard;
         let nested = depth > 0;
-        if !nested {
-            // The validation word is shared by eager and captured CUDA kernels,
-            // but its meaning is request-local. Clear any prior request before
-            // this one can enqueue work; failures are correctness failures and
-            // must propagate through the EP seam.
-            self.ep.reset_device_validation_error()?;
-        }
+        let mut validation_submission = if nested {
+            None
+        } else {
+            // At most one deferred generation may be outstanding on a shared
+            // provider. A later submission is refused until the previous
+            // generation has been consumed, so no reset can erase an unseen
+            // asynchronous failure.
+            Some(DeviceValidationSubmission::begin(&self.ep)?)
+        };
         self.reset_run_state()?;
 
         // Keep the setup span around shape resolution, Stage-2 restoration,
@@ -109,6 +111,8 @@ impl Executor {
             Ok(())
         } else {
             let defer_until_binding_read = !self.graph.outputs.is_empty()
+                && mode != RunMode::Capture
+                && outcome.is_ok()
                 && self
                     .graph
                     .outputs
@@ -116,6 +120,9 @@ impl Executor {
                     .all(|output| external.outputs.contains_key(output));
             self.finish_device_validation(defer_until_binding_read)
         };
+        if let Some(submission) = validation_submission.as_mut() {
+            submission.disarm();
+        }
         let unbound = self.unbind_borrowed_inputs();
         if !decode_memo_eligible {
             self.scratch_resolved_shapes = resolved;
@@ -141,13 +148,8 @@ impl Executor {
         // and for captured replay. The CUDA EP's explicit sync is unconditional,
         // so the latch read observes every kernel from this request.
         self.ep.sync()?;
-        let checked = self.ep.check_device_capture_error();
-        // Clear after the synchronized read as well as before the next request:
-        // callers inspecting a failed run cannot leave poison behind, and a
-        // reset failure is never silently discarded.
-        let reset = self.ep.reset_device_validation_error();
-        match (checked, reset) {
-            (Ok(0), Ok(())) => {
+        match self.ep.consume_device_validation_error() {
+            Ok(0) => {
                 // The single coarse safe boundary: the request's kernels and any
                 // captured replay have completed (the sync above), the stream is
                 // no longer capturing, and the device validation latch is clean.
@@ -158,22 +160,12 @@ impl Executor {
                 self.ep.consume_route_residency_at_boundary()?;
                 Ok(())
             }
-            (Ok(flags), Ok(())) => Err(EpError::KernelFailed(format!(
+            Ok(flags) => Err(EpError::KernelFailed(format!(
                 "{}: device validation failed (flags=0x{flags:x})",
                 self.ep.name()
             ))
             .into()),
-            (Err(error), Ok(())) | (Ok(0), Err(error)) => Err(error.into()),
-            (Ok(flags), Err(reset_error)) => Err(SessionError::Internal(format!(
-                "{}: device validation failed (flags=0x{flags:x}); additionally failed to reset \
-                 the device validation latch: {reset_error}",
-                self.ep.name()
-            ))),
-            (Err(check_error), Err(reset_error)) => Err(SessionError::Internal(format!(
-                "{}: failed to check the device validation latch: {check_error}; additionally \
-                 failed to reset it: {reset_error}",
-                self.ep.name()
-            ))),
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -768,7 +760,7 @@ impl Executor {
                     ) {
                         Ok(_) => break 'capture schedule,
                         Err(error) => {
-                            let _ = self.ep.reset_device_graph_in(self.graph_slot);
+                            let _ = self.reset_device_graph();
                             // Quarantine the op-type that aborted recording and
                             // retry, unless we already quarantined it (no
                             // progress), hit the attempt bound, or cannot
@@ -817,7 +809,7 @@ impl Executor {
                     .map(|(vid, seeded)| (*vid, seeded.clone()))
                 {
                     let current = resolved.get(&vid).cloned();
-                    let _ = self.ep.reset_device_graph_in(self.graph_slot);
+                    let _ = self.reset_device_graph();
                     let cap = self.cap_mut();
                     cap.capture_schedule = None;
                     cap.capture_segmentation.clear();
@@ -874,11 +866,7 @@ impl Executor {
                     // token), but the installed segments are stale. Retire the
                     // device graph so the caller re-warms and re-captures for the
                     // new branch. `capture_schedule` stays `None`.
-                    let cap = self.cap_mut();
-                    cap.capture_segmentation.clear();
-                    cap.capture_cf_shapes.clear();
-                    cap.device_graph_signature = None;
-                    self.ep.reset_device_graph_in(self.graph_slot)?;
+                    self.reset_device_graph()?;
                 }
             }
         }

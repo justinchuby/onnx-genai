@@ -6,11 +6,11 @@
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::{CStr, CString, c_void};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
-use arc_swap::ArcSwapOption;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use cudarc::driver::sys::{
     CUdevice_attribute, CUdeviceptr, CUfunction, CUfunction_attribute_enum, CUmodule,
 };
@@ -18,7 +18,9 @@ use cudarc::driver::{CudaContext, CudaEvent, CudaFunction, CudaModule, CudaStrea
 
 use onnx_runtime_ep_api::EpError;
 use onnx_runtime_ep_api::Kernel;
-use onnx_runtime_ep_api::{DeviceGraphResource, DeviceGraphSlot};
+use onnx_runtime_ep_api::{
+    DeviceGraphOwner, DeviceGraphResource, DeviceGraphSlot, DeviceGraphToken,
+};
 use onnx_runtime_ep_api::{RawDeviceAllocationSiteStats, Result};
 
 use crate::blas::CublasLt;
@@ -550,6 +552,11 @@ pub struct CudaRuntime {
     copy_stream: Arc<CudaStream>,
     graph: CudaGraphLifecycle,
     verify_graph: CudaGraphLifecycle,
+    /// Executor-owned graph lifecycles. The atomically published map makes the
+    /// warmed replay lookup allocation- and mutex-free; capture/reset clone the
+    /// small map under `owned_graphs_write`.
+    owned_graphs: ArcSwap<HashMap<(DeviceGraphOwner, DeviceGraphSlot), Arc<CudaGraphLifecycle>>>,
+    owned_graphs_write: Mutex<()>,
     registered_capture_active: AtomicBool,
     unregistered_capture_active: AtomicBool,
     active_capture_resource_ids: ArcSwapOption<Vec<usize>>,
@@ -637,6 +644,10 @@ pub struct CudaRuntime {
     /// The host reads it after a request synchronization so eager or captured
     /// validation failures become hard errors before outputs are consumed.
     capture_error: CUdeviceptr,
+    /// Exactly one provider-wide deferred validation generation may be
+    /// outstanding. A second submission is refused until the prior generation
+    /// is synchronized, read, and cleared, so no later reset can erase it.
+    validation_state: AtomicU8,
     /// When set, the public [`CudaRuntime::synchronize`] becomes a no-op so the
     /// redundant trailing per-op eager device syncs (issued by kernels on the
     /// `!capturing` branch) are elided and launches pipeline on the in-order EP
@@ -811,18 +822,28 @@ impl CudaRuntime {
             .map_err(|e| driver_err("create transfer stream", e))?;
         let blas = CublasLt::new()?;
         let cudnn = CudnnBackend::new(stream.clone());
-        let graph = CudaGraphLifecycle::new(stream.clone());
+        let graph = CudaGraphLifecycle::new(
+            stream.clone(),
+            DeviceGraphOwner::new(),
+            DeviceGraphSlot::Primary,
+        );
         // Second captured-graph slot for the MTP fixed-width verify forward,
         // held independently of `graph` (the M=1 decode step) on the same
         // compute stream so both shapes can be replayed by shape key without
         // per-step recapture (see `DeviceGraphSlot`).
-        let verify_graph = CudaGraphLifecycle::new(stream.clone());
+        let verify_graph = CudaGraphLifecycle::new(
+            stream.clone(),
+            DeviceGraphOwner::new(),
+            DeviceGraphSlot::Verify,
+        );
         Self {
             context,
             stream,
             copy_stream,
             graph,
             verify_graph,
+            owned_graphs: ArcSwap::from_pointee(HashMap::new()),
+            owned_graphs_write: Mutex::new(()),
             registered_capture_active: AtomicBool::new(false),
             unregistered_capture_active: AtomicBool::new(false),
             active_capture_resource_ids: ArcSwapOption::empty(),
@@ -853,6 +874,7 @@ impl CudaRuntime {
             fences: Mutex::new(HashMap::new()),
             next_fence_id: AtomicU64::new(1),
             capture_error: 0,
+            validation_state: AtomicU8::new(0),
             defer_eager_sync: AtomicBool::new(
                 // On by default; only an explicit falsey value restores the old
                 // always-sync eager path (escape hatch for debugging).
@@ -964,17 +986,17 @@ impl CudaRuntime {
     /// Replays every installed segment in capture order (one graph for a
     /// whole-subgraph capture).
     pub fn replay_graph(&self) -> Result<()> {
-        self.graph.replay()
+        self.graph.replay_current()
     }
 
     /// Launch one installed segment by its zero-based capture-order index.
     pub fn replay_graph_segment(&self, index: usize) -> Result<()> {
-        self.graph.replay_segment(index)
+        self.graph.replay_current_segment(index)
     }
 
     /// Number of installed captured segments (1 for a whole-subgraph capture).
     pub fn graph_segment_count(&self) -> Result<usize> {
-        self.graph.segment_count()
+        self.graph.current_segment_count()
     }
 
     /// Destroy the installed graph and graph-exec handles.
@@ -982,12 +1004,12 @@ impl CudaRuntime {
     /// Returns whether an executable was invalidated. Reset is rejected while a
     /// capture is active; callers must end the capture first.
     pub fn reset_graph(&self) -> Result<bool> {
-        self.graph.reset()
+        self.graph.reset_current()
     }
 
     /// Whether this runtime currently owns an instantiated graph executable.
     pub fn has_graph_executable(&self) -> Result<bool> {
-        self.graph.has_executable()
+        self.graph.has_current_executable()
     }
 
     /// Raw device pointer to the persistent capture-error latch word, passed to
@@ -1011,8 +1033,62 @@ impl CudaRuntime {
         Ok(u32::from_ne_bytes(bytes))
     }
 
+    /// Open one provider-wide validation generation.
+    ///
+    /// A fully device-bound run may return before its device word is readable.
+    /// While that generation is pending, another submission is refused rather
+    /// than clearing the shared word and erasing an unseen failure.
+    pub(crate) fn begin_device_validation(&self) -> Result<()> {
+        self.validation_state
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| {
+                EpError::KernelFailed(
+                    "cuda_ep: previous deferred device validation is still pending; consume a \
+                     bound output or finish the request boundary before submitting more work"
+                        .into(),
+                )
+            })?;
+        if let Err(error) = self.reset_capture_error() {
+            self.validation_state.store(0, Ordering::Release);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Consume the current validation generation after the caller established a
+    /// host boundary. The pending bit is released only after both the read and
+    /// reset succeed, so every error remains sticky across failure paths.
+    pub(crate) fn consume_device_validation(&self) -> Result<u32> {
+        match self
+            .validation_state
+            .compare_exchange(1, 2, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => {}
+            Err(0) => return Ok(0),
+            Err(_) => {
+                return Err(EpError::KernelFailed(
+                    "cuda_ep: device validation is already being consumed".into(),
+                ));
+            }
+        }
+        let result = self
+            .check_capture_error()
+            .and_then(|flags| self.reset_capture_error().map(|()| flags));
+        match result {
+            Ok(flags) => {
+                self.validation_state.store(0, Ordering::Release);
+                Ok(flags)
+            }
+            Err(error) => {
+                self.validation_state.store(1, Ordering::Release);
+                Err(error)
+            }
+        }
+    }
+
     /// Clear the latching capture-error word back to the un-poisoned state.
-    /// Invoked at session request boundaries and on graph reset / re-capture.
+    /// Invoked only when opening or consuming a validation generation. Graph
+    /// reset must never clear an unconsumed result.
     pub fn reset_capture_error(&self) -> Result<()> {
         self.bind()?;
         // SAFETY: `capture_error` is a live four-byte device allocation owned by
@@ -1088,16 +1164,27 @@ impl CudaRuntime {
                 .map(DeviceGraphResource::identity)
                 .collect(),
         );
-        self.graph_slot(slot).begin(resources)?;
-        self.active_capture_resource_ids.store(Some(resource_ids));
         self.registered_capture_active
-            .store(true, Ordering::Release);
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| {
+                EpError::KernelFailed(
+                    "cuda_ep: cannot begin CUDA graph capture while another registered capture \
+                     is active on the runtime stream"
+                        .into(),
+                )
+            })?;
+        if let Err(error) = self.graph_slot(slot).begin_current(resources) {
+            self.registered_capture_active
+                .store(false, Ordering::Release);
+            return Err(error);
+        }
+        self.active_capture_resource_ids.store(Some(resource_ids));
         Ok(())
     }
 
     /// Slot-aware [`end_graph_capture`](Self::end_graph_capture).
     pub fn end_graph_capture_in(&self, slot: DeviceGraphSlot) -> Result<()> {
-        let result = self.graph_slot(slot).end();
+        let result = self.graph_slot(slot).end_current();
         self.registered_capture_active
             .store(false, Ordering::Release);
         self.active_capture_resource_ids.store(None);
@@ -1106,7 +1193,7 @@ impl CudaRuntime {
 
     /// Slot-aware [`abort_graph_capture`](Self::abort_graph_capture).
     pub fn abort_graph_capture_in(&self, slot: DeviceGraphSlot) -> Result<()> {
-        let result = self.graph_slot(slot).abort();
+        let result = self.graph_slot(slot).abort_current();
         self.registered_capture_active
             .store(false, Ordering::Release);
         self.active_capture_resource_ids.store(None);
@@ -1115,27 +1202,197 @@ impl CudaRuntime {
 
     /// Slot-aware [`replay_graph`](Self::replay_graph).
     pub fn replay_graph_in(&self, slot: DeviceGraphSlot) -> Result<()> {
-        self.graph_slot(slot).replay()
+        self.graph_slot(slot).replay_current()
     }
 
     /// Slot-aware [`replay_graph_segment`](Self::replay_graph_segment).
     pub fn replay_graph_segment_in(&self, slot: DeviceGraphSlot, index: usize) -> Result<()> {
-        self.graph_slot(slot).replay_segment(index)
+        self.graph_slot(slot).replay_current_segment(index)
     }
 
     /// Slot-aware [`graph_segment_count`](Self::graph_segment_count).
     pub fn graph_segment_count_in(&self, slot: DeviceGraphSlot) -> Result<usize> {
-        self.graph_slot(slot).segment_count()
+        self.graph_slot(slot).current_segment_count()
     }
 
     /// Slot-aware [`reset_graph`](Self::reset_graph).
     pub fn reset_graph_in(&self, slot: DeviceGraphSlot) -> Result<bool> {
-        self.graph_slot(slot).reset()
+        self.graph_slot(slot).reset_current()
     }
 
     /// Slot-aware [`has_graph_executable`](Self::has_graph_executable).
     pub fn has_graph_executable_in(&self, slot: DeviceGraphSlot) -> Result<bool> {
-        self.graph_slot(slot).has_executable()
+        self.graph_slot(slot).has_current_executable()
+    }
+
+    fn owned_graph(
+        &self,
+        owner: DeviceGraphOwner,
+        slot: DeviceGraphSlot,
+    ) -> Option<Arc<CudaGraphLifecycle>> {
+        self.owned_graphs.load().get(&(owner, slot)).cloned()
+    }
+
+    fn owned_graph_for_begin(
+        &self,
+        owner: DeviceGraphOwner,
+        slot: DeviceGraphSlot,
+        continuation: Option<DeviceGraphToken>,
+    ) -> Result<Arc<CudaGraphLifecycle>> {
+        let _writer = self.owned_graphs_write.lock().map_err(|_| {
+            EpError::KernelFailed("cuda_ep: owned CUDA graph registry was poisoned".into())
+        })?;
+        if let Some(graph) = self.owned_graph(owner, slot) {
+            return Ok(graph);
+        }
+        if continuation.is_some() {
+            return Err(EpError::KernelFailed(
+                "cuda_ep: CUDA graph continuation token names a retired executor graph".into(),
+            ));
+        }
+        let graph = Arc::new(CudaGraphLifecycle::new(self.stream.clone(), owner, slot));
+        let current = self.owned_graphs.load_full();
+        let mut next = (*current).clone();
+        next.insert((owner, slot), Arc::clone(&graph));
+        self.owned_graphs.store(Arc::new(next));
+        Ok(graph)
+    }
+
+    /// Begin capture in one executor-owned graph namespace.
+    pub(crate) fn begin_owned_graph_capture_in(
+        &self,
+        owner: DeviceGraphOwner,
+        slot: DeviceGraphSlot,
+        continuation: Option<DeviceGraphToken>,
+        kernels: &[&dyn Kernel],
+    ) -> Result<DeviceGraphToken> {
+        crate::capture::require_subgraph_graph_capturable(kernels)?;
+        let mut resources: Vec<DeviceGraphResource> = kernels
+            .iter()
+            .flat_map(|kernel| kernel.device_graph_resources())
+            .collect();
+        resources.sort_unstable_by_key(DeviceGraphResource::identity);
+        resources.dedup_by_key(|resource| resource.identity());
+        let resource_ids = Arc::new(
+            resources
+                .iter()
+                .map(DeviceGraphResource::identity)
+                .collect(),
+        );
+        self.registered_capture_active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| {
+                EpError::KernelFailed(
+                    "cuda_ep: cannot begin CUDA graph capture while another registered capture \
+                     is active on the runtime stream"
+                        .into(),
+                )
+            })?;
+        let graph = match self.owned_graph_for_begin(owner, slot, continuation) {
+            Ok(graph) => graph,
+            Err(error) => {
+                self.registered_capture_active
+                    .store(false, Ordering::Release);
+                return Err(error);
+            }
+        };
+        let token = match graph.begin(continuation, resources) {
+            Ok(token) => token,
+            Err(error) => {
+                self.registered_capture_active
+                    .store(false, Ordering::Release);
+                return Err(error);
+            }
+        };
+        self.active_capture_resource_ids.store(Some(resource_ids));
+        Ok(token)
+    }
+
+    pub(crate) fn end_owned_graph_capture(&self, token: DeviceGraphToken) -> Result<()> {
+        let result = self
+            .owned_graph(token.owner(), token.slot())
+            .ok_or_else(|| {
+                EpError::KernelFailed(
+                    "cuda_ep: cannot end a retired executor-owned CUDA graph".into(),
+                )
+            })?
+            .end(token);
+        self.registered_capture_active
+            .store(false, Ordering::Release);
+        self.active_capture_resource_ids.store(None);
+        result
+    }
+
+    pub(crate) fn abort_owned_graph_capture(&self, token: DeviceGraphToken) -> Result<()> {
+        let result = match self.owned_graph(token.owner(), token.slot()) {
+            Some(graph) => graph.abort(token),
+            None => Ok(()),
+        };
+        self.registered_capture_active
+            .store(false, Ordering::Release);
+        self.active_capture_resource_ids.store(None);
+        result
+    }
+
+    pub(crate) fn replay_owned_graph(&self, token: DeviceGraphToken) -> Result<()> {
+        self.owned_graph(token.owner(), token.slot())
+            .ok_or_else(|| {
+                EpError::KernelFailed(
+                    "cuda_ep: cannot replay a retired executor-owned CUDA graph".into(),
+                )
+            })?
+            .replay(token)
+    }
+
+    pub(crate) fn replay_owned_graph_segment(
+        &self,
+        token: DeviceGraphToken,
+        index: usize,
+    ) -> Result<()> {
+        self.owned_graph(token.owner(), token.slot())
+            .ok_or_else(|| {
+                EpError::KernelFailed(
+                    "cuda_ep: cannot replay a retired executor-owned CUDA graph".into(),
+                )
+            })?
+            .replay_segment(token, index)
+    }
+
+    pub(crate) fn reset_owned_graph(&self, token: DeviceGraphToken) -> Result<bool> {
+        let _writer = self.owned_graphs_write.lock().map_err(|_| {
+            EpError::KernelFailed("cuda_ep: owned CUDA graph registry was poisoned".into())
+        })?;
+        let Some(graph) = self.owned_graph(token.owner(), token.slot()) else {
+            return Ok(false);
+        };
+        let (_, had_graph) = graph.reset(token)?;
+        Ok(had_graph)
+    }
+
+    pub(crate) fn retire_owned_graphs(&self, owner: DeviceGraphOwner) -> Result<()> {
+        let _writer = self.owned_graphs_write.lock().map_err(|_| {
+            EpError::KernelFailed("cuda_ep: owned CUDA graph registry was poisoned".into())
+        })?;
+        let current = self.owned_graphs.load_full();
+        for ((entry_owner, _), graph) in current.iter() {
+            if *entry_owner == owner && graph.current_token()?.is_some() {
+                return Err(EpError::KernelFailed(format!(
+                    "cuda_ep: cannot retire graph owner {} while an installation is live",
+                    owner.get()
+                )));
+            }
+        }
+        let mut next = (*current).clone();
+        next.retain(|(entry_owner, _), _| *entry_owner != owner);
+        self.owned_graphs.store(Arc::new(next));
+        Ok(())
+    }
+
+    pub(crate) fn has_owned_graph(&self, token: DeviceGraphToken) -> Result<bool> {
+        match self.owned_graph(token.owner(), token.slot()) {
+            Some(graph) => graph.has_executable(token),
+            None => Ok(false),
+        }
     }
 
     /// Start capture directly on the stream without installing a lifecycle
@@ -2014,8 +2271,15 @@ impl CudaRuntime {
             // SAFETY: every pooled block came from `malloc_sync` on this
             // runtime's context and is freed exactly once — it was removed from
             // the pool here, so `free_raw` cannot also free it.
-            let _ = unsafe { cudarc::driver::result::free_sync(ptr) };
+            if unsafe { cudarc::driver::result::free_sync(ptr) }.is_ok() {
+                self.frees.fetch_add(1, Ordering::Relaxed);
+            }
         }
+    }
+
+    #[cfg(feature = "gpu-tests")]
+    pub fn test_drain_raw_pool(&self) {
+        self.drain_raw_pool();
     }
 
     /// Free a device pointer previously returned by [`CudaRuntime::alloc_raw`].

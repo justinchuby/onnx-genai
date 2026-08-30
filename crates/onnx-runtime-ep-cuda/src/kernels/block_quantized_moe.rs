@@ -18,6 +18,14 @@
 //! activation/SwiGLU pass, the FC2 down-projection, and a weighted combine of
 //! each token's selected experts. All heavy work runs asynchronously on the
 //! EP's selected-device stream and is safe to record after warm-up.
+//!
+//! The concrete kernel/factory and raw telemetry record are intentionally not
+//! part of the ordinary production API; callers observe traffic through
+//! `onnx_runtime_session::BlockQuantizedMoeTrafficObserver`.
+//!
+//! ```compile_fail
+//! use onnx_runtime_ep_cuda::kernels::block_quantized_moe::BlockQuantizedMoEFactory;
+//! ```
 
 use std::borrow::Cow;
 use std::cell::Cell;
@@ -41,7 +49,11 @@ use onnx_runtime_memory_governor::{MemoryRole, ProviderContextIdentity};
 use crate::error::driver_err;
 use crate::kernels::block_quantized_matmul::{BlockFormat, decoder_prelude};
 use crate::kernels::expert_route_telemetry::{
-    ArmedTelemetry, MARK_DEVICE_SRC, RouteTelemetryConfig, TelemetrySnapshot, TelemetryUnsupported,
+    ArmedTelemetry, MARK_DEVICE_SRC, RouteTelemetryConfig, TelemetryUnsupported,
+};
+#[cfg(feature = "gpu-tests")]
+use crate::kernels::expert_route_telemetry::{
+    H_DEVICE, H_EPOCH, H_OVERFLOW, H_POISON, H_REQUEST, TelemetrySnapshot,
 };
 use crate::provider::CudaExecutionProvider;
 use crate::runtime::{CudaRuntime, RawCudaFunction, cuptr};
@@ -67,6 +79,16 @@ thread_local! {
 pub struct BlockQuantizedMoePreparationCounts {
     pub format_parse_calls: u64,
     pub workspace_layout_builds: u64,
+}
+
+#[cfg(feature = "gpu-tests")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockQuantizedMoeTrafficFaultForTest {
+    Poison,
+    Overflow,
+    StaleEpoch,
+    ForeignRequest,
+    WrongDevice,
 }
 
 pub fn block_quantized_moe_preparation_counts() -> BlockQuantizedMoePreparationCounts {
@@ -629,10 +651,22 @@ impl AdmittedBlockQuantizedMoeBanks {
             .checked_mul(selected_count)
             .ok_or_else(|| error("unique selected-expert byte count overflow"))?;
         Ok(BlockQuantizedMoeTraffic {
-            uploaded_whole_bank_bytes: uploaded_whole_bank_bytes as u64,
-            committed_whole_bank_bytes: uploaded_whole_bank_bytes as u64,
-            logical_route_demand_bytes: logical_route_demand_bytes as u64,
-            unique_selected_expert_bytes: unique_selected_expert_bytes as u64,
+            uploaded_whole_bank_bytes: as_u64(
+                "uploaded whole-bank bytes",
+                uploaded_whole_bank_bytes,
+            )?,
+            committed_whole_bank_bytes: as_u64(
+                "committed whole-bank bytes",
+                uploaded_whole_bank_bytes,
+            )?,
+            logical_route_demand_bytes: as_u64(
+                "logical route-demand bytes",
+                logical_route_demand_bytes,
+            )?,
+            unique_selected_expert_bytes: as_u64(
+                "unique selected-expert bytes",
+                unique_selected_expert_bytes,
+            )?,
             physical_dram_bytes: None,
             page_ins: 0,
             byte_hit_rate: None,
@@ -1305,8 +1339,14 @@ fn pointwise_config_for(runtime: &CudaRuntime, total: u64) -> LaunchConfig {
     }
 }
 
+#[cfg(feature = "gpu-tests")]
 pub struct BlockQuantizedMoEFactory {
     pub runtime: Arc<CudaRuntime>,
+}
+
+#[cfg(not(feature = "gpu-tests"))]
+pub(crate) struct BlockQuantizedMoEFactory {
+    pub(crate) runtime: Arc<CudaRuntime>,
 }
 
 impl KernelFactory for BlockQuantizedMoEFactory {
@@ -1316,13 +1356,7 @@ impl KernelFactory for BlockQuantizedMoEFactory {
 }
 
 impl BlockQuantizedMoEFactory {
-    /// Build a concrete [`BlockQuantizedMoEKernel`]. Exposed so route-telemetry
-    /// tests (issue #1810 Slice 7A) can obtain the concrete kernel and call its
-    /// `#[doc(hidden)]` arming API — the trait object returned by
-    /// [`KernelFactory::create`] cannot expose it. Crate-internal / test seam
-    /// only.
-    #[doc(hidden)]
-    pub fn create_kernel(
+    fn create_kernel_impl(
         &self,
         node: &Node,
         input_shapes: &[Vec<usize>],
@@ -1343,6 +1377,24 @@ impl BlockQuantizedMoEFactory {
             committed_whole_bank_bytes: 0,
             bytes_per_expert: 0,
         })
+    }
+
+    #[cfg(feature = "gpu-tests")]
+    pub fn create_kernel(
+        &self,
+        node: &Node,
+        input_shapes: &[Vec<usize>],
+    ) -> Result<BlockQuantizedMoEKernel> {
+        self.create_kernel_impl(node, input_shapes)
+    }
+
+    #[cfg(not(feature = "gpu-tests"))]
+    pub(crate) fn create_kernel(
+        &self,
+        node: &Node,
+        input_shapes: &[Vec<usize>],
+    ) -> Result<BlockQuantizedMoEKernel> {
+        self.create_kernel_impl(node, input_shapes)
     }
 }
 
@@ -1453,7 +1505,21 @@ pub(crate) fn unsupported_reason(
     None
 }
 
+#[cfg(feature = "gpu-tests")]
 pub struct BlockQuantizedMoEKernel {
+    runtime: Arc<CudaRuntime>,
+    attributes: MoeAttributes,
+    formats: ProjectionFormats,
+    geometry: PreparedMoeGeometry,
+    launches: PreparedMoeLaunches,
+    shared: Option<Arc<BlockQuantizedMoeSharedState>>,
+    uploaded_whole_bank_bytes: u64,
+    committed_whole_bank_bytes: u64,
+    bytes_per_expert: u64,
+}
+
+#[cfg(not(feature = "gpu-tests"))]
+pub(crate) struct BlockQuantizedMoEKernel {
     runtime: Arc<CudaRuntime>,
     attributes: MoeAttributes,
     formats: ProjectionFormats,
@@ -1493,6 +1559,20 @@ impl Drop for OwnedBlockQuantizedMoeTelemetry {
     }
 }
 
+fn checked_logical_traffic_bytes(
+    bytes_per_expert: u64,
+    route_count: u64,
+    unique_experts: u64,
+) -> Result<(u64, u64)> {
+    let logical = bytes_per_expert
+        .checked_mul(route_count)
+        .ok_or_else(|| error("logical route-demand byte count overflow"))?;
+    let unique = bytes_per_expert
+        .checked_mul(unique_experts)
+        .ok_or_else(|| error("unique selected-expert byte count overflow"))?;
+    Ok((logical, unique))
+}
+
 impl BlockQuantizedMoEKernel {
     fn install_banks(&mut self, banks: Arc<AdmittedBlockQuantizedMoeBankSet>) -> Result<()> {
         self.validate_admitted_bank_set(&banks)?;
@@ -1518,9 +1598,9 @@ impl BlockQuantizedMoEKernel {
                     .map_or(Some(bytes), |fc3| bytes.checked_add(fc3.bytes_per_expert))
             })
             .ok_or_else(|| error("per-expert projection byte count overflow"))?;
-        self.uploaded_whole_bank_bytes = total as u64;
-        self.committed_whole_bank_bytes = total as u64;
-        self.bytes_per_expert = per_expert as u64;
+        self.uploaded_whole_bank_bytes = as_u64("uploaded whole-bank bytes", total)?;
+        self.committed_whole_bank_bytes = self.uploaded_whole_bank_bytes;
+        self.bytes_per_expert = as_u64("per-expert projection bytes", per_expert)?;
         self.shared = Some(Arc::new(BlockQuantizedMoeSharedState {
             banks,
             telemetry: ArcSwapOption::empty(),
@@ -1534,8 +1614,7 @@ impl BlockQuantizedMoEKernel {
             .ok_or_else(|| error("BlockQuantizedMoE projection banks were not admitted"))
     }
 
-    #[doc(hidden)]
-    pub fn arm_route_telemetry(
+    fn arm_route_telemetry_impl(
         &mut self,
         config: RouteTelemetryConfig,
     ) -> std::result::Result<(), TelemetryUnsupported> {
@@ -1555,8 +1634,7 @@ impl BlockQuantizedMoEKernel {
         Ok(())
     }
 
-    #[doc(hidden)]
-    pub fn disarm_route_telemetry(&mut self) -> Result<()> {
+    fn disarm_route_telemetry_impl(&mut self) -> Result<()> {
         if self.runtime.has_graph_executable()?
             || self
                 .runtime
@@ -1570,16 +1648,15 @@ impl BlockQuantizedMoEKernel {
         Ok(())
     }
 
-    #[doc(hidden)]
-    pub fn reset_route_telemetry_boundary(&mut self) -> Result<()> {
+    fn reset_route_telemetry_boundary_impl(&mut self) -> Result<()> {
         if let Some(armed) = self.shared()?.telemetry.load_full() {
             armed.record.reset_boundary(&self.runtime)?;
         }
         Ok(())
     }
 
-    #[doc(hidden)]
-    pub fn route_telemetry_snapshot(&self) -> Result<Option<TelemetrySnapshot>> {
+    #[cfg(feature = "gpu-tests")]
+    fn route_telemetry_snapshot_impl(&self) -> Result<Option<TelemetrySnapshot>> {
         self.shared()?
             .telemetry
             .load_full()
@@ -1587,48 +1664,129 @@ impl BlockQuantizedMoEKernel {
             .transpose()
     }
 
-    #[doc(hidden)]
-    pub fn route_telemetry_footprint_bytes(&self) -> usize {
+    #[cfg(feature = "gpu-tests")]
+    fn route_telemetry_footprint_bytes_impl(&self) -> usize {
         self.shared
             .as_ref()
             .and_then(|shared| shared.telemetry.load_full())
             .map_or(0, |armed| armed.record.footprint_bytes())
     }
 
-    #[doc(hidden)]
-    pub fn route_telemetry_bitmap_addr(&self) -> Option<u64> {
+    #[cfg(feature = "gpu-tests")]
+    fn route_telemetry_bitmap_addr_impl(&self) -> Option<u64> {
         self.shared
             .as_ref()
             .and_then(|shared| shared.telemetry.load_full())
             .map(|armed| armed.record.bitmap_addr())
     }
 
-    #[doc(hidden)]
-    pub fn production_traffic_snapshot(&self) -> Result<BlockQuantizedMoeTraffic> {
-        let telemetry = self
-            .route_telemetry_snapshot()?
+    pub(crate) fn production_traffic_snapshot(&self) -> Result<BlockQuantizedMoeTraffic> {
+        let armed = self
+            .shared()?
+            .telemetry
+            .load_full()
             .ok_or_else(|| error("BlockQuantizedMoE traffic is not armed"))?;
-        let logical_route_demand_bytes = self
-            .bytes_per_expert
-            .checked_mul(u64::from(telemetry.count()))
-            .ok_or_else(|| error("logical route-demand byte count overflow"))?;
-        let unique_experts: usize = telemetry
+        let telemetry = armed.record.validated_snapshot(&self.runtime)?;
+        let unique_experts = telemetry
             .bitmap
             .iter()
-            .map(|word| word.count_ones() as usize)
-            .sum();
+            .try_fold(0_u64, |total, word| {
+                total.checked_add(u64::from(word.count_ones()))
+            })
+            .ok_or_else(|| error("unique selected-expert count overflow"))?;
+        let (logical_route_demand_bytes, unique_selected_expert_bytes) =
+            checked_logical_traffic_bytes(
+                self.bytes_per_expert,
+                u64::from(telemetry.count()),
+                unique_experts,
+            )?;
         Ok(BlockQuantizedMoeTraffic {
             uploaded_whole_bank_bytes: self.uploaded_whole_bank_bytes,
             committed_whole_bank_bytes: self.committed_whole_bank_bytes,
             logical_route_demand_bytes,
-            unique_selected_expert_bytes: self
-                .bytes_per_expert
-                .checked_mul(unique_experts as u64)
-                .ok_or_else(|| error("unique selected-expert byte count overflow"))?,
+            unique_selected_expert_bytes,
             physical_dram_bytes: None,
             page_ins: 0,
             byte_hit_rate: None,
         })
+    }
+
+    #[cfg(feature = "gpu-tests")]
+    pub fn arm_route_telemetry(
+        &mut self,
+        config: RouteTelemetryConfig,
+    ) -> std::result::Result<(), TelemetryUnsupported> {
+        self.arm_route_telemetry_impl(config)
+    }
+
+    #[cfg(not(feature = "gpu-tests"))]
+    pub(crate) fn arm_route_telemetry(
+        &mut self,
+        config: RouteTelemetryConfig,
+    ) -> std::result::Result<(), TelemetryUnsupported> {
+        self.arm_route_telemetry_impl(config)
+    }
+
+    #[cfg(feature = "gpu-tests")]
+    pub fn disarm_route_telemetry(&mut self) -> Result<()> {
+        self.disarm_route_telemetry_impl()
+    }
+
+    #[cfg(not(feature = "gpu-tests"))]
+    pub(crate) fn disarm_route_telemetry(&mut self) -> Result<()> {
+        self.disarm_route_telemetry_impl()
+    }
+
+    #[cfg(feature = "gpu-tests")]
+    pub fn reset_route_telemetry_boundary(&mut self) -> Result<()> {
+        self.reset_route_telemetry_boundary_impl()
+    }
+
+    #[cfg(not(feature = "gpu-tests"))]
+    pub(crate) fn reset_route_telemetry_boundary(&mut self) -> Result<()> {
+        self.reset_route_telemetry_boundary_impl()
+    }
+
+    #[cfg(feature = "gpu-tests")]
+    pub fn route_telemetry_snapshot(&self) -> Result<Option<TelemetrySnapshot>> {
+        self.route_telemetry_snapshot_impl()
+    }
+
+    #[cfg(feature = "gpu-tests")]
+    pub fn route_telemetry_footprint_bytes(&self) -> usize {
+        self.route_telemetry_footprint_bytes_impl()
+    }
+
+    #[cfg(feature = "gpu-tests")]
+    pub fn route_telemetry_bitmap_addr(&self) -> Option<u64> {
+        self.route_telemetry_bitmap_addr_impl()
+    }
+
+    #[cfg(feature = "gpu-tests")]
+    pub fn inject_route_telemetry_fault_for_test(
+        &self,
+        fault: BlockQuantizedMoeTrafficFaultForTest,
+    ) -> Result<()> {
+        let armed = self
+            .shared()?
+            .telemetry
+            .load_full()
+            .ok_or_else(|| error("BlockQuantizedMoE traffic is not armed"))?;
+        let snapshot = armed.record.snapshot(&self.runtime)?;
+        let (index, value) = match fault {
+            BlockQuantizedMoeTrafficFaultForTest::Poison => (H_POISON, 1),
+            BlockQuantizedMoeTrafficFaultForTest::Overflow => (H_OVERFLOW, 1),
+            BlockQuantizedMoeTrafficFaultForTest::StaleEpoch => {
+                (H_EPOCH, snapshot.header[H_EPOCH].wrapping_add(1))
+            }
+            BlockQuantizedMoeTrafficFaultForTest::ForeignRequest => {
+                (H_REQUEST, snapshot.header[H_REQUEST].wrapping_add(1))
+            }
+            BlockQuantizedMoeTrafficFaultForTest::WrongDevice => {
+                (H_DEVICE, snapshot.header[H_DEVICE].wrapping_add(1))
+            }
+        };
+        armed.record.inject_header_word(&self.runtime, index, value)
     }
 
     fn validate_admitted_bank_set(&self, banks: &AdmittedBlockQuantizedMoeBankSet) -> Result<()> {
@@ -2620,6 +2778,14 @@ mod workspace_tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("exceeds usize limits"));
+    }
+
+    #[test]
+    fn logical_traffic_arithmetic_rejects_overflow() {
+        let logical = checked_logical_traffic_bytes(u64::MAX, 2, 1).unwrap_err();
+        assert!(logical.to_string().contains("route-demand"));
+        let unique = checked_logical_traffic_bytes(u64::MAX, 1, 2).unwrap_err();
+        assert!(unique.to_string().contains("unique selected-expert"));
     }
 }
 

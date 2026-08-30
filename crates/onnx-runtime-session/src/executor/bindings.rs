@@ -609,6 +609,8 @@ impl Executor {
             // planning would key a different kernel than execution uses.
             let seq_independent =
                 node_capture_seq_independent(&self.graph, node, &self.capture_growing_symbols);
+            let graph_tokens =
+                std::array::from_fn(|index| self.slot_capture[index].device_graph_token);
             let (kernel, key) = self.cache.get_or_create(
                 node_id,
                 node,
@@ -619,6 +621,7 @@ impl Executor {
                 opset,
                 seq_independent,
                 self.ep.as_ref(),
+                graph_tokens,
             )?;
             self.kernel_bindings[pi] = Some(key);
             let metadata = input_shapes
@@ -990,6 +993,15 @@ impl Executor {
         self.cache.snapshot_block_quantized_moe_traffic()
     }
 
+    #[cfg(feature = "gpu-tests")]
+    pub(crate) fn inject_block_quantized_moe_traffic_fault_for_test(
+        &self,
+        fault: onnx_runtime_ep_cuda::kernels::block_quantized_moe::BlockQuantizedMoeTrafficFaultForTest,
+    ) -> Result<()> {
+        self.cache
+            .inject_block_quantized_moe_traffic_fault_for_test(fault)
+    }
+
     pub(crate) fn disarm_block_quantized_moe_traffic(&mut self) -> Result<()> {
         self.reset_device_graph()?;
         self.cache.disarm_block_quantized_moe_traffic()
@@ -1004,6 +1016,9 @@ impl Executor {
             return Err(heterogeneous_api_error(
                 "mixed-provider device-graph capture",
             ));
+        }
+        if self.cap().device_graph_token.is_some() {
+            self.reset_device_graph()?;
         }
         let external = self.prepare_external_bindings(bindings)?;
         let result = self.run_scoped_mode(inputs, &HashMap::new(), &external, RunMode::Capture);
@@ -1025,6 +1040,14 @@ impl Executor {
                             ));
                         }
                     }
+                }
+                let token = self.cap().device_graph_token.ok_or_else(|| {
+                    SessionError::Internal(
+                        "device graph capture completed without an installation token".into(),
+                    )
+                })?;
+                for binding in bindings.iter_mut() {
+                    binding.set_device_graph_token(token);
                 }
                 self.cap_mut().device_graph_signature = Some(Self::binding_signature(bindings));
                 Ok(DeviceGraphCaptureResult::Captured(tensors))
@@ -1048,10 +1071,14 @@ impl Executor {
         if !self.bindings_match_graph_signature(bindings) {
             self.reset_device_graph()?;
             return Err(SessionError::Internal(
-                "device graph replay bindings changed shape, address, or I/O identity; graph was invalidated"
+                "device graph replay bindings changed logical/physical shape, logical-exposure \
+                 policy, address, or I/O identity; graph was invalidated"
                     .into(),
             ));
         }
+        let token = self.cap().device_graph_token.ok_or_else(|| {
+            SessionError::Internal("device graph replay has no installation token".into())
+        })?;
         // The installed graph for this slot can be reset out-of-band while our
         // host-side signature/schedule stays live: a kernel-variant eviction
         // retires kernels baked into a captured graph and resets BOTH the Primary
@@ -1062,7 +1089,7 @@ impl Executor {
         // hard-error ("no executable is installed"); detect it and report an
         // invalidation so the caller re-warms and re-captures, exactly as it does
         // for a control-flow branch flip.
-        if !self.ep.has_device_graph_in(self.graph_slot)? {
+        if !self.ep.has_owned_device_graph(token)? {
             self.reset_device_graph()?;
             return Ok(false);
         }
@@ -1077,7 +1104,19 @@ impl Executor {
             .as_ref()
             .is_none_or(CaptureSchedule::is_single_graph);
         if single_graph {
-            self.ep.replay_device_graph_in(self.graph_slot)?;
+            let mut validation_submission = DeviceValidationSubmission::begin(&self.ep)?;
+            if let Err(replay_error) = self.ep.replay_owned_device_graph(token) {
+                let validation = self.finish_device_validation_boundary();
+                validation_submission.disarm();
+                return match validation {
+                    Ok(()) => Err(replay_error.into()),
+                    Err(validation_error) => Err(SessionError::Internal(format!(
+                        "device graph replay failed: {replay_error}; deferred validation cleanup \
+                         also failed: {validation_error}"
+                    ))),
+                };
+            }
+            validation_submission.disarm();
             return Ok(true);
         }
         let external = self.prepare_external_bindings(bindings)?;
@@ -1101,12 +1140,21 @@ impl Executor {
         if self.heterogeneous.is_some() {
             return Err(heterogeneous_api_error("mixed-provider device-graph reset"));
         }
-        let cap = self.cap_mut();
-        cap.device_graph_signature = None;
-        cap.capture_schedule = None;
-        cap.capture_cf_shapes.clear();
-        cap.capture_warm_seeded.clear();
-        Ok(self.ep.reset_device_graph_in(self.graph_slot)?)
+        self.finish_device_validation_boundary()?;
+        let token = self.cap().device_graph_token;
+        let reset = match token {
+            Some(token) => self.ep.reset_owned_device_graph(token)?,
+            None => false,
+        };
+        if token.is_some() {
+            let cap = self.cap_mut();
+            cap.device_graph_token = None;
+            cap.device_graph_signature = None;
+            cap.capture_schedule = None;
+            cap.capture_cf_shapes.clear();
+            cap.capture_warm_seeded.clear();
+        }
+        Ok(reset)
     }
 
     /// Which of the EP's captured-graph slots this executor drives.
@@ -1163,7 +1211,7 @@ impl Executor {
     }
 
     pub(crate) fn check_device_capture_error(&self) -> Result<u32> {
-        Ok(self.ep.check_device_capture_error()?)
+        Ok(self.ep.consume_device_validation_error()?)
     }
 
     pub(crate) fn device_allocation_counts(&self) -> Option<DeviceAllocationCounts> {
@@ -1226,6 +1274,9 @@ impl Executor {
                 output_name: binding.output_name().map(str::to_string),
                 dtype: binding.dtype,
                 physical_shape: binding.physical_shape().to_vec(),
+                logical_shape: binding.logical_shape().to_vec(),
+                exposes_logical_input_shape: binding.exposes_logical_input_shape(),
+                mask_decode_freeze_safe: binding.mask_decode_freeze_safe(),
                 device_ptr: binding.device_ptr() as usize,
             })
             .collect()
@@ -1243,6 +1294,10 @@ impl Executor {
                             && expected.output_name.as_deref() == binding.output_name()
                             && expected.dtype == binding.dtype
                             && expected.physical_shape == binding.physical_shape()
+                            && expected.logical_shape == binding.logical_shape()
+                            && expected.exposes_logical_input_shape
+                                == binding.exposes_logical_input_shape()
+                            && expected.mask_decode_freeze_safe == binding.mask_decode_freeze_safe()
                             && expected.device_ptr == binding.device_ptr() as usize
                     })
             })
