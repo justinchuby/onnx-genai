@@ -1785,7 +1785,8 @@ fn label_seed(label: &str) -> u64 {
 // fail-closed rejection on a device mismatch, inert behavior on a capacity
 // mismatch (never fails inference), and multi-instance request/device isolation
 // with teardown accounting.
-mod route_telemetry {
+#[cfg(feature = "gpu-tests")]
+mod route_telemetry_impl {
     use super::*;
     use onnx_runtime_ep_api::Kernel;
     use onnx_runtime_ep_cuda::kernels::block_quantized_moe::{
@@ -1971,12 +1972,7 @@ mod route_telemetry {
         ep.runtime().ordinal()
     }
 
-    #[cfg_attr(
-        not(feature = "gpu-tests"),
-        ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
-    )]
-    #[test]
-    fn telemetry_off_on_output_is_byte_identical() {
+    pub(super) fn telemetry_off_on_output_is_byte_identical() {
         let ep = require_cuda();
         for rows in [1usize, 5] {
             let config = telemetry_config(rows);
@@ -2002,12 +1998,7 @@ mod route_telemetry {
         }
     }
 
-    #[cfg_attr(
-        not(feature = "gpu-tests"),
-        ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
-    )]
-    #[test]
-    fn telemetry_bitmap_matches_cpu_oracle_decode_and_prefill() {
+    pub(super) fn telemetry_bitmap_matches_cpu_oracle_decode_and_prefill() {
         let ep = require_cuda();
         for rows in [1usize, 6] {
             let config = telemetry_config(rows);
@@ -2040,12 +2031,7 @@ mod route_telemetry {
         }
     }
 
-    #[cfg_attr(
-        not(feature = "gpu-tests"),
-        ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
-    )]
-    #[test]
-    fn telemetry_eager_calls_accumulate_union_within_window() {
+    pub(super) fn telemetry_eager_calls_accumulate_union_within_window() {
         let ep = require_cuda();
         let config = telemetry_config(4);
         let mut inputs = build_inputs(&config, 0xC0FFEE);
@@ -2113,12 +2099,7 @@ mod route_telemetry {
         );
     }
 
-    #[cfg_attr(
-        not(feature = "gpu-tests"),
-        ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
-    )]
-    #[test]
-    fn telemetry_boundary_reset_increments_epoch_and_starts_empty_window() {
+    pub(super) fn telemetry_boundary_reset_increments_epoch_and_starts_empty_window() {
         let ep = require_cuda();
         let config = telemetry_config(4);
         let mut inputs = build_inputs(&config, 0xB0);
@@ -2160,12 +2141,7 @@ mod route_telemetry {
         assert!(!after.overflow());
     }
 
-    #[cfg_attr(
-        not(feature = "gpu-tests"),
-        ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
-    )]
-    #[test]
-    fn telemetry_bqmoe_route_matches_oracle_for_m_1_2_4_8() {
+    pub(super) fn telemetry_bqmoe_route_matches_oracle_for_m_1_2_4_8() {
         // BQMoE token counts M in {1,2,4,8} (issue #1810 §5): the fused route
         // bitmap and count must match the CPU oracle at every M.
         let ep = require_cuda();
@@ -2202,12 +2178,7 @@ mod route_telemetry {
         }
     }
 
-    #[cfg_attr(
-        not(feature = "gpu-tests"),
-        ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
-    )]
-    #[test]
-    fn telemetry_device_mismatch_fails_closed_without_failing_inference() {
+    pub(super) fn telemetry_device_mismatch_fails_closed_without_failing_inference() {
         let ep = require_cuda();
         let config = telemetry_config(2);
         let inputs = build_inputs(&config, 0xD00D);
@@ -2229,12 +2200,7 @@ mod route_telemetry {
         assert!(kernel.route_telemetry_snapshot().unwrap().is_none());
     }
 
-    #[cfg_attr(
-        not(feature = "gpu-tests"),
-        ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
-    )]
-    #[test]
-    fn telemetry_capacity_mismatch_is_inert_and_never_fails_inference() {
+    pub(super) fn telemetry_capacity_mismatch_is_inert_and_never_fails_inference() {
         let ep = require_cuda();
         let config = telemetry_config(2);
         let mut inputs = build_inputs(&config, 0xFEED);
@@ -2257,12 +2223,7 @@ mod route_telemetry {
         assert!(snapshot.bitmap.iter().all(|&word| word == 0));
     }
 
-    #[cfg_attr(
-        not(feature = "gpu-tests"),
-        ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
-    )]
-    #[test]
-    fn telemetry_multi_instance_request_isolation_and_accounting() {
+    pub(super) fn telemetry_multi_instance_request_isolation_and_accounting() {
         let ep = require_cuda();
         let config = telemetry_config(3);
         let mut inputs = build_inputs(&config, 0x5EED);
@@ -2306,5 +2267,88 @@ mod route_telemetry {
         assert!(kernel_a.route_telemetry_snapshot().unwrap().is_none());
         let out = exec_eager(&ep, &kernel_a, &config, &inputs).unwrap();
         assert_eq!(out.len(), config.rows * config.hidden * 4);
+    }
+}
+
+mod route_telemetry {
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+    )]
+    #[test]
+    fn telemetry_off_on_output_is_byte_identical() {
+        #[cfg(feature = "gpu-tests")]
+        super::route_telemetry_impl::telemetry_off_on_output_is_byte_identical();
+    }
+
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+    )]
+    #[test]
+    fn telemetry_bitmap_matches_cpu_oracle_decode_and_prefill() {
+        #[cfg(feature = "gpu-tests")]
+        super::route_telemetry_impl::telemetry_bitmap_matches_cpu_oracle_decode_and_prefill();
+    }
+
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+    )]
+    #[test]
+    fn telemetry_eager_calls_accumulate_union_within_window() {
+        #[cfg(feature = "gpu-tests")]
+        super::route_telemetry_impl::telemetry_eager_calls_accumulate_union_within_window();
+    }
+
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+    )]
+    #[test]
+    fn telemetry_boundary_reset_increments_epoch_and_starts_empty_window() {
+        #[cfg(feature = "gpu-tests")]
+        super::route_telemetry_impl::telemetry_boundary_reset_increments_epoch_and_starts_empty_window();
+    }
+
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+    )]
+    #[test]
+    fn telemetry_bqmoe_route_matches_oracle_for_m_1_2_4_8() {
+        #[cfg(feature = "gpu-tests")]
+        super::route_telemetry_impl::telemetry_bqmoe_route_matches_oracle_for_m_1_2_4_8();
+    }
+
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+    )]
+    #[test]
+    fn telemetry_device_mismatch_fails_closed_without_failing_inference() {
+        #[cfg(feature = "gpu-tests")]
+        super::route_telemetry_impl::telemetry_device_mismatch_fails_closed_without_failing_inference();
+    }
+
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+    )]
+    #[test]
+    fn telemetry_capacity_mismatch_is_inert_and_never_fails_inference() {
+        #[cfg(feature = "gpu-tests")]
+        super::route_telemetry_impl::telemetry_capacity_mismatch_is_inert_and_never_fails_inference(
+        );
+    }
+
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+    )]
+    #[test]
+    fn telemetry_multi_instance_request_isolation_and_accounting() {
+        #[cfg(feature = "gpu-tests")]
+        super::route_telemetry_impl::telemetry_multi_instance_request_isolation_and_accounting();
     }
 }
