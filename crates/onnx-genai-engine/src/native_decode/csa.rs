@@ -159,10 +159,9 @@ impl std::fmt::Display for CompressedStateLoadRefusal {
                 role_name(*role)
             ),
             Self::UnsupportedDevice => formatter.write_str(
-                "compressed-attention record state is unsupported by native CUDA: the current \
-                 persistent-state path cannot represent per-layer rank-3 record axes, packed \
-                 uint8 records, or compression-cadence cursor advancement; use native CPU or \
-                 the CUDA state implementation owned by stacked PR #2194",
+                "compressed-attention record state requires the native CUDA state implementation, \
+                 but this build does not include the 'native-cuda' feature; rebuild with \
+                 '--features native-cuda' or use native CPU",
             ),
         }
     }

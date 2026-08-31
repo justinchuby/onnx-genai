@@ -12,7 +12,7 @@
     clippy::err_expect,
     clippy::clone_on_copy
 )]
-//! GPU parity tests for `pkg.nxrt::CompressedSparseAttention` v1 (host-staged).
+//! GPU parity tests for `pkg.nxrt::CompressedSparseAttention` v1.
 //!
 //! Each case builds a single-node model with the `onnx-runtime-ir` graph API and
 //! runs the SAME inputs through both the CPU CSA kernel (the authoritative
@@ -238,6 +238,23 @@ fn ratio128_inputs(
         total_len,
         sink.clone(),
     ]
+}
+
+fn ratio128_carry_for_positions(start: usize, count: usize) -> HostTensor {
+    let mut carry = vec![0.0f32; RATIO * 2 * DIM];
+    for slot in 0..RATIO {
+        for d in 0..DIM {
+            carry[(slot * 2 + 1) * DIM + d] = f32::NEG_INFINITY;
+        }
+    }
+    for position in start..start + count {
+        let slot = position % RATIO;
+        for d in 0..DIM {
+            carry[(slot * 2) * DIM + d] = compressor_value(position, d);
+            carry[(slot * 2 + 1) * DIM + d] = compressor_score(position, d);
+        }
+    }
+    HostTensor::f32(&[1, RATIO, 2, DIM], &carry)
 }
 
 fn ratio128_node(inputs: &[HostTensor], next_records: usize) -> (Graph, NodeId) {
@@ -984,9 +1001,9 @@ fn ratio128_fp8_decode_capture_replay_matches_cpu() {
 //
 // With cache_format="f32", `present_compressed_kv` is the f32 dequantized
 // candidate-record buffer, so the CUDA kernel runs stage-6 (candidate read) +
-// stage-7 (sparse sink-softmax attention) on device (compression/state stay
-// host). Y must match the CPU oracle bit-for-bit (ULP=0). The all-Host fp8
-// tests above stay green (the device path only engages for f32 cache).
+// stage-7 (sparse sink-softmax attention) on device, and the ratio-128
+// compressor emits the logical dequantized record there as well. Y and state
+// must match the CPU oracle bit-for-bit (ULP=0).
 // ---------------------------------------------------------------------------
 
 /// f32-record ratio-128 node: cache_format="f32", `present_compressed_kv` is
@@ -1126,7 +1143,7 @@ fn run_step_f32(
         ulp, 0,
         "device sink-softmax attention Y must match the CPU oracle bit-for-bit"
     );
-    // State stays host-staged, so it is byte-identical to the oracle.
+    // Device compression must emit the same logical dequantized record bytes.
     assert_eq!(gpu[1], cpu[1], "present_compressed_kv must match exactly");
     assert_f32_close(&gpu[2], &cpu[2], 1e-4, "present_compression_carry");
 
@@ -1177,6 +1194,24 @@ fn ratio128_f32_device_attention_matches_cpu() {
     let decode2 = ratio128_inputs(1, 127, 0, 128, 128, &ape, &norm, &sink, &after_decode1);
     let (_, _, after_decode2) = run_step_f32(&ep, &decode2, 1);
     assert_eq!(after_decode2.cache.shape, vec![1, 1, DIM]);
+    let at_129 = ratio128_inputs(1, 128, 1, 128, 129, &ape, &norm, &sink, &after_decode2);
+    let (_, _, after_129) = run_step_f32(&ep, &at_129, 1);
+    assert_eq!(after_129.cache.shape, vec![1, 1, DIM]);
+
+    // Seed the contract-valid carry immediately before the second boundary:
+    // record 0 is the exact first-boundary output and slots 0..125 hold
+    // positions 128..253, while the two unwritten slots remain -infinity.
+    // This keeps the boundary assertions focused and avoids conflating them
+    // with unrelated multi-query prefill reduction-order coverage.
+    let after_254 = CsaState {
+        cache: after_decode2.cache.clone(),
+        carry: ratio128_carry_for_positions(128, 126),
+    };
+    let at_255 = ratio128_inputs(1, 254, 127, 128, 255, &ape, &norm, &sink, &after_254);
+    let (_, _, after_255) = run_step_f32(&ep, &at_255, 1);
+    let at_256 = ratio128_inputs(1, 255, 128, 128, 256, &ape, &norm, &sink, &after_255);
+    let (_, _, after_256) = run_step_f32(&ep, &at_256, 2);
+    assert_eq!(after_256.cache.shape, vec![1, 2, DIM]);
 }
 
 #[cfg_attr(

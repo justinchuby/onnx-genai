@@ -1069,6 +1069,7 @@ impl Executor {
         if self.heterogeneous.is_some() {
             return Err(heterogeneous_api_error("mixed-provider device-graph reset"));
         }
+        self.cache.captured_nodes.clear();
         let cap = self.cap_mut();
         cap.device_graph_signature = None;
         cap.capture_schedule = None;
@@ -1250,6 +1251,9 @@ impl Executor {
                     "device binding '{input_name}' needs {required} bytes for {physical_shape:?}, allocation has {len}"
                 )));
             }
+            let fixed_strides = binding
+                .fixed_physical_strides()
+                .then(|| compute_contiguous_strides(physical_shape));
             let ptr = binding.buffer_mut().as_mut_ptr();
             if bind_input {
                 let input_vid = *self.input_index.get(&input_name).ok_or_else(|| {
@@ -1265,6 +1269,7 @@ impl Executor {
                         binding.kernel_input_shape().to_vec()
                     },
                     accepts_subshape: false,
+                    strides: fixed_strides.clone(),
                     ptr,
                     len,
                     alignment,
@@ -1310,6 +1315,7 @@ impl Executor {
                     shape: binding.physical_shape().to_vec(),
                     accepts_subshape: bind_input
                         && binding.logical_shape() != binding.physical_shape(),
+                    strides: fixed_strides.clone(),
                     ptr,
                     len,
                     alignment,

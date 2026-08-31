@@ -657,8 +657,17 @@ impl NativeDecodeSession {
         )?;
         csa::refuse_compressed_records_on_cuda(
             io.map(|io| io.state_groups.as_slice()).unwrap_or_default(),
-            session.device_id().device_type == DeviceType::Cuda,
+            session.device_id().device_type == DeviceType::Cuda && !cfg!(feature = "native-cuda"),
         )?;
+        let csa_record_specs = compressed_state
+            .records()
+            .map(|spec| CsaRecordBindingSpec {
+                past: spec.input.clone(),
+                present: spec.output.clone(),
+                role: spec.role,
+                ratio: spec.ratio,
+            })
+            .collect::<Vec<_>>();
         // Only the fixed carries and hybrid recurrent states are wholesale-swap
         // "fixed" state; the growable CSA record buffers are explicitly excluded
         // so the CUDA/accounting/growth paths treat them as growable, matching
@@ -834,6 +843,7 @@ impl NativeDecodeSession {
                 &session,
                 &present_to_past,
                 &fixed_state_inputs,
+                &csa_record_specs,
             )?;
             let device_memory = cuda_device_memory_snapshot(session.device_id().index as i32).ok();
             let max_len = match cuda_options.kv_max_len {
@@ -900,6 +910,7 @@ impl NativeDecodeSession {
                 },
                 &present_to_past,
                 &fixed_state_inputs,
+                &csa_record_specs,
                 capacity,
                 graph_capture,
                 position_rank,

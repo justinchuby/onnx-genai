@@ -514,6 +514,7 @@ impl Executor {
         let mut ctx = KernelDispatchContext {
             ep: &ep,
             graph: &self.graph,
+            external,
             weight_handles: &self.weight_handles,
             expert_region_candidates: &self.expert_region_candidates,
             buffers: &mut self.buffers,
@@ -719,9 +720,16 @@ impl Executor {
 
         // Take output buffers out so they can be borrowed `&mut` disjointly from
         // the input reads (SSA guarantees outputs are disjoint from inputs).
-        let out_strides: Vec<Vec<i64>> = output_shapes
+        let out_strides: Vec<Vec<i64>> = outputs
             .iter()
-            .map(|s| compute_contiguous_strides(s))
+            .zip(&output_shapes)
+            .map(|(value_id, shape)| {
+                external
+                    .outputs
+                    .get(value_id)
+                    .and_then(|value| value.strides.clone())
+                    .unwrap_or_else(|| compute_contiguous_strides(shape))
+            })
             .collect();
         let (out_bufs, mut outs) = ctx.build_output_bindings(
             outputs,
@@ -1040,7 +1048,10 @@ impl Executor {
                 .get(&vid)
                 .or_else(|| external.outputs.get(&vid))
             {
-                let strides = compute_contiguous_strides(&value.shape);
+                let strides = value
+                    .strides
+                    .clone()
+                    .unwrap_or_else(|| compute_contiguous_strides(&value.shape));
                 view_bounds(&value.shape, &strides, 0, value.dtype, value.len)?;
                 in_infos.push(InInfo {
                     present: true,
@@ -1146,11 +1157,37 @@ impl Executor {
                 continue;
             }
             let root = self.root_of(vid);
-            let buf = self.buffers.get(&root).ok_or_else(|| {
-                SessionError::Internal(format!("missing buffer for input value#{}", vid.0))
-            })?;
-            let root_len = buf.len();
-            let base_ptr = buf.as_ptr();
+            let external_root = external
+                .inputs
+                .get(&root)
+                .or_else(|| external.outputs.get(&root));
+            let (root_len, base_ptr, device, backing) = if let Some(value) = external_root {
+                (
+                    value.len,
+                    value.ptr.cast_const(),
+                    value.device,
+                    TensorBacking::Opaque,
+                )
+            } else {
+                let buf = self.buffers.get(&root).ok_or_else(|| {
+                    SessionError::Internal(format!("missing buffer for input value#{}", vid.0))
+                })?;
+                let backing = self
+                    .graph
+                    .initializers
+                    .get(&root)
+                    .filter(|_| buf.is_borrowed())
+                    .and_then(|weight| self.weights.external_mmap_provenance(weight))
+                    .map(|(mapping_id, offset, len)| {
+                        TensorBacking::ExternalMmap(ExternalMmapRegion {
+                            mapping_id,
+                            offset,
+                            len,
+                        })
+                    })
+                    .unwrap_or(TensorBacking::Opaque);
+                (buf.len(), buf.as_ptr(), buf.device(), backing)
+            };
             let (shape, strides, byte_offset) = match self.views.get(&vid) {
                 Some(view) => (view.shape.clone(), view.strides.clone(), view.byte_offset),
                 None => {
@@ -1160,20 +1197,6 @@ impl Executor {
                 }
             };
             view_bounds(&shape, &strides, byte_offset, input_dtypes[i], root_len)?;
-            let backing = self
-                .graph
-                .initializers
-                .get(&root)
-                .filter(|_| buf.is_borrowed())
-                .and_then(|weight| self.weights.external_mmap_provenance(weight))
-                .map(|(mapping_id, offset, len)| {
-                    TensorBacking::ExternalMmap(ExternalMmapRegion {
-                        mapping_id,
-                        offset,
-                        len,
-                    })
-                })
-                .unwrap_or(TensorBacking::Opaque);
             in_infos.push(InInfo {
                 present: true,
                 dtype: input_dtypes[i],
@@ -1181,7 +1204,7 @@ impl Executor {
                 strides,
                 byte_offset,
                 base_ptr,
-                device: buf.device(),
+                device,
                 backing,
                 root_len,
                 lazy_unresolved: false,
@@ -1377,6 +1400,7 @@ fn materialize_strided_inputs(
 struct KernelDispatchContext<'a> {
     ep: &'a Arc<dyn ExecutionProvider>,
     graph: &'a Graph,
+    external: &'a ExternalBindings,
     weight_handles: &'a HashMap<ValueId, WeightHandle>,
     expert_region_candidates: &'a HashMap<ValueId, onnx_runtime_loader::WeightRegionCatalog>,
     buffers: &'a mut HashMap<ValueId, DeviceBuffer>,
@@ -1468,9 +1492,20 @@ impl KernelDispatchContext<'_> {
                 Some(v) => v.source,
                 None => in_vid,
             };
-            let root_len = self.buffers.get(&root).map(|b| b.len()).ok_or_else(|| {
-                SessionError::Internal(format!("view source value#{} has no buffer", root.0))
-            })?;
+            let root_len = self
+                .buffers
+                .get(&root)
+                .map(|buffer| buffer.len())
+                .or_else(|| {
+                    self.external
+                        .inputs
+                        .get(&root)
+                        .or_else(|| self.external.outputs.get(&root))
+                        .map(|value| value.len)
+                })
+                .ok_or_else(|| {
+                    SessionError::Internal(format!("view source value#{} has no buffer", root.0))
+                })?;
             // Bounds-gate the composed view against the source allocation.
             view_bounds(
                 &spec.shape,

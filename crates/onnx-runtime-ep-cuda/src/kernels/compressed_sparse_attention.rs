@@ -38,7 +38,9 @@ use std::sync::{Arc, Mutex};
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 use onnx_runtime_ep_api::{Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ep_cpu::kernels::compressed_sparse_attention::CompressedSparseAttentionFactory as CpuCsaFactory;
-use onnx_runtime_ir::{DataType, DeviceId, Dim, Node, Shape, as_static_shape};
+use onnx_runtime_ir::{
+    DataType, DeviceId, Dim, Node, Shape, as_static_shape, compute_contiguous_strides,
+};
 
 use crate::error::{driver_err, not_implemented};
 use crate::kernels::block_quant;
@@ -175,19 +177,21 @@ extern "C" __global__ void csa_ratio128_compress(
     const float* kv, const float* gate, const float* ape, const float* norm,
     const float* past_carry, const unsigned char* past_cache,
     float* carry, unsigned char* cache,
-    int batch, int sequence, int dim, int past_records, int cache_records, int cache_fp8,
+    int batch, int sequence, int dim, int past_row_records, int cache_row_records, int cache_fp8,
     const long long* total_ptr)
 {
     const int b = blockIdx.x;
     if (b >= batch || threadIdx.x != 0) return;
     const long long start = *total_ptr - (long long)sequence;
+    const int past_records = (int)(start / 128);
+    const int cache_records = (int)(*total_ptr / 128);
     const int carry_stride = 2 * 128 * dim;
     const int cache_width = cache_fp8 ? 583 : dim * 4;
     // The graph outputs are the next state.  Copy only the old records/carry;
     // newly completed records are written below.
     for (int i = 0; i < carry_stride; ++i) carry[b * carry_stride + i] = past_carry[b * carry_stride + i];
     for (int i = 0; i < past_records * cache_width; ++i)
-        cache[b * cache_records * cache_width + i] = past_cache[b * past_records * cache_width + i];
+        cache[b * cache_row_records * cache_width + i] = past_cache[b * past_row_records * cache_width + i];
     if (start == 0) {
         // A completed ratio-128 block consumes every slot.  Clear the complete
         // block after finalizing it (the next token writes only its own slot).
@@ -241,7 +245,7 @@ extern "C" __global__ void csa_ratio128_compress(
         }
         const int out = past_records + emitted++;
         if (cache_fp8) {
-            unsigned char* dst = cache + (b * cache_records + out) * 583;
+            unsigned char* dst = cache + (b * cache_row_records + out) * 583;
             for (int block = 0; block < 7; ++block)
                 quantize_fp8_e4m3_block(record + block * 64, dst + block * 65, dst + block * 65 + 1);
             for (int d = 0; d < 64; ++d) {
@@ -250,7 +254,18 @@ extern "C" __global__ void csa_ratio128_compress(
                 dst[455 + 2 * d + 1] = (unsigned char)(bits >> 8);
             }
         } else {
-            float* dst = (float*)cache + (b * cache_records + out) * dim;
+            float* dst = (float*)cache + (b * cache_row_records + out) * dim;
+            // The f32 cache is the logical dequantized view of the frozen
+            // FP8/BF16 record format, not the pre-quantization RMSNorm row.
+            // Preserve the same block quantize/dequantize step as the CPU
+            // oracle before exposing the non-RoPE values.
+            for (int block = 0; block < 7; ++block) {
+                unsigned char scale, packed[64];
+                quantize_fp8_e4m3_block(record + block * 64, &scale, packed);
+                const float scale_value = e8m0_scale(scale);
+                for (int d = 0; d < 64; ++d)
+                    record[block * 64 + d] = decode_e4m3fn(packed[d]) * scale_value;
+            }
             for (int d = 0; d < dim; ++d) dst[d] = record[d];
         }
         for (int reset_slot = 0; reset_slot < 128; ++reset_slot)
@@ -273,17 +288,18 @@ extern "C" __global__ void csa_ratio4_index_compress(
     const float* kv, const float* gate, const float* ape, const float* norm,
     const unsigned char* past_key, const float* past_carry,
     unsigned char* key, float* carry,
-    int batch, int sequence, int dim, int rope_dim, int past_records, int key_records,
+    int batch, int sequence, int dim, int rope_dim, int past_row_records, int key_row_records,
     const long long* total_ptr)
 {
     const int b = blockIdx.x;
     if (b >= batch || threadIdx.x != 0) return;
     const long long start = *total_ptr - (long long)sequence;
+    const int past_records = (int)(start / 4);
     const int source_width = 2 * dim;
     const int carry_stride = 8 * 2 * source_width;
     for (int i = 0; i < carry_stride; ++i) carry[b * carry_stride + i] = past_carry[b * carry_stride + i];
     for (int i = 0; i < past_records * 68; ++i)
-        key[(b * key_records) * 68 + i] = past_key[(b * past_records) * 68 + i];
+        key[(b * key_row_records) * 68 + i] = past_key[(b * past_row_records) * 68 + i];
     const float NEG = __int_as_float(0xff800000);
     if (start == 0) {
         for (int slot = 0; slot < 8; ++slot)
@@ -354,7 +370,7 @@ extern "C" __global__ void csa_ratio4_index_compress(
                 }
         const float hadamard_scale = __frcp_rn(__fsqrt_rn((float)dim));
         for (int d = 0; d < dim; ++d) record[d] = csa_index_bf16(__fmul_rn(record[d], hadamard_scale));
-        unsigned char* dst = key + (b * key_records + past_records + emitted++) * 68;
+        unsigned char* dst = key + (b * key_row_records + past_records + emitted++) * 68;
         for (int block = 0; block < 4; ++block)
             quantize_fp4_e2m1_block(record + 32 * block, dst + 17 * block, dst + 17 * block + 1);
 
@@ -381,12 +397,13 @@ extern "C" __global__ void csa_ratio4_main_compress(
     const float* kv, const float* gate, const float* ape, const float* norm,
     const unsigned char* past_cache, const float* past_carry,
     unsigned char* cache, float* carry,
-    int batch, int sequence, int dim, int rope_dim, int past_records, int cache_records,
+    int batch, int sequence, int dim, int rope_dim, int past_row_records, int cache_row_records,
     const long long* total_ptr)
 {
     const int b = blockIdx.x;
     if (b >= batch || threadIdx.x != 0) return;
     const long long start = *total_ptr - (long long)sequence;
+    const int past_records = (int)(start / 4);
     const int source_width = 2 * dim;
     const int carry_stride = 8 * 2 * source_width;
     const int cache_width = 583;
@@ -394,7 +411,7 @@ extern "C" __global__ void csa_ratio4_main_compress(
     // completed records are written below (stable-address, in-place update).
     for (int i = 0; i < carry_stride; ++i) carry[b * carry_stride + i] = past_carry[b * carry_stride + i];
     for (int i = 0; i < past_records * cache_width; ++i)
-        cache[(b * cache_records) * cache_width + i] = past_cache[(b * past_records) * cache_width + i];
+        cache[(b * cache_row_records) * cache_width + i] = past_cache[(b * past_row_records) * cache_width + i];
     const float NEG = __int_as_float(0xff800000);
     if (start == 0) {
         for (int slot = 0; slot < 8; ++slot)
@@ -459,7 +476,7 @@ extern "C" __global__ void csa_ratio4_main_compress(
             record[d] = csa_main4_bf16(__fsub_rn(__fmul_rn(re, cs), __fmul_rn(im, sn)));
             record[d + 1] = csa_main4_bf16(__fadd_rn(__fmul_rn(re, sn), __fmul_rn(im, cs)));
         }
-        unsigned char* dst = cache + (b * cache_records + past_records + emitted++) * cache_width;
+        unsigned char* dst = cache + (b * cache_row_records + past_records + emitted++) * cache_width;
         for (int block = 0; block < 7; ++block)
             quantize_fp8_e4m3_block(record + block * 64, dst + block * 65, dst + block * 65 + 1);
         for (int d = 0; d < rope_dim; ++d) {
@@ -535,7 +552,7 @@ extern "C" __global__ void csa_ratio4_index_select(
     float* scores,                   // [batch, sequence, records] scratch
     int* selected,                   // [batch, sequence, topk_width] scratch
     int batch, int sequence, int index_heads, int index_dim, int rope_dim,
-    int records, const long long* total_ptr, int topk_width)
+    int record_capacity, const long long* total_ptr, int topk_width)
 {
     const int bs = blockIdx.x;
     if (bs >= batch * sequence || threadIdx.x != 0) return;
@@ -545,7 +562,7 @@ extern "C" __global__ void csa_ratio4_index_select(
     const long long start = *total_ptr - (long long)sequence;
     const long long position = start + (long long)s;
     long long valid_ll = (position + 1) / 4;
-    int limit = records;
+    int limit = record_capacity;
     if (valid_ll < (long long)limit) limit = (int)valid_ll;
     if (limit < 0) limit = 0;
 
@@ -599,9 +616,9 @@ extern "C" __global__ void csa_ratio4_index_select(
 
     // Stage 4: score each causal candidate record.
     const int weight_row = (b * sequence + s) * index_heads;
-    float* row_scores = scores + ((long long)(b * sequence + s) * records);
+    float* row_scores = scores + ((long long)(b * sequence + s) * record_capacity);
     for (int record = 0; record < limit; ++record) {
-        const unsigned char* key = index_key + ((long long)b * records + record) * 68;
+        const unsigned char* key = index_key + ((long long)b * record_capacity + record) * 68;
         float score = 0.0f;
         for (int head = 0; head < index_heads; ++head) {
             const float* q = transformed + ((long long)bs * query_stride) + (long long)head * index_dim;
@@ -678,7 +695,7 @@ extern "C" __global__ void csa_ratio128_sink_attention(
     int batch, int sequence, int heads, int dim,
     int current_kv_len,
     const long long* total_ptr,
-    int compressed_records,
+    int compressed_capacity,
     int scratch_stride,
     int cache_fp8,
     int bias_present, int bias_b, int bias_h, int bias_s, int bias_k,
@@ -698,14 +715,14 @@ extern "C" __global__ void csa_ratio128_sink_attention(
     const long long current_kv_base = total - (long long)current_kv_len;
     int dense_candidates = 128;
     if (query_start == 0) dense_candidates = current_kv_len < 128 ? current_kv_len : 128;
-    const int candidate_count = dense_candidates + compressed_records;
     const long long position = query_start + (long long)s;
     long long window = position + 1 - 128;
     if (window < 0) window = 0;
     const long long dense_start = current_kv_base > window ? current_kv_base : window;
     const long long valid_compressed = (position + 1) / 128;
-    int comp_limit = compressed_records < (int)valid_compressed
-        ? compressed_records : (int)valid_compressed;
+    int comp_limit = compressed_capacity < (int)valid_compressed
+        ? compressed_capacity : (int)valid_compressed;
+    const int candidate_count = dense_candidates + comp_limit;
 
     float* row_scores = scores + (long long)row * scratch_stride;
     const long long q_base = ((long long)(b * sequence + s) * heads + h) * dim;
@@ -743,7 +760,7 @@ extern "C" __global__ void csa_ratio128_sink_attention(
             float acc = 0.0f;
             if (cache_fp8) {
                 const unsigned char* packed = compressed
-                    + ((long long)b * compressed_records + rec) * 583;
+                    + ((long long)b * compressed_capacity + rec) * 583;
                 for (int block = 0; block < 7; ++block) {
                     const float block_scale = e8m0_scale(packed[65 * block]);
                     for (int d = 0; d < 64; ++d)
@@ -759,7 +776,7 @@ extern "C" __global__ void csa_ratio128_sink_attention(
                 }
             } else {
                 const float* kv = (const float*)compressed
-                    + ((long long)b * compressed_records + rec) * dim;
+                    + ((long long)b * compressed_capacity + rec) * dim;
                 for (int d = 0; d < dim; ++d)
                     acc = __fadd_rn(acc, __fmul_rn(query[q_base + d], kv[d]));
             }
@@ -815,7 +832,7 @@ extern "C" __global__ void csa_ratio128_sink_attention(
                 const int rec = c - dense_candidates;
                 if (cache_fp8) {
                     const unsigned char* packed = compressed
-                        + ((long long)b * compressed_records + rec) * 583;
+                        + ((long long)b * compressed_capacity + rec) * 583;
                     if (d < 448) {
                         const int block = d / 64, in_block = d % 64;
                         val = decode_e4m3fn(packed[65 * block + 1 + in_block])
@@ -828,7 +845,7 @@ extern "C" __global__ void csa_ratio128_sink_attention(
                     }
                 } else {
                     val = ((const float*)compressed)
-                        [(((long long)b * compressed_records + rec) * dim) + d];
+                        [(((long long)b * compressed_capacity + rec) * dim) + d];
                 }
             }
             result = __fadd_rn(result, __fmul_rn(prob, val));
@@ -842,7 +859,7 @@ extern "C" __global__ void csa_ratio4_sink_attention(
     const float* query, const float* current_kv, const unsigned char* compressed,
     const int* selected, const float* sink, const float* bias, float* output, float* scores,
     int batch, int sequence, int heads, int dim, int current_kv_len,
-    const long long* total_ptr, int compressed_records,
+    const long long* total_ptr, int compressed_capacity,
     int index_heads, int topk_width, int scratch_stride,
     int bias_present, int bias_b, int bias_h, int bias_s, int bias_k, float scale)
 {
@@ -856,6 +873,7 @@ extern "C" __global__ void csa_ratio4_sink_attention(
     const float NEG = __int_as_float(0xff800000);
     // B6: derive the logical cursors on device from `total_sequence_length`.
     const long long total = *total_ptr;
+    const int valid_records = (int)(total / 4);
     const long long query_start = total - (long long)sequence;
     const long long current_kv_base = total - (long long)current_kv_len;
     int dense_candidates = 128;
@@ -895,8 +913,8 @@ extern "C" __global__ void csa_ratio4_sink_attention(
         }
         for (int slot = 0; slot < topk_width; ++slot) {
             const int record = selected[selected_base + slot];
-            if (record < 0 || record >= compressed_records) continue;
-            const unsigned char* packed = compressed + ((long long)b * compressed_records + record) * 583;
+            if (record < 0 || record >= valid_records) continue;
+            const unsigned char* packed = compressed + ((long long)b * compressed_capacity + record) * 583;
             float acc = 0.0f;
             for (int block = 0; block < 7; ++block) {
                 const float block_scale = e8m0_scale(packed[65 * block]);
@@ -949,7 +967,7 @@ extern "C" __global__ void csa_ratio4_sink_attention(
                 value = current_kv[((long long)b * current_kv_len + relative) * dim + d];
             } else {
                 const int record = selected[selected_base + c - dense_candidates];
-                const unsigned char* packed = compressed + ((long long)b * compressed_records + record) * 583;
+                const unsigned char* packed = compressed + ((long long)b * compressed_capacity + record) * 583;
                 if (d < 448) {
                     const int block = d / 64, in_block = d % 64;
                     value = decode_e4m3fn(packed[65 * block + 1 + in_block])
@@ -1039,8 +1057,9 @@ impl KernelFactory for CompressedSparseAttentionFactory {
         let device_index_scoring = ratio == 4;
         let device_attention =
             ratio == 128 && matches!(cache_format.as_str(), "f32" | "fp8_e4m3_block64");
-        let device_resident_ratio128 =
-            ratio == 128 && cache_format == "fp8_e4m3_block64" && node.outputs.len() == 3;
+        let device_resident_ratio128 = ratio == 128
+            && matches!(cache_format.as_str(), "f32" | "fp8_e4m3_block64")
+            && node.outputs.len() == 3;
         // B6: ratio-4 main KV compression (outputs 1/2) on device — the last
         // host-staged ratio-4 stage. With it the whole ratio-4 decode is
         // device-resident.
@@ -1181,6 +1200,222 @@ struct CompressedSparseAttentionKernel {
     golden_capture: CsaGoldenCapture,
 }
 
+fn record_row_capacity(shape: &[usize], strides: &[i64], name: &str) -> Result<usize> {
+    if shape.len() != 3 || strides.len() != 3 || shape[2] == 0 {
+        return Err(not_implemented(format!(
+            "{OP}: {name} must be rank-3 [batch, records, width], got shape {shape:?} strides {strides:?}"
+        )));
+    }
+    let row_stride = usize::try_from(strides[0])
+        .map_err(|_| not_implemented(format!("{OP}: {name} has negative row stride")))?;
+    let record_stride = usize::try_from(strides[1])
+        .map_err(|_| not_implemented(format!("{OP}: {name} has negative record stride")))?;
+    if record_stride != shape[2] || strides[2] != 1 || !row_stride.is_multiple_of(record_stride) {
+        return Err(not_implemented(format!(
+            "{OP}: {name} requires fixed contiguous record rows, got shape {shape:?} strides {strides:?}"
+        )));
+    }
+    Ok(row_stride / record_stride)
+}
+
+fn dense_copy_chunks(
+    shape: &[usize],
+    strides: &[i64],
+    element_bytes: usize,
+    name: &str,
+) -> Result<Vec<(usize, std::ops::Range<usize>)>> {
+    if shape.len() != strides.len() {
+        return Err(not_implemented(format!(
+            "{OP}: {name} rank {} does not match stride rank {}",
+            shape.len(),
+            strides.len()
+        )));
+    }
+    if element_bytes == 0 {
+        return Err(not_implemented(format!(
+            "{OP}: {name} uses sub-byte storage, which the CUDA host-staged path cannot copy"
+        )));
+    }
+    if shape.contains(&0) {
+        return Ok(Vec::new());
+    }
+
+    let strides = strides
+        .iter()
+        .map(|&stride| {
+            usize::try_from(stride).map_err(|_| {
+                not_implemented(format!(
+                    "{OP}: {name} has negative stride {stride}; the CUDA host-staged path \
+                     requires non-negative storage geometry"
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut suffix_start = shape.len();
+    let mut chunk_elements = 1usize;
+    for axis in (0..shape.len()).rev() {
+        if strides[axis] != chunk_elements {
+            break;
+        }
+        suffix_start = axis;
+        chunk_elements = chunk_elements.checked_mul(shape[axis]).ok_or_else(|| {
+            not_implemented(format!(
+                "{OP}: {name} contiguous suffix overflows for shape {shape:?}"
+            ))
+        })?;
+    }
+    let chunk_bytes = chunk_elements.checked_mul(element_bytes).ok_or_else(|| {
+        not_implemented(format!(
+            "{OP}: {name} contiguous chunk byte size overflows for shape {shape:?}"
+        ))
+    })?;
+    let prefix_count = shape[..suffix_start]
+        .iter()
+        .try_fold(1usize, |count, &extent| count.checked_mul(extent))
+        .ok_or_else(|| {
+            not_implemented(format!(
+                "{OP}: {name} prefix count overflows for shape {shape:?}"
+            ))
+        })?;
+
+    let mut chunks = Vec::with_capacity(prefix_count);
+    for linear in 0..prefix_count {
+        let mut remainder = linear;
+        let mut source_elements = 0usize;
+        for axis in (0..suffix_start).rev() {
+            let coordinate = remainder % shape[axis];
+            remainder /= shape[axis];
+            source_elements = source_elements
+                .checked_add(coordinate.checked_mul(strides[axis]).ok_or_else(|| {
+                    not_implemented(format!(
+                        "{OP}: {name} source offset overflows for shape {shape:?} strides \
+                         {strides:?}"
+                    ))
+                })?)
+                .ok_or_else(|| {
+                    not_implemented(format!(
+                        "{OP}: {name} source offset overflows for shape {shape:?} strides \
+                         {strides:?}"
+                    ))
+                })?;
+        }
+        let source_bytes = source_elements.checked_mul(element_bytes).ok_or_else(|| {
+            not_implemented(format!(
+                "{OP}: {name} source byte offset overflows for shape {shape:?}"
+            ))
+        })?;
+        let dense_start = linear.checked_mul(chunk_bytes).ok_or_else(|| {
+            not_implemented(format!(
+                "{OP}: {name} dense byte offset overflows for shape {shape:?}"
+            ))
+        })?;
+        let dense_end = dense_start.checked_add(chunk_bytes).ok_or_else(|| {
+            not_implemented(format!(
+                "{OP}: {name} dense byte range overflows for shape {shape:?}"
+            ))
+        })?;
+        chunks.push((source_bytes, dense_start..dense_end));
+    }
+    Ok(chunks)
+}
+
+fn device_view_shape_to_dense_host(
+    runtime: &CudaRuntime,
+    input: &TensorView<'_>,
+    shape: &[usize],
+    name: &str,
+) -> Result<Vec<u8>> {
+    let element_bytes = input.dtype.byte_size();
+    let chunks = dense_copy_chunks(shape, input.strides, element_bytes, name)?;
+    let elements = shape
+        .iter()
+        .try_fold(1usize, |count, &extent| count.checked_mul(extent))
+        .ok_or_else(|| {
+            not_implemented(format!(
+                "{OP}: {name} logical element count overflows for shape {shape:?}"
+            ))
+        })?;
+    let dense_bytes = input.dtype.storage_bytes(elements);
+    let mut host = vec![0u8; dense_bytes];
+    let base = cuptr(input.data_ptr::<u8>() as *const c_void);
+    for (source_offset, destination) in chunks {
+        let source = base
+            .checked_add(
+                u64::try_from(source_offset).map_err(|_| {
+                    not_implemented(format!("{OP}: {name} device offset exceeds u64"))
+                })?,
+            )
+            .ok_or_else(|| not_implemented(format!("{OP}: {name} device address overflows")))?;
+        // SAFETY: `dense_copy_chunks` describes the logical view as disjoint
+        // dense chunks and the session bounds-gates the source geometry.
+        unsafe { runtime.dtoh(&mut host[destination], source)? };
+    }
+    Ok(host)
+}
+
+fn device_view_to_dense_host(
+    runtime: &CudaRuntime,
+    input: &TensorView<'_>,
+    name: &str,
+) -> Result<Vec<u8>> {
+    device_view_shape_to_dense_host(runtime, input, input.shape, name)
+}
+
+fn dense_host_to_device_view(
+    runtime: &CudaRuntime,
+    bytes: &[u8],
+    output: &mut TensorMut<'_>,
+    name: &str,
+) -> Result<()> {
+    let element_bytes = output.dtype.byte_size();
+    let chunks = dense_copy_chunks(output.shape, output.strides, element_bytes, name)?;
+    if bytes.len() != output.dtype.storage_bytes(output.numel()) {
+        return Err(not_implemented(format!(
+            "{OP}: {name} dense host payload has {} bytes, expected {} for {:?} {:?}",
+            bytes.len(),
+            output.dtype.storage_bytes(output.numel()),
+            output.dtype,
+            output.shape
+        )));
+    }
+    let base = cuptr(output.data_ptr_mut::<u8>() as *const c_void);
+    for (destination_offset, source) in chunks {
+        let destination = base
+            .checked_add(
+                u64::try_from(destination_offset).map_err(|_| {
+                    not_implemented(format!("{OP}: {name} device offset exceeds u64"))
+                })?,
+            )
+            .ok_or_else(|| not_implemented(format!("{OP}: {name} device address overflows")))?;
+        // SAFETY: `dense_copy_chunks` describes disjoint logical output chunks
+        // and the session bounds-gates the destination geometry.
+        unsafe { runtime.htod(&bytes[source], destination)? };
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod host_staging_layout_tests {
+    use super::dense_copy_chunks;
+
+    #[test]
+    fn fixed_batch_row_stride_copies_one_dense_chunk_per_row() {
+        let chunks = dense_copy_chunks(&[2, 2, 3], &[12, 3, 1], 1, "records").unwrap();
+        assert_eq!(chunks, vec![(0, 0..6), (12, 6..12)]);
+    }
+
+    #[test]
+    fn contiguous_tensor_copies_as_one_chunk_and_negative_stride_fails_closed() {
+        assert_eq!(
+            dense_copy_chunks(&[2, 2, 3], &[6, 3, 1], 4, "dense").unwrap(),
+            vec![(0, 0..48)]
+        );
+        let error = dense_copy_chunks(&[2, 2], &[-2, 1], 4, "reversed").unwrap_err();
+        assert!(error.to_string().contains("negative stride -2"));
+    }
+}
+
 impl std::fmt::Debug for CompressedSparseAttentionKernel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CompressedSparseAttentionKernel").finish()
@@ -1318,7 +1553,11 @@ impl CompressedSparseAttentionKernel {
             ))
         })?;
         let current_kv_len = inputs[1].shape[1];
-        let compressed_records = outputs[1].shape[1];
+        let compressed_records = record_row_capacity(
+            outputs[1].shape,
+            outputs[1].strides,
+            "present_compressed_kv",
+        )?;
         let scratch_stride = RATIO4_DENSE_WINDOW
             .checked_add(compressed_records)
             .ok_or_else(|| not_implemented(format!("{OP}: ratio-128 scratch stride overflow")))?;
@@ -1441,7 +1680,11 @@ impl CompressedSparseAttentionKernel {
             ))
         })?;
         let current_kv_len = inputs[1].shape[1];
-        let compressed_records = outputs[1].shape[1];
+        let compressed_records = record_row_capacity(
+            outputs[1].shape,
+            outputs[1].strides,
+            "present_compressed_kv",
+        )?;
         let topk_width = outputs[5].shape[3];
         // B6: the per-row attention scratch is the pooled workspace with a fixed
         // stride bound (`RATIO4_DENSE_WINDOW + topk_width`). The kernel derives
@@ -1567,8 +1810,13 @@ impl CompressedSparseAttentionKernel {
     ) -> Result<()> {
         let shape = inputs[0].shape;
         let (batch, sequence, dim) = (shape[0], shape[1], shape[3]);
-        let past_records = inputs[6].shape[1];
-        let cache_records = outputs[1].shape[1];
+        let past_row_records =
+            record_row_capacity(inputs[6].shape, inputs[6].strides, "past_compressed_kv")?;
+        let cache_row_records = record_row_capacity(
+            outputs[1].shape,
+            outputs[1].strides,
+            "present_compressed_kv",
+        )?;
         if batch == 0 || sequence == 0 {
             return Ok(());
         }
@@ -1591,10 +1839,10 @@ impl CompressedSparseAttentionKernel {
         let sequence_i =
             i32::try_from(sequence).map_err(|_| not_implemented("CSA sequence exceeds i32"))?;
         let dim_i = i32::try_from(dim).map_err(|_| not_implemented("CSA dimension exceeds i32"))?;
-        let past_i =
-            i32::try_from(past_records).map_err(|_| not_implemented("CSA records exceed i32"))?;
-        let records_i =
-            i32::try_from(cache_records).map_err(|_| not_implemented("CSA records exceed i32"))?;
+        let past_i = i32::try_from(past_row_records)
+            .map_err(|_| not_implemented("CSA row capacity exceeds i32"))?;
+        let records_i = i32::try_from(cache_row_records)
+            .map_err(|_| not_implemented("CSA row capacity exceeds i32"))?;
         builder
             .arg(&kv)
             .arg(&gate)
@@ -1741,8 +1989,10 @@ impl CompressedSparseAttentionKernel {
             return Ok(());
         }
         let dim = inputs[16].shape[0];
-        let past_records = inputs[17].shape[1];
-        let key_records = outputs[3].shape[1];
+        let past_records =
+            record_row_capacity(inputs[17].shape, inputs[17].strides, "past_index_key")?;
+        let key_records =
+            record_row_capacity(outputs[3].shape, outputs[3].strides, "present_index_key")?;
         let source = format!("{}\n{}", block_quant::source(), INDEX_COMPRESSION_SOURCE);
         let func = self.runtime.nvrtc_function(
             INDEX_COMPRESSION_MODULE,
@@ -1818,8 +2068,13 @@ impl CompressedSparseAttentionKernel {
             return Ok(());
         }
         let dim = inputs[5].shape[0];
-        let past_records = inputs[6].shape[1];
-        let cache_records = outputs[1].shape[1];
+        let past_records =
+            record_row_capacity(inputs[6].shape, inputs[6].strides, "past_compressed_kv")?;
+        let cache_records = record_row_capacity(
+            outputs[1].shape,
+            outputs[1].strides,
+            "present_compressed_kv",
+        )?;
         let source = format!("{}\n{}", block_quant::source(), MAIN4_COMPRESSION_SOURCE);
         let func = self.runtime.nvrtc_function(
             MAIN4_COMPRESSION_MODULE,
@@ -1895,7 +2150,8 @@ impl CompressedSparseAttentionKernel {
         let (batch, sequence) = (inputs[0].shape[0], inputs[0].shape[1]);
         let index_heads = self.index_num_heads;
         let index_dim = self.index_head_dim;
-        let records = outputs[3].shape[1];
+        let records =
+            record_row_capacity(outputs[3].shape, outputs[3].strides, "present_index_key")?;
         // selected_indices is [batch, index_heads, sequence, topk_width].
         let topk_width = outputs[5].shape[3];
         // N1 (B6): the pooled `WS_SELECTED` scratch is sized to `max_topk`
@@ -2041,67 +2297,92 @@ impl Kernel for CompressedSparseAttentionKernel {
                     .into(),
             ));
         }
-        // Stage every present input host-side. Contiguity is required because the
-        // host copy is a dense byte blit; the CPU oracle then reads it densely.
+        // Stage every present input into dense host storage. Fixed-capacity
+        // state bindings expose a smaller logical record cursor while retaining
+        // their physical batch-row stride, so the copy follows the real view
+        // geometry rather than treating the allocation as a compact tensor.
         let mut staged: Vec<Vec<u8>> = Vec::with_capacity(inputs.len());
         for (index, input) in inputs.iter().enumerate() {
             if input.is_absent() {
                 staged.push(Vec::new());
                 continue;
             }
-            if !input.is_contiguous() {
-                return Err(not_implemented(format!(
-                    "{OP}: non-contiguous input {index} on CUDA (host-staged path requires contiguous inputs)"
-                )));
-            }
-            let bytes = input.byte_size();
-            let mut host = vec![0u8; bytes];
-            if bytes > 0 {
-                // SAFETY: `input` is a live contiguous device tensor and `host`
-                // is exactly its dense storage size.
-                unsafe {
-                    self.runtime
-                        .dtoh(&mut host, cuptr(input.data_ptr::<u8>() as *const c_void))?;
-                }
-            }
-            staged.push(host);
+            staged.push(device_view_to_dense_host(
+                &self.runtime,
+                input,
+                &format!("input {index}"),
+            )?);
         }
 
-        // Build host-resident input views over the staged buffers, reusing each
-        // input's (contiguous) shape/strides. `DevicePtr` is a raw pointer, so
-        // these views borrow nothing from `staged` at the type level — `staged`
-        // is kept alive until after `execute`.
+        let total_bytes: [u8; 8] = staged
+            .get(9)
+            .and_then(|bytes| bytes.as_slice().try_into().ok())
+            .ok_or_else(|| {
+                not_implemented(format!(
+                    "{OP}: total_sequence_length input 9 must be one int64 scalar"
+                ))
+            })?;
+        let total = usize::try_from(i64::from_ne_bytes(total_bytes)).map_err(|_| {
+            not_implemented(format!(
+                "{OP}: total_sequence_length input 9 must be non-negative"
+            ))
+        })?;
+        let mut host_input_shapes = inputs
+            .iter()
+            .map(|input| input.shape.to_vec())
+            .collect::<Vec<_>>();
+        let current_kv_shape = host_input_shapes
+            .get_mut(1)
+            .ok_or_else(|| not_implemented(format!("{OP}: missing current_kv input 1")))?;
+        if current_kv_shape.len() != 3 {
+            return Err(not_implemented(format!(
+                "{OP}: current_kv input 1 must be rank 3, got {current_kv_shape:?}"
+            )));
+        }
+        if total < current_kv_shape[1] {
+            current_kv_shape[1] = total;
+            staged[1] = device_view_shape_to_dense_host(
+                &self.runtime,
+                &inputs[1],
+                current_kv_shape,
+                "input 1 current_kv logical prefix",
+            )?;
+        }
+        let host_input_strides = host_input_shapes
+            .iter()
+            .map(|shape| compute_contiguous_strides(shape))
+            .collect::<Vec<_>>();
+        // Build dense host-resident input views. `DevicePtr` is a raw pointer,
+        // so these views borrow nothing from `staged` at the type level;
+        // `staged` remains alive until the oracle returns.
         let host_inputs: Vec<TensorView> = inputs
             .iter()
             .zip(&staged)
-            .map(|(input, buf)| {
+            .zip(&host_input_shapes)
+            .zip(&host_input_strides)
+            .map(|(((input, buf), shape), strides)| {
                 if input.is_absent() {
                     TensorView::absent(input.dtype)
                 } else {
                     TensorView::new(
                         onnx_runtime_ep_api::DevicePtr(buf.as_ptr() as *const c_void),
                         input.dtype,
-                        input.shape,
-                        input.strides,
+                        shape,
+                        strides,
                         DeviceId::cpu(),
                     )
                 }
             })
             .collect();
 
-        // Snapshot output metadata and allocate matching host buffers. The
-        // session has already shape-inferred and allocated the device outputs, so
-        // their shapes are authoritative for the oracle's own shape checks.
-        for (index, output) in outputs.iter().enumerate() {
-            if !output.is_contiguous() {
-                return Err(not_implemented(format!(
-                    "{OP}: non-contiguous output {index} on CUDA (host-staged path requires contiguous outputs)"
-                )));
-            }
-        }
+        // The CPU oracle writes dense host outputs; the upload below scatters
+        // those bytes through each device output's actual strides.
         let out_dtypes: Vec<DataType> = outputs.iter().map(|o| o.dtype).collect();
         let out_shapes: Vec<Vec<usize>> = outputs.iter().map(|o| o.shape.to_vec()).collect();
-        let out_strides: Vec<Vec<i64>> = outputs.iter().map(|o| o.strides.to_vec()).collect();
+        let out_strides: Vec<Vec<i64>> = out_shapes
+            .iter()
+            .map(|shape| compute_contiguous_strides(shape))
+            .collect();
         let mut out_bufs: Vec<Vec<u8>> = outputs.iter().map(|o| vec![0u8; o.byte_size()]).collect();
 
         let mut host_outputs: Vec<TensorMut> = out_bufs
@@ -2128,15 +2409,12 @@ impl Kernel for CompressedSparseAttentionKernel {
         drop(host_inputs);
 
         for (index, output) in outputs.iter_mut().enumerate() {
-            let bytes = &out_bufs[index];
-            if !bytes.is_empty() {
-                // SAFETY: `output` is a live device allocation whose dense size
-                // equals `bytes.len()` (built from `output.byte_size()`).
-                unsafe {
-                    self.runtime
-                        .htod(bytes, cuptr(output.data_ptr_mut::<u8>() as *const c_void))?;
-                }
-            }
+            dense_host_to_device_view(
+                &self.runtime,
+                &out_bufs[index],
+                output,
+                &format!("output {index}"),
+            )?;
         }
 
         // B2 device stage-1: overwrite the host-oracle cache/carry with the
@@ -2241,9 +2519,9 @@ impl Kernel for CompressedSparseAttentionKernel {
         self.runtime.synchronize()
     }
 
-    fn supports_strided_input(&self, _input_idx: usize) -> bool {
-        // The host-staging blit is dense; strided inputs are rejected in execute.
-        false
+    fn supports_strided_input(&self, input_idx: usize) -> bool {
+        let device_path = !self.force_host && (self.device_resident_ratio128 || self.capturable);
+        !device_path || matches!(input_idx, 6 | 17)
     }
 
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
