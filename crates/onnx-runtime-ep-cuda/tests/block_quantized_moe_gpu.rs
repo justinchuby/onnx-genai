@@ -1988,6 +1988,7 @@ mod route_telemetry_impl {
                     request_id: 42,
                     device_id: ordinal(&ep),
                     num_experts: config.experts,
+                    routes_per_row: config.k,
                 })
                 .expect("arm telemetry");
             let on = exec_eager(&ep, &kernel, &config, &inputs).unwrap();
@@ -2012,6 +2013,7 @@ mod route_telemetry_impl {
                     request_id: 7,
                     device_id: ordinal(&ep),
                     num_experts: config.experts,
+                    routes_per_row: config.k,
                 })
                 .expect("arm telemetry");
             exec_eager(&ep, &kernel, &config, &inputs).unwrap();
@@ -2041,6 +2043,7 @@ mod route_telemetry_impl {
                 request_id: 3,
                 device_id: ordinal(&ep),
                 num_experts: config.experts,
+                routes_per_row: config.k,
             })
             .expect("arm telemetry");
 
@@ -2110,6 +2113,7 @@ mod route_telemetry_impl {
                 request_id: 9,
                 device_id: ordinal(&ep),
                 num_experts: config.experts,
+                routes_per_row: config.k,
             })
             .expect("arm telemetry");
 
@@ -2157,6 +2161,7 @@ mod route_telemetry_impl {
                     request_id: 300 + rows as u32,
                     device_id: ordinal(&ep),
                     num_experts: config.experts,
+                    routes_per_row: config.k,
                 })
                 .expect("arm telemetry");
             exec_eager(&ep, &kernel, &config, &inputs).unwrap();
@@ -2190,6 +2195,7 @@ mod route_telemetry_impl {
                 request_id: 1,
                 device_id: wrong_device,
                 num_experts: config.experts,
+                routes_per_row: config.k,
             })
             .expect_err("device mismatch must be rejected");
         assert!(matches!(error, TelemetryUnsupported::DeviceMismatch { .. }));
@@ -2212,6 +2218,7 @@ mod route_telemetry_impl {
                 request_id: 5,
                 device_id: ordinal(&ep),
                 num_experts: config.experts + 4,
+                routes_per_row: config.k,
             })
             .expect("arming with any positive capacity succeeds");
 
@@ -2236,6 +2243,7 @@ mod route_telemetry_impl {
                 request_id: 100,
                 device_id: ordinal(&ep),
                 num_experts: config.experts,
+                routes_per_row: config.k,
             })
             .unwrap();
         kernel_b
@@ -2243,6 +2251,7 @@ mod route_telemetry_impl {
                 request_id: 200,
                 device_id: ordinal(&ep),
                 num_experts: config.experts,
+                routes_per_row: config.k,
             })
             .unwrap();
 

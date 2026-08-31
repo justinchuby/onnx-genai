@@ -3866,12 +3866,11 @@ impl ExecutionProvider for CudaExecutionProvider {
         self.runtime.has_owned_graph(token)
     }
 
-    fn begin_device_validation(&self) -> Result<()> {
-        self.runtime.begin_device_validation()
-    }
-
-    fn reset_device_validation_error(&self) -> Result<()> {
-        self.runtime.reset_capture_error()
+    fn begin_device_validation(
+        &self,
+        owner: onnx_runtime_ep_api::DeviceValidationOwner,
+    ) -> Result<onnx_runtime_ep_api::DeviceValidationToken> {
+        self.runtime.begin_device_validation(owner)
     }
 
     fn defers_device_validation(&self) -> bool {
@@ -3886,12 +3885,11 @@ impl ExecutionProvider for CudaExecutionProvider {
         self.runtime.has_graph_executable_in(slot)
     }
 
-    fn check_device_capture_error(&self) -> Result<u32> {
-        self.runtime.check_capture_error()
-    }
-
-    fn consume_device_validation_error(&self) -> Result<u32> {
-        self.runtime.consume_device_validation()
+    fn consume_device_validation_error(
+        &self,
+        token: onnx_runtime_ep_api::DeviceValidationToken,
+    ) -> Result<u32> {
+        self.runtime.consume_device_validation(token)
     }
 
     /// Slice-7C: the coarse safe-boundary route-telemetry consumer, called once

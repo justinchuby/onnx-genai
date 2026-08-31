@@ -947,6 +947,8 @@ impl Executor {
             heterogeneous: None,
             graph_slot: DeviceGraphSlot::Primary,
             graph_owner: DeviceGraphOwner::new(),
+            validation_owner: DeviceValidationOwner::new(),
+            pending_device_validation: None,
             weight_handles,
             expert_region_candidates,
             residency_plan,

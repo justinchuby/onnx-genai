@@ -50,10 +50,10 @@ use std::time::{Duration, Instant};
 
 use onnx_runtime_ep_api::{
     CaptureRegionShapeStatus, DeviceBuffer, DeviceGraphOwner, DeviceGraphSlot, DeviceGraphToken,
-    DevicePtr, DevicePtrMut, EpError, ExecutionProvider, ExternalMmapRegion, Kernel,
-    KernelConstantInput, KernelInput, KernelMatch, LazyWeight, LazyWeightBoundary, ResidentWeight,
-    StructuralCaptureDecline, TensorBacking, TensorMetadata, TensorMut, TensorView, WeightHandle,
-    WorkspaceAllocation, WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
+    DevicePtr, DevicePtrMut, DeviceValidationOwner, EpError, ExecutionProvider, ExternalMmapRegion,
+    Kernel, KernelConstantInput, KernelInput, KernelMatch, LazyWeight, LazyWeightBoundary,
+    ResidentWeight, StructuralCaptureDecline, TensorBacking, TensorMetadata, TensorMut, TensorView,
+    WeightHandle, WorkspaceAllocation, WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
     lazy_weight_candidates,
 };
 use smallvec::SmallVec;
@@ -81,20 +81,31 @@ use crate::error::{Result, SessionError};
 use crate::sequence::{
     ConcatPlan, SeqTensor, SequenceError, SequenceValue, SplitSpec, split_tensor, stack_new_axis,
 };
-use crate::tensor::{DeviceBindingSpec, DeviceIoBinding, SharedTensorBuffer, Tensor};
+use crate::tensor::{
+    DeviceBindingSpec, DeviceIoBinding, DeviceValidationReceipt, SharedTensorBuffer, Tensor,
+};
 
 pub(super) struct DeviceValidationSubmission {
     ep: Arc<dyn ExecutionProvider>,
+    receipt: Arc<DeviceValidationReceipt>,
     active: bool,
 }
 
 impl DeviceValidationSubmission {
-    pub(super) fn begin(ep: &Arc<dyn ExecutionProvider>) -> Result<Self> {
-        ep.begin_device_validation()?;
+    pub(super) fn begin(
+        ep: &Arc<dyn ExecutionProvider>,
+        owner: DeviceValidationOwner,
+    ) -> Result<Self> {
+        let token = ep.begin_device_validation(owner)?;
         Ok(Self {
             ep: Arc::clone(ep),
+            receipt: DeviceValidationReceipt::new(Arc::clone(ep), token),
             active: true,
         })
+    }
+
+    pub(super) fn receipt(&self) -> Arc<DeviceValidationReceipt> {
+        Arc::clone(&self.receipt)
     }
 
     pub(super) fn disarm(&mut self) {
@@ -110,7 +121,8 @@ impl Drop for DeviceValidationSubmission {
         let result = self
             .ep
             .sync()
-            .and_then(|()| self.ep.consume_device_validation_error());
+            .map_err(SessionError::from)
+            .and_then(|()| self.receipt.consume_after_sync());
         match result {
             Ok(0) => {}
             Ok(flags) => eprintln!(
@@ -816,18 +828,23 @@ impl Drop for Executor {
                 false
             }
         };
-        match self.ep.consume_device_validation_error() {
-            Ok(0) => {}
-            Ok(flags) => eprintln!(
-                "[onnx-runtime-session] executor drop consumed a deferred validation failure \
-                 (flags=0x{flags:x})"
-            ),
-            Err(error) => {
-                safe_to_release = false;
-                eprintln!(
-                    "[onnx-runtime-session] executor drop could not consume deferred validation: \
-                     {error}"
-                );
+        if safe_to_release
+            && let Some(receipt) = &self.pending_device_validation
+            && !receipt.is_consumed()
+        {
+            match receipt.consume_after_sync() {
+                Ok(0) => {}
+                Ok(flags) => eprintln!(
+                    "[onnx-runtime-session] executor drop consumed its deferred validation \
+                     failure (flags=0x{flags:x})"
+                ),
+                Err(error) => {
+                    safe_to_release = false;
+                    eprintln!(
+                        "[onnx-runtime-session] executor drop could not consume its deferred \
+                         validation: {error}"
+                    );
+                }
             }
         }
         let mut graphs_reset = true;

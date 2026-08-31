@@ -195,6 +195,8 @@ pub struct RouteTelemetryConfig {
     pub device_id: u32,
     /// Number of experts; fixes the bitmap capacity (bits) for this arming.
     pub num_experts: usize,
+    /// Number of selected experts contributed by every clean routed row.
+    pub routes_per_row: usize,
 }
 
 /// Typed reason telemetry could not be armed. Arming returns this instead of
@@ -205,6 +207,14 @@ pub enum TelemetryUnsupported {
     DeviceMismatch { config: u32, runtime: u32 },
     /// `num_experts` was zero — no bitmap capacity is representable.
     ZeroExperts,
+    /// The execution contract cannot select zero experts or more experts than
+    /// the admitted expert domain for one row.
+    InvalidRoutesPerRow {
+        routes_per_row: usize,
+        num_experts: usize,
+    },
+    /// The arming request disagrees with the kernel's prepared top-k contract.
+    RouteWidthMismatch { config: usize, execution: usize },
     /// The device buffer could not be allocated (message carried for the log).
     Alloc(String),
     /// Reconfiguration would invalidate pointers embedded in an installed graph.
@@ -219,6 +229,19 @@ impl std::fmt::Display for TelemetryUnsupported {
                 "route telemetry device mismatch: config device {config} != runtime device {runtime} (multi-device fails closed)"
             ),
             Self::ZeroExperts => write!(f, "route telemetry requires num_experts > 0"),
+            Self::InvalidRoutesPerRow {
+                routes_per_row,
+                num_experts,
+            } => write!(
+                f,
+                "route telemetry requires 0 < routes_per_row <= num_experts, got \
+                 routes_per_row={routes_per_row} and num_experts={num_experts}"
+            ),
+            Self::RouteWidthMismatch { config, execution } => write!(
+                f,
+                "route telemetry routes_per_row={config} does not match the prepared execution \
+                 contract {execution}; re-arm with the kernel's actual selected-expert width"
+            ),
             Self::Alloc(message) => write!(f, "route telemetry buffer alloc failed: {message}"),
             Self::GraphInstalled => write!(
                 f,
@@ -244,6 +267,7 @@ pub(crate) struct ArmedTelemetry {
     request_id: u32,
     device_id: u32,
     num_experts: usize,
+    routes_per_row: u32,
     words: usize,
     bitmap: CUdeviceptr,
     header: CUdeviceptr,
@@ -276,6 +300,18 @@ impl ArmedTelemetry {
         if config.num_experts == 0 {
             return Err(TelemetryUnsupported::ZeroExperts);
         }
+        if config.routes_per_row == 0 || config.routes_per_row > config.num_experts {
+            return Err(TelemetryUnsupported::InvalidRoutesPerRow {
+                routes_per_row: config.routes_per_row,
+                num_experts: config.num_experts,
+            });
+        }
+        let routes_per_row = u32::try_from(config.routes_per_row).map_err(|_| {
+            TelemetryUnsupported::InvalidRoutesPerRow {
+                routes_per_row: config.routes_per_row,
+                num_experts: config.num_experts,
+            }
+        })?;
 
         let words = words_for(config.num_experts);
         let bitmap_bytes = words * 4;
@@ -297,6 +333,7 @@ impl ArmedTelemetry {
             request_id: config.request_id,
             device_id: config.device_id,
             num_experts: config.num_experts,
+            routes_per_row,
             words,
             bitmap,
             header,
@@ -433,11 +470,15 @@ impl ArmedTelemetry {
             header,
             bitmap,
             num_experts: self.num_experts,
+            routes_per_row: self.routes_per_row,
         })
     }
 
     /// Read and validate the complete record against this immutable arming.
-    pub(crate) fn validated_snapshot(&self, runtime: &CudaRuntime) -> Result<TelemetrySnapshot> {
+    pub(crate) fn validated_snapshot(
+        &self,
+        runtime: &CudaRuntime,
+    ) -> Result<ValidatedTelemetrySnapshot> {
         let snapshot = self.snapshot(runtime)?;
         match consume_and_validate(
             &snapshot.header,
@@ -446,8 +487,24 @@ impl ArmedTelemetry {
             self.request_id,
             self.device_id,
             self.num_experts,
+            usize::try_from(self.routes_per_row).expect("u32 routes-per-row fits usize"),
         ) {
-            RouteDecision::HotSet(_) => Ok(snapshot),
+            RouteDecision::HotSet(_) => {
+                let unique_expert_count = snapshot
+                    .bitmap
+                    .iter()
+                    .try_fold(0_u32, |total, word| total.checked_add(word.count_ones()))
+                    .ok_or_else(|| {
+                        EpError::KernelFailed(
+                            "cuda_ep: validated route telemetry unique-expert count overflow"
+                                .into(),
+                        )
+                    })?;
+                Ok(ValidatedTelemetrySnapshot {
+                    selected_route_count: snapshot.count(),
+                    unique_expert_count,
+                })
+            }
             RouteDecision::WholeBank(reason) => Err(EpError::KernelFailed(format!(
                 "cuda_ep: invalid BlockQuantizedMoE traffic record: {reason}"
             ))),
@@ -505,6 +562,8 @@ pub struct TelemetrySnapshot {
     pub bitmap: Vec<u32>,
     /// Expert count the bitmap was sized for.
     pub num_experts: usize,
+    /// Number of selected experts every clean routed row contributes.
+    pub routes_per_row: u32,
 }
 
 impl TelemetrySnapshot {
@@ -533,6 +592,21 @@ impl TelemetrySnapshot {
     /// True iff the sticky overflow (counter-saturation) bit is set.
     pub fn overflow(&self) -> bool {
         self.header[H_OVERFLOW] != 0
+    }
+}
+
+pub(crate) struct ValidatedTelemetrySnapshot {
+    selected_route_count: u32,
+    unique_expert_count: u32,
+}
+
+impl ValidatedTelemetrySnapshot {
+    pub(crate) fn selected_route_count(&self) -> u32 {
+        self.selected_route_count
+    }
+
+    pub(crate) fn unique_expert_count(&self) -> u32 {
+        self.unique_expert_count
     }
 }
 
@@ -574,6 +648,7 @@ pub fn consume_and_validate(
     expected_request: u32,
     expected_device: u32,
     expected_num_experts: usize,
+    expected_routes_per_row: usize,
 ) -> RouteDecision {
     if header.len() != HEADER_LEN {
         return RouteDecision::WholeBank(format!(
@@ -586,6 +661,12 @@ pub fn consume_and_validate(
         return RouteDecision::WholeBank(format!(
             "bitmap length mismatch: record={} expected {expected_words}",
             bitmap.len()
+        ));
+    }
+    if expected_routes_per_row == 0 || expected_routes_per_row > expected_num_experts {
+        return RouteDecision::WholeBank(format!(
+            "invalid route-width contract: routes_per_row={expected_routes_per_row}, \
+             num_experts={expected_num_experts}"
         ));
     }
     if header[H_POISON] != 0 {
@@ -627,7 +708,18 @@ pub fn consume_and_validate(
         return RouteDecision::WholeBank("unique expert count overflow".into());
     };
     let count = header[H_COUNT];
-    if count < unique || (count == 0 && unique != 0) {
+    let Ok(routes_per_row) = u32::try_from(expected_routes_per_row) else {
+        return RouteDecision::WholeBank(format!(
+            "route-width contract {expected_routes_per_row} exceeds the telemetry counter domain"
+        ));
+    };
+    if !count.is_multiple_of(routes_per_row) {
+        return RouteDecision::WholeBank(format!(
+            "route count {count} is impossible for routes_per_row={routes_per_row}; every clean \
+             routed row contributes exactly {routes_per_row} selections"
+        ));
+    }
+    if count < unique || (count == 0) != (unique == 0) {
         return RouteDecision::WholeBank(format!(
             "route count {count} is inconsistent with {unique} unique selected experts"
         ));
@@ -689,11 +781,11 @@ mod tests {
         header[H_COUNT] = 2;
         let bitmap = vec![0b1010u32];
         assert_eq!(
-            consume_and_validate(&header, &bitmap, 4, 9, 1, 32),
+            consume_and_validate(&header, &bitmap, 4, 9, 1, 32, 2),
             RouteDecision::HotSet(vec![0b1010u32])
         );
         assert!(matches!(
-            consume_and_validate(&header, &bitmap, 3, 9, 1, 32),
+            consume_and_validate(&header, &bitmap, 3, 9, 1, 32, 2),
             RouteDecision::WholeBank(_)
         ));
     }
@@ -713,46 +805,53 @@ mod tests {
         let mut poisoned = clean(4, 9, 1);
         poisoned[H_POISON] = 1;
         assert!(matches!(
-            consume_and_validate(&poisoned, &bitmap, 4, 9, 1, 32),
+            consume_and_validate(&poisoned, &bitmap, 4, 9, 1, 32, 1),
             RouteDecision::WholeBank(_)
         ));
 
         let mut overflowed = clean(4, 9, 1);
         overflowed[H_OVERFLOW] = 1;
         assert!(matches!(
-            consume_and_validate(&overflowed, &bitmap, 4, 9, 1, 32),
+            consume_and_validate(&overflowed, &bitmap, 4, 9, 1, 32, 1),
             RouteDecision::WholeBank(_)
         ));
 
         // Foreign device / request identity fails closed (isolation).
         assert!(matches!(
-            consume_and_validate(&clean(4, 9, 2), &bitmap, 4, 9, 1, 32),
+            consume_and_validate(&clean(4, 9, 2), &bitmap, 4, 9, 1, 32, 1),
             RouteDecision::WholeBank(_)
         ));
         assert!(matches!(
-            consume_and_validate(&clean(4, 8, 1), &bitmap, 4, 9, 1, 32),
+            consume_and_validate(&clean(4, 8, 1), &bitmap, 4, 9, 1, 32, 1),
             RouteDecision::WholeBank(_)
         ));
 
         // A stale epoch (record older than the boundary) fails closed.
         assert!(matches!(
-            consume_and_validate(&clean(2, 9, 1), &bitmap, 3, 9, 1, 32),
+            consume_and_validate(&clean(2, 9, 1), &bitmap, 3, 9, 1, 32, 1),
             RouteDecision::WholeBank(_)
         ));
 
         let mut inconsistent_count = clean(4, 9, 1);
         inconsistent_count[H_COUNT] = 0;
         assert!(matches!(
-            consume_and_validate(&inconsistent_count, &bitmap, 4, 9, 1, 32),
+            consume_and_validate(&inconsistent_count, &bitmap, 4, 9, 1, 32, 1),
             RouteDecision::WholeBank(_)
         ));
         assert!(matches!(
-            consume_and_validate(&clean(4, 9, 1), &[1, 0], 4, 9, 1, 32),
+            consume_and_validate(&clean(4, 9, 1), &[1, 0], 4, 9, 1, 32, 1),
             RouteDecision::WholeBank(_)
         ));
         assert!(matches!(
-            consume_and_validate(&clean(4, 9, 1), &[1 << 31], 4, 9, 1, 17),
+            consume_and_validate(&clean(4, 9, 1), &[1 << 31], 4, 9, 1, 17, 1),
             RouteDecision::WholeBank(_)
+        ));
+
+        let mut non_multiple = clean(4, 9, 1);
+        non_multiple[H_COUNT] = 3;
+        assert!(matches!(
+            consume_and_validate(&non_multiple, &bitmap, 4, 9, 1, 32, 2),
+            RouteDecision::WholeBank(reason) if reason.contains("impossible")
         ));
     }
 
@@ -777,6 +876,7 @@ mod tests {
             header,
             bitmap: vec![(1 << 1) | (1 << 4)],
             num_experts: 8,
+            routes_per_row: 1,
         };
         assert_eq!(snapshot.epoch(), 7);
         assert_eq!(snapshot.count(), 3);

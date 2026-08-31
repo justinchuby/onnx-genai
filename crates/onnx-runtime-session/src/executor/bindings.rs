@@ -965,7 +965,9 @@ impl Executor {
         let result = self.run_scoped(inputs, &HashMap::new(), &external);
         self.scratch_external_bindings = external;
         self.release_step_workspace()?;
-        result?
+        let outputs = result?;
+        self.attach_pending_device_validation(bindings);
+        outputs
             .into_iter()
             .map(|output| match output {
                 None => Ok(None),
@@ -1104,7 +1106,7 @@ impl Executor {
             .as_ref()
             .is_none_or(CaptureSchedule::is_single_graph);
         if single_graph {
-            let mut validation_submission = DeviceValidationSubmission::begin(&self.ep)?;
+            let mut validation_submission = self.begin_device_validation_submission()?;
             if let Err(replay_error) = self.ep.replay_owned_device_graph(token) {
                 let validation = self.finish_device_validation_boundary();
                 validation_submission.disarm();
@@ -1117,6 +1119,7 @@ impl Executor {
                 };
             }
             validation_submission.disarm();
+            self.attach_pending_device_validation(bindings);
             return Ok(true);
         }
         let external = self.prepare_external_bindings(bindings)?;
@@ -1126,7 +1129,10 @@ impl Executor {
         match result? {
             // `run_scoped_mode` clears `capture_schedule` when a branch flip
             // retired the graph this step; report that so the caller re-arms.
-            ScopedRunResult::Executed(_) => Ok(self.cap().capture_schedule.is_some()),
+            ScopedRunResult::Executed(_) => {
+                self.attach_pending_device_validation(bindings);
+                Ok(self.cap().capture_schedule.is_some())
+            }
             ScopedRunResult::NotCapturable(reason) => {
                 self.reset_device_graph()?;
                 Err(SessionError::Internal(format!(
@@ -1211,7 +1217,11 @@ impl Executor {
     }
 
     pub(crate) fn check_device_capture_error(&self) -> Result<u32> {
-        Ok(self.ep.consume_device_validation_error()?)
+        self.ep.sync()?;
+        match &self.pending_device_validation {
+            Some(receipt) => receipt.consume_after_sync(),
+            None => Ok(0),
+        }
     }
 
     pub(crate) fn device_allocation_counts(&self) -> Option<DeviceAllocationCounts> {
@@ -1309,6 +1319,21 @@ impl Executor {
     ) -> Result<ExternalBindings> {
         let external = std::mem::take(&mut self.scratch_external_bindings);
         self.refill_external_bindings(external, bindings, false)
+    }
+
+    fn attach_pending_device_validation(&self, bindings: &mut [DeviceIoBinding]) {
+        let Some(receipt) = self
+            .pending_device_validation
+            .as_ref()
+            .filter(|receipt| !receipt.is_consumed())
+        else {
+            return;
+        };
+        for binding in bindings {
+            if binding.output_name().is_some() {
+                binding.set_device_validation(Arc::clone(receipt));
+            }
+        }
     }
 
     /// As [`Self::prepare_external_bindings`], but when `plan_capacity` is set the

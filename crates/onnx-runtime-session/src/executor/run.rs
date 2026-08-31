@@ -18,6 +18,21 @@ fn activation_memory_planning_enabled() -> bool {
 }
 
 impl Executor {
+    pub(super) fn begin_device_validation_submission(
+        &mut self,
+    ) -> Result<DeviceValidationSubmission> {
+        if self
+            .pending_device_validation
+            .as_ref()
+            .is_some_and(|receipt| receipt.is_consumed())
+        {
+            self.pending_device_validation = None;
+        }
+        let submission = DeviceValidationSubmission::begin(&self.ep, self.validation_owner)?;
+        self.pending_device_validation = Some(submission.receipt());
+        Ok(submission)
+    }
+
     /// Execute the graph with `inputs` bound by name, plus an `outer_scope` of
     /// enclosing named values a nested control-flow subgraph body may capture.
     /// The top-level session `run` passes an empty scope; a control-flow body's
@@ -68,7 +83,7 @@ impl Executor {
             // provider. A later submission is refused until the previous
             // generation has been consumed, so no reset can erase an unseen
             // asynchronous failure.
-            Some(DeviceValidationSubmission::begin(&self.ep)?)
+            Some(self.begin_device_validation_submission()?)
         };
         self.reset_run_state()?;
 
@@ -135,7 +150,7 @@ impl Executor {
         }
     }
 
-    fn finish_device_validation(&self, defer_until_binding_read: bool) -> Result<()> {
+    fn finish_device_validation(&mut self, defer_until_binding_read: bool) -> Result<()> {
         if defer_until_binding_read && self.ep.defers_device_validation() {
             self.ep.consume_route_residency_at_boundary()?;
             return Ok(());
@@ -143,13 +158,24 @@ impl Executor {
         self.finish_device_validation_boundary()
     }
 
-    pub(crate) fn finish_device_validation_boundary(&self) -> Result<()> {
+    pub(crate) fn finish_device_validation_boundary(&mut self) -> Result<()> {
         // This is the one request-level host boundary for deferred eager work
         // and for captured replay. The CUDA EP's explicit sync is unconditional,
         // so the latch read observes every kernel from this request.
         self.ep.sync()?;
-        match self.ep.consume_device_validation_error() {
-            Ok(0) => {
+        let flags = match self.pending_device_validation.take() {
+            Some(receipt) if receipt.is_consumed() => 0,
+            Some(receipt) => match receipt.consume_after_sync() {
+                Ok(flags) => flags,
+                Err(error) => {
+                    self.pending_device_validation = Some(receipt);
+                    return Err(error);
+                }
+            },
+            None => 0,
+        };
+        match flags {
+            0 => {
                 // The single coarse safe boundary: the request's kernels and any
                 // captured replay have completed (the sync above), the stream is
                 // no longer capturing, and the device validation latch is clean.
@@ -160,12 +186,11 @@ impl Executor {
                 self.ep.consume_route_residency_at_boundary()?;
                 Ok(())
             }
-            Ok(flags) => Err(EpError::KernelFailed(format!(
+            flags => Err(EpError::KernelFailed(format!(
                 "{}: device validation failed (flags=0x{flags:x})",
                 self.ep.name()
             ))
             .into()),
-            Err(error) => Err(error.into()),
         }
     }
 

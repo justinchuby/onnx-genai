@@ -127,7 +127,10 @@ struct DeferredValidationEp {
     synchronized_executions: Arc<AtomicUsize>,
     resets: Arc<AtomicUsize>,
     reset_failure_at: Arc<AtomicUsize>,
-    validation_state: Arc<AtomicU8>,
+    validation_state: Arc<std::sync::Mutex<Option<onnx_runtime_ep_api::DeviceValidationToken>>>,
+    next_validation_generation: Arc<AtomicU64>,
+    validation_consume_attempts: Arc<AtomicUsize>,
+    sync_calls: Arc<AtomicUsize>,
     panic_next: Arc<AtomicBool>,
     graph_reset_failure: Arc<AtomicBool>,
     graph_reset_calls: Arc<AtomicUsize>,
@@ -147,7 +150,10 @@ impl DeferredValidationEp {
             synchronized_executions: Arc::new(AtomicUsize::new(0)),
             resets: Arc::new(AtomicUsize::new(0)),
             reset_failure_at: Arc::new(AtomicUsize::new(0)),
-            validation_state: Arc::new(AtomicU8::new(0)),
+            validation_state: Arc::new(std::sync::Mutex::new(None)),
+            next_validation_generation: Arc::new(AtomicU64::new(1)),
+            validation_consume_attempts: Arc::new(AtomicUsize::new(0)),
+            sync_calls: Arc::new(AtomicUsize::new(0)),
             panic_next: Arc::new(AtomicBool::new(false)),
             graph_reset_failure: Arc::new(AtomicBool::new(false)),
             graph_reset_calls: Arc::new(AtomicUsize::new(0)),
@@ -243,76 +249,71 @@ impl ExecutionProvider for DeferredValidationEp {
     }
 
     fn sync(&self) -> onnx_runtime_ep_api::Result<()> {
+        self.sync_calls.fetch_add(1, Ordering::Relaxed);
         self.synchronized_executions
             .store(self.executions.load(Ordering::Relaxed), Ordering::Relaxed);
         Ok(())
     }
 
-    fn reset_device_validation_error(&self) -> onnx_runtime_ep_api::Result<()> {
-        let call = self.resets.fetch_add(1, Ordering::Relaxed) + 1;
-        if self.reset_failure_at.load(Ordering::Relaxed) == call {
-            return Err(EpError::KernelFailed(
-                "forced device validation reset failure".into(),
-            ));
+    fn begin_device_validation(
+        &self,
+        owner: onnx_runtime_ep_api::DeviceValidationOwner,
+    ) -> onnx_runtime_ep_api::Result<onnx_runtime_ep_api::DeviceValidationToken> {
+        let mut active = self.validation_state.lock().unwrap();
+        if let Some(token) = *active {
+            return Err(EpError::KernelFailed(format!(
+                "previous deferred device validation is still pending (owner={} generation={})",
+                token.owner().get(),
+                token.generation()
+            )));
         }
-        self.validation_latch.store(0, Ordering::Relaxed);
-        Ok(())
-    }
-
-    fn begin_device_validation(&self) -> onnx_runtime_ep_api::Result<()> {
-        self.validation_state
-            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| {
-                EpError::KernelFailed("previous deferred device validation is still pending".into())
-            })?;
-        if let Err(error) = self.reset_device_validation_error() {
-            self.validation_state.store(0, Ordering::Release);
-            return Err(error);
-        }
-        Ok(())
+        self.reset_validation_latch()?;
+        let generation = self
+            .next_validation_generation
+            .fetch_add(1, Ordering::Relaxed);
+        let token = onnx_runtime_ep_api::DeviceValidationToken::new(owner, generation);
+        *active = Some(token);
+        Ok(token)
     }
 
     fn defers_device_validation(&self) -> bool {
         true
     }
 
-    fn check_device_capture_error(&self) -> onnx_runtime_ep_api::Result<u32> {
-        if self.synchronized_executions.load(Ordering::Relaxed)
-            != self.executions.load(Ordering::Relaxed)
-        {
-            return Err(EpError::KernelFailed(
-                "device validation latch checked before synchronization".into(),
-            ));
-        }
-        Ok(self.validation_latch.load(Ordering::Relaxed))
-    }
-
-    fn consume_device_validation_error(&self) -> onnx_runtime_ep_api::Result<u32> {
-        match self
-            .validation_state
-            .compare_exchange(1, 2, Ordering::AcqRel, Ordering::Acquire)
-        {
-            Ok(_) => {}
-            Err(0) => return Ok(0),
-            Err(_) => {
-                return Err(EpError::KernelFailed(
-                    "device validation is already being consumed".into(),
-                ));
+    fn consume_device_validation_error(
+        &self,
+        token: onnx_runtime_ep_api::DeviceValidationToken,
+    ) -> onnx_runtime_ep_api::Result<u32> {
+        self.validation_consume_attempts
+            .fetch_add(1, Ordering::Relaxed);
+        let mut active = self.validation_state.lock().unwrap();
+        match *active {
+            Some(expected) if expected == token => {}
+            Some(expected) => {
+                return Err(EpError::KernelFailed(format!(
+                    "validation token owner={} generation={} cannot consume active owner={} \
+                     generation={}",
+                    token.owner().get(),
+                    token.generation(),
+                    expected.owner().get(),
+                    expected.generation()
+                )));
+            }
+            None => {
+                return Err(EpError::KernelFailed(format!(
+                    "validation token owner={} generation={} is stale",
+                    token.owner().get(),
+                    token.generation()
+                )));
             }
         }
         let result = self
-            .check_device_capture_error()
-            .and_then(|flags| self.reset_device_validation_error().map(|()| flags));
-        match result {
-            Ok(flags) => {
-                self.validation_state.store(0, Ordering::Release);
-                Ok(flags)
-            }
-            Err(error) => {
-                self.validation_state.store(1, Ordering::Release);
-                Err(error)
-            }
+            .check_validation_latch()
+            .and_then(|flags| self.reset_validation_latch().map(|()| flags));
+        if result.is_ok() {
+            *active = None;
         }
+        result
     }
 
     fn reset_owned_device_graph(
@@ -345,8 +346,33 @@ impl ExecutionProvider for DeferredValidationEp {
     }
 }
 
-fn deferred_validation_bound_fixture() -> (Executor, Arc<DeferredValidationEp>, Vec<DeviceIoBinding>)
-{
+impl DeferredValidationEp {
+    fn reset_validation_latch(&self) -> onnx_runtime_ep_api::Result<()> {
+        let call = self.resets.fetch_add(1, Ordering::Relaxed) + 1;
+        if self.reset_failure_at.load(Ordering::Relaxed) == call {
+            return Err(EpError::KernelFailed(
+                "forced device validation reset failure".into(),
+            ));
+        }
+        self.validation_latch.store(0, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn check_validation_latch(&self) -> onnx_runtime_ep_api::Result<u32> {
+        if self.synchronized_executions.load(Ordering::Relaxed)
+            != self.executions.load(Ordering::Relaxed)
+        {
+            return Err(EpError::KernelFailed(
+                "device validation latch checked before synchronization".into(),
+            ));
+        }
+        Ok(self.validation_latch.load(Ordering::Relaxed))
+    }
+}
+
+fn deferred_validation_bound_fixture_for_provider(
+    ep: Arc<DeferredValidationEp>,
+) -> (Executor, Vec<DeviceIoBinding>) {
     let mut graph = Graph::new();
     graph.opset_imports.insert(String::new(), 17);
     let input = graph.create_named_value("input", DataType::Float32, static_shape([2]));
@@ -360,7 +386,6 @@ fn deferred_validation_bound_fixture() -> (Executor, Arc<DeferredValidationEp>, 
     ));
     graph.add_output(output);
 
-    let ep = Arc::new(DeferredValidationEp::new());
     let executor = Executor::build(
         graph,
         Arc::new(WeightStore::new()),
@@ -384,6 +409,13 @@ fn deferred_validation_bound_fixture() -> (Executor, Arc<DeferredValidationEp>, 
                 .collect::<Vec<_>>(),
         )
         .unwrap();
+    (executor, bindings)
+}
+
+fn deferred_validation_bound_fixture() -> (Executor, Arc<DeferredValidationEp>, Vec<DeviceIoBinding>)
+{
+    let ep = Arc::new(DeferredValidationEp::new());
+    let (executor, bindings) = deferred_validation_bound_fixture_for_provider(Arc::clone(&ep));
     (executor, ep, bindings)
 }
 
@@ -472,7 +504,89 @@ fn unconsumed_bound_failure_rejects_later_success_or_failure_without_erasure() {
                 .contains("device validation failed (flags=0x40)"),
             "run A's sticky failure must remain observable after run B: {first}"
         );
-        assert_eq!(ep.validation_state.load(Ordering::Acquire), 0);
+        assert!(ep.validation_state.lock().unwrap().is_none());
+    }
+}
+
+#[test]
+fn foreign_binding_executor_drop_and_reset_cannot_consume_owned_validation() {
+    #[derive(Clone, Copy, Debug)]
+    enum ForeignAction {
+        BindingDrop,
+        ExecutorDrop,
+        GraphReset,
+    }
+
+    for action in [
+        ForeignAction::BindingDrop,
+        ForeignAction::ExecutorDrop,
+        ForeignAction::GraphReset,
+    ] {
+        let ep = Arc::new(DeferredValidationEp::new());
+        let (mut owner, mut owner_bindings) =
+            deferred_validation_bound_fixture_for_provider(Arc::clone(&ep));
+        let (foreign, mut foreign_bindings) =
+            deferred_validation_bound_fixture_for_provider(Arc::clone(&ep));
+        assert_ne!(owner.validation_owner, foreign.validation_owner);
+
+        owner
+            .run_with_device_bindings(&[], &mut owner_bindings)
+            .expect("the owner submits one deferred failing generation");
+        assert_eq!(
+            ep.executions.load(Ordering::Relaxed),
+            1,
+            "{action:?}: positive control must execute the owner's failing kernel"
+        );
+        let active = ep
+            .validation_state
+            .lock()
+            .unwrap()
+            .expect("the owner's validation token must remain pending");
+        assert_eq!(active.owner(), owner.validation_owner);
+
+        let sync_before = ep.sync_calls.load(Ordering::Relaxed);
+        let mut foreign = Some(foreign);
+        match action {
+            ForeignAction::BindingDrop => {
+                drop(foreign_bindings.remove(1));
+            }
+            ForeignAction::ExecutorDrop => {
+                drop(foreign.take());
+            }
+            ForeignAction::GraphReset => {
+                assert!(!foreign.as_mut().unwrap().reset_device_graph().unwrap());
+            }
+        }
+        assert!(
+            ep.sync_calls.load(Ordering::Relaxed) > sync_before,
+            "{action:?}: positive control must prove the foreign teardown/reset synchronized"
+        );
+        assert_eq!(
+            ep.validation_consume_attempts.load(Ordering::Relaxed),
+            0,
+            "{action:?}: a foreign owner must not even attempt to consume the active token"
+        );
+        assert_eq!(
+            ep.validation_state
+                .lock()
+                .unwrap()
+                .expect("foreign action must preserve the owner's token"),
+            active
+        );
+
+        let error = owner_bindings[1].read_bytes_range(0, 4).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("device validation failed (flags=0x40)"),
+            "{action:?}: the submitting owner's unseen failure must remain observable: {error}"
+        );
+        assert_eq!(
+            ep.validation_consume_attempts.load(Ordering::Relaxed),
+            1,
+            "{action:?}: only the submitting binding may consume the token"
+        );
+        assert!(ep.validation_state.lock().unwrap().is_none());
     }
 }
 
@@ -485,9 +599,8 @@ fn panicking_bound_run_consumes_deferred_validation_before_reuse() {
         let _ = executor.run_with_device_bindings(&[], &mut bindings);
     }));
     assert!(panic.is_err());
-    assert_eq!(
-        ep.validation_state.load(Ordering::Acquire),
-        0,
+    assert!(
+        ep.validation_state.lock().unwrap().is_none(),
         "the unwind guard must consume the pending generation"
     );
     assert_eq!(
@@ -6231,8 +6344,9 @@ fn shared_provider_graphs_are_owner_scoped_repeatable_and_logical_shape_safe() {
 #[test]
 fn supported_observer_rejects_every_corrupt_device_record_field() {
     use onnx_runtime_ep_cuda::kernels::block_quantized_moe::BlockQuantizedMoeTrafficFaultForTest::{
-        ForeignRequest, Overflow, Poison, StaleEpoch, WrongDevice,
+        ForeignRequest, NonTopKMultipleCount, Overflow, Poison, StaleEpoch, WrongDevice,
     };
+    const ROUTE_BYTES: u64 = 6_528;
 
     let (mut session, mut bindings, _runtime) = sealed_bqmoe_cuda_session_fixture();
     let mut observer = session
@@ -6247,6 +6361,7 @@ fn supported_observer_rejects_every_corrupt_device_record_field() {
         (StaleEpoch, "epoch mismatch"),
         (ForeignRequest, "request mismatch"),
         (WrongDevice, "device mismatch"),
+        (NonTopKMultipleCount, "impossible"),
     ] {
         observer
             .reset_phase(crate::BlockQuantizedMoeTrafficPhase::Decode)
@@ -6254,6 +6369,11 @@ fn supported_observer_rejects_every_corrupt_device_record_field() {
         observer
             .run_with_device_bindings(&[], &mut bindings)
             .unwrap();
+        let clean = observer.snapshot().unwrap();
+        assert_eq!(
+            clean.traffic.logical_route_demand_bytes, ROUTE_BYTES,
+            "{fault:?}: positive control must publish the validated top-k route extent"
+        );
         observer.inject_fault_for_test(fault).unwrap();
         let error = observer.snapshot().unwrap_err();
         assert!(
@@ -6266,6 +6386,66 @@ fn supported_observer_rejects_every_corrupt_device_record_field() {
         .reset_phase(crate::BlockQuantizedMoeTrafficPhase::Decode)
         .unwrap();
     observer.finish().unwrap();
+}
+
+#[cfg(feature = "gpu-tests")]
+#[test]
+fn shared_cuda_provider_foreign_teardown_preserves_owned_validation_error() {
+    use onnx_runtime_ep_cuda::CudaExecutionProvider;
+
+    #[derive(Clone, Copy, Debug)]
+    enum ForeignAction {
+        BindingDrop,
+        ExecutorDrop,
+        GraphReset,
+    }
+
+    for action in [
+        ForeignAction::BindingDrop,
+        ForeignAction::ExecutorDrop,
+        ForeignAction::GraphReset,
+    ] {
+        let cuda = Arc::new(CudaExecutionProvider::new_default().unwrap());
+        let (mut owner, mut owner_bindings, runtime) =
+            sealed_bqmoe_cuda_session_for_provider(Arc::clone(&cuda));
+        let (foreign, mut foreign_bindings, _) =
+            sealed_bqmoe_cuda_session_for_provider(Arc::clone(&cuda));
+
+        owner
+            .run_with_device_bindings(&[], &mut owner_bindings)
+            .expect("the owner must submit one deferred device-bound run");
+        let flags = 0x40u32.to_ne_bytes();
+        // SAFETY: GPU-test-only fault injection into the runtime's live
+        // validation word, ordered after the owner's submitted work.
+        unsafe {
+            runtime.htod(&flags, runtime.capture_error_ptr()).unwrap();
+        }
+
+        let sync_before = runtime.forced_synchronization_count();
+        let mut foreign = Some(foreign);
+        match action {
+            ForeignAction::BindingDrop => drop(foreign_bindings.remove(2)),
+            ForeignAction::ExecutorDrop => drop(foreign.take()),
+            ForeignAction::GraphReset => {
+                assert!(!foreign.as_mut().unwrap().reset_device_graph().unwrap());
+            }
+        }
+        assert!(
+            runtime.forced_synchronization_count() > sync_before,
+            "{action:?}: positive control must prove the foreign teardown/reset synchronized"
+        );
+
+        for observation in 1..=2 {
+            let error = owner_bindings[2].read_bytes_range(0, 4).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("device validation failed (flags=0x40)"),
+                "{action:?} observation {observation}: the owner's sticky failure must survive: \
+                 {error}"
+            );
+        }
+    }
 }
 
 #[cfg(feature = "gpu-tests")]

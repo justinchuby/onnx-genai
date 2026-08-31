@@ -53,7 +53,7 @@ use crate::kernels::expert_route_telemetry::{
 };
 #[cfg(feature = "gpu-tests")]
 use crate::kernels::expert_route_telemetry::{
-    H_DEVICE, H_EPOCH, H_OVERFLOW, H_POISON, H_REQUEST, TelemetrySnapshot,
+    H_COUNT, H_DEVICE, H_EPOCH, H_OVERFLOW, H_POISON, H_REQUEST, TelemetrySnapshot,
 };
 use crate::provider::CudaExecutionProvider;
 use crate::runtime::{CudaRuntime, RawCudaFunction, cuptr};
@@ -89,6 +89,7 @@ pub enum BlockQuantizedMoeTrafficFaultForTest {
     StaleEpoch,
     ForeignRequest,
     WrongDevice,
+    NonTopKMultipleCount,
 }
 
 pub fn block_quantized_moe_preparation_counts() -> BlockQuantizedMoePreparationCounts {
@@ -1626,6 +1627,12 @@ impl BlockQuantizedMoEKernel {
         {
             return Err(TelemetryUnsupported::GraphInstalled);
         }
+        if config.routes_per_row != self.attributes.k {
+            return Err(TelemetryUnsupported::RouteWidthMismatch {
+                config: config.routes_per_row,
+                execution: self.attributes.k,
+            });
+        }
         let shared = self.shared.as_ref().ok_or_else(|| {
             TelemetryUnsupported::Alloc("projection banks are not admitted".into())
         })?;
@@ -1687,18 +1694,11 @@ impl BlockQuantizedMoEKernel {
             .load_full()
             .ok_or_else(|| error("BlockQuantizedMoE traffic is not armed"))?;
         let telemetry = armed.record.validated_snapshot(&self.runtime)?;
-        let unique_experts = telemetry
-            .bitmap
-            .iter()
-            .try_fold(0_u64, |total, word| {
-                total.checked_add(u64::from(word.count_ones()))
-            })
-            .ok_or_else(|| error("unique selected-expert count overflow"))?;
         let (logical_route_demand_bytes, unique_selected_expert_bytes) =
             checked_logical_traffic_bytes(
                 self.bytes_per_expert,
-                u64::from(telemetry.count()),
-                unique_experts,
+                u64::from(telemetry.selected_route_count()),
+                u64::from(telemetry.unique_expert_count()),
             )?;
         Ok(BlockQuantizedMoeTraffic {
             uploaded_whole_bank_bytes: self.uploaded_whole_bank_bytes,
@@ -1784,6 +1784,10 @@ impl BlockQuantizedMoEKernel {
             }
             BlockQuantizedMoeTrafficFaultForTest::WrongDevice => {
                 (H_DEVICE, snapshot.header[H_DEVICE].wrapping_add(1))
+            }
+            BlockQuantizedMoeTrafficFaultForTest::NonTopKMultipleCount => {
+                let count = snapshot.header[H_COUNT];
+                (H_COUNT, count.saturating_add(1))
             }
         };
         armed.record.inject_header_word(&self.runtime, index, value)
@@ -2241,6 +2245,7 @@ impl Kernel for BlockQuantizedMoEKernel {
             request_id,
             device_id: self.runtime.ordinal(),
             num_experts: self.geometry.experts,
+            routes_per_row: self.attributes.k,
         })
         .map_err(|error| EpError::KernelFailed(error.to_string()))?;
         Ok(true)

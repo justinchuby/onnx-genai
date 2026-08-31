@@ -94,6 +94,12 @@ pub(crate) struct Executor {
     /// Immutable namespace identity for every captured graph owned by this
     /// executor. Sibling sessions sharing one provider receive distinct owners.
     pub(super) graph_owner: DeviceGraphOwner,
+    /// Immutable namespace identity for deferred device validation. The
+    /// provider issues exact per-submission tokens under this owner.
+    pub(super) validation_owner: DeviceValidationOwner,
+    /// Most recent submitted generation. Bound outputs receive an `Arc` clone,
+    /// so consuming through one owner preserves the sticky result for the rest.
+    pub(super) pending_device_validation: Option<Arc<DeviceValidationReceipt>>,
     /// Lazy external initializers available only at the nxrt fused-MoE boundary.
     /// Stock EPs ignore this map and keep receiving the resident buffers below.
     pub(super) weight_handles: HashMap<ValueId, WeightHandle>,

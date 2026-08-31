@@ -119,6 +119,55 @@ impl Default for DeviceGraphOwner {
     }
 }
 
+/// Immutable identity of one executor's deferred-validation namespace.
+///
+/// A provider may be shared by several sessions. Only the executor that opened
+/// a validation generation, or an output binding carrying its exact token, may
+/// consume that generation's result.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct DeviceValidationOwner(u64);
+
+impl DeviceValidationOwner {
+    /// Mint a process-unique owner identity. Identities are never reused.
+    pub fn new() -> Self {
+        static NEXT_OWNER: AtomicU64 = AtomicU64::new(1);
+        Self(NEXT_OWNER.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// Stable process-local numeric identity.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl Default for DeviceValidationOwner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Exact identity of one submitted deferred-validation generation.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct DeviceValidationToken {
+    owner: DeviceValidationOwner,
+    generation: u64,
+}
+
+impl DeviceValidationToken {
+    /// Construct a provider-issued validation token.
+    pub const fn new(owner: DeviceValidationOwner, generation: u64) -> Self {
+        Self { owner, generation }
+    }
+
+    pub const fn owner(self) -> DeviceValidationOwner {
+        self.owner
+    }
+
+    pub const fn generation(self) -> u64 {
+        self.generation
+    }
+}
+
 /// Exact identity of one installed device-graph generation.
 ///
 /// All replay, liveness, reset, and invalidation operations require this token.
@@ -1517,21 +1566,16 @@ pub trait ExecutionProvider: Send + Sync {
         self.has_device_graph_in(token.slot())
     }
 
-    /// Begin one top-level device-validation generation.
+    /// Begin one top-level device-validation generation owned by `owner`.
     ///
     /// Providers with deferred validation may reject this call while a previous
-    /// generation remains unconsumed.
-    fn begin_device_validation(&self) -> Result<()> {
-        self.reset_device_validation_error()
-    }
-
-    /// Clear the provider's latching device-side validation error.
-    ///
-    /// Session executors call this at top-level request boundaries. Implementations
-    /// must make the reset safe for both eager and captured execution; providers
-    /// without a device validation latch keep the no-op default.
-    fn reset_device_validation_error(&self) -> Result<()> {
-        Ok(())
+    /// generation remains unconsumed. The returned token is the only authority
+    /// that may consume this submission's result.
+    fn begin_device_validation(
+        &self,
+        owner: DeviceValidationOwner,
+    ) -> Result<DeviceValidationToken> {
+        Ok(DeviceValidationToken::new(owner, 0))
     }
 
     /// Whether top-level execution defers validation until a host-visible read.
@@ -1539,22 +1583,11 @@ pub trait ExecutionProvider: Send + Sync {
         false
     }
 
-    /// Read (without clearing) any latching device-side validation error as a
-    /// raw violation bitmask (zero when none). The compatibility name predates
-    /// deferred eager validation; EPs without device validation report no error.
-    ///
-    /// The caller must first establish a host synchronization boundary so all
-    /// kernels from the request have completed before this value is observed.
-    fn check_device_capture_error(&self) -> Result<u32> {
+    /// Consume the exact top-level device-validation generation after a host
+    /// synchronization boundary. Implementations must reject a foreign, stale,
+    /// or concurrently consumed token without clearing the active result.
+    fn consume_device_validation_error(&self, _token: DeviceValidationToken) -> Result<u32> {
         Ok(0)
-    }
-
-    /// Consume the current top-level device-validation generation after a host
-    /// synchronization boundary. The result is sticky until this succeeds.
-    fn consume_device_validation_error(&self) -> Result<u32> {
-        let flags = self.check_device_capture_error()?;
-        self.reset_device_validation_error()?;
-        Ok(flags)
     }
 
     /// Consume any completed coarse-boundary route-telemetry window and apply

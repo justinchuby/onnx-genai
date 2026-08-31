@@ -58,9 +58,9 @@ pub use kernel::{
 pub use onnx_runtime_optimizer::OptimizationPass as OptimizerPass;
 pub use provider::{
     ArgmaxTieBreak, BoundBufferOwnership, CaptureRegionShapeStatus, DeviceBuffer, DeviceGraphOwner,
-    DeviceGraphSlot, DeviceGraphToken, EpConfig, EpId, ExecutionProvider, Fence,
-    HostToDeviceCopier, RawDeviceAllocationSiteStats, SealedDeviceAllocation,
-    StructuralCaptureDecline, WorkspaceAllocation,
+    DeviceGraphSlot, DeviceGraphToken, DeviceValidationOwner, DeviceValidationToken, EpConfig,
+    EpId, ExecutionProvider, Fence, HostToDeviceCopier, RawDeviceAllocationSiteStats,
+    SealedDeviceAllocation, StructuralCaptureDecline, WorkspaceAllocation,
 };
 pub use registry::{EpRegistry, KernelFactory, OpKey, OpRegistry};
 pub use tensor::{
